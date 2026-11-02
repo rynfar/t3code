@@ -3,9 +3,10 @@
 //! (`upsertSurface`, `toggle`, `closeSurface`, `closeOtherSurfaces`, `closeSurfacesToRight`,
 //! `closeAllSurfaces`, `moveSurface`, `setMaximized`), `apps/web/src/closedViewStore.ts` and
 //! `planNextReopen` from `apps/web/src/reopenClosedView.ts`, with the file surfaces' `openFile` and
-//! `navigateFolder`. Other surfaces plug in as new `Surface` variants.
+//! `navigateFolder`, and the browser tabs' `openBrowser` and `reconcileBrowserSurfaces`. Other
+//! surfaces plug in as new `Surface` variants.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -38,6 +39,9 @@ pub enum SurfaceKind {
     },
     #[serde(rename_all = "camelCase")]
     SideChat { thread_id: String },
+    /// A browser tab: `browser:<tab>` for a preview session, `browser:new` before one opens.
+    #[serde(rename_all = "camelCase")]
+    Preview { resource_id: Option<String> },
 }
 
 /// `normalizeRevealLine`: a positive whole line, anything else none.
@@ -71,8 +75,24 @@ impl Surface {
         Surface { id: format!("side-chat:{thread_id}"), kind: SurfaceKind::SideChat { thread_id: thread_id.to_owned() } }
     }
 
+    /// `browserSurface`.
+    pub fn browser(tab_id: Option<&str>) -> Surface {
+        match tab_id {
+            Some(tab_id) => Surface { id: format!("browser:{tab_id}"), kind: SurfaceKind::Preview { resource_id: Some(tab_id.to_owned()) } },
+            None => Surface { id: BROWSER_PLACEHOLDER_ID.to_owned(), kind: SurfaceKind::Preview { resource_id: None } },
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The preview session a browser tab shows.
+    pub fn preview_tab(&self) -> Option<&str> {
+        match &self.kind {
+            SurfaceKind::Preview { resource_id } => resource_id.as_deref(),
+            _ => None,
+        }
     }
 
     /// `surfaceTitle` in `RightPanelTabs.tsx`: a file tab shows its name.
@@ -86,6 +106,7 @@ impl Surface {
                 relative_path[start..].to_owned()
             }
             SurfaceKind::SideChat { .. } => "Side chat".to_owned(),
+            SurfaceKind::Preview { .. } => "Browser".to_owned(),
         }
     }
 
@@ -172,6 +193,7 @@ pub struct ClosedView {
 }
 
 const CLOSED_VIEW_LIMIT: usize = 20;
+const BROWSER_PLACEHOLDER_ID: &str = "browser:new";
 
 /// `usePreviewPanelInlineSize`: the inline panel's default and minimum width.
 pub const DEFAULT_WIDTH: f32 = 540.;
@@ -291,7 +313,8 @@ impl RightPanels {
             .iter()
             .filter(|surface| Some(surface.id()) != active)
             .chain(removed.iter().filter(|surface| Some(surface.id()) == active));
-        for surface in ordered {
+        // A closed browser tab's session closes with it, so there is nothing to reopen by id.
+        for surface in ordered.filter(|surface| surface.preview_tab().is_none()) {
             self.remember(ClosedView { thread_id: thread_id.to_owned(), surface: (*surface).clone() });
         }
         true
@@ -451,6 +474,42 @@ impl RightPanels {
             }
             if panel.active().is_none() {
                 panel.active_surface_id = panel.surfaces.last().map(|surface| surface.id.clone());
+            }
+        })
+    }
+
+    /// `openBrowser`: a session's tab replaces the `browser:new` placeholder.
+    pub fn open_browser(&mut self, thread_id: &str, tab_id: Option<&str>) -> bool {
+        self.update(thread_id, |panel| {
+            if tab_id.is_some() {
+                panel.surfaces.retain(|surface| surface.id != BROWSER_PLACEHOLDER_ID);
+            }
+            panel.upsert(Surface::browser(tab_id));
+        })
+    }
+
+    /// `reconcileBrowserSurfaces`: browser tabs follow the thread's preview sessions. Closed
+    /// sessions lose their tab, new ones gain one unless `hidden`, and the placeholder goes.
+    pub fn reconcile_browser_surfaces(&mut self, thread_id: &str, tab_ids: &[String], hidden: &HashSet<String>) -> bool {
+        self.update(thread_id, |panel| {
+            let had_session_tab = panel.surfaces.iter().any(|surface| surface.preview_tab().is_some());
+            panel.surfaces.retain(|surface| match &surface.kind {
+                SurfaceKind::Preview { resource_id: Some(tab) } => tab_ids.contains(tab),
+                SurfaceKind::Preview { resource_id: None } => false,
+                _ => true,
+            });
+            for tab in tab_ids {
+                if !hidden.contains(tab) && !panel.surfaces.iter().any(|surface| surface.preview_tab() == Some(tab.as_str())) {
+                    panel.surfaces.push(Surface::browser(Some(tab)));
+                }
+            }
+            // The last session tab closed: hide the panel as a user close would.
+            if panel.surfaces.is_empty() && had_session_tab {
+                panel.is_open = false;
+            }
+            if panel.active().is_none() {
+                let fallback = panel.surfaces.iter().find(|surface| matches!(surface.kind, SurfaceKind::Preview { .. })).or(panel.surfaces.first());
+                panel.active_surface_id = fallback.map(|surface| surface.id.clone());
             }
         })
     }

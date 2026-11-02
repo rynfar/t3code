@@ -168,7 +168,7 @@ fn widths_and_maximized_state_are_per_thread() {
 fn persisted_state_drops_unknown_surfaces() {
     let json = r#"{
         "threads": { "t": { "isOpen": true, "activeSurfaceId": "diff",
-            "surfaces": [{ "id": "browser:1", "kind": "preview", "resourceId": "1" }, { "id": "diff", "kind": "diff" }] } },
+            "surfaces": [{ "id": "terminal:1", "kind": "terminal", "terminalIds": ["1"] }, { "id": "diff", "kind": "diff" }] } },
         "widths": { "t": 480.0 },
         "closed": [{ "threadId": "t", "surface": { "id": "device", "kind": "device" } },
                    { "threadId": "t", "surface": { "id": "diff", "kind": "diff" } }]
@@ -196,8 +196,8 @@ fn width_clamps_to_the_window_and_the_thread_column() {
 fn persisted_state_survives_bad_entries_and_repairs_the_active_tab() {
     let json = r#"{
         "threads": {
-            "kept": { "isOpen": true, "activeSurfaceId": "browser:1",
-                "surfaces": [{ "id": "browser:1", "kind": "preview" }, { "id": "diff", "kind": "diff" }] },
+            "kept": { "isOpen": true, "activeSurfaceId": "terminal:1",
+                "surfaces": [{ "id": "terminal:1", "kind": "terminal" }, { "id": "diff", "kind": "diff" }] },
             "hidden": { "isOpen": false, "activeSurfaceId": "gone", "surfaces": [{ "id": "diff", "kind": "diff" }] },
             "broken": "not a panel",
             "emptied": { "isOpen": true, "activeSurfaceId": "device", "surfaces": [{ "id": "device", "kind": "device" }] }
@@ -281,4 +281,36 @@ fn persisted_file_tabs_decode_and_normalize_reveal_lines() {
     let saved = serde_json::to_value(&panels).unwrap();
     assert_eq!(saved["threads"]["t"]["surfaces"][0]["relativePath"], "a.rs");
     assert_eq!(saved["threads"]["t"]["surfaces"][0]["revealRequestId"], 2);
+}
+
+#[test]
+fn browser_tabs_follow_preview_sessions() {
+    let mut panels = RightPanels::default();
+    panels.open("t", Surface::diff());
+    assert!(panels.open_browser("t", None));
+    assert!(panels.open_browser("t", Some("a")));
+    assert_eq!(ids(&panels, "t"), ["diff", "browser:a"]);
+    assert_eq!(panels.active_surface("t").and_then(Surface::preview_tab), Some("a"));
+    let hidden = HashSet::from(["h".to_owned()]);
+    // A new session gains a tab, an unrevealed one does not, a closed one loses its tab.
+    assert!(panels.reconcile_browser_surfaces("t", &["b".to_owned(), "h".to_owned()], &hidden));
+    assert_eq!(ids(&panels, "t"), ["diff", "browser:b"]);
+    assert_eq!(panels.panel("t").active_surface_id.as_deref(), Some("browser:b"));
+    assert!(!panels.reconcile_browser_surfaces("t", &["b".to_owned(), "h".to_owned()], &hidden));
+    // Closing a session tab is not remembered for cmd-shift-t: its session is gone.
+    panels.close_surface("t", "browser:b");
+    assert!(panels.closed_views().iter().all(|view| view.surface.preview_tab().is_none()));
+    // The last session tab closing on the server hides the panel.
+    let mut only = RightPanels::default();
+    only.open_browser("t", Some("a"));
+    assert!(only.reconcile_browser_surfaces("t", &[], &HashSet::new()));
+    assert!(!only.is_open("t"));
+}
+
+#[test]
+fn browser_tabs_persist_in_the_web_shape() {
+    let value = serde_json::to_value(Surface::browser(Some("a"))).unwrap();
+    assert_eq!(value, serde_json::json!({ "id": "browser:a", "kind": "preview", "resourceId": "a" }));
+    let placeholder: Surface = serde_json::from_value(serde_json::json!({ "id": "browser:new", "kind": "preview", "resourceId": null })).unwrap();
+    assert_eq!(placeholder, Surface::browser(None));
 }

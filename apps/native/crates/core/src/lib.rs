@@ -17,6 +17,7 @@ pub mod media;
 pub mod model;
 pub mod notifications;
 pub mod pairing;
+pub mod preview;
 pub mod palette;
 pub mod project_scripts;
 pub mod project_search;
