@@ -213,7 +213,10 @@ impl Composer {
                     attachments: &outgoing.attachments,
                 });
                 // "Work locally" on the setup card resends this launch in the project checkout.
-                let worktree_launch = matches!(strategy, workspace::Strategy::Worktree { .. }).then(|| payload.clone());
+                let connection = this.state.read(cx).connection_id();
+                let worktree_launch = connection.filter(|_| matches!(strategy, workspace::Strategy::Worktree { .. })).map(|connection| {
+                    t3_core::worktree_setup::DraftLaunch { thread_id: thread_id.clone(), connection, launch: payload.clone() }
+                });
                 Ok::<_, String>((thread_id, worktree_launch, this.state.read(cx).rpc(method::LAUNCH_THREAD, payload)))
             });
             let (result, worktree_launch) = match launch {
@@ -231,7 +234,7 @@ impl Composer {
                     Ok(_) if intent == SubmitIntent::Background => {}
                     Ok(thread_id) => {
                         if let (Some(launch), Some(setup)) = (worktree_launch, this.setup.clone()) {
-                            setup.update(cx, |setup, cx| setup.record_launch(thread_id.clone(), launch, cx));
+                            setup.update(cx, |setup, cx| setup.record_launch(launch, cx));
                         }
                         this.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx));
                     }
@@ -254,7 +257,7 @@ impl Composer {
         let approvals = self.snapshot.pending.approvals.clone();
         let follow_up = if approvals.is_empty() { settings.follow_up_behavior } else { FollowUpBehavior::Steer };
         let can_steer = !self.snapshot.compacting;
-        let dispatch = rules::dispatch_mode(self.snapshot.running, intent == SubmitIntent::Alternate, follow_up, can_steer);
+        let dispatch = rules::turn_dispatch_mode(rules::dispatch_mode(self.snapshot.running, intent == SubmitIntent::Alternate, follow_up, can_steer), self.snapshot.setup_queues);
         let feedback = approvals.first().filter(|approval| approval.supports_feedback && approval.live).map(|approval| approval.request_id.clone());
         if feedback.is_some() && (!outgoing.attachments.is_empty() || outgoing.context.is_some()) {
             self.error = Some("Send approval feedback without attachments or added context.".to_owned());

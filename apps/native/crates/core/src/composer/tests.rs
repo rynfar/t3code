@@ -12,6 +12,11 @@ fn dispatch_follows_the_follow_up_setting_and_its_alternate() {
     assert_eq!(dispatch_mode(true, false, FollowUpBehavior::Queue, true), ComposerDispatch::Queue);
     assert_eq!(dispatch_mode(true, true, FollowUpBehavior::Queue, true), ComposerDispatch::Steer);
     assert_eq!(dispatch_mode(true, false, FollowUpBehavior::Steer, false), ComposerDispatch::Queue);
+    // A run still being prepared takes the send as a queued turn, whatever the preference says.
+    assert_eq!(turn_dispatch_mode(dispatch_mode(true, false, FollowUpBehavior::Steer, true), true), ComposerDispatch::Queue);
+    assert_eq!(turn_dispatch_mode(dispatch_mode(true, true, FollowUpBehavior::Queue, true), true), ComposerDispatch::Queue);
+    assert_eq!(turn_dispatch_mode(dispatch_mode(false, false, FollowUpBehavior::Steer, true), true), ComposerDispatch::Queue);
+    assert_eq!(turn_dispatch_mode(ComposerDispatch::Steer, false), ComposerDispatch::Steer);
 }
 
 #[test]

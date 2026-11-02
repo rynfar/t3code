@@ -10,7 +10,7 @@ use gpui::{Action, App, AppContext, Context, Entity, EventEmitter, Global, Subsc
 use serde_json::Value;
 use t3_core::commands::method::LAUNCH_THREAD;
 use t3_core::timeline::{LatestRun, derive_activity};
-use t3_core::worktree_setup::{self as rules, Feed, Snapshot};
+use t3_core::worktree_setup::{self as rules, DraftLaunch, Feed, Snapshot};
 
 use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::toast::{Toast, ToastKind};
@@ -31,6 +31,8 @@ pub struct SetupView {
     pub preparing: bool,
     /// The composer holds the send back.
     pub blocks_send: bool,
+    /// The run waits on preparation, so a send queues behind it (`sendQueuesBehindSetup`).
+    pub queues_behind_setup: bool,
     /// The agent took over while the setup script still runs: the working row's chip.
     pub background: Option<Arc<Snapshot>>,
     /// "Work locally" is offered: the thread was just launched from the draft and setup runs.
@@ -47,9 +49,11 @@ pub struct WorktreeSetupStore {
     connection: Option<u64>,
     feed: Feed,
     stream: Option<(t3_client::worktree_setup::WorktreeSetupStream, Task<()>)>,
+    /// The server failed the subscription; it waits for the session to be replaced.
+    failed: bool,
     view: SetupView,
-    /// The thread the composer just launched from its draft in a new worktree, and the launch.
-    draft_launch: Option<(String, Value)>,
+    /// The thread the composer just launched from its draft in a new worktree.
+    draft_launch: Option<DraftLaunch>,
     /// A cancel is in flight, so a second click does nothing.
     cancelling: bool,
     /// A snapshot fixture stands in for the server's (`--worktree-setup`).
@@ -76,6 +80,10 @@ pub fn store(state: &Entity<AppState>, cx: &mut App) -> Entity<WorktreeSetupStor
 impl WorktreeSetupStore {
     fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+            // A reconnect replaces the session, so a subscription the server failed may try again.
+            if *event == AppEvent::Phase {
+                this.failed = false;
+            }
             if matches!(event, AppEvent::Selection | AppEvent::Thread | AppEvent::Shell | AppEvent::Phase) {
                 this.sync(cx);
             }
@@ -86,6 +94,7 @@ impl WorktreeSetupStore {
             connection: None,
             feed: Feed::default(),
             stream: None,
+            failed: false,
             view: SetupView::default(),
             draft_launch: None,
             cancelling: false,
@@ -111,16 +120,20 @@ impl WorktreeSetupStore {
             self.thread_id = thread_id.clone();
             self.feed = Feed::default();
             self.stream = None;
+            self.failed = false;
             self.fixture = false;
         }
         if connection != self.connection {
             self.connection = connection;
             self.stream = None;
+            self.failed = false;
+            // The launch belongs to the environment it was sent to.
+            self.draft_launch = None;
         }
         let has_worktree = thread_id.as_deref().and_then(|id| state.thread_shell(id)).is_some_and(|thread| thread.worktree_path.is_some());
         let run = self.activity_run(cx);
-        let preparing = run.as_ref().is_some_and(|run| run.status == "preparing");
-        let wanted = !self.fixture && connection.is_some() && thread_id.is_some() && (has_worktree || preparing);
+        let run_status = run.as_ref().map(|run| run.status.as_str());
+        let wanted = !self.fixture && connection.is_some() && thread_id.is_some() && rules::wants_subscription(has_worktree, run_status, self.failed);
         match (wanted, self.stream.is_some()) {
             (true, false) => self.subscribe(cx),
             (false, true) => {
@@ -144,6 +157,7 @@ impl WorktreeSetupStore {
         let (Some(thread_id), Some(client)) = (self.thread_id.clone(), state.client_handle()) else { return };
         let stream = t3_client::worktree_setup::subscribe(state.runtime(), client, &thread_id, self.feed.clone());
         let mut feed = stream.feed.clone();
+        let connection = self.connection;
         let pump = cx.spawn(async move |this, cx| {
             while feed.changed().await.is_ok() {
                 let next = feed.borrow_and_update().clone();
@@ -157,6 +171,16 @@ impl WorktreeSetupStore {
                     return;
                 }
             }
+            // The subscription only ends on a server failure: let the handle go, so the next
+            // session subscribes again.
+            let _ = this.update(cx, |store, cx| {
+                if store.thread_id.as_deref() == Some(thread_id.as_str()) && store.connection == connection && store.stream.is_some() {
+                    store.stream = None;
+                    store.failed = true;
+                    store.feed.apply(None);
+                    store.refresh(cx);
+                }
+            });
         });
         self.stream = Some((stream, pump));
     }
@@ -185,16 +209,17 @@ impl WorktreeSetupStore {
                 projection.messages.iter().filter(|message| message.value.get("role").and_then(Value::as_str) == Some("user")).count() > 1
             });
         let visible = rules::resolve_visible(progress.snapshot.as_ref(), None, turn_started, follow_up_sent);
-        let blocks_send = rules::blocks_send(visible.as_deref(), progress.preparing, rules::send_queues_behind_setup(run_status));
+        let queues_behind_setup = rules::send_queues_behind_setup(run_status);
+        let blocks_send = rules::blocks_send(visible.as_deref(), progress.preparing, queues_behind_setup);
         let work_locally = visible.as_ref().is_some_and(|snapshot| snapshot.running())
-            && self.draft_launch.as_ref().is_some_and(|(launched, _)| launched == thread_id);
-        SetupView { background: rules::background(visible.as_ref(), turn_started), visible, preparing: progress.preparing, blocks_send, work_locally }
+            && self.draft_launch.as_ref().is_some_and(|launch| launch.thread_id == thread_id && Some(launch.connection) == self.connection);
+        SetupView { background: rules::background(visible.as_ref(), turn_started), visible, preparing: progress.preparing, blocks_send, queues_behind_setup, work_locally }
     }
 
-    /// The composer launched `thread_id` from its draft with `launch` in a new worktree; "Work
-    /// locally" may resend it in the project checkout.
-    pub fn record_launch(&mut self, thread_id: String, launch: Value, cx: &mut Context<Self>) {
-        self.draft_launch = Some((thread_id, launch));
+    /// The composer launched a thread from its draft into a new worktree; "Work locally" may
+    /// resend it in the project checkout.
+    pub fn record_launch(&mut self, launch: DraftLaunch, cx: &mut Context<Self>) {
+        self.draft_launch = Some(launch);
         self.refresh(cx);
     }
 
@@ -225,7 +250,7 @@ impl WorktreeSetupStore {
         if !self.view.work_locally {
             return;
         }
-        let Some((_, launch)) = self.draft_launch.clone() else { return };
+        let Some(launch) = self.draft_launch.clone() else { return };
         let Some(cancel) = self.request_cancel(cx) else { return };
         cx.spawn(async move |this, cx| {
             let cancelled = cancel.await;
@@ -236,14 +261,16 @@ impl WorktreeSetupStore {
                 }
                 store.draft_launch = None;
                 store.refresh(cx);
+                // The user may have switched environments while the cancel was out.
                 let thread_id = uuid_v4();
-                let payload = rules::local_relaunch(&launch, &uuid_v4(), &thread_id, &uuid_v4());
+                let payload = launch.relaunch(store.state.read(cx).connection_id(), &uuid_v4(), &thread_id, &uuid_v4())?;
                 Some((thread_id, store.state.read(cx).rpc(LAUNCH_THREAD, payload)))
             });
             let Ok(Some((thread_id, request))) = relaunch else { return };
             let result = request.await;
             let _ = this.update(cx, |store, cx| {
                 store.state.update(cx, |state, cx| match result {
+                    Ok(_) if state.connection_id() != Some(launch.connection) => {}
                     Ok(_) => state.select_when_listed(&thread_id, cx),
                     Err(error) => state.show_toast(Toast::new(ToastKind::Error, "Could not start the thread locally").description(error.to_string()), cx),
                 });

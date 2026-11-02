@@ -117,6 +117,12 @@ pub fn dispatch_mode(running: bool, alternate: bool, follow_up: FollowUpBehavior
     }
 }
 
+/// `planComposerTurn`'s `turnDispatchMode`: a run still being prepared (worktree setup) or
+/// starting takes the send as a queued turn, since steering into it is rejected.
+pub fn turn_dispatch_mode(dispatch: ComposerDispatch, queues_behind_setup: bool) -> ComposerDispatch {
+    if queues_behind_setup { ComposerDispatch::Queue } else { dispatch }
+}
+
 /// `composerRequiresModifier`.
 pub fn requires_modifier(shortcut: SendShortcut, prompt: &str) -> bool {
     shortcut == SendShortcut::ModEnter || (shortcut == SendShortcut::ModEnterMultiline && prompt.contains(['\r', '\n']))

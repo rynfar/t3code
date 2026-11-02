@@ -178,6 +178,16 @@ fn checkout_shows_its_percent_while_running() {
 }
 
 #[test]
+fn the_subscription_follows_a_worktree_or_a_preparing_run_until_the_server_fails_it() {
+    assert!(wants_subscription(true, Some("completed"), false));
+    assert!(wants_subscription(false, Some("preparing"), false));
+    assert!(!wants_subscription(false, Some("running"), false));
+    assert!(!wants_subscription(false, None, false));
+    // A subscription the server failed stays down until the session is replaced.
+    assert!(!wants_subscription(true, Some("preparing"), true));
+}
+
+#[test]
 fn work_locally_relaunches_the_message_in_the_project_checkout() {
     let launch = json!({
         "commandId": "c1",
@@ -186,7 +196,11 @@ fn work_locally_relaunches_the_message_in_the_project_checkout() {
         "workspaceStrategy": { "type": "worktree", "baseRef": "main" },
         "initialMessage": { "messageId": "m1", "text": "Build it", "attachments": [] },
     });
-    let relaunch = local_relaunch(&launch, "c2", "t2", "m2");
+    let draft = DraftLaunch { thread_id: "t1".into(), connection: 3, launch: launch.clone() };
+    // Another environment has neither the project nor the message.
+    assert_eq!(draft.relaunch(Some(4), "c2", "t2", "m2"), None);
+    assert_eq!(draft.relaunch(None, "c2", "t2", "m2"), None);
+    let relaunch = draft.relaunch(Some(3), "c2", "t2", "m2").expect("same environment");
     assert_eq!(
         relaunch,
         json!({

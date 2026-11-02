@@ -1,7 +1,8 @@
 //! The worktree setup card (`WorktreeSetupCard.tsx`) and the working row's "Background setup"
 //! chip with its popover (`BackgroundWorktreeSetupChip` in `TimelineWorkGroupRows.tsx`). Rules and
 //! copy come from `t3_core::worktree_setup`. Only a running stage's time changes on a timer, each
-//! through its own `WorkingTimer`, which exists only while setup runs.
+//! through its own `WorkingTimer`, which exists only while setup runs. Text and spacing are rem
+//! metrics; offsets that line up with the stage icons stay px like the shared work row.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use super::parts::{focusable, ghost_text_button, icon_slot, work_line, work_row_
 use super::timer::WorkingTimer;
 use crate::composer::controls::{Float, floating, floating_shadow};
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 use crate::worktree_setup::{OpenSetupTerminal, SetupView};
 
@@ -125,7 +126,7 @@ fn output_tail(lines: &[String], failed: bool, cx: &App) -> AnyElement {
     };
     let rows = rules::tail_rows(lines).map(|line| div().w_full().min_w_0().truncate().child(if line.is_empty() { "\u{a0}".to_owned() } else { line.to_owned() }));
     v_flex()
-        .mb(px(4.))
+        .mb(rem(4.))
         .ml(px(32.))
         .min_w_0()
         .overflow_hidden()
@@ -133,11 +134,11 @@ fn output_tail(lines: &[String], failed: bool, cx: &App) -> AnyElement {
         .border_1()
         .border_color(border)
         .bg(fill)
-        .px(px(10.))
-        .py(px(6.))
+        .px(rem(10.))
+        .py(rem(6.))
         .font_family(cx.theme().mono_font_family.clone())
-        .text_size(px(11.))
-        .line_height(px(11. * 1.625))
+        .text_size(rem(11.))
+        .line_height(rem(11. * 1.625))
         .text_color(text)
         .children(rows)
         .into_any_element()
@@ -157,17 +158,17 @@ fn header_row(snapshot: &Snapshot, cx: &App) -> AnyElement {
     };
     div()
         .w_full()
-        .pt(px(4.))
-        .pb(px(8.))
+        .pt(rem(4.))
+        .pb(rem(8.))
         .border_b_1()
         .border_color(hsla(p.border).opacity(0.6))
         .child(
             h_flex()
-                .h(px(24.))
+                .h(rem(24.))
                 .min_w_0()
-                .gap(px(8.))
-                .px(px(4.))
-                .text_size(px(14.))
+                .gap(rem(8.))
+                .px(rem(4.))
+                .text_size(rem(14.))
                 .text_color(tone)
                 .child(div().min_w_0().truncate().child(rules::header_label(snapshot)))
                 .children(elapsed),
@@ -202,15 +203,15 @@ fn details(snapshot: &Snapshot, cx: &App) -> AnyElement {
     let values = pairs.iter().map(|(_, value)| div().min_w_0().truncate().font_family(mono.clone()).child(value.to_string()));
     h_flex()
         .items_start()
-        .mt(px(4.))
-        .mb(px(6.))
+        .mt(rem(4.))
+        .mb(rem(6.))
         .ml(px(32.))
         .min_w_0()
-        .gap(px(12.))
+        .gap(rem(12.))
         .text_xs()
         .text_color(hsla(p.muted_foreground))
-        .child(v_flex().flex_none().gap(px(2.)).children(labels))
-        .child(v_flex().flex_1().min_w_0().gap(px(2.)).children(values))
+        .child(v_flex().flex_none().gap(rem(2.)).children(labels))
+        .child(v_flex().flex_1().min_w_0().gap(rem(2.)).children(values))
         .into_any_element()
 }
 
@@ -229,9 +230,9 @@ pub fn card(scope: &str, snapshot: &Arc<Snapshot>, embedded: bool, env: &RowEnv,
                 rows.push(output_tail(&stage.tail, stage.status == StageStatus::Failed, cx));
             }
         }
-        v_flex().w_full().min_w_0().when(layout.show_header, |this| this.pt(px(6.))).children(rows).into_any_element()
+        v_flex().w_full().min_w_0().when(layout.show_header, |this| this.pt(rem(6.))).children(rows).into_any_element()
     };
-    let error = snapshot.error.clone().filter(|_| layout.show_error).map(|error| muted_text(error, cx).mt(px(4.)).ml(px(32.)));
+    let error = snapshot.error.clone().filter(|_| layout.show_error).map(|error| muted_text(error, cx).mt(rem(4.)).ml(px(32.)));
 
     let open = env.setup.details_open;
     let mut actions = vec![ghost_text_button(
@@ -277,7 +278,7 @@ pub fn card(scope: &str, snapshot: &Arc<Snapshot>, embedded: bool, env: &RowEnv,
         .child(body)
         .children(error)
         // Aligns the buttons' icons with the stage icons: 24 + 2 - (8 - 1).
-        .child(h_flex().flex_wrap().mt(px(2.)).ml(px(19.)).gap(px(2.)).children(actions))
+        .child(h_flex().flex_wrap().mt(rem(2.)).ml(px(19.)).gap(rem(2.)).children(actions))
         .when(open, |this| this.child(details(snapshot, cx)))
         .into_any_element()
 }
@@ -292,11 +293,11 @@ pub fn background_chip(env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<Any
         .id("background-worktree-setup")
         .flex_none()
         .min_w_0()
-        .h(px(20.))
-        .px(px(5.))
-        .gap(px(4.))
+        .h(rem(20.))
+        .px(rem(5.))
+        .gap(rem(4.))
         .rounded(px(4.))
-        .text_size(px(11.))
+        .text_size(rem(11.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(hsla(p.muted_foreground))
         .cursor_pointer()
@@ -309,10 +310,10 @@ pub fn background_chip(env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<Any
         let content = v_flex()
             .id("background-worktree-setup-popover")
             .occlude()
-            .mt(px(4.))
-            .w(px(384.))
-            .px(px(12.))
-            .py(px(8.))
+            .mt(rem(4.))
+            .w(rem(384.))
+            .px(rem(12.))
+            .py(rem(8.))
             .rounded(px(8.))
             .border_1()
             .border_color(hsla(p.dropdown_border))

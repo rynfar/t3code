@@ -222,6 +222,13 @@ pub fn resolve_visible(live: Option<&Arc<Snapshot>>, recorded: Option<&Arc<Snaps
     }
 }
 
+/// `useWorktreeSetup`'s query condition: the open thread has a worktree or its run is being
+/// prepared. A subscription the server failed (authorization) stays down until the session is
+/// replaced, rather than retrying on every update.
+pub fn wants_subscription(has_worktree: bool, run_status: Option<&str>, failed: bool) -> bool {
+    !failed && (has_worktree || run_status == Some("preparing"))
+}
+
 /// `sendQueuesBehindSetup`: a server thread whose run waits on preparation queues the send.
 pub fn send_queues_behind_setup(run_status: Option<&str>) -> bool {
     matches!(run_status, Some("preparing" | "starting"))
@@ -394,6 +401,23 @@ pub fn details(snapshot: &Snapshot) -> Vec<(&'static str, &str)> {
     .into_iter()
     .filter_map(|(label, value)| Some((label, value?)))
     .collect()
+}
+
+/// A thread the composer launched from its draft into a new worktree, on one connection, and
+/// the launch it sent, which "Work locally" may resend.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftLaunch {
+    pub thread_id: String,
+    pub connection: u64,
+    pub launch: Value,
+}
+
+impl DraftLaunch {
+    /// The resend in the project checkout, only on the connection that launched it: another
+    /// environment has neither the project nor the message.
+    pub fn relaunch(&self, connection: Option<u64>, command_id: &str, thread_id: &str, message_id: &str) -> Option<Value> {
+        (connection == Some(self.connection)).then(|| local_relaunch(&self.launch, command_id, thread_id, message_id))
+    }
 }
 
 /// "Work locally" relaunches the draft's message in the project checkout (`onWorktreeSetupWorkLocally`
