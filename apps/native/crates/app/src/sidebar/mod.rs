@@ -485,5 +485,6 @@ impl Render for SidebarPane {
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .children(self.render_footer(cx))
             .children(self.render_project_filter(cx))
+            .child(crate::pull_requests::sidebar_item(&self.state, cx))
     }
 }

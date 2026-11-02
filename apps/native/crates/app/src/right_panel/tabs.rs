@@ -20,12 +20,15 @@ struct SurfaceAction {
     open: fn(&mut AppState, &mut gpui::Context<AppState>),
 }
 
-const SURFACE_ACTIONS: &[SurfaceAction] =
-    &[SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface }];
+const SURFACE_ACTIONS: &[SurfaceAction] = &[
+    SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface },
+    SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface },
+];
 
 fn surface_icon(surface: &Surface) -> Icon {
     match surface.kind {
         SurfaceKind::Diff => Icon::FileDiff,
+        SurfaceKind::PullRequests => Icon::Link2,
     }
 }
 

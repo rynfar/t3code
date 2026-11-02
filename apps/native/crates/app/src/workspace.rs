@@ -19,6 +19,7 @@ use crate::keymap::{
 };
 use crate::palette::{CommandPalette, Mode as PaletteMode};
 use crate::right_panel::RightPanelView;
+use crate::pull_requests::{CopyPullRequestNumber, LinkPullRequest, LinkPullRequestDialog, PullRequestsPage, ShowLinkedPullRequests};
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
 use crate::terminal::{self, TerminalDrawer, ToggleTerminal};
@@ -45,6 +46,8 @@ pub struct Workspace {
     header: Entity<ChatHeader>,
     details: Entity<DetailsView>,
     git_dialogs: Entity<GitDialogs>,
+    pull_requests: Entity<PullRequestsPage>,
+    link_dialog: Entity<LinkPullRequestDialog>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -66,6 +69,8 @@ impl Workspace {
         let git = details_model.read(cx).git.clone();
         let git_dialogs = cx.new(|cx| GitDialogs::new(git, window, cx));
         let details = cx.new(|cx| DetailsView::new(state.clone(), details_model.clone(), git_dialogs.clone(), window, cx));
+        let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
+        let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
@@ -97,6 +102,8 @@ impl Workspace {
             header,
             details,
             git_dialogs,
+            pull_requests,
+            link_dialog,
             _subscriptions: subscriptions,
         }
     }
@@ -146,6 +153,7 @@ impl Render for Workspace {
         let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
         let drawer = self.terminal.clone();
         let details_layout = thread_details::layout(&self.state, window, cx);
+        let on_pull_requests = state.pull_requests_open;
         h_flex()
             .relative()
             .size_full()
@@ -179,8 +187,16 @@ impl Render for Workspace {
             }))
             .on_action(|_: &Unimplemented, _, cx| cx.propagate())
             .on_action(cx.listener(|this, _: &crate::thread_view::FindInThread, window, cx| this.thread.update(cx, |view, cx| view.open_find(window, cx))))
+            .on_action(cx.listener(|this, _: &LinkPullRequest, window, cx| crate::pull_requests::open_link_dialog(&this.link_dialog, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowLinkedPullRequests, _, cx| this.state.update(cx, |state, cx| state.add_pull_requests_surface(cx))))
+            .on_action(cx.listener(|this, _: &CopyPullRequestNumber, _, cx| {
+                if !this.pull_requests.update(cx, |page, cx| page.copy_selected_number(cx)) {
+                    cx.propagate();
+                }
+            }))
             .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
+                this.pull_requests.update(cx, |page, cx| page.set_modifiers(event.modifiers, cx));
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.state.update(cx, |state, cx| state.clear_thread_selection(cx)) {
@@ -211,7 +227,8 @@ impl Render for Workspace {
                         .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
                 )
             })
-            .when(!maximized, |this| {
+            .when(on_pull_requests, |this| this.child(div().flex_1().h_full().min_w_0().child(self.pull_requests.clone())))
+            .when(!maximized && !on_pull_requests, |this| {
                 this.child(
                 v_flex()
                     .flex_1()
@@ -248,13 +265,14 @@ impl Render for Workspace {
                     }),
                 )
             })
-            .child(self.right_panel.clone())
+            .when(!on_pull_requests, |this| this.child(self.right_panel.clone()))
             .child(self.render_sidebar_toggle(cx))
             .child(self.menu.clone())
             .child(self.dialog.clone())
             .child(self.git_dialogs.clone())
             .child(self.snooze.clone())
             .child(self.palette.clone())
+            .child(self.link_dialog.clone())
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))
             .into_any_element()

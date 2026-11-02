@@ -24,7 +24,8 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
         DiffSelection::Turn { turn_id, .. } => Some(turn_id.clone()),
         _ => None,
     };
-    let git_scope = matches!(scope, DiffScope::Branch { .. } | DiffScope::Unstaged);
+    let external = panel.is_external();
+    let git_scope = !external && matches!(scope, DiffScope::Branch { .. } | DiffScope::Unstaged);
     let parsed = panel.view.as_ref().map(|view| view.parsed.clone());
     let has_files = parsed.as_ref().is_some_and(|parsed| !parsed.files().is_empty());
     let stats = parsed.as_ref().filter(|_| has_files).map(|parsed| {
@@ -115,7 +116,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                 .flex_1()
                 .min_w_0()
                 .gap(px(12.))
-                .child(scope_menu)
+                .when(!external, |this| this.child(scope_menu))
                 .children(refs.map(|refs| div().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(refs))),
         )
         .child(
@@ -160,7 +161,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                         .tooltip(if panel.wrap { "Disable line wrapping" } else { "Enable line wrapping" })
                         .on_click(act(DiffPanel::toggle_wrap)),
                 )
-                .child(
+                .when(!external, |this| this.child(
                     Button::new("diff-whitespace")
                         .variant(Variant::Toggle)
                         .size(Size::IconSm)
@@ -169,7 +170,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                         .pressed(panel.ignore_whitespace)
                         .tooltip(if panel.ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" })
                         .on_click(act(DiffPanel::toggle_whitespace)),
-                )
+                ))
                 .when(has_files, |this| {
                     this.child(
                         Button::new("diff-tree")

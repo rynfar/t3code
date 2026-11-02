@@ -25,7 +25,8 @@ use t3_core::right_panel::SurfaceKind;
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::theme::{hsla, palette};
 use source::{Loaded, RequestKey};
-use view::{Parsed, View};
+pub use view::Parsed;
+use view::View;
 
 /// `LIVE_REFRESH_MIN_INTERVAL_MS`: showing the panel revalidates a git diff older than this.
 const GIT_REFRESH_FLOOR: Duration = Duration::from_secs(10);
@@ -68,17 +69,33 @@ pub struct DiffPanel {
     top_file: Option<usize>,
     selected_file: Option<String>,
     handled_reveal: Option<(String, String, u64)>,
+    /// A patch from outside the thread (a pull request's Code tab) replaces the scopes.
+    external: Option<External>,
     _subscription: Subscription,
+}
+
+/// What a detached panel shows: a key for its folds, and the patch or why there is none.
+pub struct External {
+    pub key: String,
+    pub parsed: Option<Arc<Parsed>>,
+    pub pending: bool,
+    pub error: Option<String>,
 }
 
 impl DiffPanel {
     pub fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self::construct(state, cx);
+        panel.sync(cx);
+        panel
+    }
+
+    fn construct(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
             if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::RightPanel | AppEvent::Shell | AppEvent::Phase) {
                 this.sync(cx);
             }
         });
-        let mut panel = DiffPanel {
+        DiffPanel {
             state,
             thread_id: None,
             fingerprint: (0, None),
@@ -110,15 +127,38 @@ impl DiffPanel {
             top_file: None,
             selected_file: None,
             handled_reveal: None,
+            external: None,
             _subscription: subscription,
-        };
-        panel.sync(cx);
+        }
+    }
+
+    /// A panel that shows `show_external`'s patch instead of the open thread's scopes.
+    pub fn detached(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self::construct(state, cx);
+        panel.external = Some(External { key: String::new(), parsed: None, pending: true, error: None });
         panel
+    }
+
+    /// Files start expanded, as the pull request Code tab shows unviewed files.
+    pub fn show_external(&mut self, external: External, cx: &mut Context<Self>) {
+        self.collapsed.entry(external.key.clone()).or_default();
+        self.external = Some(external);
+        self.rebuild(cx);
+        cx.notify();
     }
 
     /// Reconciles with app state. Runs on every thread event, so it does nothing unless the
     /// scope, the request, the connection or the workspace actually changed.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        if self.external.is_some() {
+            let ui = (self.state.read(cx).panels.diff_layout, self.state.read(cx).panels.diff_file_tree_open);
+            if ui != self.ui {
+                self.ui = ui;
+                self.rebuild(cx);
+                cx.notify();
+            }
+            return;
+        }
         let state = self.state.read(cx);
         let thread_id = state.selected_thread.clone();
         if thread_id != self.thread_id {
@@ -287,6 +327,9 @@ impl DiffPanel {
     /// The patch for the current scope: the loaded one, or the last one of the same source
     /// while a refresh is in flight.
     fn current(&self) -> Option<Arc<Parsed>> {
+        if let Some(external) = &self.external {
+            return external.parsed.clone();
+        }
         if !self.has_loaded() {
             return None;
         }
@@ -300,6 +343,9 @@ impl DiffPanel {
 
     /// `reviewSectionId`: folds are remembered per thread and scope.
     fn scope_key(&self) -> String {
+        if let Some(external) = &self.external {
+            return external.key.clone();
+        }
         let section = match &self.scope {
             DiffScope::Branch { .. } => "branch".to_owned(),
             DiffScope::Unstaged => "unstaged".to_owned(),
@@ -374,6 +420,10 @@ impl DiffPanel {
         self.collapsed.insert(view.scope_key.clone(), view.folded_keys());
         self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
         cx.notify();
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.external.is_some()
     }
 
     pub fn all_collapsed(&self) -> bool {
@@ -476,7 +526,16 @@ impl DiffPanel {
                 .child(text.to_owned())
                 .into_any_element()
         };
-        if self.thread_id.is_none() {
+        if let Some(external) = &self.external
+            && self.view.is_none()
+        {
+            return match (&external.error, external.pending) {
+                (Some(error), _) => message(error),
+                (None, true) => lines::loading_state(cx).into_any_element(),
+                (None, false) => message("No patch available for this selection."),
+            };
+        }
+        if self.thread_id.is_none() && self.external.is_none() {
             return message("Select a thread to inspect turn diffs.");
         }
         if self.is_outside_repository(cx) {

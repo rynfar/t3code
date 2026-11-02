@@ -17,6 +17,7 @@ mod palette;
 mod project_files;
 mod projects;
 mod provider_icon;
+mod pull_requests;
 mod right_panel;
 mod settings;
 mod sidebar;
@@ -70,6 +71,7 @@ fn main() {
         settings::init(state.clone(), cx);
         new_thread::init(state.clone(), cx);
         right_panel::init(state.clone(), cx);
+        pull_requests::init(state.clone(), cx);
         terminal::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(

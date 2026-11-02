@@ -23,11 +23,17 @@ pub struct Surface {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SurfaceKind {
     Diff,
+    PullRequests,
 }
 
 impl Surface {
     pub fn diff() -> Surface {
         Surface { id: "diff".to_owned(), kind: SurfaceKind::Diff }
+    }
+
+    /// A thread's linked pull requests (`{ id: "pull-requests", kind: "pull-requests" }`).
+    pub fn pull_requests() -> Surface {
+        Surface { id: "pull-requests".to_owned(), kind: SurfaceKind::PullRequests }
     }
 
     pub fn id(&self) -> &str {
@@ -38,6 +44,7 @@ impl Surface {
     pub fn title(&self) -> &'static str {
         match self.kind {
             SurfaceKind::Diff => "Diff",
+            SurfaceKind::PullRequests => "Pull requests",
         }
     }
 }
