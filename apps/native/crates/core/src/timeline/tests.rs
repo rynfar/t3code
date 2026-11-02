@@ -818,3 +818,48 @@ fn withheld_output_is_requested_by_revision_and_decoded() {
     assert!(decode_detail(serde_json::json!({ "item": null })).expect("decodes").is_none());
     assert_eq!(command_output_text(r#"{"stdout":"out","stderr":"","interrupted":false}"#).as_deref(), Some("out"));
 }
+
+/// `threadFind.ts` counting and wrapping, and stepping inside the navigation window.
+#[test]
+fn find_steps_through_the_window_and_wraps() {
+    assert_eq!(format_count(0, 0), "0/0");
+    assert_eq!(format_count(2, 5), "3/5");
+    assert_eq!(format_count(9, 5), "5/5");
+    assert_eq!(step_index(4, 5, 1), 0);
+    assert_eq!(step_index(0, 5, -1), 4);
+    let result = decode_result(serde_json::json!({
+        "snapshotSequence": 7, "totalMatches": 5, "activeIndex": 1,
+        "match": { "entryId": "m1", "runId": "r1", "occurrence": 0 },
+        "navigation": [
+            { "entryId": "m0", "runId": null, "startIndex": 0, "count": 1 },
+            { "entryId": "m1", "runId": "r1", "startIndex": 1, "count": 3 },
+        ],
+    }))
+    .expect("result decodes");
+    assert_eq!(step_locally(&result, 1, 1).map(|(index, m)| (index, m.entry_id, m.occurrence)), Some((2, "m1".into(), 1)));
+    assert_eq!(step_locally(&result, 1, -1).map(|(_, m)| m.entry_id), Some("m0".into()));
+    assert!(step_locally(&result, 3, 1).is_none(), "match 5 lies outside the window");
+    assert_eq!(bar_label("needle", Some(&result), 1, false, false), "2/5");
+    assert_eq!(bar_label("needle", None, 0, true, false), "Searching…");
+    let start = FindStart { entry_id: "m1".into(), occurrence: 2 };
+    assert_eq!(
+        search_request("t", " needle ", Some(&start), -1),
+        serde_json::json!({ "threadId": "t", "query": "needle", "skills": [], "start": { "entryId": "m1", "occurrence": 2 }, "offset": -1 })
+    );
+}
+
+/// `timelineTurnFoldRunIdsByEntryId`: find opens the fold hiding its match.
+#[test]
+fn fold_membership_names_the_fold_hiding_each_entry() {
+    let entries = vec![
+        message("user-1", Role::User, "Build it", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        message("assistant-first", Role::Assistant, "Checklist", Some("turn-1"), "2026-01-01T00:00:05Z", "2026-01-01T00:00:06Z"),
+        work("work-entry-1", "turn-1", "2026-01-01T00:00:08Z", |_| {}),
+        message("assistant-final", Role::Assistant, "Done", Some("turn-1"), "2026-01-01T00:00:20Z", "2026-01-01T00:00:22Z"),
+    ];
+    let (runs, attempts) = fold_membership(&entries, &ThreadActivity::default());
+    assert_eq!(runs.get("work-entry-1").map(String::as_str), Some("turn-1"));
+    assert_eq!(runs.get("assistant-first-entry").map(String::as_str), Some("turn-1"));
+    assert!(!runs.contains_key("assistant-final-entry"));
+    assert!(attempts.is_empty());
+}

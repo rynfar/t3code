@@ -7,6 +7,7 @@ mod activity;
 mod compaction;
 mod detail;
 mod entries;
+mod find;
 mod folds;
 mod presentation;
 mod rows;
@@ -35,7 +36,8 @@ pub use presentation::{
     summary_icon, summarize_tool_group, tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label,
     work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_log_entry_is_tool_like,
 };
-pub use rows::{RowsCache, RowsInput, derive_rows};
+pub use find::{FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, SEARCH_THREAD, bar_label, decode_result, format_count, search_request, step_index, step_locally};
+pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};
 pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, parse_iso_ms};
 pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name};
 pub use user_input::{has_question_answer, question_answer_preview, question_answer_text, question_text_preview};
@@ -216,6 +218,8 @@ pub enum RowKind {
     WorkToggle {
         run_id: Option<String>,
         group_id: String,
+        /// The members the group holds when opened.
+        entries: Vec<Arc<WorkLogEntry>>,
         hidden_count: usize,
         expanded: bool,
         summary: String,
@@ -310,6 +314,10 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
             Arc::ptr_eq(ia, ib) && ra == rb && sa.len() == sb.len() && sa.iter().zip(sb).all(|(l, r)| Arc::ptr_eq(l, r))
         }
         (RowKind::ProposedPlan(pa), RowKind::ProposedPlan(pb)) => Arc::ptr_eq(pa, pb),
+        (
+            RowKind::WorkToggle { run_id: ra, group_id: ga, entries: ea, hidden_count: ha, expanded: xa, summary: sa, summary_kind: ka, tool_surface: ta, has_failure: fa },
+            RowKind::WorkToggle { run_id: rb, group_id: gb, entries: eb, hidden_count: hb, expanded: xb, summary: sb, summary_kind: kb, tool_surface: tb, has_failure: fb },
+        ) => same_entries(ea, eb) && (ra, ga, ha, xa, sa, ka, ta, fa) == (rb, gb, hb, xb, sb, kb, tb, fb),
         _ => a.kind == b.kind,
     }
 }

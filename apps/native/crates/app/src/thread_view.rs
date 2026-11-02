@@ -7,7 +7,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Window, div, list, prelude::*, px};
+mod find;
+
+use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Window, actions, div, list, prelude::*, px};
 use t3_core::history::HistoryControl;
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
@@ -18,6 +20,8 @@ use crate::app_state::{AppEvent, AppState};
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::MarkdownStore;
 use crate::transcript::{Clock, Detail, RowEnv, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+
+actions!(thread_view, [FindInThread]);
 
 pub const CONTENT_MAX_WIDTH: f32 = 736.;
 const DETAIL_CACHE_LIMIT: usize = 64;
@@ -37,6 +41,7 @@ pub struct ThreadView {
     details: HashMap<String, Detail>,
     group_lists: RefCell<HashMap<String, ListState>>,
     working_timer: Option<Entity<WorkingTimer>>,
+    find: Option<find::FindUi>,
     clock: Clock,
     window_height: f32,
     _subscription: Subscription,
@@ -64,6 +69,7 @@ impl ThreadView {
             details: HashMap::new(),
             group_lists: RefCell::new(HashMap::new()),
             working_timer: None,
+            find: None,
             clock: Clock::now(),
             window_height: 0.,
             _subscription: subscription,
@@ -90,6 +96,7 @@ impl ThreadView {
             self.group_lists.borrow_mut().clear();
             self.rows.clear();
             self.history = None;
+            self.find = None;
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -109,6 +116,7 @@ impl ThreadView {
         self.sync_history(cx);
         self.rederive(cx);
         self.refresh_open_details(cx);
+        self.refresh_find_after_change(cx);
     }
 
     /// The control above the first row: shown, hidden, or relabelled without touching rows.
@@ -292,6 +300,7 @@ impl ThreadView {
             details: &self.details,
             group_lists: &self.group_lists,
             working_timer: self.working_timer.as_ref(),
+            find_target: self.find.as_ref().and_then(|find| find.active_entry()),
         };
         render(&env, &mut self.markdown)
     }
@@ -343,7 +352,8 @@ impl Render for ThreadView {
         self.clock = Clock::now();
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
-        list(
+        let find_bar = self.render_find_bar(cx);
+        let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, _window, cx| {
                 let offset = this.header_count();
@@ -359,7 +369,7 @@ impl Render for ThreadView {
                 lane(content, ix == 0)
             }),
         )
-        .size_full()
-        .into_any_element()
+        .size_full();
+        div().relative().size_full().child(transcript).children(find_bar).into_any_element()
     }
 }

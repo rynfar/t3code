@@ -56,6 +56,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "thread.copyReference" => Box::new(CopyThreadReference),
         "commandPalette.toggle" => Box::new(ToggleCommandPalette),
         "chat.new" => Box::new(crate::new_thread::NewThread),
+        "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
         "rightPanel.toggle" => Box::new(crate::right_panel::ToggleRightPanel),
