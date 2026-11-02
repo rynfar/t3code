@@ -912,6 +912,36 @@ pub fn terminal_output_spans(text: &str, palette: &[Rgb; 16], max_spans: usize) 
     out.spans
 }
 
+/// What `CommandOutputPanel` draws: the spans joined into one text, and the styled byte ranges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalDisplay {
+    pub text: String,
+    pub styles: Vec<(std::ops::Range<usize>, SpanStyle)>,
+}
+
+/// `terminalOutputSpans` (capped at `MAX_SPANS`) joined. A final newline is dropped: a
+/// `pre-wrap` block does not draw an empty last line for it.
+pub fn terminal_output_display(text: &str, palette: &[Rgb; 16]) -> TerminalDisplay {
+    let mut joined = String::with_capacity(text.len());
+    let mut styles = Vec::new();
+    for span in terminal_output_spans(text, palette, MAX_SPANS) {
+        let start = joined.len();
+        joined.push_str(&span.text);
+        if let Some(style) = span.style {
+            styles.push((start..joined.len(), style));
+        }
+    }
+    if joined.ends_with('\n') {
+        joined.pop();
+        let end = joined.len();
+        styles.retain_mut(|(range, _)| {
+            range.end = range.end.min(end);
+            range.start < range.end
+        });
+    }
+    TerminalDisplay { text: joined, styles }
+}
+
 /// `terminalOutputPlainText`: the text without its SGR escapes.
 pub fn terminal_output_plain_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

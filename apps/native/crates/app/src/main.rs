@@ -26,6 +26,7 @@ mod provider_icon;
 mod pull_requests;
 mod quit_hold;
 mod right_panel;
+mod selectable_text;
 mod settings;
 mod side_chat;
 #[cfg(feature = "snapshot")]
@@ -117,6 +118,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     pull_requests::init(state.clone(), cx);
     terminal::init(cx);
     files::init(cx);
+    selectable_text::init(cx);
     state
 }
 

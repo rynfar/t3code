@@ -37,6 +37,7 @@ pub mod side_chat;
 pub mod sidebar;
 pub mod terminal;
 pub mod terminal_output;
+pub mod text_selection;
 pub mod thread;
 pub mod thread_actions;
 pub mod timeline;
