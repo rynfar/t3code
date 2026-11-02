@@ -236,6 +236,7 @@ impl UsageView {
     }
 
     fn render_provider_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
         let open = self.menu == Some(MenuKind::Provider);
         let hidden = self.data.hidden().clone();
         let trigger = menu_trigger("usage-provider-filter", usage::provider_filter_label(&hidden), None, open, window, cx)
@@ -250,7 +251,7 @@ impl UsageView {
                 .child(menu_separator(cx))
                 .children(UsageProvider::ORDER.map(|provider| {
                     let visible = !hidden.contains(&provider);
-                    let label = h_flex().min_w_0().gap(r(8.)).child(brand_mark(provider.driver(), 14., cx)).child(div().truncate().child(provider.label()));
+                    let label = h_flex().min_w_0().gap(r(8.)).child(brand_mark(provider.driver(), 14., hsla(p.foreground), cx)).child(div().truncate().child(provider.label()));
                     check_item(("usage-provider", provider.index()), visible, label.into_any_element(), cx).on_click(cx.listener(move |this, _, _, cx| {
                         let mut next = this.data.hidden().clone();
                         if !next.remove(&provider) {

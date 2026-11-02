@@ -13,13 +13,15 @@ use std::time::{Duration, Instant};
 use gpui::{AnyWindowHandle, Entity, VisualTestAppContext, px, size};
 use t3_core::client_settings::AppearanceMode;
 use t3_core::settings::search::{NAV_GROUPS, Section};
+use t3_core::usage::{UsageMetric, UsagePeriod};
 
 use crate::app_state::AppState;
 
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
 [--settings <section>] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
-[--pull-requests] [--pull-request <number> [--pull-request-tab code]] [--width 1440] [--height 900] \
-[--dark|--light] [--wait 6]";
+[--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
+[--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
+[--width 1440] [--height 900] [--dark|--light] [--wait 6]";
 
 pub struct Options {
     out: PathBuf,
@@ -36,6 +38,10 @@ pub struct Options {
     pull_requests: bool,
     pull_request: Option<u64>,
     pull_request_code: bool,
+    usage: Option<String>,
+    usage_period: Option<String>,
+    usage_model: bool,
+    context_meter: bool,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -62,6 +68,10 @@ impl Options {
             pull_requests: has("--pull-requests"),
             pull_request: flag("--pull-request").and_then(|value| value.trim_start_matches('#').parse().ok()),
             pull_request_code: flag("--pull-request-tab").is_some_and(|tab| tab == "code"),
+            usage: flag("--usage"),
+            usage_period: flag("--usage-period"),
+            usage_model: has("--usage-model"),
+            context_meter: has("--context-meter"),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -142,6 +152,9 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         move |cx: &mut VisualTestAppContext| state.read_with(cx, |state, _| state.shell.synchronized)
     };
     pump(&mut cx, options.wait, synchronized(&state));
+    if options.context_meter {
+        state.update(&mut cx, |state, _| state.client_settings.context_window_meter = true);
+    }
     if let Some(thread) = &options.thread {
         state.update(&mut cx, |state, cx| state.select_thread(thread, cx));
         let loaded = state.clone();
@@ -199,6 +212,20 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     if let Some(prompt) = &options.prompt {
         cx.simulate_input(window, prompt);
+    }
+    if let Some(metric) = &options.usage {
+        let metric = UsageMetric::ALL.into_iter().find(|candidate| candidate.label().eq_ignore_ascii_case(metric)).ok_or_else(|| format!("unknown usage metric {metric:?}"))?;
+        let period = match options.usage_period.as_deref() {
+            None => None,
+            Some(name) => Some(
+                UsagePeriod::ALL
+                    .into_iter()
+                    .find(|period| format!("{period:?}").eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("unknown usage period {name:?}"))?,
+            ),
+        };
+        cx.update(|cx| crate::usage::open_read_only(metric, period, options.usage_model, cx));
+        pump(&mut cx, options.wait.max(30.), |cx| cx.update(crate::usage::is_settled));
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;

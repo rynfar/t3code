@@ -131,7 +131,7 @@ impl UsageView {
                             .min_w_0()
                             .items_center()
                             .gap(r(12.))
-                            .when(link.url == CHATGPT_USAGE_URL, |this| this.child(brand_mark("codex", 20., cx)))
+                            .when(link.url == CHATGPT_USAGE_URL, |this| this.child(brand_mark("codex", 20., hsla(p.foreground), cx)))
                             .child(
                                 v_flex()
                                     .min_w_0()
@@ -176,7 +176,7 @@ impl UsageView {
         let p = palette(cx);
         v_flex()
             .gap(r(12.))
-            .child(h_flex().gap(r(8.)).child(div().size(r(20.)).flex().items_center().justify_center().child(brand_mark("cursor", 16., cx))).child(heading("Cursor", cx)))
+            .child(h_flex().gap(r(8.)).child(div().size(r(20.)).flex().items_center().justify_center().child(brand_mark("cursor", 16., hsla(p.foreground), cx))).child(heading("Cursor", cx)))
             .child(
                 v_flex()
                     .items_start()
@@ -203,7 +203,7 @@ impl UsageView {
             .child(
                 h_flex()
                     .gap(r(8.))
-                    .child(div().size(r(20.)).flex().items_center().justify_center().text_color(hsla(p.foreground).opacity(0.8)).child(brand_mark(&pool.driver, 16., cx)))
+                    .child(div().size(r(20.)).flex().items_center().justify_center().text_color(hsla(p.foreground).opacity(0.8)).child(brand_mark(&pool.driver, 16., hsla(p.foreground).opacity(0.8), cx)))
                     .child(heading(driver_label(&pool.driver), cx)),
             )
             .children(limits::display_limit_windows(pool).into_iter().map(|pool_window| self.render_pool_window(&pool.driver, pool_window, color, window, cx)))
@@ -272,7 +272,25 @@ impl UsageView {
                 .filter_map(|(index, (account, member))| member.as_ref().map(|member| self.render_legend_row(driver, pool, account, member, color, index + 1, cx)))
                 .collect()
         };
-        v_flex().min_w_0().gap(r(4.)).child(h_flex().gap(r(4.)).children(segments)).children(legend).into_any_element()
+        // The popover closed before the confirm, so progress and the outcome show under the bar.
+        let status = self.reset_status.as_ref().and_then(|(key, status)| {
+            let account = pool.columns.iter().find(|(account, member)| account.key == *key && member.is_some())?.0.clone();
+            let text = match status {
+                None => "Using reset credit…".to_owned(),
+                Some(text) if !text.is_empty() && self.confirm_reset.is_none() => text.clone(),
+                Some(_) => return None,
+            };
+            let p = palette(cx);
+            Some(
+                h_flex()
+                    .gap(r(4.))
+                    .text_size(r(12.))
+                    .text_color(hsla(p.muted_foreground))
+                    .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(account_name(&account)))
+                    .child(text),
+            )
+        });
+        v_flex().min_w_0().gap(r(4.)).child(h_flex().gap(r(4.)).children(segments)).children(legend).children(status).into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -492,7 +510,7 @@ impl UsageView {
                             .gap(r(8.))
                             .text_size(r(14.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(if account.redeem.is_some() || account.email.is_none() { brand_mark(&account.driver, 16., cx) } else { account_chip(account.email.as_deref().unwrap_or("")).into_any_element() })
+                            .child(if account.redeem.is_some() || account.email.is_none() { brand_mark(&account.driver, 16., hsla(p.foreground), cx) } else { account_chip(account.email.as_deref().unwrap_or("")).into_any_element() })
                             .child(div().truncate().child(account_title(account))),
                     )
                     .children(account.email.clone().map(|email| div().text_color(hsla(p.muted_foreground)).child(email))),

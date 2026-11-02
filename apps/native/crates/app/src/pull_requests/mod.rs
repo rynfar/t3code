@@ -101,7 +101,7 @@ pub fn sidebar_item(state: &Entity<AppState>, window: &mut Window, cx: &mut App)
         .text_color(hsla(p.sidebar_muted_foreground).opacity(0.8))
         .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
         .on_click(move |_, _, cx| state.update(cx, |state, cx| state.set_pull_requests_open(!open, cx)));
-    let button = if open {
+    if open {
         button.flex_1().px(px(10.)).child(Icon::ArrowLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon))).child("Back")
     } else {
         button
@@ -109,8 +109,7 @@ pub fn sidebar_item(state: &Entity<AppState>, window: &mut Window, cx: &mut App)
             .justify_center()
             .child(Icon::GitPullRequestArrow.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
             .tooltip(|window, cx| crate::right_panel::tooltip_view("Pull requests".into(), window, cx))
-    };
-    button
+    }
 }
 
 /// Opens the link dialog for the open thread (`openLinkPullRequestDialog`).

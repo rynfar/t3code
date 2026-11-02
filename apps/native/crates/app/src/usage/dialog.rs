@@ -112,7 +112,7 @@ impl UsageView {
                     .child(
                         h_flex()
                             .gap(r(8.))
-                            .child(brand_mark(model.provider.driver(), 20., cx))
+                            .child(brand_mark(model.provider.driver(), 20., hsla(p.foreground), cx))
                             .child(div().min_w_0().text_size(r(20.)).line_height(r(24.)).font_weight(FontWeight::SEMIBOLD).child(model.model.clone())),
                     )
                     .child(div().text_size(r(14.)).text_color(hsla(p.muted_foreground)).child(description)),

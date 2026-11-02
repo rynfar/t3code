@@ -326,7 +326,8 @@ impl UsageView {
 
     fn refresh_limits(&mut self, automatic: bool, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        if state.server_config.config.is_none() || (automatic && now_ms() < cx.global::<Host>().limits_refresh_after) {
+        let host = cx.global::<Host>();
+        if state.server_config.config.is_none() || host.read_only || (automatic && now_ms() < host.limits_refresh_after) {
             return;
         }
         let request = state.rpc(method::REFRESH_PROVIDERS, usage::refresh_providers_payload());

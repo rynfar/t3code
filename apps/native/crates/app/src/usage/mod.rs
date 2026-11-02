@@ -33,12 +33,16 @@ struct Host {
     pending: bool,
     /// When Limits may ask providers again on its own (`refreshUsageLimits`, five minutes).
     limits_refresh_after: i64,
+    /// Never asks providers to refresh, for the snapshot tool, which must not write.
+    read_only: bool,
+    /// The metric, period and whether to open the top model that the next view starts on.
+    initial: Option<(UsageMetric, Option<UsagePeriod>, bool)>,
 }
 
 impl Global for Host {}
 
 pub fn init(state: Entity<AppState>, cx: &mut App) {
-    cx.set_global(Host { state, view: None, pending: false, limits_refresh_after: 0 });
+    cx.set_global(Host { state, view: None, pending: false, limits_refresh_after: 0, read_only: false, initial: None });
     cx.on_action(|_: &OpenUsage, cx| open(cx));
     cx.bind_keys([KeyBinding::new("escape", CloseUsage, Some("UsageModal"))]);
 }
@@ -46,6 +50,25 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
 pub fn open(cx: &mut App) {
     cx.global_mut::<Host>().pending = true;
     cx.refresh_windows();
+}
+
+/// Opens Usage on `metric` (and `period`) without asking providers to refresh, optionally with
+/// the top model's breakdown open once it loads: the snapshot tool's entry.
+#[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
+pub fn open_read_only(metric: UsageMetric, period: Option<UsagePeriod>, model: bool, cx: &mut App) {
+    let host = cx.global_mut::<Host>();
+    host.read_only = true;
+    host.initial = Some((metric, period, model));
+    open(cx);
+}
+
+/// Whether an open page has its answer (or its error), and any requested model is open.
+#[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
+pub fn is_settled(cx: &mut App) -> bool {
+    let Some(view) = cx.global::<Host>().view.clone() else { return false };
+    let view = view.read(cx);
+    let limits = view.data.preferences.metric == UsageMetric::Limits;
+    limits || (!view.data.pending && (view.data.summary.is_some() || view.data.error.is_some()) && !view.open_top_model)
 }
 
 fn close(cx: &mut App) {
@@ -135,6 +158,8 @@ pub struct UsageView {
     confirm_reset: Option<Redeem>,
     /// The account a reset credit is being used for, and what came of it.
     reset_status: Option<(String, Option<String>)>,
+    /// Opens the top model's breakdown once a summary arrives (snapshot tool).
+    open_top_model: bool,
     _subscriptions: Vec<Subscription>,
     _grants: Option<Task<()>>,
 }
@@ -171,9 +196,18 @@ impl UsageView {
             segment: None,
             confirm_reset: None,
             reset_status: None,
+            open_top_model: false,
             _subscriptions: subscriptions,
             _grants: None,
         };
+        if let Some((metric, period, model)) = cx.global_mut::<Host>().initial.take() {
+            view.data.preferences.metric = metric;
+            if let Some(period) = period {
+                view.data.preferences.period = period;
+                view.data.set_window(crate::sidebar::controller::now_ms());
+            }
+            view.open_top_model = model;
+        }
         view.watch_grants(cx);
         view.sync_access(cx);
         view.auto_refresh_limits(cx);
@@ -256,6 +290,10 @@ impl UsageView {
 impl Render for UsageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.data.prepare(&self.state, cx);
+        if self.open_top_model && self.data.summary.is_some() && !self.data.pending {
+            self.open_top_model = false;
+            self.selected_model = self.data.merged.models.first().map(|model| model.key());
+        }
         let p = palette(cx);
         v_flex()
             .key_context("UsageModal usagePageOpen")

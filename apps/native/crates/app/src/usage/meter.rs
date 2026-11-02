@@ -58,50 +58,46 @@ pub fn context_meter(state: &Entity<AppState>, window: &mut Window, cx: &mut App
     )
 }
 
-fn arc_point(center: gpui::Point<Pixels>, fraction: f32) -> gpui::Point<Pixels> {
+fn arc_point(center: gpui::Point<Pixels>, radius: f32, fraction: f32) -> gpui::Point<Pixels> {
     let angle = fraction * std::f32::consts::TAU;
-    point(center.x + px(RADIUS * angle.sin()), center.y - px(RADIUS * angle.cos()))
+    point(center.x + px(radius * angle.sin()), center.y - px(radius * angle.cos()))
 }
 
-fn circle(center: gpui::Point<Pixels>, radius: f32, window: &mut Window, color: Hsla) {
-    let mut dot = PathBuilder::fill();
-    dot.move_to(point(center.x, center.y - px(radius)));
-    dot.arc_to(point(px(radius), px(radius)), px(0.), false, true, point(center.x, center.y + px(radius)));
-    dot.arc_to(point(px(radius), px(radius)), px(0.), false, true, point(center.x, center.y - px(radius)));
-    dot.close();
-    if let Ok(path) = dot.build() {
-        window.paint_path(path, color);
-    }
-}
-
-/// The track, then the used share clockwise from the top with round ends.
+/// The track, then the used share clockwise from the top. The share is one filled band with
+/// round ends, so its translucent color never doubles where a cap meets the arc.
 fn paint_ring(bounds: Bounds<Pixels>, used: f64, track: Hsla, color: Hsla, window: &mut Window) {
     let center = bounds.center();
-    let radii = point(px(RADIUS), px(RADIUS));
-    let mut ring = PathBuilder::stroke(px(STROKE));
-    ring.move_to(arc_point(center, 0.));
-    ring.arc_to(radii, px(0.), false, true, arc_point(center, 0.5));
-    ring.arc_to(radii, px(0.), false, true, arc_point(center, 1.));
-    if let Ok(path) = ring.build() {
-        window.paint_path(path, track);
-    }
+    let ring = |color: Hsla, window: &mut Window| {
+        let radii = point(px(RADIUS), px(RADIUS));
+        let mut ring = PathBuilder::stroke(px(STROKE));
+        ring.move_to(arc_point(center, RADIUS, 0.));
+        ring.arc_to(radii, px(0.), false, true, arc_point(center, RADIUS, 0.5));
+        ring.arc_to(radii, px(0.), false, true, arc_point(center, RADIUS, 1.));
+        if let Ok(path) = ring.build() {
+            window.paint_path(path, color);
+        }
+    };
+    ring(track, window);
     let fraction = (used / 100.) as f32;
     if fraction <= 0. {
         return;
     }
-    let mut arc = PathBuilder::stroke(px(STROKE));
-    arc.move_to(arc_point(center, 0.));
     if fraction >= 0.999 {
-        arc.arc_to(radii, px(0.), false, true, arc_point(center, 0.5));
-        arc.arc_to(radii, px(0.), false, true, arc_point(center, 1.));
-    } else {
-        arc.arc_to(radii, px(0.), fraction > 0.5, true, arc_point(center, fraction));
+        ring(color, window);
+        return;
     }
-    if let Ok(path) = arc.build() {
+    let (outer, inner, cap) = (RADIUS + STROKE / 2., RADIUS - STROKE / 2., STROKE / 2.);
+    let large = fraction > 0.5;
+    let mut band = PathBuilder::fill();
+    band.move_to(arc_point(center, outer, 0.));
+    band.arc_to(point(px(outer), px(outer)), px(0.), large, true, arc_point(center, outer, fraction));
+    band.arc_to(point(px(cap), px(cap)), px(0.), false, true, arc_point(center, inner, fraction));
+    band.arc_to(point(px(inner), px(inner)), px(0.), large, false, arc_point(center, inner, 0.));
+    band.arc_to(point(px(cap), px(cap)), px(0.), false, true, arc_point(center, outer, 0.));
+    band.close();
+    if let Ok(path) = band.build() {
         window.paint_path(path, color);
     }
-    circle(arc_point(center, 0.), STROKE / 2., window, color);
-    circle(arc_point(center, fraction.min(1.)), STROKE / 2., window, color);
 }
 
 /// The hover details: usage, the bar against the window, processed tokens, cost, compaction.

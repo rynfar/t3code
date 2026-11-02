@@ -45,11 +45,10 @@ pub fn driver_color(driver: &str, p: &Palette) -> Hsla {
     UsageProvider::from_driver(driver).map_or(hsla(p.foreground), |provider| provider_color(provider, p))
 }
 
-/// The provider's brand mark (`ProviderInstanceIcon` without a badge), in the text color for
-/// one-color marks.
-pub fn brand_mark(driver: &str, size: f32, cx: &App) -> AnyElement {
+/// The provider's brand mark (`ProviderInstanceIcon` without a badge); one-color marks take `color`.
+pub fn brand_mark(driver: &str, size: f32, color: Hsla, cx: &App) -> AnyElement {
     match provider_logo(driver) {
-        Some(ProviderLogo::Mono(path)) => svg().path(path).size(r(size)).flex_none().into_any_element(),
+        Some(ProviderLogo::Mono(path)) => svg().path(path).size(r(size)).flex_none().text_color(color).into_any_element(),
         Some(ProviderLogo::Image { light, dark }) => img(if cx.theme().is_dark() { dark } else { light }).size(r(size)).flex_none().into_any_element(),
         None => div().size(r(size)).flex_none().into_any_element(),
     }

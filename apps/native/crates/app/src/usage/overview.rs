@@ -292,7 +292,7 @@ impl UsageView {
                             .text_size(r(12.))
                             .text_color(hsla(p.muted_foreground))
                             .child(fade(div().child(format!("{} sessions", format_count(merged.sessions as f64))), loading.partial))
-                            .when(metric == ChartMetric::Cost, |this| this.child(" · API estimate"))
+                            .when(metric == ChartMetric::Cost, |this| this.child("· API estimate"))
                             .when(metric == ChartMetric::Cost && unpriced > 0., |this| {
                                 let tip: SharedString = format!("API estimate excludes {} unpriced records.", format_percent(unpriced)).into();
                                 this.child(
@@ -352,7 +352,7 @@ impl UsageView {
                             .text_size(r(14.))
                             .text_color(hsla(p.foreground))
                             .child(dot(provider_color(provider, p)))
-                            .child(brand_mark(provider.driver(), 16., cx))
+                            .child(brand_mark(provider.driver(), 16., hsla(p.foreground), cx))
                             .child(
                                 h_flex()
                                     .min_w_0()
@@ -387,7 +387,7 @@ impl UsageView {
                     .items_center()
                     .gap(r(8.))
                     .child(dot(provider_color(UsageProvider::Cursor, p)))
-                    .child(brand_mark("cursor", 16., cx))
+                    .child(brand_mark("cursor", 16., hsla(p.foreground), cx))
                     .child(div().truncate().child("Cursor")),
             )
             .child(
@@ -488,7 +488,7 @@ impl UsageView {
                                         .gap(r(8.))
                                         .text_color(hsla(p.foreground))
                                         .when(!has_bar, |this| this.py(r(4.)))
-                                        .child(brand_mark(model.provider.driver(), 14., cx))
+                                        .child(brand_mark(model.provider.driver(), 14., hsla(p.foreground), cx))
                                         .child(div().min_w_0().child(model.model.clone())),
                                 )
                                 .when(has_bar, |this| {

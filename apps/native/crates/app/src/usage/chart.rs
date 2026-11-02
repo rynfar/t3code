@@ -267,7 +267,7 @@ fn tooltip(data: &ChartData, index: usize, cx: &App) -> Option<impl IntoElement>
                         h_flex()
                             .gap(r(6.))
                             .text_color(hsla(p.muted_foreground))
-                            .child(brand_mark(provider.driver(), 12., cx))
+                            .child(brand_mark(provider.driver(), 12., hsla(p.muted_foreground), cx))
                             .child(provider.label()),
                     )
                     .child(div().text_color(figure(data.loading.contains(provider))).child(format_value(data.metric, column.value(*provider))))
