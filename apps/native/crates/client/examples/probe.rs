@@ -6,6 +6,7 @@
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --send "hello"   # costs a turn
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --history 3     # page earlier history
 //!   cargo run -p t3-client --example probe -- --config
+//!   cargo run -p t3-client --example probe -- --thread <thread-id> --command-output   # stream every command's output
 //!   cargo run -p t3-client --example probe -- --local   # one-click pair with T3 Code on this Mac
 //!
 //! `--local` runs `t3 pair` against the server it finds under `T3CODE_HOME`. Point both
@@ -17,6 +18,9 @@
 //!   cargo run -p t3-client --example probe -- --launch <project-id> "go" \
 //!     --provider devReplay --model showcase --runtime-mode approval-required \
 //!     --approve accept --answer --seconds 40
+//!
+//! `--delete-after` deletes the launched thread once the probe is done, so a scratch launch
+//! leaves nothing behind.
 //!
 //! Add `--worktree <workspace-root>` to launch into a new worktree the way the composer resolves
 //! one: the project's `t3.json`, then the default branch from `vcs.listRefs`. `--dry-run` prints
@@ -87,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let answer = has("--answer");
     let (client, mut events) = start(&tokio::runtime::Handle::current(), credentials);
     let mut watched = flag("--thread");
+    let mut launched: Option<String> = None;
     if let Some(thread_id) = &watched {
         client.open_thread(thread_id);
         if let Some(text) = flag("--compose") {
@@ -177,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
                     value.get("sequence").map(|s| s.to_string()).unwrap_or_default()
                 );
                 client.open_thread(&thread_id);
+                launched = Some(thread_id.clone());
                 watched = Some(thread_id);
             }
             Err(error) => println!("launch failed: {error}"),
@@ -186,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
     let mut thread = ThreadState::default();
     let mut config = ServerConfigState::default();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut command_outputs: HashMap<String, t3_client::command_output::CommandOutputStream> = HashMap::new();
     let deadline = tokio::time::sleep(Duration::from_secs(seconds));
     tokio::pin!(deadline);
     loop {
@@ -226,6 +233,26 @@ async fn main() -> anyhow::Result<()> {
                         println!("thread {thread_id}: {label}");
                     }
                     let Some(projection) = &thread.projection else { continue };
+                    if has("--command-output") {
+                        for item in &projection.turn_items {
+                            if !matches!(item.kind, t3_core::turn_item::TurnItemKind::CommandExecution { .. }) || command_outputs.contains_key(&item.id) {
+                                continue;
+                            }
+                            let stream = t3_client::command_output::subscribe(&tokio::runtime::Handle::current(), client.clone(), &item.thread_id, &item.id);
+                            let (mut status, id) = (stream.status.clone(), item.id.clone());
+                            println!("command-output {id}: subscribed ({})", item.status);
+                            tokio::spawn(async move {
+                                while status.changed().await.is_ok() {
+                                    let next = status.borrow_and_update().clone();
+                                    let (text, running, truncated) = next.output.map(|o| (o.text.to_string(), o.running, o.truncated)).unwrap_or_default();
+                                    let tail: String = text.chars().rev().take(72).collect::<Vec<_>>().into_iter().rev().collect();
+                                    println!("command-output {id}: running={running} truncated={truncated} chars={} error={:?} tail={tail:?}", text.chars().count(), next.error);
+                                }
+                                println!("command-output {id}: stream ended");
+                            });
+                            command_outputs.insert(item.id.clone(), stream);
+                        }
+                    }
                     let pending = requests::pending_requests(projection);
                     for approval in &pending.approvals {
                         if !seen.insert(approval.request_id.clone()) { continue }
@@ -262,6 +289,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(ClientEvent::StreamError { context, message }) => println!("decode error in {context}: {message}"),
             }
         }
+    }
+    if let Some(thread_id) = launched.as_deref().filter(|_| has("--delete-after")) {
+        let deleted = client.dispatch(t3_core::thread_actions::delete(&new_id(), thread_id)).await;
+        println!("deleted {thread_id}: {:?}", deleted.map(|value| value.to_string()));
     }
     if let Some(projection) = &thread.projection {
         let active = t3_core::workflows::active_run(projection).map(|run| run.id.as_str());

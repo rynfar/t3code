@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use t3_core::command_output::{CommandOutputFrame, CommandOutputView};
 use t3_core::families::{FamilyRead, rows_missing_from_shell};
 use t3_core::history::{HistoryStep, decode_history_page};
 use t3_core::sidebar::older_settled::{
@@ -15,6 +16,7 @@ use t3_core::sidebar::older_settled::{
 use t3_core::sidebar::time::{format_iso, parse_iso};
 use t3_core::shell::{ShellState, ShellStreamItem, ThreadShell};
 use t3_core::notifications::{NotificationGate, NotificationKind, Observation};
+use t3_core::terminal_output::{DARK_PALETTE, LIGHT_PALETTE, MAX_SPANS, Rgb, SpanStyle, TerminalOutputState, terminal_output_spans};
 use t3_core::thread::{ApplyOptions, DomainEvent, ThreadProjection, ThreadState, apply_event, decode_thread_stream_item};
 
 /// One case per line.
@@ -392,4 +394,78 @@ fn notification_gate_matches_typescript() {
         }
     }
     report.finish("notify", 500);
+}
+
+/// A CSS colour `terminalOutputSpans` resolved: `#rrggbb` or `rgb(r,g,b)`; anything else paints
+/// as unset, which is how the Rust port models it.
+fn css_color(value: &Value) -> Option<Rgb> {
+    let text = value.as_str()?;
+    let channels: Vec<u8> = match text.strip_prefix('#') {
+        Some(hex) => (0..3).map(|at| hex.get(at * 2..at * 2 + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect::<Option<_>>()?,
+        None => text.strip_prefix("rgb(")?.strip_suffix(')')?.split(',').map(|part| part.parse().ok()).collect::<Option<_>>()?,
+    };
+    match channels[..] {
+        [r, g, b] => Some(Rgb { r, g, b }),
+        _ => None,
+    }
+}
+
+fn typescript_spans(value: &Value) -> Vec<(String, Option<SpanStyle>)> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|span| {
+            let style = &span["style"];
+            let decoration = style["textDecorationLine"].as_str().unwrap_or_default();
+            let style = (!style.is_null()).then(|| SpanStyle {
+                color: css_color(&style["color"]),
+                background: css_color(&style["backgroundColor"]),
+                bold: style["fontWeight"] == "600",
+                dim: style.get("opacity").is_some(),
+                italic: style["fontStyle"] == "italic",
+                underline: decoration.contains("underline"),
+                strike: decoration.contains("line-through"),
+            });
+            (text(span, "text").unwrap_or_default(), style)
+        })
+        .collect()
+}
+
+fn rust_spans(text: &str, palette: &[Rgb; 16]) -> Vec<(String, Option<SpanStyle>)> {
+    terminal_output_spans(text, palette, MAX_SPANS).into_iter().map(|span| (span.text, span.style)).collect()
+}
+
+#[test]
+fn command_output_matches_typescript() {
+    let mut report = Report::default();
+    for case in fixture("command-output.jsonl") {
+        let name = text(&case, "name").unwrap_or_default();
+        let palette = if case["dark"] == true { &DARK_PALETTE } else { &LIGHT_PALETTE };
+        let expected = |step: &Value| (text(step, "text").unwrap_or_default(), step["truncated"] == true, text(step, "pending").unwrap_or_default());
+        if let Some(max_chars) = case["maxChars"].as_u64() {
+            let mut state = TerminalOutputState::default();
+            for (index, step) in list(&case, "steps").iter().enumerate() {
+                state.append(&text(step, "chunk").unwrap_or_default(), max_chars as usize);
+                let at = format!("{name} step {index} after {:?}", text(step, "chunk").unwrap_or_default());
+                report.check(&at, (state.text.clone(), state.truncated, state.pending()), expected(step));
+                if let Some(spans) = step.get("spans") {
+                    report.check(&format!("{at} spans"), rust_spans(&state.text, palette), typescript_spans(spans));
+                }
+                report.compared += 1;
+            }
+            continue;
+        }
+        let mut view = CommandOutputView::default();
+        for (index, step) in list(&case, "steps").iter().enumerate() {
+            let frame: CommandOutputFrame = serde_json::from_value(step["frame"].clone()).expect("frames decode");
+            view.apply(&frame);
+            let at = format!("{name} frame {index} {frame:?}");
+            report.check(&at, (view.output.text.clone(), view.output.truncated, view.output.pending()), expected(step));
+            report.check(&format!("{at} running"), view.running, step["running"] == true);
+            report.compared += 1;
+        }
+        report.check(&format!("{name} spans"), rust_spans(&view.output.text, palette), typescript_spans(&case["spans"]));
+    }
+    report.finish("command-output", 1000);
 }

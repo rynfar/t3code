@@ -34,7 +34,7 @@ pub use activity::{
     Attribution, LatestRun, ThreadActivity, derive_activity, plan_title, should_collapse_user_message, strip_displayed_plan_markdown,
     user_message_attribution,
 };
-pub use detail::{GET_TURN_ITEM, command_output_text, decode_detail, detail_request, detail_revision, needs_detail_fetch};
+pub use detail::{GET_TURN_ITEM, command_output_text, decode_detail, detail_request, detail_revision, needs_detail_fetch, open_command_items};
 pub use entries::{EntriesCache, derive_entries, item_type_name, update_entries};
 pub use presentation::{
     SummaryKind, ToolGroupAction, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args,

@@ -1296,3 +1296,47 @@ fn force_stop_notices_name_what_kept_running() {
     assert_eq!(shared.1.as_deref(), Some("It is shared with 1 working thread. Stop those to free it."));
     assert_eq!(force_stop_request("t", "r"), serde_json::json!({ "threadId": "t", "runId": "r" }));
 }
+
+/// An open command row keeps its output subscription only while it is drawn, so folding its
+/// group drops it and reopening the group brings it back.
+#[test]
+fn open_command_items_follow_folded_groups() {
+    let command = |id: &str, input: &str| {
+        let item: crate::turn_item::TurnItem =
+            serde_json::from_value(serde_json::json!({ "id": id, "threadId": "t1", "status": "completed", "type": "command_execution", "input": input })).unwrap();
+        Arc::new(item)
+    };
+    let entries = vec![
+        message("user-1", Role::User, "Go", Some("run-1"), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        work("cmd-1", "run-1", "2026-01-01T00:00:01Z", |w| {
+            w.item_type = Some("command_execution");
+            w.status = Some(ToolStatus::Completed);
+            w.item = Some(command("item-1", "git status"));
+        }),
+        work("cmd-2", "run-1", "2026-01-01T00:00:02Z", |w| {
+            w.item_type = Some("command_execution");
+            w.status = Some(ToolStatus::Completed);
+            w.item = Some(command("item-2", "vp test run"));
+        }),
+        work("edit-1", "run-1", "2026-01-01T00:00:03Z", |w| {
+            w.item_type = Some("file_change");
+            w.changed_files = vec!["src/a.ts".into()];
+            w.status = Some(ToolStatus::Completed);
+        }),
+    ];
+    let open: HashSet<String> = ["cmd-2", "edit-1"].map(str::to_owned).into();
+    let open_items = |input: &Input| {
+        let rows: Vec<Arc<TimelineRow>> = input.rows(&entries).into_iter().map(Arc::new).collect();
+        open_command_items(&rows, &open).into_iter().map(|(entry, item)| (entry, item.id.clone())).collect::<Vec<_>>()
+    };
+    let mut input = Input::idle();
+    input.runs.insert("run-1".into());
+    input.groups.insert("work-group:cmd-1".into());
+    assert_eq!(open_items(&input), [("cmd-2".to_owned(), "item-2".to_owned())], "only open commands, not the open file change");
+    input.groups.clear();
+    assert_eq!(open_items(&input), [], "a folded group draws none of its entries");
+    input.groups.insert("work-group:cmd-1".into());
+    assert_eq!(open_items(&input), [("cmd-2".to_owned(), "item-2".to_owned())]);
+    input.runs.clear();
+    assert_eq!(open_items(&input), [], "a folded turn draws none of its entries");
+}

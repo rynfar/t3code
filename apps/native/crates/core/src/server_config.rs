@@ -515,6 +515,9 @@ pub struct EnvironmentCapabilities {
     /// The server hosts headless Chromium tabs streamed over `/api/preview-stream`.
     #[serde(default)]
     pub server_browser: Option<bool>,
+    /// The server answers `orchestration.subscribeCommandOutput`; older servers never send it.
+    #[serde(default)]
+    pub command_output_streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

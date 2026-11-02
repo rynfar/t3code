@@ -2,6 +2,7 @@
 //! row spacing of `TimelineRowContent` and `WorkLogBlock` (`MessagesTimeline.tsx`, `WorkLog.tsx`).
 
 mod changed_files;
+mod command_output;
 pub mod markdown;
 mod media;
 mod messages;
@@ -20,6 +21,7 @@ use t3_core::turn_item::TurnItem;
 
 use crate::thread_view::ThreadView;
 use markdown::MarkdownStore;
+pub use command_output::CommandOutputSlot;
 pub use notices::history_control;
 pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_button, inline_button};
 pub use timer::{TimerKind, WorkingTimer};
@@ -80,6 +82,9 @@ pub struct RowEnv<'a> {
     /// File changes offer their diff. Not in a side chat: the diff panel follows only the open
     /// thread's items, so a side chat's running change would never refetch once it settles.
     pub tool_diffs: bool,
+    /// Open command rows' streamed output, by entry; `None` when the server does not stream it
+    /// (`commandOutputStreaming`), so rows show the item's own output instead.
+    pub command_outputs: Option<&'a HashMap<String, CommandOutputSlot>>,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.
