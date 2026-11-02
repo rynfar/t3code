@@ -43,8 +43,8 @@ impl SettingsView {
                 Row::new("disconnect", "Disconnect from server")
                     .description("Forget this server on this device. Pair again with a new pairing link.")
                     .control(
-                        Button::new("disconnect-server", ButtonVariant::DestructiveOutline, ButtonSize::Sm).label("Disconnect").on_click(move |_, _, cx| {
-                            close(cx);
+                        Button::new("disconnect-server", ButtonVariant::DestructiveOutline, ButtonSize::Sm).label("Disconnect").on_click(move |_, window, cx| {
+                            close(window, cx);
                             disconnect_state.update(cx, |state, cx| state.forget_connection(cx));
                         }),
                     )

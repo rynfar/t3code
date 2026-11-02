@@ -25,6 +25,8 @@ use crate::theme::{hsla, palette};
 
 const SELECTION_SEPARATOR: char = '\u{1f}';
 
+type SnoozeEdit = Box<dyn FnOnce(&mut Vec<SnoozePreset>)>;
+
 pub(crate) struct ThreadsState {
     pub(crate) base_directory: Entity<InputState>,
     pub(crate) auto_settle_days: Entity<InputState>,
@@ -43,13 +45,9 @@ impl ThreadsState {
         let base_directory = cx.new(|cx| InputState::new(window, cx).placeholder("~/"));
         let auto_settle_days = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
-            cx.subscribe_in(&base_directory, window, |this, input, event: &InputEvent, _, cx| {
+            cx.subscribe_in(&base_directory, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                    let value = input.read(cx).value().trim().to_owned();
-                    let saved = this.thread_settings(cx).map(|config| config.settings.threads.add_project_base_directory.clone());
-                    if saved.as_deref() != Some(value.as_str()) {
-                        store::update_server(&this.state, ServerSettingChange::AddProjectBaseDirectory(value), cx);
-                    }
+                    this.commit_base_directory(cx);
                 }
             }),
             cx.subscribe_in(&auto_settle_days, window, |this, input, event: &InputEvent, window, cx| match event {
@@ -402,6 +400,43 @@ impl SettingsView {
         ]
     }
 
+    fn commit_base_directory(&mut self, cx: &mut Context<Self>) {
+        let value = self.threads.base_directory.read(cx).value().trim().to_owned();
+        let saved = self.thread_settings(cx).map(|config| config.settings.threads.add_project_base_directory.clone());
+        if saved.as_deref() != Some(value.as_str()) {
+            store::update_server(&self.state, ServerSettingChange::AddProjectBaseDirectory(value), cx);
+        }
+    }
+
+    /// Saves a typed wake time, or puts the saved one back when it does not parse.
+    fn commit_time_input(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.threads.time_inputs.get(index).map(|(input, _)| input.clone()) else { return };
+        let Some(SnoozePreset::At { day, time }) = self.threads.snooze.as_ref().and_then(|draft| draft.presets().get(index).cloned()) else { return };
+        let typed = input.read(cx).value().trim().to_owned();
+        if snooze::parse_time(&typed).is_some() && typed != time {
+            self.edit_snooze(
+                |presets| {
+                    if let Some(slot) = presets.get_mut(index) {
+                        *slot = SnoozePreset::At { day, time: typed };
+                    }
+                },
+                cx,
+            );
+        } else {
+            input.update(cx, |input, cx| input.set_value(time, window, cx));
+        }
+    }
+
+    /// The Threads page's commit-on-blur fields, committed before the modal closes.
+    pub(super) fn commit_focused_thread_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.threads.base_directory.focus_handle(cx).is_focused(window) {
+            self.commit_base_directory(cx);
+        }
+        if let Some(index) = self.threads.time_inputs.iter().position(|(input, _)| input.focus_handle(cx).is_focused(window)) {
+            self.commit_time_input(index, window, cx);
+        }
+    }
+
     /// Edits the snooze draft and saves the whole list; a failed save puts the saved list back.
     fn edit_snooze(&mut self, change: impl FnOnce(&mut Vec<SnoozePreset>), cx: &mut Context<Self>) {
         let Some(draft) = self.threads.snooze.as_mut() else { return };
@@ -434,7 +469,7 @@ impl SettingsView {
         self.sync_time_inputs(presets, window, cx);
 
         let view = cx.entity().downgrade();
-        let save = move |change: Box<dyn FnOnce(&mut Vec<SnoozePreset>)>, cx: &mut App| {
+        let save = move |change: SnoozeEdit, cx: &mut App| {
             let _ = view.update(cx, |this, cx| this.edit_snooze(change, cx));
         };
         let mut seen_ids: Vec<String> = Vec::new();
@@ -626,23 +661,9 @@ impl SettingsView {
         while self.threads.time_inputs.len() < presets.len() {
             let index = self.threads.time_inputs.len();
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("09:00"));
-            let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                    return;
-                }
-                let Some(SnoozePreset::At { day, time }) = this.threads.snooze.as_ref().and_then(|draft| draft.presets().get(index).cloned()) else { return };
-                let typed = input.read(cx).value().trim().to_owned();
-                if snooze::parse_time(&typed).is_some() && typed != time {
-                    this.edit_snooze(
-                        |presets| {
-                            if let Some(slot) = presets.get_mut(index) {
-                                *slot = SnoozePreset::At { day, time: typed };
-                            }
-                        },
-                        cx,
-                    );
-                } else {
-                    input.update(cx, |input, cx| input.set_value(time, window, cx));
+            let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_time_input(index, window, cx);
                 }
             });
             self.threads.time_inputs.push((input, subscription));
