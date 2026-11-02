@@ -66,7 +66,8 @@ keys at web fidelity), **M3 Full parity** (settings, PRs, panels, the long tail)
 ## Gates every PR passes
 
 - `cargo test -p t3-core -p t3-client` and `cargo clippy --workspace --all-targets -- -D warnings`
-- `node scripts/gen-theme.ts --check` and `node --test parity/sync.test.ts`
+- `node scripts/gen-theme.ts --check`, `node --test parity/sync.test.ts`, and
+  `node conformance/generate.ts --check`
 - The app builds, and UI changes carry before/after screenshots from a real window
 - The ledger row is updated
 
