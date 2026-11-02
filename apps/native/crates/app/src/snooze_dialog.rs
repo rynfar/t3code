@@ -205,10 +205,9 @@ impl Render for SnoozeDialog {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w_full()
                         .max_w(px(384.))
+                        .relative()
                         .rounded(px(16.))
-                        .border_1()
-                        .border_color(hsla(p.dialog_border))
-                        .bg(hsla(p.dialog_surface))
+                        .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
                         .shadow(vec![BoxShadow { color: gpui_hsla(0., 0., 0., 0.65), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(-24.), inset: false }])
                         .child(
                             div()

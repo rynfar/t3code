@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use gpui::{
-    App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Render, SharedString, Styled,
+    App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
     Subscription, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
@@ -16,7 +16,11 @@ use t3_core::palette::{
 use t3_core::sidebar::time::{compact_relative_label, format_iso, parse_iso};
 
 use crate::app_state::AppState;
-use crate::keymap;
+use crate::keymap::{
+    self, CopyThreadReference, JumpToThread1, JumpToThread2, JumpToThread3, JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8,
+    JumpToThread9, PinThread,
+};
+use crate::sidebar::is_composing;
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
 
@@ -33,6 +37,7 @@ pub struct CommandPalette {
     groups: Vec<CommandPaletteGroup>,
     highlighted: Option<String>,
     focus_return: Option<FocusHandle>,
+    scroll: ScrollHandle,
     _subscription: Subscription,
 }
 
@@ -86,6 +91,7 @@ impl CommandPalette {
             groups: Vec::new(),
             highlighted: None,
             focus_return: None,
+            scroll: ScrollHandle::new(),
             _subscription: subscription,
         }
     }
@@ -187,7 +193,31 @@ impl CommandPalette {
         let current = self.highlighted.as_deref().and_then(|value| rows.item_values.iter().position(|v| *v == value)).map_or(-1, |p| p as isize);
         let next = if current < 0 { if step > 0 { 0 } else { count - 1 } } else { (current + step).rem_euclid(count) };
         self.highlighted = rows.item_values.get(next as usize).map(|value| (*value).to_owned());
+        if let Some(row) = rows.row_index_by_item_index.get(next as usize) {
+            self.scroll.scroll_to_item(*row);
+        }
         cx.notify();
+    }
+
+    /// A jump key runs the row that carries its shortcut; otherwise the palette swallows it.
+    fn jump(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(command) = t3_core::keybindings::thread_jump_command_for_index(index) else { return };
+        let value = self.groups.iter().flat_map(|group| &group.items).find(|item| item.shortcut_command.as_deref() == Some(command)).map(|item| item.value.clone());
+        if let Some(value) = value {
+            self.activate(&value, window, cx);
+        }
+    }
+
+    /// The pin key toggles the highlighted thread row's pin; anything else pins the open thread.
+    fn pin_highlighted(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.highlighted.as_deref().and_then(|value| value.strip_prefix("thread:")).map(|rest| rest.split_once(':').map_or(rest, |(_, id)| id).to_owned()) else {
+            return cx.propagate();
+        };
+        self.state.update(cx, |state, cx| match state.sidebar.model.thread(&thread_id).map(|thread| thread.pinned) {
+            Some(true) => state.unpin_thread(&thread_id, cx),
+            Some(false) => state.pin_thread(&thread_id, None, cx),
+            None => {}
+        });
     }
 
     fn activate_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -300,26 +330,46 @@ impl Render for CommandPalette {
                         .id("command-palette")
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                            this.move_highlight(1, cx);
-                            cx.stop_propagation();
+                        .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                            if !is_composing(&this.input, window, cx) {
+                                this.move_highlight(1, cx);
+                                cx.stop_propagation();
+                            }
                         }))
-                        .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                            this.move_highlight(-1, cx);
-                            cx.stop_propagation();
+                        .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                            if !is_composing(&this.input, window, cx) {
+                                this.move_highlight(-1, cx);
+                                cx.stop_propagation();
+                            }
                         }))
                         .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                            if !is_composing(&this.input, window, cx) {
+                                this.close(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        // Inside the palette, jump keys and the pin key act on its rows (`CommandPalette.tsx`).
+                        .on_action(cx.listener(|this, _: &JumpToThread1, window, cx| this.jump(0, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread2, window, cx| this.jump(1, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread3, window, cx| this.jump(2, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread4, window, cx| this.jump(3, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread5, window, cx| this.jump(4, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread6, window, cx| this.jump(5, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread7, window, cx| this.jump(6, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread8, window, cx| this.jump(7, window, cx)))
+                        .on_action(cx.listener(|this, _: &JumpToThread9, window, cx| this.jump(8, window, cx)))
+                        .on_action(cx.listener(|this, _: &PinThread, _, cx| this.pin_highlighted(cx)))
+                        .on_action(cx.listener(|this, _: &CopyThreadReference, window, cx| {
                             this.close(window, cx);
-                            cx.stop_propagation();
+                            cx.propagate();
                         }))
                         .w(px(576.))
                         .max_h(px(420.))
                         .flex()
                         .flex_col()
+                        .relative()
                         .rounded(px(16.))
-                        .border_1()
-                        .border_color(hsla(p.dialog_border))
-                        .bg(hsla(p.dialog_surface))
+                        .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
                         .shadow(vec![BoxShadow { color: gpui_hsla(0., 0., 0., 0.65), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(-24.), inset: false }])
                         .child(
                             div()
@@ -335,6 +385,7 @@ impl Render for CommandPalette {
                                 .flex_1()
                                 .min_h_0()
                                 .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
                                 .p(px(8.))
                                 .when(empty, |this| this.child(div().py(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("No results")))
                                 .children(rendered),

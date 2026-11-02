@@ -48,9 +48,7 @@ impl Toast {
             .pr(px(16.))
             .py(px(12.))
             .rounded(px(8.))
-            .border_1()
-            .border_color(hsla(p.dropdown_border))
-            .bg(hsla(p.dropdown_surface))
+            .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
             .shadow(vec![
                 BoxShadow { color: gpui_hsla(0., 0., 0., 0.25), offset: point(px(0.), px(20.)), blur_radius: px(25.), spread_radius: px(-5.), inset: false },
                 BoxShadow { color: gpui_hsla(0., 0., 0., 0.25), offset: point(px(0.), px(8.)), blur_radius: px(10.), spread_radius: px(-6.), inset: false },

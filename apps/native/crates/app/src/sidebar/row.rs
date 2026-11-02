@@ -139,9 +139,12 @@ impl SidebarPane {
             let p = palette(cx);
             return div()
                 .id("thread-rename")
-                .capture_action(cx.listener(|this, _: &gpui_component::input::Escape, _, cx| {
-                    this.cancel_rename(cx);
-                    cx.stop_propagation();
+                .capture_action(cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    let composing = this.rename.as_ref().is_some_and(|(_, input)| super::is_composing(input, window, cx));
+                    if !composing {
+                        this.cancel_rename(cx);
+                        cx.stop_propagation();
+                    }
                 }))
                 .flex_1()
                 .min_w_0()
@@ -231,6 +234,9 @@ impl SidebarPane {
                     _ => None,
                 }
                 .map(|started| working_duration_label(now - started));
+                if duration.is_some() {
+                    self.note_live_row(cx);
+                }
                 div()
                     .flex()
                     .items_center()

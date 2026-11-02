@@ -12,7 +12,7 @@ use t3_core::thread_actions::{Available, MenuItem, Supports, ThreadAction, Threa
 use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::sidebar::controller::now_ms;
-use crate::theme::{Palette, hsla, palette};
+use crate::theme::{hsla, palette};
 
 const MENU_WIDTH: f32 = 220.;
 const ITEM_HEIGHT: f32 = 28.;
@@ -58,9 +58,11 @@ impl ContextMenu {
         let Some(thread) = state.sidebar.model.thread(thread_id) else { return };
         let now = now_ms();
         let presets = state.snooze_presets();
-        let supports = Supports { settlement: true, auto_settle_opt_out: true, snooze: true, pinning: true, title_regeneration: true };
+        let caps = state.sidebar.capabilities;
+        let loaded = caps.config_loaded;
+        let supports = Supports { settlement: loaded, auto_settle_opt_out: caps.auto_settle_opt_out, snooze: loaded, pinning: loaded, title_regeneration: loaded };
         let items = build_menu(&ThreadActionMenuState {
-            can_operate: true,
+            can_operate: caps.can_operate,
             can_find: false,
             branch: thread.branch.as_deref(),
             project_filter: None,
@@ -229,14 +231,14 @@ impl ContextMenu {
             .into_any_element()
     }
 
-    fn panel(p: &Palette) -> gpui::Div {
+    fn panel(cx: &App) -> gpui::Div {
+        let p = palette(cx);
         div()
+            .relative()
             .w(px(MENU_WIDTH))
-            .p(px(4.))
+            .p(px(5.))
             .rounded(px(8.))
-            .border_1()
-            .border_color(hsla(p.dropdown_border))
-            .bg(hsla(p.dropdown_surface))
+            .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
             .shadow(vec![BoxShadow {
                 color: gpui_hsla(0., 0., 0., 0.55),
                 offset: point(px(0.), px(16.)),
@@ -268,12 +270,11 @@ fn item_offset(items: &[MenuItem], index: usize) -> f32 {
 impl Render for ContextMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(open) = self.open.as_ref() else { return div().into_any_element() };
-        let p = palette(cx);
         let main = self.render_list(&open.items, open.highlighted, None, cx);
         let submenu = open.submenu.map(|parent| {
             let items = &open.items[parent].children;
             let list = self.render_list(items, open.sub_highlighted, Some(parent), cx);
-            Self::panel(p).id("thread-context-submenu").occlude().absolute().left(px(MENU_WIDTH - 4.)).top(px(item_offset(&open.items, parent) - 5.)).children(list)
+            Self::panel(cx).id("thread-context-submenu").occlude().absolute().left(px(MENU_WIDTH - 4.)).top(px(item_offset(&open.items, parent) - 5.)).children(list)
         });
         let position = open.position;
         div()
@@ -286,7 +287,7 @@ impl Render for ContextMenu {
             .child(
                 deferred(
                     anchored().position(position).snap_to_window_with_margin(px(8.)).child(
-                        Self::panel(p)
+                        Self::panel(cx)
                             .id("thread-context-menu")
                             .relative()
                             .occlude()

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use grouping::{GroupingSettings, build_project_groups};
-use inbox::{InboxObservation, InboxReturnTracker, is_thread_working};
+use inbox::{InboxObservation, InboxReturnTracker};
 use settled::effective_snoozed;
 use thread::{SidebarThread, pending_subagent_requests, present_thread};
 use time::Ms;
@@ -339,14 +339,6 @@ impl SidebarModel {
 
     pub fn jump_target(&self, index: usize) -> Option<&str> {
         self.ordered.get(index).map(|thread| self.threads[*thread].id.as_str())
-    }
-
-    /// Whether any visible row shows a ticking working duration.
-    pub fn has_live_duration(&self) -> bool {
-        self.rows.iter().any(|row| match row {
-            SidebarRow::Thread { index, section } => section.is_card() && is_thread_working(&self.threads[*index]),
-            _ => false,
-        })
     }
 }
 

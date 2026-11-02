@@ -3,6 +3,7 @@ mod composer;
 mod connect;
 mod context_menu;
 mod dialog;
+mod glass;
 mod icons;
 mod keymap;
 mod menus;

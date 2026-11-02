@@ -5,18 +5,7 @@ use std::cmp::Ordering;
 
 use super::thread::SidebarThread;
 use super::time::Ms;
-
-/// `String.prototype.localeCompare` for ids: case-insensitive first, then lowercase first.
-pub fn locale_compare(left: &str, right: &str) -> Ordering {
-    let folded = left.chars().flat_map(char::to_lowercase).cmp(right.chars().flat_map(char::to_lowercase));
-    folded.then_with(|| {
-        left.chars()
-            .zip(right.chars())
-            .find(|(a, b)| a != b)
-            .map(|(a, b)| b.is_lowercase().cmp(&a.is_lowercase()))
-            .unwrap_or(Ordering::Equal)
-    })
-}
+use crate::thread::locale_compare;
 
 /// `resolveSettledThreadTimestamp`.
 pub fn settled_timestamp(thread: &SidebarThread) -> Option<Ms> {

@@ -12,6 +12,8 @@ use t3_core::sidebar::inbox::InboxReturnTracker;
 use t3_core::sidebar::settled::{self, DEFAULT_SNOOZE_PRESETS, SnoozePreset};
 use t3_core::sidebar::sort::top_of_pinned_order_key;
 use t3_core::sidebar::time::{LocalTime, Ms, Zone};
+use t3_core::shell::{ShellState, ShellStreamItem};
+use t3_core::sidebar::thread::same_apart_from_streaming;
 use t3_core::sidebar::visits::{VisitDecision, VisitTracker, VisitedShell};
 use t3_core::sidebar::{ModelInput, Shelf, ShelfState, SidebarModel, SidebarSettings};
 use t3_core::thread_actions::{
@@ -21,6 +23,33 @@ use t3_core::thread_actions::{
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::toast::{Toast, ToastKind};
 use t3_client::supervisor::ConnectionStatus;
+
+/// A thread delta that only moves streaming fields; the sidebar skips its rebuild.
+pub fn is_streaming_tick(shell: &ShellState, item: &ShellStreamItem) -> bool {
+    match item {
+        ShellStreamItem::ThreadUpdated { location, thread, .. } if location == "active" => {
+            shell.thread(&thread.id).is_some_and(|previous| same_apart_from_streaming(previous, thread))
+        }
+        _ => false,
+    }
+}
+
+/// What this environment lets the menu offer. The web reads these from the server config and the
+/// session's scopes (`useThreadActionMenu.ts`); until the native client subscribes to the server
+/// config, the defaults assume a current server and an operator session, and keep auto-settle
+/// opt-out (a newer capability) hidden. The server-config subscription should set this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadCapabilities {
+    pub can_operate: bool,
+    pub config_loaded: bool,
+    pub auto_settle_opt_out: bool,
+}
+
+impl Default for ThreadCapabilities {
+    fn default() -> Self {
+        ThreadCapabilities { can_operate: true, config_loaded: true, auto_settle_opt_out: false }
+    }
+}
 
 pub fn now_ms() -> Ms {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as Ms).unwrap_or(0)
@@ -55,6 +84,7 @@ pub struct SidebarController {
     pub shelves: ShelfState,
     pub settings: SidebarSettings,
     pub undo: ThreadUndoStore,
+    pub capabilities: ThreadCapabilities,
     pub collapsed: bool,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
@@ -243,11 +273,18 @@ impl AppState {
     }
 
     pub fn pin_thread(&mut self, thread_id: &str, order_key: Option<String>, cx: &mut Context<Self>) {
+        let command = self.pin_command(thread_id, order_key);
+        self.dispatch_then(command, Some("Failed to pin thread"), cx, |_, _, _| {});
+    }
+
+    /// `pinThread`: tops the pinned run by default, and supersedes older pin, settle and snooze
+    /// undos, since pinning clears snooze and un-settles.
+    fn pin_command(&mut self, thread_id: &str, order_key: Option<String>) -> Value {
         let order_key = order_key.or_else(|| top_of_pinned_order_key(self.sidebar.model.threads.iter()));
         for kind in [UndoKind::Pin, UndoKind::Settle, UndoKind::Snooze] {
             self.sidebar.undo.invalidate(kind, thread_id);
         }
-        self.dispatch_then(actions::pin(&uuid(), thread_id, order_key.as_deref()), Some("Failed to pin thread"), cx, |_, _, _| {});
+        actions::pin(&uuid(), thread_id, order_key.as_deref())
     }
 
     pub fn unpin_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -433,12 +470,22 @@ impl AppState {
             return;
         }
         let step = steps.remove(0);
+        // Each step goes through its action's claim invalidation, as `runUndoPlan` calls the actions.
         let command = match &step {
-            UndoStep::Unsettle => actions::unsettle(&uuid(), &thread_id),
-            UndoStep::Unsnooze => actions::unsnooze(&uuid(), &thread_id),
-            UndoStep::Pin { order_key } => actions::pin(&uuid(), &thread_id, order_key.as_deref()),
+            UndoStep::Unsettle => {
+                self.sidebar.undo.invalidate(UndoKind::Settle, &thread_id);
+                actions::unsettle(&uuid(), &thread_id)
+            }
+            UndoStep::Unsnooze => {
+                self.sidebar.undo.invalidate(UndoKind::Snooze, &thread_id);
+                actions::unsnooze(&uuid(), &thread_id)
+            }
+            UndoStep::Pin { order_key } => self.pin_command(&thread_id, order_key.clone()),
             UndoStep::Snooze { snoozed_until } => actions::snooze(&uuid(), &thread_id, *snoozed_until),
-            UndoStep::Unarchive => actions::unarchive(&uuid(), &thread_id),
+            UndoStep::Unarchive => {
+                self.sidebar.undo.invalidate(UndoKind::Archive, &thread_id);
+                actions::unarchive(&uuid(), &thread_id)
+            }
         };
         let title = match step {
             UndoStep::Unarchive => "Failed to undo archive",

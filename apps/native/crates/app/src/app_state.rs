@@ -153,7 +153,7 @@ impl AppState {
     }
 
     fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
-        let (mut shell_changed, mut thread_changed, mut config_changed) = (false, false, false);
+        let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut config_changed) = (false, false, false, false);
         for event in batch {
             match event {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => {
@@ -162,7 +162,13 @@ impl AppState {
                     self.set_phase(Phase::Unpaired { error: Some(reason) }, cx);
                 }
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
-                ClientEvent::Shell(item) => shell_changed |= self.shell.apply(item),
+                ClientEvent::Shell(item) => {
+                    let quiet = crate::sidebar::controller::is_streaming_tick(&self.shell, &item);
+                    if self.shell.apply(item) {
+                        shell_changed = true;
+                        sidebar_changed |= !quiet;
+                    }
+                }
                 ClientEvent::Thread { thread_id, item } => {
                     if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
                         thread_changed |= self.thread.apply(*item);
@@ -175,7 +181,9 @@ impl AppState {
             }
         }
         if shell_changed {
-            self.rebuild_sidebar(cx);
+            if sidebar_changed {
+                self.rebuild_sidebar(cx);
+            }
             cx.emit(AppEvent::Shell);
             if let Some(id) = self.select_when_listed.take_if(|id| self.shell.thread(id).is_some()) {
                 self.select_thread(&id, cx);
@@ -210,6 +218,11 @@ impl AppState {
         if self.phase != phase {
             self.phase = phase;
             cx.emit(AppEvent::Phase);
+            // Connection state places threads on the Working shelf.
+            if self.shell.snapshot.is_some() {
+                self.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+            }
         }
     }
 

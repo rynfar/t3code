@@ -183,6 +183,26 @@ pub fn present_thread(thread: &ThreadShell, pending_subagent_request: Option<Sub
     }
 }
 
+/// `threadRuntimeIsActive` on the shell's runtime summary.
+pub fn runtime_is_active(thread: &ThreadShell) -> bool {
+    shell_runtime(thread).is_some_and(|runtime| matches!(runtime.status.as_str(), "preparing" | "queued" | "starting" | "running" | "waiting"))
+}
+
+/// `sameApartFromStreaming` (`client-runtime/src/state/threadShell.ts`): while a run streams the
+/// server bumps timestamps, item counts and the latest message several times a second; only the
+/// counts' zero crossing matters. Such a tick changes nothing the sidebar shows.
+pub fn same_apart_from_streaming(previous: &ThreadShell, next: &ThreadShell) -> bool {
+    if !runtime_is_active(next) || (previous.item_count > 0) != (next.item_count > 0) || (previous.visible_item_count > 0) != (next.visible_item_count > 0) {
+        return false;
+    }
+    let mut adjusted = previous.clone();
+    adjusted.updated_at.clone_from(&next.updated_at);
+    adjusted.item_count = next.item_count;
+    adjusted.visible_item_count = next.visible_item_count;
+    adjusted.latest_visible_message.clone_from(&next.latest_visible_message);
+    adjusted == *next
+}
+
 fn is_child_run_live(thread: &ThreadShell) -> bool {
     match &thread.activity_run_status {
         Some(_) => true,

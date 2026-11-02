@@ -660,3 +660,29 @@ fn custom_snooze_rejects_the_spring_gap_and_keeps_days_at_24_hours() {
     let wake = resolve_custom_snooze(&CustomSnoozeInput::Duration { amount: "1", unit: DurationUnit::Days }, before, &LosAngeles);
     assert_eq!(wake, Some(from_local(2027, 3, 14, 13, 0, &LosAngeles)));
 }
+
+#[test]
+fn id_ties_follow_locale_compare() {
+    let dash = SidebarThread { pinned: true, created_at: Some(1), ..base("a-b") };
+    let underscore = SidebarThread { pinned: true, created_at: Some(1), ..base("a_b") };
+    let mut list = vec![&dash, &underscore];
+    sort_pinned(&mut list);
+    assert_eq!(list.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a_b", "a-b"]);
+}
+
+#[test]
+fn streaming_ticks_are_quiet_but_real_changes_are_not() {
+    let running = json!({"latestRunId": "r", "activeRunId": "r", "status": "running", "itemCount": 3, "visibleItemCount": 2});
+    let before: ThreadShell = serde_json::from_value(wire_thread("t", running.clone())).unwrap();
+    let mut tick = before.clone();
+    tick.updated_at = "2026-04-01T00:00:05.000Z".into();
+    tick.item_count = 9;
+    assert!(same_apart_from_streaming(&before, &tick));
+    let mut renamed = tick.clone();
+    renamed.title = "Renamed".into();
+    assert!(!same_apart_from_streaming(&before, &renamed));
+    let idle: ThreadShell = serde_json::from_value(wire_thread("t", json!({"latestRunId": "r", "status": "completed"}))).unwrap();
+    let mut idle_tick = idle.clone();
+    idle_tick.updated_at = "2026-04-01T00:00:05.000Z".into();
+    assert!(!same_apart_from_streaming(&idle, &idle_tick));
+}
