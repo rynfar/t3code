@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use gpui::{Action, App, AppContext, Context, Entity, EventEmitter, Global, Window, actions};
 use serde::{Deserialize, Serialize};
 use t3_client::store;
-use t3_core::project_scripts::{ProjectScript, preferred_script};
+use t3_core::project_scripts::{ProjectScript, preferred_script, resolve_project_scripts};
 use t3_core::right_panel::{DEFAULT_WIDTH, clamp_width};
+use t3_core::server_config::ServerSettings;
 use t3_core::vcs;
 
 pub use view::DetailsView;
@@ -197,11 +198,16 @@ impl Details {
     }
 }
 
-/// The open thread's project scripts, decoded from the shell.
+/// The open thread's effective project scripts: the shell's, as server settings override them
+/// (`resolveProjectScripts` in `ChatView.tsx`).
 pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)> {
     let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
     let project = state.shell.project(&thread.project_id)?;
-    let scripts = project.scripts.iter().filter_map(|value| serde_json::from_value(value.clone()).ok()).collect();
+    let own = project.scripts.iter().filter_map(|value| serde_json::from_value(value.clone()).ok()).collect();
+    let scripts = match state.server_config.config.as_ref() {
+        Some(config) => resolve_project_scripts(&config.settings, &project.id, own),
+        None => resolve_project_scripts(&ServerSettings::default(), &project.id, own),
+    };
     Some((project.id.clone(), scripts))
 }
 

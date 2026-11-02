@@ -1,7 +1,8 @@
 //! Project scripts: which one the Run button offers, their keybinding commands, and running them
-//! in a thread terminal. Ports `apps/web/src/projectScripts.ts`, `projectScriptMenuLabel` and
-//! `projectScriptTerminalInput` (`packages/shared/src/projectScripts.ts`), the launch in
-//! `components/chat/useChatTerminalActions.ts`, and the terminal metadata stream
+//! in a thread terminal. Ports `apps/web/src/projectScripts.ts`, `resolveProjectScripts`,
+//! `projectScriptMenuLabel` and `projectScriptTerminalInput` (`packages/shared/src/projectScripts.ts`),
+//! the launch in `components/chat/useChatTerminalActions.ts` and `terminal/useThreadTerminalActions.ts`
+//! (its env from `terminal::LaunchLocation`), and the terminal metadata stream
 //! (`TerminalMetadataStreamEvent`, `packages/contracts/src/terminal.ts`) that says which terminals
 //! still run a command.
 
@@ -9,6 +10,9 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::server_config::ServerSettings;
+use crate::terminal::{self, Grid, LaunchLocation};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -92,17 +96,30 @@ pub fn terminal_input(command: &str) -> String {
 }
 
 /// `SCRIPT_TERMINAL_COLS` × `SCRIPT_TERMINAL_ROWS`.
-const SCRIPT_TERMINAL_SIZE: (u32, u32) = (120, 30);
+const SCRIPT_TERMINAL_SIZE: (u16, u16) = (120, 30);
 
-pub fn open_terminal(thread_id: &str, terminal_id: &str, cwd: &str, worktree_path: Option<&str>) -> Value {
-    json!({
-        "threadId": thread_id,
-        "terminalId": terminal_id,
-        "cwd": cwd,
-        "worktreePath": worktree_path,
-        "cols": SCRIPT_TERMINAL_SIZE.0,
-        "rows": SCRIPT_TERMINAL_SIZE.1,
-    })
+/// `resolveProjectScripts`: a project's own override, then the folded defaults, then the legacy
+/// per-project override (null means the defaults), then the project's scripts or the defaults.
+pub fn resolve_project_scripts(settings: &ServerSettings, project_id: &str, project_scripts: Vec<ProjectScript>) -> Vec<ProjectScript> {
+    if let Some(scripts) = settings.project_settings_overrides.get(project_id).and_then(|overrides| overrides.default_project_scripts.as_ref()) {
+        return scripts.clone();
+    }
+    if settings.project_settings_folded {
+        return settings.default_project_scripts.clone();
+    }
+    match settings.project_script_overrides.get(project_id) {
+        Some(Some(scripts)) => scripts.clone(),
+        Some(None) => settings.default_project_scripts.clone(),
+        None if !project_scripts.is_empty() => project_scripts,
+        None => settings.default_project_scripts.clone(),
+    }
+}
+
+/// `terminal.open` for a script run (`launchTerminal`): in the thread's checkout, with the
+/// project's runtime env.
+pub fn open_terminal(thread_id: &str, terminal_id: &str, project_root: &str, worktree_path: Option<&str>) -> Value {
+    let location = LaunchLocation::new(project_root, worktree_path);
+    terminal::open_input(thread_id, terminal_id, &location, Some(Grid::new(SCRIPT_TERMINAL_SIZE.0, SCRIPT_TERMINAL_SIZE.1)))
 }
 
 pub fn write_terminal(thread_id: &str, terminal_id: &str, data: &str) -> Value {
@@ -227,7 +244,39 @@ mod tests {
         assert_eq!(terminal_input("bun dev"), " bun dev\r");
         let decoded: ProjectScript = serde_json::from_value(json!({ "id": "t", "name": "Test", "command": "bun test", "icon": "rocket", "runOnWorktreeCreate": false })).expect("decodes");
         assert_eq!(decoded.icon, ScriptIcon::Play, "unknown icons fall back to play");
-        assert_eq!(open_terminal("th", "script:t", "/r", None)["cols"], 120);
+    }
+
+    #[test]
+    fn script_terminals_open_with_the_runtime_env() {
+        let local = open_terminal("th", "script:t", "/r", None);
+        assert_eq!(local["cols"], 120);
+        assert_eq!(local["env"], json!({ "T3CODE_PROJECT_ROOT": "/r" }));
+        assert!(local.get("worktreePath").is_none());
+        let worktree = open_terminal("th", "script:t", "/r", Some("/wt/a"));
+        assert_eq!(worktree["cwd"], "/wt/a");
+        assert_eq!(worktree["worktreePath"], "/wt/a");
+        assert_eq!(worktree["env"], json!({ "T3CODE_PROJECT_ROOT": "/r", "T3CODE_WORKTREE_PATH": "/wt/a" }));
+    }
+
+    fn settings(value: serde_json::Value) -> ServerSettings {
+        serde_json::from_value(value).expect("decodes")
+    }
+
+    #[test]
+    fn effective_scripts_follow_the_web_precedence() {
+        let own = vec![script("own", false, false)];
+        let ids = |scripts: Vec<ProjectScript>| scripts.into_iter().map(|script| script.id).collect::<Vec<_>>();
+        let named = |id: &str| json!([{ "id": id, "name": id, "command": "run" }]);
+        let defaults = named("default");
+        assert_eq!(ids(resolve_project_scripts(&settings(json!({})), "p1", own.clone())), ["own"]);
+        assert_eq!(ids(resolve_project_scripts(&settings(json!({ "defaultProjectScripts": defaults })), "p1", vec![])), ["default"]);
+        let legacy = settings(json!({ "defaultProjectScripts": defaults, "projectScriptOverrides": { "p1": named("legacy"), "p2": null } }));
+        assert_eq!(ids(resolve_project_scripts(&legacy, "p1", own.clone())), ["legacy"]);
+        assert_eq!(ids(resolve_project_scripts(&legacy, "p2", own.clone())), ["default"], "a null override means the defaults");
+        let folded = settings(json!({ "defaultProjectScripts": defaults, "projectSettingsFolded": true, "projectScriptOverrides": { "p1": named("legacy") } }));
+        assert_eq!(ids(resolve_project_scripts(&folded, "p1", own.clone())), ["default"]);
+        let project = settings(json!({ "projectSettingsFolded": true, "projectSettingsOverrides": { "p1": { "defaultProjectScripts": [] } } }));
+        assert_eq!(ids(resolve_project_scripts(&project, "p1", own.clone())), Vec::<String>::new(), "a project override wins, even empty");
     }
 
     fn summary(terminal: &str, running: bool) -> TerminalSummary {

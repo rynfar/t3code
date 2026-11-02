@@ -561,7 +561,7 @@ impl GitStore {
         let (Some(target), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
         let suffix: String = uuid_v4().chars().take(8).collect();
         let terminal_id = self.terminals.terminal_for_run(&target.thread_id, &script.id, &suffix);
-        let open = project_scripts::open_terminal(&target.thread_id, &terminal_id, &target.cwd, target.worktree_path.as_deref());
+        let open = project_scripts::open_terminal(&target.thread_id, &terminal_id, &target.project_cwd, target.worktree_path.as_deref());
         let write = project_scripts::write_terminal(&target.thread_id, &terminal_id, &project_scripts::terminal_input(&script.command));
         let name = script.name.clone();
         let task = runtime.spawn(async move {

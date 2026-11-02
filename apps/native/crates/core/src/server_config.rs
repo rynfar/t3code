@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::model::ModelSelection;
+use crate::project_scripts::ProjectScript;
 
 /// `RuntimeMode` in `contracts/src/providerPolicy.ts`, in the web's picker order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -316,6 +317,8 @@ pub struct ProjectSettingsOverrides {
     pub new_worktrees_start_from_origin: Option<bool>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub provider_instances: HashMap<String, ProjectInstanceOverride>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub default_project_scripts: Option<Vec<ProjectScript>>,
 }
 
 /// `ServerSettings`: the subset the composer reads. Absent keys take the contract's defaults.
@@ -341,6 +344,13 @@ pub struct ServerSettings {
     pub fallback_model_selection: Option<ModelSelection>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub project_settings_overrides: HashMap<String, ProjectSettingsOverrides>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub project_settings_folded: bool,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub default_project_scripts: Vec<ProjectScript>,
+    /// The legacy per-project scripts; null means the defaults.
+    #[serde(default, deserialize_with = "lenient_map")]
+    pub project_script_overrides: HashMap<String, Option<Vec<ProjectScript>>>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub provider_instances: HashMap<String, ProviderInstanceConfig>,
     #[serde(flatten)]
