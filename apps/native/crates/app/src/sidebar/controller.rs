@@ -9,7 +9,8 @@ use gpui::{ClipboardItem, Context, Task};
 use serde_json::Value;
 use t3_client::session::RpcError;
 use t3_core::sidebar::inbox::InboxReturnTracker;
-use t3_core::sidebar::settled::{self, DEFAULT_SNOOZE_PRESETS, SnoozePreset};
+use t3_core::settings::snooze::menu_settings;
+use t3_core::sidebar::settled::{self, DEFAULT_SNOOZE_PRESETS, SnoozePreset, SnoozePresetSetting};
 use t3_core::sidebar::sort::top_of_pinned_order_key;
 use t3_core::sidebar::time::{LocalTime, Ms, Zone};
 use t3_core::shell::{ShellState, ShellStreamItem};
@@ -450,7 +451,12 @@ impl AppState {
     }
 
     pub fn snooze_presets(&self) -> Vec<SnoozePreset> {
-        settled::resolve_snooze_presets(&DEFAULT_SNOOZE_PRESETS, now_ms(), &SystemZone, &time_label)
+        settled::resolve_snooze_presets(&self.snooze_settings(), now_ms(), &SystemZone, &time_label)
+    }
+
+    /// The environment's saved snooze options, or the defaults before its settings load (`Sidebar.snooze.ts`).
+    fn snooze_settings(&self) -> Vec<SnoozePresetSetting> {
+        self.server_config.config.as_ref().map_or_else(|| DEFAULT_SNOOZE_PRESETS.to_vec(), |config| menu_settings(&config.settings.threads.snooze_presets))
     }
 
     /// Runs one context-menu or palette action for a thread.
@@ -460,10 +466,10 @@ impl AppState {
             ThreadAction::Settle => self.settle_thread(thread_id, cx),
             ThreadAction::Unsettle => self.unsettle_thread(thread_id, cx),
             ThreadAction::Pin => self.pin_thread(thread_id, None, cx),
-            ThreadAction::Unpin => self.unpin_thread(thread_id, cx),
+            ThreadAction::Unpin => self.request_unpin_thread(thread_id, cx),
             ThreadAction::Unsnooze => self.unsnooze_thread(thread_id, cx),
             ThreadAction::SnoozePreset(id) => {
-                if let Some(preset) = settled::pick_snooze_preset(shown_presets, &id, now_ms(), &DEFAULT_SNOOZE_PRESETS, &SystemZone, &time_label) {
+                if let Some(preset) = settled::pick_snooze_preset(shown_presets, &id, now_ms(), &self.snooze_settings(), &SystemZone, &time_label) {
                     self.snooze_thread(thread_id, preset.snoozed_until, cx);
                 }
             }
@@ -475,7 +481,7 @@ impl AppState {
                 self.dispatch_then(actions::regenerate_title(&uuid(), thread_id), Some("Failed to regenerate thread title"), cx, |_, _, _| {});
             }
             ThreadAction::MarkUnread => self.mark_thread_unread(thread_id, cx),
-            ThreadAction::Archive => self.archive_thread(thread_id, cx),
+            ThreadAction::Archive => self.request_archive_thread(thread_id, cx),
             ThreadAction::CopyPath => {
                 let path = thread.worktree_path.clone().or_else(|| self.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()));
                 match path {

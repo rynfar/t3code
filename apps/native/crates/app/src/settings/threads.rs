@@ -12,7 +12,7 @@ use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
 use t3_core::providers;
 use t3_core::server_config::{RuntimeMode, ServerConfig, ThreadEnvMode};
-use t3_core::settings::snooze::{self, DurationUnit, SnoozeDay, SnoozePreset};
+use t3_core::settings::snooze::{self, DurationUnit, SnoozeDay, SnoozeDraft, SnoozePreset};
 use t3_core::settings::{
     DEFAULT_AUTO_SETTLE_DAYS, ENV_MODES, MAX_AUTO_SETTLE_DAYS, MIN_AUTO_SETTLE_DAYS, ResponseStreamingMode, ServerSettingChange,
     effective_env_mode,
@@ -29,6 +29,8 @@ pub(crate) struct ThreadsState {
     pub(crate) base_directory: Entity<InputState>,
     pub(crate) auto_settle_days: Entity<InputState>,
     time_inputs: Vec<(Entity<InputState>, Subscription)>,
+    /// The snooze editor's local copy, created from the saved options on first render.
+    snooze: Option<SnoozeDraft>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -67,7 +69,7 @@ impl ThreadsState {
                 _ => {}
             }),
         ];
-        ThreadsState { base_directory, auto_settle_days, time_inputs: Vec::new(), _subscriptions: subscriptions }
+        ThreadsState { base_directory, auto_settle_days, time_inputs: Vec::new(), snooze: None, _subscriptions: subscriptions }
     }
 }
 
@@ -400,15 +402,40 @@ impl SettingsView {
         ]
     }
 
-    fn snooze_row(&mut self, presets: &[SnoozePreset], window: &mut Window, cx: &mut Context<Self>) -> Row {
+    /// Edits the snooze draft and saves the whole list; a failed save puts the saved list back.
+    fn edit_snooze(&mut self, change: impl FnOnce(&mut Vec<SnoozePreset>), cx: &mut Context<Self>) {
+        let Some(draft) = self.threads.snooze.as_mut() else { return };
+        let mut next = draft.presets().to_vec();
+        change(&mut next);
+        if !draft.edit(next.clone()) {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        let on_failed = Box::new(move |cx: &mut App| {
+            let _ = view.update(cx, |this, cx| {
+                if let Some(draft) = this.threads.snooze.as_mut() {
+                    draft.failed();
+                }
+                cx.notify();
+            });
+        });
+        store::update_server_with(&self.state, ServerSettingChange::SnoozePresets(next), Some(on_failed), cx);
+        cx.notify();
+    }
+
+    fn snooze_row(&mut self, saved: &[SnoozePreset], window: &mut Window, cx: &mut Context<Self>) -> Row {
         let p = palette(cx);
         let format = store::client(cx).timestamp_format();
         let now = Local::now();
+        let draft = self.threads.snooze.get_or_insert_with(|| SnoozeDraft::new(saved));
+        draft.observe(saved);
+        let presets = draft.presets().to_vec();
+        let presets = presets.as_slice();
         self.sync_time_inputs(presets, window, cx);
 
-        let save = {
-            let state = self.state.clone();
-            move |next: Vec<SnoozePreset>, cx: &mut App| store::update_server(&state, ServerSettingChange::SnoozePresets(next), cx)
+        let view = cx.entity().downgrade();
+        let save = move |change: Box<dyn FnOnce(&mut Vec<SnoozePreset>)>, cx: &mut App| {
+            let _ = view.update(cx, |this, cx| this.edit_snooze(change, cx));
         };
         let mut seen_ids: Vec<String> = Vec::new();
         let mut seen_wakes: Vec<i64> = Vec::new();
@@ -425,19 +452,29 @@ impl SettingsView {
                 }
             };
             let replace = {
-                let (save, presets) = (save.clone(), presets.to_vec());
+                let save = save.clone();
                 move |next: SnoozePreset, cx: &mut App| {
-                    let mut presets = presets.clone();
-                    presets[index] = next;
-                    save(presets, cx);
+                    save(
+                        Box::new(move |presets| {
+                            if let Some(slot) = presets.get_mut(index) {
+                                *slot = next;
+                            }
+                        }),
+                        cx,
+                    )
                 }
             };
             let remove = {
-                let (save, presets) = (save.clone(), presets.to_vec());
+                let save = save.clone();
                 move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                    let mut presets = presets.clone();
-                    presets.remove(index);
-                    save(presets, cx);
+                    save(
+                        Box::new(move |presets| {
+                            if index < presets.len() {
+                                presets.remove(index);
+                            }
+                        }),
+                        cx,
+                    )
                 }
             };
             list = list.child(
@@ -484,11 +521,16 @@ impl SettingsView {
         };
         let full = presets.len() >= snooze::MAX_PRESETS;
         let add = {
-            let (save, presets) = (save.clone(), presets.to_vec());
+            let save = save.clone();
             move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                let mut next = presets.clone();
-                next.push(snooze::next_candidate(&presets));
-                save(next, cx);
+                save(
+                    Box::new(|presets| {
+                        if presets.len() < snooze::MAX_PRESETS {
+                            presets.push(snooze::next_candidate(presets));
+                        }
+                    }),
+                    cx,
+                )
             }
         };
         list = list.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(menu_text)).child(
@@ -501,7 +543,10 @@ impl SettingsView {
         Row::new("snooze-options", "Snooze options")
             .description("Choices in every snooze menu, listed soonest first. Weekdays mean the next one after today.")
             .highlighted(self.is_target("snooze-options"))
-            .reset(!snooze::same_presets(presets, &defaults), move |_, _, cx| save(defaults.clone(), cx))
+            .reset(!snooze::same_presets(presets, &defaults), move |_, _, cx| {
+                let defaults = defaults.clone();
+                save(Box::new(move |presets| *presets = defaults), cx)
+            })
             .below(list)
     }
 
@@ -585,13 +630,17 @@ impl SettingsView {
                 if !matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     return;
                 }
-                let Some(presets) = this.thread_settings(cx).map(|config| config.settings.threads.snooze_presets.clone()) else { return };
-                let Some(SnoozePreset::At { day, time }) = presets.get(index).cloned() else { return };
+                let Some(SnoozePreset::At { day, time }) = this.threads.snooze.as_ref().and_then(|draft| draft.presets().get(index).cloned()) else { return };
                 let typed = input.read(cx).value().trim().to_owned();
                 if snooze::parse_time(&typed).is_some() && typed != time {
-                    let mut next = presets;
-                    next[index] = SnoozePreset::At { day, time: typed };
-                    store::update_server(&this.state, ServerSettingChange::SnoozePresets(next), cx);
+                    this.edit_snooze(
+                        |presets| {
+                            if let Some(slot) = presets.get_mut(index) {
+                                *slot = SnoozePreset::At { day, time: typed };
+                            }
+                        },
+                        cx,
+                    );
                 } else {
                     input.update(cx, |input, cx| input.set_value(time, window, cx));
                 }
