@@ -380,6 +380,7 @@ impl Render for Composer {
                                 .when(show_permissions, |this| this.child(self.render_permissions_chip(&resolved, cx)))
                                 .when(resolved.plan_enabled, |this| this.child(self.render_plan_toggle(&resolved, cx)))
                                 .child(div().flex_1().min_w(px(8.)))
+                                .children(crate::usage::meter::context_meter(&self.state, window, cx))
                                 .child(self.render_primary(&resolved, cx)),
                         ),
                     ),

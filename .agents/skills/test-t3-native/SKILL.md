@@ -79,11 +79,15 @@ export T3_NATIVE_HOME="$(git rev-parse --show-toplevel)/.t3/native"   # whose sa
 cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   [--thread <id>] [--right-panel diff] [--settings appearance] [--palette] \
   [--new-thread] [--attach <file>]... [--prompt "@src"] \
-  [--width 1440] [--height 900] [--dark | --light] [--wait 6]
+  [--usage cost|tokens|limits] [--usage-period day|week|month|quarter] [--usage-model] \
+  [--context-meter] [--width 1440] [--height 900] [--dark | --light] [--wait 6]
 ```
 
 - `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher);
   `--settings` a section (`appearance`, `chat`, `keybindings`, …).
+- `--usage` opens the Usage page on a metric and waits for its summary; `--usage-model` opens
+  the top model's breakdown. Limits skips its provider refresh so the run stays read-only.
+  `--context-meter` turns on the composer's legacy context window indicator for `--thread`.
 - A home with no saved environment renders the connect screen (set `T3CODE_HOME` as above to
   show the one-click local option).
 - `--new-thread` opens the new-thread draft; `--prompt` types into the composer last, so a trigger

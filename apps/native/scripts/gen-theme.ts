@@ -530,6 +530,35 @@ const statusHue = (name: string, color: string, darkAlpha: number): ColorToken[]
   },
 ];
 
+// Usage page hues, read from the web source so a changed color shows as drift: each provider's
+// series color (`usageProviders.ts` PROVIDER_PRESENTATION) and the share-bar inks
+// (`usageBreakdown.ts` `ink(percent)`, foreground mixed into the background).
+const USAGE_PROVIDERS = "apps/web/src/components/usage/usageProviders.ts";
+const USAGE_BREAKDOWN = "apps/web/src/components/usage/usageBreakdown.ts";
+const usageTokens = (): ColorToken[] => {
+  const providers = [
+    ...read(USAGE_PROVIDERS).matchAll(/(\w+):\s*\{\s*label:\s*"[^"]*",\s*color:\s*"([^"]+)"/g),
+  ];
+  const inks = [
+    ...new Set(
+      [...read(USAGE_BREAKDOWN).matchAll(/ink\((\d+)\)/g)].map((match) => Number(match[1])),
+    ),
+  ].sort((a, b) => a - b);
+  if (providers.length === 0 || inks.length === 0) throw new Error("usage colors not found");
+  return [
+    ...providers.map(([, id, color]) => ({
+      name: `usage_${id}`,
+      web: `usageProviders.ts ${id}`,
+      css: color!,
+    })),
+    ...inks.map((percent) => ({
+      name: `usage_ink_${percent}`,
+      web: `usageBreakdown.ts ink(${percent})`,
+      css: `color-mix(in oklab, var(--foreground) ${percent}%, var(--background))`,
+    })),
+  ];
+};
+
 // What a changed diff row paints: Pierre mixes its line color `in lab` over the code surface
 // (lines 88%/80%, gutter 91%/85%) toward the override `diffRendering.ts` sets
 // (`--diffs-bg-{kind}-override` and `--diffs-bg-{kind}-number-override`). Inside the viewer
@@ -757,6 +786,7 @@ const COLOR_TOKENS: readonly ColorToken[] = [
   ...statusHue("failed", "red", 90),
   ...statusHue("plan", "violet", 90),
   ...statusHue("completed", "emerald", 90),
+  ...usageTokens(),
   {
     name: "glass_surface",
     web: "@utility surface-glass",
@@ -1189,6 +1219,8 @@ function renderRust(): string {
     WEB_PALETTE,
     SHARED_PALETTES,
     SETTINGS,
+    USAGE_PROVIDERS,
+    USAGE_BREAKDOWN,
     `tailwindcss@${tailwindVersion}/theme.css`,
     `@pierre/highlights@${highlightsVersion}`,
   ];

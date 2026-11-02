@@ -24,9 +24,10 @@ pub mod method {
 pub const CREATION_SOURCE: &str = "web";
 
 /// Per-cwd provider snapshots are left out: the native composer has no slash-command menu yet,
-/// and `server.refreshProviders` fetches them on demand when it does.
+/// and `server.refreshProviders` fetches them on demand when it does. Limit sources feed the
+/// Usage page's pooled limits, as the web opts in.
 pub fn subscribe_server_config() -> Value {
-    json!({ "workspaceSnapshotsOnDemand": true })
+    json!({ "workspaceSnapshotsOnDemand": true, "usageLimitSources": true })
 }
 
 /// Which rows the shell may leave to on-demand reads, as `shell.ts` decides from the config.

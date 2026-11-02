@@ -184,6 +184,12 @@ pub struct ProviderAuth {
     pub status: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub subscription_sharing: Option<bool>,
 }
 
 /// `ServerProvider`: one provider instance as the server reports it.
@@ -278,21 +284,102 @@ pub struct WorkspaceSnapshot {
     pub skills: Vec<ProviderSkill>,
 }
 
-/// `ServerProviderUsageWindow`: how much of one quota is spent and when it resets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageWindowKind {
+    Session,
+    Weekly,
+    Monthly,
+    Other,
+}
+
+/// `ServerProviderUsageWindow`: how much of one quota is spent and when it resets. A window of
+/// an unknown kind fails to decode and its array drops it, as `ForwardCompatibleArray` does.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     pub id: String,
+    pub kind: UsageWindowKind,
+    pub label: String,
     #[serde(default)]
     pub used_percent: f64,
     #[serde(default)]
     pub resets_at: Option<String>,
+    #[serde(default)]
+    pub window_duration_mins: Option<u64>,
 }
 
+/// `ServerProviderResetCredits`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredits {
+    #[serde(default)]
+    pub available_count: u64,
+    #[serde(default)]
+    pub next_expires_at: Option<String>,
+    #[serde(default)]
+    pub next_credit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ExternalUsage {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LimitsUnavailable {
+    /// `unsupported` or `probeFailed`.
+    pub reason: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `ServerProviderUsageLimits`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageLimits {
+    #[serde(default)]
+    pub checked_at: String,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub windows: Vec<UsageWindow>,
+    #[serde(default)]
+    pub credential_fingerprint: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub reset_credits: Option<ResetCredits>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub external_usage: Option<ExternalUsage>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub unavailable: Option<LimitsUnavailable>,
+}
+
+/// `UsageLimitSourceAccount`: one account a limit source (CLI Proxy) reports.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimitSourceAccount {
+    pub id: String,
+    pub driver: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    pub usage_limits: UsageLimits,
+}
+
+/// `UsageLimitSourceSnapshot`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimitSource {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub checked_at: String,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub accounts: Vec<UsageLimitSourceAccount>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl ServerProvider {
@@ -432,6 +519,9 @@ pub struct ServerSettings {
     pub provider_instances: HashMap<String, ProviderInstanceConfig>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub pull_request_merge_method: Option<crate::pull_requests::wire::MergeMethod>,
+    /// The Usage page asks for summaries through this filter.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub usage_model_filter: Option<crate::usage::UsageModelFilter>,
     #[serde(flatten)]
     pub threads: crate::settings::ThreadSettings,
 }
@@ -460,6 +550,9 @@ pub struct ServerConfig {
     pub shell_older_settled: bool,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub available_editors: Vec<String>,
+    /// Sent only to clients that opt in with `usageLimitSources`; empty means none.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub usage_limit_sources: Vec<UsageLimitSource>,
 }
 
 impl ServerConfig {
@@ -487,6 +580,12 @@ pub struct SettingsPayload {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct UsageLimitSourcesPayload {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub sources: Vec<UsageLimitSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerConfigStreamEvent {
     #[serde(rename = "snapshot")]
@@ -497,6 +596,8 @@ pub enum ServerConfigStreamEvent {
     ProviderStatuses { payload: ProvidersPayload },
     #[serde(rename = "settingsUpdated")]
     SettingsUpdated { payload: Box<SettingsPayload> },
+    #[serde(rename = "usageLimitSourcesUpdated")]
+    UsageLimitSourcesUpdated { payload: UsageLimitSourcesPayload },
     #[serde(other)]
     Unknown,
 }
@@ -515,8 +616,12 @@ impl ServerConfigState {
     /// are reported as unchanged and views stay quiet.
     pub fn apply(&mut self, event: ServerConfigStreamEvent) -> bool {
         match event {
-            ServerConfigStreamEvent::Snapshot { config } => {
+            ServerConfigStreamEvent::Snapshot { mut config } => {
                 self.settings_revision += 1;
+                // `serverConfigProjection.ts`: sources follow their own event once known.
+                if let Some(current) = self.config.as_ref().filter(|current| !current.usage_limit_sources.is_empty()) {
+                    config.usage_limit_sources = current.usage_limit_sources.clone();
+                }
                 if self.config.as_ref() == Some(&*config) {
                     return false;
                 }
@@ -532,6 +637,9 @@ impl ServerConfigState {
             ServerConfigStreamEvent::SettingsUpdated { payload } => {
                 self.settings_revision += 1;
                 self.update(|config| replace(&mut config.settings, payload.settings))
+            }
+            ServerConfigStreamEvent::UsageLimitSourcesUpdated { payload } => {
+                self.update(|config| replace(&mut config.usage_limit_sources, payload.sources))
             }
             ServerConfigStreamEvent::Unknown => false,
         }

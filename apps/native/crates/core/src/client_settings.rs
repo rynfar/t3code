@@ -174,6 +174,7 @@ pub enum ClientSettingChange {
     FollowUpBehavior(crate::composer::FollowUpBehavior),
     ShowSkillsInSlashMenu(bool),
     PlanMode(bool),
+    ContextWindowMeter(bool),
     /// `setTheme`: replaces the theme and keeps the current appearance mode.
     Theme(ThemePreference),
     AppearanceMode(AppearanceMode),
@@ -218,6 +219,7 @@ impl ClientSettingChange {
             ),
             ClientSettingChange::ShowSkillsInSlashMenu(on) => ("showSkillsInSlashMenu", Value::Bool(*on)),
             ClientSettingChange::PlanMode(on) => ("planModeEnabled", Value::Bool(*on)),
+            ClientSettingChange::ContextWindowMeter(on) => ("contextWindowMeterEnabled", Value::Bool(*on)),
             ClientSettingChange::Theme(theme) => (THEME_KEY, text(theme.as_str())),
             ClientSettingChange::AppearanceMode(mode) => (THEME_APPEARANCE_MODE_KEY, text(mode.as_str())),
             ClientSettingChange::LastEnabledProjectGrouping(mode) => {

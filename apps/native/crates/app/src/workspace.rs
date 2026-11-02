@@ -324,6 +324,7 @@ impl Render for Workspace {
             .child(self.link_dialog.clone())
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))
+            .children(crate::usage::overlay(window, cx))
             .children(crate::quit_hold::hint(cx))
             .into_any_element()
     }
