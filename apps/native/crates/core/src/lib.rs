@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod composer;
 pub mod history;
+pub mod keybindings;
 pub mod model;
 pub mod pairing;
 pub mod providers;

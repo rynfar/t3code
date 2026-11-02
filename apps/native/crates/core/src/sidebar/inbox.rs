@@ -30,11 +30,24 @@ pub fn is_thread_working(thread: &SidebarThread) -> bool {
     !(thread.interaction_mode == "plan" && thread.has_actionable_proposed_plan && run_settled)
 }
 
+/// The fields that place a thread on a shelf; a change ends a held grace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Placement {
+    archived: bool,
+    deleted: bool,
+    pinned: bool,
+    settled: Option<u8>,
+    settled_at: Option<Ms>,
+    snoozed_at: Option<Ms>,
+    snoozed_until: Option<Ms>,
+    active_order_key: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackedState {
     working: bool,
     deadline: Option<Ms>,
-    placement: (bool, bool, bool, Option<u8>, Option<Ms>, Option<Ms>, Option<Ms>, Option<String>),
+    placement: Placement,
 }
 
 #[derive(Debug, Default)]
@@ -78,16 +91,16 @@ impl InboxReturnTracker {
         let mut present = std::collections::HashSet::with_capacity(threads.len());
         for thread in threads {
             present.insert(thread.id.as_str());
-            let placement = (
-                thread.archived,
-                thread.deleted,
-                thread.pinned,
-                thread.settled_override.map(|o| o as u8),
-                thread.settled_at,
-                thread.snoozed_at,
-                thread.snoozed_until,
-                thread.active_order_key.clone(),
-            );
+            let placement = Placement {
+                archived: thread.archived,
+                deleted: thread.deleted,
+                pinned: thread.pinned,
+                settled: thread.settled_override.map(|o| o as u8),
+                settled_at: thread.settled_at,
+                snoozed_at: thread.snoozed_at,
+                snoozed_until: thread.snoozed_until,
+                active_order_key: thread.active_order_key.clone(),
+            };
             let previous = self.states.get(&thread.id);
             let actionable = thread.has_pending_approvals
                 || thread.has_pending_user_input

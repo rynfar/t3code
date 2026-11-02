@@ -147,20 +147,20 @@ fn tracker_cancels_a_transient_return_on_resume() {
 
 #[test]
 fn tracker_ends_grace_for_attention_or_manual_placement() {
-    let changes: Vec<Box<dyn Fn(&mut SidebarThread)>> = vec![
-        Box::new(|t| t.has_pending_approvals = true),
-        Box::new(|t| t.has_pending_user_input = true),
-        Box::new(|t| t.pending_subagent_request = Some(SubagentRequest::Approval)),
-        Box::new(|t| t.pending_guest_message_count = 1),
-        Box::new(|t| {
+    let changes: [fn(&mut SidebarThread); 10] = [
+        (|t| t.has_pending_approvals = true),
+        (|t| t.has_pending_user_input = true),
+        (|t| t.pending_subagent_request = Some(SubagentRequest::Approval)),
+        (|t| t.pending_guest_message_count = 1),
+        (|t| {
             t.interaction_mode = "plan".into();
             t.has_actionable_proposed_plan = true;
         }),
-        Box::new(|t| t.runtime = Some(RuntimeSummary { last_error: Some("failed".into()), ..runtime("failed") })),
-        Box::new(|t| t.pinned = true),
-        Box::new(|t| t.settled_override = Some(SettledOverride::Settled)),
-        Box::new(|t| t.snoozed_until = Some(iso("2026-06-02T00:00:00Z"))),
-        Box::new(|t| t.active_order_key = Some("manual-order".into())),
+        (|t| t.runtime = Some(RuntimeSummary { last_error: Some("failed".into()), ..runtime("failed") })),
+        (|t| t.pinned = true),
+        (|t| t.settled_override = Some(SettledOverride::Settled)),
+        (|t| t.snoozed_until = Some(iso("2026-06-02T00:00:00Z"))),
+        (|t| t.active_order_key = Some("manual-order".into())),
     ];
     for change in changes {
         let mut tracker = InboxReturnTracker::default();
