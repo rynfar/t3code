@@ -18,6 +18,7 @@ mod menus;
 mod new_thread;
 mod omitted_rows;
 mod notifications;
+mod onboarding;
 mod palette;
 mod preview;
 mod project_files;

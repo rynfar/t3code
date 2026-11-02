@@ -18,6 +18,7 @@ pub mod local_server;
 pub mod media;
 pub mod model;
 pub mod notifications;
+pub mod onboarding;
 pub mod pairing;
 pub mod preview;
 pub mod palette;

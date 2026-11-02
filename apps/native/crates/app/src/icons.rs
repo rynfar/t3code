@@ -132,6 +132,7 @@ icons! {
     MessagesSquare => "icons/lucide/messages-square.svg",
     Minimize2 => "icons/lucide/minimize-2.svg",
     Minus => "icons/lucide/minus.svg",
+    Monitor => "icons/lucide/monitor.svg",
     Package => "icons/lucide/package.svg",
     Palette => "icons/lucide/palette.svg",
     PanelLeft => "icons/lucide/panel-left.svg",
