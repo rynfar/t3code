@@ -9,16 +9,23 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnItem {
+    // Defaults let an unknown `type` decode with only its discriminator, as
+    // `ForwardCompatibleUnion` requires; it is filtered out right after.
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub thread_id: String,
     pub run_id: Option<String>,
     pub node_id: Option<String>,
     pub parent_item_id: Option<String>,
+    #[serde(default)]
     pub ordinal: u64,
+    #[serde(default)]
     pub status: String,
     pub title: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    #[serde(default)]
     pub updated_at: String,
     #[serde(flatten)]
     pub kind: TurnItemKind,

@@ -1,6 +1,7 @@
 mod app_state;
 mod composer;
 mod connect;
+mod menus;
 mod sidebar;
 mod theme;
 mod thread_view;
@@ -36,6 +37,7 @@ fn main() {
         gpui_component::init(cx);
         theme::init(cx);
         let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
+        menus::init(state.clone(), cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(
             WindowOptions {

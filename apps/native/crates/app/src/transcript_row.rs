@@ -4,6 +4,8 @@
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, div, px};
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
+
+use crate::theme::{hsla, palette};
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
 pub fn render_item(item: &TurnItem, markdown: Option<Entity<TextViewState>>, cx: &App) -> AnyElement {
@@ -13,18 +15,25 @@ pub fn render_item(item: &TurnItem, markdown: Option<Entity<TextViewState>>, cx:
             .justify_end()
             .child(
                 div()
-                    .max_w(px(620.))
-                    .px_3p5()
-                    .py_2()
-                    .rounded_xl()
-                    .bg(theme.secondary)
-                    .text_color(theme.secondary_foreground)
+                    .max_w(gpui::relative(0.8))
+                    .p_3()
+                    .rounded(px(16.))
+                    .bg(hsla(palette(cx).message_surface))
+                    .text_color(hsla(palette(cx).message_foreground))
                     .text_sm()
+                    .line_height(px(22.75))
                     .child(SharedString::from(text.clone())),
             )
             .into_any_element(),
         TurnItemKind::AssistantMessage { .. } | TurnItemKind::ProposedPlan { .. } => match markdown {
-            Some(state) => div().text_sm().child(TextView::new(&state)).into_any_element(),
+            Some(state) => div()
+                .px_1()
+                .py_0p5()
+                .text_sm()
+                .line_height(px(22.75))
+                .text_color(theme.foreground.opacity(0.9))
+                .child(TextView::new(&state))
+                .into_any_element(),
             None => div().into_any_element(),
         },
         TurnItemKind::Reasoning { text, streaming } => {
@@ -103,12 +112,21 @@ pub fn render_item(item: &TurnItem, markdown: Option<Entity<TextViewState>>, cx:
 
 fn work_line(icon: IconName, verb: &str, detail: Option<&str>, failed: bool, cx: &App) -> AnyElement {
     let theme = cx.theme();
+    let p = palette(cx);
     h_flex()
-        .gap_2()
-        .h(px(24.))
+        .gap(px(6.))
+        .min_h(px(24.))
+        .px_0p5()
         .text_sm()
-        .text_color(if failed { theme.danger } else { theme.muted_foreground })
-        .child(Icon::new(icon).xsmall())
+        .text_color(hsla(p.secondary_label))
+        .child(
+            div()
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(icon).small().text_color(hsla(if failed { p.tool_error_icon } else { p.icon_muted }))),
+        )
         .child(div().flex_none().child(SharedString::from(verb.to_owned())))
         .children(detail.map(|detail| {
             div().min_w_0().truncate().font_family(theme.mono_font_family.clone()).text_xs().child(SharedString::from(detail.to_owned()))

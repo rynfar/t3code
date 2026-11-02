@@ -25,10 +25,10 @@ pub enum Phase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
-    PhaseChanged,
-    ShellChanged,
-    SelectionChanged,
-    ThreadChanged,
+    Phase,
+    Shell,
+    Selection,
+    Thread,
 }
 
 pub struct AppState {
@@ -38,6 +38,7 @@ pub struct AppState {
     pub selected_thread: Option<String>,
     pub thread: ThreadState,
     pub last_error: Option<String>,
+    restore_thread: Option<String>,
     client: Option<ClientHandle>,
     runtime: tokio::runtime::Handle,
     _pump: Option<Task<()>>,
@@ -56,6 +57,7 @@ impl AppState {
             selected_thread: None,
             thread: ThreadState::default(),
             last_error: None,
+            restore_thread: store::load_last_thread(),
             client: None,
             runtime,
             _pump: None,
@@ -100,8 +102,8 @@ impl AppState {
         self.selected_thread = None;
         self.thread = ThreadState::default();
         self.set_phase(Phase::Unpaired { error: None }, cx);
-        cx.emit(AppEvent::ShellChanged);
-        cx.emit(AppEvent::SelectionChanged);
+        cx.emit(AppEvent::Shell);
+        cx.emit(AppEvent::Selection);
     }
 
     fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
@@ -147,17 +149,22 @@ impl AppState {
         }
         if shell_changed {
             self.sidebar_rows = Arc::new(self.shell.snapshot.as_ref().map(sidebar_rows).unwrap_or_default());
-            cx.emit(AppEvent::ShellChanged);
+            cx.emit(AppEvent::Shell);
+            if self.selected_thread.is_none()
+                && let Some(id) = self.restore_thread.take_if(|id| self.shell.thread(id).is_some())
+            {
+                self.select_thread(&id, cx);
+            }
         }
         if thread_changed {
-            cx.emit(AppEvent::ThreadChanged);
+            cx.emit(AppEvent::Thread);
         }
     }
 
     fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
         if self.phase != phase {
             self.phase = phase;
-            cx.emit(AppEvent::PhaseChanged);
+            cx.emit(AppEvent::Phase);
         }
     }
 
@@ -170,11 +177,13 @@ impl AppState {
         }
         self.selected_thread = Some(thread_id.to_owned());
         self.thread = ThreadState::default();
+        self.restore_thread = None;
+        store::save_last_thread(thread_id);
         if let Some(client) = &self.client {
             client.open_thread(thread_id);
         }
-        cx.emit(AppEvent::SelectionChanged);
-        cx.emit(AppEvent::ThreadChanged);
+        cx.emit(AppEvent::Selection);
+        cx.emit(AppEvent::Thread);
     }
 
     pub fn is_selected_thread_running(&self) -> bool {
@@ -207,7 +216,7 @@ impl AppState {
             if let Err(error) = result {
                 let _ = this.update(cx, |state, cx| {
                     state.last_error = Some(error.to_string());
-                    cx.emit(AppEvent::ThreadChanged);
+                    cx.emit(AppEvent::Thread);
                 });
             }
         })

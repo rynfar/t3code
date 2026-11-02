@@ -13,6 +13,8 @@ pub struct ProjectShell {
     pub title: String,
     pub workspace_root: String,
     #[serde(default)]
+    pub repository_identity: Option<serde_json::Value>,
+    #[serde(default)]
     pub default_model_selection: Option<ModelSelection>,
     #[serde(default)]
     pub pinned_at: Option<String>,
@@ -132,9 +134,15 @@ pub enum ShellStreamItem {
     #[serde(rename = "synchronized")]
     Synchronized,
     #[serde(rename = "snapshot")]
-    Snapshot { snapshot: ShellSnapshot },
+    Snapshot {
+        snapshot: Box<ShellSnapshot>,
+        /// Present on metadata-only enrichment refreshes: same structure and sequence, only
+        /// repository identities for these workspace roots are authoritative.
+        #[serde(default, rename = "resolvedRepositoryIdentityRoots")]
+        resolved_repository_identity_roots: Option<Vec<String>>,
+    },
     #[serde(rename = "project.updated")]
-    ProjectUpdated { sequence: u64, project: ProjectShell },
+    ProjectUpdated { sequence: u64, project: Box<ProjectShell> },
     #[serde(rename = "project.removed")]
     ProjectRemoved {
         sequence: u64,
@@ -170,8 +178,17 @@ impl ShellState {
     pub fn apply(&mut self, item: ShellStreamItem) -> bool {
         match item {
             ShellStreamItem::Synchronized => !std::mem::replace(&mut self.synchronized, true),
-            ShellStreamItem::Snapshot { snapshot } => {
-                self.snapshot = Some(snapshot);
+            ShellStreamItem::Snapshot { snapshot, resolved_repository_identity_roots: Some(roots) } => {
+                match self.snapshot.as_mut() {
+                    Some(previous) => merge_identity_enrichment(previous, &snapshot, &roots),
+                    None => {
+                        self.snapshot = Some(*snapshot);
+                        true
+                    }
+                }
+            }
+            ShellStreamItem::Snapshot { snapshot, resolved_repository_identity_roots: None } => {
+                self.snapshot = Some(*snapshot);
                 true
             }
             ShellStreamItem::Unknown => false,
@@ -202,7 +219,7 @@ fn apply_delta(snapshot: &mut ShellSnapshot, item: ShellStreamItem) -> bool {
     snapshot.snapshot_sequence = sequence;
     match item {
         ShellStreamItem::ProjectUpdated { project, .. } => {
-            upsert(&mut snapshot.projects, project, |p| &p.id);
+            upsert(&mut snapshot.projects, *project, |p| &p.id);
         }
         ShellStreamItem::ProjectRemoved { project_id, .. } => {
             snapshot.projects.retain(|project| project.id != project_id);
@@ -210,7 +227,7 @@ fn apply_delta(snapshot: &mut ShellSnapshot, item: ShellStreamItem) -> bool {
         ShellStreamItem::ThreadUpdated { location, thread, .. } => {
             let thread = *thread;
             if location == "active" {
-                if snapshot.threads.iter().any(|existing| *existing == thread) {
+                if snapshot.threads.contains(&thread) {
                     return false;
                 }
                 upsert(&mut snapshot.threads, thread.clone(), |t| &t.id);
@@ -227,6 +244,28 @@ fn apply_delta(snapshot: &mut ShellSnapshot, item: ShellStreamItem) -> bool {
         _ => {}
     }
     true
+}
+
+/// `mergeShellSnapshotProjects` with enrichment options: only repository identities change.
+fn merge_identity_enrichment(previous: &mut ShellSnapshot, next: &ShellSnapshot, roots: &[String]) -> bool {
+    let mut changed = false;
+    for project in &mut previous.projects {
+        let Some(candidate) = next.projects.iter().find(|c| c.id == project.id) else { continue };
+        if candidate.workspace_root != project.workspace_root {
+            continue;
+        }
+        let authoritative = roots.contains(&project.workspace_root);
+        let adopt = if authoritative {
+            project.repository_identity != candidate.repository_identity
+        } else {
+            project.repository_identity.is_none() && candidate.repository_identity.is_some()
+        };
+        if adopt {
+            project.repository_identity = candidate.repository_identity.clone();
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn upsert<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {

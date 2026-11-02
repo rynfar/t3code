@@ -10,8 +10,8 @@ use crate::connect::ConnectView;
 use crate::sidebar::SidebarPane;
 use crate::thread_view::ThreadView;
 
-pub const TITLEBAR_HEIGHT: f32 = 40.;
-pub const SIDEBAR_WIDTH: f32 = 280.;
+pub const TITLEBAR_HEIGHT: f32 = 52.;
+pub const SIDEBAR_WIDTH: f32 = 256.;
 
 pub struct Workspace {
     state: Entity<AppState>,
@@ -29,7 +29,7 @@ impl Workspace {
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
         let subscription = cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
-            if matches!(event, AppEvent::PhaseChanged | AppEvent::SelectionChanged) {
+            if matches!(event, AppEvent::Phase | AppEvent::Selection) {
                 cx.notify();
             }
         });
@@ -56,8 +56,8 @@ impl Workspace {
             .window_control_area(WindowControlArea::Drag)
             .h(px(TITLEBAR_HEIGHT))
             .flex_none()
-            .pl(px(SIDEBAR_WIDTH + 16.))
-            .pr_4()
+            .pl(px(20.))
+            .pr(px(12.))
             .gap_3()
             .border_b_1()
             .border_color(theme.border)
@@ -85,7 +85,7 @@ impl Render for Workspace {
                     .flex_none()
                     .bg(theme.sidebar)
                     .border_r_1()
-                    .border_color(theme.sidebar_border)
+                    .border_color(crate::theme::hsla(crate::theme::palette(cx).sidebar_edge))
                     .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
             )
             .child(

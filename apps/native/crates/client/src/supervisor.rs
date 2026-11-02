@@ -59,9 +59,15 @@ impl ClientHandle {
     }
 }
 
-pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (ClientHandle, mpsc::UnboundedReceiver<ClientEvent>) {
+/// Bounded so a stalled UI pushes back through acks to the server instead of buffering forever.
+const EVENT_QUEUE: usize = 1024;
+const THREAD_RETRY: Duration = Duration::from_secs(2);
+
+type Events = mpsc::Sender<ClientEvent>;
+
+pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
     let (commands, command_rx) = mpsc::unbounded_channel();
-    let (events, event_rx) = mpsc::unbounded_channel();
+    let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     runtime.spawn(supervise(credentials, command_rx, events));
     (ClientHandle { commands }, event_rx)
 }
@@ -74,7 +80,7 @@ struct Resume {
 async fn supervise(
     credentials: Credentials,
     mut commands: mpsc::UnboundedReceiver<Command>,
-    events: mpsc::UnboundedSender<ClientEvent>,
+    events: Events,
 ) {
     let mut resume = Resume { shell: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
@@ -83,24 +89,24 @@ async fn supervise(
             ConnectionStatus::Connecting
         } else {
             ConnectionStatus::Reconnecting { reason: "Reconnecting…".into(), attempt }
-        }));
+        })).await;
         let reason = match connect(&credentials).await {
             Ok(session) => {
                 attempt = 0;
-                let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected));
+                let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
                 match run_session(&session, &mut resume, &mut commands, &events).await {
                     SessionEnd::Closed(reason) => reason,
                     SessionEnd::Dropped => return,
                 }
             }
             Err(ConnectError::Unauthorized(reason)) => {
-                let _ = events.send(ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }));
+                let _ = events.send(ClientEvent::Status(ConnectionStatus::NeedsPairing { reason })).await;
                 return;
             }
             Err(ConnectError::Transient(reason)) => reason,
         };
         attempt += 1;
-        let _ = events.send(ClientEvent::Status(ConnectionStatus::Reconnecting { reason, attempt }));
+        let _ = events.send(ClientEvent::Status(ConnectionStatus::Reconnecting { reason, attempt })).await;
         let delay = Duration::from_millis((500u64 << attempt.min(5)).min(15_000));
         if !wait_draining(delay, &mut commands, &mut resume).await {
             return;
@@ -155,7 +161,7 @@ async fn run_session(
     session: &Session,
     resume: &mut Resume,
     commands: &mut mpsc::UnboundedReceiver<Command>,
-    events: &mpsc::UnboundedSender<ClientEvent>,
+    events: &Events,
 ) -> SessionEnd {
     let Ok(mut shell) = session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell)) else {
         return SessionEnd::Closed("Could not subscribe to the shell.".into());
@@ -171,9 +177,9 @@ async fn run_session(
                 Some(Ok(value)) => match serde_json::from_value::<ShellStreamItem>(value) {
                     Ok(item) => {
                         resume.shell = shell_sequence(&item).or(resume.shell);
-                        let _ = events.send(ClientEvent::Shell(item));
+                        let _ = events.send(ClientEvent::Shell(item)).await;
                     }
-                    Err(error) => report(events, "shell", error.to_string()),
+                    Err(error) => report(events, "shell", error.to_string()).await,
                 },
                 Some(Err(error)) => break SessionEnd::Closed(format!("Shell subscription failed: {error}")),
                 None => break SessionEnd::Closed("Shell subscription ended.".into()),
@@ -187,12 +193,12 @@ async fn run_session(
                             if let Some(sequence) = thread_sequence(&item) {
                                 resume.threads.insert(thread_id.clone(), Some(sequence));
                             }
-                            let _ = events.send(ClientEvent::Thread { thread_id, item: Box::new(item) });
+                            let _ = events.send(ClientEvent::Thread { thread_id, item: Box::new(item) }).await;
                         }
-                        Err(error) => report(events, &format!("thread {thread_id}"), error.to_string()),
+                        Err(error) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
                     },
                     Some(Err(RpcError::Closed)) | None => {}
-                    Some(Err(error)) => report(events, &format!("thread {thread_id}"), error.to_string()),
+                    Some(Err(error)) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
                 }
             }
             command = commands.recv() => match command {
@@ -223,23 +229,34 @@ async fn run_session(
     end
 }
 
+/// Keeps one thread subscribed for the life of the session. A stream that ends or fails on a
+/// healthy connection resubscribes from the last sequence it delivered, as `threads.ts` retries.
 fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx: mpsc::Sender<ThreadFrame>) -> JoinHandle<()> {
-    let stream = session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(thread_id, sequence));
+    let session = session.clone();
     let thread_id = thread_id.to_owned();
     tokio::spawn(async move {
-        let Ok(mut stream) = stream else { return };
-        while let Some(value) = stream.receiver.recv().await {
-            if tx.send((thread_id.clone(), Some(value))).await.is_err() {
+        let mut sequence = sequence;
+        loop {
+            let Ok(mut stream) = session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, sequence)) else {
                 return;
+            };
+            while let Some(value) = stream.receiver.recv().await {
+                if let Ok(item) = &value {
+                    sequence = item.get("snapshotSequence").or_else(|| item.get("sequence")).and_then(Value::as_u64).or(sequence);
+                }
+                let closed = matches!(value, Err(RpcError::Closed));
+                if tx.send((thread_id.clone(), Some(value))).await.is_err() || closed {
+                    return;
+                }
             }
+            tokio::time::sleep(THREAD_RETRY).await;
         }
-        let _ = tx.send((thread_id, None)).await;
     })
 }
 
 fn shell_sequence(item: &ShellStreamItem) -> Option<u64> {
     match item {
-        ShellStreamItem::Snapshot { snapshot } => Some(snapshot.snapshot_sequence),
+        ShellStreamItem::Snapshot { snapshot, .. } => Some(snapshot.snapshot_sequence),
         ShellStreamItem::ProjectUpdated { sequence, .. }
         | ShellStreamItem::ProjectRemoved { sequence, .. }
         | ShellStreamItem::ThreadUpdated { sequence, .. }
@@ -256,7 +273,7 @@ fn thread_sequence(item: &ThreadStreamItem) -> Option<u64> {
     }
 }
 
-fn report(events: &mpsc::UnboundedSender<ClientEvent>, context: &str, message: String) {
-    tracing::warn!(context, %message, "stream decode failed");
-    let _ = events.send(ClientEvent::StreamError { context: context.to_owned(), message });
+async fn report(events: &Events, context: &str, message: String) {
+    tracing::warn!(context, %message, "stream failed");
+    let _ = events.send(ClientEvent::StreamError { context: context.to_owned(), message }).await;
 }

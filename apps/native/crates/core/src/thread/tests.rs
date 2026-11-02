@@ -34,6 +34,7 @@ fn run(id: &str, status: &str) -> Value {
 fn projection(items: Vec<Value>, runs: Vec<Value>) -> ThreadProjection {
     let visible: Vec<Value> = items
         .iter()
+        .filter(|item| item.get("id").is_some())
         .enumerate()
         .map(|(position, item)| json!({
             "position": position, "visibility": "local", "sourceThreadId": "t1",
@@ -123,9 +124,14 @@ fn touch_events_do_not_bump_activity_and_unknown_events_are_skipped() {
 fn unknown_turn_item_types_are_filtered_from_snapshots() {
     let mut weird = base_item("w", 5, None);
     weird.as_object_mut().unwrap().insert("type".into(), json!("hologram"));
-    let p = projection(vec![assistant("a", 1, None, "x"), weird], vec![]);
+    let p = projection(vec![assistant("a", 1, None, "x"), weird, json!({"type": "from_the_future"})], vec![]);
     assert_eq!(p.turn_items.len(), 1);
     assert_eq!(visible_ids(&p), ["a"]);
+    let minimal: ThreadStreamItem = serde_json::from_value(json!({
+        "kind": "event", "sequence": 9, "event": {"type": "brand.new", "payload": {}}
+    }))
+    .unwrap();
+    assert!(matches!(minimal, ThreadStreamItem::Event { ref event, .. } if matches!(event.body, EventBody::Unknown(_))));
 }
 
 #[test]

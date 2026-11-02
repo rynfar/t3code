@@ -67,3 +67,23 @@ fn unknown_stream_kinds_decode_and_are_ignored() {
     let mut state = ShellState::default();
     assert!(!state.apply(item(json!({"kind": "something.new", "sequence": 5}))));
 }
+
+#[test]
+fn identity_enrichment_snapshot_keeps_threads_and_only_updates_identity() {
+    let mut state = ShellState::default();
+    state.apply(snapshot_item(3));
+    let enrichment = item(json!({
+        "kind": "snapshot",
+        "resolvedRepositoryIdentityRoots": ["/w"],
+        "snapshot": {
+            "schemaVersion": 1, "snapshotSequence": 3, "archivedThreads": [], "threads": [],
+            "projects": [{"id": "p1", "title": "T3", "workspaceRoot": "/w", "defaultModelSelection": null,
+                          "repositoryIdentity": {"canonicalKey": "github.com/x/y"},
+                          "scripts": [], "createdAt": "2026-11-01T00:00:00.000Z", "updatedAt": "2026-11-01T00:00:00.000Z"}]
+        }
+    }));
+    assert!(state.apply(enrichment));
+    let snapshot = state.snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.threads.len(), 1);
+    assert_eq!(snapshot.projects[0].repository_identity, Some(json!({"canonicalKey": "github.com/x/y"})));
+}

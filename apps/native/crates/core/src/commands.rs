@@ -14,15 +14,17 @@ pub mod method {
 
 pub const CREATION_SOURCE: &str = "web";
 
+/// Asks for the `synchronized` marker so "no rows" can mean empty rather than still loading.
 pub fn subscribe_shell(after_sequence: Option<u64>) -> Value {
-    match after_sequence {
-        Some(sequence) => json!({ "afterSequence": sequence }),
-        None => json!({}),
+    let mut payload = json!({ "requestCompletionMarker": true });
+    if let Some(sequence) = after_sequence {
+        payload["afterSequence"] = json!(sequence);
     }
+    payload
 }
 
 pub fn subscribe_thread(thread_id: &str, after_sequence: Option<u64>) -> Value {
-    let mut payload = json!({ "threadId": thread_id });
+    let mut payload = json!({ "threadId": thread_id, "requestCompletionMarker": true });
     if let Some(sequence) = after_sequence {
         payload["afterSequence"] = json!(sequence);
     }

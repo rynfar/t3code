@@ -1,10 +1,14 @@
 //! One Effect RPC session over one WebSocket. The protocol never reopens its socket; the
-//! supervisor makes a new session on disconnect. Streams ack every chunk (the server waits for
-//! acks before sending more), and a silent socket is dropped after `PING_TIMEOUT`.
+//! supervisor makes a new session on disconnect.
+//!
+//! Flow control mirrors `RpcClient`: a chunk is acked only after the consumer took its values,
+//! and the server waits for acks. Each stream has its own in-order delivery task, so the socket
+//! reader never waits on a consumer and one slow stream cannot stall requests, other streams, or
+//! heartbeats.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -13,11 +17,14 @@ use t3_core::rpc::{ClientMessage, RequestId, RpcFailure, ServerMessage, decode_s
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const STREAM_QUEUE: usize = 256;
+/// Full thread snapshots can be large until bounded snapshots land (ledger TV-HISTORY).
+const MAX_MESSAGE_BYTES: usize = 256 << 20;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RpcError {
@@ -29,7 +36,19 @@ pub enum RpcError {
 
 enum Pending {
     Unary(oneshot::Sender<Result<Value, RpcError>>),
-    Stream(mpsc::Sender<Result<Value, RpcError>>),
+    Stream(mpsc::UnboundedSender<Delivery>),
+}
+
+enum Delivery {
+    Chunk(Vec<Value>),
+    Fail(RpcError),
+}
+
+/// `None` once the session closed: later requests fail immediately instead of waiting forever.
+type PendingMap = Arc<Mutex<Option<HashMap<RequestId, Pending>>>>;
+
+fn lock(pending: &PendingMap) -> MutexGuard<'_, Option<HashMap<RequestId, Pending>>> {
+    pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone)]
@@ -38,12 +57,6 @@ pub struct Session {
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
     closed: watch::Receiver<Option<String>>,
-}
-
-type PendingMap = Arc<Mutex<HashMap<RequestId, Pending>>>;
-
-fn lock(pending: &Mutex<HashMap<RequestId, Pending>>) -> MutexGuard<'_, HashMap<RequestId, Pending>> {
-    pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct StreamHandle {
@@ -60,36 +73,43 @@ impl Drop for StreamHandle {
 
 impl Session {
     pub async fn connect(url: &str) -> Result<Session, String> {
-        let (socket, _) = tokio::time::timeout(OPEN_TIMEOUT, tokio_tungstenite::connect_async(url))
+        let config = WebSocketConfig {
+            max_message_size: Some(MAX_MESSAGE_BYTES),
+            max_frame_size: Some(MAX_MESSAGE_BYTES),
+            ..Default::default()
+        };
+        let connect = tokio_tungstenite::connect_async_with_config(url, Some(config), false);
+        let (socket, _) = tokio::time::timeout(OPEN_TIMEOUT, connect)
             .await
             .map_err(|_| "Timed out opening the WebSocket.".to_owned())?
             .map_err(describe_ws_error)?;
         let (mut sink, mut stream) = socket.split();
         let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(Some(HashMap::new())));
         let (closed_tx, closed) = watch::channel(None);
 
-        let reader_pending = pending.clone();
-        let reader_outbound = outbound.clone();
+        // Acks go through a weak handle so the task does not keep its own session alive: when
+        // every `Session` and `StreamHandle` is gone, `outbound_rx` closes and the socket shuts.
+        let task_pending = pending.clone();
         tokio::spawn(async move {
             let mut last_frame = Instant::now();
             let mut ping = tokio::time::interval(PING_INTERVAL);
             let reason = loop {
                 tokio::select! {
                     frame = stream.next() => {
-                        let Some(frame) = frame else { break "Disconnected.".to_owned() };
                         let text = match frame {
-                            Ok(Message::Text(text)) => text,
-                            Ok(Message::Binary(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
-                            Ok(Message::Close(_)) => break "Server closed the connection.".to_owned(),
-                            Ok(_) => { last_frame = Instant::now(); continue }
-                            Err(error) => break describe_ws_error(error),
+                            None => break "Disconnected.".to_owned(),
+                            Some(Ok(Message::Text(text))) => text,
+                            Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+                            Some(Ok(Message::Close(_))) => break "Server closed the connection.".to_owned(),
+                            Some(Ok(_)) => { last_frame = Instant::now(); continue }
+                            Some(Err(error)) => break describe_ws_error(error),
                         };
                         last_frame = Instant::now();
                         match decode_server_frame(&text) {
                             Ok(messages) => {
-                                for message in messages {
-                                    route(message, &reader_pending, &reader_outbound).await;
+                                if let Some(reason) = messages.into_iter().find_map(|m| route(m, &task_pending)) {
+                                    break reason;
                                 }
                             }
                             Err(error) => tracing::warn!(%error, "undecodable server frame"),
@@ -111,14 +131,15 @@ impl Session {
                     }
                 }
             };
-            let entries: Vec<Pending> = lock(&reader_pending).drain().map(|(_, entry)| entry).collect();
-            for entry in entries {
+            let _ = sink.close().await;
+            let entries = lock(&task_pending).take().unwrap_or_default();
+            for (_, entry) in entries {
                 match entry {
                     Pending::Unary(tx) => {
                         let _ = tx.send(Err(RpcError::Closed));
                     }
                     Pending::Stream(tx) => {
-                        let _ = tx.try_send(Err(RpcError::Closed));
+                        let _ = tx.send(Delivery::Fail(RpcError::Closed));
                     }
                 }
             }
@@ -128,29 +149,52 @@ impl Session {
         Ok(Session { outbound, pending, next_id: Arc::new(AtomicU64::new(1)), closed })
     }
 
-    fn allocate(&self) -> RequestId {
-        self.next_id.fetch_add(1, Ordering::Relaxed).into()
-    }
-
-    fn send_request(&self, id: RequestId, tag: &str, payload: Value) -> Result<(), RpcError> {
-        self.outbound
-            .send(ClientMessage::Request { id, tag: tag.to_owned(), payload, headers: Vec::new() })
-            .map_err(|_| RpcError::Closed)
+    fn start(&self, tag: &str, payload: Value, entry: Pending) -> Result<RequestId, RpcError> {
+        let id: RequestId = self.next_id.fetch_add(1, Ordering::Relaxed).into();
+        let mut pending = lock(&self.pending);
+        let map = pending.as_mut().ok_or(RpcError::Closed)?;
+        map.insert(id.clone(), entry);
+        let request = ClientMessage::Request { id: id.clone(), tag: tag.to_owned(), payload, headers: Vec::new() };
+        if self.outbound.send(request).is_err() {
+            map.remove(&id);
+            return Err(RpcError::Closed);
+        }
+        Ok(id)
     }
 
     pub async fn request(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
-        let id = self.allocate();
         let (tx, rx) = oneshot::channel();
-        lock(&self.pending).insert(id.clone(), Pending::Unary(tx));
-        self.send_request(id, tag, payload)?;
+        self.start(tag, payload, Pending::Unary(tx))?;
         rx.await.unwrap_or(Err(RpcError::Closed))
     }
 
     pub fn stream(&self, tag: &str, payload: Value) -> Result<StreamHandle, RpcError> {
-        let id = self.allocate();
-        let (tx, receiver) = mpsc::channel(STREAM_QUEUE);
-        lock(&self.pending).insert(id.clone(), Pending::Stream(tx));
-        self.send_request(id.clone(), tag, payload)?;
+        let (consumer, receiver) = mpsc::channel(STREAM_QUEUE);
+        let (inbox, mut deliveries) = mpsc::unbounded_channel::<Delivery>();
+        let id = self.start(tag, payload, Pending::Stream(inbox))?;
+        // Weak, so a live stream task never keeps a dropped session's socket open.
+        let acks = self.outbound.downgrade();
+        let ack_id = id.clone();
+        tokio::spawn(async move {
+            while let Some(delivery) = deliveries.recv().await {
+                match delivery {
+                    Delivery::Chunk(values) => {
+                        for value in values {
+                            if consumer.send(Ok(value)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if let Some(outbound) = acks.upgrade() {
+                            let _ = outbound.send(ClientMessage::Ack { request_id: ack_id.clone() });
+                        }
+                    }
+                    Delivery::Fail(error) => {
+                        let _ = consumer.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        });
         Ok(StreamHandle { receiver, id, outbound: self.outbound.clone() })
     }
 
@@ -168,40 +212,34 @@ impl Session {
     }
 }
 
-async fn route(
-    message: ServerMessage,
-    pending: &Mutex<HashMap<RequestId, Pending>>,
-    outbound: &mpsc::UnboundedSender<ClientMessage>,
-) {
+/// Routes one server message. Returns a reason when the whole connection must close.
+fn route(message: ServerMessage, pending: &PendingMap) -> Option<String> {
     match message {
         ServerMessage::Chunk { request_id, values } => {
-            let sender = match lock(pending).get(&request_id) {
-                Some(Pending::Stream(tx)) => tx.clone(),
-                _ => return,
-            };
-            for value in values {
-                // Back-pressure: a slow consumer slows the socket reader instead of growing memory.
-                if sender.send(Ok(value)).await.is_err() {
-                    return;
-                }
+            if let Some(Pending::Stream(inbox)) = lock(pending).as_ref().and_then(|map| map.get(&request_id)) {
+                let _ = inbox.send(Delivery::Chunk(values));
             }
-            let _ = outbound.send(ClientMessage::Ack { request_id });
+            None
         }
         ServerMessage::Exit { request_id, exit } => {
-            let entry = lock(pending).remove(&request_id);
+            // Removing a stream's entry drops its inbox: the delivery task drains what it has, then
+            // the consumer sees the end of the stream.
+            let entry = lock(pending).as_mut().and_then(|map| map.remove(&request_id));
             match (entry, exit.into_result()) {
                 (Some(Pending::Unary(tx)), result) => {
                     let _ = tx.send(result.map_err(RpcError::from));
                 }
-                (Some(Pending::Stream(tx)), Err(failure)) => {
-                    let _ = tx.send(Err(RpcError::Failure(failure))).await;
+                (Some(Pending::Stream(inbox)), Err(failure)) => {
+                    let _ = inbox.send(Delivery::Fail(RpcError::Failure(failure)));
                 }
                 _ => {}
             }
+            None
         }
-        ServerMessage::Defect { defect } => tracing::warn!(%defect, "server defect"),
-        ServerMessage::ClientProtocolError { error } => tracing::warn!(%error, "client protocol error"),
-        ServerMessage::Pong | ServerMessage::Unknown => {}
+        // Both are connection-wide in `RpcClient`: every pending call fails.
+        ServerMessage::Defect { defect } => Some(format!("Server error: {defect}")),
+        ServerMessage::ClientProtocolError { error } => Some(format!("Protocol error: {error}")),
+        ServerMessage::Pong | ServerMessage::Unknown => None,
     }
 }
 

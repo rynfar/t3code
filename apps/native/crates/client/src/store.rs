@@ -4,9 +4,24 @@ use std::path::PathBuf;
 
 use crate::auth::Credentials;
 
+fn base() -> Option<PathBuf> {
+    std::env::var_os("T3_NATIVE_HOME").map(PathBuf::from).or_else(|| dirs::config_dir().map(|dir| dir.join("T3 Code Native")))
+}
+
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("T3_NATIVE_HOME").map(PathBuf::from).or_else(|| dirs::config_dir().map(|dir| dir.join("T3 Code Native")))?;
-    Some(base.join("connection.json"))
+    Some(base()?.join("connection.json"))
+}
+
+/// The thread that was open last, restored on launch the way the web restores its route.
+pub fn load_last_thread() -> Option<String> {
+    std::fs::read_to_string(base()?.join("last-thread")).ok().map(|id| id.trim().to_owned()).filter(|id| !id.is_empty())
+}
+
+pub fn save_last_thread(thread_id: &str) {
+    if let Some(base) = base() {
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::write(base.join("last-thread"), thread_id);
+    }
 }
 
 pub fn load() -> Option<Credentials> {

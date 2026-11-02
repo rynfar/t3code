@@ -13,7 +13,7 @@ use t3_core::turn_item::{TurnItem, TurnItemKind};
 use crate::app_state::{AppEvent, AppState};
 use crate::transcript_row::render_item;
 
-pub const CONTENT_MAX_WIDTH: f32 = 768.;
+pub const CONTENT_MAX_WIDTH: f32 = 736.;
 
 struct Row {
     id: String,
@@ -32,7 +32,7 @@ pub struct ThreadView {
 impl ThreadView {
     pub fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
-            if matches!(event, AppEvent::ThreadChanged | AppEvent::SelectionChanged) {
+            if matches!(event, AppEvent::Thread | AppEvent::Selection) {
                 this.sync_rows(cx);
             }
         });
@@ -136,7 +136,7 @@ impl Render for ThreadView {
                     .w_full()
                     .flex()
                     .justify_center()
-                    .px_6()
+                    .px(px(48.))
                     .child(
                         div()
                             .w_full()

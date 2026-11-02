@@ -175,8 +175,12 @@ pub enum EventBody {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawEvent {
+    // Unknown event types only need `type`; known ones are checked by their payload decode.
+    #[serde(default)]
     id: String,
+    #[serde(default)]
     thread_id: String,
+    #[serde(default)]
     occurred_at: String,
     #[serde(rename = "type")]
     kind: String,

@@ -23,7 +23,7 @@ impl ConnectView {
                 }
             }),
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
-                if matches!(event, AppEvent::PhaseChanged) {
+                if matches!(event, AppEvent::Phase) {
                     cx.notify();
                 }
             }),

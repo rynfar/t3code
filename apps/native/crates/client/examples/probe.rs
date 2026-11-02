@@ -3,6 +3,7 @@
 //!
 //!   cargo run -p t3-client --example probe -- --pair 'http://127.0.0.1:3773/pair#token=…'
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --seconds 10
+//!   cargo run -p t3-client --example probe -- --thread <thread-id> --send "hello"   # costs a turn
 
 use std::time::Duration;
 
@@ -29,6 +30,17 @@ async fn main() -> anyhow::Result<()> {
     let (client, mut events) = start(&tokio::runtime::Handle::current(), credentials);
     if let Some(thread_id) = flag("--thread") {
         client.open_thread(&thread_id);
+        if let Some(text) = flag("--send") {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            let command = t3_core::commands::send_message(
+                &command_id,
+                &thread_id,
+                &text,
+                &t3_core::commands::DispatchMode::QueueAfterActive,
+            );
+            let client = client.clone();
+            tokio::spawn(async move { println!("dispatch: {:?}", client.dispatch(command).await) });
+        }
     }
     let mut shell = ShellState::default();
     let mut thread = ThreadState::default();
@@ -42,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(ClientEvent::Status(status)) => println!("status: {status:?}"),
                 Some(ClientEvent::Shell(item)) => {
                     let label = match &item {
-                        ShellStreamItem::Snapshot { snapshot } => format!(
+                        ShellStreamItem::Snapshot { snapshot, .. } => format!(
                             "snapshot seq={} projects={} threads={}",
                             snapshot.snapshot_sequence, snapshot.projects.len(), snapshot.threads.len()
                         ),
