@@ -4,8 +4,8 @@
 
 use gpui::{App, Context, Entity, IntoElement, SharedString};
 use t3_core::client_settings::{
-    ClientSettingChange, ClientSettingsDoc, NotificationMode, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
-    TimestampFormat, project_grouping_from_toggle,
+    ClientSettingChange, ClientSettingsDoc, NOTIFICATION_MODES, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
+    TimestampFormat, notification_mode_value, project_grouping_from_toggle,
 };
 use t3_core::composer::{FollowUpBehavior, SendShortcut};
 
@@ -47,11 +47,11 @@ impl SettingsView {
                     .description("System alerts when a thread finishes, fails, or needs input or approval. Applies to this device while T3 Code is open.")
                     .highlighted(self.is_target("thread-notifications"))
                     .control(
-                        Select::new("thread-notifications-select", literal_options(NotificationMode::ALL, NotificationMode::as_str, NotificationMode::label))
-                            .selected(doc.notification_mode().as_str())
+                        Select::new("thread-notifications-select", literal_options(&NOTIFICATION_MODES, notification_mode_value, |mode| mode.label()))
+                            .selected(notification_mode_value(doc.notification_mode()))
                             .width(224.)
                             .on_change(move |value, _, cx| {
-                                if let Some(mode) = NotificationMode::parse(&value) {
+                                if let Some(mode) = NOTIFICATION_MODES.into_iter().find(|mode| notification_mode_value(*mode) == value.as_ref()) {
                                     store::update_client(&notification_state, ClientSettingChange::NotificationMode(mode), cx);
                                 }
                             }),

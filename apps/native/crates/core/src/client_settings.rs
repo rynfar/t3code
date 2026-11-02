@@ -7,6 +7,7 @@
 use serde_json::{Map, Value};
 
 use crate::composer::ClientSettings;
+pub use crate::notifications::NotificationMode;
 
 macro_rules! literal_enum {
     ($(#[$meta:meta])* $name:ident { $($variant:ident => $wire:literal : $label:literal),+ $(,)? } default $default:ident) => {
@@ -46,16 +47,6 @@ macro_rules! literal_enum {
         }
     };
 }
-
-literal_enum!(
-    /// `NotificationMode`, labelled as `NOTIFICATION_MODE_LABELS` in `web/src/threadNotifications.ts`.
-    NotificationMode {
-        Off => "off": "Off",
-        Notifications => "notifications": "Notifications only",
-        Sound => "sound": "Sound only",
-        NotificationsAndSound => "notifications-and-sound": "Notifications with sound",
-    } default Off
-);
 
 literal_enum!(
     /// `SidebarProjectGroupingMode`. The switch shows on for both repository modes.
@@ -110,6 +101,20 @@ literal_enum!(
         Dark => "dark": "Dark",
     } default System
 );
+
+/// Every `NotificationMode` in the web's select order.
+pub const NOTIFICATION_MODES: [NotificationMode; 4] =
+    [NotificationMode::Off, NotificationMode::Notifications, NotificationMode::Sound, NotificationMode::NotificationsAndSound];
+
+/// The wire value of a notification mode.
+pub fn notification_mode_value(mode: NotificationMode) -> &'static str {
+    match mode {
+        NotificationMode::Off => "off",
+        NotificationMode::Notifications => "notifications",
+        NotificationMode::Sound => "sound",
+        NotificationMode::NotificationsAndSound => "notifications-and-sound",
+    }
+}
 
 pub const MIN_INTERFACE_FONT_SIZE: u32 = 12;
 pub const MAX_INTERFACE_FONT_SIZE: u32 = 20;
@@ -180,7 +185,7 @@ impl ClientSettingChange {
         use crate::composer::{FollowUpBehavior, SendShortcut};
         let text = |value: &str| Value::String(value.to_owned());
         match self {
-            ClientSettingChange::NotificationMode(mode) => ("notificationMode", text(mode.as_str())),
+            ClientSettingChange::NotificationMode(mode) => ("notificationMode", text(notification_mode_value(*mode))),
             ClientSettingChange::InAppNotifications(on) => ("inAppNotificationsEnabled", Value::Bool(*on)),
             ClientSettingChange::ProjectGrouping(mode) => ("sidebarProjectGroupingMode", text(mode.as_str())),
             ClientSettingChange::ProjectSortOrder(order) => ("sidebarProjectSortOrder", text(order.as_str())),
@@ -276,7 +281,7 @@ impl ClientSettingsDoc {
     }
 
     pub fn notification_mode(&self) -> NotificationMode {
-        self.literal("notificationMode", NotificationMode::parse)
+        self.entries.get("notificationMode").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default()
     }
 
     pub fn in_app_notifications(&self) -> bool {
