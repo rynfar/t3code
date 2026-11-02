@@ -10,6 +10,10 @@ publish.workspace = true
 name = "t3-native"
 path = "src/main.rs"
 
+[features]
+# Offscreen screenshots through GPUI's test renderer (`src/snapshot.rs`); off in normal builds.
+snapshot = ["gpui/test-support", "gpui_platform/test-support"]
+
 [dependencies]
 t3-core.workspace = true
 t3-client.workspace = true

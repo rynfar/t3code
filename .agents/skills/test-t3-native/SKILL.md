@@ -59,6 +59,26 @@ apps/native/scripts/snap.sh /path/to/out.png
 - Real agent turns cost money: use the `Replay (dev)` provider for streaming tests, or a
   provider's cheapest model when the change depends on that provider.
 
+## Screenshots without screen recording
+
+When the screen is locked or screen recording is denied, a real window gets no frames and
+`snap.sh` fails. Render the real views offscreen instead (GPUI's Metal test renderer):
+
+```sh
+cd apps/native
+export T3_NATIVE_HOME="$(git rev-parse --show-toplevel)/.t3/native"   # whose saved connection to use
+cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
+  [--thread <id>] [--right-panel diff] [--settings appearance] [--palette] \
+  [--width 1440] [--height 900] [--dark | --light] [--wait 6]
+```
+
+- `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher);
+  `--settings` a section (`appearance`, `chat`, `keybindings`, …).
+- It only subscribes and reads; it never writes to the server. Local UI state goes to a
+  throwaway copy of the home, so `T3_NATIVE_HOME` keeps its panels and last thread.
+- One PNG per run at 2x. The first build with the feature compiles GPUI's test support once.
+- Backdrop blur (dialogs, menus, the composer) may render without blur offscreen.
+
 ## 4. Clean up
 
 Stop the app and dev server by the PIDs you captured. Never kill by name or pattern.

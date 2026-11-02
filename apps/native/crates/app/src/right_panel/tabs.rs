@@ -25,6 +25,14 @@ const SURFACE_ACTIONS: &[SurfaceAction] = &[
     SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface },
 ];
 
+/// Opens the launcher entry named `label` (case-insensitive), as clicking it would.
+#[cfg(feature = "snapshot")]
+pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<AppState>) -> bool {
+    let Some(action) = SURFACE_ACTIONS.iter().find(|action| action.label.eq_ignore_ascii_case(label)) else { return false };
+    (action.open)(state, cx);
+    true
+}
+
 fn surface_icon(surface: &Surface) -> Icon {
     match surface.kind {
         SurfaceKind::Diff => Icon::FileDiff,

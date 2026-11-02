@@ -21,6 +21,8 @@ mod pull_requests;
 mod quit_hold;
 mod right_panel;
 mod settings;
+#[cfg(feature = "snapshot")]
+mod snapshot;
 mod sidebar;
 mod snooze_dialog;
 mod terminal;
@@ -31,7 +33,7 @@ mod toast;
 mod transcript;
 mod workspace;
 
-use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
+use gpui::{App, Bounds, Entity, TitlebarOptions, Window, WindowBounds, WindowOptions, point, prelude::*, px, size};
 use gpui_component::Root;
 
 #[cfg(target_os = "macos")]
@@ -56,24 +58,20 @@ fn main() {
     let handle = runtime.handle().clone();
     std::mem::forget(runtime);
 
+    #[cfg(feature = "snapshot")]
+    if let Some(options) = snapshot::Options::from_args() {
+        snapshot::run(options, handle);
+        return;
+    }
+
     gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
-        gpui_component::init(cx);
-        theme::init(cx);
-        composer::init(cx);
-        keymap::init(cx);
-        let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
+        let state = boot(handle.clone(), cx);
         cx.on_system_notification_response({
             let state = state.downgrade();
             move |response, cx| {
                 let _ = state.update(cx, |state, cx| state.open_notification(&response.tag, cx));
             }
         });
-        menus::init(state.clone(), cx);
-        settings::init(state.clone(), cx);
-        new_thread::init(state.clone(), cx);
-        right_panel::init(state.clone(), cx);
-        pull_requests::init(state.clone(), cx);
-        terminal::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(
             WindowOptions {
@@ -86,13 +84,31 @@ fn main() {
                 window_min_size: Some(size(px(720.), px(480.))),
                 ..Default::default()
             },
-            |window, cx| {
-                theme::follow_system_appearance(window, cx);
-                let view = cx.new(|cx| workspace::Workspace::new(state.clone(), window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            },
+            |window, cx| root_view(&state, window, cx),
         )
         .expect("open window");
         cx.activate(true);
     });
+}
+
+/// The app's globals, actions and state; shared by the window and the offscreen snapshot.
+fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppState> {
+    gpui_component::init(cx);
+    theme::init(cx);
+    composer::init(cx);
+    keymap::init(cx);
+    let state = cx.new(|cx| app_state::AppState::new(runtime, cx));
+    menus::init(state.clone(), cx);
+    settings::init(state.clone(), cx);
+    new_thread::init(state.clone(), cx);
+    right_panel::init(state.clone(), cx);
+    pull_requests::init(state.clone(), cx);
+    terminal::init(cx);
+    state
+}
+
+fn root_view(state: &Entity<app_state::AppState>, window: &mut Window, cx: &mut App) -> Entity<Root> {
+    theme::follow_system_appearance(window, cx);
+    let view = cx.new(|cx| workspace::Workspace::new(state.clone(), window, cx));
+    cx.new(|cx| Root::new(view, window, cx))
 }
