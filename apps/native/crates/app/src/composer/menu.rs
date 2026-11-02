@@ -404,6 +404,10 @@ impl Composer {
             }
         }
         self.menu.highlighted = None;
+        // A click on a row leaves the caret where typing continues; `/model` hands focus to the picker.
+        if !self.picker_open {
+            self.focus(window, cx);
+        }
         cx.notify();
     }
 
