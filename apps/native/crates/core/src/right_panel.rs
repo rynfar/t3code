@@ -2,8 +2,8 @@
 //! panel shows, and the closed-tab history `cmd-shift-t` reopens. Ports `apps/web/src/rightPanelStore.ts`
 //! (`upsertSurface`, `toggle`, `closeSurface`, `closeOtherSurfaces`, `closeSurfacesToRight`,
 //! `closeAllSurfaces`, `moveSurface`, `setMaximized`), `apps/web/src/closedViewStore.ts` and
-//! `planNextReopen` from `apps/web/src/reopenClosedView.ts`. Surfaces other than the diff plug in
-//! as new `Surface` variants.
+//! `planNextReopen` from `apps/web/src/reopenClosedView.ts`, with the file surfaces' `openFile` and
+//! `navigateFolder`. Other surfaces plug in as new `Surface` variants.
 
 use std::collections::HashMap;
 
@@ -24,6 +24,23 @@ pub struct Surface {
 pub enum SurfaceKind {
     Diff,
     PullRequests,
+    /// The workspace explorer on its own.
+    Files,
+    /// A file (or, until its read says otherwise, a folder) at a workspace-relative or host path.
+    /// `reveal_request_id` grows on every open so opening the same line again scrolls again.
+    #[serde(rename_all = "camelCase")]
+    File {
+        relative_path: String,
+        #[serde(default, deserialize_with = "reveal_line")]
+        reveal_line: Option<u64>,
+        #[serde(default)]
+        reveal_request_id: u64,
+    },
+}
+
+/// `normalizeRevealLine`: a positive whole line, anything else none.
+fn reveal_line<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| value.as_f64()).filter(|line| line.is_finite()).map(|line| line.trunc().max(1.) as u64))
 }
 
 impl Surface {
@@ -36,15 +53,31 @@ impl Surface {
         Surface { id: "pull-requests".to_owned(), kind: SurfaceKind::PullRequests }
     }
 
+    pub fn files() -> Surface {
+        Surface { id: "files".to_owned(), kind: SurfaceKind::Files }
+    }
+
+    pub fn file(relative_path: &str, reveal_line: Option<u64>, reveal_request_id: u64) -> Surface {
+        Surface {
+            id: format!("file:{relative_path}"),
+            kind: SurfaceKind::File { relative_path: relative_path.to_owned(), reveal_line, reveal_request_id },
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// `surfaceTitle` in `RightPanelTabs.tsx`.
-    pub fn title(&self) -> &'static str {
-        match self.kind {
-            SurfaceKind::Diff => "Diff",
-            SurfaceKind::PullRequests => "Pull requests",
+    /// `surfaceTitle` in `RightPanelTabs.tsx`: a file tab shows its name.
+    pub fn title(&self) -> String {
+        match &self.kind {
+            SurfaceKind::Diff => "Diff".to_owned(),
+            SurfaceKind::PullRequests => "Pull requests".to_owned(),
+            SurfaceKind::Files => "Files".to_owned(),
+            SurfaceKind::File { relative_path, .. } => {
+                let start = relative_path.rfind(['/', '\\']).map_or(0, |index| index + 1);
+                relative_path[start..].to_owned()
+            }
         }
     }
 }
@@ -339,6 +372,71 @@ impl RightPanels {
             let Some(from) = panel.surfaces.iter().position(|surface| surface.id() == surface_id) else { return };
             let surface = panel.surfaces.remove(from);
             panel.surfaces.insert(to_index.min(panel.surfaces.len()), surface);
+        })
+    }
+
+    /// `openFile`: `None` opens the explorer; a path replaces the standalone explorer with its
+    /// file tab (which carries the explorer beside it) and asks for a fresh reveal.
+    pub fn open_file(&mut self, thread_id: &str, path: Option<&str>, line: Option<u64>) -> bool {
+        let Some(path) = path else { return self.open(thread_id, Surface::files()) };
+        self.update(thread_id, |panel| {
+            panel.surfaces.retain(|surface| surface.kind != SurfaceKind::Files);
+            let id = format!("file:{path}");
+            let previous = panel.surfaces.iter().find_map(|surface| match &surface.kind {
+                SurfaceKind::File { reveal_request_id, .. } if surface.id == id => Some(*reveal_request_id),
+                _ => None,
+            });
+            let surface = Surface::file(path, line.map(|line| line.max(1)), previous.unwrap_or(0) + 1);
+            panel.is_open = true;
+            panel.active_surface_id = Some(id.clone());
+            match panel.surfaces.iter_mut().find(|entry| entry.id == id) {
+                Some(existing) => *existing = surface,
+                None => panel.surfaces.push(surface),
+            }
+        })
+    }
+
+    /// `navigateFolder` without the breadcrumb trail: replaces `surface_id` with the folder
+    /// (`""` is the explorer), or opens it beside the source when `keep_source`.
+    pub fn navigate_folder(&mut self, thread_id: &str, surface_id: &str, folder: &str, keep_source: bool) -> bool {
+        self.update(thread_id, |panel| {
+            let Some(index) = panel.surfaces.iter().position(|surface| surface.id == surface_id) else { return };
+            let target = if folder.is_empty() { Surface::files() } else { Surface::file(folder, None, 1) };
+            let exists = panel.surfaces.iter().enumerate().any(|(i, surface)| i != index && surface.id == target.id);
+            let source = panel.surfaces[index].clone();
+            let mut surfaces = Vec::with_capacity(panel.surfaces.len() + 1);
+            for (i, surface) in panel.surfaces.drain(..).enumerate() {
+                if i == index {
+                    if keep_source {
+                        surfaces.push(source.clone());
+                    }
+                    if !exists {
+                        surfaces.push(target.clone());
+                    }
+                } else if exists || !matches!(target.kind, SurfaceKind::File { .. }) || surface.kind != SurfaceKind::Files {
+                    surfaces.push(surface);
+                }
+            }
+            panel.surfaces = surfaces;
+            panel.is_open = true;
+            panel.active_surface_id = Some(target.id);
+        })
+    }
+
+    /// `reconcileFileSurfaces`: without a workspace, file tabs and the explorer close.
+    pub fn close_file_surfaces(&mut self, thread_id: &str) -> bool {
+        self.update(thread_id, |panel| {
+            let before = panel.surfaces.len();
+            panel.surfaces.retain(|surface| !matches!(surface.kind, SurfaceKind::Files | SurfaceKind::File { .. }));
+            if panel.surfaces.len() == before {
+                return;
+            }
+            if panel.surfaces.is_empty() {
+                panel.is_open = false;
+            }
+            if panel.active().is_none() {
+                panel.active_surface_id = panel.surfaces.last().map(|surface| surface.id.clone());
+            }
         })
     }
 
