@@ -371,6 +371,8 @@ pub struct Shown<'a> {
     /// The host answered this text, so its matches stand even where no row field shows it.
     pub answered: bool,
     pub sort: Sort,
+    /// The listing's state: a row an action moved out of it leaves (`applyPullRequestOverrides`).
+    pub state: ListState,
 }
 
 pub fn shown_groups(input: &Shown) -> Vec<Group> {
@@ -378,7 +380,8 @@ pub fn shown_groups(input: &Shown) -> Vec<Group> {
     let mut rows: Vec<usize> = (0..input.entries.len())
         .filter(|index| {
             let entry = &input.entries[*index];
-            matches_involvement(entry, input.viewers, input.involvement)
+            input.state.holds(entry.state)
+                && matches_involvement(entry, input.viewers, input.involvement)
                 && (input.filters.is_empty() || matches_filters(entry, input.filters, entry_viewer(entry, input.viewers).as_deref()))
                 && (input.text.is_empty() || (input.answered && searching.contains(entry.host.as_str())) || matches_query(entry, input.text))
         })

@@ -104,20 +104,45 @@ fn runs(raw: &str, separator: impl Fn(char) -> bool) -> Vec<&str> {
     out
 }
 
-fn tokens(raw: &str) -> Vec<&str> {
-    runs(raw, char::is_whitespace)
+/// JavaScript's `\s`: Unicode `White_Space` without U+0085, plus U+FEFF.
+fn js_whitespace(c: char) -> bool {
+    c == '\u{feff}' || (c.is_whitespace() && c != '\u{85}')
 }
 
+/// What `.` refuses to match without the `s` flag.
+fn js_line_terminator(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
+fn tokens(raw: &str) -> Vec<&str> {
+    runs(raw, js_whitespace)
+}
+
+/// `.replaceAll('"', "").trim()`, trimming what JavaScript's `trim` does.
 fn qualifier_value(raw: &str) -> String {
-    raw.replace('"', "").trim().to_owned()
+    raw.replace('"', "").trim_matches(js_whitespace).to_owned()
 }
 
 fn split_qualifier_list(raw: &str) -> Vec<String> {
     runs(raw, |c| c == ',').into_iter().map(qualifier_value).filter(|part| !part.is_empty()).collect()
 }
 
+/// `value.slice(0, max)`: `max` UTF-16 code units. A pair the bound splits is dropped, since a
+/// Rust string cannot hold half of one.
+pub fn truncate_utf16(value: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (index, c) in value.char_indices() {
+        units += c.len_utf16();
+        if units > max {
+            return &value[..index];
+        }
+    }
+    value
+}
+
+/// `.slice(0, max).trim()`.
 fn truncate(value: &str, max: usize) -> String {
-    value.chars().take(max).collect::<String>().trim().to_owned()
+    truncate_utf16(value, max).trim_matches(js_whitespace).to_owned()
 }
 
 fn bounded_names(names: Vec<String>) -> Vec<String> {
@@ -135,7 +160,7 @@ fn qualifier(token: &str) -> Option<(bool, &str, &str)> {
     let mut chars = key.chars();
     let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    (valid && !rest[colon + 1..].contains('\n')).then(|| (negated, key, &rest[colon + 1..]))
+    (valid && !rest[colon + 1..].contains(js_line_terminator)).then(|| (negated, key, &rest[colon + 1..]))
 }
 
 fn review_value(value: &str) -> Option<ReviewFilter> {
@@ -281,6 +306,37 @@ mod tests {
         assert_eq!(parse_query(&format!("label:{many}")).filters.labels[0].len(), 10);
         let long = "x".repeat(250);
         assert_eq!(parse_query(&format!("author:{long}")).filters.author.map(|a| a.len()), Some(200));
+    }
+
+    #[test]
+    fn separators_are_javascripts_whitespace() {
+        assert_eq!(tokens("a\u{feff}b"), vec!["a", "b"]);
+        assert_eq!(tokens("a\u{85}b"), vec!["a\u{85}b"]);
+        assert_eq!(tokens("a\u{3000}b\u{2028}c\u{a0}d"), vec!["a", "b", "c", "d"]);
+        let parsed = parse_query("label:bug\u{feff}fix");
+        assert_eq!((parsed.text.as_str(), parsed.filters.labels.clone()), ("fix", labels(&[&["bug"]])));
+    }
+
+    #[test]
+    fn a_quoted_line_break_keeps_the_token_as_text() {
+        for line_break in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+            let raw = format!("label:\"a{line_break}b\"");
+            let parsed = parse_query(&raw);
+            assert!(parsed.filters.is_empty(), "{line_break:?}");
+            assert_eq!(parsed.text, raw);
+        }
+        assert_eq!(parse_query("label:\"a\tb\"").filters.labels, labels(&[&["a\tb"]]));
+    }
+
+    #[test]
+    fn bounds_count_utf16_units_as_slice_does() {
+        let astral = "😀".repeat(150);
+        assert_eq!(parse_query(&format!("author:{astral}")).filters.author.map(|a| a.encode_utf16().count()), Some(200));
+        // A pair the bound splits is dropped: a Rust string cannot hold half of one.
+        let split = format!("x{astral}");
+        assert_eq!(parse_query(&format!("author:{split}")).filters.author.map(|a| a.encode_utf16().count()), Some(199));
+        assert_eq!(parse_query(&format!("label:{split}")).filters.labels[0][0].encode_utf16().count(), 199);
+        assert_eq!(truncate_utf16("ab", 5), "ab");
     }
 
     #[test]

@@ -422,6 +422,18 @@ impl DiffPanel {
         cx.notify();
     }
 
+    /// Runs `handler` after each scroll of the rows, for a detached panel that loads more as
+    /// the reader nears the end.
+    pub fn on_rows_scrolled(&self, handler: impl FnMut(&gpui::ListScrollEvent, &mut Window, &mut gpui::App) + 'static) {
+        self.list.set_scroll_handler(handler);
+    }
+
+    /// Whether the last row sits within `margin` below the viewport, as last laid out.
+    pub fn near_end(&self, margin: Pixels) -> bool {
+        let count = self.list.item_count();
+        count > 0 && self.list.bounds_for_item(count - 1).is_some_and(|row| row.top() <= self.list.viewport_bounds().bottom() + margin)
+    }
+
     pub fn is_external(&self) -> bool {
         self.external.is_some()
     }

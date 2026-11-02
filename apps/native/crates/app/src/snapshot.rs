@@ -17,7 +17,8 @@ use t3_core::settings::search::{NAV_GROUPS, Section};
 use crate::app_state::AppState;
 
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
-[--settings <section>] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] [--width 1440] [--height 900] \
+[--settings <section>] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
+[--pull-requests] [--pull-request <number> [--pull-request-tab code]] [--width 1440] [--height 900] \
 [--dark|--light] [--wait 6]";
 
 pub struct Options {
@@ -32,6 +33,9 @@ pub struct Options {
     attach: Vec<PathBuf>,
     /// Typed into the composer last, so a trigger such as `@src` or `/` opens its menu.
     prompt: Option<String>,
+    pull_requests: bool,
+    pull_request: Option<u64>,
+    pull_request_code: bool,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -55,6 +59,9 @@ impl Options {
             new_thread: has("--new-thread"),
             attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
             prompt: flag("--prompt"),
+            pull_requests: has("--pull-requests"),
+            pull_request: flag("--pull-request").and_then(|value| value.trim_start_matches('#').parse().ok()),
+            pull_request_code: flag("--pull-request-tab").is_some_and(|tab| tab == "code"),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -155,6 +162,13 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     if let Some(name) = &options.settings {
         let section = section(name).ok_or_else(|| format!("unknown settings section {name:?}"))?;
         cx.update(|cx| crate::settings::open(section, cx));
+    }
+    if options.pull_requests || options.pull_request.is_some() {
+        if let Some(number) = options.pull_request {
+            cx.update(|cx| cx.set_global(crate::pull_requests::SnapshotSelection { number, code: options.pull_request_code }));
+        }
+        state.update(&mut cx, |state, cx| state.set_pull_requests_open(true, cx));
+        pump(&mut cx, options.wait, |_| false);
     }
     if options.palette {
         // Actions bubble from the focused element; an offscreen window starts with none.

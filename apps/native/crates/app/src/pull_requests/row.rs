@@ -57,7 +57,7 @@ fn entry_row(page: &PullRequestsPage, index: usize, window: &mut Window, cx: &mu
     let reference = PrRef::of(entry);
     let key = entry_key(entry);
     let selected = page.selected.as_ref() == Some(&reference);
-    let acting = page.acting.contains(&key);
+    let acting = super::mutations::pending(&reference, cx).is_some();
     let actions = quick_actions(entry.state, entry.is_draft, &host_actions(&result.providers, entry));
     let show_actions = !actions.is_empty() && (page.shift || acting);
     let elsewhere = matched_elsewhere(entry, &parse_query(&page.typed).text);

@@ -49,29 +49,58 @@ fn workflow_runs_awaiting_approval_say_so() {
 #[test]
 fn primary_control_follows_state_and_permissions() {
     let mut pr = detail();
-    assert_eq!(primary_control(&pr), Some(PrimaryControl::Merge));
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::Merge));
     assert_eq!(pr.allowed_merge_methods(), vec![MergeMethod::Merge]);
     pr.auto_merge_enabled = Some(false);
     pr.checks = vec![check("ci", CheckStatus::Pending)];
-    assert_eq!(primary_control(&pr), Some(PrimaryControl::EnableAutoMerge));
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::EnableAutoMerge));
     pr.auto_merge_enabled = Some(true);
-    assert_eq!(primary_control(&pr), Some(PrimaryControl::AutoMergeArmed));
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::AutoMergeArmed));
     pr.is_draft = true;
-    assert_eq!(primary_control(&pr), Some(PrimaryControl::Ready));
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::Ready));
     pr.viewer_permissions.actions.retain(|action| *action != Action::Ready);
-    assert_eq!(primary_control(&pr), None);
+    assert_eq!(primary_control(&pr, false), None);
     pr.mergeability = Mergeability::Conflicting;
-    assert_eq!(primary_control(&pr), Some(PrimaryControl::Resolve));
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::Resolve));
     pr.state = PrState::Merged;
-    assert_eq!(primary_control(&pr), Some(PrimaryControl::Merged));
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::Merged));
 }
 
 #[test]
-fn merge_method_prefers_current_then_last_selected() {
+fn merge_method_prefers_current_then_project_default_then_last_selected() {
     let allowed = [MergeMethod::Squash, MergeMethod::Rebase];
-    assert_eq!(resolve_merge_method(&allowed, None, Some(MergeMethod::Rebase)), MergeMethod::Rebase);
-    assert_eq!(resolve_merge_method(&allowed, Some(MergeMethod::Merge), None), MergeMethod::Squash);
-    assert_eq!(resolve_merge_method(&[], None, None), MergeMethod::Merge);
+    assert_eq!(resolve_merge_method(&allowed, None, None, Some(MergeMethod::Rebase)), MergeMethod::Rebase);
+    assert_eq!(resolve_merge_method(&allowed, None, Some(MergeMethod::Squash), Some(MergeMethod::Rebase)), MergeMethod::Squash);
+    assert_eq!(resolve_merge_method(&allowed, Some(MergeMethod::Rebase), Some(MergeMethod::Squash), None), MergeMethod::Rebase);
+    assert_eq!(resolve_merge_method(&allowed, None, Some(MergeMethod::Merge), Some(MergeMethod::Rebase)), MergeMethod::Rebase);
+    assert_eq!(resolve_merge_method(&allowed, Some(MergeMethod::Merge), None, None), MergeMethod::Squash);
+    assert_eq!(resolve_merge_method(&[], None, None, None), MergeMethod::Merge);
+}
+
+fn stack(layers: serde_json::Value) -> Stack {
+    decode(json!({ "id": "s1", "number": 9, "url": "https://git.cafe/acme/app/stacks/9", "base": "main", "layers": layers })).expect("stack decodes")
+}
+
+#[test]
+fn a_stack_owns_merging_where_the_host_runs_stack_actions() {
+    let mut pr = detail();
+    let found = Ok(Some(stack(json!([{ "number": 7, "headBranch": "h", "state": "open", "headSha": "a" }]))));
+    let gate = merge_gate(&pr, None);
+    assert_eq!(gate, MergeGate { single: true, stack_owns: false, blocked: None });
+    assert_eq!(merge_gate(&pr, Some(&found)), gate);
+    pr.capabilities.stacks = Some(true);
+    assert_eq!(merge_gate(&pr, Some(&found)), gate);
+    pr.capabilities.stack_actions = Some(true);
+    assert_eq!(merge_gate(&pr, None), MergeGate { single: false, stack_owns: false, blocked: Some("Checking stack membership…") });
+    assert_eq!(merge_gate(&pr, Some(&Err("down".into()))), MergeGate { single: false, stack_owns: false, blocked: Some("Couldn't check stack membership") });
+    assert_eq!(merge_gate(&pr, Some(&Ok(None))), gate);
+    let owned = merge_gate(&pr, Some(&found));
+    assert!(!owned.single && owned.stack_owns);
+    assert_eq!(primary_control(&pr, owned.stack_owns), None);
+    assert_eq!(primary_control(&pr, false), Some(PrimaryControl::Merge));
+    pr.auto_merge_enabled = Some(false);
+    pr.checks = vec![check("ci", CheckStatus::Pending)];
+    assert_eq!(primary_control(&pr, true), None);
 }
 
 #[test]

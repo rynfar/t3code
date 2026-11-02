@@ -1,11 +1,13 @@
 //! The Code tab (`PullRequestCodeTab.tsx`): the patch from `POST /api/pull-requests/diff`, read in
-//! slices (`nextCursor`) and parsed on the network runtime, shown in the diff panel.
+//! slices (`nextCursor`) as the reader nears the end of what is loaded, each slice parsed once on
+//! the network runtime (`sliceParses`) and the parses joined there for the diff panel.
 
 use std::sync::Arc;
 
 use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
+use t3_core::diff::{FileDiff, ParsedPatch};
 use t3_core::pull_requests::wire::{DiffResult, decode};
 use t3_core::pull_requests::{PrRef, failure_message};
 
@@ -14,34 +16,62 @@ use crate::app_state::AppState;
 use crate::diff::{DiffPanel, External, Parsed};
 use crate::theme::{hsla, palette};
 
-/// A cap on slices held, so a huge change cannot grow without bound.
-const MAX_SLICES: usize = 10;
+/// The sentinel's `rootMargin`: the next slice is read once the end is this close.
+const NEAR_END: f32 = 240.;
 
 pub struct CodeTab {
     state: Entity<AppState>,
     reference: PrRef,
     panel: Entity<DiffPanel>,
-    /// Patches read so far, in order.
-    slices: Vec<String>,
+    /// Each slice's own parse, in order.
+    slices: Vec<Arc<Parsed>>,
+    /// Where the next slice starts, read once the reader nears the end.
     next_cursor: Option<String>,
-    truncated: bool,
     pending: bool,
     error: Option<String>,
+    /// Counts reloads, so a slice read before one is dropped.
+    generation: u64,
+    near_end_check: bool,
     _fetch: Option<Task<()>>,
 }
 
 impl CodeTab {
     pub fn new(state: Entity<AppState>, reference: PrRef, cx: &mut Context<Self>) -> Self {
         let panel = cx.new(|cx| DiffPanel::detached(state.clone(), cx));
-        let mut tab = CodeTab { state, reference, panel, slices: Vec::new(), next_cursor: None, truncated: false, pending: false, error: None, _fetch: None };
+        let this = cx.entity().downgrade();
+        let rows = panel.downgrade();
+        // The list holds its state borrowed while it reports a scroll, so it is read afterwards.
+        panel.read(cx).on_rows_scrolled(move |_, _, cx| {
+            let (this, rows) = (this.clone(), rows.clone());
+            cx.defer(move |cx| {
+                let near = rows.upgrade().is_some_and(|rows| rows.read(cx).near_end(px(NEAR_END)));
+                if near && let Some(this) = this.upgrade() {
+                    this.update(cx, |tab, cx| tab.load_next(cx));
+                }
+            });
+        });
+        let mut tab = CodeTab { state, reference, panel, slices: Vec::new(), next_cursor: None, pending: false, error: None, generation: 0, near_end_check: false, _fetch: None };
         tab.fetch(None, cx);
         tab
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
         self.slices.clear();
         self.next_cursor = None;
         self.fetch(None, cx);
+    }
+
+    /// `canLoadNextSlice`: never after a failure, which would retry without end.
+    fn can_load_next(&self) -> bool {
+        self.next_cursor.is_some() && !self.pending && self.error.is_none()
+    }
+
+    fn load_next(&mut self, cx: &mut Context<Self>) {
+        if self.can_load_next() {
+            let cursor = self.next_cursor.clone();
+            self.fetch(cursor, cx);
+        }
     }
 
     fn fetch(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
@@ -53,30 +83,30 @@ impl CodeTab {
         if let Some(cursor) = &cursor {
             payload["cursor"] = json!(cursor);
         }
-        let held = self.slices.join("\n");
+        let held = self.slices.clone();
         let task = self.state.read(cx).runtime().spawn(async move {
             let value = client.pull_request_diff(payload).await.map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
             let diff: DiffResult = decode(value)?;
-            let patch = if held.is_empty() { diff.patch.clone() } else { format!("{held}\n{}", diff.patch) };
-            let parsed = Parsed::new(&patch, diff.truncated || diff.next_cursor.is_some(), None, None, None);
-            Ok::<_, String>((diff, parsed))
+            let slice = Parsed::new(&diff.patch, diff.truncated, None, None, None);
+            let joined = join(&held, &slice, diff.truncated || diff.next_cursor.is_some());
+            Ok::<_, String>((diff.next_cursor, slice, joined))
         });
+        let generation = self.generation;
         self.pending = true;
         self.error = None;
         self.show(cx);
         self._fetch = Some(cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
             let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.pending = false;
                 match result {
-                    Ok((diff, parsed)) => {
-                        this.slices.push(diff.patch);
-                        this.next_cursor = diff.next_cursor.filter(|_| this.slices.len() < MAX_SLICES);
-                        this.truncated = diff.truncated;
-                        this.show_parsed(parsed, cx);
-                        if let Some(cursor) = this.next_cursor.clone() {
-                            this.fetch(Some(cursor), cx);
-                        }
+                    Ok((next_cursor, slice, joined)) => {
+                        this.slices.push(slice);
+                        this.next_cursor = next_cursor;
+                        this.show_parsed(joined, cx);
                     }
                     Err(error) => {
                         this.error = Some(error);
@@ -107,9 +137,45 @@ impl CodeTab {
     }
 }
 
+/// The held slices and a new one as one patch for the panel. Each slice keeps its own parse, so
+/// a new slice costs one parse plus copies of the files before it, all off the UI thread.
+fn join(held: &[Arc<Parsed>], slice: &Arc<Parsed>, truncated: bool) -> Arc<Parsed> {
+    if held.is_empty() && slice.truncated == truncated {
+        return slice.clone();
+    }
+    let slices = || held.iter().chain(std::iter::once(slice));
+    let files: Vec<FileDiff> = slices().flat_map(|slice| slice.files().iter().cloned()).collect();
+    let patch = if files.is_empty() {
+        slices()
+            .find_map(|slice| match &slice.patch {
+                ParsedPatch::Raw { text, reason } => Some(ParsedPatch::Raw { text: text.clone(), reason }),
+                _ => None,
+            })
+            .unwrap_or(ParsedPatch::Empty)
+    } else {
+        ParsedPatch::Files(files)
+    };
+    let max_line_len = slices().map(|slice| slice.max_line_len).max().unwrap_or(0);
+    Arc::new(Parsed { patch, truncated, totals: None, base_ref: None, head_ref: None, max_line_len })
+}
+
 impl Render for CodeTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        // A slice that does not fill the panel leaves the end in view with nothing to scroll, so
+        // the next one is read once this frame's rows are laid out.
+        if self.can_load_next() && !self.near_end_check {
+            self.near_end_check = true;
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |tab, cx| {
+                    tab.near_end_check = false;
+                    if tab.panel.read(cx).near_end(px(NEAR_END)) {
+                        tab.load_next(cx);
+                    }
+                });
+            });
+        }
         let failed = self.error.is_some();
         let first = self.slices.is_empty();
         let partial = (!first && self.pending) || failed;

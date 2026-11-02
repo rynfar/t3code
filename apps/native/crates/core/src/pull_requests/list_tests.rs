@@ -166,6 +166,7 @@ fn shown_groups_keep_host_matches_only_when_answered() {
         text: "alpha",
         answered,
         sort: Sort::Updated,
+        state: ListState::All,
     };
     assert!(shown_groups(&input(true))[0].entries.is_empty());
     let mut asked = entries.clone();
@@ -174,6 +175,19 @@ fn shown_groups_keep_host_matches_only_when_answered() {
     assert_eq!(numbers(&asked, &shown_groups(&answered)[0].entries), vec![1, 2]);
     let local = Shown { entries: &asked, ..input(false) };
     assert_eq!(numbers(&asked, &shown_groups(&local)[0].entries), vec![1]);
+}
+
+#[test]
+fn shown_groups_drop_rows_an_action_moved_out_of_the_state_filter() {
+    let mut closed = entry(2, "closed");
+    closed.state = PrState::Closed;
+    let entries = vec![entry(1, "open"), closed];
+    let viewers = viewers();
+    let filters = ListFilters::default();
+    let shown = |state| Shown { entries: &entries, viewers: &viewers, providers: &[], involvement: Involvement::All, filters: &filters, text: "", answered: false, sort: Sort::Updated, state };
+    assert_eq!(numbers(&entries, &shown_groups(&shown(ListState::Open))[0].entries), vec![1]);
+    assert_eq!(numbers(&entries, &shown_groups(&shown(ListState::Closed))[0].entries), vec![2]);
+    assert_eq!(shown_groups(&shown(ListState::All))[0].entries.len(), 2);
 }
 
 #[test]

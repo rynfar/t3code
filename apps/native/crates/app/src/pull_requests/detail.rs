@@ -1,26 +1,26 @@
 //! The pull request detail panel (`PullRequestDetailPanel.tsx`): its reads, the header with the
 //! primary control and the actions menu (`PullRequestDetailActions.tsx`,
 //! `PullRequestActionsMenu.tsx`) with the web's two-step confirmations
-//! (`useInlineActionConfirm.ts`), and the Summary, Timeline and Code tabs.
+//! (`useInlineActionConfirm.ts`), the stack merge where the host runs stack actions
+//! (`PullRequestStackMenu.tsx`), and the Summary, Timeline and Code tabs.
 
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Task, WeakEntity, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, div, prelude::*, px,
 };
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
-use serde_json::json;
-use t3_core::pull_requests::detail::{PrimaryControl, StateKind, change_request_term, merge_method_label, primary_control, resolve_merge_method};
-use t3_core::pull_requests::wire::{Action, Activity, Detail, ListEntry, MergeMethod, PrState, decode};
-use t3_core::pull_requests::{PrRef, action_done_label, action_input, method};
+use t3_core::pull_requests::detail::{MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate, merge_method_label, primary_control, resolve_merge_method};
+use t3_core::pull_requests::wire::{Action, Activity, Detail, ListEntry, MergeMethod, PrState, Stack, decode};
+use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge};
 
 use super::code::CodeTab;
 use super::controls::{BadgeKind, Button, Size, Variant, badge, diff_stat, state_glyph};
-use super::page::{PullRequestsPage, action_verb};
-use super::{Read, read, settle};
-use crate::app_state::AppState;
+use super::mutations::{self, MergePicks, Mutations};
+use super::page::PullRequestsPage;
+use super::{read, settle};
+use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::right_panel::{segment, segmented};
 use crate::theme::{hsla, palette};
@@ -31,12 +31,27 @@ type ViewAction = Box<dyn Fn(&mut DetailView, &mut Context<DetailView>)>;
 
 /// How long a first click stays armed (`useInlineActionConfirm`).
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+/// The confirmation a menu item arms, shown beside the primary control.
+const INLINE_CONFIRM: &str = "pr-confirm-inline";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
     Summary,
     Timeline,
     Code,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirm {
+    Action(Action),
+    Stack,
+}
+
+/// A first click on `element`; only a second click on the same element runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Armed {
+    confirm: Confirm,
+    element: &'static str,
 }
 
 pub struct DetailView {
@@ -50,27 +65,36 @@ pub struct DetailView {
     pub(super) activity_error: Option<String>,
     pub(super) checks_open: bool,
     tab: Tab,
+    /// This pull request's own merge method pick (`mergeMethodSelection`).
     merge_method: Option<MergeMethod>,
-    armed: Option<Action>,
-    pending_action: Option<Action>,
+    /// `pullRequests.stack` where the host runs stack actions; `None` until it first answers.
+    stack: Option<Result<Option<Stack>, String>>,
+    stack_pending: bool,
+    refreshing: bool,
+    armed: Option<Armed>,
     pub(super) markdown: MarkdownStore,
     pub(super) timeline: Vec<t3_core::pull_requests::detail::TimelineEvent>,
     pub(super) timeline_list: gpui::ListState,
     code: Option<Entity<CodeTab>>,
     _detail: Option<Task<()>>,
     _activity: Option<Task<()>>,
+    _stack: Option<Task<()>>,
     _disarm: Option<Task<()>>,
+    _escape: Option<Subscription>,
+    _activation: Option<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DetailView {
-    pub fn new(
-        state: Entity<AppState>,
-        page: WeakEntity<PullRequestsPage>,
-        reference: PrRef,
-        entry: Option<ListEntry>,
-        merge_method: Option<MergeMethod>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(state: Entity<AppState>, page: WeakEntity<PullRequestsPage>, reference: PrRef, entry: Option<ListEntry>, cx: &mut Context<Self>) -> Self {
+        let subscriptions = vec![
+            cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Selection | AppEvent::Phase) {
+                    this.disarm(cx);
+                }
+            }),
+            cx.observe_global::<Mutations>(|_, cx| cx.notify()),
+        ];
         let mut view = DetailView {
             state,
             page,
@@ -82,21 +106,28 @@ impl DetailView {
             activity_error: None,
             checks_open: false,
             tab: Tab::Summary,
-            merge_method,
+            merge_method: None,
+            stack: None,
+            stack_pending: false,
+            refreshing: false,
             armed: None,
-            pending_action: None,
             markdown: MarkdownStore::new(cx.entity_id()),
             timeline: Vec::new(),
             timeline_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(600.)),
             code: None,
             _detail: None,
             _activity: None,
+            _stack: None,
             _disarm: None,
+            _escape: None,
+            _activation: None,
+            _subscriptions: subscriptions,
         };
         view.refresh(cx);
         view
     }
 
+    /// Re-reads the detail, its activity and stack membership, and the patch if it was read.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let detail = read(state, method::DETAIL, self.reference.payload(), decode::<Detail>);
@@ -108,6 +139,7 @@ impl DetailView {
                     Ok(detail) => {
                         this.detail = Some(detail);
                         this.error = None;
+                        this.refresh_stack(cx);
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -134,6 +166,46 @@ impl DetailView {
         }
     }
 
+    /// "Refresh from host": this pull request's host reads are dropped
+    /// (`pullRequests.invalidate({ reference })`), then everything re-read.
+    pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
+        let task = read(self.state.read(cx), method::INVALIDATE, invalidate_input(Some(&self.reference)), |_| Ok(()));
+        self.refreshing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let _ = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.refreshing = false;
+                this.refresh(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Stack membership, read only where the host runs stack actions. The last answer stands
+    /// while it is re-read; the merge itself checks again before it runs.
+    fn refresh_stack(&mut self, cx: &mut Context<Self>) {
+        let supported = self.detail.as_ref().is_some_and(|detail| detail.capabilities.stacks == Some(true) && detail.capabilities.stack_actions == Some(true));
+        if !supported {
+            self._stack = None;
+            return;
+        }
+        let task = read(self.state.read(cx), method::STACK, self.reference.payload(), decode::<Option<Stack>>);
+        self._stack = Some(cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.stack = Some(result);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn retry_stack(&mut self, cx: &mut Context<Self>) {
+        self.stack = None;
+        self.refresh_stack(cx);
+        cx.notify();
+    }
+
     /// `pullRequests.checks` for the Checks section, when the detail's are out of date.
     pub(super) fn refresh_checks(&mut self, cx: &mut Context<Self>) {
         let task = read(self.state.read(cx), method::CHECKS, self.reference.payload(), t3_core::pull_requests::wire::decode_checks);
@@ -150,72 +222,135 @@ impl DetailView {
     }
 
     fn term(&self) -> &'static str {
-        change_request_term(self.detail.as_ref().map(|d| d.provider.as_str()).or(self.entry.as_ref().map(|e| e.provider.as_str())).unwrap_or("github"))
+        change_request_term(self.provider())
     }
 
-    fn selected_merge_method(&self) -> Option<MergeMethod> {
+    fn provider(&self) -> &str {
+        self.detail.as_ref().map(|d| d.provider.as_str()).or(self.entry.as_ref().map(|e| e.provider.as_str())).unwrap_or("github")
+    }
+
+    fn gate(&self) -> MergeGate {
+        self.detail.as_ref().map_or(MergeGate { single: false, stack_owns: false, blocked: None }, |detail| merge_gate(detail, self.stack.as_ref()))
+    }
+
+    fn picks(&self, cx: &gpui::App) -> MergePicks {
+        self.page
+            .upgrade()
+            .map(|page| page.read(cx).merge_picks(&self.reference.project_id, self.merge_method, cx))
+            .unwrap_or(MergePicks { current: self.merge_method, ..Default::default() })
+    }
+
+    fn selected_merge_method(&self, cx: &gpui::App) -> Option<MergeMethod> {
         let detail = self.detail.as_ref()?;
         let allowed = detail.allowed_merge_methods();
-        (!allowed.is_empty()).then(|| resolve_merge_method(&allowed, self.merge_method, None))
+        let picks = self.picks(cx);
+        (!allowed.is_empty()).then(|| resolve_merge_method(&allowed, picks.current, picks.project_default, picks.last))
     }
 
-    /// A first click arms; a second within the window runs it (`useInlineActionConfirm`).
-    fn confirm(&mut self, action: Action, cx: &mut Context<Self>) {
-        if self.armed == Some(action) {
-            self.armed = None;
-            self._disarm = None;
-            self.perform(action, cx);
+    /// A first click arms; a second on the same control within the window runs it
+    /// (`useInlineActionConfirm`). Escape, a press anywhere else, the window losing focus, or a
+    /// change of view disarms it.
+    fn confirm(&mut self, confirm: Confirm, element: &'static str, cx: &mut Context<Self>) {
+        let armed = Armed { confirm, element };
+        if self.armed == Some(armed) {
+            self.disarm(cx);
+            match confirm {
+                Confirm::Action(action) => self.perform(action, cx),
+                Confirm::Stack => self.merge_stack(cx),
+            }
             return;
         }
-        self.armed = Some(action);
+        self.armed = Some(armed);
         self._disarm = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(CONFIRM_WINDOW).await;
-            let _ = this.update(cx, |this, cx| {
-                this.armed = None;
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.disarm(cx));
+        }));
+        let this = cx.entity().downgrade();
+        self._escape = Some(cx.intercept_keystrokes(move |event, _, cx| {
+            if event.keystroke.key == "escape"
+                && let Some(this) = this.upgrade()
+            {
+                this.update(cx, |this, cx| this.disarm(cx));
+                cx.stop_propagation();
+            }
         }));
         cx.notify();
     }
 
     fn disarm(&mut self, cx: &mut Context<Self>) {
+        self._disarm = None;
+        self._escape = None;
         if self.armed.take().is_some() {
-            self._disarm = None;
             cx.notify();
         }
     }
 
+    fn armed_on(&self, element: &'static str) -> Option<Confirm> {
+        self.armed.filter(|armed| armed.element == element).map(|armed| armed.confirm)
+    }
+
     fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
-        if self.pending_action.is_some() {
+        if !mutations::begin(&self.reference, action, cx) {
             return;
         }
-        let state = self.state.read(cx);
-        let method = self.selected_merge_method();
-        let task = match action {
-            Action::Merge => merge_with_detail(state, self.reference.clone(), method),
-            _ => read(state, method::RUN_ACTION, action_input(&self.reference, action, method), |_| Ok(())),
+        let task = if action == Action::Merge {
+            let picks = self.picks(cx);
+            mutations::merge(self.state.read(cx), self.reference.clone(), picks, cx)
+        } else {
+            let method = self.selected_merge_method(cx);
+            mutations::run_action(self.state.read(cx), action_input(&self.reference, action, method), cx)
         };
-        self.pending_action = Some(action);
         let term = self.term();
-        let number = self.reference.number;
+        cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                mutations::finish(&this.reference, cx);
+                if let Err(error) = &result {
+                    let toast = Toast::new(ToastKind::Error, action_failed_label(action, term)).description(error.clone());
+                    this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                    return;
+                }
+                let reference = this.reference.clone();
+                if let Some(page) = this.page.upgrade() {
+                    page.update(cx, |page, cx| page.acted(&reference, action, cx));
+                }
+                if action_needs_host_refresh(action) {
+                    this.refresh_from_host(cx);
+                } else {
+                    this.refresh(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A stack-scoped merge of this layer and the unmerged ones below it, with the heads the
+    /// host must still see (`PullRequestStackMenu`'s `run`).
+    fn merge_stack(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(Some(stack))) = &self.stack else { return };
+        let Some(method) = self.selected_merge_method(cx) else { return };
+        let Some(merge) = stack_merge(stack, &self.reference, method) else { return };
+        if !mutations::begin(&self.reference, Action::Merge, cx) {
+            return;
+        }
+        self.stack_pending = true;
+        let task = mutations::run_action(self.state.read(cx), merge.input, cx);
+        let host = host_label(self.provider());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |this, cx| {
-                this.pending_action = None;
+                mutations::finish(&this.reference, cx);
+                this.stack_pending = false;
                 let toast = match &result {
-                    Ok(()) => Toast::new(ToastKind::Success, action_done_label(action, term)).description(format!("#{number}")),
-                    Err(error) => Toast::new(ToastKind::Error, format!("Could not {} #{number}", action_verb(action))).description(error.clone()),
+                    Ok(()) => Toast::new(ToastKind::Success, "Stack merge request completed").description(format!("{host} merged the stack or added it to its merge queue.")),
+                    Err(error) => Toast::new(ToastKind::Error, "Could not merge the stack").description(error.clone()),
                 };
                 this.state.update(cx, |state, cx| state.show_toast(toast, cx));
-                if result.is_ok() {
-                    let reference = this.reference.clone();
-                    if let Some(page) = this.page.upgrade() {
-                        page.update(cx, |page, cx| page.acted(&reference, action, cx));
-                    }
-                    this.refresh(cx);
+                this.refresh(cx);
+                if let Some(page) = this.page.upgrade() {
+                    page.update(cx, |page, cx| page.refetch(cx));
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -229,7 +364,8 @@ impl DetailView {
         cx.notify();
     }
 
-    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    pub(super) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.disarm(cx);
         self.tab = tab;
         if tab == Tab::Code && self.code.is_none() {
             let state = self.state.clone();
@@ -319,71 +455,130 @@ impl DetailView {
         )
     }
 
-    /// The primary control and the actions menu.
+    /// The primary control, the stack merge, the armed menu confirmation and the actions menu.
+    /// An armed control that is no longer shown disarms, as the web's does on unmount.
     fn render_actions(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let Some(detail) = self.detail.clone() else { return h_flex().into_any_element() };
-        let pending = self.pending_action;
-        let armed = self.armed;
-        let method = self.selected_merge_method();
+        let pending = mutations::pending(&self.reference, cx);
+        let busy = pending.is_some();
+        let gate = self.gate();
+        let method = self.selected_merge_method(cx);
         let method_label = merge_method_label(method.unwrap_or(MergeMethod::Merge));
-        let primary: Option<AnyElement> = match primary_control(&detail) {
+        let mut shown: Vec<&'static str> = Vec::new();
+        let mut confirmable = |id: &'static str, button: Button, view: &Self, cx: &mut Context<Self>| {
+            shown.push(id);
+            if view.armed_on(id).is_some() { button.on_mouse_down_out(cx.listener(|this, _, _, cx| this.disarm(cx))) } else { button }
+        };
+        let blocked = gate.blocked.filter(|_| !gate.single && !gate.stack_owns);
+        let primary: Option<AnyElement> = match primary_control(&detail, gate.stack_owns) {
             Some(PrimaryControl::Resolve) => Some(badge(format!("Conflicts with {}", detail.base_branch), BadgeKind::Outline, true, cx).text_color(hsla(p.destructive)).into_any_element()),
             Some(PrimaryControl::Ready) => Some(
                 Button::new("pr-ready", Variant::Default, Size::Xs)
                     .icon(Icon::GitPullRequestArrow)
                     .label(if pending == Some(Action::Ready) { "Marking ready..." } else { "Ready for review" })
-                    .disabled(pending.is_some())
+                    .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.perform(Action::Ready, cx)))
                     .into_any_element(),
             ),
-            Some(PrimaryControl::Merge) => Some(
-                Button::new("pr-merge", Variant::Default, Size::Xs)
-                    .icon(if armed == Some(Action::Merge) { Icon::Check } else { Icon::GitMerge })
-                    .label(if pending == Some(Action::Merge) { "Merging...".to_owned() } else if armed == Some(Action::Merge) { "Confirm merge?".to_owned() } else { method_label.to_owned() })
-                    .disabled(pending.is_some())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.confirm(Action::Merge, cx)))
-                    .into_any_element(),
-            ),
+            Some(PrimaryControl::Merge) => {
+                let armed = self.armed_on("pr-merge").is_some();
+                let button = Button::new("pr-merge", Variant::Default, Size::Xs)
+                    .icon(if armed { Icon::Check } else { Icon::GitMerge })
+                    .label(if pending == Some(Action::Merge) { "Merging...".to_owned() } else if armed { "Confirm merge?".to_owned() } else { method_label.to_owned() })
+                    .disabled(busy || blocked.is_some())
+                    .when_some(blocked, |button, reason| button.tooltip(reason))
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm(Confirm::Action(Action::Merge), "pr-merge", cx)));
+                Some(confirmable("pr-merge", button, self, cx).into_any_element())
+            }
             Some(PrimaryControl::EnableAutoMerge) => {
+                let armed = self.armed_on("pr-auto-merge").is_some();
                 let label = format!("Auto-merge ({})", method_label.to_lowercase());
-                Some(
-                    Button::new("pr-auto-merge", Variant::Default, Size::Xs)
-                        .icon(if armed == Some(Action::EnableAutoMerge) { Icon::Check } else { Icon::GitMerge })
-                        .label(if pending == Some(Action::EnableAutoMerge) { "Enabling...".to_owned() } else if armed == Some(Action::EnableAutoMerge) { "Confirm auto-merge?".to_owned() } else { label })
-                        .disabled(pending.is_some())
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| this.confirm(Action::EnableAutoMerge, cx)))
-                        .into_any_element(),
-                )
+                let button = Button::new("pr-auto-merge", Variant::Default, Size::Xs)
+                    .icon(if armed { Icon::Check } else { Icon::GitMerge })
+                    .label(if pending == Some(Action::EnableAutoMerge) { "Enabling...".to_owned() } else if armed { "Confirm auto-merge?".to_owned() } else { label })
+                    .disabled(busy || blocked.is_some())
+                    .when_some(blocked, |button, reason| button.tooltip(reason))
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm(Confirm::Action(Action::EnableAutoMerge), "pr-auto-merge", cx)));
+                Some(confirmable("pr-auto-merge", button, self, cx).into_any_element())
             }
             Some(PrimaryControl::AutoMergeArmed) => Some(badge("Auto-merge", BadgeKind::Info, true, cx).into_any_element()),
             Some(PrimaryControl::Merged | PrimaryControl::Closed) | None => None,
         };
-        let close_confirm = (armed == Some(Action::Close)).then(|| {
-            Button::new("pr-confirm-close", Variant::DestructiveOutline, Size::Xs)
-                .icon(Icon::Check)
-                .label(if pending == Some(Action::Close) { "Closing..." } else { "Confirm close?" })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|this, _, _, cx| this.confirm(Action::Close, cx)))
+        let stack = match &self.stack {
+            Some(Ok(Some(stack))) if gate.stack_owns && detail.can(Action::Merge) && method.is_some() => {
+                let layer_open = stack.layers.iter().any(|layer| layer.number == self.reference.number && layer.state == PrState::Open);
+                layer_open.then(|| {
+                    let merge = method.and_then(|method| stack_merge(stack, &self.reference, method));
+                    let armed = self.armed_on("pr-merge-stack").is_some();
+                    let term = |count: usize| if count == 1 { self.term().to_owned() } else { format!("{}s", self.term()) };
+                    let tooltip = merge.as_ref().map_or_else(
+                        || "A layer below is closed, a draft, or has no known head.".to_owned(),
+                        |merge| format!("Merge stack through #{} into {} ({} {})", self.reference.number, stack.base, merge.count, term(merge.count)),
+                    );
+                    let label = if self.stack_pending {
+                        "Merging stack...".to_owned()
+                    } else if armed {
+                        merge.as_ref().map_or_else(|| "Merge stack".to_owned(), |merge| format!("Confirm merging {} {}?", merge.count, term(merge.count)))
+                    } else {
+                        "Merge stack".to_owned()
+                    };
+                    let button = Button::new("pr-merge-stack", Variant::Default, Size::Xs)
+                        .icon(if armed { Icon::Check } else { Icon::GitMerge })
+                        .label(label)
+                        .tooltip(tooltip)
+                        .disabled(busy || merge.is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm(Confirm::Stack, "pr-merge-stack", cx)));
+                    confirmable("pr-merge-stack", button, self, cx)
+                })
+            }
+            _ => None,
+        };
+        let retry_stack = matches!(self.stack, Some(Err(_))).then(|| {
+            Button::new("pr-retry-stack", Variant::Ghost, Size::Xs).label("Retry stack lookup").on_click(cx.listener(|this, _, _, cx| this.retry_stack(cx)))
         });
-        let workflows = detail.workflow_approvals_required.filter(|count| *count > 0 && detail.state == PrState::Open && detail.can(Action::ApproveWorkflows)).map(|_| {
-            Button::new("pr-approve-workflows", Variant::WarningOutline, Size::Xs)
-                .icon(if armed == Some(Action::ApproveWorkflows) { Icon::Check } else { Icon::Hammer })
-                .label(if pending == Some(Action::ApproveWorkflows) { "Approving..." } else if armed == Some(Action::ApproveWorkflows) { "Confirm approve?" } else { "Approve workflows to run" })
-                .disabled(pending.is_some())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|this, _, _, cx| this.confirm(Action::ApproveWorkflows, cx)))
+        let open = detail.state == PrState::Open;
+        let can_merge_now = gate.single && open && !detail.is_draft && detail.can(Action::Merge) && method.is_some();
+        let inline = self.armed_on(INLINE_CONFIRM).and_then(|confirm| match confirm {
+            Confirm::Action(Action::Close) if open && detail.can(Action::Close) => {
+                Some(Button::new(INLINE_CONFIRM, Variant::DestructiveOutline, Size::Xs).icon(Icon::Check).label(if pending == Some(Action::Close) { "Closing..." } else { "Confirm close?" }))
+            }
+            Confirm::Action(Action::Merge) if can_merge_now => Some(Button::new(INLINE_CONFIRM, Variant::Default, Size::Xs).icon(Icon::Check).label("Confirm merge?")),
+            _ => None,
         });
-        h_flex().flex_none().gap(px(4.)).children(workflows).children(primary).children(close_confirm).child(self.actions_menu(&detail, cx)).into_any_element()
+        let inline = inline.map(|button| {
+            let confirm = self.armed_on(INLINE_CONFIRM);
+            let button = button.disabled(busy).on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(confirm) = confirm {
+                    this.confirm(confirm, INLINE_CONFIRM, cx);
+                }
+            }));
+            confirmable(INLINE_CONFIRM, button, self, cx)
+        });
+        let workflows = detail.workflow_approvals_required.filter(|count| *count > 0 && open && detail.can(Action::ApproveWorkflows)).map(|_| {
+            let armed = self.armed_on("pr-approve-workflows").is_some();
+            let button = Button::new("pr-approve-workflows", Variant::WarningOutline, Size::Xs)
+                .icon(if armed { Icon::Check } else { Icon::Hammer })
+                .label(if pending == Some(Action::ApproveWorkflows) { "Approving..." } else if armed { "Confirm approve?" } else { "Approve workflows to run" })
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, _, cx| this.confirm(Confirm::Action(Action::ApproveWorkflows), "pr-approve-workflows", cx)));
+            confirmable("pr-approve-workflows", button, self, cx)
+        });
+        if self.armed.is_some_and(|armed| !shown.contains(&armed.element)) {
+            self.armed = None;
+            self._disarm = None;
+            self._escape = None;
+        }
+        let menu = self.actions_menu(&detail, gate, cx);
+        h_flex().flex_none().gap(px(4.)).children(retry_stack).children(workflows).children(stack).children(primary).children(inline).child(menu).into_any_element()
     }
 
-    fn actions_menu(&self, detail: &Detail, cx: &mut Context<Self>) -> impl IntoElement {
+    fn actions_menu(&self, detail: &Detail, gate: MergeGate, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().downgrade();
         let detail = detail.clone();
-        let pending = self.pending_action.is_some();
-        let selected = self.selected_merge_method();
+        let pending = mutations::pending(&self.reference, cx).is_some();
+        let selected = self.selected_merge_method(cx);
+        let refreshing = self.refreshing;
         let term = self.term();
         let act = move |entity: &WeakEntity<DetailView>, run: ViewAction| {
             let entity = entity.clone();
@@ -394,7 +589,7 @@ impl DetailView {
             }
         };
         Button::new("pr-actions", Variant::Ghost, Size::IconSm).icon(Icon::Ellipsis).tooltip("More actions").dropdown_menu(move |menu, _, _| {
-            let mut menu = menu.item(PopupMenuItem::new("Refresh from host").on_click(act(&entity, Box::new(|view, cx| view.refresh(cx)))));
+            let mut menu = menu.item(PopupMenuItem::new(if refreshing { "Refreshing..." } else { "Refresh from host" }).disabled(refreshing).on_click(act(&entity, Box::new(|view, cx| view.refresh_from_host(cx)))));
             if detail.state == PrState::Open {
                 menu = menu.separator();
                 let toggle = if detail.is_draft { Action::Ready } else { Action::Draft };
@@ -402,10 +597,10 @@ impl DetailView {
                     let label = if detail.is_draft { "Ready for review" } else { "Convert to draft" };
                     menu = menu.item(PopupMenuItem::new(label).disabled(pending).on_click(act(&entity, Box::new(move |view, cx| view.perform(toggle, cx)))));
                 }
-                if !detail.is_draft && detail.can(Action::Merge) && selected.is_some() {
-                    menu = menu.item(PopupMenuItem::new("Merge now").disabled(pending).on_click(act(&entity, Box::new(|view, cx| view.confirm(Action::Merge, cx)))));
+                if gate.single && !detail.is_draft && detail.can(Action::Merge) && selected.is_some() {
+                    menu = menu.item(PopupMenuItem::new("Merge now").disabled(pending).on_click(act(&entity, Box::new(|view, cx| view.confirm(Confirm::Action(Action::Merge), INLINE_CONFIRM, cx)))));
                 }
-                if detail.auto_merge_enabled == Some(true) && detail.can(Action::DisableAutoMerge) {
+                if gate.single && detail.auto_merge_enabled == Some(true) && detail.can(Action::DisableAutoMerge) {
                     menu = menu.item(PopupMenuItem::new("Disable auto-merge").disabled(pending).on_click(act(&entity, Box::new(|view, cx| view.perform(Action::DisableAutoMerge, cx)))));
                 }
                 let methods = detail.allowed_merge_methods();
@@ -430,7 +625,9 @@ impl DetailView {
                 .item(PopupMenuItem::new(format!("Copy {term} link")).on_click(act(&entity, Box::new(move |view, cx| view.copy(link.clone(), "Link", cx)))))
                 .item(PopupMenuItem::new(format!("Copy {term} number")).on_click(act(&entity, Box::new(move |view, cx| view.copy(number.clone(), "Number", cx)))));
             if detail.state == PrState::Open && detail.can(Action::Close) {
-                menu = menu.separator().item(PopupMenuItem::new(format!("Close {term}")).disabled(pending).on_click(act(&entity, Box::new(|view, cx| view.confirm(Action::Close, cx)))));
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::new(format!("Close {term}")).disabled(pending).on_click(act(&entity, Box::new(|view, cx| view.confirm(Confirm::Action(Action::Close), INLINE_CONFIRM, cx)))));
             } else if detail.state == PrState::Closed && detail.can(Action::Reopen) {
                 menu = menu.separator().item(PopupMenuItem::new(format!("Reopen {term}")).disabled(pending).on_click(act(&entity, Box::new(|view, cx| view.perform(Action::Reopen, cx)))));
             }
@@ -458,34 +655,6 @@ fn tab_label(label: &'static str) -> impl IntoElement {
     div().ml(px(6.)).text_xs().font_weight(FontWeight::MEDIUM).child(SharedString::from(label))
 }
 
-/// `PullRequests.runAction` for a merge with a merge method: the detail is re-read fresh, the
-/// merge refused unless it is still open, ready and allowed, then the method chosen.
-pub(super) fn merge_with_detail(state: &AppState, reference: PrRef, preferred: Option<MergeMethod>) -> Read<()> {
-    let client = state.client_handle()?;
-    Some(state.runtime().spawn(async move {
-        let mut fresh = reference.payload();
-        fresh["allowStale"] = json!(false);
-        let detail: Detail = match client.request(method::DETAIL, fresh).await {
-            Ok(value) => decode(value)?,
-            Err(t3_client::session::RpcError::Failure(f)) => return Err(t3_core::pull_requests::failure_message(f.tag.as_deref(), &f.error, &f.message)),
-            Err(_) => return Err(super::NOT_CONNECTED.to_owned()),
-        };
-        if detail.state != PrState::Open || detail.is_draft || !detail.can(Action::Merge) {
-            return Err("This pull request cannot be merged.".to_owned());
-        }
-        let allowed = detail.allowed_merge_methods();
-        if allowed.is_empty() {
-            return Err("No merge method is available for this repository.".to_owned());
-        }
-        let method = resolve_merge_method(&allowed, preferred, None);
-        match client.request(method::RUN_ACTION, action_input(&reference, Action::Merge, Some(method))).await {
-            Ok(_) => Ok(()),
-            Err(t3_client::session::RpcError::Failure(f)) => Err(t3_core::pull_requests::failure_message(f.tag.as_deref(), &f.error, &f.message)),
-            Err(_) => Err(super::NOT_CONNECTED.to_owned()),
-        }
-    }))
-}
-
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
@@ -505,18 +674,18 @@ impl Render for DetailView {
             (None, None) => super::row::ghost("", cx).into_any_element(),
             (Some(_), _) => self.render_tab(window, cx),
         };
+        if self._activation.is_none() {
+            self._activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.disarm(cx);
+                }
+            }));
+        }
         v_flex()
             .id("pr-detail")
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.disarm(cx)))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.armed.is_some() {
-                    this.disarm(cx);
-                    cx.stop_propagation();
-                }
-            }))
             .child(self.render_header(window, cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
     }
