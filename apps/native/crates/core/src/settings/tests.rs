@@ -18,7 +18,7 @@ fn thread_settings_take_contract_defaults() {
     assert_eq!(decoded.threads.sidebar_auto_settle_after_days, Some(3));
     assert!(decoded.threads.sidebar_auto_settle_on_merge);
     assert_eq!(decoded.threads.snooze_presets.len(), 5);
-    assert_eq!(decoded.threads.effective_env_mode(), ThreadEnvMode::Local);
+    assert_eq!(effective_env_mode(&decoded), ThreadEnvMode::Local);
     assert_eq!(decoded.threads.response_streaming_mode, ResponseStreamingMode::Paragraph);
 }
 
@@ -42,14 +42,37 @@ fn thread_settings_decode_values_and_drop_bad_ones_alone() {
     assert!(!threads.sidebar_auto_settle_on_merge);
     assert!(threads.snooze_limited_threads);
     assert_eq!(threads.snooze_presets[1], SnoozePreset::At { day: SnoozeDay::Friday, time: "17:30".into() });
-    assert_eq!(threads.effective_env_mode(), ThreadEnvMode::Worktree);
-    assert_eq!(threads.fallback_model_selection.as_ref().map(|s| s.model.as_str()), Some("gpt-5"));
+    assert_eq!(effective_env_mode(&decoded), ThreadEnvMode::Worktree);
+    assert_eq!(decoded.fallback_model_selection.as_ref().map(|s| s.model.as_str()), Some("gpt-5"), "the composer's field still decodes beside the flattened ones");
     assert_eq!(threads.add_project_base_directory, "~/code");
     assert_eq!(threads.response_streaming_mode, ResponseStreamingMode::Turn);
 
     let out_of_range = settings(json!({"sidebarAutoSettleAfterDays": 400, "snoozePresets": [{"kind": "at", "day": "today", "time": "25:00"}]}));
     assert_eq!(out_of_range.threads.sidebar_auto_settle_after_days, Some(3));
     assert_eq!(out_of_range.threads.snooze_presets, snooze::default_presets());
+}
+
+#[test]
+fn every_flattened_key_reaches_thread_settings() {
+    // A key `ServerSettings` also declares is consumed before the flattened struct sees it.
+    let non_default = json!({
+        "sidebarAutoSettleAfterDays": 7,
+        "sidebarAutoSettleOnMerge": false,
+        "sidebarAutoSettleKeepPullRequests": true,
+        "autoResumeLimitedThreads": true,
+        "snoozeLimitedThreads": true,
+        "snoozePresets": [{"kind": "after", "minutes": 15}],
+        "addProjectBaseDirectory": "~/src",
+        "responseStreamingMode": "turn",
+    });
+    let decoded = settings(non_default.clone()).threads;
+    let defaults = ThreadSettings::default();
+    for key in non_default.as_object().unwrap().keys() {
+        let mut only = serde_json::Map::new();
+        only.insert(key.clone(), non_default[key].clone());
+        assert_ne!(settings(serde_json::Value::Object(only)).threads, defaults, "{key} is shadowed");
+    }
+    assert_eq!(decoded.sidebar_auto_settle_after_days, Some(7));
 }
 
 #[test]

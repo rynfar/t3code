@@ -8,13 +8,14 @@ use gpui::{App, AppContext, Context, Entity, Focusable, IntoElement, ParentEleme
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::client_settings::TimestampFormat;
-use t3_core::composer::{draft_defaults, runtime_mode_description, runtime_mode_label};
+use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
 use t3_core::providers;
-use t3_core::server_config::{RuntimeMode, ServerConfig};
+use t3_core::server_config::{RuntimeMode, ServerConfig, ThreadEnvMode};
 use t3_core::settings::snooze::{self, DurationUnit, SnoozeDay, SnoozePreset};
 use t3_core::settings::{
-    DEFAULT_AUTO_SETTLE_DAYS, MAX_AUTO_SETTLE_DAYS, MIN_AUTO_SETTLE_DAYS, ResponseStreamingMode, ServerSettingChange, ThreadEnvMode,
+    DEFAULT_AUTO_SETTLE_DAYS, ENV_MODES, MAX_AUTO_SETTLE_DAYS, MIN_AUTO_SETTLE_DAYS, ResponseStreamingMode, ServerSettingChange,
+    effective_env_mode,
 };
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, muted_text, r, section};
@@ -176,7 +177,11 @@ impl SettingsView {
         );
 
         let options = model_options(&config);
-        let selection = draft_defaults(Some(&config), "", None, None).model_selection;
+        let selection = settings
+            .default_model_selection
+            .clone()
+            .filter(|selection| providers::instance_enabled(settings, None, &selection.instance_id))
+            .or_else(|| providers::project_default_selection(&providers::entries(&config, None)));
         let automatic = settings.default_model_selection.is_none();
         let model_state = self.state.clone();
         let model_row = Row::new("default-model", "Model")
@@ -208,11 +213,11 @@ impl SettingsView {
         };
 
         let fallback_state = self.state.clone();
-        let fallback = threads.fallback_model_selection.clone().or(selection.clone());
+        let fallback = settings.fallback_model_selection.clone().or(selection.clone());
         let fallback_row = Row::new("fallback-model", "Fallback model")
             .description("Used for new threads when the default model's provider is out of usage.")
             .highlighted(self.is_target("fallback-model"))
-            .reset(threads.fallback_model_selection.is_some(), {
+            .reset(settings.fallback_model_selection.is_some(), {
                 let reset = update(ServerSettingChange::FallbackModelSelection(None));
                 move |_, _, cx| reset(cx)
             });
@@ -220,7 +225,7 @@ impl SettingsView {
             Some(shown) if !options.is_empty() => fallback_row.control(
                 Select::new("fallback-model-select", options)
                     .selected(selection_value(shown))
-                    .label(if threads.fallback_model_selection.is_none() { "None".to_owned() } else { selection_label(&config, shown) })
+                    .label(if settings.fallback_model_selection.is_none() { "None".to_owned() } else { selection_label(&config, shown) })
                     .width(220.)
                     .popup_width(260.)
                     .show_check()
@@ -266,13 +271,13 @@ impl SettingsView {
         let workspace_row = Row::new("new-threads", "Workspace")
             .description("Where new threads start. Projects and their t3.json can override it.")
             .highlighted(self.is_target("new-threads"))
-            .reset(threads.default_thread_env_mode.is_some(), {
+            .reset(settings.default_thread_env_mode.is_some(), {
                 let reset = update(ServerSettingChange::DefaultThreadEnvMode(None));
                 move |_, _, cx| reset(cx)
             })
             .control(
-                Select::new("default-workspace-select", ThreadEnvMode::ALL.iter().map(|mode| SelectOption::new(env_mode_value(*mode), mode.label())).collect())
-                    .selected(env_mode_value(threads.effective_env_mode()))
+                Select::new("default-workspace-select", ENV_MODES.iter().map(|(mode, label)| SelectOption::new(env_mode_value(*mode), *label)).collect())
+                    .selected(env_mode_value(effective_env_mode(settings)))
                     .show_check()
                     .on_change(move |value, _, cx| {
                         let mode = match value.as_ref() {

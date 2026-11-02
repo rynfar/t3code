@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
             let rows = keybindings::rows(&config.keybindings, cfg!(target_os = "macos"));
             println!("keymap  {} commands; first: {:?}", rows.len(), rows.first().map(|row| (&row.label, &row.shortcuts)));
             let threads = &config.settings.threads;
-            println!("threads autoSettleAfterDays={:?} snoozePresets={} envMode={:?}", threads.sidebar_auto_settle_after_days, threads.snooze_presets.len(), threads.default_thread_env_mode);
+            println!("threads autoSettleAfterDays={:?} snoozePresets={} envMode={:?}", threads.sidebar_auto_settle_after_days, threads.snooze_presets.len(), config.settings.default_thread_env_mode);
         }
         return Ok(());
     }

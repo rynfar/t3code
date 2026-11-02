@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 use crate::model::ModelSelection;
-use crate::server_config::{RuntimeMode, ServerSettings};
+use crate::server_config::{RuntimeMode, ServerSettings, ThreadEnvMode};
 use snooze::SnoozePreset;
 
 pub const MIN_AUTO_SETTLE_DAYS: u32 = 1;
@@ -22,24 +22,12 @@ pub const MAX_AUTO_SETTLE_DAYS: u32 = 90;
 /// `DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS`, also what the switch turns back on to.
 pub const DEFAULT_AUTO_SETTLE_DAYS: u32 = 3;
 
-/// `ThreadEnvMode`: where a new thread starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThreadEnvMode {
-    Local,
-    Worktree,
-}
+/// The workspace choices with `resolveEnvModeLabel`'s labels.
+pub const ENV_MODES: [(ThreadEnvMode, &str); 2] = [(ThreadEnvMode::Local, "Current checkout"), (ThreadEnvMode::Worktree, "New worktree")];
 
-impl ThreadEnvMode {
-    pub const ALL: [ThreadEnvMode; 2] = [ThreadEnvMode::Local, ThreadEnvMode::Worktree];
-
-    /// `resolveEnvModeLabel`.
-    pub fn label(self) -> &'static str {
-        match self {
-            ThreadEnvMode::Local => "Current checkout",
-            ThreadEnvMode::Worktree => "New worktree",
-        }
-    }
+/// `resolveProjectSettings` at environment scope: an unset mode starts in the checkout.
+pub fn effective_env_mode(settings: &ServerSettings) -> ThreadEnvMode {
+    settings.default_thread_env_mode.unwrap_or(ThreadEnvMode::Local)
 }
 
 /// `ResponseStreamingMode` with its labels and descriptions.
@@ -87,11 +75,6 @@ pub struct ThreadSettings {
     pub snooze_limited_threads: bool,
     #[serde(deserialize_with = "snooze_presets")]
     pub snooze_presets: Vec<SnoozePreset>,
-    /// Null inherits the repository's t3.json, then the current checkout.
-    #[serde(deserialize_with = "lenient_or")]
-    pub default_thread_env_mode: Option<ThreadEnvMode>,
-    #[serde(deserialize_with = "lenient_or")]
-    pub fallback_model_selection: Option<ModelSelection>,
     #[serde(deserialize_with = "lenient_or")]
     pub add_project_base_directory: String,
     #[serde(deserialize_with = "lenient_or")]
@@ -107,18 +90,9 @@ impl Default for ThreadSettings {
             auto_resume_limited_threads: false,
             snooze_limited_threads: false,
             snooze_presets: snooze::default_presets(),
-            default_thread_env_mode: None,
-            fallback_model_selection: None,
             add_project_base_directory: String::new(),
             response_streaming_mode: ResponseStreamingMode::default(),
         }
-    }
-}
-
-impl ThreadSettings {
-    /// `resolveProjectSettings` at environment scope: an unset mode starts in the checkout.
-    pub fn effective_env_mode(&self) -> ThreadEnvMode {
-        self.default_thread_env_mode.unwrap_or(ThreadEnvMode::Local)
     }
 }
 
