@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use gpui::{AnyElement, App, Context, Focusable, FontWeight, IntoElement, ParentElement, ScrollHandle, SharedString, Styled, Task, Window, div, prelude::*, px, relative};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::composer::context as context_rules;
 use t3_core::composer::menu::{
     self as rules, MenuAction, MenuItem, PathEntry, PathKind, SkillSource, SlashCommand, SlashMenuOptions, ThreadContext, Trigger, TriggerKind,
     TriggerState,
@@ -453,10 +454,26 @@ impl Composer {
         }
     }
 
-    /// Forgets a target's mentioned threads and terminal excerpts once its message went out.
+    /// Forgets a target's mentioned threads and terminal excerpts once a stash took them.
     pub(super) fn clear_mentions(&mut self, target: &Target) {
         self.menu.threads.remove(target);
         self.clear_terminals(target);
+    }
+
+    /// The threads a send's `prompt` links; the rest go with the prompt's history.
+    pub(super) fn take_threads(&mut self, target: &Target, prompt: &str) -> Vec<ThreadContext> {
+        self.menu.threads.get_mut(target).map(|held| context_rules::take_for_send(held, prompt)).unwrap_or_default()
+    }
+
+    pub(super) fn restore_threads(&mut self, target: &Target, sent: Vec<ThreadContext>) {
+        context_rules::restore_unsent(self.menu.threads.entry(target.clone()).or_default(), sent);
+    }
+
+    /// Threads `prompt` no longer links go once its undo history does.
+    pub(super) fn reset_thread_history(&mut self, target: &Target, prompt: &str) {
+        if let Some(held) = self.menu.threads.get_mut(target) {
+            context_rules::reset_history(held, prompt);
+        }
     }
 
     pub(super) fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

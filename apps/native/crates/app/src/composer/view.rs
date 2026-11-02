@@ -315,6 +315,9 @@ impl Render for Composer {
                 }))
                 .on_action(cx.listener(|this, _: &PasteAsText, window, cx| this.paste_as_text(window, cx)))
                 .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                    if this.close_context_details(cx) {
+                        return;
+                    }
                     if this.permissions_open || this.approval_menu_open {
                         this.permissions_open = false;
                         this.approval_menu_open = false;

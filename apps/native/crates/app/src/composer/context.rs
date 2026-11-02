@@ -9,7 +9,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use gpui::{AnyElement, App, Context, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, App, BoxShadow, Context, Hsla, IntoElement, KeyDownEvent, ParentElement, SharedString, Styled, Window, div, point,
+    prelude::*, px,
+};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::composer::context::{self as rules, TerminalContext, TerminalSelection};
@@ -89,6 +92,24 @@ impl Composer {
         self.context.terminals.remove(target);
     }
 
+    /// The excerpts a send's `prompt` links; the rest go with the prompt's history.
+    pub(super) fn take_terminals(&mut self, target: &Target, prompt: &str) -> Vec<TerminalContext> {
+        self.context.terminals.get_mut(target).map(|held| rules::take_for_send(held, prompt)).unwrap_or_default()
+    }
+
+    pub(super) fn restore_terminals(&mut self, target: &Target, sent: Vec<TerminalContext>) {
+        rules::restore_unsent(self.context.terminals.entry(target.clone()).or_default(), sent);
+    }
+
+    /// Leaving a target ends its prompt's undo history (`set_value` clears it), so the threads
+    /// and excerpts its draft no longer links go.
+    pub(super) fn reset_context_history(&mut self, target: &Target, prompt: &str) {
+        self.reset_thread_history(target, prompt);
+        if let Some(held) = self.context.terminals.get_mut(target) {
+            rules::reset_history(held, prompt);
+        }
+    }
+
     /// `addTerminalContext`: links the selection at the caret, unless the prompt already links
     /// the same lines, and moves focus to the prompt after the link.
     pub(super) fn add_terminal_context(&mut self, selection: TerminalSelection, window: &mut Window, cx: &mut Context<Self>) {
@@ -116,6 +137,16 @@ impl Composer {
         self.draft_changed(cx);
         self.focus(window, cx);
         cx.notify();
+    }
+
+    /// Closes an open details popover; whether one was open. Escape does this from the prompt
+    /// and from the chip.
+    pub(super) fn close_context_details(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.context.open.take().is_some();
+        if closed {
+            cx.notify();
+        }
+        closed
     }
 
     /// Removes every link to `context_id` from the prompt, as one undoable edit.
@@ -212,6 +243,11 @@ impl Composer {
                         }
                         this.context.open = if this.context.open.as_deref() == Some(toggle_id.as_str()) { None } else { Some(toggle_id.clone()) };
                         cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" && this.close_context_details(cx) {
+                            cx.stop_propagation();
+                        }
                     }));
                 div()
                     .relative()
@@ -258,6 +294,7 @@ impl Composer {
     /// the link out of the prompt.
     fn with_remove(&self, shell: gpui::Stateful<gpui::Div>, context_id: &str, ink: Ink, cx: &mut Context<Self>) -> impl IntoElement {
         let color = ink_color(ink, cx);
+        let ring_color = hsla(palette(cx).ring);
         let remove_id = context_id.to_owned();
         h_flex().items_center().child(shell).child(
             div()
@@ -271,6 +308,8 @@ impl Composer {
                 .rounded(px(4.))
                 .cursor_pointer()
                 .hover(move |style| style.bg(color.opacity(0.17)))
+                .tab_index(0)
+                .focus_visible(move |style| style.shadow(ring(ring_color, 1.)))
                 .tooltip(text_tooltip("Remove".to_owned()))
                 .on_click(cx.listener(move |this, _, window, cx| this.remove_context(&remove_id, window, cx)))
                 .child(Icon::X.render(px(CHIP_TEXT * 0.85), color)),
@@ -362,13 +401,19 @@ fn ink_color(ink: Ink, cx: &App) -> Hsla {
     }
 }
 
+/// A focus ring drawn inside the control, so focusing it moves nothing.
+fn ring(color: Hsla, width: f32) -> Vec<BoxShadow> {
+    vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(width), inset: true }]
+}
+
 fn text_tooltip(text: String) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
     let text = SharedString::from(text);
     move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }
 
-/// `ContextChipShell`: icon and label in the kind's ink at the prompt's size, medium weight; a
-/// chip that opens something underlines its label on hover.
+/// `ContextChipShell`: icon and label in the kind's ink at the prompt's size, medium weight. A
+/// chip that opens something is a tab stop (Enter and Space click it) with a 2px ring in its ink,
+/// and underlines its label on hover.
 fn chip_shell(context_id: &str, icon: Icon, label: String, ink: Ink, clickable: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let color = ink_color(ink, cx);
     let group = SharedString::from(format!("context-chip-{context_id}"));
@@ -382,6 +427,7 @@ fn chip_shell(context_id: &str, icon: Icon, label: String, ink: Ink, clickable: 
         .text_size(px(CHIP_TEXT))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color)
+        .when(clickable, |this| this.tab_index(0).focus_visible(move |style| style.shadow(ring(color, 2.))))
         .child(div().flex_none().child(icon.render(px(CHIP_TEXT), color)))
         .child(
             div()

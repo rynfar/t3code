@@ -8,8 +8,8 @@ use gpui::{App, Context, Window};
 use serde_json::Value;
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
-use t3_core::composer::context::{ExpiredNotice, TerminalSend, expired_toast_copy};
-use t3_core::composer::menu::SlashCommand;
+use t3_core::composer::context::{ExpiredNotice, TerminalContext, TerminalSend, expired_toast_copy};
+use t3_core::composer::menu::{SlashCommand, ThreadContext};
 use t3_core::composer::{self as rules, FollowUpBehavior, SubmitIntent};
 use t3_core::model::ModelSelection;
 use t3_core::server_config::{InteractionMode, ThreadEnvMode};
@@ -21,6 +21,13 @@ use crate::app_state::uuid_v4;
 use crate::toast::{Toast, ToastKind};
 
 const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
+
+/// What a send took from the composer, put back if it fails.
+pub(super) struct Taken {
+    attachments: Vec<super::attachments::Staged>,
+    threads: Vec<ThreadContext>,
+    terminals: Vec<TerminalContext>,
+}
 
 /// What one send carries, resolved before the prompt clears.
 struct Outgoing {
@@ -170,7 +177,7 @@ impl Composer {
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
         let refs = state.rpc(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd));
         let target = Target::Draft(project_id.clone());
-        let taken = self.begin_send(&target, window, cx);
+        let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let file_mode = match (&configured, &root) {
                 (None, Some(_)) => project_file
@@ -211,12 +218,9 @@ impl Composer {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
-                if result.is_ok() {
-                    this.clear_mentions(&target);
-                    // A background launch leaves the draft open for the next thread.
-                    if intent != SubmitIntent::Background {
-                        this.discard_draft(&target, cx);
-                    }
+                // A background launch leaves the draft open for the next thread.
+                if result.is_ok() && intent != SubmitIntent::Background {
+                    this.discard_draft(&target, cx);
                 }
                 match result {
                     Ok(_) if intent == SubmitIntent::Background => {}
@@ -279,14 +283,13 @@ impl Composer {
         let failures: Vec<&'static str> = steps.iter().map(|(_, failure)| *failure).collect();
         let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(command, _)| command).collect());
         let target = Target::Thread(thread_id);
-        let taken = self.begin_send(&target, window, cx);
+        let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let failure = request.await.err().map(|(index, error)| format!("{} {error}", failures.get(index).copied().unwrap_or("Failed to send message.")));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
-                match failure {
-                    Some(error) => this.restore(&target, &outgoing.prompt, taken, error, window, cx),
-                    None => this.clear_mentions(&target),
+                if let Some(error) = failure {
+                    this.restore(&target, &outgoing.prompt, taken, error, window, cx);
                 }
                 cx.notify();
             });
@@ -294,22 +297,27 @@ impl Composer {
         .detach();
     }
 
-    /// Clears the prompt and takes the attachments, as the web clears the composer on send.
-    fn begin_send(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) -> Vec<super::attachments::Staged> {
+    /// Clears the prompt and takes the attachments and the context `prompt` links, as the web
+    /// clears the composer on send. Whatever is added while the send is in flight stays.
+    fn begin_send(&mut self, target: &Target, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> Taken {
         self.sending = true;
         self.error = None;
         self.set_prompt("", window, cx);
         cx.notify();
-        self.take_attachments(target)
+        Taken {
+            attachments: self.take_attachments(target),
+            threads: self.take_threads(target, prompt),
+            terminals: self.take_terminals(target, prompt),
+        }
     }
 
-    /// A failed send puts the text back unless the user already typed something new, and its
-    /// attachments back in front of any added since.
+    /// A failed send puts the text back unless the user already typed something new, its
+    /// attachments back in front of any added since, and its context beside what was added since.
     fn restore(
         &mut self,
         target: &Target,
         text: &str,
-        taken: Vec<super::attachments::Staged>,
+        taken: Taken,
         error: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -317,7 +325,9 @@ impl Composer {
         if self.prompt(cx).trim().is_empty() {
             self.set_prompt(text, window, cx);
         }
-        self.restore_attachments(target, taken);
+        self.restore_attachments(target, taken.attachments);
+        self.restore_threads(target, taken.threads);
+        self.restore_terminals(target, taken.terminals);
         self.error = Some(error);
     }
 

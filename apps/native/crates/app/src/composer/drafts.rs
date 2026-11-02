@@ -112,6 +112,7 @@ impl Composer {
             (None, false) => self.prompt(cx),
         };
         if let Some(from) = from {
+            self.reset_context_history(from, &leaving);
             let draft = self.capture_draft(from, leaving);
             if self.drafts.store.set(&key(from), draft) {
                 self.schedule_draft_save(cx);

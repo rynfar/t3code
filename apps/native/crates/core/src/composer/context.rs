@@ -9,10 +9,12 @@
 //! `snapshotComposerSend` and `buildExpiredTerminalContextToastCopy` from
 //! `web/src/components/ChatView.logic.ts`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::menu::{CONTEXT_HREF_PREFIX, context_references, kind_scoped_context_id, sanitize_context_label, to_context_id};
+use super::menu::{CONTEXT_HREF_PREFIX, ThreadContext, context_references, kind_scoped_context_id, sanitize_context_label, to_context_id};
 
 pub const TERMINAL_KIND: &str = "terminal";
 
@@ -56,8 +58,9 @@ pub struct TerminalContext {
     pub line_start: u32,
     pub line_end: u32,
     /// Absent in drafts saved before excerpts kept their text; such an excerpt has expired.
+    /// Shared, so drafts and chips copy a pointer rather than the captured output.
     #[serde(default)]
-    pub text: String,
+    pub text: Arc<str>,
 }
 
 /// `normalizeTerminalContextText`: CRLF becomes LF and blank lines around the excerpt go.
@@ -82,7 +85,7 @@ impl TerminalContext {
             terminal_label: terminal_label.to_owned(),
             line_start,
             line_end: selection.line_end.max(line_start),
-            text: normalize_text(&selection.text),
+            text: normalize_text(&selection.text).into(),
         })
     }
 
@@ -117,9 +120,14 @@ impl TerminalContext {
         format_reference(TERMINAL_KIND, &self.context_id(), &self.label())
     }
 
-    /// `isTerminalContextExpired`: nothing left to send.
+    /// `isTerminalContextExpired`: nothing left to send once normalized, which leaves only line
+    /// breaks empty. Checked without copying the text.
     pub fn is_expired(&self) -> bool {
-        normalize_text(&self.text).is_empty()
+        let mut rest = &*self.text;
+        while let Some(next) = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")) {
+            rest = next;
+        }
+        rest.is_empty()
     }
 
     /// `terminalContextDedupKey`: the same lines of the same terminal are added once.
@@ -140,6 +148,50 @@ impl TerminalContext {
             "lineEnd": self.line_end,
             "text": normalize_text(&self.text),
         })
+    }
+}
+
+/// A record a prompt links by context id: a terminal excerpt or a mentioned thread.
+pub trait Linked {
+    fn link_id(&self) -> String;
+}
+
+impl Linked for TerminalContext {
+    fn link_id(&self) -> String {
+        self.context_id()
+    }
+}
+
+impl Linked for ThreadContext {
+    fn link_id(&self) -> String {
+        self.context_id.clone()
+    }
+}
+
+fn linked_ids(prompt: &str) -> Vec<&str> {
+    context_references(prompt).into_iter().map(|reference| reference.context_id).collect()
+}
+
+/// The prompt was replaced and its undo history with it: records it does not link can no longer
+/// come back, so they go (`useRetainedContextPayloads` clears on a target change).
+pub fn reset_history<T: Linked>(held: &mut Vec<T>, prompt: &str) {
+    let linked = linked_ids(prompt);
+    held.retain(|record| linked.contains(&record.link_id().as_str()));
+}
+
+/// A send clears the prompt: it takes the records its text links and the rest go with the
+/// history, so records added while it is in flight are the only ones held afterwards.
+pub fn take_for_send<T: Linked>(held: &mut Vec<T>, prompt: &str) -> Vec<T> {
+    let linked = linked_ids(prompt);
+    std::mem::take(held).into_iter().filter(|record| linked.contains(&record.link_id().as_str())).collect()
+}
+
+/// A failed send puts its records back beside any added since.
+pub fn restore_unsent<T: Linked>(held: &mut Vec<T>, sent: Vec<T>) {
+    for record in sent {
+        if !held.iter().any(|existing| existing.link_id() == record.link_id()) {
+            held.push(record);
+        }
     }
 }
 

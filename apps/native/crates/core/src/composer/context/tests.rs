@@ -55,6 +55,9 @@ fn normalizing_drops_carriage_returns_and_surrounding_blank_lines_only() {
     assert_eq!(normalize_text("\r\n\r\nline one\r\nline two\n\n"), "line one\nline two");
     assert_eq!(normalize_text("\n  indented\n\n  kept\n"), "  indented\n\n  kept");
     assert_eq!(normalize_text("\n\n"), "");
+    let blank = |text: &str| context("x", 1, 1, text).is_expired();
+    assert!(blank("") && blank("\r\n\n\r\n"));
+    assert!(!blank("\r") && !blank("\n x\n"));
 }
 
 #[test]
@@ -62,7 +65,7 @@ fn a_selection_becomes_a_normalized_excerpt() {
     let added = TerminalContext::new(selection(0, 0, "\r\n$ ls\r\n"), "a b", "thread-1", "2026-11-02T00:00:00.000Z").unwrap();
     assert_eq!((added.terminal_id.as_str(), added.terminal_label.as_str()), ("term-1", "Terminal 1"));
     assert_eq!((added.line_start, added.line_end), (1, 1));
-    assert_eq!(added.text, "$ ls");
+    assert_eq!(&*added.text, "$ ls");
     assert_eq!(added.id, to_context_id("a b"));
     let reversed = TerminalContext::new(selection(9, 3, "x"), "id", "thread-1", "now").unwrap();
     assert_eq!((reversed.line_start, reversed.line_end), (9, 9));
@@ -194,4 +197,36 @@ fn expired_toasts_read_as_the_web_words_them() {
         expired_tooltip("Terminal 1 line 4"),
         "Terminal context expired. Remove and re-add Terminal 1 line 4 to include it in your message."
     );
+}
+
+#[test]
+fn a_send_in_flight_keeps_records_added_meanwhile() {
+    let (sent, added) = (context("sent", 1, 2, "a"), context("added", 3, 3, "b"));
+    let thread = ThreadContext::new("env", "t1", "Other");
+    let prompt = format!("look at {} and {}", sent.reference(), thread.reference());
+    let mut held = vec![sent.clone(), context("deleted", 9, 9, "c")];
+    let taken = take_for_send(&mut held, &prompt);
+    assert_eq!(taken, std::slice::from_ref(&sent), "the send takes what its text links; the rest go with the history");
+    assert!(held.is_empty());
+    // Added before the send lands; landing must not take it (it once cleared everything).
+    held.push(added.clone());
+    assert_eq!(held, std::slice::from_ref(&added));
+    // A failed send puts its excerpts back beside it, once.
+    restore_unsent(&mut held, taken.clone());
+    restore_unsent(&mut held, taken);
+    assert_eq!(held, [added, sent]);
+    let mut threads = vec![thread.clone()];
+    assert_eq!(take_for_send(&mut threads, &prompt), [thread]);
+    assert!(threads.is_empty());
+}
+
+#[test]
+fn a_new_prompt_history_drops_unlinked_records() {
+    let (kept, dropped) = (context("kept", 1, 1, "a"), context("dropped", 2, 2, "b"));
+    let mut held = vec![kept.clone(), dropped];
+    reset_history(&mut held, &format!("still {}", kept.reference()));
+    assert_eq!(held, [kept]);
+    let mut threads = vec![ThreadContext::new("env", "t1", "Other")];
+    reset_history(&mut threads, "no links");
+    assert!(threads.is_empty());
 }
