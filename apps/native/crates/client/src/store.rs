@@ -7,8 +7,21 @@ use std::sync::mpsc;
 
 use crate::auth::Credentials;
 
+static HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Points every read and write at `home` for the rest of the process, ahead of
+/// `T3_NATIVE_HOME`. Tools that must not touch the caller's saved state call it before anything
+/// loads. Only the first call takes effect.
+pub fn use_home(home: PathBuf) {
+    let _ = HOME_OVERRIDE.set(home);
+}
+
 fn base() -> Option<PathBuf> {
-    std::env::var_os("T3_NATIVE_HOME").map(PathBuf::from).or_else(|| dirs::config_dir().map(|dir| dir.join("T3 Code Native")))
+    HOME_OVERRIDE
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("T3_NATIVE_HOME").map(PathBuf::from))
+        .or_else(|| dirs::config_dir().map(|dir| dir.join("T3 Code Native")))
 }
 
 fn path() -> Option<PathBuf> {

@@ -18,6 +18,8 @@ use t3_core::right_panel::{DEFAULT_WIDTH, SurfaceKind, clamp_width};
 
 pub use controls::{Button, Size, Variant, focusable, segment, segmented, tooltip_view};
 pub use state::PanelState;
+#[cfg(feature = "snapshot")]
+pub use tabs::open_surface;
 
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
