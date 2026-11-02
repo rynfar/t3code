@@ -119,6 +119,7 @@ impl SidebarPane {
         let menu_id = thread.id.clone();
         let state = self.state.read(cx);
         let selected = !active && state.sidebar.selection.contains(&thread.id);
+        let hover_bg = !active && !selected;
         let dragging = state.sidebar.drag.as_ref().is_some_and(|(dragged, _)| *dragged == thread.id);
         let draggable = section != Section::Working && state.sidebar.capabilities.can_operate && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != thread.id);
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
@@ -134,8 +135,14 @@ impl SidebarPane {
             .cursor_pointer()
             .when(active, |this| this.bg(hsla(p.sidebar_row_active)).when(light, |this| this.shadow(vec![ring.clone()])))
             .when(selected, |this| this.bg(hsla(p.sidebar_row_selected)).when(light, |this| this.shadow(vec![ring.clone()])))
-            .when(!active && !selected, |this| this.hover(|this| this.bg(hsla(p.sidebar_row_hover))))
-            .when(recede_working, |this| this.opacity(0.7).hover(|this| this.opacity(1.)))
+            .when(recede_working, |this| this.opacity(0.7))
+            // GPUI allows one hover style per element: the background and the receding row's full opacity share it.
+            .when(hover_bg || recede_working, |this| {
+                this.hover(|style| {
+                    let style = if hover_bg { style.bg(hsla(p.sidebar_row_hover)) } else { style };
+                    if recede_working { style.opacity(1.) } else { style }
+                })
+            })
             .when(dragging, |this| this.opacity(0.5))
             .when(self.drag.is_none() && !self.menu_open, |this| this.tooltip(move |_, cx| {
                 let hover = hover_card(card.0.read(cx), &card.1, card.2.clone());
