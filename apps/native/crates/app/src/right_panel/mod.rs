@@ -14,7 +14,7 @@ use gpui::{
     Styled, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 use gpui_component::v_flex;
-use t3_core::right_panel::{DEFAULT_WIDTH, SurfaceKind, clamp_width};
+use t3_core::right_panel::{DEFAULT_WIDTH, Surface, SurfaceKind, ThreadPanel, clamp_width};
 
 pub use controls::{Button, Size, Variant, focusable, segment, segmented, tooltip_view};
 pub use state::PanelState;
@@ -58,6 +58,8 @@ pub struct RightPanelView {
     files: Entity<FilesPanel>,
     /// One pane per open side chat tab of the showing thread.
     side_chats: Vec<Entity<crate::side_chat::SideChatPane>>,
+    /// One pane per open browser tab of the showing thread; only the active one streams.
+    previews: Vec<Entity<crate::preview::PreviewPane>>,
     _save_width: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -86,7 +88,7 @@ impl RightPanelView {
             }
             _ => {}
         });
-        RightPanelView { state, diff, pull_requests, files, side_chats: Vec::new(), _save_width: None, _subscription: subscription }
+        RightPanelView { state, diff, pull_requests, files, side_chats: Vec::new(), previews: Vec::new(), _save_width: None, _subscription: subscription }
     }
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
@@ -123,6 +125,31 @@ impl RightPanelView {
         pane
     }
 
+    /// Keeps a pane per browser tab of the showing thread, and lets only the one in front stream.
+    fn sync_previews(&mut self, thread_id: Option<&str>, panel: Option<&ThreadPanel>, window: &mut Window, cx: &mut Context<Self>) {
+        let front = panel.filter(|panel| panel.is_open).and_then(|panel| panel.active_surface_id.as_deref());
+        self.previews.retain(|pane| {
+            let pane = pane.read(cx);
+            thread_id == Some(pane.thread_id()) && panel.is_some_and(|panel| panel.surfaces.iter().any(|surface| surface.id == pane.surface_id()))
+        });
+        for pane in &self.previews {
+            let visible = front == Some(pane.read(cx).surface_id());
+            pane.update(cx, |pane, cx| pane.set_visible(visible, window, cx));
+        }
+    }
+
+    fn preview_pane(&mut self, thread_id: &str, surface: &Surface, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<crate::preview::PreviewPane>> {
+        if let Some(pane) = self.previews.iter().find(|pane| pane.read(cx).surface_id() == surface.id) {
+            return Some(pane.clone());
+        }
+        let previews = crate::preview::previews(cx)?;
+        let (state, thread_id, surface_id, tab) = (self.state.clone(), thread_id.to_owned(), surface.id.clone(), surface.preview_tab().map(str::to_owned));
+        let pane = cx.new(|cx| crate::preview::PreviewPane::new(state, previews, thread_id, surface_id, tab, window, cx));
+        pane.update(cx, |pane, cx| pane.set_visible(true, window, cx));
+        self.previews.push(pane.clone());
+        Some(pane)
+    }
+
     fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let dragging = cx.has_active_drag();
@@ -152,8 +179,11 @@ impl RightPanelView {
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
-        let Some(thread_id) = state.selected_thread.clone() else { return div().into_any_element() };
-        let panel = state.panels.panels.panel(&thread_id).clone();
+        let thread_id = state.selected_thread.clone();
+        let panel = thread_id.as_deref().map(|thread_id| state.panels.panels.panel(thread_id).clone());
+        self.sync_previews(thread_id.as_deref(), panel.as_ref(), window, cx);
+        let state = self.state.read(cx);
+        let (Some(thread_id), Some(panel)) = (thread_id, panel) else { return div().into_any_element() };
         if !panel.is_open {
             return div().into_any_element();
         }
@@ -172,6 +202,11 @@ impl Render for RightPanelView {
                 self.files.clone().cached(StyleRefinement::default().size_full()).into_any_element()
             }
             Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, window, cx).into_any_element(),
+            // Cached: frames repaint the page view inside, not the panel around it.
+            Some(SurfaceKind::Preview { .. }) => match panel.active().and_then(|surface| self.preview_pane(&thread_id, surface, window, cx)) {
+                Some(pane) => pane.cached(StyleRefinement::default().size_full()).into_any_element(),
+                None => div().into_any_element(),
+            },
             None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
         };
         v_flex()

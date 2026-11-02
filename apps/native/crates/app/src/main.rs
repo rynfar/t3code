@@ -18,6 +18,7 @@ mod new_thread;
 mod omitted_rows;
 mod notifications;
 mod palette;
+mod preview;
 mod project_files;
 mod projects;
 mod provider_icon;
@@ -110,6 +111,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     usage::init(state.clone(), cx);
     new_thread::init(state.clone(), cx);
     right_panel::init(state.clone(), cx);
+    preview::init(state.clone(), cx);
     pull_requests::init(state.clone(), cx);
     terminal::init(cx);
     files::init(cx);

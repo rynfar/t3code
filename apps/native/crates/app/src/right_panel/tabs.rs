@@ -18,12 +18,24 @@ struct SurfaceAction {
     icon: Icon,
     shortcut: &'static str,
     open: fn(&mut AppState, &mut gpui::Context<AppState>),
+    /// Why the entry is unavailable, if it is.
+    unavailable: fn(&App) -> Option<&'static str>,
+}
+
+fn always(_: &App) -> Option<&'static str> {
+    None
+}
+
+/// `browserAvailable` with `SURFACE_UNAVAILABLE_HINTS.browser`.
+fn browser_unavailable(cx: &App) -> Option<&'static str> {
+    crate::preview::previews(cx).and_then(|previews| previews.read(cx).availability().launcher_hint())
 }
 
 const SURFACE_ACTIONS: &[SurfaceAction] = &[
-    SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface },
-    SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface },
-    SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface },
+    SurfaceAction { label: "Browser", icon: Icon::Earth, shortcut: "B", open: crate::preview::add_browser_surface, unavailable: browser_unavailable },
+    SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface, unavailable: always },
+    SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: always },
+    SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: always },
 ];
 
 /// Opens the launcher entry named `label` (case-insensitive), as clicking it would.
@@ -37,6 +49,13 @@ pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<Ap
         }
         return is_side_chat;
     }
+    // An existing browser session by `browser:<tab>`, or `browser:new` for the empty state;
+    // the "Browser" entry would open a session on the server.
+    if let Some(tab) = label.strip_prefix("browser:") {
+        let tab = (tab != "new").then_some(tab);
+        state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, tab));
+        return true;
+    }
     let Some(action) = SURFACE_ACTIONS.iter().find(|action| action.label.eq_ignore_ascii_case(label)) else { return false };
     (action.open)(state, cx);
     true
@@ -49,6 +68,7 @@ fn surface_icon(surface: &Surface) -> Icon {
         SurfaceKind::Files => Icon::Files,
         SurfaceKind::File { .. } => Icon::File,
         SurfaceKind::SideChat { .. } => Icon::MessagesSquare,
+        SurfaceKind::Preview { .. } => Icon::Earth,
     }
 }
 
@@ -75,6 +95,7 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
         .collect();
     let add_state = state.clone();
     let side_chat = side_chat_entry(state.read(cx));
+    let unavailable: Vec<Option<&'static str>> = SURFACE_ACTIONS.iter().map(|action| (action.unavailable)(cx)).collect();
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
         .flex_none()
@@ -96,11 +117,12 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
                         .icon(Icon::Plus)
                         .tooltip("Add panel surface")
                         .dropdown_menu(move |menu, _, _| {
-                            let menu = SURFACE_ACTIONS.iter().fold(menu, |menu, action| {
+                            let menu = SURFACE_ACTIONS.iter().zip(unavailable.iter()).fold(menu, |menu, (action, unavailable)| {
                                 let state = add_state.clone();
                                 let open = action.open;
                                 menu.item(
                                     PopupMenuItem::new(action.label)
+                                        .disabled(unavailable.is_some())
                                         .on_click(move |_, _, cx| state.update(cx, open)),
                                 )
                             });
@@ -121,7 +143,15 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
 fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     let side_chat = surface.side_chat_thread().and_then(|id| state.read(cx).thread_shell(id));
-    let title: SharedString = side_chat.map_or_else(|| surface.title().into(), |thread| thread.title.clone().into());
+    let title: SharedString = match (side_chat, surface.preview_tab()) {
+        (Some(thread), _) => thread.title.clone().into(),
+        (None, Some(tab)) => {
+            let previews = crate::preview::previews(cx);
+            let snapshot = previews.as_ref().zip(state.read(cx).selected_thread.as_deref()).and_then(|(previews, thread)| previews.read(cx).session(thread, tab));
+            t3_core::preview::tab_title(snapshot).into()
+        }
+        (None, None) => surface.title().into(),
+    };
     // Static dot: a side chat tab can stay open for a whole run.
     let dot = side_chat.and_then(t3_core::side_chat::TabState::of).map(|tab_state| match tab_state {
         t3_core::side_chat::TabState::Running => hsla(p.muted_foreground),
@@ -233,7 +263,8 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
         let state = state.clone();
         let open = action.open;
         let row_id = ElementId::from(("surface-launcher", index));
-        focusable(h_flex().id(row_id.clone()), row_id, true, window, cx)
+        let reason = (action.unavailable)(cx);
+        focusable(h_flex().id(row_id.clone()), row_id, reason.is_none(), window, cx)
             .h(px(32.))
             .w_full()
             .px(px(10.))
@@ -241,9 +272,11 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
             .rounded(px(8.))
             .text_sm()
             .text_color(hsla(p.foreground))
-            .cursor_pointer()
-            .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
-            .on_click(move |_, _, cx| state.update(cx, open))
+            .when(reason.is_some(), |this| this.opacity(0.64))
+            .when(reason.is_none(), |this| {
+                this.cursor_pointer().hover(|style| style.bg(hsla(p.accent).opacity(0.6))).on_click(move |_, _, cx| state.update(cx, open))
+            })
+            .when_some(reason, |this, reason| this.tooltip(move |window, cx| super::tooltip_view(reason.into(), window, cx)))
             .child(action.icon.svg().size(px(16.)).text_color(hsla(p.foreground)))
             .child(div().flex_1().min_w_0().truncate().child(action.label))
             .child(kbd(action.shortcut, cx))
