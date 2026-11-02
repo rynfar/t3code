@@ -6,7 +6,7 @@ use t3_client::supervisor::ConnectionStatus;
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::chat_header::{self, ChatHeader};
-use crate::composer::{Composer, OpenPermissions, ToggleModelPicker};
+use crate::composer::{Composer, FocusPrompt, OpenPermissions, ToggleModelPicker};
 use crate::connect::ConnectView;
 use crate::git::GitDialogs;
 use crate::new_thread::{self, DraftHero};
@@ -204,6 +204,9 @@ impl Render for Workspace {
             .map(crate::quit_hold::listen)
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.toggle_picker(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &FocusPrompt, window, cx| {
+                this.composer.update(cx, |composer, cx| composer.focus(window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));

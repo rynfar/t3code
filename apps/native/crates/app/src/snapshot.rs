@@ -17,7 +17,8 @@ use t3_core::settings::search::{NAV_GROUPS, Section};
 use crate::app_state::AppState;
 
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
-[--settings <section>] [--palette] [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
+[--settings <section>] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] [--width 1440] [--height 900] \
+[--dark|--light] [--wait 6]";
 
 pub struct Options {
     out: PathBuf,
@@ -25,6 +26,12 @@ pub struct Options {
     right_panel: Option<String>,
     settings: Option<String>,
     palette: bool,
+    /// Opens the new-thread draft, as `chat.new` does.
+    new_thread: bool,
+    /// Files dropped on the composer. They upload, so point this at a scratch server.
+    attach: Vec<PathBuf>,
+    /// Typed into the composer last, so a trigger such as `@src` or `/` opens its menu.
+    prompt: Option<String>,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -45,6 +52,9 @@ impl Options {
             right_panel: flag("--right-panel"),
             settings: flag("--settings"),
             palette: has("--palette"),
+            new_thread: has("--new-thread"),
+            attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
+            prompt: flag("--prompt"),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -153,6 +163,28 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             window.dispatch_action(Box::new(crate::keymap::ToggleCommandPalette), cx);
         })
         .map_err(|error| error.to_string())?;
+    }
+    if options.new_thread {
+        cx.update(|cx| cx.dispatch_action(&crate::new_thread::NewThread));
+        pump(&mut cx, 1., |_| false);
+    }
+    if !options.attach.is_empty() || options.prompt.is_some() {
+        // Actions bubble from the focused element; an offscreen window starts with none.
+        cx.update_window(window, |_, window, cx| window.focus_next(cx)).map_err(|error| error.to_string())?;
+        cx.dispatch_action(window, crate::composer::FocusPrompt);
+    }
+    if !options.attach.is_empty() {
+        // Dropped inside the composer's card: at the bottom of a thread, mid-page on a draft.
+        let draft = state.read_with(&cx, |state, _| state.selected_thread.is_none() && state.draft_project.is_some());
+        let y = if draft { options.height * 0.55 } else { options.height - 40. };
+        let position = gpui::point(px((crate::workspace::SIDEBAR_WIDTH + options.width) / 2.), px(y));
+        let paths = gpui::ExternalPaths(options.attach.clone().into());
+        cx.simulate_event(window, gpui::FileDropEvent::Entered { position, paths });
+        cx.simulate_event(window, gpui::FileDropEvent::Submit { position });
+        pump(&mut cx, options.wait.min(3.), |_| false);
+    }
+    if let Some(prompt) = &options.prompt {
+        cx.simulate_input(window, prompt);
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
