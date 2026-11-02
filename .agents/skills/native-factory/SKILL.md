@@ -10,7 +10,7 @@ description: Orchestrate the native client parity factory - resume state from gi
 ## Resume (always first)
 
 1. `cd /Volumes/DevSSD/t3code-native && git switch native && git pull --ff-only fork native`
-2. `gh issue list -R rynfar/t3code --label "Factory status" --state open` or the pinned
+2. `gh issue list -R rynfar/t3code --label factory --state open`: the pinned
    `Factory status` issue: read in-flight, blocked, next.
 3. `gh issue list -R rynfar/t3code --label status:in-progress` and
    `gh pr list -R rynfar/t3code --base native` — reconcile each with its branch.
