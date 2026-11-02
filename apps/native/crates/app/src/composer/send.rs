@@ -4,7 +4,7 @@
 //! the previous one committed, as `declinePendingApprovals` and `persistThreadSettingsForNextTurn`
 //! await them.
 
-use gpui::{Context, Window};
+use gpui::{App, Context, Window};
 use serde_json::Value;
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
@@ -17,6 +17,7 @@ use t3_core::workspace::{self, VcsRefs};
 
 use super::{Composer, Resolved, Target};
 use crate::app_state::uuid_v4;
+use crate::toast::{Toast, ToastKind};
 
 const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
 
@@ -37,7 +38,16 @@ impl Composer {
         if self.sending {
             return;
         }
-        if !self.snapshot.pending.user_inputs.is_empty() {
+        let answering = !self.snapshot.pending.user_inputs.is_empty();
+        // `/side` beats an open question; where side chats are unavailable it stays a literal answer.
+        if self.editing_queued().is_none()
+            && let Some(prompt) = t3_core::composer::menu::parse_side_chat_command(&self.prompt(cx))
+            && !(answering && self.side_chat_disabled_reason(cx).is_some())
+        {
+            self.send_side_chat(prompt, window, cx);
+            return;
+        }
+        if answering {
             self.advance(window, cx);
             return;
         }
@@ -74,6 +84,33 @@ impl Composer {
             Some(Target::Draft(project_id)) => self.launch(project_id, outgoing, intent, window, cx),
             Some(Target::Thread(thread_id)) => self.send(thread_id, outgoing, intent, window, cx),
             None => {}
+        }
+    }
+
+    /// `sideChatDisabledReason` for this composer; a side chat's own composer cannot start one.
+    pub(super) fn side_chat_disabled_reason(&self, cx: &App) -> Option<&'static str> {
+        if self.fixed.is_some() {
+            return Some("Side chats cannot start side chats.");
+        }
+        self.state.read(cx).side_chat_disabled_reason()
+    }
+
+    /// `/side` and `/btw` as the whole message: its text starts a side chat of the open thread.
+    fn send_side_chat(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+        let warn = |title: &'static str, description: &'static str| Toast::new(ToastKind::Warning, title).description(description);
+        if let Some(reason) = self.side_chat_disabled_reason(cx) {
+            self.state.update(cx, |state, cx| state.show_toast(warn("Side chat not started", reason), cx));
+            return;
+        }
+        let staged = self.staged_attachments();
+        if !staged.is_empty() || self.message_context(&self.prompt(cx), &staged).is_some() {
+            let toast = warn("Side chats take text only", "Remove the attachments and context, then send it again.");
+            self.state.update(cx, |state, cx| state.show_toast(toast, cx));
+            return;
+        }
+        if self.state.update(cx, |state, cx| state.open_side_chat(Some(prompt), cx)) {
+            self.set_prompt("", window, cx);
+            self.draft_changed(cx);
         }
     }
 

@@ -199,7 +199,7 @@ impl Composer {
         }
         let step = {
             let state = self.state.read(cx);
-            let Some(projection) = state.thread.projection.as_ref().filter(|projection| projection.thread.id == thread_id) else { return false };
+            let Some(projection) = state.thread_state(&thread_id).projection.as_ref().filter(|projection| projection.thread.id == thread_id) else { return false };
             // Built on the keypress: the transcript changes with every streamed delta.
             rules::step_history(backward, &rules::history_entries(projection), position.as_ref(), &prompt)
         };

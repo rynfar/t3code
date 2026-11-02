@@ -213,7 +213,8 @@ impl Composer {
             TriggerKind::SlashCommand => {
                 let options = SlashMenuOptions {
                     plan_mode: resolved.plan_enabled,
-                    side_chat: false,
+                    side_chat: self.fixed.is_none() && state.side_chats_offered(),
+                    side_chat_disabled: self.side_chat_disabled_reason(cx),
                     compact: self.compact_available(trigger, cx),
                     show_skills,
                 };
@@ -278,7 +279,7 @@ impl Composer {
             return false;
         }
         let state = self.state.read(cx);
-        state.thread.projection.as_ref().filter(|projection| projection.thread.id == *thread_id).is_some_and(rules::has_compactable_conversation)
+        state.thread_state(thread_id).projection.as_ref().filter(|projection| projection.thread.id == *thread_id).is_some_and(rules::has_compactable_conversation)
     }
 
     fn active_menu_item(&self) -> Option<&MenuItem> {
@@ -385,6 +386,9 @@ impl Composer {
                 self.draft_changed(cx);
             }
             MenuAction::Slash(command @ (SlashCommand::Side | SlashCommand::Btw)) => {
+                if self.side_chat_disabled_reason(cx).is_some() {
+                    return;
+                }
                 self.replace_prompt_range(trigger.range_start, trigger.range_end, &format!("/{} ", command.name()), window, cx);
             }
             MenuAction::ProviderCommand { name } => self.replace_trigger(&text, &trigger, &format!("/{name} "), window, cx),

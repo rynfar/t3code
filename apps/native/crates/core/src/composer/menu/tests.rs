@@ -91,6 +91,15 @@ fn standalone_mode_commands_switch_instead_of_sending() {
 }
 
 #[test]
+fn side_commands_carry_their_prompt() {
+    assert_eq!(parse_side_chat_command(" /side why is this slow? ").as_deref(), Some("why is this slow?"));
+    assert_eq!(parse_side_chat_command("/BTW\nsecond line").as_deref(), Some("second line"));
+    assert_eq!(parse_side_chat_command("/side").as_deref(), Some(""));
+    assert_eq!(parse_side_chat_command("/sidebar"), None);
+    assert_eq!(parse_side_chat_command("ask /side later"), None);
+}
+
+#[test]
 fn replacements_swallow_one_following_space() {
     let text = "see @sr please";
     let end = extend_range_for_trailing_space(text, 7, "[src](src) ");
@@ -113,7 +122,7 @@ fn file_mentions_are_markdown_links_with_encoded_paths() {
 fn slash_menu_lists_builtins_commands_then_skills() {
     let skills = [skill("review"), ProviderSkill { enabled: false, ..skill("off") }, skill("compact")];
     let commands = [command("compact", Some("Compact the thread")), command("init", None), command("review", None)];
-    let options = SlashMenuOptions { plan_mode: true, side_chat: false, compact: true, show_skills: true };
+    let options = SlashMenuOptions { plan_mode: true, compact: true, show_skills: true, ..Default::default() };
     let items = slash_items(&at_end("/").unwrap(), "codex", &skills, &commands, options);
     // A command named like a visible skill shows as the skill.
     assert_eq!(labels(&items), ["/model", "/plan", "/default", "/init", "/skill:review", "/skill:compact"]);
@@ -124,11 +133,15 @@ fn slash_menu_lists_builtins_commands_then_skills() {
     let options = SlashMenuOptions { compact: false, plan_mode: false, ..options };
     let items = slash_items(&at_end("/").unwrap(), "codex", &skills, &commands, options);
     assert_eq!(labels(&items), ["/model", "/init", "/review"]);
+    let options = SlashMenuOptions { side_chat: true, side_chat_disabled: Some("Side chats start after the first message."), ..options };
+    let items = slash_items(&at_end("/").unwrap(), "codex", &skills, &commands, options);
+    assert_eq!(labels(&items), ["/model", "/side", "/btw", "/init", "/review"]);
+    assert_eq!(items[1].description, "Side chats start after the first message.");
 }
 
 #[test]
 fn slash_menu_mid_prompt_offers_only_builtins_and_skills() {
-    let options = SlashMenuOptions { plan_mode: true, side_chat: true, compact: true, show_skills: true };
+    let options = SlashMenuOptions { plan_mode: true, side_chat: true, compact: true, show_skills: true, ..Default::default() };
     let items = slash_items(&at_end("fix this /").unwrap(), "codex", &[skill("review")], &[command("init", None)], options);
     assert_eq!(labels(&items), ["/model", "/plan", "/default", "/skill:review"]);
 }

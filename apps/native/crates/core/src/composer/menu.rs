@@ -183,6 +183,13 @@ impl TriggerState {
     }
 }
 
+/// `parseSideChatCommand`: `/side [prompt]`, or its alias `/btw [prompt]`, as the whole message.
+pub fn parse_side_chat_command(text: &str) -> Option<String> {
+    let rest = text.trim().strip_prefix('/')?;
+    let (name, prompt) = rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len()));
+    (name.eq_ignore_ascii_case("side") || name.eq_ignore_ascii_case("btw")).then(|| prompt.trim().to_owned())
+}
+
 /// `parseStandaloneComposerSlashCommand`: `/plan` or `/default` as the whole message switches
 /// the mode instead of sending.
 pub fn parse_standalone_slash_command(text: &str) -> Option<SlashCommand> {
@@ -535,6 +542,8 @@ pub struct MenuItem {
 pub struct SlashMenuOptions {
     pub plan_mode: bool,
     pub side_chat: bool,
+    /// `sideChatDisabledReason`: replaces the `/side` and `/btw` descriptions.
+    pub side_chat_disabled: Option<&'static str>,
     /// `compactSlashCommandAvailable`: `/compact` shows only when it could run now.
     pub compact: bool,
     pub show_skills: bool,
@@ -612,8 +621,8 @@ pub fn slash_items(
         items.push(builtin_item(SlashCommand::Default, "Switch this thread back to normal build mode"));
     }
     if options.side_chat {
-        items.push(builtin_item(SlashCommand::Side, "Ask a side question in a new side chat"));
-        items.push(builtin_item(SlashCommand::Btw, "Same as /side"));
+        items.push(builtin_item(SlashCommand::Side, options.side_chat_disabled.unwrap_or("Ask a side question in a new side chat")));
+        items.push(builtin_item(SlashCommand::Btw, options.side_chat_disabled.unwrap_or("Same as /side")));
     }
     let menu_skills =
         if options.show_skills { dedupe_by_name(skills.iter().filter(|skill| is_user_invocable(skill)).cloned()) } else { Vec::new() };
