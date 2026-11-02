@@ -2,10 +2,12 @@
 //! Ports `partitionSidebarThreads` and the list builder in `apps/web/src/components/Sidebar.tsx`
 //! with the helpers in `apps/web/src/components/Sidebar.logic.ts`.
 
+pub mod drag;
 pub mod grouping;
 pub mod history;
 pub mod inbox;
 pub mod older_settled;
+pub mod selection;
 pub mod settled;
 pub mod sort;
 pub mod status;
@@ -19,6 +21,7 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use drag::{DropItem, Marker};
 use grouping::{GroupingSettings, build_project_groups};
 use inbox::{InboxObservation, InboxReturnTracker};
 use settled::effective_snoozed;
@@ -71,6 +74,8 @@ pub enum SidebarRow {
     Thread { index: usize, section: Section },
     Shelf { shelf: Shelf, count: usize, expanded: bool },
     ShowMore { count: usize },
+    /// Drop boundaries and empty-section hints, present only while a thread is dragged.
+    Marker(Marker),
 }
 
 /// Identity and height class of a row, for incremental list updates.
@@ -79,6 +84,7 @@ pub enum RowKey {
     Thread { id: String, card: bool, meta: bool },
     Shelf(Shelf),
     ShowMore,
+    Marker(Marker),
 }
 
 /// `resolveSidebarThreadSection`.
@@ -205,6 +211,8 @@ pub struct ModelInput<'a> {
     pub project_scope: Option<&'a HashSet<String>>,
     pub connected: bool,
     pub now: Ms,
+    /// The section a thread is being dragged out of, which shows the drop markers.
+    pub dragging: Option<Section>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -265,11 +273,11 @@ impl SidebarModel {
             .min();
         let mut model = SidebarModel { threads, index_by_id, project_names, partition, next_change_at, ..Default::default() };
         let frontier = input.older_settled.and_then(|shelf| shelf.frontier);
-        model.build_rows(input.shelves, input.selected_thread_id, frontier, unloaded_settled);
+        model.build_rows(input.shelves, input.selected_thread_id, frontier, unloaded_settled, input.dragging);
         model
     }
 
-    fn build_rows(&mut self, shelves: &ShelfState, selected: Option<&str>, frontier: Option<&older_settled::Cursor>, unloaded_settled: usize) {
+    fn build_rows(&mut self, shelves: &ShelfState, selected: Option<&str>, frontier: Option<&older_settled::Cursor>, unloaded_settled: usize, dragging: Option<Section>) {
         let selected = selected.and_then(|id| self.index_by_id.get(id).copied());
         let route_only = |list: &[usize]| -> Vec<usize> { list.iter().copied().filter(|index| Some(*index) == selected).collect() };
         let p = &self.partition;
@@ -287,7 +295,17 @@ impl SidebarModel {
                 ordered.push(index);
             }
         };
+        let marker = |rows: &mut Vec<SidebarRow>, marker: Marker| {
+            if dragging.is_some() {
+                rows.push(SidebarRow::Marker(marker));
+            }
+        };
+        marker(&mut rows, Marker::PinnedHeader);
         push_threads(&mut rows, &p.pinned, Section::Pinned);
+        marker(&mut rows, Marker::PinnedDivider);
+        if p.active.is_empty() {
+            marker(&mut rows, Marker::ActivePlaceholder);
+        }
         push_threads(&mut rows, &p.active, Section::Active);
         if !p.working.is_empty() {
             rows.push(SidebarRow::Shelf { shelf: Shelf::Working, count: p.working.len(), expanded: shelves.working_expanded });
@@ -318,6 +336,9 @@ impl SidebarModel {
         }
         let hidden_settled = settled_count.saturating_sub(visible_settled.len());
         let rendered = if shelves.settled_expanded { visible_settled } else { route_only(&visible_settled) };
+        if rendered.is_empty() {
+            marker(&mut rows, Marker::SettledPlaceholder);
+        }
         push_threads(&mut rows, &rendered, Section::Settled);
         if shelves.settled_expanded && hidden_settled > 0 {
             rows.push(SidebarRow::ShowMore { count: hidden_settled.min(SETTLED_TAIL_PAGE_COUNT) });
@@ -341,7 +362,33 @@ impl SidebarModel {
             }
             SidebarRow::Shelf { shelf, .. } => RowKey::Shelf(*shelf),
             SidebarRow::ShowMore { .. } => RowKey::ShowMore,
+            SidebarRow::Marker(marker) => RowKey::Marker(*marker),
         }
+    }
+
+    /// The drag list (`sidebarListItems`): rows as drop items, without Show more.
+    pub fn drop_items(&self) -> Vec<DropItem> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                SidebarRow::Thread { index, section } => Some(DropItem::Thread { id: self.threads[*index].id.clone(), section: *section }),
+                SidebarRow::Shelf { shelf, .. } => Some(DropItem::Marker(match shelf {
+                    Shelf::Working => Marker::WorkingHeader,
+                    Shelf::Snoozed => Marker::SnoozedHeader,
+                    Shelf::Settled => Marker::SettledHeader,
+                })),
+                SidebarRow::Marker(marker) => Some(DropItem::Marker(*marker)),
+                SidebarRow::ShowMore { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The insertion slot in `drop_items` for the pointer over `row`, in its lower half when
+    /// `after`.
+    pub fn drop_slot(&self, row: usize, after: bool) -> Option<usize> {
+        let before = self.rows.get(..row)?.iter().filter(|row| !matches!(row, SidebarRow::ShowMore { .. })).count();
+        let is_item = !matches!(self.rows.get(row)?, SidebarRow::ShowMore { .. });
+        Some(before + usize::from(after && is_item))
     }
 
     pub fn row_keys(&self) -> Vec<RowKey> {

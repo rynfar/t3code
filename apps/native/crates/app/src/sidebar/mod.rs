@@ -4,7 +4,9 @@
 //! list is a variable-height `list` that splices only the rows that changed. The pane is
 //! rendered `.cached()` and notifies itself only on shell, selection and notice changes.
 
+mod bulk;
 pub mod controller;
+mod drag;
 mod project_filter;
 mod row;
 mod search;
@@ -61,6 +63,7 @@ pub struct SidebarPane {
     /// Whether the last frame drew a ticking working duration; only then does the clock run per second.
     live_rendered: bool,
     clock: Option<(ClockRate, Task<()>)>,
+    drag: Option<drag::PaneDrag>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -88,6 +91,11 @@ impl SidebarPane {
                     cx.notify();
                 }
                 AppEvent::Notice => cx.notify(),
+                AppEvent::SidebarSelection => {
+                    this.model_seen = this.state.read(cx).sidebar.model.clone();
+                    this.sync_rows(cx);
+                    cx.notify();
+                }
                 _ => {}
             }),
             cx.subscribe_in(&search_input, window, |this, input, event: &InputEvent, window, cx| match event {
@@ -101,7 +109,12 @@ impl SidebarPane {
             }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
                 ContextMenuEvent::Rename(thread_id) => this.start_rename(thread_id, window, cx),
-                ContextMenuEvent::CustomSnooze(thread_id) => snooze.update(cx, |snooze, cx| snooze.open(thread_id, window, cx)),
+                ContextMenuEvent::CustomSnooze(thread_ids) => snooze.update(cx, |snooze, cx| snooze.open(thread_ids.clone(), window, cx)),
+                ContextMenuEvent::BulkDelete(thread_ids) => {
+                    let (heading, description) = t3_core::sidebar::selection::bulk_delete_confirmation(thread_ids.len());
+                    let ids = thread_ids.clone();
+                    dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| state.delete_threads(ids, cx), window, cx));
+                }
                 ContextMenuEvent::Delete(thread_id) => {
                     let Some(title) = this.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
                     let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
@@ -125,6 +138,7 @@ impl SidebarPane {
             model_seen: Default::default(),
             live_rendered: false,
             clock: None,
+            drag: None,
             _subscriptions: subscriptions,
         };
         pane.sync_rows(cx);
@@ -234,8 +248,13 @@ impl SidebarPane {
         }
     }
 
+    /// A selected row opens the bulk menu (`handleThreadContextMenu`).
     pub fn open_menu(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu.update(cx, |menu, cx| menu.open_for_thread(thread_id, position, window, cx));
+        if self.state.read(cx).sidebar.selection.contains(thread_id) {
+            self.menu.update(cx, |menu, cx| menu.open_for_selection(position, window, cx));
+        } else {
+            self.menu.update(cx, |menu, cx| menu.open_for_thread(thread_id, position, window, cx));
+        }
     }
 
     pub fn open_snooze_menu(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -444,13 +463,22 @@ impl Render for SidebarPane {
                 .child(self.empty_message(synchronized, cx))
                 .into_any_element()
         } else {
-            list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx))).flex_1().into_any_element()
+            div()
+                .id("sidebar-thread-list")
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx))).flex_1())
+                .on_drop(cx.listener(|this, _: &drag::DraggedThread, _, cx| this.finish_drag(true, cx)))
+                .into_any_element()
         };
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(hsla(p.sidebar))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.finish_drag(false, cx)))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.finish_drag(false, cx)))
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))

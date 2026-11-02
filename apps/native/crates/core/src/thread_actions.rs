@@ -43,6 +43,20 @@ pub fn pin(command_id: &str, thread_id: &str, order_key: Option<&str>) -> Value 
     command
 }
 
+/// `thread.pin.reorder`: moves a pinned thread to `order_key`.
+pub fn reorder_pin(command_id: &str, thread_id: &str, order_key: &str) -> Value {
+    let mut command = thread_command("thread.pin.reorder", command_id, thread_id);
+    command["orderKey"] = json!(order_key);
+    command
+}
+
+/// `thread.active.reorder`: moves an Active thread to `order_key`.
+pub fn reorder_active(command_id: &str, thread_id: &str, order_key: &str) -> Value {
+    let mut command = thread_command("thread.active.reorder", command_id, thread_id);
+    command["orderKey"] = json!(order_key);
+    command
+}
+
 pub fn unpin(command_id: &str, thread_id: &str) -> Value {
     thread_command("thread.unpin", command_id, thread_id)
 }
@@ -607,6 +621,8 @@ mod tests {
         assert_eq!(regenerate_title("c", "t")["regenerateTitle"], true);
         assert_eq!(set_auto_settle("c", "t", false)["enabled"], false);
         assert_eq!(mark_unread("c", "t")["type"], "thread.mark-unread");
+        assert_eq!(reorder_pin("c", "t", "m"), json!({"type": "thread.pin.reorder", "commandId": "c", "threadId": "t", "orderKey": "m"}));
+        assert_eq!(reorder_active("c", "t", "m")["type"], "thread.active.reorder");
         assert_eq!(visit("c", "t", 0)["visitedAt"], "1970-01-01T00:00:00.000Z");
     }
 

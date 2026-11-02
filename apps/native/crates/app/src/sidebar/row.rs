@@ -2,7 +2,7 @@
 //! `sidebar/SidebarListMarkers.tsx`): 78px cards for pinned, active and working threads, 36px slim
 //! rows for snoozed and settled ones, shelf headers, and the Settled "Show more" button.
 
-use gpui::{AnyElement, App, BoxShadow, Context, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, point, prelude::*, px};
+use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, point, prelude::*, px};
 use t3_core::sidebar::settled::{self, snooze_wake_label};
 use t3_core::sidebar::status::{self, StatusIcon, StatusTone, ThreadStatus, TopStatus};
 use t3_core::sidebar::thread::SidebarThread;
@@ -10,6 +10,7 @@ use t3_core::sidebar::time::{compact_relative_label, working_duration_label};
 use t3_core::sidebar::{Section, Shelf, SidebarRow, sort::settled_timestamp};
 
 use super::SidebarPane;
+use super::drag::{DraggedThread, ThreadDragPreview, ThreadHoverCard};
 use crate::icons::Icon;
 use crate::theme::{Palette, hsla, palette};
 
@@ -86,27 +87,43 @@ impl SidebarPane {
     pub(super) fn render_row(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let model = self.state.read(cx).sidebar.model.clone();
         let Some(row) = model.rows.get(index) else { return div().into_any_element() };
-        match row {
+        let element = match row {
             SidebarRow::Thread { index: thread_index, section } => {
                 let thread = &model.threads[*thread_index];
                 let project = model.project_names.get(&thread.project_id).cloned();
                 let active = self.state.read(cx).selected_thread.as_deref() == Some(thread.id.as_str());
                 if section.is_card() {
-                    self.render_card(thread, project, active, cx)
+                    self.render_card(thread, project, *section, active, cx)
                 } else {
-                    self.render_slim(thread, *section, active, cx)
+                    self.render_slim(thread, project, *section, active, cx)
                 }
             }
             SidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, cx),
             SidebarRow::ShowMore { count } => self.render_show_more(*count, cx),
-        }
+            SidebarRow::Marker(marker) => self.render_marker(*marker, cx),
+        };
+        div()
+            .id(("sidebar-row", index))
+            .relative()
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedThread>, _, cx| this.drag_moved(index, event, cx)))
+            .child(element)
+            .children(self.drop_line(index, cx))
+            .into_any_element()
     }
 
-    fn row_surface(&self, thread: &SidebarThread, active: bool, recede_working: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn row_surface(&self, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, recede_working: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = palette(cx);
         let light = !cx.window_appearance_is_dark();
         let id = thread.id.clone();
         let menu_id = thread.id.clone();
+        let state = self.state.read(cx);
+        let selected = !active && state.sidebar.selection.contains(&thread.id);
+        let dragging = state.sidebar.drag.as_ref().is_some_and(|(dragged, _)| *dragged == thread.id);
+        let draggable = section != Section::Working && state.sidebar.capabilities.can_operate && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != thread.id);
+        let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
+        let card = (self.state.clone(), thread.id.clone(), project.clone());
+        let preview = (thread.title.clone(), project);
+        let pane = cx.entity().downgrade();
         div()
             .id(SharedString::from(format!("thread-row-{}", thread.id)))
             .group("sidebar-row")
@@ -114,19 +131,31 @@ impl SidebarPane {
             .w_full()
             .rounded(px(6.))
             .cursor_pointer()
-            .when(active, |this| {
-                this.bg(hsla(p.sidebar_row_active)).when(light, |this| {
-                    this.shadow(vec![BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true }])
+            .when(active, |this| this.bg(hsla(p.sidebar_row_active)).when(light, |this| this.shadow(vec![ring.clone()])))
+            .when(selected, |this| this.bg(hsla(p.sidebar_row_selected)).when(light, |this| this.shadow(vec![ring.clone()])))
+            .when(!active && !selected, |this| this.hover(|this| this.bg(hsla(p.sidebar_row_hover))))
+            .when(recede_working, |this| this.opacity(0.7).hover(|this| this.opacity(1.)))
+            .when(dragging, |this| this.opacity(0.5))
+            .when(self.drag.is_none(), |this| this.tooltip(move |_, cx| {
+                let hover = hover_card(card.0.read(cx), &card.1, card.2.clone());
+                cx.new(|_| hover).into()
+            }))
+            .when(draggable, |this| {
+                this.on_drag(DraggedThread { id: thread.id.clone() }, move |dragged, _, _, cx| {
+                    let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone()));
+                    if let Some(pane) = pane.upgrade() {
+                        pane.update(cx, |pane, cx| pane.begin_drag(&dragged.id, preview.clone(), cx));
+                    }
+                    preview
                 })
             })
-            .when(!active, |this| this.hover(|this| this.bg(hsla(p.sidebar_row_hover))))
-            .when(recede_working, |this| this.opacity(0.7).hover(|this| this.opacity(1.)))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                if event.click_count() > 1 {
+                let modifiers = event.modifiers();
+                if event.click_count() > 1 && !modifiers.shift && !modifiers.platform && !modifiers.control {
                     this.start_rename(&id, window, cx);
                     return;
                 }
-                this.state.update(cx, |state, cx| state.select_thread(&id, cx));
+                this.state.update(cx, |state, cx| state.click_sidebar_thread(&id, modifiers, cx));
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                 this.open_menu(&menu_id, event.position, window, cx);
@@ -194,7 +223,7 @@ impl SidebarPane {
         )
     }
 
-    fn render_card(&mut self, thread: &SidebarThread, project: Option<String>, active: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_card(&mut self, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let now = self.now;
         let state = row_state(thread, active, now);
@@ -293,7 +322,7 @@ impl SidebarPane {
             .py(px(2.))
             .pb(px(3.))
             .child(
-                self.row_surface(thread, active, state.recede && state.status == ThreadStatus::Working, cx).child(
+                self.row_surface(thread, project.clone(), section, active, state.recede && state.status == ThreadStatus::Working, cx).child(
                     div()
                         .when(has_meta, |this| this.h(px(CARD_CONTENT_HEIGHT)))
                         .px(px(10.))
@@ -338,7 +367,7 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    fn render_slim(&mut self, thread: &SidebarThread, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_slim(&mut self, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let now = self.now;
         let state = row_state(thread, active, now);
@@ -400,7 +429,7 @@ impl SidebarPane {
             .px(px(8.))
             .pb(px(1.))
             .child(
-                self.row_surface(thread, active, false, cx).h(px(SLIM_HEIGHT)).child(
+                self.row_surface(thread, project, section, active, false, cx).h(px(SLIM_HEIGHT)).child(
                     div()
                         .h_full()
                         .flex()
@@ -461,6 +490,13 @@ impl SidebarPane {
 
     fn render_shelf(&self, shelf: Shelf, count: usize, expanded: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let tone = if shelf == Shelf::Settled && self.drop_target() == Some(Section::Settled) {
+            hsla(p.primary)
+        } else if self.drag.is_some() {
+            hsla(p.sidebar_foreground)
+        } else {
+            hsla(p.sidebar_muted_foreground)
+        };
         div()
             .px(px(10.))
             .pb(px(1.))
@@ -476,7 +512,7 @@ impl SidebarPane {
                     .cursor_pointer()
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(hsla(p.sidebar_muted_foreground))
+                    .text_color(tone)
                     .hover(|this| this.text_color(hsla(p.sidebar_foreground)))
                     .child(shelf.label())
                     .child(div().flex_1())
@@ -511,6 +547,20 @@ impl SidebarPane {
                     })),
             )
             .into_any_element()
+    }
+}
+
+/// Built when the tooltip opens, so rows pay nothing for it while drawing.
+fn hover_card(state: &crate::app_state::AppState, thread_id: &str, project: Option<String>) -> ThreadHoverCard {
+    let thread = state.sidebar.model.thread(thread_id);
+    let model = state.shell.thread(thread_id).map(|shell| shell.model_selection.model.clone()).filter(|model| !model.is_empty());
+    let error = thread.and_then(|thread| thread.runtime.as_ref()).filter(|runtime| runtime.last_error.is_some()).map(|runtime| runtime.last_error_class.as_deref() == Some("usage_limit"));
+    ThreadHoverCard {
+        title: thread.map(|thread| thread.title.clone()).unwrap_or_default().into(),
+        project: project.map(Into::into),
+        branch: thread.and_then(|thread| thread.branch.clone()).map(Into::into),
+        model: model.map(Into::into),
+        error,
     }
 }
 

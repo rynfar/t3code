@@ -44,6 +44,8 @@ pub enum AppEvent {
     RightPanel,
     /// A file was queued in `composer_mentions` for the composer.
     ComposerMention,
+    /// The sidebar's multi-selection or thread drag changed.
+    SidebarSelection,
 }
 
 pub struct AppState {

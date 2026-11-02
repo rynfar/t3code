@@ -89,6 +89,9 @@ pub struct SidebarController {
     pub history: t3_core::sidebar::history::NavHistory,
     /// Project ids the thread list is filtered to, or every project.
     pub project_scope: Option<std::collections::HashSet<String>>,
+    pub selection: t3_core::sidebar::selection::ThreadSelection,
+    /// The thread being dragged and the section it left.
+    pub drag: Option<(String, t3_core::sidebar::Section)>,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
     wake_timer: Option<Task<()>>,
@@ -120,6 +123,7 @@ impl AppState {
                     project_scope: self.sidebar.project_scope.as_ref(),
                     connected: connected(&self.phase),
                     now,
+                    dragging: self.sidebar.drag.as_ref().map(|(_, from)| *from),
                 },
                 &mut self.sidebar.tracker,
             ),
@@ -175,6 +179,8 @@ impl AppState {
     }
 
     pub fn set_project_scope(&mut self, scope: Option<std::collections::HashSet<String>>, cx: &mut Context<Self>) {
+        // A selection made under one scope can hold threads the next scope hides.
+        self.sidebar.selection.clear();
         self.sidebar.project_scope = scope;
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Shell);
@@ -317,7 +323,7 @@ impl AppState {
 
     /// `pinThread`: tops the pinned run by default, and supersedes older pin, settle and snooze
     /// undos, since pinning clears snooze and un-settles.
-    fn pin_command(&mut self, thread_id: &str, order_key: Option<String>) -> Value {
+    pub(crate) fn pin_command(&mut self, thread_id: &str, order_key: Option<String>) -> Value {
         let order_key = order_key.or_else(|| top_of_pinned_order_key(self.sidebar.model.threads.iter()));
         for kind in [UndoKind::Pin, UndoKind::Settle, UndoKind::Snooze] {
             self.sidebar.undo.invalidate(kind, thread_id);
@@ -389,15 +395,28 @@ impl AppState {
 
     /// Deletes after the caller confirmed. Stops a live runtime first, as the web does.
     pub fn delete_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let Some(thread) = self.snapshot_thread(thread_id) else { return };
+        let fallback = self.sidebar.model.adjacent_thread(Some(thread_id), true).or_else(|| self.sidebar.model.adjacent_thread(Some(thread_id), false)).map(str::to_owned);
+        self.delete_thread_then(thread_id, fallback, "Failed to delete thread", cx, |_, _, _| {});
+    }
+
+    /// `delete_thread` with the thread to open if the deleted one was open, and a callback with
+    /// the outcome.
+    pub(crate) fn delete_thread_then(
+        &mut self,
+        thread_id: &str,
+        fallback: Option<String>,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
+    ) {
+        let Some(thread) = self.snapshot_thread(thread_id) else { return then(self, false, cx) };
         if thread.runtime.is_some() {
             self.dispatch_then(t3_core::commands::stop_thread(&uuid(), thread_id), None, cx, |_, _, _| {});
         }
         let id = thread_id.to_owned();
-        let fallback = self.sidebar.model.adjacent_thread(Some(thread_id), true).or_else(|| self.sidebar.model.adjacent_thread(Some(thread_id), false)).map(str::to_owned);
-        self.dispatch_then(actions::delete(&uuid(), thread_id), Some("Failed to delete thread"), cx, move |state, ok, cx| {
+        self.dispatch_then(actions::delete(&uuid(), thread_id), Some(failure_title), cx, move |state, ok, cx| {
             if !ok {
-                return;
+                return then(state, false, cx);
             }
             state.sidebar.undo.expire_placement(&id, true);
             cx.emit(AppEvent::Notice);
@@ -407,6 +426,7 @@ impl AppState {
                     None => state.clear_selection(cx),
                 }
             }
+            then(state, true, cx);
         });
     }
 
