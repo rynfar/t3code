@@ -39,111 +39,116 @@ Source: `index.css` (`:root` 91–152, 1113–1229, 1282–1301, 1600–1712, 22
 Web source column. `#rrggbb` is opaque and `#rrggbbaa` is translucent. Tokens marked _sidebar scope_
 are evaluated inside `[data-app-sidebar]`, which redefines the surface variables (§2.3).
 
-| Native token                     | Web source                                         | LIGHT       | DARK        |
-| -------------------------------- | -------------------------------------------------- | ----------- | ----------- |
-| `app_chrome_background`          | `--app-chrome-background`                          | `#fcfcfc`   | `#000000`   |
-| `background`                     | `--background`                                     | `#fcfcfc`   | `#000000`   |
-| `foreground`                     | `--color-foreground`                               | `#18181b`   | `#f5f5f5`   |
-| `surface_raised`                 | `--surface-raised`                                 | `#ffffff33` | `#111111`   |
-| `card`                           | `--card`                                           | `#ffffff`   | `#111111`   |
-| `card_foreground`                | `--color-card-foreground`                          | `#18181b`   | `#f5f5f5`   |
-| `popover`                        | `--popover`                                        | `#ffffff`   | `#111111`   |
-| `popover_foreground`             | `--color-popover-foreground`                       | `#18181b`   | `#f5f5f5`   |
-| `primary`                        | `--primary`                                        | `#1b4ed8`   | `#346bf1`   |
-| `primary_foreground`             | `--primary-foreground`                             | `#ffffff`   | `#ffffff`   |
-| `secondary`                      | `--secondary`                                      | `#fafafa`   | `#ffffff08` |
-| `secondary_foreground`           | `--color-secondary-foreground`                     | `#27272a`   | `#f5f5f5`   |
-| `muted`                          | `--muted`                                          | `#fafafa`   | `#ffffff08` |
-| `muted_foreground`               | `--color-muted-foreground`                         | `#71717b`   | `#a1a1a1`   |
-| `accent`                         | `--accent`                                         | `#f4f4f5`   | `#ffffff0a` |
-| `accent_foreground`              | `--color-accent-foreground`                        | `#18181b`   | `#f5f5f5`   |
-| `placeholder`                    | `--color-placeholder`                              | `#71717b`   | `#a1a1a1`   |
-| `secondary_label`                | `--color-secondary-label`                          | `#71717b`   | `#a1a1a1`   |
-| `icon_muted`                     | `--color-icon-muted`                               | `#71717b`   | `#a1a1a1`   |
-| `border`                         | `--color-border`                                   | `#e4e4e7`   | `#ffffff14` |
-| `input`                          | `--color-input`                                    | `#d4d4d8`   | `#ffffff1c` |
-| `ring`                           | `--ring`                                           | `#1b4ed8`   | `#346bf1`   |
-| `destructive`                    | `--destructive`                                    | `#fb2c36`   | `#fb414a`   |
-| `destructive_foreground`         | `--destructive-foreground`                         | `#c10007`   | `#ff6467`   |
-| `error`                          | `--error`                                          | `#fb2c36`   | `#fb414a`   |
-| `error_foreground`               | `--error-foreground`                               | `#c10007`   | `#ff6467`   |
-| `error_surface`                  | `--error-surface`                                  | `#fb2c3614` | `#fb414a29` |
-| `tool_error_icon`                | `--tool-error-icon`                                | `#fb2c36`   | `#fca5a5`   |
-| `warning`                        | `--warning`                                        | `#fe9a00`   | `#fe9a00`   |
-| `warning_foreground`             | `--warning-foreground`                             | `#bb4d00`   | `#ffb900`   |
-| `warning_surface`                | `--warning-surface`                                | `#fe9a0014` | `#fe9a0029` |
-| `success`                        | `--success`                                        | `#00bc7d`   | `#00bc7d`   |
-| `success_foreground`             | `--success-foreground`                             | `#007a55`   | `#00d492`   |
-| `info`                           | `--info`                                           | `#2b7fff`   | `#2b7fff`   |
-| `info_foreground`                | `--info-foreground`                                | `#1447e6`   | `#51a2ff`   |
-| `update`                         | `--update`                                         | `#1b4ed8`   | `#346bf1`   |
-| `update_foreground`              | `--update-foreground`                              | `#1b4ed8`   | `#51a2ff`   |
-| `guest`                          | `--guest`                                          | `#e12afb`   | `#e12afb`   |
-| `guest_foreground`               | `--guest-foreground`                               | `#c800de`   | `#f4a8ff`   |
-| `guest_surface`                  | `--guest-surface`                                  | `#ead0ef`   | `#391f3d`   |
-| `message_surface`                | `--message-surface`                                | `#ebebed`   | `#1e1e1e`   |
-| `message_foreground`             | `--color-message-foreground`                       | `#18181b`   | `#f5f5f5`   |
-| `message_action`                 | `--message-action`                                 | `#1b4ed8`   | `#346bf1`   |
-| `message_action_foreground`      | `--message-action-foreground`                      | `#ffffff`   | `#ffffff`   |
-| `message_action_hover`           | `--message-action-hover`                           | `#3160db`   | `#2f60d9`   |
-| `code_background`                | `--code-background`                                | `#ffffff`   | `#101010`   |
-| `code_foreground`                | `--code-foreground`                                | `#18181b`   | `#f5f5f5`   |
-| `code_block_background`          | `.chat-markdown-codeblock`                         | `#fafafa`   | `#ffffff09` |
-| `code_block_border`              | `.chat-markdown-codeblock`                         | `#e4e4e7b3` | `#00000000` |
-| `inline_code_background`         | `.chat-markdown :not(pre) > code`                  | `#18181b1a` | `#f5f5f51a` |
-| `diff_addition`                  | `--diff-addition`                                  | `#00bc7d`   | `#00bc7d`   |
-| `diff_deletion`                  | `--diff-deletion`                                  | `#fb2c36`   | `#fb414a`   |
-| `diff_addition_foreground`       | `--diff-addition-foreground`                       | `#007a55`   | `#00d492`   |
-| `diff_deletion_foreground`       | `--diff-deletion-foreground`                       | `#c10007`   | `#ff6467`   |
-| `diff_modified_icon`             | `--diff-modified-icon`                             | `#425cb1`   | `#51a2ffa6` |
-| `toolbar_background`             | `--toolbar-background`                             | `#fcfcfc`   | `#000000`   |
-| `toolbar_foreground`             | `--contrast-toolbar-foreground`                    | `#18181b`   | `#f5f5f5`   |
-| `toolbar_border`                 | `--contrast-toolbar-border`                        | `#e4e4e7`   | `#ffffff14` |
-| `toolbar_control`                | `--toolbar-control`                                | `#ffffff`   | `#111111`   |
-| `toolbar_control_foreground`     | `--contrast-toolbar-control-foreground`            | `#18181b`   | `#f5f5f5`   |
-| `toolbar_control_hover`          | `--toolbar-control-hover`                          | `#f4f4f5`   | `#ffffff0a` |
-| `terminal_background`            | `--terminal-background`                            | `#fcfcfc`   | `#000000`   |
-| `terminal_foreground`            | `--terminal-foreground`                            | `#18181b`   | `#f5f5f5`   |
-| `terminal_cursor`                | `--terminal-cursor`                                | `#26384e`   | `#b4cbff`   |
-| `terminal_selection`             | `--terminal-selection-background`                  | `#253f6333` | `#b4cbff40` |
-| `scrollbar_thumb`                | `--app-scrollbar-thumb`                            | `#d9d9d9`   | `#ffffff14` |
-| `scrollbar_thumb_hover`          | `--app-scrollbar-thumb-hover`                      | `#bfbfbf`   | `#ffffff1f` |
-| `search_match_background`        | `::highlight(t3-thread-find)`                      | `#ffde8b`   | `#8c6c1f`   |
-| `search_match_foreground`        | `::highlight(t3-thread-find)`                      | `#21180a`   | `#f5f5f5`   |
-| `search_match_active_background` | `::highlight(t3-thread-find-active)`               | `#eea52b`   | `#eea52b`   |
-| `search_match_active_foreground` | `::highlight(t3-thread-find-active)`               | `#21180a`   | `#21180a`   |
-| `status_input_icon`              | `text-indigo-600 dark:text-indigo-300`             | `#4f39f6`   | `#a3b3ff`   |
-| `terminal_running`               | `text-teal-600 dark:text-teal-300/90`              | `#009689`   | `#46ecd5e6` |
-| `pill_approval`                  | `text-amber-600 dark:text-amber-300/90`            | `#e17100`   | `#ffd230e6` |
-| `pill_approval_dot`              | `bg-amber-500 dark:bg-amber-300/90`                | `#fe9a00`   | `#ffd230e6` |
-| `pill_input`                     | `text-indigo-600 dark:text-indigo-300/90`          | `#4f39f6`   | `#a3b3ffe6` |
-| `pill_input_dot`                 | `bg-indigo-500 dark:bg-indigo-300/90`              | `#615fff`   | `#a3b3ffe6` |
-| `pill_working`                   | `text-sky-600 dark:text-sky-300/80`                | `#0084d1`   | `#74d4ffcc` |
-| `pill_working_dot`               | `bg-sky-500 dark:bg-sky-300/80`                    | `#00a6f4`   | `#74d4ffcc` |
-| `pill_failed`                    | `text-red-600 dark:text-red-300/90`                | `#e7000b`   | `#ffa2a2e6` |
-| `pill_failed_dot`                | `bg-red-500 dark:bg-red-300/90`                    | `#fb2c36`   | `#ffa2a2e6` |
-| `pill_plan`                      | `text-violet-600 dark:text-violet-300/90`          | `#7f22fe`   | `#c4b4ffe6` |
-| `pill_plan_dot`                  | `bg-violet-500 dark:bg-violet-300/90`              | `#8e51ff`   | `#c4b4ffe6` |
-| `pill_completed`                 | `text-emerald-600 dark:text-emerald-300/90`        | `#009966`   | `#5ee9b5e6` |
-| `pill_completed_dot`             | `bg-emerald-500 dark:bg-emerald-300/90`            | `#00bc7d`   | `#5ee9b5e6` |
-| `glass_surface`                  | `@utility surface-glass`                           | `#fcfcfccc` | `#000000cc` |
-| `dialog_surface`                 | `@utility dialog-glass`                            | `#fcfcfccc` | `#000000cc` |
-| `dialog_border`                  | `@utility dialog-glass`                            | `#18181b1a` | `#ffffff14` |
-| `dialog_backdrop`                | `@utility dialog-backdrop`                         | `#fcfcfc99` | `#000000a3` |
-| `dropdown_surface`               | `@utility dropdown-glass`                          | `#ffffffd5` | `#111111d5` |
-| `dropdown_border`                | `@utility dropdown-glass`                          | `#18181b1a` | `#f5f5f51a` |
-| `sidebar`                        | `--sidebar` (sidebar scope)                        | `#fafafa`   | `#000000`   |
-| `sidebar_foreground`             | `--color-sidebar-foreground` (sidebar scope)       | `#18181b`   | `#f1f3f7`   |
-| `sidebar_muted_foreground`       | `--color-sidebar-muted-foreground` (sidebar scope) | `#71717b`   | `#a3a3a3`   |
-| `sidebar_icon`                   | `--sidebar-icon-color` (sidebar scope)             | `#86858e`   | `#8b8b8b`   |
-| `sidebar_secondary_label`        | `--color-secondary-label` (sidebar scope)          | `#71717b`   | `#8f8f8f`   |
-| `sidebar_accent`                 | `--accent` (sidebar scope)                         | `#f4f4f5`   | `#191a1d`   |
-| `sidebar_control_surface`        | `--sidebar-control-surface` (sidebar scope)        | `#f4f4f5`   | `#0a0a0a`   |
-| `sidebar_row_hover`              | `--sidebar-row-hover` (sidebar scope)              | `#fcfcfc`   | `#f1f3f714` |
-| `sidebar_row_active`             | `--sidebar-row-active` (sidebar scope)             | `#ffffff`   | `#f1f3f71c` |
-| `sidebar_row_selected`           | `--sidebar-row-selected` (sidebar scope)           | `#ffffff`   | `#f1f3f712` |
-| `sidebar_border`                 | `--color-sidebar-border` (sidebar scope)           | `#e4e4e7`   | `#ffffff14` |
-| `sidebar_edge`                   | `[data-app-sidebar] border-color` (sidebar scope)  | `#e4e4e7`   | `#ffffff14` |
+| Native token                     | Web source                                             | LIGHT       | DARK        |
+| -------------------------------- | ------------------------------------------------------ | ----------- | ----------- |
+| `app_chrome_background`          | `--app-chrome-background`                              | `#fcfcfc`   | `#000000`   |
+| `background`                     | `--background`                                         | `#fcfcfc`   | `#000000`   |
+| `foreground`                     | `--color-foreground`                                   | `#18181b`   | `#f5f5f5`   |
+| `surface_raised`                 | `--surface-raised`                                     | `#ffffff33` | `#111111`   |
+| `card`                           | `--card`                                               | `#ffffff`   | `#111111`   |
+| `card_foreground`                | `--color-card-foreground`                              | `#18181b`   | `#f5f5f5`   |
+| `popover`                        | `--popover`                                            | `#ffffff`   | `#111111`   |
+| `popover_foreground`             | `--color-popover-foreground`                           | `#18181b`   | `#f5f5f5`   |
+| `primary`                        | `--primary`                                            | `#1b4ed8`   | `#346bf1`   |
+| `primary_foreground`             | `--primary-foreground`                                 | `#ffffff`   | `#ffffff`   |
+| `secondary`                      | `--secondary`                                          | `#fafafa`   | `#ffffff08` |
+| `secondary_foreground`           | `--color-secondary-foreground`                         | `#27272a`   | `#f5f5f5`   |
+| `muted`                          | `--muted`                                              | `#fafafa`   | `#ffffff08` |
+| `muted_foreground`               | `--color-muted-foreground`                             | `#71717b`   | `#a1a1a1`   |
+| `accent`                         | `--accent`                                             | `#f4f4f5`   | `#ffffff0a` |
+| `accent_foreground`              | `--color-accent-foreground`                            | `#18181b`   | `#f5f5f5`   |
+| `placeholder`                    | `--color-placeholder`                                  | `#71717b`   | `#a1a1a1`   |
+| `secondary_label`                | `--color-secondary-label`                              | `#71717b`   | `#a1a1a1`   |
+| `icon_muted`                     | `--color-icon-muted`                                   | `#71717b`   | `#a1a1a1`   |
+| `border`                         | `--color-border`                                       | `#e4e4e7`   | `#ffffff14` |
+| `input`                          | `--color-input`                                        | `#d4d4d8`   | `#ffffff1c` |
+| `ring`                           | `--ring`                                               | `#1b4ed8`   | `#346bf1`   |
+| `destructive`                    | `--destructive`                                        | `#fb2c36`   | `#fb414a`   |
+| `destructive_foreground`         | `--destructive-foreground`                             | `#c10007`   | `#ff6467`   |
+| `error`                          | `--error`                                              | `#fb2c36`   | `#fb414a`   |
+| `error_foreground`               | `--error-foreground`                                   | `#c10007`   | `#ff6467`   |
+| `error_surface`                  | `--error-surface`                                      | `#fb2c3614` | `#fb414a29` |
+| `tool_error_icon`                | `--tool-error-icon`                                    | `#fb2c36`   | `#fca5a5`   |
+| `warning`                        | `--warning`                                            | `#fe9a00`   | `#fe9a00`   |
+| `warning_foreground`             | `--warning-foreground`                                 | `#bb4d00`   | `#ffb900`   |
+| `warning_surface`                | `--warning-surface`                                    | `#fe9a0014` | `#fe9a0029` |
+| `success`                        | `--success`                                            | `#00bc7d`   | `#00bc7d`   |
+| `success_foreground`             | `--success-foreground`                                 | `#007a55`   | `#00d492`   |
+| `info`                           | `--info`                                               | `#2b7fff`   | `#2b7fff`   |
+| `info_foreground`                | `--info-foreground`                                    | `#1447e6`   | `#51a2ff`   |
+| `update`                         | `--update`                                             | `#1b4ed8`   | `#346bf1`   |
+| `update_foreground`              | `--update-foreground`                                  | `#1b4ed8`   | `#51a2ff`   |
+| `guest`                          | `--guest`                                              | `#e12afb`   | `#e12afb`   |
+| `guest_foreground`               | `--guest-foreground`                                   | `#c800de`   | `#f4a8ff`   |
+| `guest_surface`                  | `--guest-surface`                                      | `#ead0ef`   | `#391f3d`   |
+| `message_surface`                | `--message-surface`                                    | `#ebebed`   | `#1e1e1e`   |
+| `message_foreground`             | `--color-message-foreground`                           | `#18181b`   | `#f5f5f5`   |
+| `message_action`                 | `--message-action`                                     | `#1b4ed8`   | `#346bf1`   |
+| `message_action_foreground`      | `--message-action-foreground`                          | `#ffffff`   | `#ffffff`   |
+| `message_action_hover`           | `--message-action-hover`                               | `#3160db`   | `#2f60d9`   |
+| `code_background`                | `--code-background`                                    | `#ffffff`   | `#101010`   |
+| `code_foreground`                | `--code-foreground`                                    | `#18181b`   | `#f5f5f5`   |
+| `code_block_background`          | `.chat-markdown-codeblock`                             | `#fafafa`   | `#ffffff09` |
+| `code_block_border`              | `.chat-markdown-codeblock`                             | `#e4e4e7b3` | `#00000000` |
+| `inline_code_background`         | `.chat-markdown :not(pre) > code`                      | `#18181b1a` | `#f5f5f51a` |
+| `diff_addition`                  | `--diff-addition`                                      | `#00bc7d`   | `#00bc7d`   |
+| `diff_deletion`                  | `--diff-deletion`                                      | `#fb2c36`   | `#fb414a`   |
+| `diff_addition_foreground`       | `--diff-addition-foreground`                           | `#007a55`   | `#00d492`   |
+| `diff_deletion_foreground`       | `--diff-deletion-foreground`                           | `#c10007`   | `#ff6467`   |
+| `diff_modified_icon`             | `--diff-modified-icon`                                 | `#425cb1`   | `#51a2ffa6` |
+| `diff_row_addition`              | `diffRendering.ts --diffs-bg-addition-override`        | `#ecf9f4`   | `#02110b`   |
+| `diff_row_addition_gutter`       | `diffRendering.ts --diffs-bg-addition-number-override` | `#eef9f5`   | `#04110b`   |
+| `diff_row_deletion`              | `diffRendering.ts --diffs-bg-deletion-override`        | `#fef0f0`   | `#170705`   |
+| `diff_row_deletion_gutter`       | `diffRendering.ts --diffs-bg-deletion-number-override` | `#fef1f0`   | `#170806`   |
+| `diff_hunk_separator`            | `StyledDiffCodeView.tsx --diffs-bg-separator`          | `#f5f5f6`   | `#070707`   |
+| `toolbar_background`             | `--toolbar-background`                                 | `#fcfcfc`   | `#000000`   |
+| `toolbar_foreground`             | `--contrast-toolbar-foreground`                        | `#18181b`   | `#f5f5f5`   |
+| `toolbar_border`                 | `--contrast-toolbar-border`                            | `#e4e4e7`   | `#ffffff14` |
+| `toolbar_control`                | `--toolbar-control`                                    | `#ffffff`   | `#111111`   |
+| `toolbar_control_foreground`     | `--contrast-toolbar-control-foreground`                | `#18181b`   | `#f5f5f5`   |
+| `toolbar_control_hover`          | `--toolbar-control-hover`                              | `#f4f4f5`   | `#ffffff0a` |
+| `terminal_background`            | `--terminal-background`                                | `#fcfcfc`   | `#000000`   |
+| `terminal_foreground`            | `--terminal-foreground`                                | `#18181b`   | `#f5f5f5`   |
+| `terminal_cursor`                | `--terminal-cursor`                                    | `#26384e`   | `#b4cbff`   |
+| `terminal_selection`             | `--terminal-selection-background`                      | `#253f6333` | `#b4cbff40` |
+| `scrollbar_thumb`                | `--app-scrollbar-thumb`                                | `#d9d9d9`   | `#ffffff14` |
+| `scrollbar_thumb_hover`          | `--app-scrollbar-thumb-hover`                          | `#bfbfbf`   | `#ffffff1f` |
+| `search_match_background`        | `::highlight(t3-thread-find)`                          | `#ffde8b`   | `#8c6c1f`   |
+| `search_match_foreground`        | `::highlight(t3-thread-find)`                          | `#21180a`   | `#f5f5f5`   |
+| `search_match_active_background` | `::highlight(t3-thread-find-active)`                   | `#eea52b`   | `#eea52b`   |
+| `search_match_active_foreground` | `::highlight(t3-thread-find-active)`                   | `#21180a`   | `#21180a`   |
+| `status_input_icon`              | `text-indigo-600 dark:text-indigo-300`                 | `#4f39f6`   | `#a3b3ff`   |
+| `terminal_running`               | `text-teal-600 dark:text-teal-300/90`                  | `#009689`   | `#46ecd5e6` |
+| `pill_approval`                  | `text-amber-600 dark:text-amber-300/90`                | `#e17100`   | `#ffd230e6` |
+| `pill_approval_dot`              | `bg-amber-500 dark:bg-amber-300/90`                    | `#fe9a00`   | `#ffd230e6` |
+| `pill_input`                     | `text-indigo-600 dark:text-indigo-300/90`              | `#4f39f6`   | `#a3b3ffe6` |
+| `pill_input_dot`                 | `bg-indigo-500 dark:bg-indigo-300/90`                  | `#615fff`   | `#a3b3ffe6` |
+| `pill_working`                   | `text-sky-600 dark:text-sky-300/80`                    | `#0084d1`   | `#74d4ffcc` |
+| `pill_working_dot`               | `bg-sky-500 dark:bg-sky-300/80`                        | `#00a6f4`   | `#74d4ffcc` |
+| `pill_failed`                    | `text-red-600 dark:text-red-300/90`                    | `#e7000b`   | `#ffa2a2e6` |
+| `pill_failed_dot`                | `bg-red-500 dark:bg-red-300/90`                        | `#fb2c36`   | `#ffa2a2e6` |
+| `pill_plan`                      | `text-violet-600 dark:text-violet-300/90`              | `#7f22fe`   | `#c4b4ffe6` |
+| `pill_plan_dot`                  | `bg-violet-500 dark:bg-violet-300/90`                  | `#8e51ff`   | `#c4b4ffe6` |
+| `pill_completed`                 | `text-emerald-600 dark:text-emerald-300/90`            | `#009966`   | `#5ee9b5e6` |
+| `pill_completed_dot`             | `bg-emerald-500 dark:bg-emerald-300/90`                | `#00bc7d`   | `#5ee9b5e6` |
+| `glass_surface`                  | `@utility surface-glass`                               | `#fcfcfccc` | `#000000cc` |
+| `dialog_surface`                 | `@utility dialog-glass`                                | `#fcfcfccc` | `#000000cc` |
+| `dialog_border`                  | `@utility dialog-glass`                                | `#18181b1a` | `#ffffff14` |
+| `dialog_backdrop`                | `@utility dialog-backdrop`                             | `#fcfcfc99` | `#000000a3` |
+| `dropdown_surface`               | `@utility dropdown-glass`                              | `#ffffffd5` | `#111111d5` |
+| `dropdown_border`                | `@utility dropdown-glass`                              | `#18181b1a` | `#f5f5f51a` |
+| `sidebar`                        | `--sidebar` (sidebar scope)                            | `#fafafa`   | `#000000`   |
+| `sidebar_foreground`             | `--color-sidebar-foreground` (sidebar scope)           | `#18181b`   | `#f1f3f7`   |
+| `sidebar_muted_foreground`       | `--color-sidebar-muted-foreground` (sidebar scope)     | `#71717b`   | `#a3a3a3`   |
+| `sidebar_icon`                   | `--sidebar-icon-color` (sidebar scope)                 | `#86858e`   | `#8b8b8b`   |
+| `sidebar_secondary_label`        | `--color-secondary-label` (sidebar scope)              | `#71717b`   | `#8f8f8f`   |
+| `sidebar_accent`                 | `--accent` (sidebar scope)                             | `#f4f4f5`   | `#191a1d`   |
+| `sidebar_control_surface`        | `--sidebar-control-surface` (sidebar scope)            | `#f4f4f5`   | `#0a0a0a`   |
+| `sidebar_row_hover`              | `--sidebar-row-hover` (sidebar scope)                  | `#fcfcfc`   | `#f1f3f714` |
+| `sidebar_row_active`             | `--sidebar-row-active` (sidebar scope)                 | `#ffffff`   | `#f1f3f71c` |
+| `sidebar_row_selected`           | `--sidebar-row-selected` (sidebar scope)               | `#ffffff`   | `#f1f3f712` |
+| `sidebar_border`                 | `--color-sidebar-border` (sidebar scope)               | `#e4e4e7`   | `#ffffff14` |
+| `sidebar_edge`                   | `[data-app-sidebar] border-color` (sidebar scope)      | `#e4e4e7`   | `#ffffff14` |
 
 ### 2.2 What each family is for
 
@@ -658,15 +663,15 @@ pressed use `accent` (`toolbar_control_hover` under named themes).
 
 ### 7.8 Code blocks and diffs
 
-| Part                                          | Spec                                                                                                                                                                                                                                                                                                                 |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Code block frame (`MarkdownCodeBlock.tsx:68`) | Vertical margin 10.4, radius 8, 1px `code_block_border`, `code_block_background`, line height 1.375                                                                                                                                                                                                                  |
-| Code block header                             | Pad 6 / 6 / 0 / 12 (about 30px tall). Language label mono 11px at 72% `foreground` (or a 14px file icon). End: Wrap, Run (shell only), Copy as `icon-xs` buttons (24) with 12px icons, gap 2. Wrap pressed = `secondary` variant                                                                                     |
-| Code block body                               | Pad 12.8 / 14.4, mono at code size, transparent fill; `pre-wrap` when wrapping                                                                                                                                                                                                                                       |
-| Changed-files card (`ChangedFilesTree.tsx`)   | Margin-top 16, radius 8, `secondary` fill (dark `input` at 20%). Sticky header pad 12 / 8, 12px, 500 weight. Tree padding 8; rows 28 tall, gap 8, radius 6, start padding 8 + 14 × depth, hover `accent` at 60%. Folder name mono 11px; file name mono 12px `foreground` at 85%; stats mono 10px in a `4ch 4ch` grid |
-| Diff panel (`StyledDiffCodeView.tsx`)         | Mono 13px on a 20px line. File header 32px, 12px sans, pad 8 / 12, sticky. Hunk separator 24px, 11px text                                                                                                                                                                                                            |
-| Diff row fills (`diffRendering.ts:267–330`)   | Added row = `code_background` mixed toward `diff_addition` 50% (dark 70%); added gutter 35% (dark 60%). Deleted rows the same with `diff_deletion`. Context row = `code_background` 97% mixed with `code_foreground`                                                                                                 |
-| Diff icons                                    | Added `success_foreground` (dark); deleted `destructive`; modified `diff_modified_icon`                                                                                                                                                                                                                              |
+| Part                                          | Spec                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Code block frame (`MarkdownCodeBlock.tsx:68`) | Vertical margin 10.4, radius 8, 1px `code_block_border`, `code_block_background`, line height 1.375                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Code block header                             | Pad 6 / 6 / 0 / 12 (about 30px tall). Language label mono 11px at 72% `foreground` (or a 14px file icon). End: Wrap, Run (shell only), Copy as `icon-xs` buttons (24) with 12px icons, gap 2. Wrap pressed = `secondary` variant                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Code block body                               | Pad 12.8 / 14.4, mono at code size, transparent fill; `pre-wrap` when wrapping                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Changed-files card (`ChangedFilesTree.tsx`)   | Margin-top 16, radius 8, `secondary` fill (dark `input` at 20%). Sticky header pad 12 / 8, 12px, 500 weight. Tree padding 8; rows 28 tall, gap 8, radius 6, start padding 8 + 14 × depth, hover `accent` at 60%. Folder name mono 11px; file name mono 12px `foreground` at 85%; stats mono 10px in a `4ch 4ch` grid                                                                                                                                                                                                                                                                                                                        |
+| Diff panel (`StyledDiffCodeView.tsx`)         | Mono 13px on a 20px line. File header 32px, 12px sans, pad 8 / 12, sticky. Hunk separator 24px, 11px text                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Diff row fills (`diffRendering.ts:267–330`)   | `diff_row_addition` / `diff_row_addition_gutter` and the `deletion` pair: Pierre mixes the surface (88%, gutter 91%; dark 80% / 85%) `in lab` toward the overrides `diffRendering.ts` sets (surface 50% / 35% into `diff_addition`; dark 70% / 60%). The diff viewer sets `--code-background: var(--background)` (`StyledDiffCodeView.tsx`), so the surface is `background`: context rows, headers and the list paint it, and `diff_hunk_separator` (97% toward `code_foreground`) fills separators. Gutter numbers: `diff_*_foreground`, context `code_foreground` at 65%. A 4px `diff_addition` / `diff_deletion` bar marks changed lines |
+| Diff icons                                    | Added `success_foreground` (dark); deleted `destructive`; modified `diff_modified_icon`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 ### 7.9 Composer (`ComposerSurface.tsx`, `ChatComposer.tsx`, `ComposerPrimaryActions.tsx`)
 

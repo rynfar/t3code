@@ -264,7 +264,7 @@ function substitute(scope: Scope, text: string, seen: ReadonlySet<string> = new 
 
 // Color math. Colors are gamma-encoded sRGB, unclamped until output.
 type Color = Readonly<{ r: number; g: number; b: number; a: number }>;
-type Space = "srgb" | "oklab" | "oklch";
+type Space = "srgb" | "oklab" | "oklch" | "lab";
 
 const TRANSPARENT: Color = { r: 0, g: 0, b: 0, a: 0 };
 const toLinear = (c: number) => {
@@ -305,8 +305,53 @@ function fromOklch(L: number, C: number, h: number, a: number): Color {
   return fromOklab(L, C * Math.cos(rad), C * Math.sin(rad), a);
 }
 
+// CIE Lab (D50), as CSS Color 4 defines it: Pierre's diff rows mix `in lab`.
+type Matrix = readonly [readonly number[], readonly number[], readonly number[]];
+const apply = (m: Matrix, [x, y, z]: readonly number[]): [number, number, number] => [
+  m[0][0]! * x! + m[0][1]! * y! + m[0][2]! * z!,
+  m[1][0]! * x! + m[1][1]! * y! + m[1][2]! * z!,
+  m[2][0]! * x! + m[2][1]! * y! + m[2][2]! * z!,
+];
+const SRGB_TO_XYZ_D50: Matrix = [
+  [0.4360747, 0.3850649, 0.1430804],
+  [0.2225045, 0.7168786, 0.0606169],
+  [0.0139322, 0.0971045, 0.7141733],
+];
+const XYZ_D50_TO_SRGB: Matrix = [
+  [3.1338561, -1.6168667, -0.4906146],
+  [-0.9787684, 1.9161415, 0.033454],
+  [0.0719453, -0.2289914, 1.4052427],
+];
+const D50 = [0.3457 / 0.3585, 1, (1 - 0.3457 - 0.3585) / 0.3585] as const;
+const LAB_E = 216 / 24389;
+const LAB_K = 24389 / 27;
+
+function toLab({ r, g, b }: Color): [number, number, number] {
+  const xyz = apply(SRGB_TO_XYZ_D50, [toLinear(r), toLinear(g), toLinear(b)]);
+  const [fx, fy, fz] = xyz.map((value, index) => {
+    const v = value / D50[index]!;
+    return v > LAB_E ? Math.cbrt(v) : (LAB_K * v + 16) / 116;
+  }) as [number, number, number];
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+function fromLab(L: number, A: number, B: number, a: number): Color {
+  const fy = (L + 16) / 116;
+  const fx = A / 500 + fy;
+  const fz = fy - B / 200;
+  const inverse = (f: number) => (f ** 3 > LAB_E ? f ** 3 : (116 * f - 16) / LAB_K);
+  const xyz = [
+    inverse(fx) * D50[0],
+    (L > LAB_K * LAB_E ? fy ** 3 : L / LAB_K) * D50[1],
+    inverse(fz) * D50[2],
+  ];
+  const [lr, lg, lb] = apply(XYZ_D50_TO_SRGB, xyz);
+  return { r: toGamma(lr), g: toGamma(lg), b: toGamma(lb), a };
+}
+
 function toSpace(color: Color, space: Space): [number, number, number] {
   if (space === "srgb") return [color.r, color.g, color.b];
+  if (space === "lab") return toLab(color);
   const [L, A, B] = toOklab(color);
   if (space === "oklab") return [L, A, B];
   const C = Math.hypot(A, B);
@@ -315,6 +360,7 @@ function toSpace(color: Color, space: Space): [number, number, number] {
 
 function fromSpace([x, y, z]: [number, number, number], a: number, space: Space): Color {
   if (space === "srgb") return { r: x, g: y, b: z, a };
+  if (space === "lab") return fromLab(x, y, z, a);
   return space === "oklab" ? fromOklab(x, y, z, a) : fromOklch(x, y, Number.isNaN(z) ? 0 : z, a);
 }
 
@@ -414,7 +460,7 @@ function parseColor(input: string, appearance: Appearance): Color {
       const [method, first, second] = splitTop(args, ",");
       const space = method!.replace(/^in\s+/, "").split(/\s+/)[0] as Space;
       if (
-        !["srgb", "oklab", "oklch"].includes(space) ||
+        !["srgb", "oklab", "oklch", "lab"].includes(space) ||
         /longer|increasing|decreasing/.test(method!)
       ) {
         throw new Error(`Unsupported color-mix method "${method}"`);
@@ -483,6 +529,32 @@ const statusHue = (name: string, color: string, darkAlpha: number): ColorToken[]
     css: hue(`${color}-500`, `${color}-300`, darkAlpha),
   },
 ];
+
+// What a changed diff row paints: Pierre mixes its line color `in lab` over the code surface
+// (lines 88%/80%, gutter 91%/85%) toward the override `diffRendering.ts` sets
+// (`--diffs-bg-{kind}-override` and `--diffs-bg-{kind}-number-override`). Inside the viewer
+// `StyledDiffCodeView.tsx` sets `--code-background: var(--background)`, so the surface is the canvas.
+const diffRowTokens = (kind: "addition" | "deletion"): ColorToken[] => {
+  const row = (line: [number, number], target: [number, number]) =>
+    `light-dark(${[0, 1]
+      .map(
+        (i) =>
+          `color-mix(in lab, var(--background) ${line[i]}%, color-mix(in srgb, var(--background) ${target[i]}%, var(--diff-${kind})))`,
+      )
+      .join(", ")})`;
+  return [
+    {
+      name: `diff_row_${kind}`,
+      web: `diffRendering.ts --diffs-bg-${kind}-override`,
+      css: row([88, 80], [50, 70]),
+    },
+    {
+      name: `diff_row_${kind}_gutter`,
+      web: `diffRendering.ts --diffs-bg-${kind}-number-override`,
+      css: row([91, 85], [35, 60]),
+    },
+  ];
+};
 
 const COLOR_TOKENS: readonly ColorToken[] = [
   {
@@ -610,6 +682,13 @@ const COLOR_TOKENS: readonly ColorToken[] = [
     css: v("--diff-deletion-foreground"),
   },
   { name: "diff_modified_icon", web: "--diff-modified-icon", css: v("--diff-modified-icon") },
+  ...diffRowTokens("addition"),
+  ...diffRowTokens("deletion"),
+  {
+    name: "diff_hunk_separator",
+    web: "StyledDiffCodeView.tsx --diffs-bg-separator",
+    css: "color-mix(in srgb, var(--background) 97%, var(--code-foreground))",
+  },
   { name: "toolbar_background", web: "--toolbar-background", css: v("--toolbar-background") },
   {
     name: "toolbar_foreground",

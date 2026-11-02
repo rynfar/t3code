@@ -39,6 +39,8 @@ pub enum AppEvent {
     History,
     /// Toasts and the Undo notice.
     Notice,
+    /// Right panel tabs, visibility, width, or the diff selection changed.
+    RightPanel,
 }
 
 pub struct AppState {
@@ -54,6 +56,7 @@ pub struct AppState {
     pub client_settings: ClientSettings,
     /// The project of the new-thread draft, while the user composes a thread that does not exist.
     pub draft_project: Option<String>,
+    pub panels: crate::right_panel::PanelState,
     restore_thread: Option<String>,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
@@ -80,6 +83,7 @@ impl AppState {
             server_config: ServerConfigState::default(),
             client_settings: ClientSettings::from_json(&store::load_client_settings().unwrap_or_default()),
             draft_project: None,
+            panels: crate::right_panel::PanelState::load(),
             restore_thread: store::load_last_thread(),
             select_when_listed: None,
             client: None,
@@ -377,6 +381,23 @@ impl AppState {
             _ => commands::stop_thread(&uuid_v4(), &thread_id),
         };
         self.dispatch(command, cx);
+    }
+
+    /// One unary RPC, run and decoded on the network runtime so large replies never parse on the
+    /// UI thread. `None` while there is no connection.
+    pub fn request<T: Send + 'static>(
+        &self,
+        method: &'static str,
+        payload: Value,
+        decode: impl FnOnce(Value) -> Result<T, String> + Send + 'static,
+    ) -> Option<tokio::task::JoinHandle<Result<T, String>>> {
+        let client = self.client.clone()?;
+        Some(self.runtime.spawn(async move { decode(client.request(method, payload).await.map_err(|error| error.to_string())?) }))
+    }
+
+    /// The connected server's address, `None` while unpaired.
+    pub fn environment(&self) -> Option<&str> {
+        self.client.as_ref().map(ClientHandle::environment)
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {

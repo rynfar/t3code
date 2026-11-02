@@ -21,6 +21,7 @@ gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d
 ] }
 gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
 gpui-component = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
+gpui-component-assets = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
 
 anyhow = "1"
 futures = "0.3"

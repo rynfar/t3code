@@ -58,6 +58,11 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "chat.new" => Box::new(crate::new_thread::NewThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
+        "rightPanel.toggle" => Box::new(crate::right_panel::ToggleRightPanel),
+        "rightPanel.toggleMaximized" => Box::new(crate::right_panel::ToggleMaximized),
+        "rightPanel.close" => Box::new(crate::right_panel::CloseActiveSurface),
+        "view.reopenClosed" => Box::new(crate::right_panel::ReopenClosedView),
+        "diff.toggle" => Box::new(crate::right_panel::ToggleDiff),
         _ => Box::new(Unimplemented),
     }
 }
