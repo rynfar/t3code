@@ -1,17 +1,18 @@
 //! Sidebar thread search (`searchSidebarThreads` in `Sidebar.logic.ts`, the server half in
 //! `client-runtime/src/state/threadSearch.ts`): title and branch matches ranked locally, then
-//! threads listed only because their messages match, in the order the server ranked them.
+//! threads listed only because their messages match, in the order the server ranked them. Below
+//! the shell's older-settled cut the server also returns the best older rows, mounted while shown.
 
 use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Task, div, prelude::*, px, uniform_list};
-use serde_json::json;
+use t3_core::families::FamilyRead;
+use t3_core::sidebar::older_settled::{SEARCH_THREADS, search_request};
 
 use super::SidebarPane;
 use crate::app_state::AppState;
 use crate::theme::{hsla, palette};
 
-const SEARCH_THREADS: &str = "orchestration.searchThreads";
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 const RESULT_HEIGHT: f32 = 36.;
 
@@ -22,11 +23,6 @@ pub struct SearchState {
     content_matches: Vec<(String, String)>,
     highlighted: usize,
     request: Option<Task<()>>,
-}
-
-/// The server needs a word of three or more letters to match messages.
-fn searches_messages(query: &str) -> bool {
-    query.split(|c: char| !c.is_alphanumeric()).any(|word| word.chars().count() >= 3)
 }
 
 impl SearchState {
@@ -55,17 +51,20 @@ impl SearchState {
         self.request = None;
         self.refresh(state, cx);
         let trimmed = self.query.trim().to_owned();
-        if trimmed.chars().count() < 2 || !searches_messages(&trimmed) {
+        let app = state.read(cx);
+        let generation = app.shell.generation;
+        let Some(payload) = search_request(&trimmed, app.omitted.older().as_ref().map(|older| older.before.as_str()), None) else {
+            state.update(cx, |state, cx| state.mount_search_rows(generation, None, cx));
             return;
-        }
-        let Some(client) = state.read(cx).client_handle() else { return };
-        let runtime = state.read(cx).runtime().clone();
+        };
+        let Some(client) = app.client_handle() else { return };
+        let runtime = app.runtime().clone();
         let state = state.clone();
         self.request = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            let query = trimmed.clone();
-            let result = runtime.spawn(async move { client.request(SEARCH_THREADS, json!({ "query": query })).await }).await;
+            let result = runtime.spawn(async move { client.request(SEARCH_THREADS, payload).await }).await;
             let Ok(Ok(value)) = result else { return };
+            let rows = serde_json::from_value::<FamilyRead>(value.clone()).ok();
             let matches: Vec<(String, String)> = value
                 .get("matches")
                 .and_then(|matches| matches.as_array())
@@ -79,6 +78,7 @@ impl SearchState {
             let _ = this.update(cx, |this, cx| {
                 if this.search.query.trim() == trimmed {
                     this.search.content_matches = matches;
+                    state.update(cx, |state, cx| state.mount_search_rows(generation, rows, cx));
                     this.search.refresh(&state, cx);
                     cx.notify();
                 }

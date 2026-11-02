@@ -165,7 +165,7 @@ fn run_script(details: &Entity<Details>, project_id: &str, script: &ProjectScrip
 
 pub fn workspace(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.shell.thread(id))?;
+    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
     let project_root = app.shell.project(&thread.project_id)?.workspace_root.clone();
     let items = &ctx.details.read(cx).items;
     let rows: Vec<AnyElement> = [
@@ -234,7 +234,7 @@ fn branch_rows(ctx: &Ctx, thread: &ThreadShell, cx: &App) -> AnyElement {
 
 pub fn version_control(ctx: &Ctx, separated: bool, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.shell.thread(id))?;
+    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
     let items = &ctx.details.read(cx).items;
     let is_repo = ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
     let no_runs_yet = thread.latest_run_id.is_none();
@@ -295,7 +295,7 @@ pub fn lineage(ctx: &Ctx, shown: usize, separated: bool, on_more: impl Fn(&Click
         return None;
     }
     let app = ctx.state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.shell.thread(id))?;
+    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
     let rows = lineage_rows(app, thread);
     if rows.is_empty() {
         return None;

@@ -167,7 +167,7 @@ impl GitStore {
 
     /// `gitCwd`: the thread's worktree, else its project root.
     fn resolve_target(state: &AppState) -> Option<Target> {
-        let thread = state.selected_thread.as_deref().and_then(|id| state.shell.thread(id))?;
+        let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
         let project = state.shell.project(&thread.project_id)?;
         Some(Target {
             thread_id: thread.id.clone(),

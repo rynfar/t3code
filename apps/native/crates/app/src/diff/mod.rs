@@ -166,7 +166,7 @@ impl DiffPanel {
         let environment = state.environment().map(str::to_owned);
         let visible = state.panels.panels.active_surface(&thread_id).is_some_and(|surface| surface.kind == SurfaceKind::Diff);
         let scope = DiffScope::resolve(&selection, &self.summaries);
-        let cwd = state.shell.thread(&thread_id).and_then(|thread| {
+        let cwd = state.thread_shell(&thread_id).and_then(|thread| {
             thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()))
         });
         let repository = cwd.as_ref().and_then(|cwd| self.repositories.get(cwd)).copied();
@@ -508,7 +508,7 @@ impl DiffPanel {
     fn is_outside_repository(&self, cx: &gpui::App) -> bool {
         let Some(thread_id) = self.thread_id.as_deref() else { return false };
         let state = self.state.read(cx);
-        let cwd = state.shell.thread(thread_id).and_then(|thread| {
+        let cwd = state.thread_shell(thread_id).and_then(|thread| {
             thread.worktree_path.as_deref().or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.as_str()))
         });
         cwd.and_then(|cwd| self.repositories.get(cwd)) == Some(&false)

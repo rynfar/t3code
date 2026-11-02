@@ -147,6 +147,8 @@ pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (Cli
 
 struct Resume {
     shell: Option<u64>,
+    /// The options the shell that reached `shell` was trimmed with.
+    shell_options: Option<ShellOptions>,
     threads: HashMap<String, Option<u64>>,
 }
 
@@ -156,7 +158,7 @@ async fn supervise(
     events: Events,
     grants: watch::Sender<Option<AuthSessionState>>,
 ) {
-    let mut resume = Resume { shell: None, threads: HashMap::new() };
+    let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
     loop {
         let _ = events.send(ClientEvent::Status(if attempt == 0 {
@@ -250,6 +252,11 @@ async fn run_session(
 ) -> SessionEnd {
     let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, commands::subscribe_server_config()).ok();
     let options = initial_shell_options(&mut server_config, events).await;
+    // Deltas never restore rows trimmed under other options (nor trim them), so the shell starts
+    // over from an authoritative snapshot, as `shell.ts` does for every new session.
+    if resume.shell_options.replace(options) != Some(options) {
+        resume.shell = None;
+    }
     let Ok(mut shell) = session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell, options)) else {
         return SessionEnd::Closed("Could not subscribe to the shell.".into());
     };

@@ -140,7 +140,6 @@ impl Render for Workspace {
         let has_thread = state.selected_thread.is_some();
         let has_draft = !has_thread && state.draft_project.is_some();
         let collapsed = state.sidebar.collapsed;
-        let toast = state.toast.clone();
         let running = state.is_selected_thread_running();
         let panel = state.selected_thread.as_deref().map(|thread| state.panels.panels.panel(thread));
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
@@ -256,18 +255,7 @@ impl Render for Workspace {
             .child(self.git_dialogs.clone())
             .child(self.snooze.clone())
             .child(self.palette.clone())
-            .children(toast.map(|toast| {
-                let element = toast.render(cx);
-                match toast.open_thread {
-                    Some(thread_id) => div()
-                        .id("toast-open-thread")
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.select_thread(&thread_id, cx))))
-                        .child(element)
-                        .into_any_element(),
-                    None => element,
-                }
-            }))
+            .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))
             .into_any_element()
     }

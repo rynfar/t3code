@@ -284,7 +284,8 @@ impl SidebarModel {
         let p = &self.partition;
         let mut rows = Vec::new();
         let mut ordered = Vec::new();
-        let total = p.pinned.len() + p.active.len() + p.working.len() + p.snoozed.len() + p.settled.len();
+        // Older settled threads still to load count, so the Settled shelf outlives its loaded rows.
+        let total = p.pinned.len() + p.active.len() + p.working.len() + p.snoozed.len() + p.settled.len() + unloaded_settled;
         if total == 0 {
             self.rows = rows;
             self.ordered = ordered;

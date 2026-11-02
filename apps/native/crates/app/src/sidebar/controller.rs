@@ -171,13 +171,13 @@ impl AppState {
     }
 
     pub fn can_navigate(&self, back: bool) -> bool {
-        self.sidebar.history.can_go(back, |id| self.shell.thread(id).is_some())
+        self.sidebar.history.can_go(back, |id| self.thread_shell(id).is_some())
     }
 
     /// `navigation.back` / `navigation.forward`.
     pub fn navigate_history(&mut self, back: bool, cx: &mut Context<Self>) {
-        let shell = &self.shell;
-        if let Some(id) = self.sidebar.history.go(back, |id| shell.thread(id).is_some()).map(str::to_owned) {
+        let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+        if let Some(id) = self.sidebar.history.go(back, |id| mounts.thread(shell, id).is_some()).map(str::to_owned) {
             self.select_thread(&id, cx);
         }
     }
@@ -200,7 +200,7 @@ impl AppState {
             self.sidebar.visit = None;
             return;
         };
-        let Some(thread) = self.shell.thread(&id) else { return };
+        let Some(thread) = self.thread_shell(&id) else { return };
         let Some(updated_at) = t3_core::sidebar::time::parse_iso(&thread.updated_at) else { return };
         let now = now_ms();
         let shell = VisitedShell {
@@ -258,18 +258,6 @@ impl AppState {
             });
         })
         .detach();
-    }
-
-    pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
-        self.toast = Some(toast);
-        cx.emit(AppEvent::Notice);
-        self.toast_timer = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(4)).await;
-            let _ = this.update(cx, |state, cx| {
-                state.toast = None;
-                cx.emit(AppEvent::Notice);
-            });
-        }));
     }
 
     fn after_undo_change(&mut self, cx: &mut Context<Self>) {

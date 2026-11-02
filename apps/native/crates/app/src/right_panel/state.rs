@@ -175,8 +175,8 @@ impl AppState {
 
     /// `view.reopenClosed` (`cmd-shift-t`): may switch to the thread the tab belonged to.
     pub fn reopen_closed_view(&mut self, cx: &mut Context<Self>) {
-        let shell = &self.shell;
-        let Some(thread_id) = self.panels.panels.reopen_closed(|thread| shell.thread(thread).is_some()) else { return };
+        let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+        let Some(thread_id) = self.panels.panels.reopen_closed(|thread| mounts.thread(shell, thread).is_some()) else { return };
         self.select_thread(&thread_id, cx);
         // A restored tab was not showing before, so a restored diff opens like any other open.
         if self.panels.diff_visible(&thread_id) {

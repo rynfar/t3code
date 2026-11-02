@@ -338,7 +338,7 @@ impl ThreadView {
             return;
         }
         let state = self.state.read(cx);
-        let Some(title) = self.thread_id.as_deref().and_then(|id| state.shell.thread(id)).map(|thread| thread.title.clone()) else { return };
+        let Some(title) = self.thread_id.as_deref().and_then(|id| state.thread_shell(id)).map(|thread| thread.title.clone()) else { return };
         let target = crate::app_state::uuid_v4();
         let command = t3_core::timeline::fork_from_run(&crate::app_state::uuid_v4(), source_thread_id, &target, run_id, &title);
         let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, command);

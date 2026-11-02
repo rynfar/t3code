@@ -49,6 +49,7 @@ fn mounted_reads_merge_behind_the_shell_for_their_generation_only() {
     apply(&mut shell, json!({"kind": "thread.removed", "sequence": 11, "threadId": "child"}));
     assert_eq!(ids(&mounts.extras(&shell)), ["old", "child"], "the family read predates the removal; the page read does not");
     assert_eq!(shell.removed_at.get("child"), Some(&11));
+    assert!(std::ptr::eq(mounts.thread(&shell, "child").unwrap(), mounts.extras(&shell)[1]), "the row extras merge");
 
     apply(&mut shell, snapshot(20, 20));
     assert!(shell.removed_at.is_empty());
@@ -57,4 +58,29 @@ fn mounted_reads_merge_behind_the_shell_for_their_generation_only() {
     assert_eq!(ids(&mounts.extras(&shell)), ["old"]);
     mounts.unmount("pages");
     assert!(mounts.extras(&shell).is_empty());
+}
+
+#[test]
+fn the_open_thread_reads_its_family_whenever_the_shell_leaves_it_out() {
+    let mut shell = ShellState::default();
+    let snapshot = |sequence: u64, ids: &[&str]| {
+        json!({"kind": "snapshot", "snapshot": {"snapshotSequence": sequence, "projects": [], "threads": ids.iter().map(|id| thread(id)).collect::<Vec<_>>()}})
+    };
+    apply(&mut shell, snapshot(10, &["a"]));
+    let mut mounts = MountedReads::default();
+    assert!(!family_read_due(&shell, &mounts, "a", None), "the shell holds it");
+
+    // A new snapshot can cut the open thread, say once it settled long enough ago.
+    apply(&mut shell, snapshot(20, &[]));
+    assert!(family_read_due(&shell, &mounts, "a", None));
+    assert!(!family_read_due(&shell, &mounts, "a", Some(shell.generation)), "its read is on the way");
+    mounts.mount("search", shell.generation, vec![read(20, &["a"])]);
+    assert!(family_read_due(&shell, &mounts, "a", None), "a search can let go of it");
+    mounts.mount(&family_key("a"), shell.generation, vec![read(20, &["a"])]);
+    assert!(!family_read_due(&shell, &mounts, "a", None));
+    assert_eq!(mounts.thread(&shell, "a").map(|thread| thread.id.as_str()), Some("a"));
+
+    apply(&mut shell, snapshot(30, &[]));
+    assert!(mounts.thread(&shell, "a").is_none());
+    assert!(family_read_due(&shell, &mounts, "a", Some(shell.generation - 1)), "each snapshot reads it again");
 }

@@ -12,11 +12,14 @@ use crate::shell::{ShellState, ThreadShell};
 
 pub const GET_THREAD_FAMILY: &str = "orchestration.getThreadFamily";
 
-/// `OrchestrationV2ThreadFamily`; an older-settled page decodes the same way.
+/// `OrchestrationV2ThreadFamily`; an older-settled page and a search result's older rows decode
+/// the same way (the search result's keys are optional: `snapshotSequence ?? 0`).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FamilyRead {
+    #[serde(default)]
     pub snapshot_sequence: u64,
+    #[serde(default)]
     pub threads: Vec<ThreadShell>,
 }
 
@@ -81,24 +84,48 @@ impl MountedReads {
         self.mounts.iter().map(|(key, ..)| key.as_str())
     }
 
-    /// Rows the shell lacks, from current-generation reads at or after the snapshot's own cut
-    /// (`snapshotAtom` in `threadFamilies.ts`).
-    pub fn extras<'a>(&'a self, shell: &'a ShellState) -> Vec<&'a ThreadShell> {
-        let Some(snapshot) = &shell.snapshot else { return Vec::new() };
-        let cut = snapshot.older_settled.as_ref().map_or(0, |older| older.as_of_sequence);
-        let reads = self
-            .mounts
+    /// Current-generation reads at or after the snapshot's own cut (`snapshotAtom` in
+    /// `threadFamilies.ts`).
+    fn current_reads<'a>(&'a self, shell: &'a ShellState) -> impl Iterator<Item = &'a FamilyRead> {
+        let cut = shell.snapshot.as_ref().and_then(|snapshot| snapshot.older_settled.as_ref()).map_or(0, |older| older.as_of_sequence);
+        self.mounts
             .iter()
-            .filter(|(_, generation, _)| *generation == shell.generation)
+            .filter(move |(_, generation, _)| *generation == shell.generation)
             .flat_map(|(_, _, reads)| reads)
-            .filter(|read| read.snapshot_sequence >= cut);
-        rows_missing_from_shell(&snapshot.threads, reads, &shell.removed_at)
+            .filter(move |read| read.snapshot_sequence >= cut)
     }
 
-    /// A thread from the shell, else from a mounted read.
-    pub fn thread<'a>(&'a self, shell: &'a ShellState, id: &str) -> Option<&'a ThreadShell> {
-        shell.thread(id).or_else(|| self.extras(shell).into_iter().find(|thread| thread.id == id))
+    /// Rows the shell lacks, from the current reads.
+    pub fn extras<'a>(&'a self, shell: &'a ShellState) -> Vec<&'a ThreadShell> {
+        let Some(snapshot) = &shell.snapshot else { return Vec::new() };
+        rows_missing_from_shell(&snapshot.threads, self.current_reads(shell), &shell.removed_at)
     }
+
+    /// A thread from the shell, else from a mounted read: the row `extras` would merge for it.
+    pub fn thread<'a>(&'a self, shell: &'a ShellState, id: &str) -> Option<&'a ThreadShell> {
+        if let Some(thread) = shell.thread(id) {
+            return Some(thread);
+        }
+        shell.snapshot.as_ref()?;
+        let removed = shell.removed_at.get(id).copied();
+        self.current_reads(shell)
+            .filter(|read| removed.is_none_or(|sequence| sequence <= read.snapshot_sequence))
+            .find_map(|read| read.threads.iter().find(|thread| thread.id == id))
+    }
+}
+
+pub fn family_key(thread_id: &str) -> String {
+    format!("family:{thread_id}")
+}
+
+/// Whether the open thread needs its family read: the shell itself leaves it out (an idle
+/// subagent, an older settled thread, or a row a new snapshot cut while it was open) and no read
+/// for this generation is mounted or `requested`. Other mounts (a page, a search) can let go of it.
+pub fn family_read_due(shell: &ShellState, mounts: &MountedReads, thread_id: &str, requested: Option<u64>) -> bool {
+    shell.snapshot.is_some()
+        && shell.thread(thread_id).is_none()
+        && requested != Some(shell.generation)
+        && mounts.generation_of(&family_key(thread_id)) != Some(shell.generation)
 }
 
 #[cfg(test)]

@@ -77,14 +77,32 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     drop(first);
 
     let mut second = server.connection().await;
-    answer_config(&mut second, Some(json!({"shellThreadFamilies": true, "shellOlderSettled": true}))).await;
+    answer_config(&mut second, None).await;
     let shell = second.request(method::SUBSCRIBE_SHELL).await;
     assert_eq!(shell["payload"]["afterSequence"], 40);
-    assert_eq!(shell["payload"]["omitIdleSubagents"], true);
-    assert_eq!(shell["payload"]["omitOlderSettled"], true);
     let thread = second.request(method::SUBSCRIBE_THREAD).await;
     assert_eq!(thread["payload"]["afterSequence"], 6);
     assert_eq!(thread["payload"]["threadId"], "t1");
+    second.chunk(&shell, json!([{"kind": "thread.removed", "sequence": 41, "threadId": "gone"}])).await;
+    let removal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ClientEvent::Shell(item)) = events.recv().await {
+                break shell_sequence(&item);
+            }
+        }
+    });
+    assert_eq!(removal.await.expect("the removal"), Some(41));
+    drop(second);
+
+    // Rows trimmed under other options never come back as deltas: start from a fresh snapshot.
+    let mut third = server.connection().await;
+    answer_config(&mut third, Some(json!({"shellThreadFamilies": true, "shellOlderSettled": true}))).await;
+    let shell = third.request(method::SUBSCRIBE_SHELL).await;
+    assert_eq!(shell["payload"].get("afterSequence"), None);
+    assert_eq!(shell["payload"]["omitIdleSubagents"], true);
+    assert_eq!(shell["payload"]["omitOlderSettled"], true);
+    let thread = third.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(thread["payload"]["afterSequence"], 6);
 }
 
 

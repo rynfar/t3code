@@ -28,7 +28,7 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
 /// `resolveThreadActionProjectRef`: the open thread's project, else the draft's, else the first
 /// project that is not archived.
 pub fn default_project(state: &AppState) -> Option<String> {
-    let thread_project = state.selected_thread.as_deref().and_then(|id| state.shell.thread(id)).map(|t| t.project_id.clone());
+    let thread_project = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)).map(|t| t.project_id.clone());
     thread_project.or_else(|| state.draft_project.clone()).or_else(|| {
         let snapshot = state.shell.snapshot.as_ref()?;
         snapshot.projects.iter().find(|project| project.archived_at.is_none()).map(|project| project.id.clone())
@@ -46,7 +46,7 @@ pub fn start_new_thread(state: &mut AppState, cx: &mut Context<AppState>) {
 pub fn breadcrumb(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let p = palette(cx);
     let app = state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.shell.thread(id));
+    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
     let project_id = thread.map(|thread| thread.project_id.clone()).or_else(|| app.draft_project.clone());
     let project = project_id.as_deref().and_then(|id| app.shell.project(id)).map(|project| (project.id.clone(), project.title.clone()));
     let title: Option<SharedString> = match thread {

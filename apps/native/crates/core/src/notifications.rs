@@ -3,12 +3,12 @@
 //! and titles of `ThreadNotificationCoordinator.tsx`, and the mode helpers and tag of
 //! `apps/web/src/threadNotifications.ts`. The app presents what this decides.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash;
 
 use serde::Deserialize;
 
-use crate::shell::ThreadShell;
+use crate::shell::{ShellState, ThreadShell};
 use crate::sidebar::status::{ThreadStatus, resolve_status};
 use crate::sidebar::thread::{SubagentRequest, pending_subagent_requests, present_thread};
 use crate::sidebar::time::Ms;
@@ -110,8 +110,8 @@ impl<K: Eq + Hash + Clone> NotificationGate<K> {
     }
 
     /// Forgets threads that left the snapshot.
-    pub fn retain(&mut self, keys: &HashSet<K>) {
-        self.handled.retain(|key, _| keys.contains(key));
+    pub fn retain(&mut self, keep: impl Fn(&K) -> bool) {
+        self.handled.retain(|key, _| keep(key));
     }
 
     pub fn clear(&mut self) {
@@ -144,10 +144,28 @@ pub fn notification_title(kind: NotificationKind, status: ThreadStatus) -> &'sta
 
 #[derive(Debug, Clone)]
 struct Observed {
-    raw: ThreadShell,
+    /// The shell row's stamp when observed; the web compares row identity instead.
+    revision: Option<u64>,
     request: Option<SubagentRequest>,
     observation: Observation,
     status: ThreadStatus,
+}
+
+fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Option<u64>) -> Observed {
+    let thread = present_thread(raw, request);
+    let run = thread.latest_run.as_ref();
+    let mut status = resolve_status(&thread);
+    if status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "failed") {
+        status = ThreadStatus::Failed;
+    }
+    let attention = matches!(
+        status,
+        ThreadStatus::Input | ThreadStatus::Request | ThreadStatus::Approval | ThreadStatus::Failed | ThreadStatus::Limited
+    )
+    .then(|| format!("{}:{status:?}", run.map_or("", |run| run.run_id.as_str())));
+    let settled = status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "completed");
+    let completed_at = run.and_then(|run| run.completed_at).filter(|_| settled);
+    Observed { revision, request, observation: Observation { attention, settled, completed_at }, status }
 }
 
 /// `observeThreads` for one environment: turns status transitions in the live shell into
@@ -159,51 +177,43 @@ pub struct ThreadNotifications {
 }
 
 impl ThreadNotifications {
-    pub fn observe(&mut self, threads: &[ThreadShell]) -> Vec<ThreadNotification> {
+    /// Rows the shell has not replaced since the last call keep their observation untouched.
+    pub fn observe(&mut self, shell: &ShellState) -> Vec<ThreadNotification> {
+        let Some(snapshot) = &shell.snapshot else { return Vec::new() };
+        let threads = &snapshot.threads;
         let requests = pending_subagent_requests(threads);
-        let mut next: HashMap<String, Observed> = HashMap::new();
-        let mut changed: Vec<String> = Vec::new();
+        let mut previous = std::mem::take(&mut self.previous);
+        let mut changed: Vec<(&ThreadShell, Option<Observation>)> = Vec::new();
         for raw in threads.iter().filter(|thread| thread.lineage.is_listed()) {
             let request = requests.get(&raw.id).copied();
-            if let Some(prior) = self.previous.get(&raw.id)
-                && prior.raw == *raw
-                && prior.request == request
-            {
-                next.insert(raw.id.clone(), prior.clone());
-                continue;
-            }
-            let thread = present_thread(raw, request);
-            let run = thread.latest_run.as_ref();
-            let mut status = resolve_status(&thread);
-            if status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "failed") {
-                status = ThreadStatus::Failed;
-            }
-            let attention = matches!(
-                status,
-                ThreadStatus::Input | ThreadStatus::Request | ThreadStatus::Approval | ThreadStatus::Failed | ThreadStatus::Limited
-            )
-            .then(|| format!("{}:{status:?}", run.map_or("", |run| run.run_id.as_str())));
-            let settled = status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "completed");
-            let completed_at = run.and_then(|run| run.completed_at).filter(|_| settled);
-            let observation = Observation { attention, settled, completed_at };
-            next.insert(raw.id.clone(), Observed { raw: raw.clone(), request, observation, status });
-            changed.push(raw.id.clone());
+            let revision = shell.revision(&raw.id);
+            let (key, prior) = match previous.remove_entry(raw.id.as_str()) {
+                Some((key, prior)) if revision.is_some() && prior.revision == revision && prior.request == request => {
+                    self.previous.insert(key, prior);
+                    continue;
+                }
+                Some((key, prior)) => (key, Some(prior.observation)),
+                None => (raw.id.clone(), None),
+            };
+            self.previous.insert(key, observe_row(raw, request, revision));
+            changed.push((raw, prior));
         }
-        let previous = std::mem::replace(&mut self.previous, next);
-        self.gate.retain(&self.previous.keys().cloned().collect());
+        if !previous.is_empty() {
+            let current = &self.previous;
+            self.gate.retain(|key| current.contains_key(key));
+        }
         let mut notifications = Vec::new();
-        for id in changed {
-            let Some(state) = self.previous.get(&id) else { continue };
-            let prior = previous.get(&id).map(|prior| &prior.observation);
-            let archived = state.raw.archived_at.is_some();
-            let quiet = state.raw.latest_run_stop_requested == Some(true);
-            if let Some(kind) = self.gate.observe(&id, prior, &state.observation, archived, quiet) {
+        for (raw, prior) in changed {
+            let Some(state) = self.previous.get(&raw.id) else { continue };
+            let archived = raw.archived_at.is_some();
+            let quiet = raw.latest_run_stop_requested == Some(true);
+            if let Some(kind) = self.gate.observe(&raw.id, prior.as_ref(), &state.observation, archived, quiet) {
                 notifications.push(ThreadNotification {
-                    thread_id: id.clone(),
+                    thread_id: raw.id.clone(),
                     kind,
                     status: state.status,
                     title: notification_title(kind, state.status),
-                    body: state.raw.title.clone(),
+                    body: raw.title.clone(),
                 });
             }
         }

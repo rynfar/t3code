@@ -14,12 +14,11 @@ use t3_core::composer::ClientSettings;
 use t3_core::history::{HistoryStep, PageOutcome};
 use t3_core::pairing::parse_pairing_link;
 use t3_core::server_config::ServerConfigState;
-use t3_core::shell::ShellState;
+use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::thread::ThreadState;
 use t3_core::workflows::{self, StopTarget};
 
 use crate::sidebar::controller::SidebarController;
-use crate::toast::Toast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -52,9 +51,8 @@ pub struct AppState {
     pub phase: Phase,
     pub shell: ShellState,
     pub sidebar: SidebarController,
-    pub toast: Option<Toast>,
+    pub toasts: crate::toast::Toasts,
     pub composer_mentions: Vec<crate::project_files::ComposerMention>,
-    pub(crate) toast_timer: Option<Task<()>>,
     pub selected_thread: Option<String>,
     pub thread: ThreadState,
     pub last_error: Option<String>,
@@ -84,9 +82,8 @@ impl AppState {
             phase: Phase::Unpaired { error: None },
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
-            toast: None,
+            toasts: Default::default(),
             composer_mentions: Vec::new(),
-            toast_timer: None,
             selected_thread: None,
             thread: ThreadState::default(),
             last_error: None,
@@ -171,6 +168,8 @@ impl AppState {
 
     fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
         let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut config_changed) = (false, false, false, false);
+        // A resubscribed shell is live again at its completion marker, even with nothing new.
+        let mut resynchronized = false;
         for event in batch {
             match event {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => {
@@ -180,6 +179,7 @@ impl AppState {
                 }
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
                 ClientEvent::Shell(item) => {
+                    resynchronized |= matches!(item, ShellStreamItem::Synchronized);
                     let quiet = crate::sidebar::controller::is_streaming_tick(&self.shell, &item);
                     if self.shell.apply(item) {
                         shell_changed = true;
@@ -197,18 +197,22 @@ impl AppState {
                 }
             }
         }
+        if shell_changed || resynchronized {
+            // Transitions a disconnect held back are compared once the shell is live again.
+            self.observe_notifications(cx);
+        }
         if shell_changed {
             self.sync_omitted_rows(cx);
-            self.observe_notifications(cx);
             if sidebar_changed {
                 self.rebuild_sidebar(cx);
             }
             cx.emit(AppEvent::Shell);
-            if let Some(id) = self.select_when_listed.take_if(|id| self.shell.thread(id).is_some()) {
+            let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+            if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
                 self.select_thread(&id, cx);
             } else if self.selected_thread.is_none()
                 && self.draft_project.is_none()
-                && let Some(id) = self.restore_thread.take_if(|id| self.shell.thread(id).is_some())
+                && let Some(id) = self.restore_thread.take_if(|id| mounts.thread(shell, id).is_some())
             {
                 self.select_thread(&id, cx);
             } else if self.selected_thread.is_none()
@@ -272,9 +276,7 @@ impl AppState {
         }
         // An idle subagent or older settled thread opens from its family when the shell omits it.
         self.release_families(Some(thread_id));
-        if self.thread_shell(thread_id).is_none() {
-            self.read_family(thread_id, false, cx);
-        }
+        self.mount_selected_family(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
@@ -368,7 +370,7 @@ impl AppState {
 
     /// Selects a thread the draft launched as soon as the shell lists it.
     pub fn select_when_listed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if self.shell.thread(thread_id).is_some() {
+        if self.thread_shell(thread_id).is_some() {
             self.select_thread(thread_id, cx);
         } else {
             self.select_when_listed = Some(thread_id.to_owned());

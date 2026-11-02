@@ -14,6 +14,7 @@ use super::status::*;
 use super::thread::*;
 use super::time::*;
 use super::*;
+use crate::families::FamilyRead;
 use crate::shell::{ProjectShell, ShellSnapshot, ThreadShell};
 
 fn iso(value: &str) -> Ms {
@@ -500,6 +501,38 @@ fn older_settled_listing_and_counts() {
     let other: HashSet<String> = ["other".to_owned()].into();
     assert_eq!(unloaded_count(&older, Some(&other), &refs), 0);
     assert_eq!(page_request(&tie, None)["before"], json!({"settledAt": format_iso(30 * day), "threadId": "m"}));
+
+    // Search reaches threads below the cut: titles from two letters, messages from a long word.
+    let before = older.before.as_str();
+    assert_eq!(search_request("ab", None, None), None);
+    assert_eq!(search_request(" ab ", Some(before), None), Some(json!({"query": "ab", "olderSettledBefore": before, "titlesOnly": true})));
+    let scope = ["p1".to_owned()];
+    assert_eq!(
+        search_request("deploy", Some(before), Some(&scope)),
+        Some(json!({"query": "deploy", "olderSettledBefore": before, "projectIds": ["p1"]}))
+    );
+    assert_eq!(search_request("deploy", None, Some(&scope)), Some(json!({"query": "deploy"})));
+    let read: FamilyRead = serde_json::from_value(json!({"matches": []})).unwrap();
+    assert!(read.threads.is_empty(), "a result without older rows mounts nothing");
+
+    // Older threads the shell left out keep the Settled shelf once every loaded row is gone.
+    let empty = snapshot(vec![]);
+    let model = SidebarModel::build(
+        &ModelInput {
+            snapshot: &empty,
+            extra_threads: &[],
+            older_settled: Some(OlderSettledShelf { older: &older, frontier: None }),
+            settings: &SidebarSettings::default(),
+            shelves: &ShelfState::default(),
+            selected_thread_id: None,
+            project_scope: None,
+            connected: true,
+            now: iso(NOW),
+            dragging: None,
+        },
+        &mut InboxReturnTracker::default(),
+    );
+    assert_eq!(labels(&model), ["[Settled 3]"]);
 }
 
 fn wire_thread(id: &str, extra: Value) -> Value {

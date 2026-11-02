@@ -578,7 +578,7 @@ impl SidebarPane {
 /// Built when the tooltip opens, so rows pay nothing for it while drawing.
 fn hover_card(state: &crate::app_state::AppState, thread_id: &str, project: Option<String>) -> ThreadHoverCard {
     let thread = state.sidebar.model.thread(thread_id);
-    let model = state.shell.thread(thread_id).map(|shell| shell.model_selection.model.clone()).filter(|model| !model.is_empty());
+    let model = state.thread_shell(thread_id).map(|shell| shell.model_selection.model.clone()).filter(|model| !model.is_empty());
     let error = thread.and_then(|thread| thread.runtime.as_ref()).filter(|runtime| runtime.last_error.is_some()).map(|runtime| runtime.last_error_class.as_deref() == Some("usage_limit"));
     ThreadHoverCard {
         title: thread.map(|thread| thread.title.clone()).unwrap_or_default().into(),

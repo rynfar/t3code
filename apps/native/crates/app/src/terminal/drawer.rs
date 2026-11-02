@@ -233,9 +233,9 @@ impl TerminalDrawer {
     /// Where a terminal runs: its server session's cwd when known (reopening elsewhere would
     /// restart it), otherwise the thread's worktree or project root.
     fn location(&self, thread_id: &str, terminal_id: Option<&str>, cx: &App) -> Option<LaunchLocation> {
-        let shell = &self.app.read(cx).shell;
-        let thread = shell.thread(thread_id)?;
-        let root = &shell.project(&thread.project_id)?.workspace_root;
+        let app = self.app.read(cx);
+        let thread = app.thread_shell(thread_id)?;
+        let root = &app.shell.project(&thread.project_id)?.workspace_root;
         let known = terminal_id.and_then(|id| self.summary(thread_id, id)).filter(|summary| !summary.cwd.is_empty());
         Some(match known {
             Some(summary) => LaunchLocation {
