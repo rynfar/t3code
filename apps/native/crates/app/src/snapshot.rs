@@ -22,7 +22,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
-[--click <x>,<y>]... [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
+[--click <x>,<y>]... [--hover <x>,<y>] [--scroll <x>,<y>,<dy>] [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
 
 pub struct Options {
     out: PathBuf,
@@ -45,6 +45,10 @@ pub struct Options {
     context_meter: bool,
     /// Left clicks at window points, in order, after everything else is open.
     clicks: Vec<(f32, f32)>,
+    /// The pointer rests here after the clicks, so hover states show.
+    hover: Option<(f32, f32)>,
+    /// A wheel of `dy` pixels at a point, last, with the pointer left there.
+    scroll: Option<(f32, f32, f32)>,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -80,6 +84,11 @@ impl Options {
                 .filter(|pair| pair[0] == "--click")
                 .filter_map(|pair| pair[1].split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?))))
                 .collect(),
+            hover: flag("--hover").and_then(|pair| pair.split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))),
+            scroll: flag("--scroll").and_then(|value| {
+                let mut parts = value.split(',').map(|part| part.trim().parse::<f32>().ok());
+                Some((parts.next()??, parts.next()??, parts.next()??))
+            }),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -108,6 +117,12 @@ fn section(name: &str) -> Option<Section> {
 fn pump(cx: &mut VisualTestAppContext, seconds: f32, done: impl Fn(&mut VisualTestAppContext) -> bool) {
     let until = Instant::now() + Duration::from_secs_f32(seconds);
     while Instant::now() < until {
+        // The test platform has no display link; deliver `on_next_frame` work as the app would.
+        cx.update(|cx| {
+            for window in cx.windows() {
+                let _ = window.update(cx, |_, window, cx| window.simulate_next_frame(cx));
+            }
+        });
         cx.run_until_parked();
         if done(cx) {
             return;
@@ -264,6 +279,18 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let position = gpui::point(px(x), px(y));
         cx.simulate_mouse_move(window, position, None, gpui::Modifiers::default());
         cx.simulate_click(window, position, gpui::Modifiers::default());
+    }
+    if let Some((x, y)) = options.hover {
+        pump(&mut cx, options.wait.min(3.), |_| false);
+        cx.simulate_mouse_move(window, gpui::point(px(x), px(y)), None, gpui::Modifiers::default());
+    }
+    if let Some((x, y, dy)) = options.scroll {
+        pump(&mut cx, options.wait.min(3.), |_| false);
+        let position = gpui::point(px(x), px(y));
+        cx.simulate_mouse_move(window, position, None, gpui::Modifiers::default());
+        pump(&mut cx, 0.5, |_| false);
+        let delta = gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(dy)));
+        cx.simulate_event(window, gpui::ScrollWheelEvent { position, delta, ..Default::default() });
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;

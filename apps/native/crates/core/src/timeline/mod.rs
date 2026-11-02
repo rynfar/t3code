@@ -11,6 +11,7 @@ mod changed_files;
 mod find;
 mod folds;
 mod fork;
+pub mod minimap;
 mod now;
 mod presentation;
 mod rewind;
