@@ -6,6 +6,7 @@
 //! next turn, the model on the turn itself.
 
 pub(crate) mod controls;
+mod menu;
 mod model_picker;
 mod pending;
 mod send;
@@ -30,6 +31,7 @@ use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::provider_icon::ProviderMark;
 use crate::sidebar::controller::now_ms;
+use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
 actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions]);
@@ -142,6 +144,8 @@ pub struct Composer {
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
     /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
     pub(super) fixed: Option<String>,
+    /// The `@`, `/` and `$` menus.
+    menu: Menu,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -180,6 +184,8 @@ impl Composer {
                 }
             }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| this.on_picker(event, window, cx)),
+            // Caret moves change the token under it; blinks find the caret unchanged and stop.
+            cx.observe(&input, |this, _, cx| this.sync_menu(false, cx)),
         ];
         let limit_recovery = cx.new(|cx| crate::thread_view::LimitRecoveryBanner::new(state.clone(), cx));
         let mut composer = Composer {
@@ -207,6 +213,7 @@ impl Composer {
             input_state: None,
             question_focus: cx.focus_handle(),
             fixed,
+            menu: Menu::default(),
             _subscriptions: subscriptions,
         };
         composer.refresh(true, window, cx);
@@ -286,6 +293,7 @@ impl Composer {
         });
         self.snapshot = next;
         self.sync_answering(window, cx);
+        self.sync_menu(true, cx);
         if self.picker_open {
             let input = self.picker_input(cx);
             self.picker.update(cx, |picker, cx| picker.update_input(input, config_changed, cx));
@@ -519,6 +527,7 @@ impl Composer {
     /// The textarea draws itself; the composer repaints only when what it shows depends on the
     /// text: the send button's enabled state, or the active answer.
     fn on_prompt_change(&mut self, cx: &mut Context<Self>) {
+        self.sync_menu(true, cx);
         let text = self.prompt(cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();

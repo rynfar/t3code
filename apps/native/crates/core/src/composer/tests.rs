@@ -39,7 +39,7 @@ fn a_held_or_composing_enter_never_sends() {
 #[test]
 fn client_settings_read_web_keys_and_ignore_bad_values() {
     let settings = ClientSettings::from_json(
-        r#"{"sendShortcut": "mod-enter", "followUpBehavior": "queue", "planModeEnabled": true, "notificationMode": "notifications-and-sound", "inAppNotificationsEnabled": true}"#,
+        r#"{"sendShortcut": "mod-enter", "followUpBehavior": "queue", "planModeEnabled": true, "notificationMode": "notifications-and-sound", "inAppNotificationsEnabled": true, "showSkillsInSlashMenu": false}"#,
     );
     assert_eq!(
         settings,
@@ -49,11 +49,13 @@ fn client_settings_read_web_keys_and_ignore_bad_values() {
             plan_mode_enabled: true,
             notification_mode: crate::notifications::NotificationMode::NotificationsAndSound,
             in_app_notifications_enabled: true,
+            show_skills_in_slash_menu: false,
         }
     );
     let partial = ClientSettings::from_json(r#"{"sendShortcut": "shift-enter", "planModeEnabled": "yes"}"#);
     assert_eq!(partial, ClientSettings::default());
     assert_eq!(ClientSettings::from_json("not json"), ClientSettings::default());
+    assert!(ClientSettings::default().show_skills_in_slash_menu, "the web shows skills in the / menu by default");
 }
 
 fn provider(value: serde_json::Value) -> ServerProvider {

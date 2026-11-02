@@ -7,6 +7,8 @@
 //! `client-runtime/src/operations/threadTitle.ts`, and the draft defaults in
 //! `web/src/hooks/useHandleNewThread.ts`.
 
+pub mod menu;
+
 use serde::Deserialize;
 
 use crate::commands::ComposerDispatch;
@@ -33,7 +35,7 @@ pub enum FollowUpBehavior {
 
 /// The `ClientSettingsSchema` keys the composer reads. They are per-device on the web, so the
 /// native client keeps its own copy with the web's names and defaults.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSettings {
     pub send_shortcut: SendShortcut,
     pub follow_up_behavior: FollowUpBehavior,
@@ -42,6 +44,21 @@ pub struct ClientSettings {
     pub notification_mode: crate::notifications::NotificationMode,
     /// Toasts for other threads while the window is focused.
     pub in_app_notifications_enabled: bool,
+    /// Skills also show in the `/` menu as `/skill:name`.
+    pub show_skills_in_slash_menu: bool,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        ClientSettings {
+            send_shortcut: SendShortcut::default(),
+            follow_up_behavior: FollowUpBehavior::default(),
+            plan_mode_enabled: false,
+            notification_mode: Default::default(),
+            in_app_notifications_enabled: false,
+            show_skills_in_slash_menu: true,
+        }
+    }
 }
 
 impl ClientSettings {
@@ -66,6 +83,9 @@ impl ClientSettings {
         }
         if let Some(value) = field("inAppNotificationsEnabled").and_then(|v| v.as_bool()) {
             settings.in_app_notifications_enabled = value;
+        }
+        if let Some(value) = field("showSkillsInSlashMenu").and_then(|v| v.as_bool()) {
+            settings.show_skills_in_slash_menu = value;
         }
         settings
     }

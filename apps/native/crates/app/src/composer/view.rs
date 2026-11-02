@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, Context, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
-use gpui_component::input::{Escape, Textarea};
+use gpui_component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Textarea};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
@@ -18,7 +18,7 @@ use t3_core::traits;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
 use super::model_picker::permissions_section;
-use super::{Composer, Resolved, Target, TogglePlanMode, runtime_mode_icon};
+use super::{Composer, MenuKey, Resolved, Target, TogglePlanMode, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
@@ -266,6 +266,32 @@ impl Render for Composer {
                     }
                 }))
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
+                // The open menu takes these keys before the prompt does (`composerCommandKey`).
+                .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                    if this.menu_key(MenuKey::Up, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                    if this.menu_key(MenuKey::Down, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                    if !action.secondary && !action.shift && this.menu_key(MenuKey::Accept, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                    if this.menu_key(MenuKey::Accept, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                    if this.menu_key(MenuKey::Dismiss, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &Escape, _, cx| {
                     if this.permissions_open || this.approval_menu_open {
                         this.permissions_open = false;
@@ -286,6 +312,7 @@ impl Render for Composer {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))
                 })
                 .child(
+                    div().relative().children(self.render_menu(cx)).child(
                     v_flex()
                         .rounded(px(16.))
                         .border_1()
@@ -318,6 +345,7 @@ impl Render for Composer {
                                 .child(div().flex_1().min_w(px(8.)))
                                 .child(self.render_primary(&resolved, cx)),
                         ),
+                    ),
                 ),
         )
     }

@@ -64,6 +64,7 @@ impl Composer {
         });
         let start_from_origin = config.is_some_and(|config| workspace::start_from_origin(&config.settings, &project_id, ThreadEnvMode::Worktree));
         let cwd = root.clone().unwrap_or_default();
+        let context = self.message_context(&text);
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
         let refs = state.rpc(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd));
         self.begin_send(window, cx);
@@ -96,6 +97,8 @@ impl Composer {
                     workspace: &strategy,
                     message_id: &message_id,
                     text: &text,
+                    context: context.as_ref(),
+                    attachments: &[],
                 });
                 Ok::<_, String>((thread_id, this.state.read(cx).rpc(method::LAUNCH_THREAD, payload)))
             });
@@ -106,6 +109,9 @@ impl Composer {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
+                if result.is_ok() {
+                    this.clear_mentions(&Target::Draft(project_id.clone()));
+                }
                 match result {
                     Ok(_) if intent == SubmitIntent::Background => {}
                     Ok(thread_id) => this.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx)),
@@ -147,6 +153,7 @@ impl Composer {
             }
             let (command_id, message_id) = (uuid_v4(), uuid_v4());
             let title = rules::title_seed(&text);
+            let context = self.message_context(&text);
             let message = ComposerMessage {
                 command_id: &command_id,
                 thread_id: &thread_id,
@@ -155,6 +162,8 @@ impl Composer {
                 title_seed: &title,
                 model_selection: &selection,
                 dispatch,
+                context: context.as_ref(),
+                attachments: &[],
             };
             steps.push((commands::composer_message(&message), "Failed to send message."));
         }
@@ -165,8 +174,9 @@ impl Composer {
             let failure = request.await.err().map(|(index, error)| format!("{} {error}", failures.get(index).copied().unwrap_or("Failed to send message.")));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
-                if let Some(error) = failure {
-                    this.restore(&text, error, window, cx);
+                match failure {
+                    Some(error) => this.restore(&text, error, window, cx),
+                    None => this.clear_mentions(&Target::Thread(thread_id)),
                 }
                 cx.notify();
             });

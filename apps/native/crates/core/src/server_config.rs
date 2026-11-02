@@ -218,6 +218,64 @@ pub struct ServerProvider {
     /// `false` when the provider cannot rewind its conversation ("Edit from here").
     #[serde(default)]
     pub supports_conversation_rollback: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub slash_commands: Vec<ProviderSlashCommand>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub skills: Vec<ProviderSkill>,
+    /// Per-cwd commands and skills. Left out for clients that fetch them on demand.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+}
+
+/// `ServerProviderSlashCommand`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub input: Option<SlashCommandInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SlashCommandInput {
+    pub hint: String,
+}
+
+/// `ServerProviderSkill`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    /// Claude's `user-invocable: false`: only agents invoke it, so the menus hide it.
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+/// `ServerProviderWorkspaceSnapshot`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSnapshot {
+    pub cwd: String,
+    pub checked_at: String,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub slash_commands: Vec<ProviderSlashCommand>,
+    #[serde(default)]
+    pub slash_commands_pending: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub skills: Vec<ProviderSkill>,
 }
 
 /// `ServerProviderUsageWindow`: how much of one quota is spent and when it resets.
