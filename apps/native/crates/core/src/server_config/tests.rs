@@ -113,5 +113,13 @@ fn keybindings_update_replaces_the_raw_payload() {
     }))
     .unwrap();
     assert!(state.apply(event));
-    assert_eq!(state.config.unwrap().keybindings[0]["command"], "commandPalette.toggle");
+    assert_eq!(state.config.as_ref().unwrap().keybindings[0]["command"], "commandPalette.toggle");
+    assert_eq!(state.config.as_ref().unwrap().keybindings_config_path.as_deref(), Some("/k.json"));
+
+    // An edit's reply applies its set at once; the same set streamed after it changes nothing.
+    let reply = json!({"keybindings": [{"key": "mod+j", "command": "terminal.toggle"}], "issues": []});
+    assert!(state.apply_keybindings_reply(&reply));
+    assert!(!state.apply_keybindings_reply(&reply));
+    assert!(!state.apply_keybindings_reply(&json!({})));
+    assert_eq!(state.config.unwrap().keybindings[0]["command"], "terminal.toggle");
 }

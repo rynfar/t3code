@@ -698,6 +698,13 @@ pub struct ServerConfig {
     /// Sent only to clients that opt in with `usageLimitSources`; empty means none.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub usage_limit_sources: Vec<UsageLimitSource>,
+    /// Where `server.upsertKeybinding` writes; Settings opens it in an editor.
+    #[serde(default)]
+    pub keybindings_config_path: Option<String>,
+    /// The workspace "Start without a project" opens (`projects.ensureScratch`); absent on
+    /// servers without scratch projects.
+    #[serde(default)]
+    pub scratch_workspace_root: Option<String>,
 }
 
 impl ServerConfig {
@@ -806,6 +813,16 @@ impl ServerConfigState {
     /// streamed since: those are at least as new. Returns true when the config changed.
     pub fn apply_settings_reply(&mut self, settings: ServerSettings, sent_at: u64) -> bool {
         sent_at == self.settings_revision && self.update(|config| replace(&mut config.settings, settings))
+    }
+
+    /// Applies the `keybindings` a `server.upsertKeybinding` / `server.removeKeybinding` reply
+    /// carries, so an edit shows before `keybindingsUpdated` streams the same set. Returns true
+    /// when the config changed.
+    pub fn apply_keybindings_reply(&mut self, reply: &Value) -> bool {
+        match reply.get("keybindings") {
+            Some(keybindings @ Value::Array(_)) => self.update(|config| replace(&mut config.keybindings, keybindings.clone())),
+            _ => false,
+        }
     }
 
     fn update(&mut self, change: impl FnOnce(&mut ServerConfig) -> bool) -> bool {

@@ -2,7 +2,9 @@
 //! new-thread controls, and the draft hero above the composer. Ports `resolveThreadActionProjectRef`
 //! and `startNewThreadFromContext` (`web/src/lib/chatThreadActions.ts`), `resolveDefaultProjectRef`
 //! (`web/src/hooks/useHandleNewThread.ts`), the project breadcrumb in `ChatHeader.tsx`, and
-//! `DraftHeroProjectHeading.tsx`. The draft's first send launches the thread (see `composer`).
+//! `DraftHeroProjectHeading.tsx` and `DraftHeroHeadline.tsx` (the project picker, "or start without
+//! a project", and the scratch draft's "What should we work on?"). The draft's first send launches
+//! the thread (see `composer`). `TriageDraftHero` waits on the triage flow, which is not ported.
 
 use std::time::{Duration, Instant};
 
@@ -19,10 +21,12 @@ use crate::composer::controls::{Float, MenuItem, floating, menu_surface};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
-actions!(t3, [NewThread]);
+actions!(t3, [NewThread, NewThreadWithoutProject]);
 
 pub fn init(state: Entity<AppState>, cx: &mut App) {
+    let scratch = state.clone();
     cx.on_action(move |_: &NewThread, cx| state.update(cx, start_new_thread));
+    cx.on_action(move |_: &NewThreadWithoutProject, cx| crate::home::start_without_project(&scratch, cx));
 }
 
 /// `resolveThreadActionProjectRef`: the open thread's project, else the draft's, else the first
@@ -118,32 +122,39 @@ impl DraftHero {
     }
 }
 
-impl Render for DraftHero {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl DraftHero {
+    /// The project picker (`InlineButton tone="picker"`): every project but the scratch one, then
+    /// "Add project".
+    fn picker(&self, label: SharedString, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let app = self.state.read(cx);
         let current = app.draft_project.clone();
-        let name: SharedString =
-            current.as_deref().and_then(|id| app.shell.project(id)).map(|project| project.title.clone()).unwrap_or_else(|| "Choose a project".into()).into();
         let projects: Vec<(String, String)> = app
             .shell
             .snapshot
             .as_ref()
             .map(|snapshot| {
-                snapshot.projects.iter().filter(|project| project.archived_at.is_none()).map(|project| (project.id.clone(), project.title.clone())).collect()
+                snapshot
+                    .projects
+                    .iter()
+                    .filter(|project| project.archived_at.is_none() && !app.is_scratch_project(&project.id))
+                    .map(|project| (project.id.clone(), project.title.clone()))
+                    .collect()
             })
             .unwrap_or_default();
-        let picker = div()
+        div()
             .relative()
+            .min_w_0()
             .child(
                 h_flex()
                     .id("draft-project")
-                    .gap(px(4.))
+                    .min_w_0()
                     .cursor_pointer()
                     .font_weight(FontWeight::MEDIUM)
-                    .hover(|this| this.text_color(hsla(p.foreground).opacity(0.8)))
-                    .child(name)
-                    .child(Icon::ChevronDown.render(px(20.), hsla(p.muted_foreground)))
+                    .text_color(hsla(p.foreground))
+                    .when(self.projects_open, |this| this.underline())
+                    .hover(|this| this.underline())
+                    .child(div().min_w_0().truncate().child(label))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.dismissed.take().is_some_and(|at| at.elapsed() < Duration::from_millis(300)) {
                             return;
@@ -156,44 +167,92 @@ impl Render for DraftHero {
                 this.child(floating(
                     Float::BelowStart,
                     menu_surface(cx)
-                                .occlude()
-                                .mt(px(4.))
-                                .max_h(px(320.))
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::NORMAL)
-                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                    this.projects_open = false;
-                                    this.dismissed = Some(Instant::now());
-                                    cx.notify();
-                                }))
-                                .children(projects.into_iter().map(|(id, title)| {
-                                    let checked = current.as_deref() == Some(id.as_str());
-                                    MenuItem::new(SharedString::from(format!("project-{id}")), title).checked(checked).on_click(
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.projects_open = false;
-                                            this.state.update(cx, |state, cx| state.start_draft(&id, cx));
-                                            this.composer.update(cx, |composer, cx| composer.focus(window, cx));
-                                        }),
-                                    )
-                                })),
+                        .occlude()
+                        .mt(px(4.))
+                        .w(px(288.))
+                        .max_h(px(320.))
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .font_weight(FontWeight::NORMAL)
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.projects_open = false;
+                            this.dismissed = Some(Instant::now());
+                            cx.notify();
+                        }))
+                        .children(projects.into_iter().map(|(id, title)| {
+                            let checked = current.as_deref() == Some(id.as_str());
+                            MenuItem::new(SharedString::from(format!("project-{id}")), title).checked(checked).on_click(cx.listener(move |this, _, window, cx| {
+                                this.projects_open = false;
+                                this.state.update(cx, |state, cx| state.start_draft(&id, cx));
+                                this.composer.update(cx, |composer, cx| composer.focus(window, cx));
+                            }))
+                        }))
+                        .child(MenuItem::new("project-add", "Add project").checked(false).icon(Icon::FolderPlus, hsla(p.muted_foreground)).on_click(cx.listener(|this, _, window, cx| {
+                            this.projects_open = false;
+                            cx.notify();
+                            window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
+                        }))),
                 ))
-            });
+            })
+    }
+}
+
+impl Render for DraftHero {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let app = self.state.read(cx);
+        let project = app.draft_project.as_deref().and_then(|id| app.shell.project(id)).map(|project| (project.id.clone(), project.title.clone()));
+        let scratch_draft = project.as_ref().is_some_and(|(id, _)| app.is_scratch_project(id));
+        let scratch_available = app.scratch_root().is_some();
+        let shortcut = crate::keymap::label("chat.newWithoutProject", cx);
+        let heading = |children: Vec<gpui::AnyElement>| {
+            h_flex()
+                .w_full()
+                .px(px(48.))
+                .justify_center()
+                .flex_wrap()
+                .gap(px(8.))
+                .text_size(px(30.))
+                .line_height(px(36.))
+                .text_color(hsla(p.foreground))
+                .children(children)
+        };
+        let headline = match &project {
+            Some((_, title)) if !scratch_draft => {
+                let picker = self.picker(title.clone().into(), cx).into_any_element();
+                heading(vec!["What should we build in".into_any_element(), h_flex().min_w_0().child(picker).child("?").into_any_element()])
+            }
+            Some(_) => heading(vec!["What should we work on?".into_any_element()]),
+            None => {
+                let picker = self.picker("Choose a project".into(), cx).into_any_element();
+                heading(vec![picker, "to start".into_any_element()])
+            }
+        };
+        // The line under the headline: the scratch draft's picker, or the way to start without one.
+        let below = if !scratch_available {
+            None
+        } else if scratch_draft {
+            Some(self.picker("No project".into(), cx).into_any_element())
+        } else {
+            let state = self.state.clone();
+            Some(
+                div()
+                    .id("draft-without-project")
+                    .cursor_pointer()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hsla(p.muted_foreground))
+                    .hover(|this| this.underline().text_color(hsla(p.foreground)))
+                    .child("or start without a project")
+                    .when_some(shortcut, |this, shortcut| this.tooltip(move |window, cx| Tooltip::new(shortcut.clone()).build(window, cx)))
+                    .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_without_project(cx)))
+                    .into_any_element(),
+            )
+        };
         v_flex()
             .size_full()
             .justify_center()
-            .child(
-                h_flex()
-                    .w_full()
-                    .px(px(48.))
-                    .justify_center()
-                    .flex_wrap()
-                    .gap(px(8.))
-                    .text_size(px(30.))
-                    .line_height(px(36.))
-                    .text_color(hsla(p.foreground))
-                    .child("What should we build in")
-                    .child(h_flex().child(picker).child("?")),
-            )
+            .child(headline)
+            .children(below.map(|below| h_flex().mt(px(8.)).h(px(24.)).w_full().justify_center().text_sm().child(below)))
             .child(div().h(px(16.)))
             .child(self.composer.clone())
     }

@@ -171,22 +171,29 @@ impl AppState {
         }
         let generation = self.shell.generation;
         self.omitted.family_requested.insert(thread_id.to_owned(), generation);
+        self.restoring_thread |= select;
         let rpc = self.rpc(GET_THREAD_FAMILY, family_request(thread_id));
         let thread_id = thread_id.to_owned();
         cx.spawn(async move |this, cx| {
-            let Ok(family) = rpc.await.map_err(|error| error.to_string()).and_then(decode_read) else { return };
+            let read = rpc.await.map_err(|error| error.to_string()).and_then(decode_read);
             let _ = this.update(cx, |state, cx| {
-                if state.shell.generation != generation {
-                    return;
+                if let Ok(family) = read
+                    && state.shell.generation == generation
+                {
+                    let exists = family.threads.iter().any(|thread| thread.id == thread_id);
+                    state.omitted.mounts.mount(&family_key(&thread_id), generation, vec![family]);
+                    if select && exists && state.selected_thread.is_none() && state.draft_project.is_none() {
+                        state.select_thread(&thread_id, cx);
+                    }
+                    state.rebuild_sidebar(cx);
+                    state.sync_side_threads(cx);
+                    cx.emit(AppEvent::Shell);
                 }
-                let exists = family.threads.iter().any(|thread| thread.id == thread_id);
-                state.omitted.mounts.mount(&family_key(&thread_id), generation, vec![family]);
-                if select && exists && state.selected_thread.is_none() && state.draft_project.is_none() {
-                    state.select_thread(&thread_id, cx);
+                // A restore that finds nothing falls back to the home page.
+                if select {
+                    state.restoring_thread = false;
+                    state.land_home(cx);
                 }
-                state.rebuild_sidebar(cx);
-                state.sync_side_threads(cx);
-                cx.emit(AppEvent::Shell);
             });
         })
         .detach();

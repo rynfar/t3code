@@ -43,21 +43,31 @@ impl SidebarPane {
         });
     }
 
+    /// The filter trigger: the list-filter icon, or the scoped projects' favicons (two at most,
+    /// overlapping), labelled with their names.
     pub(super) fn render_project_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let scoped = self.state.read(cx).sidebar.project_scope.is_some();
-        div()
-            .id("project-filter")
-            .size(px(28.))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.))
-            .cursor_pointer()
-            .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
-            .when(scoped, |this| this.bg(hsla(p.sidebar_row_selected)))
-            .child(Icon::FolderTree.render(px(16.), hsla(if scoped { p.sidebar_foreground } else { p.sidebar_icon })))
+        let state = self.state.read(cx);
+        let scoped: Vec<ProjectGroup> = match &state.sidebar.project_scope {
+            Some(scope) => self.project_groups(cx).into_iter().filter(|group| group.member_project_ids.iter().any(|id| scope.contains(id))).collect(),
+            None => Vec::new(),
+        };
+        let label = if scoped.is_empty() {
+            "Filter threads by project".to_owned()
+        } else {
+            format!("Filter threads by project: {}", scoped.iter().map(|group| group.label.as_str()).collect::<Vec<_>>().join(", "))
+        };
+        let size = px(if scoped.len() > 1 { 14. } else { 16. });
+        let favicon = |group: &ProjectGroup| match state.sidebar.favicons.image(&group.representative_id) {
+            Some(image) => gpui::img(image).flex_none().size(size).into_any_element(),
+            None => Icon::Folder.render(size, hsla(p.sidebar_icon)).into_any_element(),
+        };
+        let content = if scoped.is_empty() {
+            Self::button_icon(Icon::ListFilter, "project-filter", cx).into_any_element()
+        } else {
+            div().flex().flex_none().children(scoped.iter().take(2).enumerate().map(|(index, group)| div().when(index > 0, |this| this.ml(px(-6.))).child(favicon(group)))).into_any_element()
+        };
+        Self::header_button("project-filter", content, move |_| label.clone(), true, cx)
             .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| this.toggle_project_filter(event.position(), cx)))
     }
 
