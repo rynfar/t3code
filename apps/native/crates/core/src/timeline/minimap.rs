@@ -321,5 +321,53 @@ pub fn jump_anchor(item: usize, view_offset: f32, size_at: impl Fn(usize) -> f32
     (index, 0., remaining)
 }
 
+/// A left-button event on the rail or anywhere else in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailPointerEvent {
+    Down { on_rail: bool },
+    Up { on_rail: bool },
+    Move { on_rail: bool, pressed: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailPointerAction {
+    Ignore,
+    /// Follow the pointer with the active item.
+    Track,
+    /// Jump to the item under the pointer.
+    Jump,
+}
+
+/// The rail's press state (`pressedOnStripRef` and `passThrough`): a press that starts on the
+/// rail scrubs along it and jumps where it is released; a drag from elsewhere passes over it.
+/// Every release and button-free move, on the rail or not, ends the press, as the web's window
+/// `mouseup` and `mousemove` listeners do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RailPointer {
+    pressed_on_rail: bool,
+}
+
+impl RailPointer {
+    pub fn handle(&mut self, event: RailPointerEvent) -> RailPointerAction {
+        match event {
+            RailPointerEvent::Down { on_rail } => {
+                self.pressed_on_rail = on_rail;
+                RailPointerAction::Ignore
+            }
+            RailPointerEvent::Up { on_rail } => {
+                let jump = on_rail && self.pressed_on_rail;
+                self.pressed_on_rail = false;
+                if jump { RailPointerAction::Jump } else { RailPointerAction::Ignore }
+            }
+            RailPointerEvent::Move { on_rail, pressed } => {
+                if !pressed {
+                    self.pressed_on_rail = false;
+                }
+                if on_rail && (!pressed || self.pressed_on_rail) { RailPointerAction::Track } else { RailPointerAction::Ignore }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

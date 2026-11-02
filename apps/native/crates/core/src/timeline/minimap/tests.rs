@@ -159,3 +159,27 @@ fn a_jump_anchors_above_the_message_through_measured_rows() {
     assert_eq!(jump_anchor(0, 24., size), (0, 0., 24.));
     assert_eq!(jump_anchor(4, 0., size), (4, 0., 0.));
 }
+
+#[test]
+fn only_a_press_that_starts_on_the_rail_scrubs_or_jumps() {
+    use RailPointerAction::{Ignore, Jump, Track};
+    use RailPointerEvent::{Down, Move, Up};
+    let run = |pointer: &mut RailPointer, events: &[RailPointerEvent]| events.iter().map(|event| pointer.handle(*event)).collect::<Vec<_>>();
+    let mut pointer = RailPointer::default();
+    let hover = Move { on_rail: true, pressed: false };
+    let drag_on = Move { on_rail: true, pressed: true };
+    let drag_off = Move { on_rail: false, pressed: true };
+
+    assert_eq!(run(&mut pointer, &[hover, Down { on_rail: true }, drag_on, Up { on_rail: true }]), [Track, Ignore, Track, Jump], "click and scrub");
+    assert_eq!(run(&mut pointer, &[Down { on_rail: false }, drag_on, Up { on_rail: true }]), [Ignore, Ignore, Ignore], "a drag from elsewhere passes");
+    assert_eq!(
+        run(&mut pointer, &[Down { on_rail: true }, drag_off, Up { on_rail: false }, Down { on_rail: false }, drag_on, Up { on_rail: true }]),
+        [Ignore, Ignore, Ignore, Ignore, Ignore, Ignore],
+        "a press released off the rail does not carry into the next drag",
+    );
+    assert_eq!(
+        run(&mut pointer, &[Down { on_rail: true }, Move { on_rail: false, pressed: false }, drag_on, Up { on_rail: true }]),
+        [Ignore, Ignore, Ignore, Ignore],
+        "a button-free move ends a press whose release was missed",
+    );
+}

@@ -13,10 +13,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Bounds, BoxShadow, Context, FontWeight, ListOffset, MouseButton, MouseMoveEvent, Pixels, Window, canvas, div, fill, point, prelude::*,
-    px, size,
+    AnyElement, Bounds, BoxShadow, Context, FontWeight, ListOffset, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, Window, canvas,
+    div, fill, point, prelude::*, px, size,
 };
-use t3_core::timeline::minimap::{self, MinimapItem, MinimapPreview};
+use t3_core::timeline::minimap::{self, MinimapItem, MinimapPreview, RailPointer, RailPointerAction, RailPointerEvent};
 
 use super::ThreadView;
 use crate::icons::Icon;
@@ -40,8 +40,7 @@ pub struct MinimapUi {
     strip_hovered: bool,
     preview_hovered: bool,
     nav_hovered: bool,
-    /// A press that started on the rail, so dragging along it scrubs; one from elsewhere passes.
-    pressed_on_strip: bool,
+    pointer: RailPointer,
     rail: Rc<Cell<Bounds<Pixels>>>,
     measured: Rc<Cell<Measured>>,
 }
@@ -124,6 +123,21 @@ impl ThreadView {
         });
     }
 
+    /// `forwardWheelToTimeline`: the rail and its preview sit over the transcript, so a wheel
+    /// there scrolls the transcript, never a scroller underneath (an open command's output).
+    fn forward_minimap_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        // The list's own line height for line-based wheels.
+        let delta = event.delta.pixel_delta(px(20.)).y;
+        if event.modifiers.control || delta == px(0.) {
+            return;
+        }
+        // As the list's own wheel does: clamped, and back to following the end at the bottom.
+        let top = self.list.scroll_px_offset_for_scrollbar();
+        self.list.set_offset_from_scrollbar(point(px(0.), top.y + delta));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     pub(super) fn render_minimap(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let count = self.minimap.items.len();
         if count < minimap::MIN_ITEMS {
@@ -136,6 +150,7 @@ impl ThreadView {
         // A rail that stops taking the pointer can no longer report a leave.
         if !interactive {
             (self.minimap.active, self.minimap.strip_hovered, self.minimap.preview_hovered) = (None, false, false);
+            self.minimap.pointer = RailPointer::default();
         }
         if !navigation {
             self.minimap.nav_hovered = false;
@@ -155,33 +170,41 @@ impl ThreadView {
             .children(preview.map(|(index, preview)| render_preview(index, count, rail_height, preview, cx)))
             .when(interactive, |this| {
                 this.cursor_pointer()
-                    .block_mouse_except_scroll()
+                    .occlude()
+                    .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| view.forward_minimap_wheel(event, cx)))
                     .on_hover(cx.listener(|view, hovered: &bool, window, cx| {
                         view.minimap.strip_hovered = *hovered;
                         view.minimap_hover_changed(window, cx);
                     }))
                     .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
                         let ui = &mut view.minimap;
-                        if event.pressed_button.is_none() {
-                            ui.pressed_on_strip = false;
-                        } else if !ui.pressed_on_strip {
-                            return;
-                        }
+                        let action = ui.pointer.handle(RailPointerEvent::Move { on_rail: true, pressed: event.pressed_button.is_some() });
                         let index = ui.index_at(event.position.y);
-                        if index != ui.active {
+                        if action == RailPointerAction::Track && index != ui.active {
                             ui.active = index;
                             cx.notify();
                         }
                     }))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|view, _, _, _| view.minimap.pressed_on_strip = true))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|view, _, _, _| {
+                        view.minimap.pointer.handle(RailPointerEvent::Down { on_rail: true });
+                    }))
+                    .on_mouse_down_out(cx.listener(|view, _, _, _| {
+                        view.minimap.pointer.handle(RailPointerEvent::Down { on_rail: false });
+                    }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|view, event: &gpui::MouseUpEvent, window, cx| {
-                            if std::mem::take(&mut view.minimap.pressed_on_strip)
+                        cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                            if view.minimap.pointer.handle(RailPointerEvent::Up { on_rail: true }) == RailPointerAction::Jump
                                 && let Some(index) = view.minimap.index_at(event.position.y)
                             {
                                 view.jump_to_minimap_item(index, window, cx);
                             }
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, _| {
+                            view.minimap.pointer.handle(RailPointerEvent::Up { on_rail: false });
                         }),
                     )
             });
@@ -308,7 +331,8 @@ fn render_preview(index: usize, count: usize, rail_height: f32, preview: Minimap
             BoxShadow { color: gpui::black().opacity(0.25), offset: point(px(0.), px(20.)), blur_radius: px(25.), spread_radius: px(-5.), inset: false },
             BoxShadow { color: gpui::black().opacity(0.25), offset: point(px(0.), px(8.)), blur_radius: px(10.), spread_radius: px(-6.), inset: false },
         ])
-        .block_mouse_except_scroll()
+        .occlude()
+        .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| view.forward_minimap_wheel(event, cx)))
         .on_hover(cx.listener(|view, hovered: &bool, window, cx| {
             view.minimap.preview_hovered = *hovered;
             view.minimap_hover_changed(window, cx);
