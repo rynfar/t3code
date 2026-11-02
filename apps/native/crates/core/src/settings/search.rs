@@ -65,6 +65,7 @@ impl Section {
                 | Section::Keybindings
                 | Section::Providers
                 | Section::Threads
+                | Section::Worktrees
                 | Section::Connections
                 | Section::Labs
                 | Section::About
@@ -130,6 +131,10 @@ impl SearchItem {
 pub fn items() -> Vec<SearchItem> {
     use Section::*;
     vec![
+        SearchItem::new("storage-worktree-keep-when", "Keep worktrees with local changes", Worktrees, &["any local files uncommitted changes edited tracked files ignored env build output cleanup"])
+            .target("storage-worktrees"),
+        SearchItem::new("storage-worktrees", "Worktree cleanup", Worktrees, &["disk storage automatic delete deleted archived threads old inactive merged settled unchanged worktrees retention days project inherit off custom"]),
+        SearchItem::new("storage-worktrees-location", "Worktree location", Worktrees, &["worktree location folder directory path drive external disk"]),
         SearchItem::new("project-defaults", "Project defaults and overrides", Threads, &["model workspace environments projects inheritance checkout"]),
         SearchItem::new("default-model", "Default model", Threads, &["new thread project provider reasoning effort"]),
         SearchItem::new("fallback-model", "Fallback model", Threads, &["fallback agent provider out of usage new threads"]),
@@ -158,6 +163,8 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("send-shortcut", "Send shortcut", Chat, &["enter return command ctrl multiline prompt new line composer"]),
         SearchItem::new("follow-up-behavior", "Follow-up behavior", Chat, &["queue steer running turn send default behavior composer"]),
         SearchItem::new("new-threads", "New threads", Threads, &["default workspace mode draft local worktree"]),
+        SearchItem::new("worktree-submodules", "Submodules", Worktrees, &["git submodule init recursive top-level none worktree t3.json"]),
+        SearchItem::new("start-from-origin", "Start from remote", Worktrees, &["new worktrees start remote origin latest fetched branch local"]),
         SearchItem::new("add-project-starts-in", "Add project starts in", Threads, &["base directory folder browser path home"]),
         SearchItem::new("unpin-confirmation", "Unpin confirmation", General, &["ask before thread pinned section"]),
         SearchItem::new("archive-confirmation", "Archive confirmation", General, &["ask before thread second click inline action"]),
@@ -169,6 +176,7 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
         SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
         SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),
+        SearchItem::new("worktree-branch-naming", "Worktree branch naming", Worktrees, &["static semantic prefix custom prompt instructions feat fix refactor chore"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),
     ]

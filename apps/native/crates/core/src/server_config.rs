@@ -502,6 +502,14 @@ pub struct EnvironmentCapabilities {
     pub thread_auto_settle_opt_out: Option<bool>,
     #[serde(default)]
     pub project_organization: Option<bool>,
+    #[serde(default)]
+    pub worktrees_directory: Option<bool>,
+    #[serde(default)]
+    pub storage_cleanup: Option<bool>,
+    #[serde(default)]
+    pub storage_cleanup_run: Option<bool>,
+    #[serde(default)]
+    pub settled_worktree_cleanup: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -629,6 +637,8 @@ pub struct ServerSettings {
     pub threads: crate::settings::ThreadSettings,
     #[serde(flatten)]
     pub provider_panel: crate::settings::providers::background::ProviderPanelSettings,
+    #[serde(flatten)]
+    pub worktrees: crate::settings::worktrees::WorktreeSettings,
 }
 
 /// `providerInstances` in the server's order, which is the order the provider settings list

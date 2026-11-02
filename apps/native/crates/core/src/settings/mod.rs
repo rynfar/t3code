@@ -10,6 +10,7 @@ pub mod providers;
 pub mod quit_hold;
 pub mod search;
 pub mod snooze;
+pub mod worktrees;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};

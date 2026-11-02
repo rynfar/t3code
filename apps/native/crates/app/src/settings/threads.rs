@@ -138,7 +138,7 @@ impl SettingsView {
         self.state.read(cx).server_config.config.as_ref()
     }
 
-    fn sync_input(input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App) {
+    pub(super) fn sync_input(input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App) {
         if !input.focus_handle(cx).is_focused(window) && input.read(cx).value().as_ref() != value {
             let value = value.to_owned();
             input.update(cx, |input, cx| input.set_value(value, window, cx));

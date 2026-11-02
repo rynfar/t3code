@@ -635,6 +635,7 @@ pub struct Row {
     id: SharedString,
     title: SharedString,
     description: Option<SharedString>,
+    status: Option<SharedString>,
     control: Option<AnyElement>,
     reset: Option<ClickHandler>,
     below: Option<AnyElement>,
@@ -643,11 +644,17 @@ pub struct Row {
 
 impl Row {
     pub fn new(id: impl Into<SharedString>, title: impl Into<SharedString>) -> Self {
-        Row { id: id.into(), title: title.into(), description: None, control: None, reset: None, below: None, highlighted: false }
+        Row { id: id.into(), title: title.into(), description: None, status: None, control: None, reset: None, below: None, highlighted: false }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// `SettingsRow`'s `status`: a muted line under the description.
+    pub fn status(mut self, status: impl Into<SharedString>) -> Self {
+        self.status = Some(status.into());
         self
     }
 
@@ -713,7 +720,8 @@ impl RenderOnce for Row {
                             )
                             .children(self.description.map(|description| {
                                 div().max_w(r(672.)).text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description)
-                            })),
+                            }))
+                            .children(self.status.map(|status| div().pt(r(2.)).text_xs().text_color(hsla(p.muted_foreground)).child(status))),
                     )
                     .children(self.control.map(|control| {
                         h_flex()
