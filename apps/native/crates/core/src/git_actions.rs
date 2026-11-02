@@ -399,6 +399,39 @@ pub fn missing_terminal_message(action: StackedAction) -> String {
     format!("Source control action '{}' ended without a terminal result.", action.as_str())
 }
 
+/// One `git.runStackedAction` stream, consumed to its end (`consumeVcsActionProgress`). After
+/// `action_finished` the server still links the PR and refreshes status before it ends the
+/// stream, so the result is only read once the stream is over.
+#[derive(Debug, Clone)]
+pub struct StackedActionRun {
+    action_id: String,
+    action: StackedAction,
+    terminal: Option<ProgressEvent>,
+}
+
+impl StackedActionRun {
+    pub fn new(action_id: &str, action: StackedAction) -> Self {
+        StackedActionRun { action_id: action_id.to_owned(), action, terminal: None }
+    }
+
+    /// Notes this action's terminal event; the stream stays open until the server ends it.
+    pub fn observe(&mut self, event: &ProgressEvent) {
+        if matches!(event, ProgressEvent::ActionFinished { .. } | ProgressEvent::ActionFailed { .. }) && event.action_id() == Some(self.action_id.as_str()) {
+            self.terminal = Some(event.clone());
+        }
+    }
+
+    /// The outcome once the stream ended, or failed with `stream_error`.
+    pub fn settle(self, stream_error: Option<String>) -> Result<RunResult, String> {
+        match (self.terminal, stream_error) {
+            (Some(ProgressEvent::ActionFailed { phase, .. }), _) => Err(remote_failure_message(self.action, phase.as_deref())),
+            (_, Some(error)) => Err(error),
+            (Some(ProgressEvent::ActionFinished { result, .. }), None) => Ok(result),
+            _ => Err(missing_terminal_message(self.action)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     RunChangeRequest,
