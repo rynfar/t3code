@@ -115,6 +115,38 @@ pub fn count_request(before: &str) -> Value {
     json!({ "before": { "settledAt": before }, "limit": 0 })
 }
 
+pub const SEARCH_THREADS: &str = "orchestration.searchThreads";
+/// `THREAD_SEARCH_QUERY_MAX_LENGTH`: a pasted wall of text searches by its start.
+const SEARCH_QUERY_MAX_CHARS: usize = 200;
+
+/// The server needs a word of three or more letters to match messages.
+pub fn searches_messages(query: &str) -> bool {
+    query.split(|c: char| !c.is_alphanumeric()).any(|word| word.chars().count() >= 3)
+}
+
+/// The sidebar's `searchThreads` payload (`threadSearch.ts`, `useThreadSearch`), or `None` when the
+/// server has nothing to add. Below the shell's cut (`before`) the result also carries the rows of
+/// the best older settled matches, whose titles match from two letters.
+pub fn search_request(query: &str, before: Option<&str>, project_ids: Option<&[String]>) -> Option<Value> {
+    let query: String = query.trim().chars().take(SEARCH_QUERY_MAX_CHARS).collect();
+    let query = query.trim();
+    let messages = searches_messages(query);
+    if query.chars().count() < 2 || (!messages && before.is_none()) {
+        return None;
+    }
+    let mut payload = json!({ "query": query });
+    if let Some(before) = before {
+        payload["olderSettledBefore"] = json!(before);
+        if let Some(ids) = project_ids {
+            payload["projectIds"] = json!(ids);
+        }
+        if !messages {
+            payload["titlesOnly"] = json!(true);
+        }
+    }
+    Some(payload)
+}
+
 /// The cut and its current counts: the snapshot's while nothing it counted has changed, then
 /// the latest count read for the current key (`olderSettledAtom`).
 #[derive(Debug, Clone, Default)]

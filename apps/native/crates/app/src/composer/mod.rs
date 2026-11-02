@@ -211,7 +211,7 @@ impl Composer {
             let project_id = state.draft_project.clone();
             return Snapshot { target, project_id, ..Snapshot::default() };
         };
-        let shell = state.shell.thread(thread_id);
+        let shell = state.thread_shell(thread_id);
         let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
         let pending_key = projection.map(PendingKey::of).unwrap_or_default();
         let pending = if pending_key == self.snapshot.pending_key {

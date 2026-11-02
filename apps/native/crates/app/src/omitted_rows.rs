@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gpui::{Context, Task};
 use serde_json::Value;
-use t3_core::families::{FamilyRead, GET_THREAD_FAMILY, MountedReads, family_request};
+use t3_core::families::{FamilyRead, GET_THREAD_FAMILY, MountedReads, family_key, family_read_due, family_request};
 use t3_core::shell::ThreadShell;
 use t3_core::sidebar::older_settled::{
     Cursor, GET_OLDER_SETTLED_THREADS, OlderSettled, OlderSettledCounts, PageStatus, SettledPages, count_request, page_request,
@@ -17,6 +17,7 @@ use t3_core::sidebar::older_settled::{
 use crate::app_state::{AppEvent, AppState};
 
 const PAGES_KEY: &str = "older-settled";
+const SEARCH_KEY: &str = "search";
 /// `COUNT_REREAD_DELAY`: a burst of changes (a PR sync touching many old threads) costs one read.
 const COUNT_REREAD_DELAY: Duration = Duration::from_millis(500);
 
@@ -28,6 +29,8 @@ pub struct OmittedRows {
     /// The count key last read (or being read), so a key is read once.
     count_key: Option<String>,
     count_task: Option<Task<()>>,
+    /// The shell generation each family was last asked for, so a generation reads it once.
+    family_requested: HashMap<String, u64>,
 }
 
 impl OmittedRows {
@@ -35,10 +38,6 @@ impl OmittedRows {
     pub fn older(&self) -> Option<OlderSettled> {
         self.counts.current()
     }
-}
-
-fn family_key(thread_id: &str) -> String {
-    format!("family:{thread_id}")
 }
 
 impl AppState {
@@ -70,9 +69,22 @@ impl AppState {
             .map(str::to_owned)
             .collect();
         for thread_id in stale {
-            if self.omitted.mounts.generation_of(&family_key(&thread_id)) != Some(generation) {
+            if self.omitted.mounts.generation_of(&family_key(&thread_id)) != Some(generation)
+                && self.omitted.family_requested.get(&thread_id) != Some(&generation)
+            {
                 self.read_family(&thread_id, false, cx);
             }
+        }
+        self.mount_selected_family(cx);
+    }
+
+    /// Keeps the open thread's family mounted while the shell itself leaves the thread out, so
+    /// a snapshot that cuts it, or a search or page that lets go of it, never hides it.
+    pub(crate) fn mount_selected_family(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.selected_thread.clone() else { return };
+        let requested = self.omitted.family_requested.get(&thread_id).copied();
+        if family_read_due(&self.shell, &self.omitted.mounts, &thread_id, requested) {
+            self.read_family(&thread_id, false, cx);
         }
     }
 
@@ -157,6 +169,7 @@ impl AppState {
             return;
         }
         let generation = self.shell.generation;
+        self.omitted.family_requested.insert(thread_id.to_owned(), generation);
         let rpc = self.rpc(GET_THREAD_FAMILY, family_request(thread_id));
         let thread_id = thread_id.to_owned();
         cx.spawn(async move |this, cx| {
@@ -177,8 +190,21 @@ impl AppState {
         .detach();
     }
 
+    /// Mounts a search's older settled rows until newer results replace them, or the search ends
+    /// (`None`), so the sidebar's own ranking finds them as it finds shell rows (`useThreadSearch`).
+    pub(crate) fn mount_search_rows(&mut self, generation: u64, read: Option<FamilyRead>, cx: &mut Context<Self>) {
+        match read.filter(|read| !read.threads.is_empty()) {
+            Some(read) => self.omitted.mounts.mount(SEARCH_KEY, generation, vec![read]),
+            None if self.omitted.mounts.generation_of(SEARCH_KEY).is_none() => return,
+            None => self.omitted.mounts.unmount(SEARCH_KEY),
+        }
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Shell);
+    }
+
     /// Families mount while their thread is open; switching threads lets them go.
     pub(crate) fn release_families(&mut self, keep: Option<&str>) {
+        self.omitted.family_requested.retain(|thread_id, _| Some(thread_id.as_str()) == keep);
         let keep = keep.map(family_key);
         let stale: Vec<String> =
             self.omitted.mounts.keys().filter(|key| key.starts_with("family:") && Some(*key) != keep.as_deref()).map(str::to_owned).collect();

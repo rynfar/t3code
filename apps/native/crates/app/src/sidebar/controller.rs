@@ -200,7 +200,7 @@ impl AppState {
             self.sidebar.visit = None;
             return;
         };
-        let Some(thread) = self.shell.thread(&id) else { return };
+        let Some(thread) = self.thread_shell(&id) else { return };
         let Some(updated_at) = t3_core::sidebar::time::parse_iso(&thread.updated_at) else { return };
         let now = now_ms();
         let shell = VisitedShell {

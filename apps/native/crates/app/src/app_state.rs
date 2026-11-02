@@ -207,11 +207,12 @@ impl AppState {
                 self.rebuild_sidebar(cx);
             }
             cx.emit(AppEvent::Shell);
-            if let Some(id) = self.select_when_listed.take_if(|id| self.shell.thread(id).is_some()) {
+            let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+            if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
                 self.select_thread(&id, cx);
             } else if self.selected_thread.is_none()
                 && self.draft_project.is_none()
-                && let Some(id) = self.restore_thread.take_if(|id| self.shell.thread(id).is_some())
+                && let Some(id) = self.restore_thread.take_if(|id| mounts.thread(shell, id).is_some())
             {
                 self.select_thread(&id, cx);
             } else if self.selected_thread.is_none()
@@ -275,9 +276,7 @@ impl AppState {
         }
         // An idle subagent or older settled thread opens from its family when the shell omits it.
         self.release_families(Some(thread_id));
-        if self.thread_shell(thread_id).is_none() {
-            self.read_family(thread_id, false, cx);
-        }
+        self.mount_selected_family(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
@@ -371,7 +370,7 @@ impl AppState {
 
     /// Selects a thread the draft launched as soon as the shell lists it.
     pub fn select_when_listed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if self.shell.thread(thread_id).is_some() {
+        if self.thread_shell(thread_id).is_some() {
             self.select_thread(thread_id, cx);
         } else {
             self.select_when_listed = Some(thread_id.to_owned());
