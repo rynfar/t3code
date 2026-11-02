@@ -40,6 +40,7 @@ enum Command {
     CloseThread(String),
     Dispatch { command: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
+    Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>> },
 }
 
 #[derive(Clone)]
@@ -75,11 +76,31 @@ impl ClientHandle {
     }
 
     /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
-    /// `Closed` while disconnected rather than waiting for a reconnect.
-    pub async fn request(&self, method: &'static str, payload: Value) -> Result<Value, RpcError> {
+    /// `Closed` while disconnected rather than waiting for a reconnect. The request is queued
+    /// before this returns, so calls made in order reach the server in order (terminal input
+    /// depends on it).
+    pub fn request(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        self.commands.send(Command::Request { method, payload, reply }).map_err(|_| RpcError::Closed)?;
-        rx.await.unwrap_or(Err(RpcError::Closed))
+        let queued = self.commands.send(Command::Request { method, payload, reply }).is_ok();
+        async move {
+            if !queued {
+                return Err(RpcError::Closed);
+            }
+            rx.await.unwrap_or(Err(RpcError::Closed))
+        }
+    }
+
+    /// A streaming RPC on the live session. It ends with `RpcError::Closed` when the connection
+    /// drops, and callers resubscribe. Dropping the handle interrupts it on the server.
+    pub fn stream(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<StreamHandle, RpcError>> + Send + 'static {
+        let (reply, rx) = oneshot::channel();
+        let queued = self.commands.send(Command::Stream { method, payload, reply }).is_ok();
+        async move {
+            if !queued {
+                return Err(RpcError::Closed);
+            }
+            rx.await.unwrap_or(Err(RpcError::Closed))
+        }
     }
 }
 
@@ -172,6 +193,9 @@ async fn wait_draining(delay: Duration, commands: &mut mpsc::UnboundedReceiver<C
                 Some(Command::Dispatch { reply, .. }) | Some(Command::Request { reply, .. }) => {
                     let _ = reply.send(Err(RpcError::Closed));
                 }
+                Some(Command::Stream { reply, .. }) => {
+                    let _ = reply.send(Err(RpcError::Closed));
+                }
             }
         }
     }
@@ -260,10 +284,13 @@ async fn run_session(
                     });
                 }
                 Some(Command::Request { method, payload, reply }) => {
-                    let session = session.clone();
+                    let response = session.send_request(method, payload);
                     tokio::spawn(async move {
-                        let _ = reply.send(session.request(method, payload).await);
+                        let _ = reply.send(response.await);
                     });
+                }
+                Some(Command::Stream { method, payload, reply }) => {
+                    let _ = reply.send(session.stream(method, payload));
                 }
             },
             reason = session.closed() => break SessionEnd::Closed(reason),

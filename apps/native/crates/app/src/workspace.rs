@@ -19,6 +19,7 @@ use crate::palette::CommandPalette;
 use crate::right_panel::{self, RightPanelView};
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
+use crate::terminal::{self, TerminalDrawer, ToggleTerminal};
 use crate::theme::{hsla, palette};
 use crate::thread_view::ThreadView;
 
@@ -37,7 +38,8 @@ pub struct Workspace {
     palette: Entity<CommandPalette>,
     snooze: Entity<SnoozeDialog>,
     right_panel: Entity<RightPanelView>,
-    _subscription: Subscription,
+    terminal: Entity<TerminalDrawer>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
@@ -52,12 +54,16 @@ impl Workspace {
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(state.clone(), window, cx));
-        let subscription = cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
-            if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
-                cx.notify();
-            }
-        });
-        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, right_panel, _subscription: subscription }
+        let terminal = cx.new(|cx| TerminalDrawer::new(state.clone(), window, cx));
+        let subscriptions = vec![
+            cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
+                    cx.notify();
+                }
+            }),
+            cx.observe(&terminal, |_, _, cx| cx.notify()),
+        ];
+        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, right_panel, terminal, _subscriptions: subscriptions }
     }
 
     fn render_titlebar(&self, cx: &App) -> impl IntoElement {
@@ -84,6 +90,7 @@ impl Workspace {
             .child(new_thread::breadcrumb(&self.state, cx))
             .children(status.map(|status| div().text_xs().text_color(theme.muted_foreground).child(status)))
             .child(new_thread::new_thread_button(cx))
+            .when(state.selected_thread.is_some(), |this| this.child(terminal::header_toggle(&self.terminal, cx)))
             .when(!panel_open, |this| this.child(right_panel::header_controls(&self.state, cx)))
     }
 }
@@ -104,6 +111,7 @@ impl Render for Workspace {
         let panel = state.selected_thread.as_deref().map(|thread| state.panels.panels.panel(thread));
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
         let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
+        let drawer = self.terminal.clone();
         h_flex()
             .relative()
             .size_full()
@@ -141,6 +149,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &JumpToThread9, _, cx| this.jump(8, cx)))
             .bg(theme.background)
             .text_color(theme.foreground)
+            .on_action(move |_: &ToggleTerminal, window, cx| drawer.update(cx, |drawer, cx| drawer.toggle(window, cx)))
             .when(!collapsed, |this| {
                 this.child(
                     div()
@@ -161,8 +170,10 @@ impl Render for Workspace {
                     .min_w_0()
                     .child(self.render_titlebar(cx))
                     .when(has_thread, |this| {
-                        this.child(div().flex_1().min_h_0().child(self.thread.clone()))
+                        // Cached so terminal output repaints do not re-render the transcript.
+                        this.child(div().flex_1().min_h_0().child(self.thread.clone().cached(gpui::StyleRefinement::default().size_full())))
                             .child(self.composer.clone())
+                            .child(self.terminal.clone())
                     })
                     .when(has_draft, |this| this.child(div().flex_1().min_h_0().child(self.draft.clone())))
                     .when(!has_thread && !has_draft, |this| {

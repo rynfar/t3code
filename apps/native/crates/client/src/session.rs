@@ -187,9 +187,17 @@ impl Session {
     }
 
     pub async fn request(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
+        self.send_request(tag, payload).await
+    }
+
+    /// Sends the request now and returns its reply, so requests keep their call order.
+    pub fn send_request(&self, tag: &str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
         let (tx, rx) = oneshot::channel();
-        self.start(tag, payload, Pending::Unary(tx))?;
-        rx.await.unwrap_or(Err(RpcError::Closed))
+        let started = self.start(tag, payload, Pending::Unary(tx));
+        async move {
+            started?;
+            rx.await.unwrap_or(Err(RpcError::Closed))
+        }
     }
 
     pub fn stream(&self, tag: &str, payload: Value) -> Result<StreamHandle, RpcError> {

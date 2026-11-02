@@ -13,6 +13,7 @@ mod palette;
 mod right_panel;
 mod sidebar;
 mod snooze_dialog;
+mod terminal;
 mod theme;
 mod thread_view;
 mod toast;
@@ -53,6 +54,7 @@ fn main() {
         menus::init(state.clone(), cx);
         new_thread::init(state.clone(), cx);
         right_panel::init(state.clone(), cx);
+        terminal::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(
             WindowOptions {

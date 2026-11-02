@@ -14,6 +14,7 @@ pub mod search;
 pub mod server_config;
 pub mod shell;
 pub mod sidebar;
+pub mod terminal;
 pub mod thread;
 pub mod thread_actions;
 pub mod timeline;

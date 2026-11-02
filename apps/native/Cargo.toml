@@ -23,6 +23,7 @@ gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2
 gpui-component = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
 gpui-component-assets = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
 
+alacritty_terminal = { version = "0.26", default-features = false }
 anyhow = "1"
 futures = "0.3"
 mimalloc = { version = "0.1", features = ["v2"] }
