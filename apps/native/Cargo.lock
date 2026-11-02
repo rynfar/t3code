@@ -6573,6 +6573,7 @@ name = "t3-core"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "markdown",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

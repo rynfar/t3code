@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod find;
 mod limit_recovery;
+mod minimap;
 mod rewind;
 mod status;
 
@@ -51,6 +52,7 @@ pub struct ThreadView {
     group_lists: RefCell<HashMap<String, ListState>>,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
+    minimap: minimap::MinimapUi,
     footer: status::ThreadFooter,
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
     fork_support: HashMap<String, bool>,
@@ -114,6 +116,7 @@ impl ThreadView {
             group_lists: RefCell::new(HashMap::new()),
             working_timer: None,
             find: None,
+            minimap: minimap::MinimapUi::default(),
             footer: status::ThreadFooter::default(),
             turn_diffs: HashMap::new(),
             fork_support: HashMap::new(),
@@ -160,6 +163,7 @@ impl ThreadView {
             self.rows.clear();
             self.history = None;
             self.find = None;
+            self.minimap = minimap::MinimapUi::default();
             self.reset_status();
             self.turn_diffs.clear();
             self.turn_diff_source = None;
@@ -236,6 +240,7 @@ impl ThreadView {
         let new_count = next.len() - suffix - prefix;
         self.rows = next;
         self.list.splice(old_range, new_count);
+        self.minimap.set_items(t3_core::timeline::minimap::derive_minimap_items(&self.rows));
         let open: std::collections::HashSet<&str> =
             self.rows.iter().filter(|row| matches!(row.kind, RowKind::Work { expanded_group: true, .. })).map(|row| row.id.as_str()).collect();
         self.group_lists.borrow_mut().retain(|id, _| open.contains(id.as_str()));
@@ -607,6 +612,7 @@ impl Render for ThreadView {
         crate::media::set_scope(scope, cx);
         let find_bar = self.render_find_bar(cx);
         let banners = self.render_banners(cx);
+        let minimap = self.render_minimap(window, cx);
         let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, _window, cx| {
@@ -626,6 +632,6 @@ impl Render for ThreadView {
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(banners).children(find_bar).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+        div().relative().size_full().child(transcript).children(minimap).children(banners).children(find_bar).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }
