@@ -61,10 +61,18 @@ impl AgentRow {
     }
 }
 
+/// A reply describes the environment it was asked on: after a switch to another, it is dropped.
+fn answers_current(asked_on: Option<u64>, now: Option<u64>) -> bool {
+    asked_on.is_some() && asked_on == now
+}
+
 impl WelcomeWizard {
-    /// `serverEnvironment.refreshProviders`; the reply replaces the provider list.
+    /// `serverEnvironment.refreshProviders`; the reply replaces the provider list of the
+    /// environment it came from.
     pub(super) fn refresh_providers(&mut self, cx: &mut Context<Self>) {
-        let task = self.state.read(cx).rpc(SERVER_REFRESH_PROVIDERS, refresh_payload());
+        let app = self.state.read(cx);
+        let asked_on = app.connection_id();
+        let task = app.rpc(SERVER_REFRESH_PROVIDERS, refresh_payload());
         let state = self.state.clone();
         cx.spawn(async move |_, cx| {
             let providers = match task.await {
@@ -75,6 +83,9 @@ impl WelcomeWizard {
                 }
             };
             state.update(cx, |state, cx| {
+                if !answers_current(asked_on, state.connection_id()) {
+                    return;
+                }
                 if providers.is_some_and(|providers| state.server_config.apply_providers(providers)) {
                     cx.emit(AppEvent::ServerConfig);
                 }
@@ -194,5 +205,19 @@ impl WelcomeWizard {
                 ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::answers_current;
+
+    #[test]
+    fn a_provider_reply_after_a_switch_is_dropped() {
+        assert!(answers_current(Some(3), Some(3)));
+        // Asked on A, answered after switching to B or disconnecting.
+        assert!(!answers_current(Some(3), Some(4)));
+        assert!(!answers_current(Some(3), None));
+        assert!(!answers_current(None, None));
     }
 }

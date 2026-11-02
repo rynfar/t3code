@@ -13,8 +13,8 @@ mod connection;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, App, BoxShadow, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, FontWeight, IntoElement, ParentElement, Render,
-    Styled, Subscription, Task, Window, anchored, deferred, div, point, prelude::*, px,
+    AnyElement, App, BoxShadow, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, FontWeight, IntoElement, KeyBinding,
+    ParentElement, Render, Stateful, Styled, Subscription, Task, Window, actions, anchored, deferred, div, point, prelude::*, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -30,13 +30,57 @@ use t3_core::sidebar::time::format_iso;
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::icons::Icon;
-use crate::settings::controls::{Button, ButtonSize, ButtonVariant, r};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant, activates, focus_handle, r};
 use crate::theme::{hsla, palette};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Connection,
     Agents,
+}
+
+actions!(welcome, [FocusNextInWelcome, FocusPreviousInWelcome]);
+
+const CONTEXT: &str = "WelcomeWizard";
+
+/// Tab and Shift+Tab stay inside the wizard, as the web's modal dialog keeps focus.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", FocusNextInWelcome, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", FocusPreviousInWelcome, Some(CONTEXT)),
+    ]);
+}
+
+/// Makes a row a control: a click, or Enter or Space while it has focus, runs `activate`, and Tab
+/// reaches it. Keyboard focus paints a 2px `ring` inside the row (design system §4.2, the outline
+/// that areas without a fill of their own use), so it never covers the row's contents.
+fn key_stop(
+    element: Stateful<gpui::Div>,
+    id: &ElementId,
+    activate: impl Fn(&(), &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<gpui::Div> {
+    let focus = focus_handle(id, window, cx);
+    let ring = focus.is_focused(window) && window.last_input_was_keyboard();
+    let color = hsla(palette(cx).ring);
+    let activate = std::rc::Rc::new(activate);
+    let on_key = activate.clone();
+    element
+        .track_focus(&focus)
+        .cursor_pointer()
+        .when(ring, |this| this.shadow(vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: true }]))
+        .on_click(move |event, window, cx| {
+            if !event.is_keyboard() {
+                activate(&(), window, cx);
+            }
+        })
+        .on_key_down(move |event, window, cx| {
+            if activates(event) {
+                cx.stop_propagation();
+                on_key(&(), window, cx);
+            }
+        })
 }
 
 /// `ONBOARDING_STAGES` up to the import step, which is not ported yet.
@@ -124,6 +168,22 @@ impl WelcomeWizard {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Moves to the next or previous control inside the wizard (the dialog's focus trap).
+    fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Bounded: every control in the window is at most one step each.
+        for _ in 0..512 {
+            if forward {
+                window.focus_next(cx);
+            } else {
+                window.focus_prev(cx);
+            }
+            if self.focus.contains_focused(window, cx) && !self.focus.is_focused(window) {
+                return;
+            }
+        }
+        window.focus(&self.focus, cx);
     }
 
     fn on_app_event(&mut self, event: AppEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -315,7 +375,7 @@ impl WelcomeWizard {
     }
 
     /// `WizardSteps`: done steps take you back; the current and later ones are inert.
-    fn render_steps(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_steps(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let ink = hsla(p.foreground);
@@ -354,8 +414,9 @@ impl WelcomeWizard {
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .map(|this| if done { this.child(Icon::Check.render(px(16.), badge_text)) } else { this.child((index + 1).to_string()) });
-                h_flex()
-                    .id(("welcome-step", index))
+                let id = ElementId::from(("welcome-step", index));
+                let tab = h_flex()
+                    .id(id.clone())
                     .flex_1()
                     .min_w_0()
                     .gap(r(8.))
@@ -369,9 +430,6 @@ impl WelcomeWizard {
                             this.shadow(vec![BoxShadow { color: gpui::black().opacity(0.05), offset: point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: false }])
                         })
                     })
-                    .when(done, |this| {
-                        this.cursor_pointer().hover(move |style| style.bg(hsla(p.card))).on_click(cx.listener(|this, _, _, cx| this.go_to(Step::Connection, cx)))
-                    })
                     .child(badge)
                     .child(
                         div()
@@ -381,7 +439,13 @@ impl WelcomeWizard {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(if here { hsla(p.foreground) } else { hsla(p.muted_foreground) })
                             .child(*label),
-                    )
+                    );
+                if done {
+                    let back = cx.listener(|this, _: &(), _, cx| this.go_to(Step::Connection, cx));
+                    key_stop(tab, &id, back, window, cx).hover(move |style| style.bg(hsla(p.card)))
+                } else {
+                    tab
+                }
             }))
     }
 }
@@ -428,7 +492,7 @@ impl Render for WelcomeWizard {
                     .child(div().font_weight(FontWeight::BOLD).text_color(ink).child("T3"))
                     .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Code")),
             )
-            .child(self.render_steps(cx));
+            .child(self.render_steps(window, cx));
         let panel = div()
             .px(r(24.))
             .py(r(20.))
@@ -439,8 +503,10 @@ impl Render for WelcomeWizard {
             .child(body);
         let dialog = v_flex()
             .id("welcome-wizard")
-            .key_context("WelcomeWizard")
+            .key_context(CONTEXT)
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &FocusNextInWelcome, window, cx| this.cycle_focus(true, window, cx)))
+            .on_action(cx.listener(|this, _: &FocusPreviousInWelcome, window, cx| this.cycle_focus(false, window, cx)))
             .occlude()
             .relative()
             .w_full()
