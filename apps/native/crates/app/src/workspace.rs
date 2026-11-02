@@ -102,7 +102,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let paired = matches!(self.state.read(cx).phase, Phase::Online(_));
         let theme = cx.theme();
         if !paired {
@@ -215,6 +215,7 @@ impl Render for Workspace {
                     None => element,
                 }
             }))
+            .children(crate::settings::overlay(window, cx))
             .into_any_element()
     }
 }

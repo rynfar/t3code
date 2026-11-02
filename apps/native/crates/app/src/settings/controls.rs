@@ -1,0 +1,693 @@
+//! Settings primitives: buttons, switch, select, and the page, section and row layout of
+//! `web/src/components/settings/settingsLayout.tsx` and `SettingsGroup.tsx` (design system §5, §6,
+//! §7.11). Each owns its look; callers set layout only. Sizes are rems, so the modal follows the
+//! interface font size like the web.
+
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use gpui::{
+    AnyElement, App, BoxShadow, ClickEvent, ElementId, FocusHandle, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent,
+    ParentElement, Rems, RenderOnce, SharedString, Styled, Svg, Window, div, point, prelude::*, px, rems,
+    svg,
+};
+use gpui_component::tooltip::Tooltip;
+use gpui_component::{ActiveTheme, h_flex, v_flex};
+
+use crate::icons::Icon;
+use crate::theme::{hsla, palette};
+
+const DISABLED_OPACITY: f32 = 0.64;
+
+gpui::actions!(settings_select, [CloseSelect]);
+
+/// Esc closes an open select before it reaches the modal.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("escape", CloseSelect, Some("SettingsSelect"))]);
+}
+
+type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+type ValueHandler<T> = Rc<dyn Fn(T, &mut Window, &mut App)>;
+
+/// A web pixel length at the 16px root, as rems.
+pub fn r(px: f32) -> Rems {
+    rems(px / 16.)
+}
+
+pub fn icon(glyph: Icon, size: f32, color: Hsla) -> Svg {
+    svg().path(glyph.path()).size(r(size)).flex_none().text_color(color)
+}
+
+fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+}
+
+fn control_shadow() -> Vec<BoxShadow> {
+    vec![BoxShadow { color: gpui::black().opacity(0.05), offset: point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: false }]
+}
+
+/// The 2px focus ring keyboard focus paints around a control.
+fn focus_ring(color: Hsla) -> Vec<BoxShadow> {
+    vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: false }]
+}
+
+fn focus_handle(id: &ElementId, window: &mut Window, cx: &mut App) -> FocusHandle {
+    window.use_keyed_state((id.clone(), "focus"), cx, |_, cx| cx.focus_handle().tab_stop(true)).read(cx).clone()
+}
+
+fn activates(event: &KeyDownEvent) -> bool {
+    matches!(event.keystroke.key.as_str(), "enter" | "space")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonVariant {
+    Ghost,
+    GhostMuted,
+    Outline,
+    DestructiveOutline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonSize {
+    /// 20 square, 12px icon, radius 4.
+    IconMicro,
+    /// 28 square, 16px icon.
+    IconSm,
+    /// 28 tall, 12px text, radius 6.
+    Compact,
+    /// 28 tall, 14px text.
+    Sm,
+}
+
+/// `button.tsx` in the variants and sizes settings use.
+#[derive(IntoElement)]
+pub struct Button {
+    id: ElementId,
+    variant: ButtonVariant,
+    size: ButtonSize,
+    icon: Option<Icon>,
+    label: Option<SharedString>,
+    tooltip: Option<SharedString>,
+    disabled: bool,
+    on_click: Option<ClickHandler>,
+}
+
+impl Button {
+    pub fn new(id: impl Into<ElementId>, variant: ButtonVariant, size: ButtonSize) -> Self {
+        Button { id: id.into(), variant, size, icon: None, label: None, tooltip: None, disabled: false, on_click: None }
+    }
+
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_click = Some(Rc::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for Button {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let dark = cx.theme().is_dark();
+        let (height, pad, radius, icon_size, square) = match self.size {
+            ButtonSize::IconMicro => (20., 0., 4., 12., true),
+            ButtonSize::IconSm => (28., 0., 8., 16., true),
+            ButtonSize::Compact => (28., 7., 6., 14., false),
+            ButtonSize::Sm => (28., 9., 8., 16., false),
+        };
+        let transparent = gpui::transparent_black();
+        let (fill, border, text, icon_color, hover_fill, hover_text) = match self.variant {
+            ButtonVariant::Ghost => (transparent, transparent, hsla(p.foreground), hsla(p.muted_foreground), hsla(p.accent), hsla(p.foreground)),
+            ButtonVariant::GhostMuted => {
+                (transparent, transparent, hsla(p.muted_foreground), hsla(p.muted_foreground), hsla(p.accent), hsla(p.foreground))
+            }
+            ButtonVariant::Outline | ButtonVariant::DestructiveOutline => {
+                let fill = if dark { hsla(p.input).opacity(0.32) } else { hsla(p.popover) };
+                let destructive = self.variant == ButtonVariant::DestructiveOutline;
+                let hover = match (destructive, dark) {
+                    (true, _) => hsla(p.destructive).opacity(0.04),
+                    (false, true) => hsla(p.input).opacity(0.64),
+                    (false, false) => hsla(p.accent).opacity(0.5),
+                };
+                let text = if destructive { hsla(p.destructive_foreground) } else { hsla(p.foreground) };
+                let icon = if destructive { text } else { hsla(p.muted_foreground) };
+                (fill, hsla(p.input), text, icon, hover, text)
+            }
+        };
+        let outlined = matches!(self.variant, ButtonVariant::Outline | ButtonVariant::DestructiveOutline);
+        let compact_text = self.size == ButtonSize::Compact;
+        h_flex()
+            .id(self.id)
+            .flex_none()
+            .h(r(height))
+            .when(square, |this| this.w(r(height)).justify_center())
+            .px(r(pad))
+            .gap(r(if compact_text { 4. } else { 6. }))
+            .rounded(r(radius))
+            .border_1()
+            .border_color(border)
+            .bg(fill)
+            .text_color(text)
+            .font_weight(FontWeight::MEDIUM)
+            .map(|this| if compact_text { this.text_xs() } else { this.text_sm() })
+            .when(outlined, |this| this.shadow(control_shadow()))
+            .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
+            .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.bg(hover_fill).text_color(hover_text)))
+            .children(self.icon.map(|glyph| icon(glyph, icon_size, icon_color)))
+            .children(self.label.map(|label| div().truncate().child(label)))
+            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
+            .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
+                this.on_click(move |event, window, cx| {
+                    cx.stop_propagation();
+                    handler(event, window, cx)
+                })
+            })
+    }
+}
+
+/// `switch.tsx`: an 18×30 track with a 14px thumb that travels 12px. Snaps; no frame loop.
+#[derive(IntoElement)]
+pub struct Switch {
+    id: ElementId,
+    checked: bool,
+    on_change: Option<ValueHandler<bool>>,
+}
+
+impl Switch {
+    pub fn new(id: impl Into<ElementId>, checked: bool) -> Self {
+        Switch { id: id.into(), checked, on_change: None }
+    }
+
+    pub fn on_change(mut self, handler: impl Fn(bool, &mut Window, &mut App) + 'static) -> Self {
+        self.on_change = Some(Rc::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for Switch {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let dark = cx.theme().is_dark();
+        let focus = focus_handle(&self.id, window, cx);
+        let focused = focus.is_focused(window);
+        let thumb = if dark && !self.checked { hsla(p.muted_foreground) } else { hsla(p.background) };
+        let next = !self.checked;
+        let handler = self.on_change;
+        h_flex()
+            .id(self.id)
+            .track_focus(&focus)
+            .flex_none()
+            .w(r(30.))
+            .h(r(18.))
+            .p(r(2.))
+            .rounded_full()
+            .bg(if self.checked { hsla(p.primary) } else { hsla(p.input) })
+            .when(focused, |this| this.shadow(focus_ring(hsla(p.ring))))
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(r(14.))
+                    .rounded_full()
+                    .bg(thumb)
+                    .when(self.checked, |this| this.ml(r(12.)))
+                    .shadow(vec![BoxShadow {
+                        color: gpui::black().opacity(0.05),
+                        offset: point(px(0.), px(1.)),
+                        blur_radius: px(3.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }]),
+            )
+            .when_some(handler, |this, handler| {
+                let on_key = handler.clone();
+                this.on_click(move |_, window, cx| handler(next, window, cx)).on_key_down(move |event, window, cx| {
+                    if activates(event) {
+                        cx.stop_propagation();
+                        on_key(next, window, cx);
+                    }
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectOption {
+    pub value: SharedString,
+    pub label: SharedString,
+    pub description: Option<SharedString>,
+    /// A group heading shown above the first option of each group.
+    pub group: Option<SharedString>,
+    pub icon: Option<Icon>,
+}
+
+impl SelectOption {
+    pub fn new(value: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+        SelectOption { value: value.into(), label: label.into(), description: None, group: None, icon: None }
+    }
+
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn group(mut self, group: impl Into<SharedString>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+}
+
+#[derive(Default)]
+struct SelectState {
+    open: bool,
+    highlighted: Option<usize>,
+    closed_at: Option<Instant>,
+}
+
+/// `select.tsx`: an input-box trigger with a 14px chevron, and a popup list below it aligned to
+/// its end. Keyboard: Enter or Space opens, arrows move, Enter picks, Escape closes.
+#[derive(IntoElement)]
+pub struct Select {
+    id: ElementId,
+    options: Vec<SelectOption>,
+    selected: Option<SharedString>,
+    label: Option<SharedString>,
+    width: Option<f32>,
+    popup_width: f32,
+    show_check: bool,
+    on_change: Option<ValueHandler<SharedString>>,
+}
+
+impl Select {
+    pub fn new(id: impl Into<ElementId>, options: Vec<SelectOption>) -> Self {
+        Select {
+            id: id.into(),
+            options,
+            selected: None,
+            label: None,
+            width: None,
+            popup_width: 160.,
+            show_check: false,
+            on_change: None,
+        }
+    }
+
+    pub fn selected(mut self, value: impl Into<SharedString>) -> Self {
+        self.selected = Some(value.into());
+        self
+    }
+
+    /// What the trigger says when it is not the selected option's label ("Mixed", "None").
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = Some(width);
+        self.popup_width = self.popup_width.max(width);
+        self
+    }
+
+    pub fn popup_width(mut self, width: f32) -> Self {
+        self.popup_width = width;
+        self
+    }
+
+    /// Shows a check beside the selected option (the web's default indicator).
+    pub fn show_check(mut self) -> Self {
+        self.show_check = true;
+        self
+    }
+
+    pub fn on_change(mut self, handler: impl Fn(SharedString, &mut Window, &mut App) + 'static) -> Self {
+        self.on_change = Some(Rc::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for Select {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let dark = cx.theme().is_dark();
+        let focus = focus_handle(&self.id, window, cx);
+        let focused = focus.is_focused(window);
+        let state = window.use_keyed_state((self.id.clone(), "state"), cx, |_, _| SelectState::default());
+        let (open, highlighted) = {
+            let state = state.read(cx);
+            (state.open, state.highlighted)
+        };
+        let selected_index = self.options.iter().position(|option| Some(&option.value) == self.selected.as_ref());
+        let trigger_label = self
+            .label
+            .clone()
+            .or_else(|| selected_index.map(|index| self.options[index].label.clone()))
+            .unwrap_or_default();
+        let trigger_icon = selected_index.and_then(|index| self.options[index].icon);
+        let options = Rc::new(self.options);
+        let on_change = self.on_change;
+
+        let pick = {
+            let (state, options, on_change) = (state.clone(), options.clone(), on_change.clone());
+            Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                state.update(cx, |state, cx| {
+                    state.open = false;
+                    cx.notify();
+                });
+                if let (Some(option), Some(handler)) = (options.get(index), on_change.as_ref()) {
+                    handler(option.value.clone(), window, cx);
+                }
+            })
+        };
+        let toggle = {
+            let state = state.clone();
+            move |cx: &mut App| {
+                state.update(cx, |state, cx| {
+                    if state.closed_at.is_some_and(|at| at.elapsed() < Duration::from_millis(250)) {
+                        state.closed_at = None;
+                        return;
+                    }
+                    state.open = !state.open;
+                    state.highlighted = selected_index.or(Some(0));
+                    cx.notify();
+                });
+            }
+        };
+        let on_key = {
+            let (state, options, pick) = (state.clone(), options.clone(), pick.clone());
+            move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
+                let count = options.len();
+                let (open, highlighted) = {
+                    let state = state.read(cx);
+                    (state.open, state.highlighted)
+                };
+                match event.keystroke.key.as_str() {
+                    "enter" | "space" if open => {
+                        cx.stop_propagation();
+                        if let Some(index) = highlighted {
+                            pick(index, window, cx);
+                        }
+                    }
+                    "enter" | "space" | "down" | "up" if !open => {
+                        cx.stop_propagation();
+                        state.update(cx, |state, cx| {
+                            state.open = true;
+                            state.highlighted = selected_index.or(Some(0));
+                            cx.notify();
+                        });
+                    }
+                    "down" | "up" if count > 0 => {
+                        cx.stop_propagation();
+                        let step = if event.keystroke.key == "down" { 1 } else { count - 1 };
+                        state.update(cx, |state, cx| {
+                            state.highlighted = Some(state.highlighted.map_or(0, |index| (index + step) % count));
+                            cx.notify();
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        let trigger = h_flex()
+            .id(self.id.clone())
+            .track_focus(&focus)
+            .min_h(r(28.))
+            .when_some(self.width, |this, width| this.w(r(width)))
+            .px(r(9.))
+            .gap(r(8.))
+            .rounded(r(8.))
+            .border_1()
+            .border_color(if focused || open { hsla(p.ring) } else { hsla(p.input) })
+            .bg(if dark { hsla(p.input).opacity(0.32) } else { hsla(p.background) })
+            .shadow(if focused { focus_ring(hsla(p.ring).opacity(0.24)) } else { control_shadow() })
+            .text_sm()
+            .text_color(hsla(p.foreground))
+            .cursor_pointer()
+            .key_context("SettingsSelect")
+            .on_action({
+                let state = state.clone();
+                move |_: &CloseSelect, _, cx| {
+                    if state.read(cx).open {
+                        state.update(cx, |state, cx| {
+                            state.open = false;
+                            cx.notify();
+                        });
+                    } else {
+                        cx.propagate();
+                    }
+                }
+            })
+            .on_click(move |_, _, cx| toggle(cx))
+            .on_key_down(on_key)
+            .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
+            .child(div().flex_1().min_w_0().truncate().child(trigger_label))
+            .child(icon(Icon::ChevronDown, 14., hsla(p.foreground).opacity(0.7)));
+
+        let popup = open.then(|| {
+            let close_state = state.clone();
+            let mut list = v_flex().gap(px(0.));
+            let mut previous_group: Option<SharedString> = None;
+            for (index, option) in options.iter().enumerate() {
+                if option.group.is_some() && option.group != previous_group {
+                    previous_group = option.group.clone();
+                    list = list.child(
+                        div()
+                            .px(r(8.))
+                            .pt(r(index.min(1) as f32 * 6.))
+                            .pb(r(4.))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.muted_foreground))
+                            .children(option.group.clone()),
+                    );
+                }
+                let is_selected = selected_index == Some(index);
+                let is_highlighted = highlighted == Some(index);
+                let pick = pick.clone();
+                let hover_state = state.clone();
+                list = list.child(
+                    h_flex()
+                        .id(("option", index))
+                        .min_h(r(28.))
+                        .px(r(8.))
+                        .py(r(4.))
+                        .gap(r(8.))
+                        .rounded(r(4.))
+                        .text_sm()
+                        .cursor_pointer()
+                        .text_color(hsla(p.foreground))
+                        .when(is_selected, |this| this.bg(hsla(p.foreground).opacity(0.08)))
+                        .when(is_highlighted, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                        .on_mouse_move(move |_, _, cx| {
+                            hover_state.update(cx, |state, cx| {
+                                if state.highlighted != Some(index) {
+                                    state.highlighted = Some(index);
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .on_click(move |_, window, cx| pick(index, window, cx))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(r(2.))
+                                .child(
+                                    h_flex()
+                                        .gap(r(6.))
+                                        .when(option.description.is_some(), |this| this.font_weight(FontWeight::MEDIUM))
+                                        .children(option.icon.map(|glyph| icon(glyph, 14., hsla(p.muted_foreground))))
+                                        .child(div().truncate().child(option.label.clone())),
+                                )
+                                .children(option.description.clone().map(|description| {
+                                    div().text_xs().line_height(r(16.)).text_color(hsla(p.muted_foreground)).child(description)
+                                })),
+                        )
+                        .when(self.show_check, |this| {
+                            this.child(div().size(r(16.)).flex_none().children(is_selected.then(|| icon(Icon::Check, 16., hsla(p.foreground)))))
+                        }),
+                );
+            }
+            div().absolute().bottom_0().right_0().child(
+                gpui::deferred(
+                    gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
+                        div()
+                            .id((self.id.clone(), "popup"))
+                            .occlude()
+                            .mt(r(4.))
+                            .min_w(r(self.popup_width))
+                            .max_h(r(320.))
+                            .overflow_y_scroll()
+                            .p(r(4.))
+                            .rounded(r(8.))
+                            .border_1()
+                            .border_color(hsla(p.dropdown_border))
+                            .bg(hsla(p.popover))
+                            .shadow(vec![BoxShadow {
+                                color: gpui::black().opacity(if dark { 0.8 } else { 0.55 }),
+                                offset: point(px(0.), px(if dark { 18. } else { 16. })),
+                                blur_radius: px(if dark { 44. } else { 40. }),
+                                spread_radius: px(-18.),
+                                inset: false,
+                            }])
+                            .on_mouse_down_out(move |_, _, cx| {
+                                close_state.update(cx, |state, cx| {
+                                    state.open = false;
+                                    state.closed_at = Some(Instant::now());
+                                    cx.notify();
+                                });
+                            })
+                            .child(list),
+                    ),
+                )
+                .with_priority(2),
+            )
+        });
+
+        div().relative().flex_none().child(trigger).children(popup)
+    }
+}
+
+/// `SettingsSection` (grouped): a 16px semibold title above a bordered group whose rows divide.
+pub fn section(title: impl Into<SharedString>, rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
+    v_flex().gap(r(10.)).child(section_title(title)).child(group(rows, cx))
+}
+
+pub fn section_title(title: impl Into<SharedString>) -> gpui::Div {
+    h_flex().min_h(r(28.)).px(r(16.)).text_base().font_weight(FontWeight::SEMIBOLD).child(title.into())
+}
+
+/// `SettingsGroup`: radius 12, `border` at 60%, `card` at 40%, rows divided by `border` at 50%.
+pub fn group(rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    let divider = hsla(p.border).opacity(0.5);
+    let count = rows.len();
+    v_flex()
+        .rounded(r(12.))
+        .border_1()
+        .border_color(hsla(p.border).opacity(0.6))
+        .bg(hsla(p.card).opacity(0.4))
+        .shadow(control_shadow())
+        .children(rows.into_iter().enumerate().map(move |(index, row)| {
+            div().when(index > 0 && index < count, |this| this.border_t_1().border_color(divider)).child(row)
+        }))
+}
+
+/// `SettingsRow`: title, optional reset and description on the left; the control on the
+/// right; optional content below.
+#[derive(IntoElement)]
+pub struct Row {
+    id: SharedString,
+    title: SharedString,
+    description: Option<SharedString>,
+    control: Option<AnyElement>,
+    reset: Option<ClickHandler>,
+    below: Option<AnyElement>,
+    highlighted: bool,
+}
+
+impl Row {
+    pub fn new(id: impl Into<SharedString>, title: impl Into<SharedString>) -> Self {
+        Row { id: id.into(), title: title.into(), description: None, control: None, reset: None, below: None, highlighted: false }
+    }
+
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn control(mut self, control: impl IntoElement) -> Self {
+        self.control = Some(control.into_any_element());
+        self
+    }
+
+    /// `SettingResetButton`, shown while the value differs from its default.
+    pub fn reset(mut self, visible: bool, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        if visible {
+            self.reset = Some(Rc::new(handler));
+        }
+        self
+    }
+
+    pub fn below(mut self, content: impl IntoElement) -> Self {
+        self.below = Some(content.into_any_element());
+        self
+    }
+
+    /// A settings-search jump landed here.
+    pub fn highlighted(mut self, highlighted: bool) -> Self {
+        self.highlighted = highlighted;
+        self
+    }
+}
+
+impl RenderOnce for Row {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let has_below = self.below.is_some();
+        let reset = self.reset.map(|handler| {
+            Button::new(ElementId::Name(format!("{}-reset", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                .icon(Icon::Undo2)
+                .tooltip("Reset to default")
+                .on_click(move |event, window, cx| handler(event, window, cx))
+        });
+        v_flex()
+            .id(ElementId::Name(self.id.clone()))
+            .px(r(16.))
+            .pt(r(12.))
+            .pb(r(if has_below { 4. } else { 12. }))
+            .rounded(r(12.))
+            .when(self.highlighted, |this| this.bg(hsla(p.accent).opacity(0.6)))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(r(32.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(r(4.))
+                            .child(
+                                h_flex()
+                                    .min_h(r(20.))
+                                    .gap(r(6.))
+                                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.title))
+                                    .child(div().size(r(20.)).flex().items_center().justify_center().children(reset)),
+                            )
+                            .children(self.description.map(|description| {
+                                div().max_w(r(672.)).text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description)
+                            })),
+                    )
+                    .children(self.control.map(|control| h_flex().flex_none().max_w(r(420.)).justify_end().gap(r(8.)).child(control))),
+            )
+            .children(self.below)
+    }
+}
+
+/// A row's muted plain-text stand-in for a control ("No providers available").
+pub fn muted_text(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
+    div().text_sm().text_color(hsla(palette(cx).muted_foreground)).child(text.into())
+}

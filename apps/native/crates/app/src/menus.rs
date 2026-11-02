@@ -6,6 +6,7 @@ use gpui_component::input::{Copy, Cut, Delete, Paste, Redo, SelectAll, Undo};
 
 use crate::app_state::AppState;
 use crate::keymap::{ToggleCommandPalette, ToggleSidebar};
+use crate::settings::OpenSettings;
 
 actions!(t3, [Quit, Disconnect, Hide, HideOthers, ShowAll, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
 
@@ -34,6 +35,8 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     ]);
     cx.set_menus([
         Menu::new("T3 Code").items([
+            MenuItem::action("Settings...", OpenSettings),
+            MenuItem::separator(),
             MenuItem::action("Disconnect from Server", Disconnect),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),

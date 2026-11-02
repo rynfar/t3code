@@ -1,17 +1,19 @@
 //! One theme source. T3's palette (generated into `tokens.rs` from the web theme) is written into
 //! gpui-component's `Theme` as light and dark configs, so primitives and app views read the same
 //! values. Tokens gpui-component has no slot for (pills, message surface, sidebar rows…) are read
-//! through `palette(cx)`.
+//! through `palette(cx)`. The theme, appearance mode, interface size and chat width follow the
+//! client settings (`web/src/hooks/useTheme.ts`, `appearanceFonts.ts`), and switch atomically.
 
 mod tokens;
 
 use std::rc::Rc;
 
-use gpui::{App, Global, Hsla, Window, WindowAppearance};
+use gpui::{App, Global, Hsla, Window, WindowAppearance, px};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
 use serde_json::json;
+use t3_core::client_settings::{AppearanceMode, ChatWidth, ThemePreference};
 
-pub use tokens::{Palette, metrics};
+pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
 
 /// The web's `text-white` on solid destructive buttons (design-system §6.1); not a theme role.
 pub const WHITE: u32 = 0xffff_ffff;
@@ -19,6 +21,33 @@ pub const WHITE: u32 = 0xffff_ffff;
 struct ActivePalette(&'static Palette);
 
 impl Global for ActivePalette {}
+
+/// What the theme follows: the stored preferences plus the OS appearance the window reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preferences {
+    pub theme: ThemePreference,
+    pub mode: AppearanceMode,
+    pub interface_font_size: f32,
+    pub chat_width: ChatWidth,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Preferences {
+            theme: ThemePreference::Default(AppearanceMode::System),
+            mode: AppearanceMode::System,
+            interface_font_size: metrics::ROOT_FONT_SIZE,
+            chat_width: ChatWidth::Comfortable,
+        }
+    }
+}
+
+struct ThemeState {
+    preferences: Preferences,
+    system_dark: bool,
+}
+
+impl Global for ThemeState {}
 
 pub fn palette(cx: &App) -> &'static Palette {
     cx.global::<ActivePalette>().0
@@ -29,7 +58,34 @@ pub fn hsla(color: u32) -> Hsla {
 }
 
 pub fn init(cx: &mut App) {
-    install(false, cx);
+    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false });
+    install(cx);
+}
+
+pub fn preferences(cx: &App) -> &Preferences {
+    &cx.global::<ThemeState>().preferences
+}
+
+/// Applies new preferences to every window at once; no transition runs (design system §9).
+pub fn set_preferences(preferences: Preferences, cx: &mut App) {
+    let state = cx.global_mut::<ThemeState>();
+    if state.preferences == preferences {
+        return;
+    }
+    state.preferences = preferences;
+    install(cx);
+    let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
+    Theme::change(mode, None, cx);
+    cx.refresh_windows();
+}
+
+/// The transcript and composer lane: 736 comfortable, 1152 wide, `None` for full width.
+pub fn chat_max_width(cx: &App) -> Option<f32> {
+    match preferences(cx).chat_width {
+        ChatWidth::Comfortable => Some(metrics::CHAT_CONTENT_MAX_WIDTH),
+        ChatWidth::Wide => Some(metrics::CHAT_CONTENT_MAX_WIDTH_WIDE),
+        ChatWidth::Full => None,
+    }
 }
 
 pub fn follow_system_appearance(window: &mut Window, cx: &mut App) {
@@ -40,23 +96,53 @@ pub fn follow_system_appearance(window: &mut Window, cx: &mut App) {
 }
 
 fn apply(appearance: WindowAppearance, window: &mut Window, cx: &mut App) {
-    let dark = matches!(appearance, WindowAppearance::Dark | WindowAppearance::VibrantDark);
-    install(dark, cx);
-    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, Some(window), cx);
+    cx.global_mut::<ThemeState>().system_dark = matches!(appearance, WindowAppearance::Dark | WindowAppearance::VibrantDark);
+    install(cx);
+    let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
+    Theme::change(mode, Some(window), cx);
 }
 
-fn install(dark: bool, cx: &mut App) {
-    cx.set_global(ActivePalette(if dark { &tokens::DARK } else { &tokens::LIGHT }));
+fn is_dark(cx: &App) -> bool {
+    let state = cx.global::<ThemeState>();
+    match state.preferences.mode {
+        AppearanceMode::System => state.system_dark,
+        AppearanceMode::Light => false,
+        AppearanceMode::Dark => true,
+    }
+}
+
+/// The light and dark halves of the chosen theme: a built-in named theme, else T3 Code.
+fn halves(theme: &ThemePreference) -> (&'static Palette, &'static Palette) {
+    let named = theme.named_id().and_then(|id| BUILT_IN_THEMES.iter().find(|candidate| candidate.id == id));
+    let light = named.and_then(|named| named.light.as_ref()).unwrap_or(&tokens::LIGHT);
+    let dark = named.and_then(|named| named.dark.as_ref()).unwrap_or(&tokens::DARK);
+    (light, dark)
+}
+
+fn install(cx: &mut App) {
+    let dark = is_dark(cx);
+    let preferences = preferences(cx).clone();
+    let (light_palette, dark_palette) = halves(&preferences.theme);
+    cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }));
+    let size = preferences.interface_font_size;
     let theme = Theme::global_mut(cx);
-    theme.light_theme = Rc::new(config("T3 Code Light", &tokens::LIGHT, false));
-    theme.dark_theme = Rc::new(config("T3 Code Dark", &tokens::DARK, true));
+    theme.light_theme = Rc::new(config("T3 Code Light", light_palette, false, size));
+    theme.dark_theme = Rc::new(config("T3 Code Dark", dark_palette, true, size));
+    theme.font_size = px(size);
+}
+
+/// A theme's swatch colors for the theme cards: (background, card, primary, foreground).
+pub fn swatch(theme: &ThemePreference, dark: bool) -> [u32; 4] {
+    let (light, dark_palette) = halves(theme);
+    let p = if dark { dark_palette } else { light };
+    [p.background, p.card, p.primary, p.foreground]
 }
 
 fn hex(color: u32) -> String {
     format!("#{color:08x}")
 }
 
-fn config(name: &str, p: &Palette, dark: bool) -> ThemeConfig {
+fn config(name: &str, p: &Palette, dark: bool, font_size: f32) -> ThemeConfig {
     let colors: serde_json::Map<String, serde_json::Value> = [
         ("background", hex(p.background)),
         ("foreground", hex(p.foreground)),
@@ -114,7 +200,7 @@ fn config(name: &str, p: &Palette, dark: bool) -> ThemeConfig {
         "name": name,
         "mode": if dark { "dark" } else { "light" },
         "font.family": ".SystemUIFont",
-        "font.size": metrics::ROOT_FONT_SIZE,
+        "font.size": font_size,
         "mono_font.family": "SF Mono",
         "mono_font.size": metrics::DEFAULT_CODE_FONT_SIZE,
         "radius": metrics::CONTROL_RADIUS as usize,
