@@ -1,18 +1,20 @@
 //! Keeps one environment connected: mints a ticket, opens a session, subscribes the shell and
 //! every open thread, and on disconnect reconnects with backoff, resuming each stream from the
-//! last sequence it saw. Frames are decoded here, off the UI thread.
+//! last sequence it saw. Each connection also fetches the device's grants
+//! (`client-runtime/src/state/session.ts`). Frames are decoded here, off the UI thread.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+use t3_core::auth::AuthSessionState;
 use t3_core::commands::{self, ShellOptions, method};
 use t3_core::server_config::ServerConfigStreamEvent;
 use t3_core::shell::ShellStreamItem;
 use t3_core::history::HistoryPage;
 use t3_core::thread::{ThreadStreamItem, decode_thread_stream_item};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, AuthError, Credentials};
@@ -38,7 +40,7 @@ pub enum ClientEvent {
 enum Command {
     OpenThread(String),
     CloseThread(String),
-    Dispatch { command: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
+    RefreshSessionState,
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
     Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>> },
 }
@@ -47,6 +49,7 @@ enum Command {
 pub struct ClientHandle {
     commands: mpsc::UnboundedSender<Command>,
     credentials: Arc<Credentials>,
+    session_state: watch::Receiver<Option<AuthSessionState>>,
 }
 
 impl ClientHandle {
@@ -63,11 +66,21 @@ impl ClientHandle {
         let _ = self.commands.send(Command::CloseThread(thread_id.to_owned()));
     }
 
+    /// This device's grants, `None` until the first fetch answers. The last answer stays while
+    /// reconnecting; every connection fetches anew.
+    pub fn session_state(&self) -> watch::Receiver<Option<AuthSessionState>> {
+        self.session_state.clone()
+    }
+
+    /// Fetches the grants again on the live connection, unless a fetch is already running.
+    pub fn refresh_session_state(&self) {
+        let _ = self.commands.send(Command::RefreshSessionState);
+    }
+
     /// Sends an orchestration command. Resolves with the committed sequence or the server's error.
-    pub async fn dispatch(&self, command: Value) -> Result<Value, RpcError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands.send(Command::Dispatch { command, reply }).map_err(|_| RpcError::Closed)?;
-        rx.await.unwrap_or(Err(RpcError::Closed))
+    /// Queued before this returns, in order with `request` and `stream`.
+    pub fn dispatch(&self, command: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
+        self.request(method::DISPATCH_COMMAND, command)
     }
 
     /// Fetches and decodes one page of earlier history over HTTP. Run it on the network runtime.
@@ -117,14 +130,18 @@ impl ClientHandle {
 /// Bounded so a stalled UI pushes back through acks to the server instead of buffering forever.
 const EVENT_QUEUE: usize = 1024;
 const THREAD_RETRY: Duration = Duration::from_secs(2);
+/// `SESSION_STATE_RETRY_BASE_MS` and `SESSION_STATE_RETRY_MAX_MS`.
+const SESSION_STATE_RETRY: Duration = Duration::from_secs(2);
+const SESSION_STATE_RETRY_MAX: Duration = Duration::from_secs(60);
 
 type Events = mpsc::Sender<ClientEvent>;
 
 pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
-    let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()) };
-    runtime.spawn(supervise(credentials, command_rx, events));
+    let (grants, session_state) = watch::channel(None);
+    let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()), session_state };
+    runtime.spawn(supervise(credentials, command_rx, events, grants));
     (handle, event_rx)
 }
 
@@ -137,6 +154,7 @@ async fn supervise(
     credentials: Credentials,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: Events,
+    grants: watch::Sender<Option<AuthSessionState>>,
 ) {
     let mut resume = Resume { shell: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
@@ -150,7 +168,11 @@ async fn supervise(
             Ok(session) => {
                 attempt = 0;
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
-                match run_session(&session, &mut resume, &mut commands, &events).await {
+                let mut fetch = SessionStateFetch { credentials: &credentials, grants: &grants, task: None };
+                fetch.start();
+                let end = run_session(&session, &mut resume, &mut commands, &events, &mut fetch).await;
+                fetch.stop();
+                match end {
                     SessionEnd::Closed(reason) => reason,
                     SessionEnd::Dropped => return,
                 }
@@ -200,7 +222,8 @@ async fn wait_draining(delay: Duration, commands: &mut mpsc::UnboundedReceiver<C
                 None => return false,
                 Some(Command::OpenThread(id)) => { resume.threads.entry(id).or_insert(None); }
                 Some(Command::CloseThread(id)) => { resume.threads.remove(&id); }
-                Some(Command::Dispatch { reply, .. }) | Some(Command::Request { reply, .. }) => {
+                Some(Command::RefreshSessionState) => {}
+                Some(Command::Request { reply, .. }) => {
                     let _ = reply.send(Err(RpcError::Closed));
                 }
                 Some(Command::Stream { reply, .. }) => {
@@ -223,6 +246,7 @@ async fn run_session(
     resume: &mut Resume,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     events: &Events,
+    fetch: &mut SessionStateFetch<'_>,
 ) -> SessionEnd {
     let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, commands::subscribe_server_config()).ok();
     let options = initial_shell_options(&mut server_config, events).await;
@@ -288,12 +312,7 @@ async fn run_session(
                     resume.threads.remove(&thread_id);
                     if let Some(task) = forwarders.remove(&thread_id) { task.abort(); }
                 }
-                Some(Command::Dispatch { command, reply }) => {
-                    let session = session.clone();
-                    tokio::spawn(async move {
-                        let _ = reply.send(session.request(method::DISPATCH_COMMAND, command).await);
-                    });
-                }
+                Some(Command::RefreshSessionState) => fetch.start(),
                 Some(Command::Request { method, payload, reply }) => {
                     let response = session.send_request(method, payload);
                     tokio::spawn(async move {
@@ -346,6 +365,47 @@ async fn initial_shell_options(stream: &mut Option<StreamHandle>, events: &Event
         }
     };
     tokio::time::timeout(CONFIG_WAIT, wait).await.unwrap_or_default()
+}
+
+/// The grants fetch of one connection. Failures retry with backoff while the connection lasts,
+/// so a fetch that failed mid-reconnect cannot outlive the socket that recovered.
+struct SessionStateFetch<'a> {
+    credentials: &'a Credentials,
+    grants: &'a watch::Sender<Option<AuthSessionState>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl SessionStateFetch<'_> {
+    fn start(&mut self) {
+        if self.task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let (credentials, grants) = (self.credentials.clone(), self.grants.clone());
+        self.task = Some(tokio::spawn(async move {
+            let mut delay = SESSION_STATE_RETRY;
+            loop {
+                match auth::fetch_session_state(&credentials).await {
+                    Ok(state) => {
+                        grants.send_if_modified(|current| {
+                            let changed = current.as_ref() != Some(&state);
+                            *current = Some(state);
+                            changed
+                        });
+                        return;
+                    }
+                    Err(error) => tracing::warn!(%error, "session state fetch failed"),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(SESSION_STATE_RETRY_MAX);
+            }
+        }));
+    }
+
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 async fn next_config(stream: &mut Option<StreamHandle>) -> Option<Result<Value, RpcError>> {

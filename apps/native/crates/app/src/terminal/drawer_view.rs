@@ -1,6 +1,7 @@
 //! The drawer's look, from `ThreadTerminalDrawer.tsx` (drawer mode): a 6px resize strip on the
 //! top edge, the active group's panes side by side or stacked, and either a floating action
 //! group (one terminal) or the 144px session list (several). Metrics are design-system §5.
+//! Without `terminal:operate` every action is disabled and rows lose their close button.
 
 use gpui::{
     AnyElement, App, Context, DragMoveEvent, EmptyView, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -8,7 +9,7 @@ use gpui::{
 };
 use gpui_component::button::Button;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Sizable, h_flex, v_flex};
+use gpui_component::{Disableable, Sizable, h_flex, v_flex};
 use t3_core::terminal::{self, MAX_TERMINALS_PER_GROUP, SplitDirection, TerminalGroup, ThreadTerminalLayout};
 
 use super::drawer::TerminalDrawer;
@@ -61,13 +62,13 @@ impl Action {
             Action::New => "New Terminal",
             Action::Close => "Close Terminal",
         };
-        if self.disabled(at_limit) {
+        if self.at_limit(at_limit) {
             return format!("{name} (max {MAX_TERMINALS_PER_GROUP} per group)");
         }
         with_shortcut(name, self.command(), cx)
     }
 
-    fn disabled(self, at_limit: bool) -> bool {
+    fn at_limit(self, at_limit: bool) -> bool {
         at_limit && matches!(self, Action::SplitHorizontal | Action::SplitVertical)
     }
 }
@@ -85,7 +86,7 @@ impl TerminalDrawer {
     fn action_button(&self, action: Action, at_limit: bool, hover: Hsla, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = palette(cx);
         let label = SharedString::from(action.label(at_limit, cx));
-        let disabled = action.disabled(at_limit);
+        let disabled = !self.can_operate() || action.at_limit(at_limit);
         div()
             .id(SharedString::from(format!("terminal-action-{}", action as u8)))
             .h_full()
@@ -209,27 +210,28 @@ impl TerminalDrawer {
         let text = if active { hsla(p.foreground) } else { hsla(p.muted_foreground) };
         let group_name = SharedString::from(format!("terminal-row-{terminal_id}"));
         let (close_target, activate_target) = (terminal_id.to_owned(), terminal_id.to_owned());
-        let close = div()
-            .id(SharedString::from(format!("terminal-close-{terminal_id}")))
-            .relative()
-            .size(px(16.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(4.))
-            .cursor_pointer()
-            .hover(|style| style.bg(hsla(p.muted)))
-            .tooltip(move |window, cx| Tooltip::new(close_label.clone()).build(window, cx))
-            .on_click(cx.listener(move |drawer, _, window, cx| drawer.request_close(&close_target, window, cx)))
-            .child(div().group_hover(group_name.clone(), |style| style.invisible()).child(Icon::SquareTerminal.render(px(12.), text)))
-            .child(
-                div()
-                    .absolute()
-                    .invisible()
-                    .group_hover(group_name.clone(), |style| style.visible())
-                    .child(Icon::X.render(px(12.), text)),
-            );
+        let icon = div().size(px(16.)).flex_none().flex().items_center().justify_center();
+        let close = if !self.can_operate() {
+            icon.child(Icon::SquareTerminal.render(px(12.), text)).into_any_element()
+        } else {
+            icon
+                .id(SharedString::from(format!("terminal-close-{terminal_id}")))
+                .relative()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|style| style.bg(hsla(p.muted)))
+                .tooltip(move |window, cx| Tooltip::new(close_label.clone()).build(window, cx))
+                .on_click(cx.listener(move |drawer, _, window, cx| drawer.request_close(&close_target, window, cx)))
+                .child(div().group_hover(group_name.clone(), |style| style.invisible()).child(Icon::SquareTerminal.render(px(12.), text)))
+                .child(
+                    div()
+                        .absolute()
+                        .invisible()
+                        .group_hover(group_name.clone(), |style| style.visible())
+                        .child(Icon::X.render(px(12.), text)),
+                )
+                .into_any_element()
+        };
         div()
             .id(SharedString::from(format!("terminal-tab-{terminal_id}")))
             .group(group_name)
@@ -321,6 +323,7 @@ impl Render for TerminalDrawer {
                         .label(with_shortcut("New Terminal", "terminal.new", cx))
                         .outline()
                         .xsmall()
+                        .disabled(!self.can_operate())
                         .on_click(cx.listener(|drawer, _, window, cx| drawer.new_terminal(window, cx))),
                 )
                 .into_any_element()

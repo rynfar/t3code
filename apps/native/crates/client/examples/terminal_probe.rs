@@ -1,5 +1,6 @@
-//! Headless terminal check against a live server: opens a fresh terminal for a thread, attaches,
-//! runs `echo hello && pwd`, prints what comes back, resizes, and closes it (deleting its
+//! Headless terminal check against a live server: prints this device's terminal grants, opens a
+//! fresh terminal for a thread, attaches, runs `echo hello && pwd` and prints a combining mark,
+//! shows what comes back and how the emulator lays it out, resizes, and closes it (deleting its
 //! history). With `--observe` it follows an existing terminal read-only instead (optionally
 //! typing `--run` into it) and leaves it open. Uses the saved connection, like `probe`.
 //!
@@ -11,7 +12,10 @@ use std::time::Duration;
 use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ConnectionStatus, start};
 use t3_core::shell::ShellState;
-use t3_core::terminal::{self, AttachEvent, BufferState, Grid, LaunchLocation, MetadataEvent, OutputOp, method};
+use t3_core::terminal::emulator::{Emulator, Rgb, Snapshot, ThemeColors};
+use t3_core::terminal::{
+    self, AttachEvent, BufferState, Grid, LaunchLocation, MetadataEvent, OutputOp, TerminalAccess, method,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,6 +38,14 @@ async fn main() -> anyhow::Result<()> {
             None => anyhow::bail!("client stopped"),
         }
     }
+    let mut grants = client.session_state();
+    let access = loop {
+        if let Some(state) = grants.borrow_and_update().as_ref() {
+            break TerminalAccess::of(Some(state));
+        }
+        tokio::time::timeout(Duration::from_secs(10), grants.changed()).await??;
+    };
+    println!("grants: read={} operate={} -> {:?}", access.read, access.operate, access.mode());
     let snapshot = shell.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("no shell snapshot"))?;
     let thread = match flag("--thread") {
         Some(id) => shell.thread(&id).ok_or_else(|| anyhow::anyhow!("unknown thread {id}"))?,
@@ -87,8 +99,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if !wrote && buffer.version > 0 {
                     wrote = true;
-                    client.request(method::WRITE, terminal::write_input(&thread_id, &terminal_id, "echo hello && pwd\r")).await?;
-                    println!("write: echo hello && pwd");
+                    let command = "echo hello && pwd && printf 'cafe\\314\\201\\n'\r";
+                    client.request(method::WRITE, terminal::write_input(&thread_id, &terminal_id, command)).await?;
+                    println!("write: {}", command.trim_end());
                 }
             }
         }
@@ -96,6 +109,19 @@ async fn main() -> anyhow::Result<()> {
     println!("output (control sequences stripped):");
     for line in strip_controls(&output).lines().filter(|line| !line.trim().is_empty()) {
         println!("  | {line}");
+    }
+    let gray = Rgb { r: 128, g: 128, b: 128 };
+    let mut emulator = Emulator::new(grid, ThemeColors { foreground: gray, background: gray, cursor: gray, ansi: [gray; 16] });
+    emulator.feed(output.as_bytes());
+    let mut frame = Snapshot::default();
+    emulator.snapshot(&mut frame);
+    println!("emulated grid (every codepoint per cell, combining marks escaped):");
+    for row in 0..frame.rows {
+        let text: String = (0..frame.cols).filter(|&col| !frame.row(row)[col].spacer).map(|col| frame.cell_text(row, col)).collect();
+        let text = text.trim_end();
+        if !text.is_empty() {
+            println!("  | {}", text.chars().map(|c| if ('\u{300}'..='\u{36f}').contains(&c) { c.escape_unicode().to_string() } else { c.to_string() }).collect::<String>());
+        }
     }
 
     let resized = client.request(method::RESIZE, terminal::resize_input(&thread_id, &terminal_id, Grid::new(100, 30))).await;

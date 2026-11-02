@@ -19,6 +19,7 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 
 pub use drawer::TerminalDrawer;
+pub use element::{set_typography, typography};
 
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};

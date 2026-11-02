@@ -1,7 +1,9 @@
 //! An in-process fake T3 server for session and supervisor tests: answers the RPC ticket POST and
-//! upgrades `/ws` to a WebSocket that speaks Effect RPC JSON frames, on one port.
+//! the session state GET, and upgrades `/ws` to a WebSocket that speaks Effect RPC JSON frames,
+//! on one port.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -22,6 +24,7 @@ const WAIT: Duration = Duration::from_secs(10);
 pub struct FakeServer {
     addr: SocketAddr,
     connections: mpsc::UnboundedReceiver<Connection>,
+    session: Arc<Mutex<Value>>,
 }
 
 pub struct Connection {
@@ -34,17 +37,24 @@ impl FakeServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("address");
         let (tx, connections) = mpsc::unbounded_channel();
+        let session = Arc::new(Mutex::new(json!({"authenticated": true, "auth": {}, "permissions": ["terminal:operate"]})));
+        let served = session.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let tx = tx.clone();
+                let (tx, session) = (tx.clone(), served.clone());
                 tokio::spawn(async move {
-                    if let Some(connection) = serve(stream).await {
+                    if let Some(connection) = serve(stream, session).await {
                         let _ = tx.send(connection);
                     }
                 });
             }
         });
-        FakeServer { addr, connections }
+        FakeServer { addr, connections, session }
+    }
+
+    /// What `GET /api/auth/session` answers from now on.
+    pub fn set_session(&self, state: Value) {
+        *self.session.lock().expect("session") = state;
     }
 
     pub fn credentials(&self) -> Credentials {
@@ -73,7 +83,17 @@ async fn read_head(stream: &mut TcpStream) -> Option<String> {
     String::from_utf8(head).ok()
 }
 
-async fn serve(mut stream: TcpStream) -> Option<Connection> {
+async fn respond_json(mut stream: TcpStream, body: Value) {
+    let body = body.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>) -> Option<Connection> {
     let head = read_head(&mut stream).await?;
     let path = head.split_whitespace().nth(1)?.to_owned();
     let header = |name: &str| {
@@ -83,13 +103,12 @@ async fn serve(mut stream: TcpStream) -> Option<Connection> {
         })
     };
     if head.starts_with("POST /api/auth/websocket-ticket") {
-        let body = json!({ "ticket": "ticket" }).to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
+        respond_json(stream, json!({ "ticket": "ticket" })).await;
+        return None;
+    }
+    if head.starts_with("GET /api/auth/session") {
+        let state = session.lock().expect("session").clone();
+        respond_json(stream, state).await;
         return None;
     }
     let accept = derive_accept_key(header("sec-websocket-key")?.as_bytes());

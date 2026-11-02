@@ -11,6 +11,7 @@ use t3_core::server_config::{ServerConfigStreamEvent, SettingsPayload};
 use t3_core::settings::{ServerSettingChange, decode_update_reply};
 
 use crate::app_state::{AppEvent, AppState};
+use crate::terminal;
 use crate::theme::{self, Preferences};
 
 struct ClientPrefs {
@@ -24,6 +25,7 @@ impl Global for ClientPrefs {}
 pub fn init(cx: &mut App) {
     let doc = ClientSettingsDoc::from_json(&store::load_client_settings().unwrap_or_default());
     theme::set_preferences(preferences(&doc), cx);
+    terminal::set_typography(terminal::typography(doc.entries()), cx);
     cx.set_global(ClientPrefs { doc, error: None });
 }
 
@@ -56,8 +58,10 @@ pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: 
     }
     store::save_ui_state("settings", prefs.doc.entries());
     let (composer, next) = (prefs.doc.composer(), preferences(&prefs.doc));
+    let typography = terminal::typography(prefs.doc.entries());
     state.update(cx, |state, _| state.client_settings = composer);
     theme::set_preferences(next, cx);
+    terminal::set_typography(typography, cx);
     cx.refresh_windows();
 }
 

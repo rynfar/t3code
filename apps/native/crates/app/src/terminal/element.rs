@@ -1,42 +1,110 @@
-//! Paints one terminal grid. Each frame copies the visible rows out of the emulator under its
-//! lock, merges cell backgrounds and selection into runs of quads, and shapes each row as a few
-//! text runs pinned to the cell grid (`force_width`), breaking only at wide characters. Metrics
-//! follow `apps/web/src/terminal/ghostty`: 12px mono, a line of `round(size * 1.35)`, 4px padding,
-//! and the grid anchored to the bottom once there is scrollback.
+//! Paints one terminal grid from the session's newest published frame, never from the emulator
+//! itself. Cell backgrounds and selection merge into runs of quads; each row is shaped as a few
+//! text runs pinned to the cell grid (`force_width`), breaking only at wide characters, and shaped
+//! rows are cached by content so a frame reshapes only the rows that changed. Metrics follow
+//! `apps/web/src/terminal/ghostty`: a line of `round(size * 1.35)`, 4px padding, and the grid
+//! anchored to the bottom once there is scrollback. The font is the user's terminal typography.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFeatures, FontStyle,
-    FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative,
-    size,
+    FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
+    px, relative, size,
 };
 use gpui_component::ActiveTheme;
-use t3_core::terminal::Grid;
+use t3_client::store;
 use t3_core::terminal::emulator::{CellView, CursorStyle, Snapshot};
+use t3_core::terminal::{FontSizeRange, Grid, TerminalTypography};
 
 use super::colors::{self, to_hsla};
 use super::pane::{Geometry, TerminalPane};
-use super::session::Shared;
+use super::session::{Frame, Front, take_newer};
+use crate::theme::metrics;
 
-pub const FONT_SIZE: f32 = 12.;
 pub const PADDING: f32 = 4.;
 const SCROLLBAR_WIDTH: f32 = 6.;
 const SCROLLBAR_INSET: f32 = 4.;
 const MIN_THUMB: f32 = 18.;
+/// The web keeps the split-typography switch in `localStorage` as `t3code:typography-advanced`.
+const TYPOGRAPHY_ADVANCED: &str = "typography-advanced";
 
-pub fn terminal_font(cx: &App) -> Font {
-    let mut font = gpui::font(cx.theme().mono_font_family.clone());
+/// The terminal typography every mounted surface paints with; panes repaint when it changes.
+pub struct TerminalFont(pub TerminalTypography);
+
+impl Global for TerminalFont {}
+
+/// The terminal typography the client settings ask for.
+pub fn typography(settings: &serde_json::Map<String, serde_json::Value>) -> TerminalTypography {
+    let advanced = store::load_ui_state(TYPOGRAPHY_ADVANCED).and_then(|value| value.as_bool()).unwrap_or(false);
+    TerminalTypography::resolve(
+        settings,
+        advanced,
+        FontSizeRange {
+            default: metrics::DEFAULT_CODE_FONT_SIZE,
+            min: metrics::MIN_CODE_FONT_SIZE,
+            max: metrics::MAX_CODE_FONT_SIZE,
+        },
+        FontSizeRange {
+            default: metrics::DEFAULT_TERMINAL_FONT_SIZE,
+            min: metrics::MIN_TERMINAL_FONT_SIZE,
+            max: metrics::MAX_TERMINAL_FONT_SIZE,
+        },
+    )
+}
+
+/// Applies new typography to every mounted terminal.
+pub fn set_typography(typography: TerminalTypography, cx: &mut App) {
+    if cx.try_global::<TerminalFont>().is_none_or(|current| current.0 != typography) {
+        cx.set_global(TerminalFont(typography));
+    }
+}
+
+fn terminal_font(cx: &App) -> (Font, f32) {
+    let (family, size) = match cx.try_global::<TerminalFont>() {
+        Some(TerminalFont(typography)) => (typography.family.clone(), typography.size),
+        None => (None, metrics::DEFAULT_CODE_FONT_SIZE),
+    };
+    let family = family.map_or_else(|| cx.theme().mono_font_family.clone(), SharedString::from);
+    let mut font = gpui::font(family);
     font.features = FontFeatures(std::sync::Arc::new(vec![("liga".into(), 0), ("calt".into(), 0), ("dlig".into(), 0)]));
-    font
+    (font, size)
+}
+
+/// A shaped row: its segments and the grid column each starts at.
+type ShapedRow = Rc<[(usize, ShapedLine)]>;
+
+/// Shaped rows by content, kept for the rows the last frame painted.
+#[derive(Default)]
+pub struct RowCache {
+    current: HashMap<u64, ShapedRow>,
+    previous: HashMap<u64, ShapedRow>,
+}
+
+impl RowCache {
+    fn begin_frame(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+
+    fn row(&mut self, key: u64, shape: impl FnOnce() -> Vec<(usize, ShapedLine)>) -> ShapedRow {
+        if let Some(hit) = self.current.get(&key) {
+            return hit.clone();
+        }
+        let row: ShapedRow = self.previous.remove(&key).unwrap_or_else(|| shape().into());
+        self.current.insert(key, row.clone());
+        row
+    }
 }
 
 pub struct TerminalElement {
     pane: Entity<TerminalPane>,
-    shared: Shared,
-    frame: Rc<RefCell<Snapshot>>,
+    front: Front,
+    frame: Rc<RefCell<Frame>>,
+    rows: Rc<RefCell<RowCache>>,
     focus: FocusHandle,
     focused: bool,
     marked: Option<SharedString>,
@@ -45,20 +113,23 @@ pub struct TerminalElement {
 impl TerminalElement {
     pub fn new(
         pane: Entity<TerminalPane>,
-        shared: Shared,
-        frame: Rc<RefCell<Snapshot>>,
+        front: Front,
+        frame: Rc<RefCell<Frame>>,
+        rows: Rc<RefCell<RowCache>>,
         focus: FocusHandle,
         focused: bool,
         marked: Option<SharedString>,
     ) -> Self {
-        TerminalElement { pane, shared, frame, focus, focused, marked }
+        TerminalElement { pane, front, frame, rows, focus, focused, marked }
     }
 }
 
 pub struct Prepainted {
     quads: Vec<PaintQuad>,
     cursor_block: Option<PaintQuad>,
-    lines: Vec<(Point<Pixels>, ShapedLine)>,
+    lines: Vec<(Pixels, ShapedRow)>,
+    origin_x: Pixels,
+    cell_width: Pixels,
     overlays: Vec<PaintQuad>,
     marked: Option<(Point<Pixels>, ShapedLine)>,
     line_height: Pixels,
@@ -106,26 +177,22 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepainted {
-        let font = terminal_font(cx);
-        let font_size = px(FONT_SIZE);
+        let (font, size_px) = terminal_font(cx);
+        let font_size = px(size_px);
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&font);
-        let cell_width = text_system.em_advance(font_id, font_size).unwrap_or(px(FONT_SIZE * 0.6));
+        let cell_width = text_system.em_advance(font_id, font_size).unwrap_or(px(size_px * 0.6));
         let glyph_height = text_system.ascent(font_id, font_size) + text_system.descent(font_id, font_size).abs();
-        let line_height = px((FONT_SIZE * 1.35).round().max(f32::from(glyph_height).ceil()));
+        let line_height = px((size_px * 1.35).round().max(f32::from(glyph_height).ceil()));
         let inner = size(bounds.size.width - px(2. * PADDING), bounds.size.height - px(2. * PADDING));
         let measured = Grid::new(
             (f32::from(inner.width) / f32::from(cell_width)).floor().max(1.) as u16,
             (f32::from(inner.height) / f32::from(line_height)).floor().max(1.) as u16,
         );
+        self.pane.update(cx, |pane, cx| pane.fit(measured, (f32::from(cell_width), f32::from(line_height)), cx));
         let mut frame = self.frame.borrow_mut();
-        {
-            let mut core = self.shared.lock();
-            let local = Grid::fit_within(core.buffer.grid, measured);
-            core.emulator.resize(local);
-            core.emulator.set_cell_size(f32::from(cell_width), f32::from(line_height));
-            core.emulator.snapshot(&mut frame);
-        }
+        take_newer(&self.front, &mut frame);
+        let frame = &frame.snapshot;
         let slack = if frame.history > 0 {
             (f32::from(inner.height) - frame.rows as f32 * f32::from(line_height)).max(0.)
         } else {
@@ -175,14 +242,32 @@ impl Element for TerminalElement {
         }
         let cursor_glyph = block.map(|c| (c.row, c.col));
 
-        let mut lines = Vec::new();
+        let style_key = {
+            let mut hasher = DefaultHasher::new();
+            font.family.hash(&mut hasher);
+            size_px.to_bits().hash(&mut hasher);
+            f32::from(cell_width).to_bits().hash(&mut hasher);
+            hash_color(paint.background, &mut hasher);
+            hasher.finish()
+        };
+        let mut rows = self.rows.borrow_mut();
+        rows.begin_frame();
+        let mut lines = Vec::with_capacity(frame.rows);
         for row in 0..frame.rows {
-            let y = origin.y + line_height * row as f32;
             let glyph_col = cursor_glyph.filter(|(r, _)| *r == row).map(|(_, col)| col);
-            shape_row(frame.row(row), &font, font_size, cell_width, glyph_col, paint.background, window, |col, line| {
-                lines.push((point(origin.x + cell_width * col as f32, y), line))
+            let key = row_key(frame, row, glyph_col, style_key);
+            let shaped = rows.row(key, || {
+                let mut shaped = Vec::new();
+                shape_row(frame, row, &font, font_size, cell_width, glyph_col, paint.background, window, |col, line| {
+                    shaped.push((col, line))
+                });
+                shaped
             });
+            if !shaped.is_empty() {
+                lines.push((origin.y + line_height * row as f32, shaped));
+            }
         }
+        drop(rows);
 
         if frame.display_offset > 0 {
             let total = (frame.history + frame.rows) as f32;
@@ -210,9 +295,8 @@ impl Element for TerminalElement {
             (cell(c.row, c.col, 1).origin, line)
         });
 
-        drop(frame);
-        self.pane.update(cx, |pane, cx| pane.laid_out(measured, geometry, cx));
-        Prepainted { quads, cursor_block, lines, overlays, marked, line_height }
+        self.pane.update(cx, |pane, _| pane.set_geometry(geometry));
+        Prepainted { quads, cursor_block, lines, origin_x: origin.x, cell_width, overlays, marked, line_height }
     }
 
     fn paint(
@@ -234,8 +318,11 @@ impl Element for TerminalElement {
             if let Some(cursor) = prepainted.cursor_block.take() {
                 window.paint_quad(cursor);
             }
-            for (origin, line) in &prepainted.lines {
-                let _ = line.paint(*origin, line_height, TextAlign::Left, None, window, cx);
+            for (y, segments) in &prepainted.lines {
+                for (col, line) in segments.iter() {
+                    let origin = point(prepainted.origin_x + prepainted.cell_width * *col as f32, *y);
+                    let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                }
             }
             for quad in prepainted.overlays.drain(..) {
                 window.paint_quad(quad);
@@ -246,6 +333,28 @@ impl Element for TerminalElement {
             }
         });
     }
+}
+
+fn hash_color(color: Hsla, hasher: &mut impl Hasher) {
+    for channel in [color.h, color.s, color.l, color.a] {
+        channel.to_bits().hash(hasher);
+    }
+}
+
+/// Everything `shape_row` reads for one row; equal keys shape to the same segments.
+fn row_key(frame: &Snapshot, row: usize, cursor_col: Option<usize>, style_key: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    style_key.hash(&mut hasher);
+    cursor_col.hash(&mut hasher);
+    let start = row * frame.cols;
+    for (offset, cell) in frame.row(row).iter().enumerate() {
+        let flags = [cell.bold, cell.italic, cell.dim, cell.underline, cell.strikeout, cell.wide, cell.spacer];
+        (cell.c, cell.fg.r, cell.fg.g, cell.fg.b, flags).hash(&mut hasher);
+        if cell.combining {
+            frame.combining(start + offset).for_each(|c| c.hash(&mut hasher));
+        }
+    }
+    hasher.finish()
 }
 
 /// Calls `emit(start, len, color)` for each run of adjacent cells with the same color.
@@ -270,9 +379,11 @@ fn push_runs(cells: &[CellView], color_of: impl Fn(&CellView) -> Option<Hsla>, m
 
 /// Shapes one row into segments that start at a grid column. Glyphs inside a segment are forced
 /// onto the cell grid; a wide character gets its own segment so the cells after it stay aligned.
+/// Combining marks join their base character's cluster.
 #[allow(clippy::too_many_arguments)]
 fn shape_row(
-    cells: &[CellView],
+    frame: &Snapshot,
+    row: usize,
     font: &Font,
     font_size: Pixels,
     cell_width: Pixels,
@@ -281,6 +392,7 @@ fn shape_row(
     window: &Window,
     mut emit: impl FnMut(usize, ShapedLine),
 ) {
+    let cells = frame.row(row);
     let last_text = cells.iter().rposition(|cell| cell.c != ' ' || cell.underline || cell.strikeout).map_or(0, |last| last + 1);
     let end = cursor_col.map_or(last_text, |col| last_text.max(col + 1)).min(cells.len());
     let mut text = String::new();
@@ -314,15 +426,19 @@ fn shape_row(
         };
         let underline = cell.underline.then_some(UnderlineStyle { thickness: px(1.), color: Some(color), wavy: false });
         let strikethrough = cell.strikeout.then_some(StrikethroughStyle { thickness: px(1.), color: Some(color) });
-        let c = if cell.c == '\0' { ' ' } else { cell.c };
-        text.push(c);
+        let before = text.len();
+        text.push(if cell.c == '\0' { ' ' } else { cell.c });
+        if cell.combining {
+            text.extend(frame.combining(row * frame.cols + col));
+        }
+        let len = text.len() - before;
         match runs.last_mut() {
             Some(last)
                 if last.color == color && last.font == run_font && last.underline == underline && last.strikethrough == strikethrough =>
             {
-                last.len += c.len_utf8();
+                last.len += len;
             }
-            _ => runs.push(TextRun { len: c.len_utf8(), font: run_font, color, background_color: None, underline, strikethrough }),
+            _ => runs.push(TextRun { len, font: run_font, color, background_color: None, underline, strikethrough }),
         }
         if cell.wide {
             flush(&mut text, &mut runs, start);

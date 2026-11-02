@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod client_settings;
 pub mod commands;
 pub mod composer;

@@ -2,7 +2,8 @@
 //! list from `subscribeTerminalMetadata`, and the panes of the selected thread. Ports
 //! `PersistentThreadTerminalDrawer` (`components/PersistentThreadTerminals.tsx`),
 //! `components/terminal/useThreadTerminalActions.ts`, and the toggle, new, split and close
-//! handlers of `components/chat/useChatTerminalActions.ts`.
+//! handlers of `components/chat/useChatTerminalActions.ts`. Creating and closing terminals
+//! needs `terminal:operate`; the drawer follows the device's grants as they change.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,7 +13,8 @@ use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::terminal::{
-    self, LaunchLocation, MetadataEvent, SplitDirection, TerminalLayouts, TerminalSummary, ThreadTerminalLayout, method,
+    self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalLayouts, TerminalSummary, ThreadTerminalLayout,
+    method,
 };
 use tokio::sync::mpsc;
 
@@ -32,6 +34,8 @@ pub struct TerminalDrawer {
     panes: HashMap<String, Entity<TerminalPane>>,
     panes_thread: Option<String>,
     metadata: Option<(tokio::task::JoinHandle<()>, Task<()>)>,
+    access: TerminalAccess,
+    grants: Option<Task<()>>,
     save: Option<Task<()>>,
     pub(super) resize_from: Option<(f32, f32)>,
     _subscriptions: Vec<Subscription>,
@@ -60,6 +64,8 @@ impl TerminalDrawer {
             panes: HashMap::new(),
             panes_thread: None,
             metadata: None,
+            access: TerminalAccess::default(),
+            grants: None,
             save: None,
             resize_from: None,
             _subscriptions: vec![subscription],
@@ -88,6 +94,7 @@ impl TerminalDrawer {
             if let Some((driver, _)) = self.metadata.take() {
                 driver.abort();
             }
+            self.grants = None;
             self.summaries = None;
             self.panes.clear();
             cx.notify();
@@ -96,9 +103,34 @@ impl TerminalDrawer {
         if self.metadata.is_none()
             && let Some(client) = self.app.read(cx).client_handle()
         {
+            self.watch_grants(&client, cx);
             self.start_metadata(client, window, cx);
         }
         self.sync_selection(window, cx);
+    }
+
+    pub(super) fn can_operate(&self) -> bool {
+        self.access.operate
+    }
+
+    /// Follows this device's grants; the last answer holds while reconnecting.
+    fn watch_grants(&mut self, client: &t3_client::supervisor::ClientHandle, cx: &mut Context<Self>) {
+        let mut grants = client.session_state();
+        self.access = TerminalAccess::of(grants.borrow_and_update().as_ref());
+        self.grants = Some(cx.spawn(async move |this, cx| {
+            while grants.changed().await.is_ok() {
+                let access = TerminalAccess::of(grants.borrow_and_update().as_ref());
+                let updated = this.update(cx, |drawer, cx| {
+                    if drawer.access != access {
+                        drawer.access = access;
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     fn start_metadata(&mut self, client: t3_client::supervisor::ClientHandle, window: &mut Window, cx: &mut Context<Self>) {
@@ -271,7 +303,11 @@ impl TerminalDrawer {
     /// the thread before starting a new shell.
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((thread_id, layout)) = self.layout(cx) else { return };
-        if !layout.terminal_open && layout.terminal_ids.is_empty() {
+        let opening = !layout.terminal_open;
+        if opening && !self.access.read && !self.access.operate {
+            return;
+        }
+        if opening && self.access.operate && layout.terminal_ids.is_empty() {
             let existing = self.summaries.as_ref().and_then(|summaries| terminal::pick_existing_terminal(&terminal::thread_terminals(summaries, &thread_id)));
             match existing {
                 Some(terminal_id) => {
@@ -296,12 +332,18 @@ impl TerminalDrawer {
     }
 
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.access.operate {
+            return;
+        }
         self.open_if_closed(cx);
         self.launch(|layouts, thread_id, terminal_id| layouts.new_terminal(thread_id, terminal_id), cx);
         self.changed(window, cx);
     }
 
     pub fn split(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.access.operate {
+            return;
+        }
         self.open_if_closed(cx);
         if self.layout(cx).is_none_or(|(_, layout)| layout.has_reached_split_limit()) {
             return;
@@ -313,6 +355,9 @@ impl TerminalDrawer {
     /// Allocates an id, places it, and opens the shell (`launchTerminal`). The pane attaches
     /// with the same launch location, so the two never disagree about where it runs.
     fn launch(&mut self, place: impl FnOnce(&mut TerminalLayouts, &str, &str) -> bool, cx: &mut Context<Self>) -> Option<String> {
+        if !self.access.operate {
+            return None;
+        }
         let thread_id = self.selected_thread(cx)?;
         let location = self.location(&thread_id, None, cx)?;
         let client = self.app.read(cx).client_handle()?;
@@ -352,7 +397,7 @@ impl TerminalDrawer {
     /// Asks first, like `confirmTerminalClose`: closing stops the process and clears history.
     pub fn request_close(&mut self, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread(cx) else { return };
-        if self.panes.get(terminal_id).is_some_and(|pane| pane.read(cx).is_read_only()) {
+        if !self.access.operate {
             return;
         }
         let (message, detail) = terminal::close_confirmation(&[self.label(&thread_id, terminal_id)]);
