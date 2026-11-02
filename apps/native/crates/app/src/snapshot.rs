@@ -3,8 +3,9 @@
 //! `T3_NATIVE_HOME`, renders with GPUI's Metal test renderer (no window on screen, so it works
 //! while the screen is locked or recording is denied), and writes one PNG.
 //!
-//! It never writes to the server: it only subscribes and reads. Local UI state goes to a
-//! throwaway copy of the home, so the caller's saved panels and last thread stay as they were.
+//! It never writes to the server unless told to (`--attach`, or a `--click` on a control that
+//! writes): it only subscribes and reads. Local UI state goes to a throwaway copy of the home, so
+//! the caller's saved panels and last thread stay as they were.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
-[--width 1440] [--height 900] [--dark|--light] [--wait 6]";
+[--click <x>,<y>]... [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
 
 pub struct Options {
     out: PathBuf,
@@ -42,6 +43,8 @@ pub struct Options {
     usage_period: Option<String>,
     usage_model: bool,
     context_meter: bool,
+    /// Left clicks at window points, in order, after everything else is open.
+    clicks: Vec<(f32, f32)>,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -72,6 +75,11 @@ impl Options {
             usage_period: flag("--usage-period"),
             usage_model: has("--usage-model"),
             context_meter: has("--context-meter"),
+            clicks: args
+                .windows(2)
+                .filter(|pair| pair[0] == "--click")
+                .filter_map(|pair| pair[1].split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?))))
+                .collect(),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -226,6 +234,12 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         };
         cx.update(|cx| crate::usage::open_read_only(metric, period, options.usage_model, cx));
         pump(&mut cx, options.wait.max(30.), |cx| cx.update(crate::usage::is_settled));
+    }
+    for &(x, y) in &options.clicks {
+        pump(&mut cx, options.wait.min(3.), |_| false);
+        let position = gpui::point(px(x), px(y));
+        cx.simulate_mouse_move(window, position, None, gpui::Modifiers::default());
+        cx.simulate_click(window, position, gpui::Modifiers::default());
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;

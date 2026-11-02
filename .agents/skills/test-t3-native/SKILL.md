@@ -82,7 +82,7 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   [--thread <id>] [--right-panel diff] [--settings appearance] [--palette] \
   [--new-thread] [--attach <file>]... [--prompt "@src"] \
   [--usage cost|tokens|limits] [--usage-period day|week|month|quarter] [--usage-model] \
-  [--context-meter] [--width 1440] [--height 900] [--dark | --light] [--wait 6]
+  [--context-meter] [--click <x>,<y>]... [--width 1440] [--height 900] [--dark | --light] [--wait 6]
 ```
 
 - `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher),
@@ -93,6 +93,9 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
 - `--usage` opens the Usage page on a metric and waits for its summary; `--usage-model` opens
   the top model's breakdown. Limits skips its provider refresh so the run stays read-only.
   `--context-meter` turns on the composer's legacy context window indicator for `--thread`.
+- `--click x,y` left-clicks a window point (logical px) after everything else opens, in order,
+  so a run can expand a row or press a button; take a plain run first to find the coordinates.
+  A click that writes (send, approve, archive) reaches the server, so use a scratch server.
 - A home with no saved environment renders the connect screen (set `T3CODE_HOME` as above to
   show the one-click local option).
 - `--new-thread` opens the new-thread draft; `--prompt` types into the composer last, so a trigger

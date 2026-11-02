@@ -21,7 +21,10 @@ pub struct Parsed {
 
 impl Parsed {
     pub fn new(patch: &str, truncated: bool, totals: Option<(u64, u64)>, base_ref: Option<String>, head_ref: Option<String>) -> Arc<Parsed> {
-        let patch = parse_patch(patch);
+        Parsed::from_patch(parse_patch(patch), truncated, totals, base_ref, head_ref)
+    }
+
+    pub fn from_patch(patch: ParsedPatch, truncated: bool, totals: Option<(u64, u64)>, base_ref: Option<String>, head_ref: Option<String>) -> Arc<Parsed> {
         let max_line_len = match &patch {
             ParsedPatch::Files(files) => {
                 files.iter().flat_map(|file| &file.hunks).flat_map(|hunk| &hunk.lines).map(|line| line.text.len()).max().unwrap_or(0)

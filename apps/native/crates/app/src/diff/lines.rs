@@ -10,7 +10,7 @@ use gpui::{
 use gpui_component::ActiveTheme;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex};
-use t3_core::diff::{ChangeKind, DiffLine, DiffRow, FileDiff, LineKind, compact_count, separator_label};
+use t3_core::diff::{ChangeKind, DiffLine, DiffRow, FileDiff, LineKind, RecordedContent, compact_count, separator_label};
 
 use super::DiffPanel;
 use crate::icons::Icon;
@@ -420,4 +420,38 @@ pub fn raw_patch(text: &str, reason: &str, wrap: bool, cx: &App) -> impl IntoEle
                     .child(text.to_owned()),
             ),
     )
+}
+
+/// What a provider recorded instead of a diff (`toolCallPreview.content` in `DiffPanel.tsx`).
+pub fn recorded_content(content: &[RecordedContent], wrap: bool, cx: &App) -> impl IntoElement {
+    let p = palette(cx);
+    let family = cx.theme().mono_font_family.clone();
+    v_flex()
+        .id("diff-recorded-content")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .p(px(12.))
+        .gap(px(12.))
+        .text_xs()
+        .child(div().text_color(hsla(p.muted_foreground)).child("The provider recorded file content without a diff."))
+        .children(content.iter().enumerate().map(|(index, entry)| {
+            let text = if entry.text.is_empty() { "Empty content.".to_owned() } else { entry.text.clone() };
+            let pre = div()
+                .font_family(family.clone())
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(hsla(p.foreground))
+                .map(|this| if wrap { this.flex_1().min_w_0() } else { this.flex_none().whitespace_nowrap() })
+                .child(text);
+            // Unwrapped lines scroll sideways, like the web's `overflow-auto` <pre>; a vertical
+            // wheel still scrolls the list.
+            let body = h_flex().id(("diff-recorded-text", index)).items_start().w_full().when(!wrap, |this| {
+                this.overflow_x_scroll().map(|mut this| {
+                    this.style().restrict_scroll_to_axis = Some(true);
+                    this
+                })
+            });
+            v_flex().gap(px(4.)).child(div().text_color(hsla(p.muted_foreground)).child(entry.label)).child(body.child(pre))
+        }))
 }

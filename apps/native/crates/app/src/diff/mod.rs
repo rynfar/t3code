@@ -1,7 +1,7 @@
-//! The diff surface. Ports `components/DiffPanel.tsx`: the scope (Changes, Uncommitted, a turn),
-//! the requests behind it, collapsed files per scope (`useDiffPanelSessionStore`), and its
-//! loading, empty and error states. Patches are fetched and parsed on the network runtime; the
-//! view paints only the rows on screen.
+//! The diff surface. Ports `components/DiffPanel.tsx`: the scope (Changes, Uncommitted, a turn,
+//! one tool call), the requests behind it, collapsed files per scope (`useDiffPanelSessionStore`),
+//! and its loading, empty and error states. Patches are fetched and parsed on the network
+//! runtime; the view paints only the rows on screen.
 
 mod header;
 mod lines;
@@ -19,11 +19,13 @@ use gpui::{
 };
 use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
-use t3_core::diff::{DiffScope, DiffSelection, Layout, ParsedPatch, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id};
-use t3_core::right_panel::SurfaceKind;
+use t3_core::diff::{
+    DiffScope, DiffSelection, Layout, ParsedPatch, ToolCallTarget, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id,
+};
+use t3_core::right_panel::{Surface, SurfaceKind};
 
 use crate::app_state::{AppEvent, AppState, Phase};
-use crate::theme::{hsla, palette};
+use crate::theme::{Palette, hsla, palette};
 use source::{Loaded, RequestKey};
 pub use view::Parsed;
 use view::View;
@@ -205,7 +207,13 @@ impl DiffPanel {
         let state = self.state.read(cx);
         let environment = state.environment().map(str::to_owned);
         let visible = state.panels.panels.active_surface(&thread_id).is_some_and(|surface| surface.kind == SurfaceKind::Diff);
-        let scope = DiffScope::resolve(&selection, &self.summaries);
+        let scope = match DiffScope::resolve(&selection, &self.summaries) {
+            DiffScope::ToolCall(target) => {
+                let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == thread_id);
+                DiffScope::ToolCall(target.resolve(projection.map(|projection| projection.visible_turn_items.as_slice()).unwrap_or_default()))
+            }
+            scope => scope,
+        };
         let cwd = state.thread_shell(&thread_id).and_then(|thread| {
             thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()))
         });
@@ -240,6 +248,7 @@ impl DiffPanel {
                 ignore_whitespace: self.ignore_whitespace,
             }),
             DiffScope::Turn { .. } | DiffScope::NoTurns => None,
+            DiffScope::ToolCall(target) => Some(RequestKey::ToolCall { environment, target: target.clone() }),
         });
         let ui = (state.panels.diff_layout, state.panels.diff_file_tree_open);
         let changed = request != self.request
@@ -270,8 +279,8 @@ impl DiffPanel {
             && connected
             && !self.pending
             && self.error.is_none()
-            && !self.has_loaded()
             && let Some(key) = self.request.clone()
+            && source::needs_fetch(&key, self.loaded.as_ref().map(|(loaded, _)| loaded))
         {
             self.fetch(key, cx);
         }
@@ -281,8 +290,8 @@ impl DiffPanel {
         }
     }
 
-    /// Whether the current request's source has an answer, even one with nothing to show (a
-    /// cwd that is not a repository), so it is not asked again on every event.
+    /// Whether the current request's source has something to show, even nothing (a cwd that is
+    /// not a repository), possibly from an older revision while the current one is fetched.
     fn has_loaded(&self) -> bool {
         match (&self.request, &self.loaded) {
             (Some(request), Some((key, _))) => key.same_source(request),
@@ -337,6 +346,15 @@ impl DiffPanel {
             (Loaded::Git { branch, .. }, DiffScope::Branch { .. }) => branch.clone(),
             (Loaded::Git { unstaged, .. }, DiffScope::Unstaged) => unstaged.clone(),
             (Loaded::Turn(parsed), DiffScope::Turn { .. }) => Some(parsed.clone()),
+            (Loaded::ToolCall(call), DiffScope::ToolCall(_)) => call.parsed(self.ignore_whitespace),
+            _ => None,
+        }
+    }
+
+    /// The loaded tool call for the scope on screen.
+    fn tool_call(&self) -> Option<Arc<source::ToolCall>> {
+        match &self.loaded.as_ref().filter(|_| self.has_loaded())?.1 {
+            Loaded::ToolCall(call) => Some(call.clone()),
             _ => None,
         }
     }
@@ -351,6 +369,7 @@ impl DiffPanel {
             DiffScope::Unstaged => "unstaged".to_owned(),
             DiffScope::Turn { summary_index, .. } => format!("turn:{}", self.summaries[*summary_index].run_id),
             DiffScope::NoTurns => "none".to_owned(),
+            DiffScope::ToolCall(target) => format!("tool-call:{}:{}", target.thread_id, target.item_id),
         };
         format!("{}:{section}", self.thread_id.as_deref().unwrap_or_default())
     }
@@ -494,6 +513,9 @@ impl DiffPanel {
     pub fn toggle_whitespace(&mut self, cx: &mut Context<Self>) {
         self.ignore_whitespace = !self.ignore_whitespace;
         self.sync(cx);
+        // A tool call hides whitespace itself, so its request stays the same.
+        self.rebuild(cx);
+        cx.notify();
     }
 
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
@@ -525,19 +547,7 @@ impl DiffPanel {
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = palette(cx);
-        let message = |text: &str| {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px(px(20.))
-                .text_center()
-                .text_xs()
-                .text_color(hsla(p.muted_foreground).opacity(0.7))
-                .child(text.to_owned())
-                .into_any_element()
-        };
+        let message = |text: &str| centered_message(text, p);
         if let Some(external) = &self.external
             && self.view.is_none()
         {
@@ -549,6 +559,9 @@ impl DiffPanel {
         }
         if self.thread_id.is_none() && self.external.is_none() {
             return message("Select a thread to inspect turn diffs.");
+        }
+        if matches!(self.scope, DiffScope::ToolCall(_)) {
+            return self.render_tool_call(window, cx);
         }
         if self.is_outside_repository(cx) {
             return message("Turn diffs are unavailable because this project is not a git repository.");
@@ -562,9 +575,7 @@ impl DiffPanel {
             }
             return v_flex()
                 .flex_1()
-                .children(self.error.clone().map(|error| {
-                    div().px(px(12.)).mb(px(8.)).text_size(px(11.)).text_color(hsla(p.error).opacity(0.8)).child(error)
-                }))
+                .children(self.error.clone().map(|error| error_line(error, p)))
                 .child(message("No patch available for this selection."))
                 .into_any_element();
         };
@@ -587,33 +598,95 @@ impl DiffPanel {
 
     fn render_files(&mut self, parsed: &Parsed, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = palette(cx);
-        let tree_open = self.state.read(cx).panels.diff_file_tree_open;
         let truncated = parsed.truncated.then(|| {
             let suffix = if parsed.totals.is_some() { " Totals include all changes." } else { "" };
-            div()
-                .flex_none()
-                .border_b_1()
-                .border_color(hsla(p.border).opacity(0.7))
-                .bg(hsla(p.muted).opacity(0.4))
-                .px(px(12.))
-                .py(px(6.))
-                .text_size(px(11.))
-                .text_color(hsla(p.muted_foreground))
-                .child(format!("This preview exceeds the size limit. Changes shown are incomplete.{suffix}"))
+            notice(format!("This preview exceeds the size limit. Changes shown are incomplete.{suffix}"), p)
         });
-        v_flex()
+        v_flex().flex_1().min_h_0().children(truncated).child(self.files_body(window, cx)).into_any_element()
+    }
+
+    fn files_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let tree_open = self.state.read(cx).panels.diff_file_tree_open;
+        div()
+            .flex()
             .flex_1()
             .min_h_0()
-            .children(truncated)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_list(window, cx))
-                    .when(tree_open, |this| this.child(tree::render(self, cx))),
-            )
-            .into_any_element()
+            .child(self.render_list(window, cx))
+            .when(tree_open, |this| this.child(tree::render(self, cx)))
+    }
+
+    /// The tool-call scope (`toolCallSelection` in `DiffPanel.tsx`). It reads no repository, so
+    /// it works outside one; the recorded content shows when the provider left no diff.
+    fn render_tool_call(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let p = palette(cx);
+        let call = self.tool_call();
+        // `getRenderablePatch` treats a blank patch as none.
+        let parsed = self.view.as_ref().map(|view| view.parsed.clone()).filter(|parsed| parsed.patch != ParsedPatch::Empty);
+        let truncated = call.as_ref().is_some_and(|call| call.diff.truncated).then(|| notice("This preview exceeds the size limit. Changes shown are incomplete.", p));
+        let omitted = match (&call, parsed.as_deref().map(|parsed| &parsed.patch)) {
+            (Some(call), Some(ParsedPatch::Files(files))) => Some((call.diff.recorded_files, call.diff.omitted_files(files.len()))),
+            _ => None,
+        };
+        let omitted = omitted.filter(|(_, omitted)| *omitted > 0).map(|(recorded, omitted)| {
+            notice(format!("This tool call changed {recorded} files. The recorded patch omits {omitted} of them."), p)
+        });
+        let error = self.error.clone().filter(|_| parsed.is_none()).map(|error| error_line(error, p));
+        let body = match parsed.as_deref().map(|parsed| &parsed.patch) {
+            Some(ParsedPatch::Files(_)) => self.files_body(window, cx).into_any_element(),
+            Some(ParsedPatch::Raw { text, reason }) => lines::raw_patch(text, reason, self.wrap, cx).into_any_element(),
+            Some(ParsedPatch::Empty) | None => match call.as_ref().filter(|call| !call.diff.content.is_empty()) {
+                Some(call) => lines::recorded_content(&call.diff.content, self.wrap, cx).into_any_element(),
+                None if self.pending || (self.error.is_none() && !self.has_loaded()) => lines::loading_state(cx).into_any_element(),
+                // A blank patch parses to `Empty`; a missing one leaves no view.
+                None if self.view.is_some() => centered_message("No net changes in this selection.", p),
+                None => centered_message("No patch available for this selection.", p),
+            },
+        };
+        v_flex().flex_1().min_h_0().children(truncated).children(omitted).children(error).child(body).into_any_element()
+    }
+}
+
+fn centered_message(text: &str, p: &Palette) -> gpui::AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(20.))
+        .text_center()
+        .text_xs()
+        .text_color(hsla(p.muted_foreground).opacity(0.7))
+        .child(text.to_owned())
+        .into_any_element()
+}
+
+/// The strip above the files that says what the patch leaves out.
+fn notice(text: impl Into<gpui::SharedString>, p: &Palette) -> gpui::Div {
+    div()
+        .flex_none()
+        .border_b_1()
+        .border_color(hsla(p.border).opacity(0.7))
+        .bg(hsla(p.muted).opacity(0.4))
+        .px(px(12.))
+        .py(px(6.))
+        .text_size(px(11.))
+        .text_color(hsla(p.muted_foreground))
+        .child(text.into())
+}
+
+fn error_line(error: String, p: &Palette) -> gpui::Div {
+    div().px(px(12.)).mb(px(8.)).text_size(px(11.)).text_color(hsla(p.error).opacity(0.8)).child(error)
+}
+
+impl AppState {
+    /// `onOpenToolDiff`: a file change's "Open diff" shows that tool call's patch in the diff.
+    pub fn open_tool_call_diff(&mut self, target: ToolCallTarget, cx: &mut Context<Self>) {
+        // Opening resets a diff nobody asked for to the branch scope, so select after it.
+        self.mutate_panels(cx, |state, thread| {
+            state.panels.open(thread, Surface::diff());
+            true
+        });
+        self.select_diff(DiffSelection::ToolCall(target), cx);
     }
 }
 

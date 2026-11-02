@@ -15,7 +15,7 @@ use t3_core::timeline::{
 use t3_core::turn_item::TurnItemKind;
 
 use super::markdown::{MarkdownStore, prose};
-use super::parts::{chevron, focusable, icon_slot, mono_block, timestamp, work_line, work_row_frame};
+use super::parts::{chevron, focusable, icon_slot, mono_block, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -347,7 +347,7 @@ fn fetch_status(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> AnyElement {
 }
 
 /// The expanded body: `V2ItemInspector` for projected items, plain output for reads and skills.
-fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> Option<AnyElement> {
+fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<AnyElement> {
     let p = palette(cx);
     if tool_group_action(entry) == ToolGroupAction::Read {
         return work_entry_read_output(entry, env.workspace_root).map(|paths| mono_block(paths, cx).into_any_element());
@@ -391,6 +391,11 @@ fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> Option<AnyElem
                         .child(div().text_color(hsla(p.diff_addition_foreground)).child(format!("+{}", additions.unwrap_or(0))))
                         .child(div().text_color(hsla(p.diff_deletion_foreground)).child(format!("-{}", deletions.unwrap_or(0)))),
                 );
+            }
+            if env.tool_diffs {
+                let target = t3_core::diff::ToolCallTarget::of(item);
+                let open = cx.listener(move |view, _, _, cx| view.open_tool_call_diff(target.clone(), cx));
+                header = header.child(outline_button(SharedString::from(format!("open-tool-diff:{}", item.id)), "Open diff", open, cx));
             }
             parts.push(header.into_any_element());
             if item.status == "failed" && let Some(diff) = diff_str.as_deref().filter(|d| !d.trim().is_empty()) {

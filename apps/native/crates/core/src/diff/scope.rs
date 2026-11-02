@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::ToolCallTarget;
 use crate::thread::Entity;
 use crate::turn_item::{TurnItem, TurnItemKind};
 
@@ -14,7 +15,7 @@ pub mod method {
     pub const GET_DIFF_PREVIEW: &str = "review.getDiffPreview";
 }
 
-/// `DiffPanelSelection` without the tool-call and commit kinds, which native does not offer yet.
+/// `DiffPanelSelection` without the commit kind, which native does not offer yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DiffSelection {
@@ -23,6 +24,9 @@ pub enum DiffSelection {
     Unstaged,
     #[serde(rename_all = "camelCase")]
     Turn { turn_id: String, file_path: Option<String>, reveal_request_id: u64 },
+    /// One file-change tool call's recorded patch (`selectToolCall`).
+    #[serde(rename = "tool-call")]
+    ToolCall(ToolCallTarget),
 }
 
 impl Default for DiffSelection {
@@ -78,6 +82,7 @@ pub enum DiffScope {
     Turn { summary_index: usize, latest: bool },
     /// A turn selection on a thread with no completed turns.
     NoTurns,
+    ToolCall(ToolCallTarget),
 }
 
 impl DiffScope {
@@ -92,6 +97,7 @@ impl DiffScope {
                 let index = ordered.iter().position(|summary| summary.run_id == *turn_id).unwrap_or(0);
                 DiffScope::Turn { summary_index: index, latest: index == 0 }
             }
+            DiffSelection::ToolCall(target) => DiffScope::ToolCall(target.clone()),
         }
     }
 
@@ -103,6 +109,7 @@ impl DiffScope {
             DiffScope::Turn { latest: true, .. } => "Latest turn".to_owned(),
             DiffScope::Turn { summary_index, .. } => format!("Turn {}", ordered[*summary_index].turn_count),
             DiffScope::NoTurns => "Latest turn".to_owned(),
+            DiffScope::ToolCall(_) => "Tool call".to_owned(),
         }
     }
 }
