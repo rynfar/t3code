@@ -85,7 +85,10 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   [--context-meter] [--width 1440] [--height 900] [--dark | --light] [--wait 6]
 ```
 
-- `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher);
+- `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher),
+  `browser:new` for the browser's empty state, or `browser:<tab>` for an open preview session (open
+  one on a scratch server with `cargo run -p t3-client --example preview_probe -- --keep`, then
+  `--close <tab>`; viewing takes control of an unclaimed tab and resizes it);
   `--settings` a section (`appearance`, `chat`, `keybindings`, …).
 - `--usage` opens the Usage page on a metric and waits for its summary; `--usage-model` opens
   the top model's breakdown. Limits skips its provider refresh so the run stays read-only.

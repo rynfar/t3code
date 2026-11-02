@@ -1,8 +1,8 @@
 //! Lucide icons vendored at the web's version (`lucide-react` 0.564.0) with the web's stroke
 //! baked in (design system §8): 1.75 by default, 2 under `stroke-2/` for work-row icons. The
 //! composer's own glyphs (send arrow, stop square, filled star and bolt) live under `composer/`,
-//! and provider brand marks under `providers/`. The asset source also serves gpui-component's own
-//! icons, which its `IconName` widgets load.
+//! provider brand marks under `providers/`, and the preview browser's own marks under `preview/`.
+//! The asset source also serves gpui-component's own icons, which its `IconName` widgets load.
 
 use std::borrow::Cow;
 
@@ -74,6 +74,7 @@ icons! {
     CornerLeftUp => "icons/lucide/corner-left-up.svg",
     CornerUpRight => "icons/lucide/corner-up-right.svg",
     Download => "icons/lucide/download.svg",
+    Earth => "icons/lucide/earth.svg",
     Ellipsis => "icons/lucide/ellipsis.svg",
     ExternalLink => "icons/lucide/external-link.svg",
     Eye => "icons/lucide/eye.svg",
@@ -92,6 +93,7 @@ icons! {
     FolderPlus => "icons/lucide/folder-plus.svg",
     FolderTree => "icons/lucide/folder-tree.svg",
     Gauge => "icons/lucide/gauge.svg",
+    Globe => "icons/lucide/globe.svg",
     GitBranch => "icons/lucide/git-branch.svg",
     GitBranchPlus => "icons/lucide/git-branch-plus.svg",
     GitCommit => "icons/lucide/git-commit-horizontal.svg",
@@ -103,6 +105,7 @@ icons! {
     GitPullRequestDraft => "icons/lucide/git-pull-request-draft.svg",
     Hammer => "icons/lucide/hammer.svg",
     Hash => "icons/lucide/hash.svg",
+    History => "icons/lucide/history.svg",
     Image => "icons/lucide/image.svg",
     Info => "icons/lucide/info.svg",
     Keyboard => "icons/lucide/keyboard.svg",
@@ -138,6 +141,7 @@ icons! {
     PinOff => "icons/lucide/pin-off.svg",
     Play => "icons/lucide/play.svg",
     Plus => "icons/lucide/plus.svg",
+    RadioTower => "icons/lucide/radio-tower.svg",
     Redo2 => "icons/lucide/redo-2.svg",
     RefreshCw => "icons/lucide/refresh-cw.svg",
     QrCode => "icons/lucide/qr-code.svg",
@@ -202,6 +206,9 @@ icons! {
     WorkWrench => "icons/lucide/stroke-2/wrench.svg",
     WorkX => "icons/lucide/stroke-2/x.svg",
     WorkZap => "icons/lucide/stroke-2/zap.svg",
+    AgentPointer => "icons/lucide/stroke-2/mouse-pointer-2.svg",
+    AgentPointerFill => "icons/preview/mouse-pointer-2-fill.svg",
+    PreviewError => "icons/preview/error.svg",
 }
 
 impl Icon {

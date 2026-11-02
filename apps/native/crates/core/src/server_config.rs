@@ -512,6 +512,9 @@ pub struct EnvironmentCapabilities {
     pub settled_worktree_cleanup: Option<bool>,
     #[serde(default)]
     pub one_time_schedules: Option<bool>,
+    /// The server hosts headless Chromium tabs streamed over `/api/preview-stream`.
+    #[serde(default)]
+    pub server_browser: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

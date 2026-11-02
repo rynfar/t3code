@@ -4,6 +4,7 @@ pub mod auth;
 pub mod favicon;
 pub mod history;
 pub mod local;
+pub mod preview_stream;
 pub mod pull_requests;
 pub mod session;
 pub mod status;
