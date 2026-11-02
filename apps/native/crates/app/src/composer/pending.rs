@@ -276,6 +276,7 @@ impl Composer {
                             .text_color(hsla(p.foreground))
                             .child(SharedString::from(approval.detail.clone().unwrap_or_else(|| detail_label.to_owned()))),
                     )
+                    .children(approval.app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
                     .children(approval.reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
                     .child(match approval.live {
                         true => h_flex()
@@ -289,6 +290,15 @@ impl Composer {
                                     .child("Waiting for approval"),
                             )
                             .child(actions)
+                            .children(approval.full_access_override.as_deref().map(|kind| {
+                                let explanation = requests::full_access_override_explanation(kind);
+                                div()
+                                    .id("full-access-override")
+                                    .text_color(hsla(p.muted_foreground))
+                                    .hover(|this| this.underline())
+                                    .child(requests::FULL_ACCESS_OVERRIDE_QUESTION)
+                                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(explanation).build(window, cx))
+                            }))
                             .into_any_element(),
                         false => div()
                             .text_color(hsla(p.warning_foreground))

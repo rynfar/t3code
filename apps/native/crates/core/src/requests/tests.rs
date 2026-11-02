@@ -53,7 +53,8 @@ fn pending_approvals_join_their_turn_item_and_sort_oldest_first() {
         ],
         vec![
             item("i1", json!({"type": "approval_request", "requestId": "a2", "requestKind": "command",
-                              "prompt": "rm -rf build", "reason": "", "options": [
+                              "prompt": "rm -rf build", "reason": "", "fullAccessOverride": "ask_rule", "appName": "",
+                              "options": [
                                   {"decision": "accept", "label": "Run it"},
                                   {"decision": "acceptAlways", "label": "Always", "warning": "Risky"},
                                   {"decision": "bogus", "label": "?"}]})),
@@ -69,6 +70,10 @@ fn pending_approvals_join_their_turn_item_and_sort_oldest_first() {
     assert!(second.live && second.supports_feedback);
     assert_eq!(second.detail.as_deref(), Some("rm -rf build"));
     assert_eq!(second.reason, None);
+    assert_eq!(second.app_name, None);
+    assert_eq!(second.full_access_override.as_deref(), Some("ask_rule"));
+    assert!(full_access_override_explanation("ask_rule").contains("ask rule"));
+    assert_eq!(first.full_access_override, None);
     assert_eq!(second.options.len(), 2);
     let (primary, more) = second.split_options();
     assert_eq!(primary.len(), 1);
@@ -81,14 +86,19 @@ fn pending_questions_need_their_turn_item_and_message_mode_is_dismissible() {
         vec![
             request("q1", "user_input", "pending", json!({"type": "message"}), T),
             request("q2", "user_input", "pending", live(false), T),
+            request("q3", "user_input", "pending", live(false), "2026-11-01T00:00:01.000Z"),
         ],
-        vec![item("i1", json!({"type": "user_input_request", "requestId": "q1", "questions": [
-            {"id": "color", "header": "Color", "question": "Which color?",
-             "options": [{"label": "Red", "description": "Warm"}, {"label": "Blue", "description": "Cool", "value": "blue"}]}
-        ]}))],
+        vec![
+            item("i1", json!({"type": "user_input_request", "requestId": "q1", "questions": [
+                {"id": "color", "header": "Color", "question": "Which color?",
+                 "options": [{"label": "Red", "description": "Warm"}, {"label": "Blue", "description": "Cool", "value": "blue"}]}
+            ]})),
+            item("i3", json!({"type": "user_input_request", "requestId": "q3", "responseMode": "message", "questions": []})),
+        ],
     );
     let pending = pending_requests(&projection);
-    assert_eq!(pending.user_inputs.len(), 1);
+    assert_eq!(pending.user_inputs.len(), 2);
+    assert!(pending.user_inputs[1].dismissible);
     let input = &pending.user_inputs[0];
     assert!(input.dismissible && input.can_respond());
     assert!(!input.questions[0].multi_select);

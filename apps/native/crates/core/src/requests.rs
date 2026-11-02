@@ -62,6 +62,9 @@ pub struct PendingApproval {
     pub created_at: String,
     pub detail: Option<String>,
     pub reason: Option<String>,
+    /// Why a full-access thread still asks: `ask_rule` or `provider_check`.
+    pub full_access_override: Option<String>,
+    pub app_name: Option<String>,
     pub options: Vec<ApprovalOption>,
     /// The provider can still take an answer (`responseCapability.type === "live"`).
     pub live: bool,
@@ -85,6 +88,17 @@ impl PendingApproval {
         self.options
             .iter()
             .partition(|option| matches!(option.decision, ApprovalDecision::Decline | ApprovalDecision::Accept))
+    }
+}
+
+pub const FULL_ACCESS_OVERRIDE_QUESTION: &str = "Why am I being asked this?";
+
+/// `fullAccessOverrideExplanation`.
+pub fn full_access_override_explanation(full_access_override: &str) -> &'static str {
+    if full_access_override == "ask_rule" {
+        "Full access skips approvals, but an ask rule in the agent's own settings matches this action, so it still asks. Remove or narrow that rule to stop these prompts."
+    } else {
+        "Full access skips approvals, but the agent still stops for a few safety checks of its own that no setting can skip, such as a delete whose path it can't verify. T3 Code can't turn these off, so check the request and approve it if it's what you expect."
     }
 }
 
@@ -180,16 +194,18 @@ pub fn pending_requests(projection: &ThreadProjection) -> PendingRequests {
         let Ok(request) = RuntimeRequest::deserialize(&entity.value) else { continue };
         let capability = request.response_capability.kind.clone();
         if request.kind == "user_input" {
-            let questions = projection.turn_items.iter().rev().find_map(|item| match &item.kind {
-                TurnItemKind::UserInputRequest { request_id, questions, .. } if *request_id == request.id => Some(questions),
+            let found = projection.turn_items.iter().rev().find_map(|item| match &item.kind {
+                TurnItemKind::UserInputRequest { request_id, questions, response_mode, .. } if *request_id == request.id => {
+                    Some((questions, response_mode))
+                }
                 _ => None,
             });
-            let Some(questions) = questions else { continue };
+            let Some((questions, response_mode)) = found else { continue };
             pending.user_inputs.push(PendingUserInput {
                 request_id: request.id,
                 created_at: request.created_at,
                 questions: questions.iter().filter_map(|q| Question::deserialize(q).ok()).collect(),
-                dismissible: capability == "message",
+                dismissible: response_mode.as_deref() == Some("message") || capability == "message",
                 response_capability: capability,
             });
             continue;
@@ -198,17 +214,21 @@ pub fn pending_requests(projection: &ThreadProjection) -> PendingRequests {
             continue;
         }
         let item = projection.turn_items.iter().rev().find_map(|item| match &item.kind {
-            TurnItemKind::ApprovalRequest { request_id, prompt, reason, options, .. } if *request_id == request.id => {
-                Some((prompt, reason, options))
+            TurnItemKind::ApprovalRequest { request_id, prompt, reason, options, full_access_override, app_name, .. }
+                if *request_id == request.id =>
+            {
+                Some((prompt, reason, options, full_access_override, app_name))
             }
             _ => None,
         });
         let non_empty = |text: &Option<String>| text.clone().filter(|text| !text.is_empty());
         pending.approvals.push(PendingApproval {
-            detail: item.and_then(|(prompt, _, _)| non_empty(prompt)),
-            reason: item.and_then(|(_, reason, _)| non_empty(reason)),
+            detail: item.and_then(|(prompt, ..)| non_empty(prompt)),
+            reason: item.and_then(|(_, reason, ..)| non_empty(reason)),
+            full_access_override: item.and_then(|(.., full_access, _)| full_access.clone()),
+            app_name: item.and_then(|(.., app_name)| non_empty(app_name)),
             options: item
-                .and_then(|(_, _, options)| options.as_deref())
+                .and_then(|(_, _, options, ..)| options.as_deref())
                 .map(approval_options)
                 .unwrap_or_else(default_approval_options),
             live: capability == "live",
