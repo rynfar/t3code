@@ -1,0 +1,59 @@
+---
+name: test-t3-native
+description: Build, launch, pair, and screenshot the native GPUI client (apps/native) against an isolated T3 dev server. Use to verify native UI changes, capture before/after evidence, or get a runtime transcript of the native client's protocol handling.
+---
+
+# Test the native client
+
+The native app is a real macOS window. Verify it against the worktree's isolated dev server,
+never against `~/.t3/userdata`, and never with the developer's saved native connection.
+
+## 1. Dev server
+
+Reuse a healthy dev server for this worktree if one is running. Otherwise, from the repo root,
+start `vp run dev:server` in the background and keep its PID. Read the real HTTP port from the
+`[dev-runner]` line. Seed data first if `.t3/userdata/statev2.sqlite` is missing
+(`vp run migrate-dev-db` with the server stopped); an empty database is a bad test.
+
+Mint a pairing link (standard scopes) with the server's home:
+
+```sh
+node apps/server/src/bin.ts pair --base-dir "$PWD/.t3"   # check `--help` if flags moved
+```
+
+Never print or commit the token. Never consume the developer's own pairing links.
+
+## 2. Build and launch
+
+```sh
+cd apps/native
+export T3_NATIVE_HOME="$(git rev-parse --show-toplevel)/.t3/native"   # isolated credentials
+cargo build -p t3-native
+cargo run -p t3-native &   # keep the PID you spawned; stop only that PID
+```
+
+Headless check of the same path (pairs once, then reuses the saved credentials in
+`T3_NATIVE_HOME`):
+
+```sh
+cargo run -p t3-client --example probe -- --pair '<pairing link>' --seconds 5
+cargo run -p t3-client --example probe -- --thread <thread-id> --seconds 10
+```
+
+## 3. Drive and capture
+
+- First launch shows the connect screen; paste the pairing link (or run the probe with
+  `--pair` first so the app starts already paired).
+- Screenshot only the app's window:
+
+```sh
+apps/native/scripts/snap.sh /path/to/out.png
+```
+
+- Show the user what you captured with the host's image tool (Zeron: `show_image`).
+- Real agent turns cost money: use the `Replay (dev)` provider for streaming tests, or a
+  provider's cheapest model when the change depends on that provider.
+
+## 4. Clean up
+
+Stop the app and dev server by the PIDs you captured. Never kill by name or pattern.

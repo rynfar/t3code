@@ -1,0 +1,13 @@
+[package]
+name = "t3-core"
+description = "T3 Code wire types, Effect RPC framing, and the client-side reducers. Pure: no I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/client", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+t3-core = { path = "crates/core" }
+t3-client = { path = "crates/client" }
+
+# GPUI from Zeron's fork (zeronsh/zui), extracted from Zed with identical crate sources plus
+# macOS rendering fixes. gpui-component at this rev is pinned to the same zui rev.
+gpui = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6", features = [
+  "font-kit",
+  "runtime_shaders",
+] }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
+gpui-component = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
+
+anyhow = "1"
+futures = "0.3"
+mimalloc = { version = "0.1", features = ["v2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+
+[profile.dev]
+opt-level = 0
+
+# GPUI is unusably slow unoptimized; optimize dependencies, keep our crates fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 16
