@@ -5,8 +5,10 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
 
 use crate::app_state::{AppEvent, AppState, Phase};
+use crate::chat_header::{self, ChatHeader};
 use crate::composer::{Composer, OpenPermissions, ToggleModelPicker};
 use crate::connect::ConnectView;
+use crate::git::GitDialogs;
 use crate::new_thread::{self, DraftHero};
 use crate::context_menu::ContextMenu;
 use crate::dialog::ConfirmDialog;
@@ -16,11 +18,12 @@ use crate::keymap::{
     JumpToThread9, NextThread, PinThread, PreviousThread, SettleThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch, ToggleSidebar, UndoThreadAction, Unimplemented,
 };
 use crate::palette::{CommandPalette, Mode as PaletteMode};
-use crate::right_panel::{self, RightPanelView};
+use crate::right_panel::RightPanelView;
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
 use crate::terminal::{self, TerminalDrawer, ToggleTerminal};
 use crate::theme::{hsla, palette};
+use crate::thread_details::{self, DetailsEvent, DetailsView};
 use crate::thread_view::ThreadView;
 
 pub const TITLEBAR_HEIGHT: f32 = 52.;
@@ -39,6 +42,9 @@ pub struct Workspace {
     snooze: Entity<SnoozeDialog>,
     right_panel: Entity<RightPanelView>,
     terminal: Entity<TerminalDrawer>,
+    header: Entity<ChatHeader>,
+    details: Entity<DetailsView>,
+    git_dialogs: Entity<GitDialogs>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -55,6 +61,11 @@ impl Workspace {
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(state.clone(), window, cx));
         let terminal = cx.new(|cx| TerminalDrawer::new(state.clone(), window, cx));
+        let header = cx.new(|cx| ChatHeader::new(state.clone(), menu.clone(), window, cx));
+        let details_model = thread_details::init(state.clone(), cx);
+        let git = details_model.read(cx).git.clone();
+        let git_dialogs = cx.new(|cx| GitDialogs::new(git, window, cx));
+        let details = cx.new(|cx| DetailsView::new(state.clone(), details_model.clone(), git_dialogs.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
@@ -62,6 +73,7 @@ impl Workspace {
                 }
             }),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.subscribe(&details_model, |_, _, _: &DetailsEvent, cx| cx.notify()),
             // Coming back to the app retires its delivered notifications, as the web's focus does.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -69,10 +81,27 @@ impl Workspace {
                 }
             }),
         ];
-        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, right_panel, terminal, _subscriptions: subscriptions }
+        Workspace {
+            state,
+            sidebar,
+            thread,
+            composer,
+            draft,
+            connect,
+            menu,
+            dialog,
+            palette,
+            snooze,
+            right_panel,
+            terminal,
+            header,
+            details,
+            git_dialogs,
+            _subscriptions: subscriptions,
+        }
     }
 
-    fn render_titlebar(&self, cx: &App) -> impl IntoElement {
+    fn render_titlebar(&self, window: &Window, cx: &App) -> impl IntoElement {
         let state = self.state.read(cx);
         let status = match &state.phase {
             Phase::Online(ConnectionStatus::Connected) => None,
@@ -81,7 +110,7 @@ impl Workspace {
             Phase::Online(ConnectionStatus::NeedsPairing { reason }) => Some(reason.clone()),
             Phase::Pairing | Phase::Unpaired { .. } => None,
         };
-        let panel_open = state.selected_thread.as_deref().is_some_and(|thread| state.panels.panels.is_open(thread));
+        let terminal_toggle = state.selected_thread.is_some().then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
         let theme = cx.theme();
         let collapsed = state.sidebar.collapsed;
         h_flex()
@@ -93,11 +122,10 @@ impl Workspace {
             .gap_3()
             .border_b_1()
             .border_color(theme.border)
-            .child(new_thread::breadcrumb(&self.state, cx))
+            .child(self.header.clone())
             .children(status.map(|status| div().text_xs().text_color(theme.muted_foreground).child(status)))
             .child(new_thread::new_thread_button(cx))
-            .when(state.selected_thread.is_some(), |this| this.child(terminal::header_toggle(&self.terminal, cx)))
-            .when(!panel_open, |this| this.child(right_panel::header_controls(&self.state, cx)))
+            .child(chat_header::controls(&self.state, terminal_toggle, window, cx))
     }
 }
 
@@ -118,6 +146,7 @@ impl Render for Workspace {
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
         let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
         let drawer = self.terminal.clone();
+        let details_layout = thread_details::layout(&self.state, window, cx);
         h_flex()
             .relative()
             .size_full()
@@ -189,12 +218,21 @@ impl Render for Workspace {
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .child(self.render_titlebar(cx))
+                    .child(self.render_titlebar(window, cx))
                     .when(has_thread, |this| {
-                        // Cached so terminal output repaints do not re-render the transcript.
-                        this.child(div().flex_1().min_h_0().child(self.thread.clone().cached(gpui::StyleRefinement::default().size_full())))
-                            .child(self.composer.clone())
-                            .child(self.terminal.clone())
+                        // The inline details card sits over the canvas; the lane moves left to clear it.
+                        this.child(
+                            v_flex()
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .pr(px(details_layout.lane_inset))
+                                // Cached so terminal output repaints do not re-render the transcript.
+                                .child(div().flex_1().min_h_0().child(self.thread.clone().cached(gpui::StyleRefinement::default().size_full())))
+                                .child(self.composer.clone())
+                                .child(self.details.clone()),
+                        )
+                        .child(self.terminal.clone())
                     })
                     .when(has_draft, |this| this.child(div().flex_1().min_h_0().child(self.draft.clone())))
                     .when(!has_thread && !has_draft, |this| {
@@ -215,6 +253,7 @@ impl Render for Workspace {
             .child(self.render_sidebar_toggle(cx))
             .child(self.menu.clone())
             .child(self.dialog.clone())
+            .child(self.git_dialogs.clone())
             .child(self.snooze.clone())
             .child(self.palette.clone())
             .children(toast.map(|toast| {

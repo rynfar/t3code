@@ -22,6 +22,9 @@ pub struct ProjectShell {
     pub pinned_at: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
+    /// `ProjectScript[]`, kept raw: the thread details decode them (`project_scripts`).
+    #[serde(default)]
+    pub scripts: Vec<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }

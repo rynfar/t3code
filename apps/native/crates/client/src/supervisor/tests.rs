@@ -167,3 +167,28 @@ async fn each_connection_fetches_the_grants_and_a_refresh_picks_up_changes() {
     let state = next_grants(&mut grants).await;
     assert!(state.grants("terminal:read") && !state.grants("terminal:operate"));
 }
+
+#[tokio::test]
+async fn streams_deliver_chunks_and_interrupt_when_dropped() {
+    let mut server = FakeServer::start().await;
+    let (client, _events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut connection = server.connection().await;
+    answer_config(&mut connection, None).await;
+    connection.request(method::SUBSCRIBE_SHELL).await;
+
+    let mut stream = client.stream("subscribeVcsStatus", json!({ "cwd": "/repo" })).await.expect("stream opens");
+    let request = connection.request("subscribeVcsStatus").await;
+    assert_eq!(request["payload"]["cwd"], "/repo");
+    connection.chunk(&request, json!([{ "_tag": "snapshot", "local": {}, "remote": null }])).await;
+    let value = tokio::time::timeout(Duration::from_secs(10), stream.receiver.recv()).await.expect("a chunk").expect("open").expect("ok");
+    assert_eq!(value["_tag"], "snapshot");
+
+    drop(stream);
+    loop {
+        let message = connection.recv().await;
+        if message["_tag"] == "Interrupt" {
+            assert_eq!(message["requestId"], request["id"]);
+            break;
+        }
+    }
+}
