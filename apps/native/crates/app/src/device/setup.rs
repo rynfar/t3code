@@ -218,7 +218,7 @@ impl DeviceSetupDialog {
 }
 
 /// `DeviceHubSetupStatus` and `AgentDeviceSetupStatus`: a check or a static spinner and a line.
-fn setup_status(status: Option<SetupStatus>, cx: &App) -> Option<AnyElement> {
+pub(crate) fn setup_status(status: Option<SetupStatus>, cx: &App) -> Option<AnyElement> {
     let status = status?;
     let p = palette(cx);
     let icon = if status.pending { Icon::LoaderCircle.svg().size(px(12.)).text_color(hsla(p.muted_foreground)) } else { Icon::Check.svg().size(px(12.)).text_color(hsla(p.success)) };

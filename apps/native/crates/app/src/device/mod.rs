@@ -19,6 +19,7 @@ use t3_core::right_panel::{DeviceTarget, RightPanels, Surface};
 
 pub use pane::DevicePane;
 pub use setup::DeviceSetupDialog;
+pub(crate) use setup::setup_status;
 
 use crate::app_state::{AppEvent, AppState};
 

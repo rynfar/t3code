@@ -267,6 +267,7 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
             Section::Keybindings,
             Section::Providers,
             Section::Threads,
+            Section::Devices,
             Section::ScheduledTasks,
             Section::Projects,
             Section::SourceControl,
