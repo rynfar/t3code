@@ -9,6 +9,7 @@ mod environments;
 mod files;
 mod git;
 mod glass;
+mod home;
 mod icons;
 mod keymap;
 mod media;

@@ -64,6 +64,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "navigation.forward" => Box::new(NavigateForward),
         "projectSearch.toggle" => Box::new(ToggleProjectSearch),
         "chat.new" => Box::new(crate::new_thread::NewThread),
+        "chat.newWithoutProject" => Box::new(crate::new_thread::NewThreadWithoutProject),
         "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),

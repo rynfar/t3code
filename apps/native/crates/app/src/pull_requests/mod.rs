@@ -15,7 +15,7 @@ mod thread_panel;
 mod timeline;
 mod toolbar;
 
-use gpui::{App, Context, Entity, FontWeight, IntoElement, ParentElement, Styled, Window, actions, div, prelude::*, px};
+use gpui::{App, Context, Entity, Window, actions};
 use serde_json::Value;
 use t3_client::session::RpcError;
 use t3_core::pull_requests::failure_message;
@@ -26,8 +26,6 @@ pub use page::PullRequestsPage;
 pub use thread_panel::ThreadPullRequestsPanel;
 
 use crate::app_state::{AppEvent, AppState};
-use crate::icons::Icon;
-use crate::theme::{hsla, palette};
 
 actions!(pull_requests, [OpenPullRequests, ClosePullRequests, LinkPullRequest, ShowLinkedPullRequests, CopyPullRequestNumber]);
 
@@ -37,6 +35,7 @@ impl AppState {
         if self.pull_requests_open != open {
             self.pull_requests_open = open;
             cx.emit(AppEvent::Selection);
+            self.land_home(cx);
         }
     }
 }
@@ -81,36 +80,6 @@ pub(crate) async fn settle<T>(task: Read<T>) -> Result<T, String> {
 }
 
 pub(crate) const NOT_CONNECTED: &str = "Not connected to the server.";
-
-/// The sidebar footer's utility item (`SidebarUtilityMenu`): an icon button for "Pull requests",
-/// or "Back" with its label while the page is open. Sidebar menu buttons (design-system §6.8),
-/// a tab stop that Enter and Space press.
-pub fn sidebar_item(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement {
-    let p = palette(cx);
-    let open = state.read(cx).pull_requests_open;
-    let state = state.clone();
-    let button = crate::right_panel::focusable(div().id("sidebar-pull-requests"), "sidebar-pull-requests".into(), true, window, cx)
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .h(px(32.))
-        .rounded(px(8.))
-        .cursor_pointer()
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(hsla(p.sidebar_muted_foreground).opacity(0.8))
-        .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
-        .on_click(move |_, _, cx| state.update(cx, |state, cx| state.set_pull_requests_open(!open, cx)));
-    if open {
-        button.flex_1().px(px(10.)).child(Icon::ArrowLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon))).child("Back")
-    } else {
-        button
-            .w(px(32.))
-            .justify_center()
-            .child(Icon::GitPullRequestArrow.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
-            .tooltip(|window, cx| crate::right_panel::tooltip_view("Pull requests".into(), window, cx))
-    }
-}
 
 /// Opens the link dialog for the open thread (`openLinkPullRequestDialog`).
 pub fn open_link_dialog(dialog: &Entity<LinkPullRequestDialog>, window: &mut Window, cx: &mut App) {

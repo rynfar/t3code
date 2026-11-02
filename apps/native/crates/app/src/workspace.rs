@@ -38,6 +38,7 @@ pub struct Workspace {
     lineage: Entity<crate::lineage::ComposerLineage>,
     composer_replaced: bool,
     draft: Entity<DraftHero>,
+    home: Entity<crate::home::HomeView>,
     connect: Entity<ConnectView>,
     menu: Entity<ContextMenu>,
     dialog: Entity<ConfirmDialog>,
@@ -64,6 +65,7 @@ impl Workspace {
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
         let lineage = cx.new(|cx| crate::lineage::ComposerLineage::new(state.clone(), cx));
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
+        let home = cx.new(|cx| crate::home::HomeView::new(state.clone(), cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(state.clone(), window, cx));
         let terminal = cx.new(|cx| TerminalDrawer::new(state.clone(), window, cx));
@@ -104,6 +106,7 @@ impl Workspace {
             lineage,
             composer_replaced: false,
             draft,
+            home,
             connect,
             menu,
             dialog,
@@ -300,18 +303,7 @@ impl Render for Workspace {
                         .child(self.terminal.clone())
                     })
                     .when(has_draft, |this| this.child(div().flex_1().min_h_0().child(self.draft.clone())))
-                    .when(!has_thread && !has_draft, |this| {
-                        this.child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Select a thread"),
-                        )
-                    }),
+                    .when(!has_thread && !has_draft, |this| this.child(div().flex_1().min_h_0().child(self.home.clone()))),
                 )
             })
             .when(!on_pull_requests, |this| this.child(self.right_panel.clone()))

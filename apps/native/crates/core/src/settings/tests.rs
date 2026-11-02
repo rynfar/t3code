@@ -311,13 +311,151 @@ fn keybinding_rows_group_by_command_and_label_like_the_web() {
     assert_eq!(rows[1].shortcuts, vec!["⌃⌥J"]);
     let other = keybindings::rows(&config, false);
     assert_eq!(other[0].shortcuts, vec!["Ctrl+N", "Ctrl+Shift+O"]);
-    assert_eq!(keybindings::filter(&rows, "terminal").len(), 1);
-    let grouped = keybindings::groups(&keybindings::filter(&rows, ""));
-    assert_eq!(grouped.iter().map(|(title, rows)| (*title, rows.len())).collect::<Vec<_>>(), vec![("Threads", 1), ("Terminal", 1)]);
-    assert_eq!(keybindings::filter(&rows, "⌘n").len(), 1);
     assert_eq!(keybindings::command_label("sidebar.toggleProjectFilter"), "Sidebar: Toggle Project Filter");
     assert_eq!(keybindings::command_label("script.build-app.run"), "Run Script: Build App");
     assert_eq!(keybindings::command_label("composer.sendAlternate"), "Composer: Opposite Queue or Steer Action");
+}
+
+fn shortcut(key: &str, modifiers: &[&str]) -> serde_json::Value {
+    let has = |name: &str| modifiers.contains(&name);
+    json!({"key": key, "metaKey": has("meta"), "ctrlKey": has("ctrl"), "shiftKey": has("shift"), "altKey": has("alt"), "modKey": has("mod")})
+}
+
+#[test]
+fn binding_rows_mark_sources_defaults_and_conflicts() {
+    let not_terminal = json!({"type": "not", "node": {"type": "identifier", "name": "terminalFocus"}});
+    let config = json!([
+        // A default, untouched.
+        {"command": "sidebar.toggle", "shortcut": shortcut("b", &["mod"])},
+        // chat.new rebound: its defaults drop out and the custom binding remembers them.
+        {"command": "chat.new", "shortcut": shortcut("k", &["mod"]), "whenAst": not_terminal},
+        {"command": "script.build.run", "shortcut": shortcut("r", &["mod", "shift"])},
+    ]);
+    let rows = keybindings::binding_rows(&config, true);
+    let row = |command: &str| rows.iter().find(|row| row.command == command).unwrap();
+    assert_eq!(row("sidebar.toggle").source, keybindings::BindingSource::Default);
+    assert!(!row("sidebar.toggle").can_remove() && !row("sidebar.toggle").can_reset());
+    let custom = row("chat.new");
+    assert_eq!((custom.key.as_str(), custom.when.as_str()), ("mod+k", "!terminalFocus"));
+    assert_eq!(custom.source, keybindings::BindingSource::Custom);
+    assert_eq!((custom.default_key.as_deref(), custom.default_when.as_str()), (Some("mod+n"), "!terminalFocus"));
+    assert!(custom.can_reset() && custom.can_remove());
+    assert_eq!(rows.iter().filter(|row| row.command == "chat.new").count(), 1);
+    assert_eq!(row("script.build.run").source, keybindings::BindingSource::Project);
+    // mod+k now also opens the palette where the terminal is not focused.
+    assert_eq!(custom.conflicts, vec!["Command Palette: Toggle"]);
+    assert_eq!(row("commandPalette.toggle").conflicts, vec!["Chat: New"]);
+    // terminal.new (terminalFocus) and the default chat.new (!terminalFocus) both use mod+n but never overlap.
+    assert!(row("terminal.new").conflicts.is_empty());
+    // Usage commands keep their own order; everything else sorts by command id.
+    let usage: Vec<&str> = rows.iter().map(|row| row.command.as_str()).filter(|command| command.starts_with("usage.")).collect();
+    assert_eq!(&usage[..3], ["usage.open", "usage.cost", "usage.tokens"]);
+    assert!(rows.windows(2).all(|pair| pair[0].command.starts_with("usage.") || pair[1].command.starts_with("usage.") || pair[0].command <= pair[1].command));
+
+    assert_eq!(keybindings::filter_binding_rows(&rows, "custom").len(), 1);
+    assert_eq!(keybindings::filter_binding_rows(&rows, "MOD+K").len(), 2);
+    let grouped = keybindings::group_binding_rows(&keybindings::filter_binding_rows(&rows, "mod+k"));
+    assert_eq!(grouped.iter().map(|(title, rows)| (*title, rows.len())).collect::<Vec<_>>(), vec![("Navigation", 1), ("Threads", 1)]);
+    let options = keybindings::command_options(&config);
+    assert!(options.contains(&"script.build.run".to_owned()) && options.contains(&"chat.newLocal".to_owned()));
+}
+
+#[test]
+fn conflicts_compare_resolved_chords_per_platform() {
+    let config = json!([{"command": "chat.find", "shortcut": shortcut("f", &["ctrl"])}]);
+    let rows = keybindings::binding_rows(&config, false);
+    // Off macOS, mod is Ctrl: a ctrl+f binding collides with mod+f, but meta+f does not.
+    assert_eq!(keybindings::conflict_labels(&rows, "new", "mod+f", "", false), vec!["Chat: Find"]);
+    assert!(keybindings::conflict_labels(&rows, "new", "meta+f", "", false).is_empty());
+    assert!(keybindings::conflict_labels(&rows, "new", "", "", false).is_empty());
+    assert_eq!(keybindings::conflict_description(&["A".into(), "B".into(), "C".into(), "D".into()]).unwrap(), "Conflicts with A, B, C, and more.");
+}
+
+#[test]
+fn recording_turns_keystrokes_into_keybinding_inputs() {
+    let us = |key, platform, control, alt, shift, mac| keybindings::keybinding_from_keystroke(key, platform, control, alt, shift, mac, None::<&std::collections::HashMap<char, char>>);
+    assert_eq!(us("k", true, false, false, true, true).as_deref(), Some("mod+shift+k"));
+    assert_eq!(us("k", false, true, false, false, true).as_deref(), Some("ctrl+k"));
+    assert_eq!(us("k", true, true, true, false, false).as_deref(), Some("mod+meta+alt+k"));
+    // macOS reports Cmd+Shift+[ as cmd-{ without Shift.
+    assert_eq!(us("{", true, false, false, false, true).as_deref(), Some("mod+shift+["));
+    assert_eq!(us("up", false, false, true, false, true).as_deref(), Some("alt+arrowup"));
+    assert_eq!(us("space", true, false, false, false, true).as_deref(), Some("mod+space"));
+    assert_eq!(us("f6", false, false, false, true, true).as_deref(), Some("shift+f6"));
+    assert_eq!(us("capslock", false, false, false, false, true), None);
+    assert_eq!(us("shift", false, false, false, true, true), None);
+    // Other layouts keep their glyph, as the web's `recordedLayoutShortcutKey` does. GPUI's key
+    // equivalents map each US character to the layout's at the same position.
+    let layout = |pairs: &[(char, char)]| pairs.iter().copied().collect::<std::collections::HashMap<char, char>>();
+    let british = layout(&[('#', '£')]);
+    let record = |key, shift, layout| keybindings::keybinding_from_keystroke(key, true, false, false, shift, true, Some(layout));
+    assert_eq!(record("£", false, &british).as_deref(), Some("mod+shift+£"));
+    assert_eq!(record("@", false, &british).as_deref(), Some("mod+shift+2"));
+    let unshifted_hash = layout(&[('\\', '#'), ('#', '§')]);
+    assert_eq!(record("#", false, &unshifted_hash).as_deref(), Some("mod+#"));
+    assert_eq!(record("§", false, &unshifted_hash).as_deref(), Some("mod+shift+§"));
+    // GPUI clears Shift on a shifted non-ASCII letter and reports it upper-cased.
+    assert_eq!(record("Ö", false, &layout(&[(';', 'ö')])).as_deref(), Some("mod+shift+ö"));
+    assert_eq!(keybindings::key_pill_parts("mod+shift+k", true), vec!["⌘", "⇧", "K"]);
+    assert_eq!(keybindings::key_pill_parts("mod+alt+arrowup", false), vec!["Ctrl", "Alt", "arrowup"]);
+}
+
+#[test]
+fn edit_payloads_replace_the_row_they_came_from() {
+    let config = json!([{"command": "chat.new", "shortcut": shortcut("k", &["mod"]), "whenAst": {"type": "identifier", "name": "isDesktop"}}]);
+    let rows = keybindings::binding_rows(&config, true);
+    let row = rows.iter().find(|row| row.command == "chat.new").unwrap();
+    assert_eq!(
+        keybindings::upsert_payload(&row.command, " mod+j ", " ", Some(row)),
+        json!({"command": "chat.new", "key": "mod+j", "replace": {"command": "chat.new", "key": "mod+k", "when": "isDesktop"}})
+    );
+    assert_eq!(keybindings::upsert_payload("terminal.toggle", "ctrl+`", "terminalOpen", None), json!({"command": "terminal.toggle", "key": "ctrl+`", "when": "terminalOpen"}));
+    assert_eq!(keybindings::remove_payload(row), json!({"command": "chat.new", "key": "mod+k", "when": "isDesktop"}));
+    // No default shares `isDesktop`, so reset falls back to the command's first default.
+    assert_eq!(
+        keybindings::reset_payload(row).unwrap(),
+        json!({"command": "chat.new", "key": "mod+n", "when": "!terminalFocus", "replace": {"command": "chat.new", "key": "mod+k", "when": "isDesktop"}})
+    );
+}
+
+#[test]
+fn when_builder_edits_round_trip_through_expressions() {
+    use crate::keybindings::parse_keybinding_when_expression as parse;
+    use keybindings::{WhenEdit, WhenOperator, apply_when_edit, when_ast_to_expression as show};
+    let expr = |node: Option<crate::keybindings::KeybindingWhenNode>| show(node.as_ref());
+    let root = parse("a && (b || !c) && !(d && e)").unwrap();
+    // Left-folded chains print with their inner fold parenthesized, as `whenAstToExpression` does.
+    assert_eq!(show(Some(&root)), "(a && (b || !c)) && !(d && e)");
+    assert_eq!(keybindings::when_children(&root).len(), 3);
+    assert_eq!(show(keybindings::node_at(&root, &[1, 1])), "!c");
+    assert_eq!(show(keybindings::node_at(&root, &[2, 0, 1])), "e");
+    assert!(keybindings::node_at(&root, &[3]).is_none());
+    assert!(keybindings::when_can_remove(&root, &[1, 1]));
+    assert!(!keybindings::when_can_remove(&root, &[2, 0]), "a negated group's operand goes with the group");
+
+    let edit = |path: &[usize], edit: WhenEdit| expr(apply_when_edit(Some(&root), path, &edit));
+    assert_eq!(edit(&[1, 1], WhenEdit::SetNegated(false)), "(a && (b || c)) && !(d && e)");
+    assert_eq!(edit(&[0], WhenEdit::SetIdentifier("x".into())), "(x && (b || !c)) && !(d && e)");
+    assert_eq!(edit(&[1], WhenEdit::SetOperator(WhenOperator::And)), "(a && (b && !c)) && !(d && e)");
+    assert_eq!(edit(&[2], WhenEdit::SetNegated(false)), "(a && (b || !c)) && (d && e)");
+    assert_eq!(edit(&[1, 0], WhenEdit::Remove), "(a && !c) && !(d && e)");
+    assert_eq!(edit(&[2, 0], WhenEdit::AddCondition), "(a && (b || !c)) && !((d && e) && terminalFocus)");
+    assert_eq!(edit(&[1], WhenEdit::AddGroup), "(a && ((b || !c) || (terminalFocus && !terminalFocus))) && !(d && e)");
+    assert_eq!(edit(&[], WhenEdit::Remove), "");
+    let single = parse("a").unwrap();
+    assert_eq!(expr(apply_when_edit(Some(&single), &[], &WhenEdit::SetNegated(true))), "!a");
+    assert_eq!(expr(apply_when_edit(None, &[], &WhenEdit::AddCondition)), "terminalFocus");
+    assert_eq!(show(Some(&keybindings::add_to_root(Some(&single), true))), "a && (terminalFocus || !terminalFocus)");
+    assert_eq!(keybindings::when_remove_label(&root, 0), "Clear all conditions");
+    assert_eq!(keybindings::when_remove_label(keybindings::node_at(&root, &[1]).unwrap(), 1), "Remove group and its conditions");
+
+    assert_eq!(keybindings::parse_when_draft(" "), Ok(None));
+    assert!(keybindings::parse_when_draft("a &&").is_err());
+    assert_eq!(keybindings::unknown_when_variables(Some(&root)), vec!["a", "b", "c", "d", "e"]);
+    assert!(keybindings::unknown_when_variables(parse("terminalFocus && !rightPanelOpen").as_ref()).is_empty());
+    let options = keybindings::when_variable_options();
+    assert_eq!(&options[..6], ["terminalFocus", "terminalOpen", "isWeb", "isDesktop", "true", "false"]);
+    assert!(options.contains(&"composerFocus".to_owned()));
 }
 
 #[test]

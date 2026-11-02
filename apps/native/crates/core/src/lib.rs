@@ -8,6 +8,7 @@ pub mod families;
 pub mod files;
 pub mod git_actions;
 pub mod history;
+pub mod home;
 pub mod keybindings;
 pub mod lineage;
 pub mod lists;

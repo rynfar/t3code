@@ -113,5 +113,26 @@ fn keybindings_update_replaces_the_raw_payload() {
     }))
     .unwrap();
     assert!(state.apply(event));
-    assert_eq!(state.config.unwrap().keybindings[0]["command"], "commandPalette.toggle");
+    assert_eq!(state.config.as_ref().unwrap().keybindings[0]["command"], "commandPalette.toggle");
+    assert_eq!(state.config.as_ref().unwrap().keybindings_config_path.as_deref(), Some("/k.json"));
+
+    // An edit's reply applies its set at once; the same set streamed after it changes nothing.
+    let sent_at = state.keybindings_revision();
+    let reply = json!({"keybindings": [{"key": "mod+j", "command": "terminal.toggle"}], "issues": []});
+    assert!(state.apply_keybindings_reply(&reply, sent_at));
+    assert!(!state.apply_keybindings_reply(&reply, sent_at));
+    assert!(!state.apply_keybindings_reply(&json!({}), sent_at));
+    assert_eq!(state.config.as_ref().unwrap().keybindings[0]["command"], "terminal.toggle");
+
+    // A keymap streamed while an edit was in flight is newer than that edit's reply.
+    let sent_at = state.keybindings_revision();
+    let newer: ServerConfigStreamEvent = serde_json::from_value(json!({
+        "version": 1, "type": "keybindingsUpdated",
+        "payload": {"keybindings": [{"key": "mod+l", "command": "terminal.toggle"}], "issues": []}
+    }))
+    .unwrap();
+    assert!(state.apply(newer));
+    let stale = json!({"keybindings": [{"key": "mod+m", "command": "terminal.toggle"}], "issues": []});
+    assert!(!state.apply_keybindings_reply(&stale, sent_at));
+    assert_eq!(state.config.unwrap().keybindings[0]["key"], "mod+l");
 }

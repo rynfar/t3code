@@ -14,6 +14,7 @@ use t3_core::composer::ClientSettings;
 use t3_core::history::{HistoryStep, PageOutcome};
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::{ShellState, ShellStreamItem};
+use t3_core::sidebar::history::NavEntry;
 use t3_core::thread::ThreadState;
 use t3_core::workflows::{self, StopTarget};
 
@@ -73,6 +74,8 @@ pub struct AppState {
     /// The pull requests page replaces the thread area while open (`/pull-requests`).
     pub pull_requests_open: bool,
     restore_thread: Option<String>,
+    /// The restored thread's family is being read, so home waits before opening a draft.
+    pub(crate) restoring_thread: bool,
     /// Rows the shell leaves to on-demand reads: older settled pages and thread families.
     pub(crate) omitted: crate::omitted_rows::OmittedRows,
     pub(crate) notifications: crate::notifications::NotificationCenter,
@@ -113,6 +116,7 @@ impl AppState {
             panels: Default::default(),
             pull_requests_open: false,
             restore_thread: store::load_last_thread(),
+            restoring_thread: false,
             omitted: Default::default(),
             notifications: Default::default(),
             side_threads: Default::default(),
@@ -148,6 +152,7 @@ impl AppState {
         self.selected_thread = None;
         self.select_when_listed = None;
         self.restore_thread = None;
+        self.restoring_thread = false;
         self.thread = ThreadState::default();
         // Side subscriptions and a side chat start (with its timeout) belong to this environment.
         self.side_threads = Default::default();
@@ -234,6 +239,7 @@ impl AppState {
             cx.emit(AppEvent::Shell);
             let (shell, mounts) = (&self.shell, &self.omitted.mounts);
             if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
+                self.sidebar.history.replace_draft();
                 self.select_thread(&id, cx);
             } else if self.selected_thread.is_none()
                 && self.draft_project.is_none()
@@ -255,10 +261,26 @@ impl AppState {
         } else if thread_changed {
             cx.emit(AppEvent::Thread);
         }
+        if shell_changed || resynchronized {
+            self.land_home(cx);
+        }
         if config_changed {
             self.sync_server_config(cx);
             self.sync_environment_identity();
             cx.emit(AppEvent::ServerConfig);
+        }
+    }
+
+    /// With nothing open, the home page opens a draft in the most recent project, as the web's
+    /// index route does (`_chat.index.tsx`). It waits while a thread is about to be selected.
+    pub(crate) fn land_home(&mut self, cx: &mut Context<Self>) {
+        let idle = self.selected_thread.is_none() && self.draft_project.is_none() && !self.pull_requests_open;
+        let waiting = self.restore_thread.is_some() || self.select_when_listed.is_some() || self.restoring_thread;
+        if !idle || waiting || !self.shell.synchronized {
+            return;
+        }
+        if let Some(project_id) = self.home_project() {
+            self.start_draft(&project_id, cx);
         }
     }
 
@@ -271,6 +293,7 @@ impl AppState {
         self.sync_side_threads(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
+        self.land_home(cx);
     }
 
     pub(crate) fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
@@ -299,7 +322,7 @@ impl AppState {
         self.adopt_side_thread(thread_id);
         self.restore_thread = None;
         store::save_last_thread(thread_id);
-        self.sidebar.history.visit(thread_id);
+        self.sidebar.history.visit(NavEntry::Thread(thread_id.to_owned()));
         if let Some(client) = &self.client {
             client.open_thread(thread_id);
         }
@@ -384,6 +407,7 @@ impl AppState {
         self.thread = ThreadState::default();
         self.restore_thread = None;
         self.draft_project = Some(project_id.to_owned());
+        self.sidebar.history.visit(NavEntry::Draft(project_id.to_owned()));
         self.sync_side_threads(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
@@ -399,11 +423,13 @@ impl AppState {
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
+        self.land_home(cx);
     }
 
     /// Selects a thread the draft launched as soon as the shell lists it.
     pub fn select_when_listed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.thread_shell(thread_id).is_some() {
+            self.sidebar.history.replace_draft();
             self.select_thread(thread_id, cx);
         } else {
             self.select_when_listed = Some(thread_id.to_owned());

@@ -75,6 +75,8 @@ pub enum ButtonSize {
     IconMicro,
     /// 28 square, 16px icon.
     IconSm,
+    /// 32 square, 16px icon (`icon`).
+    Icon,
     /// 28 tall, 12px text, radius 6.
     Compact,
     /// 28 tall, 14px text.
@@ -137,6 +139,7 @@ impl RenderOnce for Button {
         let (height, pad, radius, icon_size, square) = match self.size {
             ButtonSize::IconMicro => (20., 0., 4., 12., true),
             ButtonSize::IconSm => (28., 0., 8., 16., true),
+            ButtonSize::Icon => (32., 0., 8., 16., true),
             ButtonSize::Compact => (28., 7., 6., 14., false),
             ButtonSize::Sm => (28., 9., 8., 16., false),
             ButtonSize::Default => (32., 11., 8., 16., false),

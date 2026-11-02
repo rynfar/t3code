@@ -309,6 +309,9 @@ impl SettingsView {
     }
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismiss_keybinding_overlay(window, cx) {
+            return;
+        }
         if !self.query(cx).trim().is_empty() {
             self.clear_search(window, cx);
             cx.notify();
@@ -402,7 +405,7 @@ impl SettingsView {
     }
 
     fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
-        [&self.search, &self.threads.base_directory, &self.threads.auto_settle_days, &self.keybindings.filter]
+        [&self.search, &self.threads.base_directory, &self.threads.auto_settle_days, &self.keybindings.filter, &self.keybindings.when_input]
             .into_iter()
             .chain(self.threads.time_inputs())
             .chain(self.providers.inputs())
@@ -611,7 +614,7 @@ impl SettingsView {
             Section::Chat => self.chat(cx),
             Section::Labs => self.labs(cx),
             Section::Threads => self.threads_page(window, cx),
-            Section::Keybindings => self.keybindings_page(cx),
+            Section::Keybindings => self.keybindings_page(window, cx),
             Section::Providers => self.providers_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
