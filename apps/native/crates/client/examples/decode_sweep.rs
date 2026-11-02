@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         println!("  {kind}: {count}");
     }
     let mut largest: Vec<_> = snapshots.iter().collect();
-    largest.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    largest.sort_by_key(|(_, (items, _))| std::cmp::Reverse(*items));
     for (thread_id, (items, visible)) in largest.into_iter().take(3) {
         println!("  largest: {thread_id} items={items} visible={visible}");
     }
