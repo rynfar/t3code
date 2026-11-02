@@ -11,7 +11,7 @@ Read `apps/native/AGENTS.md` and `apps/native/docs/design-system.md` before writ
 
 ```sh
 gh issue edit <n> -R rynfar/t3code --add-label status:in-progress
-git -C /Volumes/DevSSD/t3code-native worktree add ../t3code-native-<n> -b native/<n>-<slug> native
+git -C /Volumes/DevSSD/t3code-native worktree add ../t3code-native-<n> -b nw/<n>-<slug> native
 ```
 
 Work only in that worktree. Run `vp i` there if you need the dev server. Use

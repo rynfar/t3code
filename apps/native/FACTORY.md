@@ -6,14 +6,14 @@ at any point and the next one resumes from the same place.
 
 ## Where state lives
 
-| State                       | Location                                                               | Written by                         |
-| --------------------------- | ---------------------------------------------------------------------- | ---------------------------------- |
-| Code                        | branch `native` on `rynfar/t3code` (worktree `t3code-native`)          | merged PRs only                    |
-| What is ported              | `apps/native/parity/LEDGER.md`                                         | the PR that changes the feature    |
-| Upstream reconciled through | `apps/native/parity/UPSTREAM`                                          | intake, after triage               |
-| Work queue                  | issues on `rynfar/t3code`                                              | intake, orchestrator               |
-| In-flight work              | issues labelled `status:in-progress`, one branch `native/<issue>` each | workers                            |
-| Session handoff             | the pinned issue titled `Factory status`                               | orchestrator, end of every session |
+| State                       | Location                                                           | Written by                         |
+| --------------------------- | ------------------------------------------------------------------ | ---------------------------------- |
+| Code                        | branch `native` on `rynfar/t3code` (worktree `t3code-native`)      | merged PRs only                    |
+| What is ported              | `apps/native/parity/LEDGER.md`                                     | the PR that changes the feature    |
+| Upstream reconciled through | `apps/native/parity/UPSTREAM`                                      | intake, after triage               |
+| Work queue                  | issues on `rynfar/t3code`                                          | intake, orchestrator               |
+| In-flight work              | issues labelled `status:in-progress`, one branch `nw/<issue>` each | workers                            |
+| Session handoff             | the pinned issue titled `Factory status`                           | orchestrator, end of every session |
 
 Nothing important lives only in a chat transcript, a scratch file, or an agent's memory.
 
@@ -24,7 +24,7 @@ Nothing important lives only in a chat transcript, a scratch file, or an agent's
 - `native` is the long-lived branch: upstream `main` merged in, plus `apps/native/` and
   `.agents/skills/native-*` and `.agents/skills/test-t3-native`. Upstream files are never
   edited here, so merges never conflict.
-- Feature work happens on `native/<issue-number>-<slug>` branches in their own worktrees and
+- Feature work happens on `nw/<issue-number>-<slug>` branches in their own worktrees and
   lands in `native` through a PR on the fork.
 - Never push to `pingdotgg/t3code`, and never write a linked reference to an upstream PR or
   issue in fork content: use a code span like `` `pingdotgg/t3code#29017` ``, so nothing
