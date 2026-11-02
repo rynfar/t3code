@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod find;
 mod limit_recovery;
+mod rewind;
 mod status;
 
 pub use limit_recovery::LimitRecoveryBanner;
@@ -57,6 +58,7 @@ pub struct ThreadView {
     local_error: Option<String>,
     clock: Clock,
     window_height: f32,
+    rewind: rewind::RewindUi,
     media: Entity<crate::media::MediaCache>,
     viewer: Entity<crate::media::MediaViewer>,
     _subscription: Subscription,
@@ -97,6 +99,7 @@ impl ThreadView {
             local_error: None,
             clock: Clock::now(),
             window_height: 0.,
+            rewind: rewind::RewindUi::default(),
             media,
             viewer,
             _subscription: subscription,
@@ -127,6 +130,7 @@ impl ThreadView {
             self.reset_status();
             self.turn_diffs.clear();
             self.turn_diff_source = None;
+            self.reset_rewind();
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -146,6 +150,8 @@ impl ThreadView {
         }
         self.sync_history(cx);
         self.rederive(cx);
+        self.sync_revert_counts(cx);
+        self.check_rewind(cx);
         self.sync_turn_diffs(cx);
         self.sync_status(cx);
         self.refresh_open_details(cx);
@@ -416,6 +422,8 @@ impl ThreadView {
             turn_diffs: &self.turn_diffs,
             fork_support: &self.fork_support,
             forking: &self.forking,
+            revert_counts: &self.rewind.counts,
+            rewind_disabled: self.rewind.busy() || self.activity.is_working,
         };
         render(&env, &mut self.markdown)
     }
@@ -497,6 +505,6 @@ impl Render for ThreadView {
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(banners).children(find_bar).child(self.viewer.clone()).into_any_element()
+        div().relative().size_full().child(transcript).children(banners).children(find_bar).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }

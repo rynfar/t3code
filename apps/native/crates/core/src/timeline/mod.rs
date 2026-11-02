@@ -12,6 +12,7 @@ mod find;
 mod folds;
 mod fork;
 mod presentation;
+mod rewind;
 mod rows;
 mod status;
 mod time;
@@ -45,7 +46,13 @@ pub use changed_files::{
 };
 pub use fork::{FORK_FAILED, FORK_LABEL, can_fork, fork_from_run, fork_support};
 pub use find::{FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, SEARCH_THREAD, bar_label, decode_result, format_count, search_request, step_index, step_locally};
+pub use rewind::{
+    CONFIRM_DESCRIPTION, CONFIRM_TITLE, EDIT_FROM_HERE, FAILED as REWIND_FAILED, INTERRUPT_FIRST, KEEP_CHANGES, NO_ROLLBACK, REVERT_FILES, RevertCheckpoint, RevertInput,
+    RewindProgress, RewindWatch, TIMED_OUT as REWIND_TIMED_OUT, TIMEOUT_SECS as REWIND_TIMEOUT_SECS, available_revert_turn_counts, find_revert_checkpoint,
+    merge_restored_prompt, recallable_prompt, revert_turn_counts, rewind_progress, rollback_command, watch_rewind,
+};
 pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};
+pub use folds::unsettled_run_id;
 pub use status::{
     CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, LimitRecovery, ProviderBanner, RunStop, SnoozeRefused, StatusLine, ThreadError, elapsed_since,
     error_banner_message, error_can_expand, goal_line, limit_recovery, presented_latest_run, provider_banner, relative_time_label, run_stop, status_line,

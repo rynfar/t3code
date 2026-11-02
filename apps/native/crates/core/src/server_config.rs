@@ -215,6 +215,9 @@ pub struct ServerProvider {
     pub models: Vec<ProviderModel>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub usage_limits: Option<UsageLimits>,
+    /// `false` when the provider cannot rewind its conversation ("Edit from here").
+    #[serde(default)]
+    pub supports_conversation_rollback: Option<bool>,
 }
 
 /// `ServerProviderUsageWindow`: how much of one quota is spent and when it resets.

@@ -1116,3 +1116,133 @@ fn forking_needs_a_completed_assistant_message_and_a_capable_provider() {
     let command = fork_from_run("c", "t", "t2", "run-1", "Refactor");
     assert_eq!((command["type"].as_str(), command["sourcePoint"]["runId"].as_str(), command["title"].as_str()), (Some("thread.fork"), Some("run-1"), Some("Refactor fork")));
 }
+
+
+fn checkpoint(id: &str, run: Option<&str>, ordinal: Option<u64>, within_scope: u64, status: &str) -> crate::thread::Entity {
+    crate::thread::Entity {
+        id: id.into(),
+        value: serde_json::json!({
+            "id": id, "scopeId": "scope", "runId": run, "appRunOrdinal": ordinal, "ordinalWithinScope": within_scope,
+            "status": status, "files": [], "capturedAt": "2026-01-01T00:00:00Z",
+        }),
+    }
+}
+
+#[test]
+fn turn_starting_messages_rewind_to_the_previous_runs_checkpoint() {
+    let entries = vec![
+        message("u1", Role::User, "one", Some("r1"), "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z"),
+        message("a1", Role::Assistant, "ok", Some("r1"), "2026-01-01T00:00:02Z", "2026-01-01T00:00:02Z"),
+        message("u2", Role::User, "two", Some("r2"), "2026-01-01T00:00:03Z", "2026-01-01T00:00:03Z"),
+        message("a2", Role::Assistant, "ok", Some("r2"), "2026-01-01T00:00:04Z", "2026-01-01T00:00:04Z"),
+        message("u3", Role::User, "three", Some("r3"), "2026-01-01T00:00:05Z", "2026-01-01T00:00:05Z"),
+    ];
+    let checkpoints = vec![checkpoint("c0", None, None, 0, "ready"), checkpoint("c1", Some("r1"), Some(1), 1, "ready"), checkpoint("c2", Some("r2"), Some(2), 2, "missing")];
+    let all: HashSet<u64> = [0, 1, 2].into();
+    let none = HashSet::new();
+    let input = RevertInput { entries: &entries, checkpoints: &checkpoints, thread_start_ready: true, available: &all, unsettled_run_id: Some("r3"), inherited: &none };
+    let counts = revert_turn_counts(&input);
+    assert_eq!(counts.get("u1"), Some(&0));
+    assert_eq!(counts.get("u2"), Some(&1));
+    assert_eq!(counts.get("u3"), None, "the unsettled run cannot rewind");
+    let settled = revert_turn_counts(&RevertInput { unsettled_run_id: None, ..input });
+    assert_eq!(settled.get("u3"), None, "the run before it has no ready checkpoint");
+    let paged = revert_turn_counts(&RevertInput { thread_start_ready: false, unsettled_run_id: None, ..input });
+    assert_eq!(paged.get("u1"), None);
+    let only_start: HashSet<u64> = [0].into();
+    let conversation = revert_turn_counts(&RevertInput { available: &only_start, ..input });
+    assert_eq!((conversation.get("u1"), conversation.get("u2")), (Some(&0), None));
+}
+
+#[test]
+fn finds_the_ready_checkpoint_for_a_turn_count() {
+    let checkpoints = vec![
+        checkpoint("start", None, None, 0, "ready"),
+        checkpoint("tool", None, None, 3, "ready"),
+        checkpoint("one-old", Some("r1"), Some(1), 1, "ready"),
+        checkpoint("one", Some("r1"), Some(1), 2, "ready"),
+        checkpoint("two", Some("r2"), Some(2), 4, "error"),
+    ];
+    assert_eq!(find_revert_checkpoint(&checkpoints, 0).map(|c| c.id), Some("start".into()));
+    assert_eq!(find_revert_checkpoint(&checkpoints, 1), Some(RevertCheckpoint { id: "one".into(), scope_id: "scope".into() }));
+    assert_eq!(find_revert_checkpoint(&checkpoints, 2), None);
+    let command = rollback_command("cmd", "t", &find_revert_checkpoint(&checkpoints, 1).unwrap(), false);
+    assert_eq!(command["type"], "checkpoint.rollback");
+    assert_eq!((command["checkpointId"].as_str(), command["scopeId"].as_str(), command["restoreFiles"].as_bool()), (Some("one"), Some("scope"), Some(false)));
+}
+
+fn rewind_projection() -> crate::thread::ThreadProjection {
+    let runs = serde_json::json!([
+        { "id": "r1", "ordinal": 1, "providerInstanceId": "codex", "modelSelection": { "instanceId": "codex", "model": "m" }, "userMessageId": "u1",
+          "status": "completed", "requestedAt": "2026-01-01T00:00:00Z", "activeAttemptId": "a1" },
+        { "id": "r2", "ordinal": 2, "providerInstanceId": "codex", "modelSelection": { "instanceId": "codex", "model": "m" }, "userMessageId": "u2",
+          "status": "completed", "requestedAt": "2026-01-01T00:00:00Z", "activeAttemptId": "a2" },
+        { "id": "r3", "ordinal": 3, "providerInstanceId": "codex", "modelSelection": { "instanceId": "codex", "model": "m" }, "userMessageId": "u3",
+          "status": "completed", "requestedAt": "2026-01-01T00:00:00Z", "activeAttemptId": "a3" },
+    ]);
+    let turns = serde_json::json!([
+        { "id": "pt1", "runAttemptId": "a1", "ordinal": 1, "providerThreadId": "pth" },
+        { "id": "pt2", "runAttemptId": "a2", "ordinal": 2, "providerThreadId": "pth" },
+        { "id": "pt3", "runAttemptId": "a3", "ordinal": 3, "providerThreadId": "older" },
+    ]);
+    let mut projection = projection_json(serde_json::json!({ "activeProviderThreadId": "pth" }), runs, serde_json::json!([]), turns);
+    projection.provider_threads = vec![crate::thread::Entity {
+        id: "pth".into(),
+        value: serde_json::json!({ "id": "pth", "providerSessionId": "s", "providerInstanceId": "codex", "appThreadId": "t", "lastRunOrdinal": 3 }),
+    }];
+    projection
+}
+
+#[test]
+fn only_runs_of_the_active_conversation_can_be_rewound_to() {
+    let mut projection = rewind_projection();
+    let mut available: Vec<u64> = available_revert_turn_counts(&projection).into_iter().collect();
+    available.sort();
+    assert_eq!(available, [0, 1, 2]);
+    projection.provider_threads[0].value["providerInstanceId"] = serde_json::json!("claude");
+    assert!(available_revert_turn_counts(&projection).is_empty());
+}
+
+#[test]
+fn a_rewind_lands_when_the_conversation_and_witness_run_roll_back() {
+    let mut projection = rewind_projection();
+    let watch = watch_rewind(&projection, 1, "cmd").unwrap();
+    assert_eq!(rewind_progress(&watch, &projection), RewindProgress::Pending);
+    projection.provider_threads[0].value["lastRunOrdinal"] = serde_json::json!(1);
+    assert_eq!(rewind_progress(&watch, &projection), RewindProgress::Pending, "the witness has not rolled back yet");
+    projection.runs[2].status = "rolled_back".into();
+    assert_eq!(rewind_progress(&watch, &projection), RewindProgress::Done);
+
+    let mut failing = rewind_projection();
+    let watch = watch_rewind(&failing, 0, "cmd-2").unwrap();
+    failing.thread.rollback_failure = Some(crate::thread::RollbackFailure { request_id: "other".into(), message: "nope".into() });
+    assert_eq!(rewind_progress(&watch, &failing), RewindProgress::Pending);
+    failing.thread.rollback_failure = Some(crate::thread::RollbackFailure { request_id: "cmd-2".into(), message: "Checkpoint unavailable.".into() });
+    assert_eq!(rewind_progress(&watch, &failing), RewindProgress::Failed("Checkpoint unavailable.".into()));
+
+    let mut fresh = rewind_projection();
+    let watch = watch_rewind(&fresh, 0, "cmd-3").unwrap();
+    fresh.runs.iter_mut().for_each(|run| run.status = "rolled_back".into());
+    fresh.provider_threads.push(crate::thread::Entity {
+        id: "fresh".into(),
+        value: serde_json::json!({ "id": "fresh", "providerInstanceId": "codex", "appThreadId": "t", "ownerNodeId": null, "lastRunOrdinal": null }),
+    });
+    assert_eq!(rewind_progress(&watch, &fresh), RewindProgress::Done, "Claude starts a fresh root session at the thread start");
+    assert_eq!(watch_rewind(&fresh, 0, "cmd-4").err().as_deref(), Some("The thread has changed. Select a message to rewind again."));
+}
+
+#[test]
+fn recalled_prompts_drop_what_the_composer_cannot_restore() {
+    assert_eq!(recallable_prompt("Ultrathink:\nfix it"), "fix it");
+    assert_eq!(recallable_prompt("look\n\n<review_comment file=\"a\">x</review_comment>\n<review_comment>y</review_comment>"), "look");
+    assert_eq!(
+        recallable_prompt("see @server-log:3-5 now\n\n<terminal_context>\n- Server log lines 3-5:\n  boom\n</terminal_context>"),
+        "see now"
+    );
+    assert_eq!(recallable_prompt("keep\n<terminal_context>\nno headers\n</terminal_context>"), "keep\n<terminal_context>\nno headers\n</terminal_context>");
+    assert_eq!(recallable_prompt("fix ![shot](t3-context:image/abc) please"), "fix please");
+    assert_eq!(recallable_prompt("PLEASE IMPLEMENT THIS PLAN:\n# Plan"), "");
+    assert_eq!(merge_restored_prompt("draft", "restored"), "draft\n\nrestored");
+    assert_eq!(merge_restored_prompt("", "restored"), "restored");
+    assert_eq!(merge_restored_prompt("draft", ""), "draft");
+}

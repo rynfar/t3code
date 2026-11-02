@@ -145,7 +145,7 @@ pub(super) fn terminal_assistant_ids(entries: &[Arc<TimelineEntry>]) -> HashSet<
     last_by_key.into_values().collect()
 }
 
-pub(super) fn unsettled_run_id(activity: &ThreadActivity) -> Option<String> {
+pub fn unsettled_run_id(activity: &ThreadActivity) -> Option<String> {
     if let Some(running) = &activity.running_run_id {
         return Some(running.clone());
     }

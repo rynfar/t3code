@@ -8,7 +8,7 @@ use gpui::{AnyElement, App, ClipboardItem, Context, FontWeight, InteractiveEleme
 use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
 use t3_core::media::MediaPlacement;
-use t3_core::timeline::{Attribution, ChatMessage, FORK_LABEL, can_fork, ProposedPlan, RowKind, TimelineRow, plan_title, should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution};
+use t3_core::timeline::{EDIT_FROM_HERE, Attribution, ChatMessage, FORK_LABEL, can_fork, ProposedPlan, RowKind, TimelineRow, plan_title, should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution};
 
 use super::markdown::{MarkdownStore, markdown_view, prose};
 use super::parts::{ROW_GROUP, Clock, DividerTone, ghost_icon_button, ghost_text_button, system_divider, tooltip_icon_button};
@@ -154,6 +154,17 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .invisible()
         .group_hover(ROW_GROUP, |style| style.visible())
         .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(env.clock.format(&message.created_at)))
+        .children(env.revert_counts.get(&message.id).map(|&turn_count| {
+            let (message_id, text) = (message.id.clone(), message.text.to_string());
+            tooltip_icon_button(
+                SharedString::from(format!("rewind:{id}")),
+                Icon::Pencil,
+                EDIT_FROM_HERE,
+                env.rewind_disabled,
+                cx.listener(move |view, _, window, cx| view.request_rewind(&message_id, turn_count, &text, window, cx)),
+                cx,
+            )
+        }))
         .child(ghost_icon_button(
             SharedString::from(format!("copy-user:{id}")),
             Icon::Copy,

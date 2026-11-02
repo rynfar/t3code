@@ -69,6 +69,16 @@ pub struct AppThread {
     pub archived_at: Option<String>,
     #[serde(default)]
     pub creation_source: Option<String>,
+    /// The last rewind that failed, by the command that asked for it.
+    #[serde(default)]
+    pub rollback_failure: Option<RollbackFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackFailure {
+    pub request_id: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
