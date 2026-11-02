@@ -184,12 +184,96 @@ pub struct ProviderAuth {
     pub status: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
     #[serde(default)]
     pub subscription_sharing: Option<bool>,
+    #[serde(default)]
+    pub can_logout: Option<bool>,
+    /// `AcpRegistryUrlAuthAction`: a URL the agent asked the user to open to finish signing in.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub action: Option<UrlAuthAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlAuthAction {
+    pub elicitation_id: String,
+    pub url: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// `ServerProvider.setup`: whether the server can sign this provider in or install it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSetup {
+    #[serde(default)]
+    pub can_authenticate: bool,
+    #[serde(default)]
+    pub can_install: bool,
+    #[serde(default)]
+    pub documentation_url: Option<String>,
+}
+
+/// `ServerProviderVersionAdvisory`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionAdvisory {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub update_command: Option<String>,
+    #[serde(default)]
+    pub can_update: bool,
+    #[serde(default)]
+    pub can_install_version: Option<bool>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `ServerProviderCompatibilityAdvisory`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatibilityAdvisory {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub latest_version_status: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub recommended_version: Option<String>,
+    #[serde(default)]
+    pub recommended_range: Option<String>,
+}
+
+/// `ServerProviderUpdateState`: a `server.updateProvider` run as the server last reported it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateState {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `checkedAt`, which every status push restamps on every provider. Equality ignores it so an
+/// otherwise unchanged push stays quiet (`providersIgnoringCheckedAtAtom`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct CheckedAt(pub Option<String>);
+
+impl PartialEq for CheckedAt {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// `ServerProvider`: one provider instance as the server reports it.
@@ -231,6 +315,18 @@ pub struct ServerProvider {
     /// Per-cwd commands and skills. Left out for clients that fetch them on demand.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub version_advisory: Option<VersionAdvisory>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub compatibility_advisory: Option<CompatibilityAdvisory>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub update_state: Option<UpdateState>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub setup: Option<ProviderSetup>,
+    #[serde(default)]
+    pub checked_at: CheckedAt,
 }
 
 /// `ServerProviderSlashCommand`.
@@ -444,15 +540,22 @@ pub struct ModelPreferences {
     pub model_order: Vec<String>,
 }
 
-/// `ProviderInstanceConfig`: only what decides whether an instance is enabled.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+/// `ProviderInstanceConfig`. `environment` and `config` stay raw: the provider settings write
+/// them back untouched (redacted secrets included, which the server keeps), so nothing is lost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInstanceConfig {
     #[serde(default)]
     pub driver: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<Value>,
 }
 
@@ -515,8 +618,8 @@ pub struct ServerSettings {
     /// The legacy per-project scripts; null means the defaults.
     #[serde(default, deserialize_with = "lenient_map")]
     pub project_script_overrides: HashMap<String, Option<Vec<ProjectScript>>>,
-    #[serde(default, deserialize_with = "lenient_map")]
-    pub provider_instances: HashMap<String, ProviderInstanceConfig>,
+    #[serde(default)]
+    pub provider_instances: ProviderInstances,
     #[serde(default, deserialize_with = "lenient_option")]
     pub pull_request_merge_method: Option<crate::pull_requests::wire::MergeMethod>,
     /// The Usage page asks for summaries through this filter.
@@ -524,6 +627,48 @@ pub struct ServerSettings {
     pub usage_model_filter: Option<crate::usage::UsageModelFilter>,
     #[serde(flatten)]
     pub threads: crate::settings::ThreadSettings,
+    #[serde(flatten)]
+    pub provider_panel: crate::settings::providers::background::ProviderPanelSettings,
+}
+
+/// `providerInstances` in the server's order, which is the order the provider settings list
+/// custom instances in. Entries that fail to decode are dropped.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProviderInstances(Vec<(String, ProviderInstanceConfig)>);
+
+impl ProviderInstances {
+    pub fn get(&self, instance_id: &str) -> Option<&ProviderInstanceConfig> {
+        self.0.iter().find(|(id, _)| id == instance_id).map(|(_, instance)| instance)
+    }
+
+    pub fn contains_key(&self, instance_id: &str) -> bool {
+        self.get(instance_id).is_some()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ProviderInstanceConfig)> {
+        self.0.iter().map(|(id, instance)| (id.as_str(), instance))
+    }
+}
+
+impl std::ops::Index<&str> for ProviderInstances {
+    type Output = ProviderInstanceConfig;
+
+    fn index(&self, instance_id: &str) -> &ProviderInstanceConfig {
+        self.get(instance_id).unwrap_or_else(|| panic!("no provider instance {instance_id:?}"))
+    }
+}
+
+impl FromIterator<(String, ProviderInstanceConfig)> for ProviderInstances {
+    fn from_iter<I: IntoIterator<Item = (String, ProviderInstanceConfig)>>(entries: I) -> Self {
+        ProviderInstances(entries.into_iter().collect())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderInstances {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let Value::Object(entries) = Value::deserialize(d)? else { return Ok(ProviderInstances::default()) };
+        Ok(entries.into_iter().filter_map(|(id, value)| serde_json::from_value(value).ok().map(|instance| (id, instance))).collect())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -631,9 +776,7 @@ impl ServerConfigState {
             ServerConfigStreamEvent::KeybindingsUpdated { payload } => {
                 self.update(|config| replace(&mut config.keybindings, payload.keybindings))
             }
-            ServerConfigStreamEvent::ProviderStatuses { payload } => {
-                self.update(|config| replace(&mut config.providers, payload.providers))
-            }
+            ServerConfigStreamEvent::ProviderStatuses { payload } => self.apply_providers(payload.providers),
             ServerConfigStreamEvent::SettingsUpdated { payload } => {
                 self.settings_revision += 1;
                 self.update(|config| replace(&mut config.settings, payload.settings))
@@ -647,6 +790,16 @@ impl ServerConfigState {
 
     pub fn settings_revision(&self) -> u64 {
         self.settings_revision
+    }
+
+    /// Takes a provider list from the stream or a `server.refreshProviders` reply. The fresh
+    /// `checkedAt` stamps are kept even when nothing else changed, which reports no change.
+    pub fn apply_providers(&mut self, providers: Vec<ServerProvider>) -> bool {
+        self.update(|config| {
+            let changed = config.providers != providers;
+            config.providers = providers;
+            changed
+        })
     }
 
     /// Applies what a `server.updateSettings` sent at `sent_at` answered with, unless settings

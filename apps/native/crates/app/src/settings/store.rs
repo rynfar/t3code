@@ -101,6 +101,9 @@ fn send_next(cx: &mut App) {
         return;
     };
     prefs.saving = true;
+    let Some(payload) = change.payload_for(state.read(cx).server_config.config.as_ref().map(|config| &config.settings)) else {
+        return send_next(cx);
+    };
     let (label, sent_at, task) = {
         let app_state = state.read(cx);
         let label = app_state
@@ -110,7 +113,7 @@ fn send_next(cx: &mut App) {
             .map(|config| config.environment.label.clone())
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| "the environment".to_owned());
-        (label, app_state.server_config.settings_revision(), app_state.rpc(method::SERVER_UPDATE_SETTINGS, change.payload()))
+        (label, app_state.server_config.settings_revision(), app_state.rpc(method::SERVER_UPDATE_SETTINGS, payload))
     };
     cx.spawn(async move |cx| {
         let result = task.await;

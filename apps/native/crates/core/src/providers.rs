@@ -6,7 +6,7 @@
 //! `web/src/components/chat/modelPickerSearch.ts`.
 
 use crate::model::ModelSelection;
-use crate::server_config::{ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow};
+use crate::server_config::{ProviderInstanceConfig, ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow};
 use crate::sidebar::time::parse_iso;
 
 /// Drivers whose instances are off until configured (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
@@ -122,15 +122,19 @@ pub fn instance_enabled(settings: &ServerSettings, project_id: Option<&str>, ins
         return enabled;
     }
     match settings.provider_instances.get(instance_id) {
-        Some(instance) => {
-            let config_enabled = instance.config.as_ref().and_then(|config| config.get("enabled")?.as_bool());
-            if instance.enabled == Some(false) || config_enabled == Some(false) {
-                return false;
-            }
-            instance.enabled.or(config_enabled).unwrap_or(!DEFAULT_DISABLED_DRIVERS.contains(&instance.driver.as_str()))
-        }
+        Some(instance) => resolve_instance_enabled(instance),
         None => DEFAULT_ENABLED_INSTANCES.contains(&instance_id),
     }
+}
+
+/// `resolveProviderInstanceEnabled`: an explicit `false` anywhere wins, then an explicit value,
+/// then the driver's default.
+pub fn resolve_instance_enabled(instance: &ProviderInstanceConfig) -> bool {
+    let config_enabled = instance.config.as_ref().and_then(|config| config.get("enabled")?.as_bool());
+    if instance.enabled == Some(false) || config_enabled == Some(false) {
+        return false;
+    }
+    instance.enabled.or(config_enabled).unwrap_or(!DEFAULT_DISABLED_DRIVERS.contains(&instance.driver.as_str()))
 }
 
 /// `ProviderInstanceEntry` with project settings applied.

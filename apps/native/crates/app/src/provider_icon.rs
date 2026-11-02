@@ -19,6 +19,12 @@ pub struct ProviderMark {
 }
 
 impl ProviderMark {
+    /// A mark from settings rather than a live entry: Settings → Providers shows instances the
+    /// server may not report yet. The badge shows while an accent is set.
+    pub fn configured(driver: &str, label: &str, accent: Option<u32>) -> Self {
+        ProviderMark { driver: driver.to_owned().into(), initials: providers::initials(label).into(), accent, badge: accent.is_some() }
+    }
+
     pub fn of(entry: &ProviderEntry, entries: &[ProviderEntry]) -> Self {
         ProviderMark {
             driver: entry.driver().to_owned().into(),
@@ -66,7 +72,9 @@ impl RenderOnce for ProviderIcon {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let mark = match provider_logo(&self.mark.driver) {
-            Some(ProviderLogo::Mono(path)) => gpui::svg().path(path).size(self.size).flex_none().into_any_element(),
+            Some(ProviderLogo::Mono(path)) => {
+                gpui::svg().path(path).size(self.size).flex_none().text_color(hsla(p.foreground)).into_any_element()
+            }
             Some(ProviderLogo::Image { light, dark }) => {
                 img(if cx.theme().is_dark() { dark } else { light }).size(self.size).flex_none().into_any_element()
             }
