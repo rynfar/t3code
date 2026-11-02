@@ -510,6 +510,8 @@ pub struct EnvironmentCapabilities {
     pub storage_cleanup_run: Option<bool>,
     #[serde(default)]
     pub settled_worktree_cleanup: Option<bool>,
+    #[serde(default)]
+    pub one_time_schedules: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

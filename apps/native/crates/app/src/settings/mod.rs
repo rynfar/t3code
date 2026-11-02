@@ -11,6 +11,7 @@ pub(crate) mod controls;
 mod general;
 mod keybindings;
 mod providers;
+mod scheduled_tasks;
 mod source_control;
 pub(crate) mod store;
 mod threads;
@@ -204,6 +205,7 @@ pub struct SettingsView {
     pub(crate) providers: providers::ProvidersState,
     pub(crate) worktrees: worktrees::WorktreesState,
     pub(crate) source_control: source_control::SourceControlState,
+    pub(crate) scheduled: scheduled_tasks::ScheduledTasksState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -247,6 +249,7 @@ impl SettingsView {
             providers: providers::ProvidersState::new(window, cx),
             worktrees: worktrees::WorktreesState::new(window, cx),
             source_control: source_control::SourceControlState::new(window, cx),
+            scheduled: scheduled_tasks::ScheduledTasksState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -282,6 +285,9 @@ impl SettingsView {
         }
         if section == Section::Archived {
             self.load_archive(cx);
+        }
+        if section != Section::ScheduledTasks {
+            self.scheduled.stream = None;
         }
         cx.notify();
     }
@@ -422,8 +428,9 @@ impl SettingsView {
             .chain(self.threads.time_inputs())
             .chain(self.providers.inputs())
             .chain(self.worktrees.inputs())
+            .chain(self.scheduled.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
-            || [&self.worktrees.instructions].into_iter().chain(self.source_control.textareas()).any(|input| input.focus_handle(cx).is_focused(window))
+            || [&self.worktrees.instructions, self.scheduled.textarea()].into_iter().chain(self.source_control.textareas()).any(|input| input.focus_handle(cx).is_focused(window))
     }
 
     fn render_nav(&self, layout: ModalLayout, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -632,6 +639,7 @@ impl SettingsView {
             Section::Providers => self.providers_page(window, cx),
             Section::Worktrees => self.worktrees_page(window, cx),
             Section::SourceControl => self.source_control_page(window, cx),
+            Section::ScheduledTasks => self.scheduled_tasks_page(cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
