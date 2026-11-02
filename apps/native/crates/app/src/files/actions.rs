@@ -19,7 +19,7 @@ pub struct FileWorkspace {
 impl AppState {
     pub fn file_workspace(&self) -> Option<FileWorkspace> {
         let thread_id = self.selected_thread.clone()?;
-        let thread = self.shell.thread(&thread_id)?;
+        let thread = self.thread_shell(&thread_id)?;
         let project = self.shell.project(&thread.project_id)?;
         let cwd = thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone());
         (!cwd.is_empty()).then(|| FileWorkspace { thread_id, cwd, project_name: project.title.clone() })
