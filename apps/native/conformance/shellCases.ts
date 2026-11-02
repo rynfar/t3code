@@ -1,0 +1,255 @@
+// Shell cases: shell.ts applies snapshots with `mergeShellSnapshotProjects` and each run of
+// deltas with `applyShellStreamEvents`; ported from shellReducer.test.ts.
+import type {
+  OrchestrationProjectShell,
+  OrchestrationV2ShellSnapshot,
+  OrchestrationV2ShellStreamItem,
+  OrchestrationV2ThreadShell,
+} from "../../../packages/contracts/src/index.ts";
+import type * as ShellReducerModule from "../../../packages/client-runtime/src/state/shellReducer.ts";
+
+import {
+  decodeShellItem,
+  encodeShellItem,
+  encodeShellSnapshot,
+  Fixtures,
+  ShellReducer,
+} from "./runtime.ts";
+
+const repositoryIdentity = {
+  canonicalKey: "github.com/example/repo",
+  locator: {
+    source: "git-remote",
+    remoteName: "origin",
+    remoteUrl: "https://github.com/example/repo.git",
+  },
+} as unknown as NonNullable<OrchestrationProjectShell["repositoryIdentity"]>;
+const otherIdentity = {
+  canonicalKey: "github.com/example/other",
+  locator: {
+    source: "git-remote",
+    remoteName: "origin",
+    remoteUrl: "https://github.com/example/other.git",
+  },
+} as unknown as NonNullable<OrchestrationProjectShell["repositoryIdentity"]>;
+
+function shellCase(name: string, items: ReadonlyArray<OrchestrationV2ShellStreamItem>) {
+  const json = items.map(encodeShellItem);
+  let snapshot: OrchestrationV2ShellSnapshot | null = null;
+  let deltas: ShellReducerModule.ShellStreamEvent[] = [];
+  const flush = () => {
+    if (snapshot !== null && deltas.length > 0)
+      snapshot = ShellReducer.applyShellStreamEvents(snapshot, deltas);
+    deltas = [];
+  };
+  for (const decoded of json.map(decodeShellItem)) {
+    if (decoded.kind === "synchronized") {
+      flush();
+      continue;
+    }
+    if (decoded.kind === "snapshot") {
+      flush();
+      snapshot = ShellReducer.mergeShellSnapshotProjects(
+        snapshot,
+        decoded.snapshot,
+        decoded.resolvedRepositoryIdentityRoots === undefined
+          ? undefined
+          : { resolvedRepositoryIdentityRoots: decoded.resolvedRepositoryIdentityRoots },
+      );
+      continue;
+    }
+    deltas.push(decoded);
+  }
+  flush();
+  return { name, items: json, expected: snapshot === null ? null : encodeShellSnapshot(snapshot) };
+}
+
+export function shellCases() {
+  const project = Fixtures.v2Project;
+  const base = Fixtures.v2ShellSnapshot;
+  const thread = Fixtures.v2ThreadShell;
+  const shellRow = (id: string, extra: Partial<OrchestrationV2ThreadShell> = {}) =>
+    ({ ...thread, id, ...extra }) as OrchestrationV2ThreadShell;
+  const snapshot = (
+    value: Partial<OrchestrationV2ShellSnapshot>,
+    roots?: string[],
+  ): OrchestrationV2ShellStreamItem =>
+    ({
+      kind: "snapshot",
+      snapshot: { ...base, ...value },
+      ...(roots === undefined ? {} : { resolvedRepositoryIdentityRoots: roots }),
+    }) as OrchestrationV2ShellStreamItem;
+  const projectUpdated = (
+    sequence: number,
+    value: OrchestrationProjectShell,
+  ): OrchestrationV2ShellStreamItem => ({ kind: "project.updated", sequence, project: value });
+  const update = (
+    sequence: number,
+    value: OrchestrationV2ThreadShell,
+    location: "active" | "archive" = "active",
+  ): OrchestrationV2ShellStreamItem => ({
+    kind: "thread.updated",
+    sequence,
+    location,
+    thread: value,
+  });
+  const remove = (sequence: number, threadId: string): OrchestrationV2ShellStreamItem =>
+    ({
+      kind: "thread.removed",
+      sequence,
+      location: "active",
+      threadId,
+    }) as OrchestrationV2ShellStreamItem;
+  const sync: OrchestrationV2ShellStreamItem = { kind: "synchronized" };
+  const otherProject = {
+    ...project,
+    id: "project-other",
+    workspaceRoot: "/workspace/other",
+    repositoryIdentity: otherIdentity,
+  } as OrchestrationProjectShell;
+
+  return [
+    shellCase("stale project updates are ignored", [
+      snapshot({ snapshotSequence: 4 }),
+      sync,
+      projectUpdated(3, { ...project, title: "Stale" }),
+      sync,
+      projectUpdated(4, { ...project, title: "Stale" }),
+    ]),
+    shellCase("delta with null identity keeps the prior identity", [
+      snapshot({}),
+      sync,
+      projectUpdated(1, { ...project, repositoryIdentity }),
+      sync,
+      projectUpdated(2, { ...project, title: "Same root", repositoryIdentity: null }),
+    ]),
+    shellCase("workspace root move drops the identity", [
+      snapshot({}),
+      projectUpdated(1, { ...project, repositoryIdentity }),
+      sync,
+      projectUpdated(2, { ...project, workspaceRoot: "/tmp/other-root", repositoryIdentity: null }),
+    ]),
+    shellCase("authoritative lower snapshot resets but keeps identities", [
+      snapshot({
+        snapshotSequence: 9,
+        projects: [{ ...project, title: "Client ahead", repositoryIdentity }, otherProject],
+        threads: [shellRow(thread.id, { title: "Local-only thread" })],
+      }),
+      snapshot({
+        snapshotSequence: 3,
+        projects: [
+          { ...project, title: "Server reset", repositoryIdentity: null },
+          { ...otherProject, repositoryIdentity: null },
+        ],
+        threads: [shellRow(thread.id, { title: "Server thread" })],
+      }),
+    ]),
+    shellCase("marked enrichment keeps structure, then an authoritative snapshot resets", [
+      snapshot({
+        snapshotSequence: 20,
+        projects: [{ ...project, title: "Client ahead", repositoryIdentity }],
+        threads: [shellRow(thread.id, { title: "Local" })],
+      }),
+      snapshot(
+        {
+          snapshotSequence: 3,
+          projects: [{ ...project, title: "Server", repositoryIdentity: null }],
+          threads: [shellRow(thread.id, { title: "Server" })],
+        },
+        [project.workspaceRoot],
+      ),
+      snapshot({
+        snapshotSequence: 3,
+        projects: [{ ...project, title: "Server", repositoryIdentity: null }],
+        threads: [shellRow(thread.id, { title: "Server" })],
+      }),
+    ]),
+    shellCase("enrichment only fills identities", [
+      snapshot({
+        snapshotSequence: 5,
+        projects: [
+          { ...project, repositoryIdentity: null },
+          { ...otherProject, repositoryIdentity: null },
+        ],
+      }),
+      snapshot(
+        {
+          snapshotSequence: 4,
+          projects: [{ ...project, repositoryIdentity }, otherProject],
+          threads: [],
+        },
+        [],
+      ),
+      snapshot(
+        {
+          snapshotSequence: 4,
+          projects: [
+            { ...project, repositoryIdentity: null },
+            { ...otherProject, repositoryIdentity: null },
+          ],
+        },
+        [project.workspaceRoot],
+      ),
+      snapshot(
+        {
+          snapshotSequence: 4,
+          projects: [
+            {
+              ...project,
+              title: "Ignored",
+              workspaceRoot: "/moved",
+              repositoryIdentity: otherIdentity,
+            },
+          ],
+        },
+        ["/moved"],
+      ),
+    ]),
+    shellCase("enrichment cannot resurrect empty structure", [
+      snapshot({ snapshotSequence: 7, projects: [], threads: [], archivedThreads: [] }),
+      snapshot(
+        { snapshotSequence: 4, projects: [{ ...project, repositoryIdentity }], threads: [thread] },
+        [project.workspaceRoot],
+      ),
+    ]),
+    shellCase("archive deltas leave the shell", [
+      snapshot({ archivedThreads: [shellRow("archived-old")] }),
+      update(3, { ...thread, archivedAt: thread.updatedAt }, "archive"),
+      update(4, thread),
+      update(5, shellRow("archived-old"), "archive"),
+    ]),
+    shellCase("mixed deltas in one batch and across batches", [
+      snapshot({
+        snapshotSequence: 4,
+        projects: [{ ...project, repositoryIdentity }, otherProject],
+        threads: [shellRow("a"), shellRow("b"), shellRow("unchanged")],
+        archivedThreads: [shellRow("archived"), shellRow("old-archive")],
+      }),
+      update(5, shellRow("b", { title: "Renamed" })),
+      remove(5, "a"),
+      remove(6, "a"),
+      update(7, shellRow("a")),
+      sync,
+      update(8, shellRow("b"), "archive"),
+      update(9, shellRow("archived")),
+      update(10, shellRow("old-archive"), "archive"),
+      update(11, shellRow("new")),
+      remove(12, "missing"),
+      remove(11, "new"),
+      remove(13, "new"),
+      update(14, shellRow("new")),
+      sync,
+      update(15, shellRow("archived")),
+      projectUpdated(16, { ...project, title: "Updated" }),
+      projectUpdated(17, { ...project, workspaceRoot: "/moved" }),
+      {
+        kind: "project.removed",
+        sequence: 18,
+        projectId: project.id,
+      } as OrchestrationV2ShellStreamItem,
+      projectUpdated(19, project),
+      update(20, shellRow("unchanged")),
+      update(21, shellRow("unchanged", { status: "running", activeRunId: "run-1" })),
+    ]),
+  ];
+}

@@ -23,8 +23,18 @@ pub fn subscribe_shell(after_sequence: Option<u64>) -> Value {
     payload
 }
 
+/// Opts into what `thread::decode_thread_stream_item` undoes, as `threads.ts` does when it can
+/// page history: a bounded window, omitted local turn items, deduped bodies, an ID table.
+/// Collapsed work (`acceptDeferredWork`) needs a transcript control the native app lacks.
 pub fn subscribe_thread(thread_id: &str, after_sequence: Option<u64>) -> Value {
-    let mut payload = json!({ "threadId": thread_id, "requestCompletionMarker": true });
+    let mut payload = json!({
+        "threadId": thread_id,
+        "requestCompletionMarker": true,
+        "acceptBoundedSnapshot": true,
+        "acceptCompactTurnItems": true,
+        "acceptCompactIds": true,
+        "acceptDedupedBodies": true,
+    });
     if let Some(sequence) = after_sequence {
         payload["afterSequence"] = json!(sequence);
     }

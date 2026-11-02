@@ -10,6 +10,7 @@ use t3_client::session::RpcError;
 use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
 use t3_core::commands::{self, DispatchMode};
+use t3_core::history::HistoryStep;
 use t3_core::pairing::parse_pairing_link;
 use t3_core::shell::ShellState;
 use t3_core::sidebar::{SidebarRow, sidebar_rows};
@@ -184,6 +185,41 @@ impl AppState {
         }
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
+    }
+
+    /// Loads the page of history before the open thread's window, and keeps paging while pages
+    /// hold no user turn (`threads.ts` `loadEarlier`). A no-op while loading or at the start.
+    pub fn load_older_history(&mut self, cx: &mut Context<Self>) {
+        let (Some(thread_id), Some(client)) = (self.selected_thread.clone(), self.client.clone()) else { return };
+        let Some(cursor) = self.thread.begin_history_load() else { return };
+        cx.emit(AppEvent::Thread);
+        self.fetch_history_page(thread_id, cursor, client, cx);
+    }
+
+    fn fetch_history_page(&mut self, thread_id: String, cursor: String, client: ClientHandle, cx: &mut Context<Self>) {
+        let task = {
+            let (client, thread_id, cursor) = (client.clone(), thread_id.clone(), cursor.clone());
+            self.runtime.spawn(async move { client.history_page(&thread_id, &cursor).await })
+        };
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|_| Err("Could not load earlier activity.".into()));
+            let _ = this.update(cx, |state, cx| {
+                if state.selected_thread.as_deref() != Some(thread_id.as_str()) {
+                    return;
+                }
+                let step = match result {
+                    Ok(page) => state.thread.apply_history_page(&cursor, page),
+                    Err(message) => state.thread.fail_history_load(&cursor, message),
+                };
+                if step != HistoryStep::Stale {
+                    cx.emit(AppEvent::Thread);
+                }
+                if let HistoryStep::Continue(next) = step {
+                    state.fetch_history_page(thread_id, next, client, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn is_selected_thread_running(&self) -> bool {

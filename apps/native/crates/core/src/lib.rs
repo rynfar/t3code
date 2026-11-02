@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod history;
 pub mod model;
 pub mod pairing;
 pub mod rpc;
@@ -6,3 +7,4 @@ pub mod shell;
 pub mod sidebar;
 pub mod thread;
 pub mod turn_item;
+pub mod wire;

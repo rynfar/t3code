@@ -14,6 +14,8 @@ use crate::app_state::{AppEvent, AppState};
 use crate::transcript_row::render_item;
 
 pub const CONTENT_MAX_WIDTH: f32 = 736.;
+/// Rows from the top at which scrolling up loads the page of history before the window.
+const EARLIER_HISTORY_ROWS: usize = 3;
 
 struct Row {
     id: String,
@@ -36,9 +38,17 @@ impl ThreadView {
                 this.sync_rows(cx);
             }
         });
+        let list = ListState::new(0, ListAlignment::Bottom, px(600.));
+        // Prepended rows arrive as `splice(0..0, n)` from `sync_rows`, which keeps the scroll anchored.
+        let weak = state.downgrade();
+        list.set_scroll_handler(move |event, _, cx| {
+            if event.visible_range.start <= EARLIER_HISTORY_ROWS {
+                let _ = weak.update(cx, |state, cx| state.load_older_history(cx));
+            }
+        });
         ThreadView {
             state,
-            list: ListState::new(0, ListAlignment::Bottom, px(600.)),
+            list,
             rows: Vec::new(),
             markdown: HashMap::new(),
             thread_id: None,

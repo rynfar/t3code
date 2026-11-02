@@ -20,6 +20,11 @@ resolve it by editing upstream code. After the merge, run `vp i` if the lockfile
 `cargo test -p t3-core -p t3-client` in `apps/native` and the probe against a dev server if
 `packages/contracts` changed (see `test-t3-native`).
 
+Then run the drift alarm from `apps/native`: `node conformance/generate.ts --check`. Exit 1
+means upstream changed what its reducers, wire codecs, or history paging produce. Regenerate
+(`node conformance/generate.ts`), run `cargo test -p t3-core --test conformance`, and file a
+`parity:wire` issue for every case that now fails; commit the regenerated fixtures with the fix.
+
 ## 2. Digest
 
 ```sh

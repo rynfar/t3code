@@ -51,6 +51,9 @@ Run from `apps/native/`:
 - `cargo run -p t3-client --example probe -- --seconds 10` — headless connect and print.
 - `node scripts/gen-theme.ts --check` — tokens are current with the web theme.
 - `node --test parity/sync.test.ts` — the parity intake.
+- `node conformance/generate.ts --check` — the drift alarm: fixtures the Rust reducers replay
+  (`crates/core/tests/conformance.rs`) still match the real TypeScript reducers and server wire
+  code. Regenerate without `--check` after a reducer or wire change, then rerun the Rust test.
 
 Set `T3_NATIVE_HOME=<worktree>/.t3/native` whenever you launch the app or the probe, so you
 never overwrite the developer's saved connection. Launch and screenshot procedure:

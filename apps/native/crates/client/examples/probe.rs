@@ -4,6 +4,7 @@
 //!   cargo run -p t3-client --example probe -- --pair 'http://127.0.0.1:3773/pair#token=…'
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --seconds 10
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --send "hello"   # costs a turn
+//!   cargo run -p t3-client --example probe -- --thread <thread-id> --history 3     # page earlier history
 
 use std::time::Duration;
 
@@ -65,8 +66,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(ClientEvent::Thread { thread_id, item }) => {
                     let label = match item.as_ref() {
-                        ThreadStreamItem::Snapshot { snapshot_sequence, projection, .. } => format!(
-                            "snapshot seq={snapshot_sequence} items={} visible={}",
+                        ThreadStreamItem::Snapshot { snapshot_sequence, projection, has_more_history, latest_local_turn_ordinal, .. } => format!(
+                            "snapshot seq={snapshot_sequence} items={} visible={} has_more={has_more_history:?} watermark={latest_local_turn_ordinal:?}",
                             projection.turn_items.len(), projection.visible_turn_items.len()
                         ),
                         ThreadStreamItem::Event { sequence, .. } => format!("event seq={sequence}"),
@@ -78,6 +79,32 @@ async fn main() -> anyhow::Result<()> {
                 Some(ClientEvent::StreamError { context, message }) => println!("decode error in {context}: {message}"),
             }
         }
+    }
+    if let (Some(thread_id), Some(loads)) = (flag("--thread"), flag("--history").and_then(|n| n.parse::<usize>().ok())) {
+        for _ in 0..loads {
+            let Some(mut cursor) = thread.begin_history_load() else { break };
+            loop {
+                let started = std::time::Instant::now();
+                let step = match client.history_page(&thread_id, &cursor).await {
+                    Ok(page) => {
+                        let rows = page.items.len();
+                        let step = thread.apply_history_page(&cursor, page);
+                        println!("history page: {rows} rows in {:?} -> {step:?}", started.elapsed());
+                        step
+                    }
+                    Err(message) => thread.fail_history_load(&cursor, message),
+                };
+                match step {
+                    t3_core::history::HistoryStep::Continue(next) => cursor = next,
+                    other => {
+                        println!("history load: {other:?}");
+                        break;
+                    }
+                }
+            }
+        }
+        let visible = thread.projection.as_ref().map_or(0, |p| p.visible_turn_items.len());
+        println!("history: visible={visible} has_more={} expanded={}", thread.history.has_more_history, thread.history.expanded);
     }
     if let Some(snapshot) = &shell.snapshot {
         println!("final: {} projects, {} threads, synchronized={}", snapshot.projects.len(), snapshot.threads.len(), shell.synchronized);
