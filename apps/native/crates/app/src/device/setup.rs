@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use t3_core::device::{AGENT_DESCRIPTION, HUB_DESCRIPTION, HostStatus, Platform, PlatformStatus, ProbeGate, SETUP_STEPS, ServiceState, SetupStatus, configure_hub_payload};
 use t3_core::right_panel::{Surface, SurfaceKind};
 
-use super::pane::{HostRetry, host_updates};
+use super::{HostRetry, host_updates};
 use super::{Devices, DevicesEvent, devices};
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;

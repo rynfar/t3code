@@ -1,17 +1,18 @@
 //! Devices: the "Devices" section of `DevicesSettingsPanel` (`DeviceIntegrationControls` in
 //! `web/src/components/settings/IntegrationsSettings.tsx`), where the device hub and agent device
-//! access stay switchable after setup. The connected environment's device state comes from
-//! `crate::device`. Tool version popovers and device sources are not ported.
+//! access stay switchable after setup, with `DeviceHostUpdates` for this machine below them. The
+//! connected environment's device state comes from `crate::device`. Tool version popovers and
+//! device sources are not ported.
 
-use gpui::{Context, IntoElement, ParentElement, Styled, Subscription};
+use gpui::{Context, IntoElement, ParentElement, Styled, Subscription, div};
 use gpui_component::h_flex;
 use serde_json::{Value, json};
-use t3_core::device::{ServiceState, configure_hub_payload};
+use t3_core::device::{HostKind, ServiceState, configure_hub_payload};
 use t3_core::settings::search::Section;
 
 use super::controls::{Row, Switch, r, section};
 use super::{Block, SettingsView};
-use crate::device::{Devices, DevicesEvent, setup_status};
+use crate::device::{Devices, DevicesEvent, HostRetry, host_updates, setup_status};
 use crate::toast::{Toast, ToastKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,8 @@ enum Pending {
 
 pub(crate) struct DevicesState {
     pending: Option<Pending>,
+    /// The host whose Retry runs.
+    retrying: Option<String>,
     _subscription: Option<Subscription>,
 }
 
@@ -34,7 +37,13 @@ impl DevicesState {
                 }
             })
         });
-        DevicesState { pending: None, _subscription: subscription }
+        DevicesState { pending: None, retrying: None, _subscription: subscription }
+    }
+}
+
+impl HostRetry for SettingsView {
+    fn set_retrying(&mut self, host: Option<String>) {
+        self.devices.retrying = host;
     }
 }
 
@@ -67,7 +76,10 @@ impl SettingsView {
         // The compact setup status shows beside a switch while its change runs.
         let hub_status = setup_status((pending == Some(Pending::Hub)).then(|| service.hub_setup_status(true)).flatten(), cx);
         let agent_status = setup_status((pending == Some(Pending::Agent)).then(|| service.agent_setup_status(true)).flatten(), cx);
-        let rows = vec![
+        // A successful configure can still leave a host installing, starting or failed.
+        let local = ServiceState { hosts: service.hosts.iter().filter(|host| host.kind == HostKind::Local).cloned().collect(), ..service.clone() };
+        let updates = host_updates(&local, &devices, self.devices.retrying.as_deref(), cx.entity().downgrade(), cx);
+        let mut rows = vec![
             Row::new("device-hub", "Use devices")
                 .description("Open simulators and emulators in the Device panel.")
                 .highlighted(self.is_target("device-hub"))
@@ -79,6 +91,7 @@ impl SettingsView {
                 .control(h_flex().gap(r(8.)).children(agent_status).child(agent))
                 .into_any_element(),
         ];
+        rows.extend(updates.map(|updates| div().px(r(16.)).py(r(12.)).child(updates).into_any_element()));
         vec![Block::new(&["devices", "device-hub", "agent-device-access"], section("Devices", rows, cx))]
     }
 
