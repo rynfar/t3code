@@ -216,8 +216,15 @@ pub fn external_web_link(href: Option<&str>) -> Option<String> {
 pub struct AnsweredQuestion {
     pub question: Option<String>,
     pub answer: Option<String>,
-    /// The attachments' names.
-    pub attachments: Vec<String>,
+    pub attachments: Vec<AnswerAttachment>,
+}
+
+/// A file given with an answer; images show as thumbnails served by the attachment's asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerAttachment {
+    pub id: String,
+    pub name: String,
+    pub image: bool,
 }
 
 /// `QuestionAnswerHistory`: every question asked, answered or given files, in order.
@@ -240,7 +247,10 @@ pub fn answered_questions(answer: &Value) -> Vec<AnsweredQuestion> {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|attachment| attachment.get("name").and_then(Value::as_str).map(str::to_owned))
+                .filter_map(|attachment| {
+                    let field = |key: &str| attachment.get(key).and_then(Value::as_str);
+                    Some(AnswerAttachment { id: field("id")?.to_owned(), name: field("name").unwrap_or_default().to_owned(), image: field("type") == Some("image") })
+                })
                 .collect(),
         })
         .collect()

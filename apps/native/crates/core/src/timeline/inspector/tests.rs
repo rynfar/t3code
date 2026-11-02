@@ -148,12 +148,19 @@ fn answered_questions_list_every_question_once_in_order() {
         "requestId": "r",
         "questionTextById": { "q2": "Second?", "q1": "First?" },
         "answers": { "q1": { "answers": ["A", "B"] }, "q3": "Only answered" },
-        "attachmentsByQuestionId": { "q2": [{ "id": "f", "name": "shot.png", "type": "image" }] },
+        "attachmentsByQuestionId": { "q2": [{ "id": "f", "name": "shot.png", "type": "image" }, { "id": "g", "name": "notes.txt", "type": "file" }] },
     });
     assert_eq!(
         answered_questions(&answer),
         vec![
-            AnsweredQuestion { question: Some("Second?".into()), answer: None, attachments: vec!["shot.png".into()] },
+            AnsweredQuestion {
+                question: Some("Second?".into()),
+                answer: None,
+                attachments: vec![
+                    AnswerAttachment { id: "f".into(), name: "shot.png".into(), image: true },
+                    AnswerAttachment { id: "g".into(), name: "notes.txt".into(), image: false },
+                ],
+            },
             AnsweredQuestion { question: Some("First?".into()), answer: Some("A, B".into()), attachments: vec![] },
             AnsweredQuestion { question: None, answer: Some("Only answered".into()), attachments: vec![] },
         ]

@@ -7,7 +7,8 @@ use std::sync::{Arc, OnceLock};
 use gpui::{AnyElement, App, Context, Div, EntityId, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_core::media::{ImageAttachment, MediaKind, MediaPlacement, MediaSource, resolve_media_source};
+use t3_core::media::{AssetResource, ImageAttachment, MediaKind, MediaPlacement, MediaSource, resolve_media_source};
+use t3_core::timeline::AnswerAttachment;
 
 use crate::icons::Icon;
 use crate::media::{self, ImageState, MediaScope, Variant, ViewerItem};
@@ -319,4 +320,30 @@ pub fn other_files(names: &[String], cx: &App) -> Option<AnyElement> {
             }))
             .into_any_element(),
     )
+}
+
+/// A file given with an answer (`QuestionAnswerHistory`): an image as a thumbnail at most 128 by
+/// 80 once it loads, anything else by its underlined name. Either opens the file in the browser.
+pub fn answer_attachment(id: SharedString, attachment: &AnswerAttachment, cx: &mut App) -> AnyElement {
+    let resource = AssetResource::Attachment { attachment_id: attachment.id.clone() };
+    let owner = cx.try_global::<media::Media>().and_then(|media| media.scope.as_ref().map(|scope| scope.owner));
+    let source = MediaSource::Asset(resource.clone());
+    let image = match owner.filter(|_| attachment.image) {
+        Some(owner) => match media::image(&source, Variant::Thumb, owner, cx) {
+            ImageState::Ready(image) => Some(image),
+            _ => None,
+        },
+        None => None,
+    };
+    let frame = div().id(id).flex_none().cursor_pointer().on_click(move |_, _, cx| {
+        cx.stop_propagation();
+        media::open_asset(&resource, cx);
+    });
+    match image {
+        Some(image) => {
+            let width = media::dimensions(&source, cx).filter(|(_, height)| *height > 0).map_or(80., |(width, height)| (80. * width as f32 / height as f32).min(128.));
+            frame.h(px(80.)).w(px(width)).child(img(image).size_full().rounded(px(4.)).object_fit(ObjectFit::Contain)).into_any_element()
+        }
+        None => frame.underline().child(SharedString::from(attachment.name.clone())).into_any_element(),
+    }
 }

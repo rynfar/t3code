@@ -258,10 +258,11 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
             .w_full()
             .min_w_0()
             .children(text.map(|text| plain_body(&entry.id, &text, cx)))
-            .when(fetches, |this| this.child(ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::OutputOnly)))
+            .when(fetches, |this| this.child(ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::OutputOnly, cx.entity_id())))
             .into_any_element(),
         EntryBody::Inspector => {
-            let mut inspector = ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::Full).workspace_root(env.workspace_root);
+            let mut inspector =
+                ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::Full, cx.entity_id()).workspace_root(env.workspace_root);
             // The server streams the output, live and then final, in place of the item's own.
             if let Some(outputs) = env.command_outputs
                 && matches!(item.kind, TurnItemKind::CommandExecution { .. })

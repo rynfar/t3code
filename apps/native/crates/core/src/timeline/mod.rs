@@ -42,7 +42,7 @@ pub use detail::{
     open_command_items, read_tool_output_image, turn_item_has_detail, turn_item_output_images, turn_item_output_text,
 };
 pub use inspector::{
-    AnsweredQuestion, EntryBody, FetchedDetail, OUTPUT_UNAVAILABLE, OutputLine, SEARCH_RESULT, TOOL_OUTPUT_IMAGE, ToolOutput, answered_questions, entry_body,
+    AnswerAttachment, AnsweredQuestion, EntryBody, FetchedDetail, OUTPUT_UNAVAILABLE, OutputLine, SEARCH_RESULT, TOOL_OUTPUT_IMAGE, ToolOutput, answered_questions, entry_body,
     entry_can_expand, entry_fetches_detail, external_web_link, fetched_turn_item, file_change_line, plain_output, questions_text, search_result_location,
     todo_text,
 };

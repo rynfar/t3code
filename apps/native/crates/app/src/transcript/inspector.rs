@@ -2,19 +2,23 @@
 //! `ToolOutput`) and `FetchedToolOutput`, over the rules in `t3_core::timeline::inspector`. Its text
 //! is selectable, long blocks scroll in their own capped scrollers, JSON arguments are highlighted
 //! with the captures the web's highlighter uses, and a tool's images come from the media cache.
-//! What it shows is derived once per item, fetched item and appearance, not on every frame.
+//! What it shows is derived once per item and fetch, without colors, and kept in a bounded cache
+//! across frames; a large item is derived on the background executor. Colors are resolved when
+//! drawn, once per theme.
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ElementId, FontWeight, HighlightStyle, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, ElementId, Entity, EntityId, FontWeight, Global, HighlightStyle, Hsla, InteractiveElement, IntoElement, ParentElement,
+    RenderOnce, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::{ActiveTheme, Rope, h_flex, v_flex};
 use serde_json::Value;
-use t3_core::json_text::{is_json_text, js_trim, json_tokens};
+use t3_core::json_text::{JsonToken, is_json_text, js_trim, json_tokens};
 use t3_core::media::MediaSource;
 use t3_core::timeline::{
     AnsweredQuestion, FetchedDetail, OutputLine, SEARCH_RESULT, TOOL_OUTPUT_IMAGE, ToolCallLines, external_web_link, fetched_turn_item, file_change_line, format_workspace_relative_path,
@@ -23,7 +27,7 @@ use t3_core::timeline::{
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 use t3_core::vcs::format_diff_count;
 
-use super::media::tool_output_image;
+use super::media::{answer_attachment, tool_output_image};
 use super::parts::mono_frame;
 use crate::icons::Icon;
 use crate::selectable_text::{Highlights, SelectableText};
@@ -48,9 +52,19 @@ pub enum Mode {
     OutputOnly,
 }
 
+/// Items with less text than this are derived during render; larger ones on the background
+/// executor, so a megabyte of output never parses on the UI thread.
+const INLINE_BUDGET: usize = 16 * 1024;
+/// Texts longer than this draw without syntax colors.
+const HIGHLIGHT_BUDGET: usize = 64 * 1024;
+/// Derived items kept, most recently drawn first.
+const CACHE_LIMIT: usize = 32;
+
 #[derive(IntoElement)]
 pub struct ItemInspector {
     id: SharedString,
+    /// The view drawing it, notified when a background derive lands.
+    owner: EntityId,
     item: Arc<TurnItem>,
     fetch: Fetch,
     mode: Mode,
@@ -62,9 +76,10 @@ pub struct ItemInspector {
 }
 
 impl ItemInspector {
-    pub fn new(entry_id: &str, item: Arc<TurnItem>, fetch: Fetch, mode: Mode) -> Self {
+    pub fn new(entry_id: &str, item: Arc<TurnItem>, fetch: Fetch, mode: Mode, owner: EntityId) -> Self {
         ItemInspector {
             id: SharedString::from(format!("inspector:{entry_id}")),
+            owner,
             item,
             fetch,
             mode,
@@ -90,16 +105,72 @@ impl ItemInspector {
     }
 }
 
-/// A text with its highlighted runs, for a selectable block.
-#[derive(Clone)]
+/// A text's runs by what colors them; the colors are looked up when drawn.
+enum Runs {
+    Plain,
+    /// Argument keys, in `muted_foreground`.
+    Keys(Vec<Range<usize>>),
+    /// JSON, by the capture the web's highlighter gives each run.
+    Json(Vec<(Range<usize>, JsonToken)>),
+    /// TypeScript, by its parsed tree.
+    Code(Box<SyntaxHighlighter>),
+}
+
+/// The theme colors are resolved against: the palette and the syntax theme, by identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThemeKey(usize, usize);
+
+impl ThemeKey {
+    fn of(cx: &App) -> Self {
+        ThemeKey(std::ptr::from_ref(palette(cx)) as usize, Arc::as_ptr(&cx.theme().highlight_theme) as usize)
+    }
+}
+
+/// A text with its runs, for a selectable block, and its colors under the last theme drawn.
 struct Text {
     text: SharedString,
-    highlights: Option<Highlights>,
+    runs: Runs,
+    resolved: RefCell<Option<(ThemeKey, Option<Highlights>)>>,
 }
 
 impl Text {
+    fn new(text: impl Into<SharedString>, runs: Runs) -> Self {
+        Text { text: text.into(), runs, resolved: RefCell::new(None) }
+    }
+
     fn plain(text: impl Into<SharedString>) -> Self {
-        Text { text: text.into(), highlights: None }
+        Self::new(text, Runs::Plain)
+    }
+
+    fn highlights(&self, cx: &App) -> Option<Highlights> {
+        self.highlights_with(ThemeKey::of(cx), || resolve(&self.text, &self.runs, cx))
+    }
+
+    /// The colors under `theme`, resolved again only when the theme changed.
+    fn highlights_with(&self, theme: ThemeKey, resolve: impl FnOnce() -> Option<Highlights>) -> Option<Highlights> {
+        if let Some((resolved_for, highlights)) = self.resolved.borrow().as_ref()
+            && *resolved_for == theme
+        {
+            return highlights.clone();
+        }
+        let highlights = resolve();
+        *self.resolved.borrow_mut() = Some((theme, highlights.clone()));
+        highlights
+    }
+}
+
+fn resolve(text: &str, runs: &Runs, cx: &App) -> Option<Highlights> {
+    let theme = cx.theme().highlight_theme.clone();
+    match runs {
+        Runs::Plain => None,
+        Runs::Keys(keys) => {
+            let muted = HighlightStyle { color: Some(hsla(palette(cx).muted_foreground)), ..HighlightStyle::default() };
+            Some(keys.iter().map(|range| (range.clone(), muted)).collect())
+        }
+        Runs::Json(tokens) => Some(tokens.iter().filter_map(|(range, token)| theme.style(token.capture()).map(|style| (range.clone(), style))).collect()),
+        Runs::Code(highlighter) => {
+            Some(highlighter.styles(&(0..text.len()), &*theme).into_iter().filter(|(_, style)| *style != HighlightStyle::default()).collect())
+        }
     }
 }
 
@@ -141,11 +212,11 @@ struct WebResult {
 }
 
 /// What the derived blocks depend on. Items compare by identity: a changed item is a new one.
+#[derive(Clone)]
 struct Key {
     item: Arc<TurnItem>,
     fetch: Fetch,
     mode: Mode,
-    dark: bool,
     streamed: bool,
     workspace_root: Option<String>,
 }
@@ -158,41 +229,161 @@ impl Key {
             (Fetch::Failed(a), Fetch::Failed(b)) => a == b,
             _ => false,
         };
-        fetch
-            && Arc::ptr_eq(&self.item, &other.item)
-            && (self.mode, self.dark, self.streamed) == (other.mode, other.dark, other.streamed)
-            && self.workspace_root == other.workspace_root
+        fetch && Arc::ptr_eq(&self.item, &other.item) && (self.mode, self.streamed) == (other.mode, other.streamed) && self.workspace_root == other.workspace_root
+    }
+
+    fn derive(&self) -> Vec<Block> {
+        derive_blocks(&self.item, &self.fetch, self.mode, self.workspace_root.as_deref(), self.streamed)
+    }
+
+    /// Whether the item is small enough to derive during render.
+    fn inline(&self) -> bool {
+        let fetched = match &self.fetch {
+            Fetch::Loaded(item) => item_bytes(item),
+            _ => 0,
+        };
+        item_bytes(&self.item) + fetched <= INLINE_BUDGET
     }
 }
 
+/// About how much text an item carries, without formatting any of it.
+fn item_bytes(item: &TurnItem) -> usize {
+    let text = |text: &Option<String>| text.as_deref().map_or(0, str::len);
+    let values = |values: &Option<Vec<Value>>| values.iter().flatten().map(value_bytes).sum::<usize>();
+    match &item.kind {
+        TurnItemKind::CommandExecution { input, output, .. } => input.len() + text(output),
+        TurnItemKind::DynamicTool { input, output, .. } => value_bytes(input) + output.as_ref().map_or(0, value_bytes),
+        TurnItemKind::FileChange { diff_str, changes, .. } => text(diff_str) + changes.as_ref().map_or(0, |changes| changes.len() * 64),
+        TurnItemKind::FileSearch { results, .. } | TurnItemKind::WebSearch { results, .. } => values(results),
+        TurnItemKind::ApprovalRequest { prompt, .. } => text(prompt),
+        TurnItemKind::UserInputRequest { questions, .. } => questions.iter().map(value_bytes).sum(),
+        TurnItemKind::Notification { detail, .. } => text(detail),
+        TurnItemKind::SystemNotice { message } => message.len(),
+        TurnItemKind::Error { failure, .. } => failure.message.len(),
+        TurnItemKind::TodoList { steps, .. } => steps.iter().map(|step| step.text.len()).sum(),
+        _ => 0,
+    }
+}
+
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(|item| value_bytes(item) + 1).sum(),
+        Value::Object(object) => object.iter().map(|(key, item)| key.len() + value_bytes(item)).sum(),
+        _ => 8,
+    }
+}
+
+struct Prepared {
+    blocks: Vec<Block>,
+}
+
+enum Slot {
+    Pending { waiters: Vec<EntityId>, _task: Task<()> },
+    Ready(Rc<Prepared>),
+}
+
+struct Entry {
+    key: Key,
+    used: u64,
+    slot: Slot,
+}
+
+/// Derived inspectors, kept while rows scroll in and out, at most `CACHE_LIMIT` of them.
 #[derive(Default)]
-struct Memo {
-    key: Option<Key>,
-    blocks: Arc<Vec<Block>>,
+pub struct PreparedCache {
+    entries: Vec<Entry>,
+    tick: u64,
+}
+
+struct Store(Entity<PreparedCache>);
+
+impl Global for Store {}
+
+fn cache(cx: &mut App) -> Entity<PreparedCache> {
+    if let Some(store) = cx.try_global::<Store>() {
+        return store.0.clone();
+    }
+    let cache = cx.new(|_| PreparedCache::default());
+    cx.set_global(Store(cache.clone()));
+    cache
+}
+
+impl PreparedCache {
+    /// The derived blocks for `key`; `None` while a background derive runs, after which `owner`
+    /// is notified.
+    fn get(&mut self, key: Key, owner: EntityId, cx: &mut Context<Self>) -> Option<Rc<Prepared>> {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key)) {
+            entry.used = tick;
+            return match &mut entry.slot {
+                Slot::Ready(prepared) => Some(prepared.clone()),
+                Slot::Pending { waiters, .. } => {
+                    if !waiters.contains(&owner) {
+                        waiters.push(owner);
+                    }
+                    None
+                }
+            };
+        }
+        if key.inline() {
+            let prepared = Rc::new(Prepared { blocks: key.derive() });
+            self.insert(key, Slot::Ready(prepared.clone()));
+            return Some(prepared);
+        }
+        let input = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let derived = cx.background_executor().spawn(async move {
+                let blocks = input.derive();
+                (input, blocks)
+            });
+            let derived = derived.await;
+            let _ = this.update(cx, |cache, cx| cache.finish(derived, cx));
+        });
+        self.insert(key, Slot::Pending { waiters: vec![owner], _task: task });
+        None
+    }
+
+    /// Lands a background derive and wakes the views waiting for it.
+    fn finish(&mut self, (key, blocks): (Key, Vec<Block>), cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key)) else { return };
+        let waiters = match std::mem::replace(&mut entry.slot, Slot::Ready(Rc::new(Prepared { blocks }))) {
+            Slot::Pending { waiters, .. } => waiters,
+            Slot::Ready(_) => Vec::new(),
+        };
+        let app: &mut App = cx;
+        for owner in waiters {
+            app.notify(owner);
+        }
+    }
+
+    fn insert(&mut self, key: Key, slot: Slot) {
+        self.entries.push(Entry { key, used: self.tick, slot });
+        while self.entries.len() > CACHE_LIMIT {
+            let oldest = self.entries.iter().enumerate().filter(|(_, entry)| matches!(entry.slot, Slot::Ready(_))).min_by_key(|(_, entry)| entry.used).map(|(index, _)| index);
+            let Some(oldest) = oldest else { break };
+            self.entries.swap_remove(oldest);
+        }
+    }
 }
 
 impl RenderOnce for ItemInspector {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let key = Key {
             item: self.item.clone(),
             fetch: self.fetch.clone(),
             mode: self.mode,
-            dark: cx.theme().is_dark(),
             streamed: self.output_slot.is_some(),
             workspace_root: self.workspace_root.clone(),
         };
-        let memo = window.use_keyed_state(ElementId::Name(SharedString::from(format!("{}:memo", self.id))), cx, |_, _| Memo::default());
-        let blocks = memo.update(cx, |memo, cx| {
-            if !memo.key.as_ref().is_some_and(|old| old.same(&key)) {
-                memo.blocks = Arc::new(derive_blocks(&self.item, &self.fetch, self.mode, self.workspace_root.as_deref(), self.output_slot.is_some(), cx));
-                memo.key = Some(key);
-            }
-            memo.blocks.clone()
-        });
+        let owner = self.owner;
+        let prepared = cache(cx).update(cx, |cache, cx| cache.get(key, owner, cx));
         let ItemInspector { id, mut output_slot, mut open_diff, mode, .. } = self;
         let p = palette(cx);
-        let children: Vec<AnyElement> = blocks
+        let children: Vec<AnyElement> = prepared
             .iter()
+            .flat_map(|prepared| prepared.blocks.iter())
             .enumerate()
             .map(|(index, block)| render_block(&format!("{id}:{index}"), block, &mut output_slot, &mut open_diff, cx))
             .collect();
@@ -215,7 +406,7 @@ fn fetched_detail(fetch: &Fetch) -> (bool, Option<FetchedDetail<'_>>) {
     }
 }
 
-fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Option<&str>, streamed: bool, cx: &App) -> Vec<Block> {
+fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Option<&str>, streamed: bool) -> Vec<Block> {
     let (fetches, detail) = fetched_detail(fetch);
     let (item, output) = fetched_turn_item(wire, fetches, detail);
     let output_part = || CallPart::Output {
@@ -232,14 +423,14 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
     let structured = |value: Option<&str>| value.filter(|text| !text.is_empty()).map(|text| Block::Structured(Text::plain(text.to_owned())));
     match &item.kind {
         TurnItemKind::CommandExecution { input, exit_code, .. } => {
-            let mut parts = call_parts(ToolCallLines::command(input), None, cx);
+            let mut parts = call_parts(ToolCallLines::command(input), None);
             // The streamed panel stands in for the output; `render_block` puts it here.
             parts.push(if streamed { CallPart::Output { images: Vec::new(), line: None } } else { output_part() });
             parts.extend(exit_code.filter(|code| *code != 0).map(|code| CallPart::Exit(format!("exit {code}").into())));
             vec![Block::Call(parts)]
         }
         TurnItemKind::DynamicTool { tool_name, input, .. } => {
-            let mut parts = call_parts(ToolCallLines::args(input), tool_name.as_deref(), cx);
+            let mut parts = call_parts(ToolCallLines::args(input), tool_name.as_deref());
             parts.push(output_part());
             vec![Block::Call(parts)]
         }
@@ -291,7 +482,7 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
 
 /// `ToolCallBody`'s command and arguments: a JavaScript REPL's `code` highlighted as TypeScript,
 /// anything that is not a record of arguments as highlighted JSON when it parses.
-fn call_parts(call: ToolCallLines, tool_name: Option<&str>, cx: &App) -> Vec<CallPart> {
+fn call_parts(call: ToolCallLines, tool_name: Option<&str>) -> Vec<CallPart> {
     let mut parts = Vec::new();
     if let Some(command) = call.command {
         parts.push(CallPart::Command(with_visible_control_characters(&command).into()));
@@ -300,14 +491,14 @@ fn call_parts(call: ToolCallLines, tool_name: Option<&str>, cx: &App) -> Vec<Cal
     let mut keys: Vec<Range<usize>> = Vec::new();
     let flush = |lines: &mut String, keys: &mut Vec<Range<usize>>, parts: &mut Vec<CallPart>| {
         if !lines.is_empty() {
-            parts.push(CallPart::Args(args_text(std::mem::take(lines), std::mem::take(keys), cx)));
+            parts.push(CallPart::Args(Text::new(std::mem::take(lines), Runs::Keys(std::mem::take(keys)))));
         }
     };
     for (key, value) in call.args.into_iter().flatten() {
         if key == "code" && is_javascript_repl_tool(tool_name) {
             flush(&mut lines, &mut keys, &mut parts);
             parts.push(CallPart::Key(key.into()));
-            parts.push(CallPart::Structured(typescript(value, cx)));
+            parts.push(CallPart::Structured(typescript(value)));
             continue;
         }
         if !lines.is_empty() {
@@ -320,37 +511,35 @@ fn call_parts(call: ToolCallLines, tool_name: Option<&str>, cx: &App) -> Vec<Cal
     }
     flush(&mut lines, &mut keys, &mut parts);
     if let Some(text) = call.args_text {
-        let highlighted = if is_json_text(&text) { json(text, cx) } else { Text::plain(text) };
-        parts.push(CallPart::Structured(highlighted));
+        parts.push(CallPart::Structured(json(text)));
     }
     parts
 }
 
-fn args_text(text: String, keys: Vec<Range<usize>>, cx: &App) -> Text {
-    let muted = HighlightStyle { color: Some(hsla(palette(cx).muted_foreground)), ..HighlightStyle::default() };
-    Text { text: text.into(), highlights: Some(keys.into_iter().map(|range| (range, muted)).collect()) }
+/// JSON in the runs the web's highlighter gives it; anything else, or too much of it, plain.
+fn json(text: String) -> Text {
+    if text.len() > HIGHLIGHT_BUDGET || !is_json_text(&text) {
+        return Text::plain(text);
+    }
+    let tokens = json_tokens(&text);
+    Text::new(text, Runs::Json(tokens))
 }
 
-/// JSON with each run in its capture's color, as the web's highlighter paints it.
-fn json(text: String, cx: &App) -> Text {
-    let theme = cx.theme().highlight_theme.clone();
-    let highlights: Highlights = json_tokens(&text).into_iter().filter_map(|(range, token)| theme.style(token.capture()).map(|style| (range, style))).collect();
-    Text { text: text.into(), highlights: Some(highlights) }
-}
-
-fn typescript(code: String, cx: &App) -> Text {
-    let theme = cx.theme().highlight_theme.clone();
+fn typescript(code: String) -> Text {
+    if code.len() > HIGHLIGHT_BUDGET {
+        return Text::plain(code);
+    }
     let mut highlighter = SyntaxHighlighter::new("typescript");
     highlighter.update(None, &Rope::from_str(&code), None);
-    let highlights: Highlights = highlighter.styles(&(0..code.len()), &*theme).into_iter().filter(|(_, style)| *style != HighlightStyle::default()).collect();
-    Text { text: code.into(), highlights: Some(highlights) }
+    Text::new(code, Runs::Code(Box::new(highlighter)))
 }
 
 /// Selectable text in a scroller capped at `max_height`: drags past its edge scroll it.
 #[derive(IntoElement)]
 struct Capped {
     id: SharedString,
-    text: Text,
+    text: SharedString,
+    highlights: Option<Highlights>,
     max_height: f32,
     color: Hsla,
 }
@@ -358,8 +547,8 @@ struct Capped {
 impl RenderOnce for Capped {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let scroll = window.use_keyed_state(ElementId::Name(SharedString::from(format!("{}:scroll", self.id))), cx, |_, _| ScrollHandle::new()).read(cx).clone();
-        let mut text = SelectableText::new(SharedString::from(format!("{}:text", self.id)), self.text.text).autoscroll(&scroll);
-        if let Some(highlights) = self.text.highlights {
+        let mut text = SelectableText::new(SharedString::from(format!("{}:text", self.id)), self.text).autoscroll(&scroll);
+        if let Some(highlights) = self.highlights {
             text = text.highlights(highlights);
         }
         div().id(self.id).w_full().max_h(rem(self.max_height)).overflow_y_scroll().track_scroll(&scroll).text_color(self.color).child(text)
@@ -458,7 +647,8 @@ fn web_result(id: &str, result: &WebResult, cx: &mut App) -> AnyElement {
 
 /// `StructuredValue`: capped at 320, muted, highlighted when it carries runs.
 fn structured(id: &str, text: &Text, cx: &App) -> AnyElement {
-    Capped { id: SharedString::from(id.to_owned()), text: text.clone(), max_height: 320., color: hsla(palette(cx).muted_foreground) }.into_any_element()
+    let color = hsla(palette(cx).muted_foreground);
+    Capped { id: SharedString::from(id.to_owned()), text: text.text.clone(), highlights: text.highlights(cx), max_height: 320., color }.into_any_element()
 }
 
 fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyElement>>, cx: &mut App) -> AnyElement {
@@ -467,8 +657,8 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
         CallPart::Command(command) => div().text_color(hsla(p.foreground).opacity(0.85)).child(selectable(id, command.clone())).into_any_element(),
         CallPart::Args(text) => {
             let mut lines = selectable(id, text.text.clone());
-            if let Some(highlights) = &text.highlights {
-                lines = lines.highlights(highlights.clone());
+            if let Some(highlights) = text.highlights(cx) {
+                lines = lines.highlights(highlights);
             }
             div().text_color(hsla(p.foreground).opacity(0.85)).child(lines).into_any_element()
         }
@@ -482,7 +672,7 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
                 images.iter().enumerate().map(|(index, source)| tool_output_image(SharedString::from(format!("{id}:image:{index}")), source.clone(), TOOL_OUTPUT_IMAGE, cx)).collect();
             let line = line.as_ref().map(|line| match line {
                 Line::Text(text) => {
-                    Capped { id: SharedString::from(format!("{id}:output")), text: Text::plain(text.clone()), max_height: 320., color: hsla(p.muted_foreground) }.into_any_element()
+                    Capped { id: SharedString::from(format!("{id}:output")), text: text.clone(), highlights: None, max_height: 320., color: hsla(p.muted_foreground) }.into_any_element()
                 }
                 Line::Note(note) => div().italic().text_color(hsla(p.muted_foreground)).child(selectable(&format!("{id}:note"), note.clone())).into_any_element(),
                 Line::Failed(error) => div().text_color(hsla(p.destructive)).child(selectable(&format!("{id}:error"), error.clone())).into_any_element(),
@@ -497,7 +687,8 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
 pub fn plain_body(entry_id: &str, text: &str, cx: &App) -> AnyElement {
     let capped = Capped {
         id: SharedString::from(format!("plain:{entry_id}")),
-        text: Text::plain(text.to_owned()),
+        text: SharedString::from(text.to_owned()),
+        highlights: None,
         max_height: 256.,
         color: hsla(palette(cx).secondary_label),
     };
@@ -505,18 +696,72 @@ pub fn plain_body(entry_id: &str, text: &str, cx: &App) -> AnyElement {
 }
 
 /// `QuestionAnswerHistory`: each question, its answer indented beneath, and the files given.
-pub fn question_history(entry_id: &str, questions: &[AnsweredQuestion], cx: &App) -> AnyElement {
-    let p = palette(cx);
-    let muted = hsla(p.muted_foreground);
-    let rows = questions.iter().enumerate().map(|(index, question)| {
+pub fn question_history(entry_id: &str, questions: &[AnsweredQuestion], cx: &mut App) -> AnyElement {
+    let muted = hsla(palette(cx).muted_foreground);
+    let mut rows = Vec::with_capacity(questions.len());
+    for (index, question) in questions.iter().enumerate() {
         let id = format!("answer:{entry_id}:{index}");
-        v_flex()
-            .gap(px(4.))
-            .children(question.question.as_ref().map(|text| div().text_color(muted).child(selectable(&format!("{id}:q"), text.clone()))))
-            .children(question.answer.as_ref().map(|text| div().ml(px(12.)).text_color(muted).child(selectable(&format!("{id}:a"), text.clone()))))
-            .when(!question.attachments.is_empty(), |this| {
-                this.child(h_flex().flex_wrap().gap(px(8.)).children(question.attachments.iter().map(|name| div().underline().child(name.clone()))))
-            })
-    });
+        let files: Vec<AnyElement> = question
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(file, attachment)| answer_attachment(SharedString::from(format!("{id}:file:{file}")), attachment, cx))
+            .collect();
+        rows.push(
+            v_flex()
+                .gap(px(4.))
+                .children(question.question.as_ref().map(|text| div().text_color(muted).child(selectable(&format!("{id}:q"), text.clone()))))
+                .children(question.answer.as_ref().map(|text| div().ml(px(12.)).text_color(muted).child(selectable(&format!("{id}:a"), text.clone()))))
+                .when(!files.is_empty(), |this| this.child(h_flex().flex_wrap().gap(px(8.)).children(files))),
+        );
+    }
     v_flex().ml(px(28.)).mt(px(8.)).gap(px(8.)).text_size(px(14.)).line_height(px(20.)).children(rows).into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(output: &str) -> Arc<TurnItem> {
+        let item = serde_json::json!({
+            "id": "item", "threadId": "thread", "runId": null, "nodeId": null, "parentItemId": null, "ordinal": 1, "status": "completed",
+            "title": null, "startedAt": null, "completedAt": null, "updatedAt": "2026-10-01T00:00:00Z",
+            "type": "dynamic_tool", "toolName": "fetch", "input": { "url": "https://example.com" }, "output": output,
+        });
+        Arc::new(serde_json::from_value(item).expect("item decodes"))
+    }
+
+    fn key(item: Arc<TurnItem>, fetch: Fetch) -> Key {
+        Key { item, fetch, mode: Mode::Full, streamed: false, workspace_root: None }
+    }
+
+    #[test]
+    fn large_items_derive_off_the_ui_thread() {
+        assert!(key(tool("short"), Fetch::None).inline());
+        assert!(!key(tool(&"x".repeat(INLINE_BUDGET)), Fetch::None).inline());
+        let fetched = Fetch::Loaded(tool(&"x".repeat(INLINE_BUDGET)));
+        assert!(!key(tool(""), fetched).inline(), "the fetched output counts too");
+    }
+
+    #[test]
+    fn text_past_the_budget_draws_plain() {
+        assert!(matches!(json("{\"a\": 1}".into()).runs, Runs::Json(_)));
+        let big = format!("[{}0]", "0,".repeat(HIGHLIGHT_BUDGET / 2));
+        assert!(matches!(json(big).runs, Runs::Plain));
+        assert!(matches!(json("not json".into()).runs, Runs::Plain));
+        assert!(matches!(typescript("x".repeat(HIGHLIGHT_BUDGET + 1)).runs, Runs::Plain));
+    }
+
+    #[test]
+    fn colors_resolve_again_when_the_theme_changes() {
+        let style = |color: u32| -> Option<Highlights> {
+            Some([(0..3, HighlightStyle { color: Some(hsla(color)), ..HighlightStyle::default() })].into_iter().collect())
+        };
+        let text = Text::new("key value", Runs::Keys(std::iter::once(0..3).collect()));
+        let (light, other_light) = (ThemeKey(1, 10), ThemeKey(2, 10));
+        assert_eq!(text.highlights_with(light, || style(0x111111ff)), style(0x111111ff));
+        assert_eq!(text.highlights_with(light, || style(0x999999ff)), style(0x111111ff), "the same theme keeps its colors");
+        assert_eq!(text.highlights_with(other_light, || style(0x222222ff)), style(0x222222ff), "another palette resolves again");
+        assert_eq!(text.highlights_with(ThemeKey(2, 11), || style(0x333333ff)), style(0x333333ff), "another syntax theme too");
+    }
 }
