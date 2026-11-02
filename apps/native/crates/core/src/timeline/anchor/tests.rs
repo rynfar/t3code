@@ -79,3 +79,14 @@ fn nothing_to_keep_while_following_the_tail_or_before_a_layout() {
     assert_eq!(capture(&rows, id, 1, ScrollTop { item: 0, offset: 0. }, 0., tops(1)), None);
     assert_eq!(capture(&[] as &[&str], id, 1, ScrollTop { item: 0, offset: 0. }, 120., tops(1)), None);
 }
+
+#[test]
+fn a_row_regrouped_above_the_anchor_moves_it_back() {
+    // The control stays put while a page merges tools into the first work group: same row count,
+    // a new id and height, so turn 8 moved although its index and the scroll top did not.
+    let old = ids(&["g7", "t8", "a8"]);
+    let top = ScrollTop { item: 0, offset: 10. };
+    let visible = capture(&old, id, 1, top, 200., tops(1)).unwrap();
+    let new = ids(&["g6", "t8", "a8"]);
+    assert_eq!(restore(&visible, &new, id, 1, top), Some(Anchor::Below { item: 2, gap: 90. }));
+}

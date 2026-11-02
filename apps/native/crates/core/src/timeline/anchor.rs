@@ -49,13 +49,15 @@ pub fn capture<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top
 /// Puts the first captured row that is still there back where it was. `None` when the list
 /// already shows it there (`current` is the list's scroll top after the change) or none is left.
 pub fn restore<T>(visible: &VisibleRows, rows: &[T], id: impl Fn(&T) -> &str, header: usize, current: ScrollTop) -> Option<Anchor> {
-    let (index, old_index, top) = visible.rows.iter().find_map(|(row_id, old_index, top)| {
+    let (candidate, index, old_index, top) = visible.rows.iter().enumerate().find_map(|(candidate, (row_id, old_index, top))| {
         let same_place = rows.get(*old_index).is_some_and(|row| id(row) == row_id);
         let index = if same_place { Some(*old_index) } else { rows.iter().position(|row| id(row) == row_id) };
-        index.map(|index| (index, *old_index, *top))
+        index.map(|index| (candidate, index, *old_index, *top))
     })?;
     let item = header + index;
-    if item == visible.header + old_index && current == visible.scroll_top {
+    // Unmoved only when the first row in view kept its place: a row in view above the anchor that
+    // went may have taken a different height with it.
+    if candidate == 0 && item == visible.header + old_index && current == visible.scroll_top {
         return None;
     }
     let anchor = if top <= 0. { Anchor::At(ScrollTop { item, offset: -top }) } else { Anchor::Below { item, gap: top } };
