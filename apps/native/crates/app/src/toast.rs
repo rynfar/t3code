@@ -210,7 +210,8 @@ fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement
     div().relative().w_full().child(toast).child(close_orb(id, state.clone(), cx)).into_any_element()
 }
 
-/// The stack, positioned by the window: top-right, inset 32, below the 52px header.
+/// The stack, positioned by the window: top-right, inset 32, below the 52px header. It paints over
+/// the settings modal and dialogs, as toasts sit above them on the web (layer 100).
 pub fn stack(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
     let toasts = &state.read(cx).toasts;
     let visible: Vec<&Entry> = toasts.entries.iter().take(VISIBLE_LIMIT).collect();
@@ -240,5 +241,5 @@ pub fn stack(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
             }))
             .child(render_toast(front, state, cx))
     };
-    Some(container.into_any_element())
+    Some(gpui::deferred(container).with_priority(60).into_any_element())
 }

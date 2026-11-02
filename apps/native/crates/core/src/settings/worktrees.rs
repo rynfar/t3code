@@ -140,6 +140,27 @@ pub struct CleanupRules {
     pub worktree_unchanged: bool,
 }
 
+/// `StorageCleanupSettings`: the worktree rules, plus the artifact and log retention the
+/// Maintenance page edits. Each field falls back to its default alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageCleanup {
+    pub rules: CleanupRules,
+    pub browser_artifacts_after_days: Option<u32>,
+    pub logs_after_days: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for StorageCleanup {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(d)?;
+        let days = |key: &str| value.get(key).and_then(|days| days_from(days, 1));
+        Ok(StorageCleanup {
+            rules: serde_json::from_value(value.clone()).unwrap_or_default(),
+            browser_artifacts_after_days: days("browserArtifactsAfterDays"),
+            logs_after_days: days("logsAfterDays"),
+        })
+    }
+}
+
 /// The environment-wide `worktreeCleanup` policy; `None` uses `storageCleanup`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupPolicy {
@@ -163,7 +184,7 @@ pub struct WorktreeSettings {
     #[serde(deserialize_with = "trimmed")]
     pub branch_name_instructions: String,
     #[serde(deserialize_with = "lenient_or")]
-    pub storage_cleanup: CleanupRules,
+    pub storage_cleanup: StorageCleanup,
     #[serde(deserialize_with = "policy")]
     pub worktree_cleanup: Option<CleanupPolicy>,
 }
@@ -176,7 +197,7 @@ impl Default for WorktreeSettings {
             branch_naming_mode: BranchNaming::default(),
             branch_name_prefix: DEFAULT_BRANCH_PREFIX.to_owned(),
             branch_name_instructions: String::new(),
-            storage_cleanup: CleanupRules::default(),
+            storage_cleanup: StorageCleanup::default(),
             worktree_cleanup: None,
         }
     }
@@ -187,8 +208,8 @@ impl WorktreeSettings {
     pub fn cleanup(&self) -> CleanupRules {
         match self.worktree_cleanup {
             Some(CleanupPolicy::Custom(rules)) => rules,
-            Some(CleanupPolicy::Off) => CleanupRules { worktree_keep_when: self.storage_cleanup.worktree_keep_when, ..CleanupRules::default() },
-            None => self.storage_cleanup,
+            Some(CleanupPolicy::Off) => CleanupRules { worktree_keep_when: self.storage_cleanup.rules.worktree_keep_when, ..CleanupRules::default() },
+            None => self.storage_cleanup.rules,
         }
     }
 

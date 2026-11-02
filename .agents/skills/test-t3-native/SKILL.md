@@ -89,7 +89,8 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   `browser:new` for the browser's empty state, or `browser:<tab>` for an open preview session (open
   one on a scratch server with `cargo run -p t3-client --example preview_probe -- --keep`, then
   `--close <tab>`; viewing takes control of an unclaimed tab and resizes it);
-  `--settings` a section (`appearance`, `chat`, `keybindings`, …).
+  `--settings` a section (`appearance`, `chat`, `keybindings`, `diagnostics`, …), or a settings
+  search result's id (`telemetry-export`) to land on that row scrolled into view.
 - `--usage` opens the Usage page on a metric and waits for its summary; `--usage-model` opens
   the top model's breakdown. Limits skips its provider refresh so the run stays read-only.
   `--context-meter` turns on the composer's legacy context window indicator for `--thread`.

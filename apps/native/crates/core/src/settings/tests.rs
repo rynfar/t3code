@@ -256,7 +256,7 @@ fn snooze_editor_rules() {
 
 #[test]
 fn nav_keeps_the_web_order_and_drops_unported_sections() {
-    let groups = search::nav_groups();
+    let groups = search::nav_groups(search::Features::default());
     let flat: Vec<Section> = groups.iter().flat_map(|(_, sections)| sections.iter().copied()).collect();
     assert_eq!(
         flat,
@@ -273,18 +273,37 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
             Section::Worktrees,
             Section::Connections,
             Section::Access,
+            Section::Maintenance,
             Section::Labs,
             Section::About,
             Section::Archived
         ]
     );
     assert_eq!(groups.iter().map(|(heading, _)| *heading).collect::<Vec<_>>(), vec![None, Some("Agents"), Some("Code"), Some("Connections"), None]);
-    assert!(search::items().iter().all(|item| item.section.is_available()));
+    assert!(search::items(search::Features::default()).iter().all(|item| item.section.is_available(search::Features::default())));
+}
+
+#[test]
+fn secrets_shows_only_behind_its_feature_flag() {
+    let on = search::Features::from_secrets_flag(Some(" TRUE "));
+    assert_eq!(on, search::Features { secrets: true });
+    assert_eq!(search::Features::from_secrets_flag(Some("yes")), search::Features::default());
+    assert_eq!(search::Features::from_secrets_flag(None), search::Features::default());
+    let connections = |features| search::nav_groups(features).into_iter().find(|(heading, _)| *heading == Some("Connections")).unwrap().1;
+    assert_eq!(connections(on), vec![Section::Connections, Section::Access, Section::Secrets]);
+    assert_eq!(connections(search::Features::default()), vec![Section::Connections, Section::Access]);
+    let has_secrets = |features| search::items(features).iter().any(|item| item.id == "secret-providers-add");
+    assert!(has_secrets(on));
+    assert!(!has_secrets(search::Features::default()));
+    // Diagnostics is a detail page: searchable, not in the nav, highlighting Maintenance.
+    assert!(search::items(on).iter().any(|item| item.section == Section::Diagnostics));
+    assert!(search::nav_groups(on).iter().all(|(_, sections)| !sections.contains(&Section::Diagnostics)));
+    assert_eq!(Section::Diagnostics.nav_parent(), Section::Maintenance);
 }
 
 #[test]
 fn search_ranks_titles_before_terms_and_keybindings_last() {
-    let mut items = search::items();
+    let mut items = search::items(search::Features::default());
     items.push(search::keybinding_item("chat.new", "Chat: New", &["⌘N".into()]));
     let titles = |query: &str| search::search(query, &items).iter().map(|item| item.title.clone()).collect::<Vec<_>>();
     assert_eq!(titles("time format").first().map(String::as_str), Some("Time format"));

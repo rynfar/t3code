@@ -36,7 +36,9 @@ fn worktree_settings_drop_bad_values_one_at_a_time() {
     assert_eq!(settings.worktree_submodules, None);
     assert_eq!(settings.branch_naming_mode, BranchNaming::Semantic);
     assert_eq!(settings.branch_name_prefix, "", "an empty prefix is a choice, not a missing value");
-    let rules = settings.storage_cleanup;
+    assert_eq!(settings.storage_cleanup.logs_after_days, Some(4));
+    assert_eq!(settings.storage_cleanup.browser_artifacts_after_days, None);
+    let rules = settings.storage_cleanup.rules;
     assert_eq!(rules.worktree_keep_when, KeepWhen::UncommittedChanges);
     assert_eq!(rules.worktree_after_days, None, "inactive retention starts at one day");
     assert_eq!(rules.worktree_settled_after_days, Some(0), "settled retention may be zero days");

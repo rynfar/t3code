@@ -65,8 +65,7 @@ pub fn clear_error(cx: &mut App) {
     cx.global_mut::<ClientPrefs>().error = None;
 }
 
-/// Shows `message` above the settings page until the next edit, as a failed save does; toasts
-/// sit under the settings modal.
+/// Shows `message` above the settings page until the next edit, as a failed save does.
 pub fn show_error(message: impl Into<SharedString>, cx: &mut App) {
     cx.global_mut::<ClientPrefs>().error = Some(message.into());
     cx.refresh_windows();

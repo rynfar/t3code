@@ -9,12 +9,15 @@ mod access;
 mod appearance;
 mod archive;
 pub(crate) mod controls;
+mod diagnostics;
 mod general;
 mod keybindings;
+mod maintenance;
 mod project_actions;
 mod projects;
 mod providers;
 mod scheduled_tasks;
+mod secrets;
 mod source_control;
 pub(crate) mod store;
 mod threads;
@@ -27,7 +30,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_core::settings::search::{self, SearchItem, Section};
+use t3_core::settings::search::{self, Features, SearchItem, Section};
 
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
@@ -44,6 +47,8 @@ struct Host {
     pending_project: Option<String>,
     /// What had focus when the modal opened, focused again when it closes.
     previous_focus: Option<FocusHandle>,
+    /// Features the web build reads from its environment, read once at launch.
+    features: Features,
 }
 
 impl Global for Host {}
@@ -52,7 +57,8 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     store::init(cx);
     controls::init(cx);
     providers::init(cx);
-    cx.set_global(Host { state, view: None, pending: None, pending_project: None, previous_focus: None });
+    let features = Features::from_secrets_flag(std::env::var("T3CODE_FEATURE_SECRETS").ok().as_deref());
+    cx.set_global(Host { state, view: None, pending: None, pending_project: None, previous_focus: None, features });
     cx.on_action(|_: &OpenSettings, cx| open(Section::General, cx));
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
@@ -68,9 +74,13 @@ pub fn open(section: Section, cx: &mut App) {
     open_at(section, None, cx);
 }
 
+fn features(cx: &App) -> Features {
+    cx.global::<Host>().features
+}
+
 /// Opens settings at the row a settings search result names, as the palette's results do.
 pub fn open_setting(id: &str, cx: &mut App) {
-    if let Some(item) = search::items().into_iter().find(|item| item.id == id) {
+    if let Some(item) = search::items(features(cx)).into_iter().find(|item| item.id == id) {
         open_at(item.section, Some(item.anchor().to_owned()), cx);
     }
 }
@@ -104,8 +114,8 @@ pub fn show_project_list(cx: &mut App) {
 }
 
 /// The settings search results the command palette lists (`CommandPalette.tsx`).
-pub fn palette_items() -> Vec<t3_core::palette::CommandPaletteItem> {
-    search::items()
+pub fn palette_items(cx: &App) -> Vec<t3_core::palette::CommandPaletteItem> {
+    search::items(features(cx))
         .into_iter()
         .map(|item| t3_core::palette::CommandPaletteItem {
             value: format!("setting:{}", item.id),
@@ -243,6 +253,9 @@ pub struct SettingsView {
     pub(crate) scheduled: scheduled_tasks::ScheduledTasksState,
     pub(crate) access: access::AccessPageState,
     pub(crate) projects: projects::ProjectsState,
+    pub(crate) secrets: secrets::SecretsState,
+    pub(crate) maintenance: maintenance::MaintenanceState,
+    pub(crate) diagnostics: diagnostics::DiagnosticsState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -289,6 +302,9 @@ impl SettingsView {
             scheduled: scheduled_tasks::ScheduledTasksState::new(window, cx),
             access: access::AccessPageState::new(window, cx),
             projects: projects::ProjectsState::new(window, cx),
+            secrets: secrets::SecretsState::new(window, cx),
+            maintenance: maintenance::MaintenanceState::new(window, cx),
+            diagnostics: diagnostics::DiagnosticsState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -297,7 +313,7 @@ impl SettingsView {
             search,
             active_result: 0,
             scroll: ScrollHandle::new(),
-            section_focus: search::nav_groups()
+            section_focus: search::nav_groups(features(cx))
                 .into_iter()
                 .flat_map(|(_, sections)| sections)
                 .map(|section| (section, cx.focus_handle().tab_stop(true)))
@@ -334,6 +350,19 @@ impl SettingsView {
         if section != Section::Projects {
             self.projects.actions.close();
         }
+        if section != Section::Secrets {
+            self.secrets.dismiss();
+        }
+        if section != Section::Maintenance {
+            self.maintenance.leave();
+        }
+        if section == Section::Diagnostics {
+            if changed {
+                self.diagnostics.reset();
+            }
+        } else {
+            self.diagnostics.leave();
+        }
         cx.notify();
     }
 
@@ -342,7 +371,7 @@ impl SettingsView {
     }
 
     fn search_items(&self, cx: &App) -> Vec<SearchItem> {
-        let mut items = search::items();
+        let mut items = search::items(features(cx));
         let mac = cfg!(target_os = "macos");
         if let Some(config) = self.state.read(cx).server_config.config.as_ref() {
             for row in t3_core::settings::keybindings::rows(&config.keybindings, mac) {
@@ -373,7 +402,7 @@ impl SettingsView {
         if self.dismiss_keybinding_overlay(window, cx) {
             return;
         }
-        if self.projects.actions.dismiss() {
+        if self.projects.actions.dismiss() || self.secrets.dismiss() || self.maintenance.dismiss() {
             self.focus.focus(window, cx);
             cx.notify();
             return;
@@ -394,6 +423,7 @@ impl SettingsView {
         self.commit_focused_worktree_field(window, cx);
         self.commit_focused_source_control_field(window, cx);
         self.commit_focused_project_field(window, cx);
+        self.commit_focused_maintenance_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -482,6 +512,9 @@ impl SettingsView {
             .chain(self.scheduled.inputs())
             .chain([&self.access.label, &self.projects.name])
             .chain(self.projects.actions.inputs())
+            .chain(self.secrets.inputs())
+            .chain(self.maintenance.inputs())
+            .chain(self.diagnostics.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
             || [&self.worktrees.instructions, self.scheduled.textarea(), &self.projects.actions.command]
                 .into_iter()
@@ -567,7 +600,8 @@ impl SettingsView {
                 .child(icon(Icon::Search, 16., hsla(p.sidebar_icon)))
                 .on_click(cx.listener(|this, _, window, cx| this.on_focus_search(&FocusSettingsSearch, window, cx)))
         });
-        v_flex().gap(r(16.)).children(open_search).children(search::nav_groups().into_iter().enumerate().map(|(group_index, (heading, sections))| {
+        let current = self.section.nav_parent();
+        v_flex().gap(r(16.)).children(open_search).children(search::nav_groups(features(cx)).into_iter().enumerate().map(|(group_index, (heading, sections))| {
             v_flex()
                 .gap(r(4.))
                 .when(rail && group_index > 0, |this| this.pt(r(16.)).border_t_1().border_color(hsla(p.sidebar_border)))
@@ -575,7 +609,7 @@ impl SettingsView {
                     div().px(r(8.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.sidebar_muted_foreground).opacity(0.8)).child(heading)
                 }))
                 .children(sections.into_iter().map(|section| {
-                    let active = section == self.section;
+                    let active = section == current;
                     let color = if active { hsla(p.sidebar_foreground) } else { hsla(p.sidebar_muted_foreground).opacity(0.8) };
                     let focus = self.section_focus.iter().find(|(candidate, _)| *candidate == section).map(|(_, handle)| handle.clone().tab_stop(section == tab_stop));
                     let ring = keyboard && focus.as_ref().is_some_and(|focus| focus.is_focused(window));
@@ -698,6 +732,9 @@ impl SettingsView {
             Section::ScheduledTasks => self.scheduled_tasks_page(cx),
             Section::Projects => self.projects_page(window, cx),
             Section::Access => self.access_page(window, cx),
+            Section::Secrets => self.secrets_page(cx),
+            Section::Maintenance => self.maintenance_page(window, cx),
+            Section::Diagnostics => self.diagnostics_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
@@ -724,7 +761,8 @@ fn section_icon(section: Section) -> Icon {
         Section::Worktrees => Icon::FolderTree,
         Section::Access => Icon::ShieldCheck,
         Section::Connections => Icon::Server,
-        Section::Maintenance => Icon::Wrench,
+        Section::Secrets => Icon::KeyRound,
+        Section::Maintenance | Section::Diagnostics => Icon::Wrench,
         Section::Labs => Icon::FlaskConical,
         Section::About => Icon::Info,
         Section::Archived => Icon::Archive,
@@ -748,8 +786,10 @@ impl Render for SettingsView {
             }
         }
         let p = palette(cx);
+        // `SettingsPageContainer width="expanded"`: Diagnostics' tables take `max-w-6xl`.
+        let page_width = if self.section == Section::Diagnostics { 1152. } else { 896. };
         let error = store::error(cx).map(|error| {
-            div().w_full().max_w(r(896.)).px(r(24.)).child(
+            div().w_full().max_w(r(page_width)).px(r(24.)).child(
                 v_flex()
                     .px(r(14.))
                     .py(r(12.))
@@ -777,10 +817,12 @@ impl Render for SettingsView {
                 .pb(r(48.))
                 .gap(r(24.))
                 .children(error)
-                .children(blocks.into_iter().map(|block| div().w_full().max_w(r(896.)).px(r(24.)).child(block.element)))
+                .children(blocks.into_iter().map(|block| div().w_full().max_w(r(page_width)).px(r(24.)).child(block.element)))
                 .into_any_element(),
         };
         let action_editor = self.action_editor_overlay(window, cx);
+        let secret_dialog = self.secret_dialog_overlay(window, cx);
+        let background_dialog = self.background_dialog_overlay(window, cx);
         h_flex()
             .relative()
             .size_full()
@@ -794,5 +836,7 @@ impl Render for SettingsView {
             .child(self.render_nav(layout, window, cx))
             .child(v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(content))
             .children(action_editor)
+            .children(secret_dialog)
+            .children(background_dialog)
     }
 }

@@ -165,7 +165,7 @@ impl CommandPalette {
             root: Vec::new(),
             threads: Vec::new(),
             projects: Vec::new(),
-            settings: crate::settings::palette_items(),
+            settings: crate::settings::palette_items(cx),
             groups: Vec::new(),
             highlighted: None,
             focus_return: None,

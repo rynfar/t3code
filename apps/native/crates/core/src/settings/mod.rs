@@ -6,13 +6,16 @@
 
 pub mod access;
 pub mod archive;
+pub mod diagnostics;
 pub mod keybindings;
+pub mod maintenance;
 pub mod project_actions;
 pub mod projects;
 pub mod providers;
 pub mod quit_hold;
 pub mod search;
 pub mod scheduled_tasks;
+pub mod secrets;
 pub mod snooze;
 pub mod source_control;
 pub mod worktrees;
@@ -126,6 +129,9 @@ pub enum ServerSettingChange {
     ProviderInstance { instance_id: String, edit: providers::InstanceEdit },
     /// Project override entries, built when the queue sends them (`projects::override_patch`).
     ProjectOverride { members: Vec<project_actions::Member>, edit: projects::OverrideEdit },
+    /// A background activity edit that pins every other resolved value, built when the queue
+    /// sends it so an edit still in flight is never undone (`maintenance::BackgroundEdit`).
+    BackgroundActivity(maintenance::BackgroundEdit),
 }
 
 impl ServerSettingChange {
@@ -143,7 +149,10 @@ impl ServerSettingChange {
             ServerSettingChange::SnoozePresets(_) => "snoozePresets",
             ServerSettingChange::AddProjectBaseDirectory(_) => "addProjectBaseDirectory",
             ServerSettingChange::ResponseStreamingMode(_) => "responseStreamingMode",
-            ServerSettingChange::Prepared(_) | ServerSettingChange::ProviderInstance { .. } | ServerSettingChange::ProjectOverride { .. } => "",
+            ServerSettingChange::Prepared(_)
+            | ServerSettingChange::ProviderInstance { .. }
+            | ServerSettingChange::ProjectOverride { .. }
+            | ServerSettingChange::BackgroundActivity(_) => "",
         }
     }
 
@@ -165,7 +174,9 @@ impl ServerSettingChange {
             ServerSettingChange::AddProjectBaseDirectory(path) => json!(path.trim()),
             ServerSettingChange::ResponseStreamingMode(mode) => json!(mode),
             ServerSettingChange::Prepared(payload) => payload.get("patch").cloned().unwrap_or_default(),
-            ServerSettingChange::ProviderInstance { .. } | ServerSettingChange::ProjectOverride { .. } => Value::Null,
+            ServerSettingChange::ProviderInstance { .. } | ServerSettingChange::ProjectOverride { .. } | ServerSettingChange::BackgroundActivity(_) => {
+                Value::Null
+            }
         }
     }
 
@@ -175,6 +186,7 @@ impl ServerSettingChange {
         match self {
             ServerSettingChange::ProviderInstance { instance_id, edit } => providers::edit_payload(settings?, instance_id, edit),
             ServerSettingChange::ProjectOverride { members, edit } => Some(projects::override_patch(settings?, members, edit)),
+            ServerSettingChange::BackgroundActivity(edit) => Some(edit.payload(&settings?.provider_panel)),
             _ => Some(self.payload()),
         }
     }

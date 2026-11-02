@@ -89,6 +89,7 @@ icons! {
     Files => "icons/lucide/files.svg",
     FlaskConical => "icons/lucide/flask-conical.svg",
     Folder => "icons/lucide/folder.svg",
+    FolderOpen => "icons/lucide/folder-open.svg",
     FolderGit => "icons/lucide/folder-git.svg",
     FolderGit2 => "icons/lucide/folder-git-2.svg",
     FolderPlus => "icons/lucide/folder-plus.svg",
@@ -110,6 +111,7 @@ icons! {
     House => "icons/lucide/house.svg",
     Image => "icons/lucide/image.svg",
     Info => "icons/lucide/info.svg",
+    KeyRound => "icons/lucide/key-round.svg",
     Keyboard => "icons/lucide/keyboard.svg",
     Link => "icons/lucide/link.svg",
     Link2 => "icons/lucide/link-2.svg",
@@ -215,6 +217,7 @@ icons! {
     AgentPointer => "icons/lucide/stroke-2/mouse-pointer-2.svg",
     AgentPointerFill => "icons/preview/mouse-pointer-2-fill.svg",
     PreviewError => "icons/preview/error.svg",
+    OnePassword => "icons/providers/one-password.svg",
 }
 
 impl Icon {
