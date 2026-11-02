@@ -2,11 +2,11 @@
 //! Mirrors `OrchestrationV2ShellStreamItem` and `client-runtime/src/state/shellReducer.ts`.
 //! Fields the native client does not read yet are left out; serde ignores them.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::ModelSelection;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectShell {
     pub id: String,
@@ -24,7 +24,7 @@ pub struct ProjectShell {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lineage {
     pub parent_thread_id: Option<String>,
@@ -41,7 +41,7 @@ impl Lineage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingRuntimeRequestSummary {
     pub id: String,
@@ -50,7 +50,7 @@ pub struct PendingRuntimeRequestSummary {
     pub blocking: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatestVisibleMessage {
     pub id: String,
@@ -59,7 +59,7 @@ pub struct LatestVisibleMessage {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadShell {
     pub id: String,
@@ -118,7 +118,7 @@ impl ThreadShell {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellSnapshot {
     pub snapshot_sequence: u64,

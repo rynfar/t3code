@@ -25,7 +25,7 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
         projection.updated_at = event.occurred_at.clone();
     }
     match event.body {
-        EventBody::ThreadReplaced(thread) | EventBody::ThreadTouched(thread) => {
+        EventBody::ThreadReplaced(thread) | EventBody::ThreadDeleted(thread) | EventBody::ThreadTouched(thread) => {
             projection.thread = *thread;
         }
         // Pull request links are not modeled natively yet; the activity bump above still applies.
