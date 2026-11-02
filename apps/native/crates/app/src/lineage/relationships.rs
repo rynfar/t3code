@@ -50,7 +50,9 @@ pub struct Relationships {
 pub fn relationships(state: &AppState, thread: &ThreadShell) -> Relationships {
     let Some(snapshot) = state.shell.snapshot.as_ref() else { return Relationships::default() };
     let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == thread.id);
-    let graph = relationship_graph(snapshot.threads.iter().chain(snapshot.archived_threads.iter()), projection);
+    // Live shells first, then the idle family rows the shell omits, then archived snapshots.
+    let family = state.omitted.mounts.extras(&state.shell);
+    let graph = relationship_graph(snapshot.threads.iter().chain(family).chain(snapshot.archived_threads.iter()), projection);
     let merge_target = projection.and_then(|projection| merge_back_target(&projection.thread));
     let rows = order_rows(&graph, immediate_relationships(&graph, &thread.id), &thread.id, merge_target.as_deref());
     let agents: Vec<Subagent> = projection.map(subagents_of).unwrap_or_default();
@@ -68,7 +70,7 @@ pub fn relationships(state: &AppState, thread: &ThreadShell) -> Relationships {
             .as_ref()
             .and_then(|group| group.name.clone())
             .or_else(|| node.map(|node| node.title.clone()))
-            .or_else(|| agent.and_then(|agent| agent.title.clone()))
+            .or_else(|| agent.map(runtime_title))
             .unwrap_or_else(|| row.thread_id.clone());
         let stop = agent.and_then(|agent| match &workflow {
             Some(_) if agent.can_stop_workflow() => Some(StopAction::Workflow { thread_id: thread.id.clone(), subagent_id: agent.id.clone() }),
@@ -102,6 +104,13 @@ pub fn relationships(state: &AppState, thread: &ThreadShell) -> Relationships {
         side_chats: groups.side_chats.iter().map(row).collect(),
         merge,
     }
+}
+
+/// The runtime title `projectedSubagentsToRuntime` gives a subagent: its title, else its prompt.
+fn runtime_title(agent: &Subagent) -> String {
+    agent.title.clone().unwrap_or_else(|| {
+        if agent.prompt.chars().count() > 80 { format!("{}...", agent.prompt.chars().take(77).collect::<String>()) } else { agent.prompt.clone() }
+    })
 }
 
 impl AppState {

@@ -29,6 +29,14 @@ const SURFACE_ACTIONS: &[SurfaceAction] = &[
 /// Opens the launcher entry named `label` (case-insensitive), as clicking it would.
 #[cfg(feature = "snapshot")]
 pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<AppState>) -> bool {
+    // An existing side chat of the open thread, by `side-chat:<thread>`; starting one would write.
+    if let Some(thread_id) = label.strip_prefix("side-chat:") {
+        let is_side_chat = state.selected_thread.as_deref().zip(state.thread_shell(thread_id)).is_some_and(|(parent, thread)| t3_core::side_chat::is_side_chat_of(thread, parent));
+        if is_side_chat {
+            state.open_related_thread(thread_id, cx);
+        }
+        return is_side_chat;
+    }
     let Some(action) = SURFACE_ACTIONS.iter().find(|action| action.label.eq_ignore_ascii_case(label)) else { return false };
     (action.open)(state, cx);
     true
