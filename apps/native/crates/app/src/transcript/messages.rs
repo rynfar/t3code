@@ -86,6 +86,13 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         let state = markdown.state(&format!("user:{id}"), &source, cx);
         Some(markdown_view(&state, cx))
     };
+    let attachments: Vec<String> = match message.item.as_ref().map(|item| &item.kind) {
+        Some(t3_core::turn_item::TurnItemKind::UserMessage { attachments, .. }) => attachments
+            .iter()
+            .filter_map(|attachment| attachment.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
     let small = |radius: bool| if radius { px(6.) } else { px(16.) };
     let bubble = v_flex()
         .relative()
@@ -100,6 +107,16 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .text_size(px(14.))
         .line_height(px(22.75))
         .text_color(hsla(p.message_foreground))
+        .when(!attachments.is_empty(), |this| {
+            this.child(v_flex().gap(px(4.)).mb(px(8.)).children(attachments.iter().map(|name| {
+                h_flex()
+                    .min_w_0()
+                    .gap(px(8.))
+                    .text_size(px(14.))
+                    .child(Icon::Link.render(px(14.), hsla(p.muted_foreground)))
+                    .child(div().min_w_0().truncate().child(name.clone()))
+            })))
+        })
         .children(body.map(|body| {
             div()
                 .relative()

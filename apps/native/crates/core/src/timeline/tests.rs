@@ -456,3 +456,16 @@ fn incremental_derives_match_a_fresh_derive_at_every_streamed_frame() {
     }
     assert!(checked > 10, "only {checked} frames changed the projection");
 }
+
+#[test]
+fn answered_questions_preview_the_question_and_answer() {
+    let answer = serde_json::json!({
+        "requestId": "r1",
+        "questionTextById": { "q1": "Which  database?" },
+        "answers": { "q1": { "answers": ["Postgres", "SQLite"] } },
+        "attachmentsByQuestionId": {}
+    });
+    assert_eq!(question_text_preview(&answer), "Which database?");
+    assert_eq!(question_answer_preview(&answer), "Postgres, SQLite");
+    assert!(has_question_answer(&answer));
+}

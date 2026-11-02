@@ -8,7 +8,7 @@ use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use serde_json::Value;
 use t3_core::timeline::{
-    RowKind, TimelineRow, WorkIcon, WorkLogEntry, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args, summary_icon,
+    RowKind, TimelineRow, WorkIcon, has_question_answer, question_answer_preview, question_text_preview, WorkLogEntry, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args, summary_icon,
     tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group,
     work_entry_read_output, work_log_entry_is_tool_like, ToolGroupAction, ToolStatus,
 };
@@ -167,10 +167,12 @@ fn entry_row(
         hsla(p.icon_muted)
     };
     let reasoning = entry.item_type == Some("reasoning");
+    let question = entry.question_answer.as_ref().map(question_text_preview).filter(|q| !q.is_empty());
+    let answer = entry.question_answer.as_ref().filter(|a| has_question_answer(a)).map(question_answer_preview);
     let preview = if reasoning && expanded {
         if entry.status == Some(ToolStatus::InProgress) { "Thinking".to_owned() } else { "Thought".to_owned() }
     } else {
-        display_label.map(str::to_owned).unwrap_or_else(|| work_entry_display_label(entry, env.workspace_root))
+        question.or_else(|| display_label.map(str::to_owned)).unwrap_or_else(|| work_entry_display_label(entry, env.workspace_root))
     };
     let label_color = if warning {
         hsla(p.warning)
@@ -188,12 +190,21 @@ fn entry_row(
     }
     trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     trailing.push(chevron(expanded, can_expand, cx));
-    let label = div()
+    let label = h_flex()
         .min_w_0()
-        .truncate()
-        .text_color(label_color)
-        .when(warning || severe, |this| this.font_weight(FontWeight::MEDIUM))
-        .child(preview)
+        .gap(px(6.))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(label_color)
+                .when(warning || severe, |this| this.font_weight(FontWeight::MEDIUM))
+                .child(preview),
+        )
+        .children(answer.map(|answer| {
+            let color = if expanded { hsla(p.muted_foreground) } else { hsla(p.foreground) };
+            div().min_w_0().truncate().text_color(color).child(answer)
+        }))
         .into_any_element();
     let entry_id = entry.id.clone();
     let mut frame = work_row_frame(SharedString::from(format!("work-entry:{}", entry.id)), grouped)

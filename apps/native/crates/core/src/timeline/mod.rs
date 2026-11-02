@@ -10,6 +10,7 @@ mod presentation;
 mod rows;
 mod time;
 mod tool_activity;
+mod user_input;
 
 #[cfg(test)]
 mod tests;
@@ -34,6 +35,7 @@ pub use presentation::{
 pub use rows::{RowsCache, RowsInput, derive_rows};
 pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, parse_iso_ms};
 pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name};
+pub use user_input::{has_question_answer, question_answer_preview, question_answer_text, question_text_preview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
