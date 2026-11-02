@@ -40,13 +40,16 @@ pub fn parse_runtime_state(text: &str) -> Option<ServerRuntimeState> {
     valid.then(|| ServerRuntimeState { origin: state.origin.trim_end_matches('/').to_owned(), ..state })
 }
 
-/// `T3CODE_HOME`, else `~/.t3` (`resolveBaseDir`), expanding a leading `~`.
-pub fn t3_home(configured: Option<&str>, user_home: &Path) -> PathBuf {
-    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+/// `T3CODE_HOME`, else `~/.t3` (`resolveBaseDir`), expanding a leading `~`. A relative value is
+/// taken from `cwd`, the directory the app was launched in, so discovery and the CLI (which runs
+/// elsewhere) agree on one absolute home.
+pub fn t3_home(configured: Option<&str>, user_home: &Path, cwd: &Path) -> PathBuf {
+    let home = match configured.map(str::trim).filter(|value| !value.is_empty()) {
         Some("~") => user_home.to_path_buf(),
         Some(value) => value.strip_prefix("~/").map_or_else(|| PathBuf::from(value), |rest| user_home.join(rest)),
         None => user_home.join(".t3"),
-    }
+    };
+    if home.is_absolute() { home } else { cwd.join(home) }
 }
 
 /// Where a running server records itself, in the order `t3 pair` checks: the release state
@@ -78,6 +81,38 @@ pub fn pair_args(home: &Path, default_home: &Path) -> Vec<String> {
         args.extend(["--base-dir".to_owned(), home.to_string_lossy().into_owned()]);
     }
     args
+}
+
+/// Why the installed CLI may not run `t3 pair` against the running server.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CliVersionRefusal {
+    #[error("The t3 CLI (v{cli}) doesn't match the running T3 Code (v{server}). {PASTE_INSTEAD}")]
+    Mismatch { cli: String, server: String },
+    #[error("Could not read the t3 CLI's version, so it can't safely pair with the running T3 Code. {PASTE_INSTEAD}")]
+    UnknownCli,
+    #[error("The running T3 Code did not record its version, so the t3 CLI can't safely pair with it. {PASTE_INSTEAD}")]
+    UnknownServer,
+}
+
+const PASTE_INSTEAD: &str = "Create a pairing link in T3 Code → Settings → Sharing & access instead.";
+
+/// The version `t3 --version` prints (`t3 v0.1.7-nightly.20261102.4061`), without its `v`.
+pub fn parse_cli_version(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        let (_name, version, rest) = (words.next()?, words.next()?, words.next());
+        let version = version.strip_prefix('v')?;
+        (rest.is_none() && version.starts_with(|c: char| c.is_ascii_digit())).then(|| version.to_owned())
+    })
+}
+
+/// `t3 pair` opens the server's database and runs its migrations (`EnvironmentAuth`, `Sqlite`),
+/// so a CLI of any other version could migrate a live database under the running server. Only
+/// the exact version recorded in `server-runtime.json` may run it.
+pub fn check_cli_version(cli_stdout: &str, server_version: Option<&str>) -> Result<(), CliVersionRefusal> {
+    let server = server_version.filter(|version| !version.is_empty()).ok_or(CliVersionRefusal::UnknownServer)?;
+    let cli = parse_cli_version(cli_stdout).ok_or(CliVersionRefusal::UnknownCli)?;
+    if cli == server { Ok(()) } else { Err(CliVersionRefusal::Mismatch { cli, server: server.to_owned() }) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,11 +177,13 @@ mod tests {
 
     #[test]
     fn home_follows_t3code_home_and_paths_follow_the_cli_order() {
-        let user = Path::new("/Users/me");
-        assert_eq!(t3_home(None, user), Path::new("/Users/me/.t3"));
-        assert_eq!(t3_home(Some("  "), user), Path::new("/Users/me/.t3"));
-        assert_eq!(t3_home(Some("~/alt"), user), Path::new("/Users/me/alt"));
-        assert_eq!(t3_home(Some("/srv/t3"), user), Path::new("/srv/t3"));
+        let (user, cwd) = (Path::new("/Users/me"), Path::new("/Volumes/work"));
+        assert_eq!(t3_home(None, user, cwd), Path::new("/Users/me/.t3"));
+        assert_eq!(t3_home(Some("  "), user, cwd), Path::new("/Users/me/.t3"));
+        assert_eq!(t3_home(Some("~/alt"), user, cwd), Path::new("/Users/me/alt"));
+        assert_eq!(t3_home(Some("/srv/t3"), user, cwd), Path::new("/srv/t3"));
+        // The CLI runs from the user's home; a relative home still means the launch directory.
+        assert_eq!(t3_home(Some(".t3-smoke"), user, cwd), Path::new("/Volumes/work/.t3-smoke"));
         let [release, dev] = runtime_state_paths(Path::new("/h"));
         assert_eq!((release.as_path(), dev.as_path()), (Path::new("/h/userdata/server-runtime.json"), Path::new("/h/dev/server-runtime.json")));
     }
@@ -165,6 +202,31 @@ mod tests {
         let default = Path::new("/Users/me/.t3");
         assert_eq!(pair_args(default, default), ["pair", "--label", "T3 Code Native", "--ttl", "2m"]);
         assert_eq!(pair_args(Path::new("/tmp/home"), default)[5..], ["--base-dir", "/tmp/home"]);
+    }
+
+    #[test]
+    fn only_a_cli_of_the_running_servers_exact_version_may_pair() {
+        let live = "0.1.7-nightly.20261102.4061";
+        assert_eq!(parse_cli_version("t3 v0.1.7-nightly.20261102.4061\n").as_deref(), Some(live));
+        assert_eq!(parse_cli_version("(node:1) ExperimentalWarning: x\nt3 v0.1.6\n").as_deref(), Some("0.1.6"));
+        assert_eq!(parse_cli_version(""), None);
+        assert_eq!(parse_cli_version("t3 version unknown\n"), None);
+        assert_eq!(parse_cli_version("t3 vnext\n"), None);
+
+        assert_eq!(check_cli_version("t3 v0.1.7-nightly.20261102.4061\n", Some(live)), Ok(()));
+        let newer = check_cli_version("t3 v0.1.7-nightly.20261103.4100\n", Some(live));
+        assert_eq!(newer, Err(CliVersionRefusal::Mismatch { cli: "0.1.7-nightly.20261103.4100".into(), server: live.into() }));
+        assert_eq!(
+            newer.unwrap_err().to_string(),
+            "The t3 CLI (v0.1.7-nightly.20261103.4100) doesn't match the running T3 Code (v0.1.7-nightly.20261102.4061). Create a pairing link in T3 Code → Settings → Sharing & access instead."
+        );
+        // Exactly equal: a prefix, a build suffix, or an older CLI never passes.
+        assert!(check_cli_version("t3 v0.1.7\n", Some(live)).is_err());
+        assert!(check_cli_version("t3 v0.1.7-nightly.20261102.40610\n", Some(live)).is_err());
+        assert!(check_cli_version("t3 v0.1.6\n", Some("0.1.7")).is_err());
+        assert_eq!(check_cli_version("garbage", Some(live)), Err(CliVersionRefusal::UnknownCli));
+        assert_eq!(check_cli_version("t3 v0.1.7\n", None), Err(CliVersionRefusal::UnknownServer));
+        assert_eq!(check_cli_version("t3 v0.1.7\n", Some("")), Err(CliVersionRefusal::UnknownServer));
     }
 
     #[test]
