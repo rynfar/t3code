@@ -535,7 +535,7 @@ fn snapshot(threads: Vec<Value>) -> ShellSnapshot {
 
 fn build(snapshot: &ShellSnapshot, shelves: &ShelfState, selected: Option<&str>) -> SidebarModel {
     SidebarModel::build(
-        &ModelInput { snapshot, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, connected: true, now: iso(NOW) },
+        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, connected: true, now: iso(NOW) },
         &mut InboxReturnTracker::default(),
     )
 }

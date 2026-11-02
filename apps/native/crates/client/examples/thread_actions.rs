@@ -21,6 +21,8 @@ fn section(shell: &ShellState, thread_id: &str) -> Option<Section> {
     let snapshot = shell.snapshot.as_ref()?;
     let input = ModelInput {
         snapshot,
+        extra_threads: &[],
+        older_settled: None,
         settings: &Default::default(),
         shelves: &Default::default(),
         selected_thread_id: Some(thread_id),

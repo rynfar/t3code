@@ -24,7 +24,7 @@ use settled::effective_snoozed;
 use thread::{SidebarThread, pending_subagent_requests, present_thread};
 use time::Ms;
 
-use crate::shell::ShellSnapshot;
+use crate::shell::{ShellSnapshot, ThreadShell};
 
 pub const SETTLED_TAIL_INITIAL_COUNT: usize = 10;
 pub const SETTLED_TAIL_PAGE_COUNT: usize = 25;
@@ -184,8 +184,19 @@ pub fn partition(input: &PartitionInput) -> Partition {
     Partition { pinned: ids(pinned), active: ids(active), working: ids(working), snoozed: ids(snoozed), settled: ids(settled) }
 }
 
+/// The Settled shelf below the shell's cut, when the shell omits older settled threads.
+#[derive(Debug, Clone, Copy)]
+pub struct OlderSettledShelf<'a> {
+    pub older: &'a older_settled::OlderSettled,
+    /// Rows below it wait for the page that holds them (`isListedSettledThread`).
+    pub frontier: Option<&'a older_settled::Cursor>,
+}
+
 pub struct ModelInput<'a> {
     pub snapshot: &'a ShellSnapshot,
+    /// Rows on-demand reads hold that the shell omits (shelf pages, families); shell rows win.
+    pub extra_threads: &'a [&'a ThreadShell],
+    pub older_settled: Option<OlderSettledShelf<'a>>,
     pub settings: &'a SidebarSettings,
     pub shelves: &'a ShelfState,
     pub selected_thread_id: Option<&'a str>,
@@ -207,6 +218,8 @@ pub struct SidebarModel {
     pub ordered: Vec<usize>,
     pub settled_count: usize,
     pub hidden_settled_count: usize,
+    /// Settled rows the shelf may list; it reads older pages until this fills what it shows.
+    pub listed_settled_count: usize,
     /// The next instant the partition can change without a shell update.
     pub next_change_at: Option<Ms>,
 }
@@ -215,13 +228,18 @@ impl SidebarModel {
     pub fn build(input: &ModelInput, tracker: &mut InboxReturnTracker) -> SidebarModel {
         let snapshot = input.snapshot;
         let subagent_requests = pending_subagent_requests(&snapshot.threads);
-        let threads: Vec<SidebarThread> = snapshot
+        let rows: Vec<&ThreadShell> = snapshot
             .threads
             .iter()
+            .chain(input.extra_threads.iter().copied())
             .filter(|thread| thread.archived_at.is_none() && thread.deleted_at.is_none() && thread.lineage.is_listed())
             .filter(|thread| input.project_scope.is_none_or(|scope| scope.contains(&thread.project_id)))
-            .map(|thread| present_thread(thread, subagent_requests.get(&thread.id).copied()))
             .collect();
+        let unloaded_settled = input
+            .older_settled
+            .map_or(0, |shelf| older_settled::unloaded_count(shelf.older, input.project_scope, &rows));
+        let threads: Vec<SidebarThread> =
+            rows.iter().map(|thread| present_thread(thread, subagent_requests.get(&thread.id).copied())).collect();
         let observation = if input.settings.working_shelf_enabled {
             tracker.observe(&threads, input.now)
         } else {
@@ -245,11 +263,12 @@ impl SidebarModel {
             .chain(tracker.next_deadline())
             .min();
         let mut model = SidebarModel { threads, index_by_id, project_names, partition, next_change_at, ..Default::default() };
-        model.build_rows(input.shelves, input.selected_thread_id);
+        let frontier = input.older_settled.and_then(|shelf| shelf.frontier);
+        model.build_rows(input.shelves, input.selected_thread_id, frontier, unloaded_settled);
         model
     }
 
-    fn build_rows(&mut self, shelves: &ShelfState, selected: Option<&str>) {
+    fn build_rows(&mut self, shelves: &ShelfState, selected: Option<&str>, frontier: Option<&older_settled::Cursor>, unloaded_settled: usize) {
         let selected = selected.and_then(|id| self.index_by_id.get(id).copied());
         let route_only = |list: &[usize]| -> Vec<usize> { list.iter().copied().filter(|index| Some(*index) == selected).collect() };
         let p = &self.partition;
@@ -279,9 +298,17 @@ impl SidebarModel {
             let visible = if shelves.snoozed_expanded { p.snoozed.clone() } else { route_only(&p.snoozed) };
             push_threads(&mut rows, &visible, Section::Snoozed);
         }
-        let settled_count = p.settled.len();
+        // Older settled threads count before they load, and list only as far as pages have loaded.
+        let settled_count = p.settled.len() + unloaded_settled;
         rows.push(SidebarRow::Shelf { shelf: Shelf::Settled, count: settled_count, expanded: shelves.settled_expanded });
-        let mut visible_settled: Vec<usize> = p.settled.iter().copied().take(shelves.settled_visible).collect();
+        let threads = &self.threads;
+        let listed: Vec<usize> = p
+            .settled
+            .iter()
+            .copied()
+            .filter(|&index| older_settled::is_listed_settled(&threads[index].id, threads[index].settled_at, frontier))
+            .collect();
+        let mut visible_settled: Vec<usize> = listed.iter().copied().take(shelves.settled_visible).collect();
         if let Some(selected) = selected
             && !visible_settled.contains(&selected)
             && p.settled.contains(&selected)
@@ -298,6 +325,7 @@ impl SidebarModel {
         self.ordered = ordered;
         self.settled_count = settled_count;
         self.hidden_settled_count = hidden_settled;
+        self.listed_settled_count = listed.len();
     }
 
     pub fn thread(&self, id: &str) -> Option<&SidebarThread> {

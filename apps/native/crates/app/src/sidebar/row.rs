@@ -505,8 +505,10 @@ impl SidebarPane {
                     .text_color(hsla(p.sidebar_muted_foreground))
                     .hover(|this| this.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
                     .child(Icon::ChevronDown.sized(px(16.)))
-                    .child(format!("Show {count} more"))
-                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.show_more_settled(cx)))),
+                    .child(self.state.read(cx).settled_show_more_label(count))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.update(cx, |state, cx| if !state.settled_shelf_loading() { state.show_more_settled(cx) })
+                    })),
             )
             .into_any_element()
     }

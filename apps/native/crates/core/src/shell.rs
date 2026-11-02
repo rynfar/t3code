@@ -2,6 +2,8 @@
 //! Mirrors `OrchestrationV2ShellStreamItem` and `client-runtime/src/state/shellReducer.ts`.
 //! Fields the native client does not read yet are left out; serde ignores them.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::ModelSelection;
@@ -240,6 +242,12 @@ pub enum ShellStreamItem {
 pub struct ShellState {
     pub snapshot: Option<ShellSnapshot>,
     pub synchronized: bool,
+    /// Bumped by every authoritative snapshot. Reads of rows the shell omits belong to one
+    /// generation (`shell.ts` `generation`), since a new snapshot may predate their changes.
+    pub generation: u64,
+    /// `thread.removed` sequences since the last authoritative snapshot, so a family or page
+    /// read from before a removal cannot bring the thread back (`shell.ts` `removedAt`).
+    pub removed_at: HashMap<String, u64>,
 }
 
 impl ShellState {
@@ -269,10 +277,22 @@ impl ShellState {
                     }
                 }
                 self.snapshot = Some(snapshot);
+                self.generation += 1;
+                self.removed_at.clear();
                 true
             }
             ShellStreamItem::Unknown => false,
-            delta => self.snapshot.as_mut().is_some_and(|snapshot| apply_delta(snapshot, delta)),
+            delta => {
+                let removed = match &delta {
+                    ShellStreamItem::ThreadRemoved { thread_id, sequence } => Some((thread_id.clone(), *sequence)),
+                    _ => None,
+                };
+                let applied = self.snapshot.as_mut().is_some_and(|snapshot| apply_delta(snapshot, delta));
+                if applied && let Some((thread_id, sequence)) = removed {
+                    self.removed_at.insert(thread_id, sequence);
+                }
+                applied
+            }
         }
     }
 
