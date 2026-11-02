@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::*;
+use crate::auth::AuthSessionState;
 
 fn local(ref_name: &str, insertions: u64) -> serde_json::Value {
     json!({
@@ -161,6 +162,35 @@ fn ref_search_also_matches_the_sanitized_query() {
     assert!(ref_matches_query("Feature/New-Thing", "new-thing"));
     assert!(ref_matches_query("feature/new-thing", "new thing"));
     assert!(!ref_matches_query("main", "dev"));
+}
+
+#[test]
+fn ref_filter_narrows_as_the_query_grows_and_rescans_new_listings() {
+    let refs: Vec<VcsRef> = ["main", "feature/new-thing", "feature/old", "fix/new"].into_iter().map(|name| vcs_ref(name, false, None)).collect();
+    let names = |filter: &RefFilter, refs: &[VcsRef]| filter.indices().iter().map(|&index| refs[index].name.clone()).collect::<Vec<_>>();
+    let mut filter = RefFilter::default();
+    filter.update(&refs, 1, "");
+    assert_eq!(filter.indices().len(), 4);
+    filter.update(&refs, 1, "new");
+    assert_eq!(names(&filter, &refs), ["feature/new-thing", "fix/new"]);
+    filter.update(&refs, 1, "new thing");
+    assert_eq!(names(&filter, &refs), ["feature/new-thing"], "the sanitized query matches");
+    filter.update(&refs, 1, "fe");
+    assert_eq!(names(&filter, &refs), ["feature/new-thing", "feature/old"], "a shorter query scans every ref again");
+    let more: Vec<VcsRef> = refs.iter().cloned().chain([vcs_ref("feature/z", false, None)]).collect();
+    filter.update(&more, 2, "fe");
+    assert_eq!(names(&filter, &more), ["feature/new-thing", "feature/old", "feature/z"], "a new listing rescans");
+}
+
+#[test]
+fn changing_a_threads_branch_needs_source_control_write_and_operate() {
+    let session = |value: serde_json::Value| -> AuthSessionState { serde_json::from_value(value).expect("decodes") };
+    assert!(!can_change_thread_branch(None), "unknown grants allow nothing");
+    assert!(can_change_thread_branch(Some(&session(json!({ "authenticated": true, "scopes": ["orchestration:operate"] })))), "legacy credentials imply source control from operate");
+    assert!(!can_change_thread_branch(Some(&session(json!({ "authenticated": true, "permissions": ["source-control:write"] })))));
+    assert!(!can_change_thread_branch(Some(&session(json!({ "authenticated": true, "permissions": ["orchestration:operate"] })))));
+    assert!(can_change_thread_branch(Some(&session(json!({ "authenticated": true, "permissions": ["source-control:write", "orchestration:operate"] })))));
+    assert!(can_operate_thread(Some(&session(json!({ "authenticated": true, "permissions": ["orchestration:operate"] })))));
 }
 
 #[test]

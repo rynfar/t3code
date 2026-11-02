@@ -1,6 +1,7 @@
 //! The card itself (`ThreadDetailsCard.tsx`): dropdown glass, radius 16, scrolling content, and
 //! the right-click menu that chooses which items show. Re-renders only when the open thread's
-//! details, its Git state, or the card's preferences change.
+//! details, its Git state, or the card's preferences change. Coming back to the window rechecks
+//! the checkout's status.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -85,6 +86,11 @@ impl DetailsView {
             cx.subscribe(&git, |_, git, _: &GitEvent, cx| {
                 git.update(cx, |git, _| git.settle_optimistic_branch());
                 cx.notify();
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.git.update(cx, |git, cx| git.revalidate_on_return(cx));
+                }
             }),
         ];
         let initial = inputs(state.read(cx));

@@ -1,16 +1,16 @@
 //! The branch picker (`BranchPicker.tsx`, `BranchToolbarBranchSelector.tsx` in panel mode): a
 //! searchable list of refs below the branch row. Picking a ref switches the checkout (or moves
-//! the thread to the worktree that has it); a query no ref matches offers to create it.
+//! the thread to the worktree that has it); a query no ref matches offers to create it. Rows are
+//! a `uniform_list`, filtered incrementally as the query grows.
 
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, ElementId, Entity, IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div,
-    prelude::*, px,
+    AnyElement, Context, ElementId, Entity, IntoElement, MouseButton, ParentElement, Render, ScrollStrategy, SharedString, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
-use gpui_component::v_flex;
-use t3_core::vcs::{VcsRef, ref_badge, ref_matches_query, sanitize_new_ref_name};
+use t3_core::vcs::{RefFilter, VcsRef, branch_selection_target, ref_badge, sanitize_new_ref_name};
 
 use super::{GitEvent, GitStore};
 use crate::composer::controls::{Float, floating, menu_surface};
@@ -32,10 +32,18 @@ pub struct BranchPicker {
     highlighted: usize,
     closed_at: Option<Instant>,
     debounce: Option<Task<()>>,
+    filter: RefFilter,
+    /// The ref name a "Create" row would make, when the query offers one.
+    create: Option<String>,
+    scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// `MenuRow`'s height and the list's `max-h-56`.
+const ROW_HEIGHT: f32 = 28.;
+const LIST_MAX_HEIGHT: f32 = 224.;
+const LIST_PADDING_Y: f32 = 4.;
 
 impl BranchPicker {
     pub fn new(git: Entity<GitStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -44,6 +52,7 @@ impl BranchPicker {
             cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
                     this.highlighted = 0;
+                    this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                     let query = input.read(cx).value().to_string();
                     this.debounce = Some(cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(SEARCH_DEBOUNCE).await;
@@ -60,7 +69,18 @@ impl BranchPicker {
                 }
             }),
         ];
-        BranchPicker { git, input, open: false, highlighted: 0, closed_at: None, debounce: None, _subscriptions: subscriptions }
+        BranchPicker {
+            git,
+            input,
+            open: false,
+            highlighted: 0,
+            closed_at: None,
+            debounce: None,
+            filter: RefFilter::default(),
+            create: None,
+            scroll: UniformListScrollHandle::new(),
+            _subscriptions: subscriptions,
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -77,6 +97,7 @@ impl BranchPicker {
         }
         self.open = true;
         self.highlighted = 0;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -97,20 +118,32 @@ impl BranchPicker {
         }
     }
 
-    fn items(&self, cx: &App) -> Vec<Item> {
+    /// Brings the filtered rows up to date with the query and the loaded refs; a no-op while
+    /// neither changed.
+    fn refresh_items(&mut self, cx: &mut Context<Self>) {
         let query = self.input.read(cx).value().trim().to_owned();
-        let normalized = query.to_lowercase();
-        let refs = &self.git.read(cx).refs;
-        let mut items: Vec<Item> = refs.refs.iter().filter(|item| ref_matches_query(&item.name, &normalized)).cloned().map(Item::Ref).collect();
+        let git = self.git.read(cx);
+        self.filter.update(&git.refs.refs, git.refs.revision, &query.to_lowercase());
         let name = sanitize_new_ref_name(&query);
-        if !query.is_empty() && !refs.refs.iter().any(|item| item.name == name) {
-            items.push(Item::Create(name));
+        // An exact match also matches the query, so the filtered rows are enough to rule it out.
+        let exists = self.filter.indices().iter().any(|&index| git.refs.refs[index].name == name);
+        self.create = (!query.is_empty() && !exists && git.can_change_branch()).then_some(name);
+    }
+
+    fn item_count(&self) -> usize {
+        self.filter.indices().len() + usize::from(self.create.is_some())
+    }
+
+    fn item(&self, index: usize, cx: &Context<Self>) -> Option<Item> {
+        match self.filter.indices().get(index) {
+            Some(&ref_index) => self.git.read(cx).refs.refs.get(ref_index).cloned().map(Item::Ref),
+            None => self.create.clone().filter(|_| index == self.filter.indices().len()).map(Item::Create),
         }
-        items
     }
 
     fn activate(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items(cx).into_iter().nth(index) else { return };
+        self.refresh_items(cx);
+        let Some(item) = self.item(index, cx) else { return };
         self.close(cx);
         self.git.update(cx, |git, cx| match &item {
             Item::Ref(target) => git.select_ref(target, cx),
@@ -119,11 +152,34 @@ impl BranchPicker {
     }
 
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.items(cx).len();
+        self.refresh_items(cx);
+        let count = self.item_count();
         if count > 0 {
             self.highlighted = (self.highlighted as isize + delta).rem_euclid(count as isize) as usize;
+            self.scroll.scroll_to_item(self.highlighted, ScrollStrategy::Nearest);
             cx.notify();
         }
+    }
+
+    fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(item) = self.item(index, cx) else { return div().into_any_element() };
+        let p = palette(cx);
+        let id = ElementId::Name(format!("branch-picker-{index}").into());
+        let (row, enabled) = match &item {
+            Item::Ref(target) => {
+                let git = self.git.read(cx);
+                let checkout = git.target.as_ref();
+                let badge = ref_badge(target, checkout.map(|checkout| checkout.project_cwd.as_str()));
+                // Moving to a worktree that already has the ref only records it on the thread.
+                let reuses = checkout.is_some_and(|checkout| branch_selection_target(&checkout.project_cwd, checkout.worktree_path.as_deref(), target).reuse_existing_worktree);
+                let enabled = git.can_change_branch() || (reuses && git.can_operate_thread());
+                let row = MenuRow::new(id, target.name.clone()).trailing(div().children(badge.map(|badge| div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.45)).child(badge))));
+                (row, enabled)
+            }
+            Item::Create(name) => (MenuRow::new(id, SharedString::from(format!("Create new ref \"{name}\""))), true),
+        };
+        let row = if enabled { row.on_click(cx.listener(move |this, _, window, cx| this.activate(index, window, cx))) } else { row };
+        div().rounded(px(4.)).when(index == self.highlighted, |this| this.bg(hsla(p.accent))).child(row).into_any_element()
     }
 }
 
@@ -132,11 +188,10 @@ impl Render for BranchPicker {
         if !self.open {
             return div().into_any_element();
         }
+        self.refresh_items(cx);
         let p = palette(cx);
-        let items = self.items(cx);
-        let store = self.git.read(cx);
-        let refs = &store.refs;
-        let project_cwd = store.target.as_ref().map(|target| target.project_cwd.clone());
+        let count = self.item_count();
+        let refs = &self.git.read(cx).refs;
         let status_text = if refs.loading && !refs.loaded {
             Some("Loading refs...".to_owned())
         } else if refs.loading {
@@ -148,22 +203,8 @@ impl Render for BranchPicker {
         };
         let has_next = refs.next_cursor.is_some() && !refs.loading;
         let error = refs.error.clone();
-        let empty = items.is_empty() && refs.loaded;
-        let rows = items.into_iter().enumerate().map(|(index, item)| {
-            let highlighted = index == self.highlighted;
-            let id = ElementId::Name(format!("branch-picker-{index}").into());
-            let row = match &item {
-                Item::Ref(target) => {
-                    let badge = ref_badge(target, project_cwd.as_deref());
-                    MenuRow::new(id, target.name.clone()).trailing(div().children(badge.map(|badge| div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.45)).child(badge))))
-                }
-                Item::Create(name) => MenuRow::new(id, SharedString::from(format!("Create new ref \"{name}\""))),
-            };
-            div()
-                .rounded(px(4.))
-                .when(highlighted, |this| this.bg(hsla(p.accent)))
-                .child(row.on_click(cx.listener(move |this, _, window, cx| this.activate(index, window, cx))))
-        });
+        let empty = count == 0 && refs.loaded;
+        let list_height = (count as f32 * ROW_HEIGHT + 2. * LIST_PADDING_Y).min(LIST_MAX_HEIGHT);
         let popup = menu_surface(cx)
             .id("branch-picker")
             .w(px(ROW_WIDTH))
@@ -202,16 +243,15 @@ impl Render for BranchPicker {
                     .child(Icon::Search.sized(px(16.)).text_color(hsla(p.muted_foreground).opacity(0.55)))
                     .child(div().flex_1().h(px(26.)).flex().items_center().child(Input::new(&self.input).appearance(false).bordered(false))),
             )
-            .child(
-                v_flex()
-                    .id("branch-picker-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .py(px(4.))
-                    .when(empty, |this| this.child(div().py(px(16.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("No refs found.")))
-                    .children(rows),
-            )
+            .when(empty, |this| this.child(div().py(px(16.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("No refs found.")))
+            .when(count > 0, |this| {
+                this.child(
+                    uniform_list("branch-picker-list", count, cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.render_row(index, cx)).collect::<Vec<_>>()))
+                        .track_scroll(&self.scroll)
+                        .h(px(list_height))
+                        .py(px(LIST_PADDING_Y)),
+                )
+            })
             .children(error.map(|error| div().px(px(8.)).py(px(6.)).text_xs().text_color(hsla(p.destructive_foreground)).child(error)))
             .children(status_text.map(|text| {
                 div()

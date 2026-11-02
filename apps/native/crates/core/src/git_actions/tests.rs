@@ -243,6 +243,25 @@ fn terminal_events_carry_the_result_or_only_the_phase() {
 }
 
 #[test]
+fn a_run_settles_only_when_its_stream_ends() {
+    let finished = progress(json!({ "kind": "action_finished", "actionId": "a", "result": { "toast": { "title": "Committed" } } }));
+    let failed = progress(json!({ "kind": "action_failed", "actionId": "a", "phase": "push", "message": "secret stderr" }));
+    let committed = Ok(RunResult { toast: ResultToast { title: "Committed".into(), description: None }, ..RunResult::default() });
+    let run = |events: &[&ProgressEvent], stream_error: Option<&str>| {
+        let mut run = StackedActionRun::new("a", StackedAction::Commit);
+        events.iter().for_each(|event| run.observe(event));
+        run.settle(stream_error.map(str::to_owned))
+    };
+    assert_eq!(run(&[&finished], None), committed);
+    assert_eq!(run(&[&failed], None), Err("Source control action 'commit' failed during push.".into()));
+    assert_eq!(run(&[&failed], Some("secret stderr")), Err("Source control action 'commit' failed during push.".into()), "only the phase reaches the user");
+    assert_eq!(run(&[&finished], Some("link failed")), Err("link failed".into()), "a stream failure after the result still fails, as on the web");
+    assert_eq!(run(&[], None), Err("Source control action 'commit' ended without a terminal result.".into()));
+    let other = progress(json!({ "kind": "action_finished", "actionId": "b", "result": {} }));
+    assert_eq!(run(&[&other], None), Err("Source control action 'commit' ended without a terminal result.".into()), "another action's result is not ours");
+}
+
+#[test]
 fn elapsed_time_switches_to_minutes() {
     assert_eq!(format_elapsed(0, 59_999), "59s");
     assert_eq!(format_elapsed(0, 61_000), "1m 1s");

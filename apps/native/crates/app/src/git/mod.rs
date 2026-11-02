@@ -1,8 +1,10 @@
 //! Source control for the open thread: its live status (`subscribeVcsStatus`), the running Git
 //! action and its progress, the branch picker's refs, and the thread terminals project scripts
 //! run in. Ports the state behind `GitActionsControl.tsx`, `BranchToolbarBranchSelector.tsx`
-//! and `useChatTerminalActions.ts` (`client-runtime/src/state/vcs.ts`, `vcsAction.ts`).
-//! Wire work and decoding run on the network runtime; this entity only applies results.
+//! and `useChatTerminalActions.ts` (`client-runtime/src/state/vcs.ts`, `vcsAction.ts`,
+//! `vcsStatusRevalidation.ts`). Wire work and decoding run on the network runtime; this entity
+//! only applies results. Operations capture the thread they started on, so a completion after
+//! the selection moved still updates that thread.
 
 mod actions;
 mod branch_picker;
@@ -15,7 +17,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
-use t3_core::git_actions::{self, ActionProgress, Operation, ProgressEvent, RunRequest, RunResult, StackedAction, terminology};
+use t3_core::auth::AuthSessionState;
+use t3_core::git_actions::{self, ActionProgress, Operation, ProgressEvent, RunRequest, RunResult, StackedAction, StackedActionRun, Terminology, terminology};
 use t3_core::project_scripts::{self, ProjectScript, TerminalMetadataEvent, Terminals};
 use t3_core::vcs::{self, ListRefsResult, PullResult, RefNameResult, VcsRef, VcsStatus, VcsStatusEvent, apply_status_event, method};
 use tokio::sync::mpsc;
@@ -55,6 +58,8 @@ pub struct InlineSuccess {
 pub struct Refs {
     pub query: String,
     pub refs: Vec<VcsRef>,
+    /// Changes whenever `refs` does, so the picker knows when to filter again.
+    pub revision: u64,
     pub next_cursor: Option<u64>,
     pub total: u64,
     pub loading: bool,
@@ -87,11 +92,15 @@ pub struct GitStore {
     pub initializing: bool,
     pub refs: Refs,
     pub terminals: Terminals,
+    /// This device's grants, `None` until the server answers (which grants nothing).
+    grants: Option<AuthSessionState>,
     status_feed: Option<Feed>,
     terminal_feed: Option<Feed>,
+    grants_task: Option<Task<()>>,
     refs_task: Option<Task<()>>,
     success_timer: Option<Task<()>>,
     tick: Option<Task<()>>,
+    wake: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -99,6 +108,8 @@ impl EventEmitter<GitEvent> for GitStore {}
 
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
+/// `vcsStatusRevalidation`'s `wakeDebounceMs`.
+const WAKE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Keeps one streaming RPC open, decoding each chunk on the network runtime and resubscribing
 /// with backoff when it ends (a reconnect ends every stream).
@@ -149,11 +160,14 @@ impl GitStore {
             initializing: false,
             refs: Refs::default(),
             terminals: Terminals::default(),
+            grants: None,
             status_feed: None,
             terminal_feed: None,
+            grants_task: None,
             refs_task: None,
             success_timer: None,
             tick: None,
+            wake: None,
             _subscription: subscription,
         };
         store.sync_target(cx);
@@ -184,8 +198,14 @@ impl GitStore {
         if !connected {
             self.terminal_feed = None;
             self.status_feed = None;
-        } else if self.terminal_feed.is_none() {
-            self.start_terminal_feed(cx);
+            self.grants_task = None;
+        } else {
+            if self.terminal_feed.is_none() {
+                self.start_terminal_feed(cx);
+            }
+            if self.grants_task.is_none() {
+                self.watch_grants(cx);
+            }
         }
         if next == self.target {
             if connected && self.status_feed.is_none() && self.target.is_some() {
@@ -200,11 +220,46 @@ impl GitStore {
             self.status_error = None;
             self.success = None;
             self.optimistic_branch = None;
-            self.refs = Refs::default();
+            self.reset_refs(String::new());
             self.refs_task = None;
             self.start_status_feed(cx);
         }
         cx.emit(GitEvent::Changed);
+    }
+
+    fn reset_refs(&mut self, query: String) {
+        self.refs = Refs { query, revision: self.refs.revision + 1, ..Refs::default() };
+    }
+
+    /// Follows this device's grants; the last answer holds while reconnecting.
+    fn watch_grants(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client_handle() else { return };
+        let mut grants = client.session_state();
+        self.grants = grants.borrow_and_update().clone();
+        self.grants_task = Some(cx.spawn(async move |this, cx| {
+            while grants.changed().await.is_ok() {
+                let next = grants.borrow_and_update().clone();
+                let updated = this.update(cx, |store, cx| {
+                    if store.grants != next {
+                        store.grants = next;
+                        cx.emit(GitEvent::Changed);
+                    }
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Whether this device may switch or create the thread's ref (`canChangeThreadBranch`).
+    pub fn can_change_branch(&self) -> bool {
+        vcs::can_change_thread_branch(self.grants.as_ref())
+    }
+
+    /// Whether this device may record a branch on the thread (`canUpdateThreadBranch`).
+    pub fn can_operate_thread(&self) -> bool {
+        vcs::can_operate_thread(self.grants.as_ref())
     }
 
     fn start_status_feed(&mut self, cx: &mut Context<Self>) {
@@ -305,25 +360,32 @@ impl GitStore {
         if self.is_running() {
             return;
         }
-        let (Some(target), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
+        let (Some(origin), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
         let action_id = uuid_v4();
-        let request = RunRequest { commit_message: commit_message.as_deref(), feature_branch, file_paths: file_paths.as_deref(), thread_id: Some(&target.thread_id) };
-        let payload = git_actions::run_stacked_action(&action_id, &target.cwd, action, &request);
+        let request = RunRequest { commit_message: commit_message.as_deref(), feature_branch, file_paths: file_paths.as_deref(), thread_id: Some(&origin.thread_id) };
+        let payload = git_actions::run_stacked_action(&action_id, &origin.cwd, action, &request);
+        let terms = terminology(self.status.as_ref().and_then(VcsStatus::provider_kind));
         self.begin(Operation::RunChangeRequest, &action_id, cx);
         let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
+        let mut run = StackedActionRun::new(&action_id, action);
         let net = runtime.spawn(async move {
+            // Read to the end: dropping the stream interrupts the server's PR link and refresh.
             let mut stream = client.stream(method::GIT_RUN_STACKED_ACTION, payload).await.map_err(|error| error.to_string())?;
+            let mut stream_error = None;
             while let Some(item) = stream.receiver.recv().await {
-                let event = serde_json::from_value::<ProgressEvent>(item.map_err(|error| error.to_string())?).unwrap_or(ProgressEvent::Unknown);
-                match &event {
-                    ProgressEvent::ActionFinished { result, .. } => return Ok(result.clone()),
-                    ProgressEvent::ActionFailed { phase, .. } => return Err(git_actions::remote_failure_message(action, phase.as_deref())),
-                    _ => {
+                match item {
+                    Ok(value) => {
+                        let event = serde_json::from_value::<ProgressEvent>(value).unwrap_or(ProgressEvent::Unknown);
+                        run.observe(&event);
                         let _ = tx.send(event);
+                    }
+                    Err(error) => {
+                        stream_error = Some(error.to_string());
+                        break;
                     }
                 }
             }
-            Err(git_actions::missing_terminal_message(action))
+            run.settle(stream_error)
         });
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.recv().await {
@@ -335,23 +397,30 @@ impl GitStore {
                 });
             }
             let result: Result<RunResult, String> = net.await.unwrap_or_else(|_| Err("Source control action failed.".into()));
-            let _ = this.update(cx, |store, cx| store.finish_stacked_action(result, cx));
+            let _ = this.update(cx, |store, cx| store.finish_stacked_action(&origin, terms, result, cx));
         })
         .detach();
     }
 
-    fn finish_stacked_action(&mut self, result: Result<RunResult, String>, cx: &mut Context<Self>) {
+    /// Whether the card still shows the checkout `origin` ran in.
+    fn shows(&self, origin: &Target) -> bool {
+        self.target.as_ref().is_some_and(|target| target.cwd == origin.cwd)
+    }
+
+    fn finish_stacked_action(&mut self, origin: &Target, terms: Terminology, result: Result<RunResult, String>, cx: &mut Context<Self>) {
         match result {
             Ok(result) => {
-                if let (Some(branch), Some(target)) = (result.created_branch(), self.target.as_ref())
-                    && target.branch.as_deref() != Some(branch)
+                // `persistThreadBranchSync` for the thread the action ran for.
+                if let Some(branch) = result.created_branch()
+                    && origin.branch.as_deref() != Some(branch)
+                    && self.can_operate_thread()
                 {
-                    let command = vcs::update_thread_branch_metadata(&uuid_v4(), &target.thread_id, Some(branch), target.branch.as_deref());
+                    let command = vcs::update_thread_branch_metadata(&uuid_v4(), &origin.thread_id, Some(branch), origin.branch.as_deref());
                     self.state.update(cx, |state, cx| state.dispatch_then(command, None, cx, |_, _, _| {}));
                 }
-                let terms = terminology(self.status.as_ref().and_then(VcsStatus::provider_kind));
                 let (title, description) = result.summary(terms);
-                self.finish(Some(InlineSuccess { title, description }), cx);
+                let success = self.shows(origin).then_some(InlineSuccess { title, description });
+                self.finish(success, cx);
             }
             Err(message) => {
                 self.finish(None, cx);
@@ -411,6 +480,18 @@ impl GitStore {
         }
     }
 
+    /// Coming back to the window rechecks the checkout, where edits made in another app or
+    /// terminal may be waiting (`vcsStatusRevalidation`).
+    pub fn revalidate_on_return(&mut self, cx: &mut Context<Self>) {
+        if self.target.is_none() {
+            return;
+        }
+        self.wake = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WAKE_DEBOUNCE).await;
+            let _ = this.update(cx, |store, cx| store.refresh_status(false, cx));
+        }));
+    }
+
     /// Loads the first page for `query`, or the next page of the current listing.
     pub fn load_refs(&mut self, query: &str, next_page: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
@@ -420,7 +501,7 @@ impl GitStore {
             return;
         }
         if !next_page {
-            self.refs = Refs { query: query.clone(), ..Refs::default() };
+            self.reset_refs(query.clone());
         }
         self.refs.loading = true;
         let payload = vcs::list_refs(&target.cwd, Some(&query), cursor, vcs::REF_PAGE_LIMIT);
@@ -442,6 +523,7 @@ impl GitStore {
                                 None => store.refs.refs.push(item),
                             }
                         }
+                        store.refs.revision += 1;
                         store.refs.next_cursor = page.next_cursor;
                         store.refs.total = store.refs.total.max(page.total_count);
                         store.refs.error = None;
@@ -455,19 +537,22 @@ impl GitStore {
 
     /// `selectBranch`: reuse the worktree a ref is checked out in, else check it out here.
     pub fn select_ref(&mut self, item: &VcsRef, cx: &mut Context<Self>) {
-        let Some(target) = self.target.clone() else { return };
-        if self.branch_pending {
+        let Some(origin) = self.target.clone() else { return };
+        if self.branch_pending || !self.can_operate_thread() {
             return;
         }
-        let selection = vcs::branch_selection_target(&target.project_cwd, target.worktree_path.as_deref(), item);
+        let selection = vcs::branch_selection_target(&origin.project_cwd, origin.worktree_path.as_deref(), item);
         if selection.reuse_existing_worktree {
-            self.set_thread_branch(Some(&item.name), selection.next_worktree_path.as_deref(), cx);
+            self.set_thread_branch(&origin.thread_id, Some(&item.name), selection.next_worktree_path.as_deref(), cx);
+            return;
+        }
+        if !self.allow_branch_change(cx) {
             return;
         }
         let local_name = if item.is_remote() { vcs::local_branch_name_from_remote_ref(&item.name).to_owned() } else { item.name.clone() };
         let payload = vcs::switch_ref(&selection.checkout_cwd, &item.name);
         let remote = item.is_remote();
-        self.branch_operation(payload, method::VCS_SWITCH_REF, local_name, "Failed to switch ref.", cx, move |result, fallback| {
+        self.branch_operation(origin, (method::VCS_SWITCH_REF, payload), local_name, "Failed to switch ref.", cx, move |result, fallback| {
             let name = if remote { result.ref_name.unwrap_or(fallback) } else { fallback };
             (name, selection.next_worktree_path)
         });
@@ -476,21 +561,30 @@ impl GitStore {
     /// `createRef`: create the typed ref and switch the checkout to it.
     pub fn create_ref(&mut self, raw: &str, cx: &mut Context<Self>) {
         let name = vcs::sanitize_new_ref_name(raw);
-        let Some(target) = self.target.clone() else { return };
-        if name.is_empty() || self.branch_pending {
+        let Some(origin) = self.target.clone() else { return };
+        if name.is_empty() || self.branch_pending || !self.can_change_branch() {
             return;
         }
-        let payload = vcs::create_ref(&target.cwd, &name);
-        let worktree = target.worktree_path.clone();
-        self.branch_operation(payload, method::VCS_CREATE_REF, name, "Failed to create and switch ref.", cx, move |result, fallback| {
+        let payload = vcs::create_ref(&origin.cwd, &name);
+        let worktree = origin.worktree_path.clone();
+        self.branch_operation(origin, (method::VCS_CREATE_REF, payload), name, "Failed to create and switch ref.", cx, move |result, fallback| {
             (result.ref_name.unwrap_or(fallback), worktree)
         });
     }
 
+    /// `runBranchAction`'s guard: a switch writes to source control and to the thread.
+    fn allow_branch_change(&self, cx: &mut Context<Self>) -> bool {
+        if self.can_change_branch() {
+            return true;
+        }
+        self.toast(Toast::new(ToastKind::Error, "Action unavailable").description("This connection cannot change the thread's branch."), cx);
+        false
+    }
+
     fn branch_operation(
         &mut self,
-        payload: Value,
-        rpc: &'static str,
+        origin: Target,
+        (rpc, payload): (&'static str, Value),
         optimistic: String,
         failure: &'static str,
         cx: &mut Context<Self>,
@@ -504,20 +598,29 @@ impl GitStore {
             let result = task.await.unwrap_or_else(|_| Err(failure.into()));
             let _ = this.update(cx, |store, cx| {
                 store.branch_pending = false;
+                // The optimistic label and listings belong to the checkout on screen, which may
+                // no longer be the one this switched.
+                let shown = store.shows(&origin);
                 match result {
                     Ok(result) => {
                         let (branch, worktree) = resolve(result, optimistic);
-                        store.optimistic_branch = Some(Some(branch.clone()));
-                        store.set_thread_branch(Some(&branch), worktree.as_deref(), cx);
+                        if shown {
+                            store.optimistic_branch = Some(Some(branch.clone()));
+                        }
+                        store.set_thread_branch(&origin.thread_id, Some(&branch), worktree.as_deref(), cx);
                     }
                     Err(message) => {
-                        store.optimistic_branch = None;
+                        if shown {
+                            store.optimistic_branch = None;
+                        }
                         store.toast(Toast::new(ToastKind::Error, failure).description(message), cx);
                     }
                 }
-                store.refresh_status(true, cx);
-                let query = store.refs.query.clone();
-                store.load_refs(&query, false, cx);
+                if shown {
+                    store.refresh_status(true, cx);
+                    let query = store.refs.query.clone();
+                    store.load_refs(&query, false, cx);
+                }
                 cx.emit(GitEvent::Changed);
             });
         })
@@ -525,9 +628,11 @@ impl GitStore {
     }
 
     /// `setThreadBranch` for a server thread: record the branch and worktree it now follows.
-    fn set_thread_branch(&mut self, branch: Option<&str>, worktree_path: Option<&str>, cx: &mut Context<Self>) {
-        let Some(target) = self.target.as_ref() else { return };
-        let command = vcs::update_thread_branch(&uuid_v4(), &target.thread_id, branch, worktree_path);
+    fn set_thread_branch(&mut self, thread_id: &str, branch: Option<&str>, worktree_path: Option<&str>, cx: &mut Context<Self>) {
+        if !self.can_operate_thread() {
+            return;
+        }
+        let command = vcs::update_thread_branch(&uuid_v4(), thread_id, branch, worktree_path);
         self.state.update(cx, |state, cx| state.dispatch_then(command, Some("Failed to update the thread's branch"), cx, |_, _, _| {}));
     }
 

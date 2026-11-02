@@ -1,10 +1,13 @@
 //! Source control status, refs and the branch toolbar's rules. Ports the status and ref shapes in
 //! `packages/contracts/src/git.ts`, `applyGitStatusStreamEvent` and the ref-name helpers in
 //! `packages/shared/src/git.ts`, `apps/web/src/components/BranchToolbar.logic.ts`, the branch
-//! picker's badges (`BranchPicker.tsx`) and `resolveChangesTotals` (`GitActionsControl.logic.ts`).
+//! picker's badges and filter (`BranchPicker.tsx`), the branch permissions in
+//! `BranchToolbarBranchSelector.tsx`, and `resolveChangesTotals` (`GitActionsControl.logic.ts`).
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+
+use crate::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE, SOURCE_CONTROL_WRITE_SCOPE};
 
 pub mod method {
     pub const SUBSCRIBE_VCS_STATUS: &str = "subscribeVcsStatus";
@@ -381,6 +384,16 @@ pub fn update_thread_branch_metadata(command_id: &str, thread_id: &str, branch: 
     json!({ "type": "thread.metadata.update", "commandId": command_id, "threadId": thread_id, "branch": branch, "expectedBranch": expected_branch })
 }
 
+/// `canUpdateThreadBranch` for a server thread: recording its branch needs `orchestration:operate`.
+pub fn can_operate_thread(grants: Option<&AuthSessionState>) -> bool {
+    grants.is_some_and(|grants| grants.grants(ORCHESTRATION_OPERATE_SCOPE))
+}
+
+/// `canChangeThreadBranch`: switching or creating a ref also writes to source control.
+pub fn can_change_thread_branch(grants: Option<&AuthSessionState>) -> bool {
+    can_operate_thread(grants) && grants.is_some_and(|grants| grants.grants(SOURCE_CONTROL_WRITE_SCOPE))
+}
+
 /// `sanitizeNewRefName`: refs cannot hold whitespace, so runs of it become one dash.
 pub fn sanitize_new_ref_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -465,6 +478,36 @@ pub fn ref_matches_query(name: &str, normalized_query: &str) -> bool {
     }
     let sanitized = sanitize_new_ref_name(normalized_query);
     !sanitized.is_empty() && sanitized != normalized_query && lower.contains(&sanitized)
+}
+
+/// The branch picker's matching refs, as indices into the listing. While the listing holds and
+/// the query only grows, it narrows the last result instead of rescanning every ref: whatever
+/// matches the longer query matched its prefix.
+#[derive(Debug, Clone, Default)]
+pub struct RefFilter {
+    revision: Option<u64>,
+    query: String,
+    indices: Vec<usize>,
+}
+
+impl RefFilter {
+    /// `revision` changes whenever the listing does; `normalized_query` is trimmed and lowercase.
+    pub fn update(&mut self, refs: &[VcsRef], revision: u64, normalized_query: &str) {
+        if self.revision == Some(revision) && self.query == normalized_query {
+            return;
+        }
+        if self.revision == Some(revision) && normalized_query.starts_with(self.query.as_str()) {
+            self.indices.retain(|&index| ref_matches_query(&refs[index].name, normalized_query));
+        } else {
+            self.indices = refs.iter().enumerate().filter(|(_, item)| ref_matches_query(&item.name, normalized_query)).map(|(index, _)| index).collect();
+        }
+        self.revision = Some(revision);
+        normalized_query.clone_into(&mut self.query);
+    }
+
+    pub fn indices(&self) -> &[usize] {
+        &self.indices
+    }
 }
 
 /// `BranchPickerRefItem`'s trailing badge.

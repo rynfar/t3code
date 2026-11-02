@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 pub const TERMINAL_READ_SCOPE: &str = "terminal:read";
 pub const TERMINAL_OPERATE_SCOPE: &str = "terminal:operate";
+pub const SOURCE_CONTROL_WRITE_SCOPE: &str = "source-control:write";
+pub const ORCHESTRATION_OPERATE_SCOPE: &str = "orchestration:operate";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]

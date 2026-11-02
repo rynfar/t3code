@@ -8,14 +8,14 @@
 //!
 //! `--add-project` registers the folder as a project for the run and removes it afterwards.
 //! `--commit <message>` also commits the working tree with `git.runStackedAction`, printing its
-//! progress, before the branch steps.
+//! progress until the server ends the stream, before the branch steps.
 
 use std::time::Duration;
 
 use t3_client::session::StreamHandle;
 use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ClientHandle, start};
-use t3_core::git_actions::{self, ActionProgress, Operation, ProgressEvent, RunRequest, StackedAction, build_menu_items, resolve_quick_action, terminology};
+use t3_core::git_actions::{self, ActionProgress, Operation, ProgressEvent, RunRequest, StackedAction, StackedActionRun, build_menu_items, resolve_quick_action, terminology};
 use t3_core::shell::ShellState;
 use t3_core::vcs::{self, ListRefsResult, RefNameResult, VcsStatus, VcsStatusEvent, apply_status_event, changes_totals, method, ref_badge};
 
@@ -136,19 +136,28 @@ async fn main() -> anyhow::Result<()> {
         let payload = git_actions::run_stacked_action(&action_id, &cwd, StackedAction::Commit, &request);
         let mut progress = ActionProgress::begin(Operation::RunChangeRequest, &action_id, 0);
         let mut run = client.stream(method::GIT_RUN_STACKED_ACTION, payload).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut outcome = StackedActionRun::new(&action_id, StackedAction::Commit);
+        let mut stream_error = None;
         println!("git.runStackedAction commit:");
+        // Read to the end, as the app does: the server links the PR and refreshes status after
+        // `action_finished`, and dropping the stream would interrupt that.
         while let Some(item) = run.receiver.recv().await {
-            let event: ProgressEvent = serde_json::from_value(item.map_err(|error| anyhow::anyhow!("{error}"))?)?;
-            progress.apply(&event, 0);
-            match &event {
-                ProgressEvent::ActionFinished { result, .. } => {
-                    println!("  finished: {:?}", result.summary(terminology(status.as_ref().and_then(VcsStatus::provider_kind))));
+            let event: ProgressEvent = match item {
+                Ok(value) => serde_json::from_value(value)?,
+                Err(error) => {
+                    stream_error = Some(error.to_string());
                     break;
                 }
-                ProgressEvent::ActionFailed { phase, .. } => anyhow::bail!(git_actions::remote_failure_message(StackedAction::Commit, phase.as_deref())),
+            };
+            progress.apply(&event, 0);
+            outcome.observe(&event);
+            match &event {
+                ProgressEvent::ActionFinished { .. } => println!("  action_finished; waiting for the server to end the stream"),
                 other => println!("  {:?} -> row shows {:?}", other, progress.presentation().status),
             }
         }
+        let result = outcome.settle(stream_error).map_err(|message| anyhow::anyhow!(message))?;
+        println!("  stream ended: {:?}", result.summary(terminology(status.as_ref().and_then(VcsStatus::provider_kind))));
         wait_status(&mut stream, &mut status, |status| !status.local.has_working_tree_changes).await?;
     }
 
