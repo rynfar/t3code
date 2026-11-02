@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::ChatMessage;
-use crate::thread::{Run, ThreadProjection};
+use crate::thread::{Entity, Run, ThreadProjection};
 
 /// `TimelineLatestRun`.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -17,6 +17,8 @@ pub struct LatestRun {
     pub status: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// The run's latest provider turn finished while the run itself is still open.
+    pub turn_ended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -24,6 +26,8 @@ pub struct ThreadActivity {
     pub latest_run: Option<LatestRun>,
     pub running_run_id: Option<String>,
     pub is_working: bool,
+    /// A provider-native subagent thread working through its runless root turn.
+    pub runless_work_active: bool,
     pub active_turn_started_at: Option<String>,
     pub pending_approval_ids: HashSet<String>,
 }
@@ -35,13 +39,37 @@ fn latest_matching(runs: &[Run], predicate: impl Fn(&Run) -> bool) -> Option<&Ru
     runs.iter().filter(|run| predicate(run)).max_by_key(|run| run.ordinal)
 }
 
-fn summarize(run: &Run) -> LatestRun {
+/// `summarizeThreadRun`: an open run whose latest provider turn has stopped reports `turnEnded`.
+fn summarize(run: &Run, provider_turns: &[Entity]) -> LatestRun {
+    let turn_status = ACTIVITY.contains(&run.status.as_str()).then(|| {
+        let attempt = run.active_attempt_id.as_deref()?;
+        provider_turns
+            .iter()
+            .filter(|turn| turn.value.get("runAttemptId").and_then(Value::as_str) == Some(attempt))
+            .max_by_key(|turn| turn.value.get("ordinal").and_then(Value::as_u64).unwrap_or(0))
+            .and_then(|turn| turn.value.get("status").and_then(Value::as_str))
+    });
     LatestRun {
         run_id: run.id.clone(),
         status: run.status.clone(),
         started_at: run.started_at.clone(),
         completed_at: run.completed_at.clone(),
+        turn_ended: matches!(turn_status.flatten(), Some(status) if status != "pending" && status != "running"),
     }
+}
+
+/// `deriveRunlessWorkStartedAt`: provider-native subagent threads have no app runs; their work is
+/// a runless root turn whose status follows the subagent.
+fn runless_work_started_at(projection: &ThreadProjection) -> Option<String> {
+    let thread = &projection.thread;
+    if thread.lineage.relationship_to_parent.as_deref() != Some("subagent") || thread.creation_source.as_deref() != Some("provider") {
+        return None;
+    }
+    let node = projection.nodes.iter().rev().find(|node| {
+        node.value.get("kind").and_then(Value::as_str) == Some("root_turn") && node.value.get("runId").is_none_or(Value::is_null)
+    })?;
+    let active = matches!(node.value.get("status").and_then(Value::as_str), Some("pending" | "running" | "waiting"));
+    active.then(|| node.value.get("startedAt").and_then(Value::as_str).unwrap_or_default().to_owned())
 }
 
 /// The run the timeline treats as current and whether the thread is working. Held queues are
@@ -52,8 +80,10 @@ pub fn derive_activity(projection: &ThreadProjection) -> ThreadActivity {
         .or_else(|| latest_matching(runs, |_| true));
     let running_run_id = latest_matching(runs, |run| INTERRUPTIBLE.contains(&run.status.as_str())).map(|run| run.id.clone());
     let live = latest_matching(runs, |run| ACTIVITY.contains(&run.status.as_str()));
-    let is_working = live.is_some();
-    let active_turn_started_at = live.map(|run| run.started_at.clone().unwrap_or_else(|| run.requested_at.clone()));
+    let runless = runless_work_started_at(projection);
+    let is_working = live.is_some() || runless.is_some();
+    let active_turn_started_at =
+        live.map(|run| run.started_at.clone().unwrap_or_else(|| run.requested_at.clone())).or_else(|| runless.clone().filter(|at| !at.is_empty()));
     let pending_approval_ids = projection
         .runtime_requests
         .iter()
@@ -64,9 +94,10 @@ pub fn derive_activity(projection: &ThreadProjection) -> ThreadActivity {
         .map(|request| request.id.clone())
         .collect();
     ThreadActivity {
-        latest_run: activity_run.map(summarize),
+        latest_run: activity_run.map(|run| summarize(run, &projection.provider_turns)),
         running_run_id,
         is_working,
+        runless_work_active: runless.is_some(),
         active_turn_started_at,
         pending_approval_ids,
     }

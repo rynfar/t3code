@@ -40,6 +40,13 @@ pub fn timestamp(clock: &Clock, iso: &str, always: bool, cx: &App) -> AnyElement
         .into_any_element()
 }
 
+/// A keyboard-reachable control: a tab stop that Enter and Space activate (GPUI delivers them as
+/// a click), with the 2px `ring` drawn inside when focused from the keyboard (§4.2).
+pub fn focusable(element: gpui::Stateful<gpui::Div>, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let ring = hsla(palette(cx).ring);
+    element.tab_index(0).focus_visible(move |style| style.border_2().border_color(ring))
+}
+
 /// The 24px icon slot of a work row with a 16px icon (§7.7).
 pub fn icon_slot(icon: Icon, color: Hsla) -> AnyElement {
     div().size(px(24.)).flex_none().flex().items_center().justify_center().child(icon.render(px(16.), color)).into_any_element()
@@ -146,7 +153,7 @@ pub fn ghost_text_button(
     cx: &App,
 ) -> AnyElement {
     let p = palette(cx);
-    div()
+    let button = div()
         .id(id)
         .flex()
         .flex_none()
@@ -162,14 +169,14 @@ pub fn ghost_text_button(
         .hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
         .children(icon.map(|icon| icon.render(px(12.), hsla(p.muted_foreground))))
         .child(label.into())
-        .on_click(on_click)
-        .into_any_element()
+        .on_click(on_click);
+    focusable(button, cx).into_any_element()
 }
 
 /// An `icon-xs` ghost button (24 square) with a 12px icon.
 pub fn ghost_icon_button(id: impl Into<ElementId>, icon: Icon, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
     let p = palette(cx);
-    div()
+    let button = div()
         .id(id)
         .size(px(24.))
         .flex_none()
@@ -180,8 +187,8 @@ pub fn ghost_icon_button(id: impl Into<ElementId>, icon: Icon, on_click: impl Fn
         .cursor_pointer()
         .hover(|style| style.bg(hsla(p.accent)))
         .child(icon.render(px(12.), hsla(p.muted_foreground)))
-        .on_click(on_click)
-        .into_any_element()
+        .on_click(on_click);
+    focusable(button, cx).into_any_element()
 }
 
 /// Mono text block for expanded tool details: code size on a 1.625 line, `secondary_label`.

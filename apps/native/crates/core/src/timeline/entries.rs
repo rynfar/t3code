@@ -325,6 +325,16 @@ fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
 pub struct EntriesCache {
     by_item: HashMap<usize, Arc<TimelineEntry>>,
     attempts: Vec<(String, String, Option<String>)>,
+    nodes: usize,
+    /// Per visible item: its `Arc` address and the index of the entry it produced.
+    positions: Vec<(usize, Option<usize>)>,
+    entries: Vec<Arc<TimelineEntry>>,
+}
+
+impl EntriesCache {
+    pub fn entries(&self) -> &[Arc<TimelineEntry>] {
+        &self.entries
+    }
 }
 
 struct Lookups<'a> {
@@ -360,12 +370,119 @@ impl<'a> Lookups<'a> {
                     id: attempt.id.clone(),
                     run_id: attempt.run_id.clone(),
                     status: attempt.status.clone(),
-                    completed_at: None,
+                    completed_at: attempt.completed_at.clone(),
                 });
             }
             let (_, parent) = self.nodes.get(node_id)?;
             node_id = (*parent)?;
         }
+    }
+}
+
+fn plan_status<'a>(plans: &'a [Entity], plan_id: &str) -> &'a str {
+    plans
+        .iter()
+        .find(|p| p.id == plan_id && p.value.get("kind").and_then(Value::as_str) == Some("proposed_plan"))
+        .and_then(|p| p.value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("active")
+}
+
+/// Whether a cached entry still stands for its item: plans also read the plan's status.
+fn still_current(entry: &TimelineEntry, plans: &[Entity]) -> bool {
+    match &entry.kind {
+        EntryKind::ProposedPlan(plan) => plan.status == plan_status(plans, &plan.id),
+        _ => true,
+    }
+}
+
+fn build_entry(row: &ProjectedTurnItem, lookups: &Lookups, plans: &[Entity]) -> Arc<TimelineEntry> {
+    let item = &row.item;
+    let kind = if let Some(message) = chat_message(item) {
+        EntryKind::Message(Arc::new(message))
+    } else if let TurnItemKind::ProposedPlan { plan_id, markdown, .. } = &item.kind {
+        EntryKind::ProposedPlan(Arc::new(ProposedPlan {
+            id: plan_id.clone(),
+            run_id: item.run_id.clone(),
+            markdown: Arc::from(markdown.as_str()),
+            status: plan_status(plans, plan_id).to_owned(),
+            updated_at: item.updated_at.clone(),
+        }))
+    } else if is_standalone(&item.kind) {
+        EntryKind::Event(item.clone())
+    } else {
+        EntryKind::Work(Arc::new(projected_work_entry(row)))
+    };
+    let id = match &kind {
+        EntryKind::Message(message) => message.id.clone(),
+        _ => item.id.clone(),
+    };
+    Arc::new(TimelineEntry { id, created_at: created_at(item), attempt: lookups.attempt(item), kind })
+}
+
+fn entry_item(entry: &TimelineEntry) -> Option<&Arc<TurnItem>> {
+    match &entry.kind {
+        EntryKind::Message(message) => message.item.as_ref(),
+        EntryKind::Work(work) => work.item.as_ref(),
+        EntryKind::Event(item) => Some(item),
+        EntryKind::ProposedPlan(_) => None,
+    }
+}
+
+/// An item that changed in place maps to the same single entry, unless it takes part in
+/// cross-item rules (user messages and question answers dedupe) or starts or stops being shown:
+/// `canRederiveInPlace`.
+fn rederives_in_place(previous: &TurnItem, next: &TurnItem) -> bool {
+    previous.id == next.id
+        && std::mem::discriminant(&previous.kind) == std::mem::discriminant(&next.kind)
+        && !matches!(next.kind, TurnItemKind::UserMessage { .. } | TurnItemKind::UserInputRequest { .. } | TurnItemKind::ProposedPlan { .. })
+        && !is_workspace_preparation(next)
+        && previous.started_at == next.started_at
+}
+
+impl EntriesCache {
+    /// Patches only the entries whose items changed in place; `None` when the shape changed.
+    fn patch<'a>(
+        &mut self,
+        visible: &[ProjectedTurnItem],
+        lookups: &mut Option<Lookups<'a>>,
+        attempts: &'a [RunAttempt],
+        nodes: &'a [Entity],
+        plans: &[Entity],
+    ) -> Option<()> {
+        if visible.len() != self.positions.len() {
+            return None;
+        }
+        let mut changed = Vec::new();
+        for (index, row) in visible.iter().enumerate() {
+            let key = Arc::as_ptr(&row.item) as usize;
+            let (previous_key, entry_index) = self.positions[index];
+            if key == previous_key {
+                if let Some(entry_index) = entry_index
+                    && !still_current(&self.entries[entry_index], plans)
+                {
+                    return None;
+                }
+                continue;
+            }
+            let entry_index = entry_index?;
+            let previous = entry_item(&self.entries[entry_index])?;
+            if !rederives_in_place(previous, &row.item) {
+                return None;
+            }
+            changed.push((index, entry_index));
+        }
+        for (index, entry_index) in changed {
+            let row = &visible[index];
+            let lookups = lookups.get_or_insert_with(|| Lookups::new(attempts, nodes));
+            let entry = build_entry(row, lookups, plans);
+            self.by_item.remove(&self.positions[index].0);
+            let key = Arc::as_ptr(&row.item) as usize;
+            self.by_item.insert(key, entry.clone());
+            self.positions[index].0 = key;
+            self.entries[entry_index] = entry;
+        }
+        Some(())
     }
 }
 
@@ -377,11 +494,26 @@ pub fn derive_entries(
     nodes: &[Entity],
     plans: &[Entity],
 ) -> Vec<Arc<TimelineEntry>> {
+    update_entries(cache, visible, attempts, nodes, plans);
+    cache.entries.clone()
+}
+
+/// Brings `cache.entries()` up to date with the visible items.
+pub fn update_entries(cache: &mut EntriesCache, visible: &[ProjectedTurnItem], attempts: &[RunAttempt], nodes: &[Entity], plans: &[Entity]) {
     let attempt_key: Vec<(String, String, Option<String>)> =
-        attempts.iter().map(|a| (a.id.clone(), a.status.clone(), None)).collect();
-    if attempt_key != cache.attempts {
+        attempts.iter().map(|a| (a.id.clone(), a.status.clone(), a.completed_at.clone())).collect();
+    let attempts_changed = attempt_key != cache.attempts;
+    if attempts_changed {
         cache.by_item.clear();
         cache.attempts = attempt_key;
+    }
+    // A node's root and parent never change, so only a new node can resolve an attempt that
+    // was missing; entries that already resolved keep theirs.
+    let new_nodes = nodes.len() != cache.nodes;
+    cache.nodes = nodes.len();
+    let mut lookups: Option<Lookups> = None;
+    if !attempts_changed && !new_nodes && cache.patch(visible, &mut lookups, attempts, nodes, plans).is_some() {
+        return;
     }
     let folded_answers: HashSet<String> = visible
         .iter()
@@ -390,53 +522,39 @@ pub fn derive_entries(
             _ => None,
         })
         .collect();
-    let mut lookups: Option<Lookups> = None;
     let mut next = HashMap::with_capacity(visible.len());
     let mut entries = Vec::with_capacity(visible.len());
+    let mut positions = Vec::with_capacity(visible.len());
     for row in visible {
         let item = &row.item;
-        if is_workspace_preparation(item) {
-            continue;
-        }
-        match &item.kind {
-            TurnItemKind::Checkpoint { .. } => continue,
-            TurnItemKind::UserMessage { input_intent, .. } if input_intent == "queued_turn" && item.status == "pending" => continue,
-            TurnItemKind::UserMessage { message_id, .. } if folded_answers.contains(message_id) => continue,
-            _ => {}
-        }
         let key = Arc::as_ptr(item) as usize;
-        // Plan rows also read the plan's status, which can change without the item changing.
-        let reusable = cache.by_item.get(&key).filter(|entry| !matches!(entry.kind, EntryKind::ProposedPlan(_)));
-        if let Some(entry) = reusable {
-            next.insert(key, entry.clone());
-            entries.push(entry.clone());
+        let shown = !is_workspace_preparation(item)
+            && match &item.kind {
+                TurnItemKind::Checkpoint { .. } => false,
+                TurnItemKind::UserMessage { input_intent, .. } if input_intent == "queued_turn" && item.status == "pending" => false,
+                TurnItemKind::UserMessage { message_id, .. } => !folded_answers.contains(message_id),
+                _ => true,
+            };
+        if !shown {
+            positions.push((key, None));
             continue;
         }
-        let lookups = lookups.get_or_insert_with(|| Lookups::new(attempts, nodes));
-        let kind = if let Some(message) = chat_message(item) {
-            EntryKind::Message(Arc::new(message))
-        } else if let TurnItemKind::ProposedPlan { plan_id, markdown, .. } = &item.kind {
-            let plan = plans.iter().find(|p| p.id == *plan_id && p.value.get("kind").and_then(Value::as_str) == Some("proposed_plan"));
-            EntryKind::ProposedPlan(Arc::new(ProposedPlan {
-                id: plan_id.clone(),
-                run_id: item.run_id.clone(),
-                markdown: Arc::from(markdown.as_str()),
-                status: plan.and_then(|p| p.value.get("status")).and_then(Value::as_str).unwrap_or("active").to_owned(),
-                updated_at: item.updated_at.clone(),
-            }))
-        } else if is_standalone(&item.kind) {
-            EntryKind::Event(item.clone())
-        } else {
-            EntryKind::Work(Arc::new(projected_work_entry(row)))
+        let reusable = cache.by_item.get(&key).filter(|entry| still_current(entry, plans));
+        let entry = match reusable {
+            Some(entry) => match (new_nodes, &entry.attempt) {
+                (true, None) => match lookups.get_or_insert_with(|| Lookups::new(attempts, nodes)).attempt(item) {
+                    Some(attempt) => Arc::new(TimelineEntry { attempt: Some(attempt), ..(**entry).clone() }),
+                    None => entry.clone(),
+                },
+                _ => entry.clone(),
+            },
+            None => build_entry(row, lookups.get_or_insert_with(|| Lookups::new(attempts, nodes)), plans),
         };
-        let id = match &kind {
-            EntryKind::Message(message) => message.id.clone(),
-            _ => item.id.clone(),
-        };
-        let entry = Arc::new(TimelineEntry { id, created_at: created_at(item), attempt: lookups.attempt(item), kind });
         next.insert(key, entry.clone());
+        positions.push((key, Some(entries.len())));
         entries.push(entry);
     }
     cache.by_item = next;
-    entries
+    cache.positions = positions;
+    cache.entries = entries;
 }
