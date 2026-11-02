@@ -27,9 +27,20 @@ pub fn save_last_thread(thread_id: &str) {
     }
 }
 
+const CLIENT_SETTINGS: &str = "settings";
+
 /// Per-device settings the web keeps in local storage (`ClientSettingsSchema` keys).
 pub fn load_client_settings() -> Option<String> {
-    std::fs::read_to_string(base()?.join("settings.json")).ok()
+    std::fs::read_to_string(base()?.join(format!("{CLIENT_SETTINGS}.json"))).ok()
+}
+
+/// Queues edited client settings keys. The writer lays them over the file as it is at write
+/// time, so a second app instance's saves survive; it skips the write while the file exists but
+/// cannot be read, and backs up a file that is not a settings object before replacing it.
+pub fn patch_client_settings(patch: serde_json::Map<String, serde_json::Value>) {
+    if !patch.is_empty() {
+        queue(CLIENT_SETTINGS, Save::Patch(patch));
+    }
 }
 
 /// UI state the web keeps in `localStorage` (panel tabs and widths, diff selections), one JSON
@@ -43,16 +54,29 @@ pub fn load_ui_state(name: &str) -> Option<serde_json::Value> {
 /// Queues a save. One writer thread owns every UI state file: saves land in order, coalesced to
 /// the newest value per file, so an older snapshot can never overwrite a newer one.
 pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
-    static WRITER: OnceLock<Option<mpsc::Sender<(String, String)>>> = OnceLock::new();
     let Ok(text) = serde_json::to_string(value) else { return };
+    queue(name, Save::Replace(text));
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Save {
+    Replace(String),
+    Patch(serde_json::Map<String, serde_json::Value>),
+}
+
+fn queue(name: &str, save: Save) {
+    static WRITER: OnceLock<Option<mpsc::Sender<(String, Save)>>> = OnceLock::new();
     let writer = WRITER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(String, String)>();
+        let (tx, rx) = mpsc::channel::<(String, Save)>();
         let spawned = std::thread::Builder::new().name("t3-ui-state".into()).spawn(move || {
             while let Ok(first) = rx.recv() {
                 let pending = coalesce(std::iter::once(first).chain(rx.try_iter()));
                 if let Some(base) = base() {
-                    for (name, text) in pending {
-                        write_atomically(&base, &name, &text);
+                    for (name, save) in pending {
+                        match save {
+                            Save::Replace(text) => write_atomically(&base, &name, &text),
+                            Save::Patch(patch) => write_patch(&base, &name, &patch),
+                        }
                     }
                 }
             }
@@ -60,20 +84,54 @@ pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
         spawned.ok().map(|_| tx)
     });
     if let Some(writer) = writer {
-        let _ = writer.send((name.to_owned(), text));
+        let _ = writer.send((name.to_owned(), save));
     }
 }
 
-/// Keeps the newest text per file, in the order files were first saved.
-fn coalesce(saves: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
-    let mut pending: Vec<(String, String)> = Vec::new();
-    for (name, text) in saves {
-        match pending.iter_mut().find(|(existing, _)| *existing == name) {
-            Some(entry) => entry.1 = text,
-            None => pending.push((name, text)),
-        }
+/// Keeps one save per file, in the order files were first saved: the newest replacement, with
+/// later patches merged into it or into each other.
+fn coalesce(saves: impl Iterator<Item = (String, Save)>) -> Vec<(String, Save)> {
+    let mut pending: Vec<(String, Save)> = Vec::new();
+    for (name, save) in saves {
+        let Some(entry) = pending.iter_mut().find(|(existing, _)| *existing == name) else {
+            pending.push((name, save));
+            continue;
+        };
+        entry.1 = match (std::mem::replace(&mut entry.1, Save::Replace(String::new())), save) {
+            (Save::Patch(mut earlier), Save::Patch(later)) => {
+                earlier.extend(later);
+                Save::Patch(earlier)
+            }
+            (Save::Replace(text), Save::Patch(later)) => {
+                Save::Replace(t3_core::client_settings::merge_patch(Some(&text), &later).text)
+            }
+            (_, replace @ Save::Replace(_)) => replace,
+        };
     }
     pending
+}
+
+fn write_patch(base: &Path, name: &str, patch: &serde_json::Map<String, serde_json::Value>) {
+    let path = base.join(format!("{name}.json"));
+    let current = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(%error, file = %path.display(), "settings not saved: the file exists but cannot be read");
+            return;
+        }
+    };
+    let merged = t3_core::client_settings::merge_patch(current.as_deref(), patch);
+    if merged.backup {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+        let backup = base.join(format!("{name}.json.corrupt-{stamp}"));
+        if let Err(error) = std::fs::copy(&path, &backup) {
+            tracing::warn!(%error, file = %path.display(), "settings not saved: could not back up the unreadable file");
+            return;
+        }
+        tracing::warn!(backup = %backup.display(), "settings file was not valid JSON; kept a copy and started fresh");
+    }
+    write_atomically(base, name, &merged.text);
 }
 
 /// A uniquely named temporary file renamed over the target: a crash or a second app instance
@@ -119,11 +177,50 @@ pub fn forget() {
 mod tests {
     use super::*;
 
+    fn patch(value: serde_json::Value) -> Save {
+        match value {
+            serde_json::Value::Object(map) => Save::Patch(map),
+            _ => unreachable!(),
+        }
+    }
+
     #[test]
     fn saves_coalesce_to_the_newest_value_per_file() {
-        let saves = [("a", "1"), ("b", "1"), ("a", "2"), ("a", "3")].map(|(n, t)| (n.to_owned(), t.to_owned()));
+        let saves = [("a", "1"), ("b", "1"), ("a", "2"), ("a", "3")].map(|(n, t)| (n.to_owned(), Save::Replace(t.to_owned())));
         let pending = coalesce(saves.into_iter());
-        assert_eq!(pending, vec![("a".to_owned(), "3".to_owned()), ("b".to_owned(), "1".to_owned())]);
+        assert_eq!(pending, vec![("a".to_owned(), Save::Replace("3".to_owned())), ("b".to_owned(), Save::Replace("1".to_owned()))]);
+
+        let saves = [
+            ("settings".to_owned(), patch(serde_json::json!({"a": 1, "b": 1}))),
+            ("settings".to_owned(), patch(serde_json::json!({"b": 2}))),
+        ];
+        assert_eq!(coalesce(saves.into_iter()), vec![("settings".to_owned(), patch(serde_json::json!({"a": 1, "b": 2})))]);
+    }
+
+    #[test]
+    fn patches_land_on_the_latest_file_and_keep_a_corrupt_one() {
+        let dir = std::env::temp_dir().join(format!("t3-settings-patch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let read = |dir: &Path| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        let Save::Patch(wide) = patch(serde_json::json!({"chatWidth": "wide"})) else { unreachable!() };
+
+        // Another instance wrote a key since this one loaded.
+        std::fs::write(dir.join("settings.json"), r#"{"sendShortcut": "mod-enter"}"#).unwrap();
+        write_patch(&dir, "settings", &wide);
+        assert_eq!(read(&dir), serde_json::json!({"sendShortcut": "mod-enter", "chatWidth": "wide"}));
+
+        std::fs::write(dir.join("settings.json"), "{not json").unwrap();
+        write_patch(&dir, "settings", &wide);
+        assert_eq!(read(&dir), serde_json::json!({"chatWidth": "wide"}));
+        let backups: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.starts_with("settings.json.corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(dir.join(&backups[0])).unwrap(), "{not json");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

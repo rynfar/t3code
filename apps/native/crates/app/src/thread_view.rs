@@ -424,14 +424,14 @@ fn toggle(set: &mut std::collections::HashSet<String>, key: &str) -> bool {
     true
 }
 
-fn lane(content: gpui::AnyElement, first: bool, max_width: Option<f32>) -> gpui::AnyElement {
+fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>) -> gpui::AnyElement {
     div()
         .w_full()
         .flex()
         .justify_center()
-        .px(px(48.))
-        .when(first, |this| this.pt(px(16.)))
-        .child(div().w_full().min_w_0().when_some(max_width, |this, width| this.max_w(px(width))).child(content))
+        .px(crate::theme::rem(48.))
+        .when(first, |this| this.pt(crate::theme::rem(16.)))
+        .child(div().w_full().min_w_0().when_some(max_width, |this, width| this.max_w(width)).child(content))
         .into_any_element()
 }
 

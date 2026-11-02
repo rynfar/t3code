@@ -27,7 +27,8 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     cx.on_action(|_: &ToggleFullScreen, cx| with_active_window(cx, |window| window.toggle_fullscreen()));
     cx.on_action(move |_: &Disconnect, cx| state.update(cx, |state, cx| state.forget_connection(cx)));
     cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
+        // Labels the menu item only: `quit_hold` handles the key so it can see auto-repeat.
+        KeyBinding::new("cmd-q", Quit, Some("QuitMenuLabel")),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),

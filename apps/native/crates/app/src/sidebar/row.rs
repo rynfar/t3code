@@ -217,7 +217,7 @@ impl SidebarPane {
                 .relative()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.state.update(cx, |state, cx| state.unpin_thread(&id, cx));
+                    this.state.update(cx, |state, cx| state.request_unpin_thread(&id, cx));
                 }))
                 .into_any_element(),
         )

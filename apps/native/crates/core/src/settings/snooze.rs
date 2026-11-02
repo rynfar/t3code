@@ -1,9 +1,12 @@
 //! Snooze menu options: `SnoozePresetSetting` in `contracts/src/settings.ts`, the labels and ids
 //! from `client-runtime/src/state/threadSettled.ts`, and the editor rules in
-//! `web/src/components/settings/SnoozePresetsSettings.tsx`. Wall-clock resolution (which day a
+//! `web/src/components/settings/SnoozePresetsSettings.tsx` and `SnoozePresetsSettings.logic.ts`.
+//! Wall-clock resolution (which day a
 //! weekday lands on, whether today's time passed) takes the local weekday and minute as inputs.
 
 use serde::{Deserialize, Serialize};
+
+use crate::sidebar::settled::{PresetDay, SnoozePresetSetting};
 
 pub const MAX_PRESETS: usize = 8;
 pub const MAX_PRESET_MINUTES: u32 = 30 * 24 * 60;
@@ -261,6 +264,78 @@ pub fn with_when(preset: &SnoozePreset, day: Option<SnoozeDay>, memory_minutes: 
         (None, SnoozePreset::At { .. }) => SnoozePreset::After { minutes: memory_minutes },
         (Some(day), SnoozePreset::At { time, .. }) => SnoozePreset::At { day, time: time.clone() },
         (Some(day), SnoozePreset::After { .. }) => SnoozePreset::At { day, time: memory_time.to_owned() },
+    }
+}
+
+/// The saved options as the sidebar's snooze menus resolve them (`Sidebar.snooze.ts`).
+pub fn menu_settings(presets: &[SnoozePreset]) -> Vec<SnoozePresetSetting> {
+    presets
+        .iter()
+        .filter_map(|preset| match preset {
+            SnoozePreset::After { minutes } => Some(SnoozePresetSetting::After { minutes: i64::from(*minutes) }),
+            SnoozePreset::At { day, time } => {
+                let (hour, minute) = parse_time(time)?;
+                let day = match day {
+                    SnoozeDay::Today => PresetDay::Today,
+                    SnoozeDay::Tomorrow => PresetDay::Tomorrow,
+                    weekday => PresetDay::Weekday(i64::from(weekday.weekday_index().unwrap_or(0))),
+                };
+                Some(SnoozePresetSetting::At { day, hour: i64::from(hour), minute: i64::from(minute) })
+            }
+        })
+        .collect()
+}
+
+/// The editor's local copy of the options (`SnoozePresetsRow`). Each edit builds on the draft
+/// and is saved whole, so a second edit before the first save echoes back keeps the first.
+/// Echoes of our own saves keep the draft; any other saved value replaces it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnoozeDraft {
+    presets: Vec<SnoozePreset>,
+    written: Vec<Vec<SnoozePreset>>,
+    /// `None` forces the next observation to adopt the saved value, as after a failed save.
+    saved_source: Option<Vec<SnoozePreset>>,
+}
+
+impl SnoozeDraft {
+    pub fn new(saved: &[SnoozePreset]) -> Self {
+        SnoozeDraft { presets: saved.to_vec(), written: Vec::new(), saved_source: Some(saved.to_vec()) }
+    }
+
+    pub fn presets(&self) -> &[SnoozePreset] {
+        &self.presets
+    }
+
+    /// Takes in the environment's saved options (`reconcileSnoozeDraft`).
+    pub fn observe(&mut self, saved: &[SnoozePreset]) {
+        if self.saved_source.as_deref() == Some(saved) {
+            return;
+        }
+        self.saved_source = Some(saved.to_vec());
+        match self.written.iter().position(|snapshot| snapshot.as_slice() == saved) {
+            Some(acknowledged) => {
+                self.written.drain(..=acknowledged);
+            }
+            None => {
+                self.written.clear();
+                self.presets = saved.to_vec();
+            }
+        }
+    }
+
+    /// Replaces the draft. Returns false when nothing changed and there is nothing to save.
+    pub fn edit(&mut self, next: Vec<SnoozePreset>) -> bool {
+        if next == self.presets {
+            return false;
+        }
+        self.written.push(next.clone());
+        self.presets = next;
+        true
+    }
+
+    pub fn failed(&mut self) {
+        self.written.clear();
+        self.saved_source = None;
     }
 }
 

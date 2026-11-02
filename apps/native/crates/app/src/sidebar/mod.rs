@@ -112,11 +112,17 @@ impl SidebarPane {
                 ContextMenuEvent::Rename(thread_id) => this.start_rename(thread_id, window, cx),
                 ContextMenuEvent::CustomSnooze(thread_ids) => snooze.update(cx, |snooze, cx| snooze.open(thread_ids.clone(), window, cx)),
                 ContextMenuEvent::BulkDelete(thread_ids) => {
+                    if !crate::settings::client_settings(cx).confirm_thread_delete() {
+                        return this.state.update(cx, |state, cx| state.delete_threads(thread_ids.clone(), cx));
+                    }
                     let (heading, description) = t3_core::sidebar::selection::bulk_delete_confirmation(thread_ids.len());
                     let ids = thread_ids.clone();
                     dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| state.delete_threads(ids, cx), window, cx));
                 }
                 ContextMenuEvent::Delete(thread_id) => {
+                    if !crate::settings::client_settings(cx).confirm_thread_delete() {
+                        return this.state.update(cx, |state, cx| state.delete_thread(thread_id, cx));
+                    }
                     let Some(title) = this.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
                     let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
                     let id = thread_id.clone();

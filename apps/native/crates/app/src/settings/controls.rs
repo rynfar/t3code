@@ -47,7 +47,7 @@ fn control_shadow() -> Vec<BoxShadow> {
 }
 
 /// The 2px focus ring keyboard focus paints around a control.
-fn focus_ring(color: Hsla) -> Vec<BoxShadow> {
+pub(super) fn focus_ring(color: Hsla) -> Vec<BoxShadow> {
     vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: false }]
 }
 
@@ -124,9 +124,12 @@ impl Button {
 }
 
 impl RenderOnce for Button {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
+        // Focusable like a web button; GPUI turns Enter and Space on a focused element into a click.
+        let focus = (!self.disabled).then(|| focus_handle(&self.id, window, cx));
+        let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         let (height, pad, radius, icon_size, square) = match self.size {
             ButtonSize::IconMicro => (20., 0., 4., 12., true),
             ButtonSize::IconSm => (28., 0., 8., 16., true),
@@ -169,6 +172,8 @@ impl RenderOnce for Button {
             .font_weight(FontWeight::MEDIUM)
             .map(|this| if compact_text { this.text_xs() } else { this.text_sm() })
             .when(outlined, |this| this.shadow(control_shadow()))
+            .when_some(focus, |this, focus| this.track_focus(&focus))
+            .when(ring, |this| this.shadow(focus_ring(hsla(p.ring))))
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.bg(hover_fill).text_color(hover_text)))
             .children(self.icon.map(|glyph| icon(glyph, icon_size, icon_color)))
@@ -238,7 +243,12 @@ impl RenderOnce for Switch {
             )
             .when_some(handler, |this, handler| {
                 let on_key = handler.clone();
-                this.on_click(move |_, window, cx| handler(next, window, cx)).on_key_down(move |event, window, cx| {
+                this.on_click(move |event, window, cx| {
+                    if !event.is_keyboard() {
+                        handler(next, window, cx)
+                    }
+                })
+                .on_key_down(move |event, window, cx| {
                     if activates(event) {
                         cx.stop_propagation();
                         on_key(next, window, cx);
@@ -460,7 +470,12 @@ impl RenderOnce for Select {
                     }
                 }
             })
-            .on_click(move |_, _, cx| toggle(cx))
+            // Keys are handled on keydown; GPUI's keyup click would toggle the popup back.
+            .on_click(move |event, _, cx| {
+                if !event.is_keyboard() {
+                    toggle(cx)
+                }
+            })
             .on_key_down(on_key)
             .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
             .child(div().flex_1().min_w_0().truncate().child(trigger_label))
@@ -645,8 +660,9 @@ impl Row {
 }
 
 impl RenderOnce for Row {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
+        let stacked = ModalLayout::of(window).rows_stacked;
         let has_below = self.below.is_some();
         let reset = self.reset.map(|handler| {
             Button::new(ElementId::Name(format!("{}-reset", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
@@ -662,9 +678,10 @@ impl RenderOnce for Row {
             .rounded(r(12.))
             .when(self.highlighted, |this| this.bg(hsla(p.accent).opacity(0.6)))
             .child(
-                h_flex()
+                div()
                     .w_full()
-                    .gap(r(32.))
+                    .flex()
+                    .map(|this| if stacked { this.flex_col().gap(r(12.)) } else { this.flex_row().items_center().gap(r(32.)) })
                     .child(
                         v_flex()
                             .flex_1()
@@ -681,9 +698,43 @@ impl RenderOnce for Row {
                                 div().max_w(r(672.)).text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description)
                             })),
                     )
-                    .children(self.control.map(|control| h_flex().flex_none().max_w(r(420.)).justify_end().gap(r(8.)).child(control))),
+                    .children(self.control.map(|control| {
+                        h_flex()
+                            .gap(r(8.))
+                            .map(|this| if stacked { this.w_full().min_w_0() } else { this.flex_none().max_w(r(420.)).justify_end() })
+                            .child(control)
+                    })),
             )
             .children(self.below)
+    }
+}
+
+/// How the modal fits the window (`AppRouteModal.tsx`, `SettingsSidebarNav.tsx`,
+/// `settingsLayout.tsx`). Breakpoints are viewport px; sizes are rems.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModalLayout {
+    /// Below 640px the modal fills the window without padding, border or radius.
+    pub full_bleed: bool,
+    pub inset: Rems,
+    /// Below 768px the nav collapses to a 56px icon rail.
+    pub nav_compact: bool,
+    /// A row's content box is under 32rem, so its control drops below the title. GPUI has no
+    /// container queries, so the width is derived from the window the way the modal lays out.
+    pub rows_stacked: bool,
+}
+
+impl ModalLayout {
+    pub fn of(window: &Window) -> Self {
+        let rem = f32::from(window.rem_size()) / 16.;
+        let viewport = f32::from(window.viewport_size().width);
+        let full_bleed = viewport < 640.;
+        let inset = if full_bleed { 0. } else if viewport >= 1024. { 40. } else { 24. };
+        let nav_compact = viewport < 768.;
+        let modal = (viewport - 2. * inset * rem).min(1280. * rem) - 2.;
+        let nav = if nav_compact { 56. } else { 240. } * rem + 1.;
+        let block = (modal - nav).min(896. * rem) - 48. * rem;
+        let row_content = block - 2. - 32. * rem;
+        ModalLayout { full_bleed, inset: r(inset), nav_compact, rows_stacked: row_content < 512. * rem }
     }
 }
 

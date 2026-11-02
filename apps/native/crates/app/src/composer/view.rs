@@ -269,7 +269,7 @@ impl Render for Composer {
                     }
                 }))
                 .w_full()
-                .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(px(width)))
+                .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
                 .children(error.map(|error| {
                     div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))

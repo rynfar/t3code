@@ -416,6 +416,9 @@ pub enum ServerConfigStreamEvent {
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfigState {
     pub config: Option<ServerConfig>,
+    /// Counts settings the stream delivered. The protocol carries no revision, so an
+    /// `updateSettings` reply applies only while nothing has streamed since it was sent.
+    settings_revision: u64,
 }
 
 impl ServerConfigState {
@@ -424,6 +427,7 @@ impl ServerConfigState {
     pub fn apply(&mut self, event: ServerConfigStreamEvent) -> bool {
         match event {
             ServerConfigStreamEvent::Snapshot { config } => {
+                self.settings_revision += 1;
                 if self.config.as_ref() == Some(&*config) {
                     return false;
                 }
@@ -437,10 +441,21 @@ impl ServerConfigState {
                 self.update(|config| replace(&mut config.providers, payload.providers))
             }
             ServerConfigStreamEvent::SettingsUpdated { payload } => {
+                self.settings_revision += 1;
                 self.update(|config| replace(&mut config.settings, payload.settings))
             }
             ServerConfigStreamEvent::Unknown => false,
         }
+    }
+
+    pub fn settings_revision(&self) -> u64 {
+        self.settings_revision
+    }
+
+    /// Applies what a `server.updateSettings` sent at `sent_at` answered with, unless settings
+    /// streamed since: those are at least as new. Returns true when the config changed.
+    pub fn apply_settings_reply(&mut self, settings: ServerSettings, sent_at: u64) -> bool {
+        sent_at == self.settings_revision && self.update(|config| replace(&mut config.settings, settings))
     }
 
     fn update(&mut self, change: impl FnOnce(&mut ServerConfig) -> bool) -> bool {

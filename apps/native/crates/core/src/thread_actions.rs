@@ -113,6 +113,16 @@ pub fn delete_confirmation(title: &str) -> (String, &'static str) {
     (format!("Delete thread \"{title}\"?"), "This permanently clears conversation history for this thread.")
 }
 
+/// The unpin confirmation copy (`requestThreadUnpinConfirmation` in `useThreadActions.ts`).
+pub fn unpin_confirmation(title: &str) -> (String, &'static str) {
+    (format!("Unpin thread \"{title}\"?"), "This will move the thread out of your pinned section.")
+}
+
+/// The archive confirmation copy (`useThreadActionMenu.ts`); the web asks with a title only.
+pub fn archive_confirmation(title: &str) -> String {
+    format!("Archive thread \"{title}\"?")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ThreadAction {
     Find,

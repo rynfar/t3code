@@ -60,6 +60,32 @@ fn edits_keep_unknown_keys_and_round_trip() {
 }
 
 #[test]
+fn edits_save_as_patches_onto_the_latest_file() {
+    let mut doc = ClientSettingsDoc::from_json(r#"{"chatWidth": "full"}"#);
+    let patch = doc.apply_change(&ClientSettingChange::ChatWidth(ChatWidth::Wide));
+    assert_eq!(Value::Object(patch.clone()), serde_json::json!({"chatWidth": "wide"}));
+    assert!(doc.apply_change(&ClientSettingChange::ChatWidth(ChatWidth::Wide)).is_empty());
+
+    // Another instance saved a key after this one loaded: the patch lands on its file.
+    let latest = r#"{"chatWidth": "full", "sendShortcut": "mod-enter", "futureSetting": [1]}"#;
+    let merged = merge_patch(Some(latest), &patch);
+    assert!(!merged.backup);
+    let value = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+    assert_eq!(value(&merged.text), serde_json::json!({"chatWidth": "wide", "sendShortcut": "mod-enter", "futureSetting": [1]}));
+    for empty in [None, Some(""), Some("  \n")] {
+        let merged = merge_patch(empty, &patch);
+        assert!(!merged.backup);
+        assert_eq!(value(&merged.text), serde_json::json!({"chatWidth": "wide"}));
+    }
+    // A file that is not a settings object is kept aside before it is replaced.
+    for corrupt in ["not json", "[1, 2]", "null", "{\"chatWidth\": "] {
+        let merged = merge_patch(Some(corrupt), &patch);
+        assert!(merged.backup, "{corrupt}");
+        assert_eq!(value(&merged.text), serde_json::json!({"chatWidth": "wide"}));
+    }
+}
+
+#[test]
 fn composer_view_follows_the_same_file() {
     let mut doc = ClientSettingsDoc::default();
     doc.apply(&ClientSettingChange::SendShortcut(SendShortcut::ModEnterMultiline));

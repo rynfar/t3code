@@ -3,6 +3,8 @@
 //! `web/src/components/settings/ArchivedThreadsPanel.tsx` groups one environment. Only the fields
 //! the panel shows decode; a project or thread that fails to decode is dropped alone.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -53,19 +55,35 @@ fn decode_each<T: for<'de> Deserialize<'de>>(value: Option<&Value>) -> Vec<T> {
 /// without threads are left out.
 pub fn groups(snapshot: &Value) -> Vec<ArchiveGroup> {
     let projects: Vec<ArchivedProject> = decode_each(snapshot.get("projects"));
-    let threads: Vec<ArchivedThread> = decode_each(snapshot.get("threads"));
+    let mut by_project: HashMap<String, Vec<ArchivedThread>> = HashMap::new();
+    for thread in decode_each::<ArchivedThread>(snapshot.get("threads")) {
+        by_project.entry(thread.project_id.clone()).or_default().push(thread);
+    }
     projects
         .into_iter()
         .filter_map(|project| {
-            let mut project_threads: Vec<ArchivedThread> =
-                threads.iter().filter(|thread| thread.project_id == project.id).cloned().collect();
-            if project_threads.is_empty() {
-                return None;
-            }
+            let mut project_threads = by_project.remove(&project.id)?;
             project_threads.sort_by(|left, right| {
                 right.archived_or_created().cmp(left.archived_or_created()).then(right.id.cmp(&left.id))
             });
             Some(ArchiveGroup { project_id: project.id, title: project.title, threads: project_threads })
+        })
+        .collect()
+}
+
+/// One row of the virtualized archive list: a project heading or one of its threads, by index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveEntry {
+    Project(usize),
+    Thread(usize, usize),
+}
+
+pub fn entries(groups: &[ArchiveGroup]) -> Vec<ArchiveEntry> {
+    groups
+        .iter()
+        .enumerate()
+        .flat_map(|(group, project)| {
+            std::iter::once(ArchiveEntry::Project(group)).chain((0..project.threads.len()).map(move |thread| ArchiveEntry::Thread(group, thread)))
         })
         .collect()
 }

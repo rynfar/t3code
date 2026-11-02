@@ -141,7 +141,7 @@ impl Render for Workspace {
         let paired = matches!(self.state.read(cx).phase, Phase::Online(_));
         let theme = cx.theme();
         if !paired {
-            return div().size_full().bg(theme.background).child(self.connect.clone()).into_any_element();
+            return div().size_full().bg(theme.background).map(crate::quit_hold::listen).child(self.connect.clone()).children(crate::quit_hold::hint(cx)).into_any_element();
         }
         let state = self.state.read(cx);
         let has_thread = state.selected_thread.is_some();
@@ -157,6 +157,7 @@ impl Render for Workspace {
         h_flex()
             .relative()
             .size_full()
+            .map(crate::quit_hold::listen)
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.toggle_picker(window, cx));
             }))
@@ -275,6 +276,7 @@ impl Render for Workspace {
             .child(self.link_dialog.clone())
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))
+            .children(crate::quit_hold::hint(cx))
             .into_any_element()
     }
 }
@@ -337,7 +339,7 @@ impl Workspace {
         self.state.update(cx, |state, cx| {
             let Some(id) = state.selected_thread.clone() else { return };
             match state.sidebar.model.thread(&id).map(|thread| thread.pinned) {
-                Some(true) => state.unpin_thread(&id, cx),
+                Some(true) => state.request_unpin_thread(&id, cx),
                 Some(false) => state.pin_thread(&id, None, cx),
                 None => {}
             }

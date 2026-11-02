@@ -98,14 +98,118 @@ fn changes_serialize_as_server_settings_patches() {
 }
 
 #[test]
-fn update_reply_replaces_settings_through_the_reducer() {
+fn update_reply_replaces_settings_unless_a_newer_change_streamed_first() {
+    let event = |value: serde_json::Value| serde_json::from_value::<ServerConfigStreamEvent>(value).unwrap();
     let mut state = ServerConfigState::default();
-    state.apply(serde_json::from_value::<ServerConfigStreamEvent>(json!({"type": "snapshot", "config": {"settings": {}}})).unwrap());
+    state.apply(event(json!({"type": "snapshot", "config": {"settings": {}}})));
+    let sent = state.settings_revision();
     let reply = decode_update_reply(json!({"sidebarAutoSettleOnMerge": false})).unwrap();
-    let event = ServerConfigStreamEvent::SettingsUpdated { payload: Box::new(crate::server_config::SettingsPayload { settings: reply }) };
-    assert!(state.apply(event));
-    assert!(!state.config.unwrap().settings.threads.sidebar_auto_settle_on_merge);
+    assert!(state.apply_settings_reply(reply, sent));
+    assert!(!state.config.as_ref().unwrap().settings.threads.sidebar_auto_settle_on_merge);
     assert!(decode_update_reply(json!("nope")).is_none());
+
+    // Another client's save streams in after ours was sent; our older reply must not undo it.
+    let sent = state.settings_revision();
+    state.apply(event(json!({"type": "settingsUpdated", "payload": {"settings": {"sidebarAutoSettleOnMerge": false, "snoozeLimitedThreads": true}}})));
+    let stale = decode_update_reply(json!({"sidebarAutoSettleOnMerge": false})).unwrap();
+    assert!(!state.apply_settings_reply(stale, sent));
+    assert!(state.config.as_ref().unwrap().settings.threads.snooze_limited_threads);
+}
+
+#[test]
+fn snooze_draft_builds_each_edit_on_the_unsaved_ones() {
+    let saved = snooze::default_presets();
+    let mut draft = snooze::SnoozeDraft::new(&saved);
+    let mut first = saved.clone();
+    first[0] = SnoozePreset::After { minutes: 90 };
+    assert!(draft.edit(first.clone()));
+    let mut second = draft.presets().to_vec();
+    second[1] = SnoozePreset::After { minutes: 240 };
+    assert!(draft.edit(second.clone()));
+    assert!(!draft.edit(second.clone()), "an unchanged list is not saved again");
+
+    // The first save echoes back while the second is in flight: both edits stay.
+    draft.observe(&first);
+    assert_eq!(draft.presets(), second.as_slice());
+    draft.observe(&second);
+    assert_eq!(draft.presets(), second.as_slice());
+
+    // A change made elsewhere is adopted.
+    let other = vec![SnoozePreset::After { minutes: 15 }];
+    draft.observe(&other);
+    assert_eq!(draft.presets(), other.as_slice());
+
+    // A failed save puts the saved list back even though it did not change.
+    draft.edit(vec![SnoozePreset::After { minutes: 15 }, SnoozePreset::After { minutes: 30 }]);
+    draft.failed();
+    draft.observe(&other);
+    assert_eq!(draft.presets(), other.as_slice());
+}
+
+#[test]
+fn saved_snooze_options_become_menu_settings() {
+    use crate::sidebar::settled::{DEFAULT_SNOOZE_PRESETS, PresetDay, SnoozePresetSetting, snooze_preset_id};
+    assert_eq!(snooze::menu_settings(&snooze::default_presets()), DEFAULT_SNOOZE_PRESETS.to_vec());
+    let saved = vec![
+        SnoozePreset::After { minutes: 30 },
+        SnoozePreset::At { day: SnoozeDay::Friday, time: "17:30".into() },
+        SnoozePreset::At { day: SnoozeDay::Sunday, time: "08:05".into() },
+    ];
+    let menu = snooze::menu_settings(&saved);
+    assert_eq!(
+        menu,
+        vec![
+            SnoozePresetSetting::After { minutes: 30 },
+            SnoozePresetSetting::At { day: PresetDay::Weekday(5), hour: 17, minute: 30 },
+            SnoozePresetSetting::At { day: PresetDay::Weekday(0), hour: 8, minute: 5 },
+        ]
+    );
+    assert_eq!(menu.iter().map(snooze_preset_id).collect::<Vec<_>>(), saved.iter().map(SnoozePreset::id).collect::<Vec<_>>());
+}
+
+#[test]
+fn quit_shortcut_follows_the_confirmation_mode() {
+    use super::quit_hold::{QuitEffect, QuitHint, QuitKeyDown, QuitShortcut};
+    use crate::client_settings::QuitConfirmationMode::{DoubleClick, Direct, Hold};
+    let cmd_q = |repeat: bool| QuitKeyDown { key: "q", modifier: true, alt: false, shift: false, repeat };
+
+    let mut quit = QuitShortcut::default();
+    assert_eq!(quit.key_down(cmd_q(false), Direct, 0), (true, vec![QuitEffect::Quit]));
+
+    // Hold: auto-repeat past the hold time arms the quit, which waits for the release.
+    let mut quit = QuitShortcut::default();
+    assert_eq!(quit.key_down(cmd_q(false), Hold, 0), (true, vec![QuitEffect::ShowHint(QuitHint::Hold)]));
+    for at in (400..=1300).step_by(100) {
+        assert_eq!(quit.key_down(cmd_q(true), Hold, at), (true, vec![]));
+    }
+    assert!(quit.modifier_released(1350).is_empty());
+    assert!(quit.tick(1949).is_empty());
+    assert_eq!(quit.tick(1950), vec![QuitEffect::HideHint, QuitEffect::Quit]);
+
+    // Hold released early only hides the hint; a second press soon after quits.
+    let mut quit = QuitShortcut::default();
+    quit.key_down(cmd_q(false), Hold, 0);
+    quit.key_down(cmd_q(true), Hold, 500);
+    assert_eq!(quit.modifier_released(700), vec![QuitEffect::HideHint]);
+    assert_eq!(quit.deadline(), None);
+    let mut quit = QuitShortcut::default();
+    quit.key_down(cmd_q(false), Hold, 0);
+    quit.modifier_released(100);
+    assert_eq!(quit.key_down(cmd_q(false), Hold, 300), (true, vec![QuitEffect::Quit]));
+
+    // Another key cancels; unrelated keys pass through.
+    let mut quit = QuitShortcut::default();
+    quit.key_down(cmd_q(false), Hold, 0);
+    let w = QuitKeyDown { key: "w", modifier: true, alt: false, shift: false, repeat: false };
+    assert_eq!(quit.key_down(w, Hold, 100), (false, vec![QuitEffect::HideHint]));
+
+    // Double press: the hint outlives the release until the window closes.
+    let mut quit = QuitShortcut::default();
+    assert_eq!(quit.key_down(cmd_q(false), DoubleClick, 0), (true, vec![QuitEffect::ShowHint(QuitHint::DoublePress)]));
+    assert!(quit.modifier_released(100).is_empty());
+    assert_eq!(quit.tick(500), vec![QuitEffect::HideHint]);
+    quit.key_down(cmd_q(false), DoubleClick, 1000);
+    assert_eq!(quit.key_down(cmd_q(false), DoubleClick, 1400), (true, vec![QuitEffect::HideHint, QuitEffect::Quit]));
 }
 
 #[test]
@@ -230,8 +334,11 @@ fn archive_groups_follow_snapshot_projects_newest_archive_first() {
     let mut groups = archive::groups(&snapshot);
     assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Alpha", "Beta"]);
     assert_eq!(groups[0].threads.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["t2", "t1"]);
+    use archive::ArchiveEntry::{Project, Thread};
+    assert_eq!(archive::entries(&groups), vec![Project(0), Thread(0, 0), Thread(0, 1), Project(1), Thread(1, 0)]);
     archive::remove_thread(&mut groups, "t3");
     assert_eq!(groups.len(), 1);
+    assert_eq!(archive::entries(&groups), vec![Project(0), Thread(0, 0), Thread(0, 1)]);
     let now = crate::timeline::parse_iso_ms("2026-10-05T03:00:00Z").unwrap();
     assert_eq!(archive::description(&groups[0].threads[0], now), "Archived 3h ago \u{00b7} Created 4d ago");
     assert_eq!(archive::relative_label("2026-10-05T02:59:30Z", now), "just now");

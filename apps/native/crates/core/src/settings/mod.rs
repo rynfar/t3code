@@ -6,6 +6,7 @@
 
 pub mod archive;
 pub mod keybindings;
+pub mod quit_hold;
 pub mod search;
 pub mod snooze;
 

@@ -1,7 +1,8 @@
 //! Settings: a modal over the current thread (`web/src/routes/_chat.settings.tsx`,
 //! `AppRouteModal.tsx`) with section navigation and settings search (`SettingsSidebarNav.tsx`,
 //! `settingsSearch.ts`). Opened with Cmd+, or the app menu; Esc or the backdrop closes it. The
-//! view exists only while open, so a closed modal costs nothing.
+//! view exists only while open, so a closed modal costs nothing. Tab stays inside the modal,
+//! sections take arrow keys, and closing commits the focused field first.
 
 mod about;
 mod appearance;
@@ -14,8 +15,8 @@ mod threads;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyBinding,
-    MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Window, actions, div, point,
-    prelude::*, px,
+    KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Window, actions,
+    div, point, prelude::*, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -24,14 +25,16 @@ use t3_core::settings::search::{self, SearchItem, Section};
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
-use controls::{Button, ButtonSize, ButtonVariant, icon, r};
+use controls::{Button, ButtonSize, ButtonVariant, ModalLayout, focus_ring, icon, r};
 
-actions!(settings, [OpenSettings, CloseSettings, FocusSettingsSearch]);
+actions!(settings, [OpenSettings, CloseSettings, FocusSettingsSearch, FocusNextInSettings, FocusPreviousInSettings]);
 
 struct Host {
     state: Entity<AppState>,
     view: Option<Entity<SettingsView>>,
     pending: Option<(Section, Option<String>)>,
+    /// What had focus when the modal opened, focused again when it closes.
+    previous_focus: Option<FocusHandle>,
 }
 
 impl Global for Host {}
@@ -39,12 +42,14 @@ impl Global for Host {}
 pub fn init(state: Entity<AppState>, cx: &mut App) {
     store::init(cx);
     controls::init(cx);
-    cx.set_global(Host { state, view: None, pending: None });
+    cx.set_global(Host { state, view: None, pending: None, previous_focus: None });
     cx.on_action(|_: &OpenSettings, cx| open(Section::General, cx));
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("escape", CloseSettings, Some("SettingsModal")),
         KeyBinding::new("cmd-f", FocusSettingsSearch, Some("SettingsModal")),
+        KeyBinding::new("tab", FocusNextInSettings, Some("SettingsModal")),
+        KeyBinding::new("shift-tab", FocusPreviousInSettings, Some("SettingsModal")),
     ]);
 }
 
@@ -80,9 +85,28 @@ pub fn palette_items() -> Vec<t3_core::palette::CommandPaletteItem> {
         .collect()
 }
 
-fn close(cx: &mut App) {
-    cx.global_mut::<Host>().view = None;
+/// The per-device settings every view reads (`useClientSettings`).
+pub fn client_settings(cx: &App) -> &t3_core::client_settings::ClientSettingsDoc {
+    store::client(cx)
+}
+
+/// Closes from outside the view: commits the focused field first, as dropping the view
+/// unmounts it without a blur (`AppRouteModal.tsx` `onOpenChange`).
+fn close(window: &mut Window, cx: &mut App) {
+    if let Some(view) = cx.global::<Host>().view.clone() {
+        view.update(cx, |view, cx| view.commit_focused_field(window, cx));
+    }
+    finish_close(window, cx);
+}
+
+fn finish_close(window: &mut Window, cx: &mut App) {
+    let host = cx.global_mut::<Host>();
+    host.view = None;
+    let previous = host.previous_focus.take();
     store::clear_error(cx);
+    if let Some(previous) = previous {
+        window.focus(&previous, cx);
+    }
     cx.refresh_windows();
 }
 
@@ -93,34 +117,34 @@ pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
             Some(view) => view.update(cx, |view, cx| view.navigate(section, anchor, cx)),
             None => {
                 let state = cx.global::<Host>().state.clone();
+                let previous = window.focused(cx);
                 let view = cx.new(|cx| SettingsView::new(state, section, anchor, window, cx));
                 view.read(cx).focus.clone().focus(window, cx);
-                cx.global_mut::<Host>().view = Some(view);
+                let host = cx.global_mut::<Host>();
+                host.view = Some(view);
+                host.previous_focus = previous;
             }
         }
     }
     let view = cx.global::<Host>().view.clone()?;
     let p = palette(cx);
     let dark = cx.theme().is_dark();
-    let inset = if window.viewport_size().width >= px(1024.) { 40. } else { 24. };
+    let layout = ModalLayout::of(window);
     let modal = div()
         .absolute()
         .inset_0()
         .flex()
         .items_center()
         .justify_center()
-        .p(px(inset))
+        .p(layout.inset)
         .bg(hsla(p.dialog_backdrop))
         .occlude()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| close(cx))
+        .on_mouse_down(MouseButton::Left, |_, window, cx| close(window, cx))
         .child(
             div()
                 .size_full()
-                .max_w(px(1280.))
-                .max_h(px(960.))
                 .flex()
-                .rounded(px(16.))
-                .border_1()
+                .when(!layout.full_bleed, |this| this.max_w(r(1280.)).max_h(r(960.)).rounded(r(16.)).border_1())
                 .border_color(hsla(p.border))
                 .bg(hsla(p.background))
                 .text_color(hsla(p.foreground))
@@ -164,6 +188,12 @@ pub struct SettingsView {
     search: Entity<InputState>,
     active_result: usize,
     scroll: ScrollHandle,
+    /// One focus handle per nav section; only one is a Tab stop (`useSettingsSectionNavigation`).
+    section_focus: Vec<(Section, FocusHandle)>,
+    /// The section arrows last moved to, and the page open when they did.
+    focused_section: Option<(Section, Section)>,
+    /// The compact (icon rail) nav shows the search field over the page while this is set.
+    compact_search_open: bool,
     server_address: String,
     pub(crate) threads: threads::ThreadsState,
     pub(crate) keybindings: keybindings::KeybindingsState,
@@ -187,6 +217,14 @@ impl SettingsView {
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.open_active_result(window, cx),
+                InputEvent::Focus => {
+                    this.compact_search_open = true;
+                    cx.notify();
+                }
+                InputEvent::Blur if this.query(cx).trim().is_empty() => {
+                    this.compact_search_open = false;
+                    cx.notify();
+                }
                 _ => {}
             }),
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
@@ -208,6 +246,13 @@ impl SettingsView {
             search,
             active_result: 0,
             scroll: ScrollHandle::new(),
+            section_focus: search::nav_groups()
+                .into_iter()
+                .flat_map(|(_, sections)| sections)
+                .map(|section| (section, cx.focus_handle().tab_stop(true)))
+                .collect(),
+            focused_section: None,
+            compact_search_open: false,
             server_address: t3_client::store::load().map(|credentials| credentials.http_base).unwrap_or_default(),
             _subscriptions: subscriptions,
         };
@@ -267,11 +312,58 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        close(cx);
+        self.commit_focused_field(window, cx);
+        finish_close(window, cx);
+    }
+
+    /// Saves what a commit-on-blur field holds, before the modal unmounts it.
+    fn commit_focused_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_focused_thread_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.compact_search_open = true;
         self.search.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Tab and Shift+Tab move through the modal's controls only (the dialog's focus trap).
+    fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Bounded: every control in the window is at most one step each.
+        for _ in 0..512 {
+            if forward {
+                window.focus_next(cx);
+            } else {
+                window.focus_prev(cx);
+            }
+            if self.focus.contains_focused(window, cx) && !self.focus.is_focused(window) {
+                return;
+            }
+        }
+        self.focus.focus(window, cx);
+    }
+
+    /// Up, Down, Home and End move between sections without opening them; Enter or Space opens.
+    fn on_nav_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.alt || modifiers.control || modifiers.platform {
+            return;
+        }
+        let Some(index) = self.section_focus.iter().position(|(_, handle)| handle.is_focused(window)) else { return };
+        let last = self.section_focus.len() - 1;
+        let next = match event.keystroke.key.as_str() {
+            "down" => (index + 1).min(last),
+            "up" => index.saturating_sub(1),
+            "home" => 0,
+            "end" => last,
+            "left" | "right" => return cx.stop_propagation(),
+            _ => return,
+        };
+        cx.stop_propagation();
+        let (section, handle) = self.section_focus[next].clone();
+        self.focused_section = Some((section, self.section));
+        handle.focus(window, cx);
+        cx.notify();
     }
 
     fn on_key_down(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -295,6 +387,9 @@ impl SettingsView {
                 if this.query(cx).trim().is_empty() || !this.search.focus_handle(cx).is_focused(window) {
                     return;
                 }
+                if crate::sidebar::is_composing(&this.search, window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 let count = search::search(&this.query(cx), &this.search_items(cx)).len().max(1);
                 this.active_result = if key == "down" { (this.active_result + 1) % count } else { (this.active_result + count - 1) % count };
@@ -310,11 +405,14 @@ impl SettingsView {
             .any(|input| input.focus_handle(cx).is_focused(window))
     }
 
-    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_nav(&self, layout: ModalLayout, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let query = self.query(cx);
         let searching = !query.trim().is_empty();
+        // The compact rail shows icons only until its search opens over the page.
+        let overlay = layout.nav_compact && self.compact_search_open;
+        let labels = !layout.nav_compact || overlay;
         let search_row = h_flex()
             .h(r(32.))
             .px(r(8.))
@@ -339,15 +437,15 @@ impl SettingsView {
             } else {
                 crate::composer::controls::kbd("/", cx).into_any_element()
             });
-        let body = if searching {
+        let body = if searching && labels {
             self.render_results(&query, cx).into_any_element()
         } else {
-            self.render_sections(cx).into_any_element()
+            self.render_sections(labels, layout.nav_compact && !overlay, window, cx).into_any_element()
         };
         v_flex()
-            .w(r(240.))
             .h_full()
             .flex_none()
+            .map(|this| if overlay { this.absolute().top_0().bottom_0().left_0().w_full() } else { this.w(r(if layout.nav_compact { 56. } else { 240. })) })
             .border_r_1()
             .border_color(hsla(p.border))
             .bg(if dark { hsla(p.card) } else { hsla(p.sidebar) })
@@ -358,29 +456,52 @@ impl SettingsView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .overflow_x_hidden()
                     .p(r(8.))
                     .gap(r(8.))
-                    .child(search_row)
+                    .on_key_down(cx.listener(Self::on_nav_key))
+                    .when(labels, |this| this.child(search_row))
                     .child(body),
             )
     }
 
-    fn render_sections(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sections(&self, labels: bool, rail: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        v_flex().gap(r(16.)).children(search::nav_groups().into_iter().enumerate().map(|(group_index, (heading, sections))| {
+        let keyboard = window.last_input_was_keyboard();
+        let tab_stop = match self.focused_section {
+            Some((section, page)) if page == self.section => section,
+            _ => self.section,
+        };
+        let open_search = rail.then(|| {
+            h_flex()
+                .id("settings-compact-search")
+                .h(r(32.))
+                .justify_center()
+                .rounded(r(8.))
+                .cursor_pointer()
+                .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
+                .child(icon(Icon::Search, 16., hsla(p.sidebar_icon)))
+                .on_click(cx.listener(|this, _, window, cx| this.on_focus_search(&FocusSettingsSearch, window, cx)))
+        });
+        v_flex().gap(r(16.)).children(open_search).children(search::nav_groups().into_iter().enumerate().map(|(group_index, (heading, sections))| {
             v_flex()
                 .gap(r(4.))
-                .children(heading.map(|heading| {
+                .when(rail && group_index > 0, |this| this.pt(r(16.)).border_t_1().border_color(hsla(p.sidebar_border)))
+                .children(heading.filter(|_| labels).map(|heading| {
                     div().px(r(8.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.sidebar_muted_foreground).opacity(0.8)).child(heading)
                 }))
                 .children(sections.into_iter().map(|section| {
                     let active = section == self.section;
                     let color = if active { hsla(p.sidebar_foreground) } else { hsla(p.sidebar_muted_foreground).opacity(0.8) };
+                    let focus = self.section_focus.iter().find(|(candidate, _)| *candidate == section).map(|(_, handle)| handle.clone().tab_stop(section == tab_stop));
+                    let ring = keyboard && focus.as_ref().is_some_and(|focus| focus.is_focused(window));
                     h_flex()
                         .id(("settings-section", group_index * 100 + section as usize))
+                        .when_some(focus, |this, focus| this.track_focus(&focus))
                         .h(r(32.))
                         .px(r(8.))
                         .gap(r(8.))
+                        .when(!labels, |this| this.justify_center())
                         .rounded(r(8.))
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
@@ -388,9 +509,13 @@ impl SettingsView {
                         .cursor_pointer()
                         .when(active, |this| this.bg(hsla(p.sidebar_row_selected)))
                         .when(!active, |this| this.hover(|this| this.bg(hsla(p.sidebar_row_hover))))
+                        .when(ring, |this| this.shadow(focus_ring(hsla(p.ring))))
                         .child(icon(section_icon(section), 16., if active { color } else { hsla(p.sidebar_icon) }))
-                        .child(div().truncate().child(section.label()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.navigate(section, None, cx)))
+                        .when(labels, |this| this.child(div().truncate().child(section.label())))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.focused_section = None;
+                            this.navigate(section, None, cx)
+                        }))
                 }))
         }))
     }
@@ -471,7 +596,7 @@ impl SettingsView {
                 Button::new("close-settings", ButtonVariant::Ghost, ButtonSize::IconSm)
                     .icon(Icon::X)
                     .tooltip("Close (Esc)")
-                    .on_click(|_, _, cx| close(cx)),
+                    .on_click(|_, window, cx| close(window, cx)),
             )
     }
 
@@ -514,7 +639,9 @@ fn section_icon(section: Section) -> Icon {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = ModalLayout::of(window);
         let blocks = self.render_page(window, cx);
+        let archive_list = if self.section == Section::Archived { self.archive_list(self.scroll_to_target, cx) } else { None };
         if self.scroll_to_target {
             self.scroll_to_target = false;
             if let Some(index) = self.target.as_deref().and_then(|target| blocks.iter().position(|block| block.anchors.iter().any(|anchor| anchor.as_ref() == target))) {
@@ -538,29 +665,33 @@ impl Render for SettingsView {
                     .child(div().opacity(0.8).child(error)),
             )
         });
+        let content = match archive_list {
+            Some(list) => v_flex().flex_1().min_h_0().items_center().when_some(error, |this, error| this.child(div().w_full().flex().justify_center().pt(r(24.)).child(error))).child(list).into_any_element(),
+            None => v_flex()
+                .id("settings-content")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .items_center()
+                .pt(r(24.))
+                .pb(r(48.))
+                .gap(r(24.))
+                .children(error)
+                .children(blocks.into_iter().map(|block| div().w_full().max_w(r(896.)).px(r(24.)).child(block.element)))
+                .into_any_element(),
+        };
         h_flex()
+            .relative()
             .size_full()
             .key_context("SettingsModal")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(|this, _: &FocusNextInSettings, window, cx| this.cycle_focus(true, window, cx)))
+            .on_action(cx.listener(|this, _: &FocusPreviousInSettings, window, cx| this.cycle_focus(false, window, cx)))
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(self.render_nav(cx))
-            .child(
-                v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(
-                    v_flex()
-                        .id("settings-content")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .items_center()
-                        .pt(r(24.))
-                        .pb(r(48.))
-                        .gap(r(24.))
-                        .children(error)
-                        .children(blocks.into_iter().map(|block| div().w_full().max_w(r(896.)).px(r(24.)).child(block.element))),
-                ),
-            )
+            .child(self.render_nav(layout, window, cx))
+            .child(v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(content))
     }
 }
