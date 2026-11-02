@@ -12,10 +12,11 @@ use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, 
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{ApprovalDecision, respond_to_approval};
 use t3_core::lineage::{
-    ProviderSubagentStatus, asks_approval, child_thread_inputs, effort_label, format_provider_subagent_status, is_active_status,
+    ProviderSubagentStatus, effort_label, format_provider_subagent_status, is_active_status,
     is_provider_native_subagent, provider_subagent_status, reported_model_selection,
 };
 use t3_core::providers;
+use t3_core::timeline::child_inputs;
 use t3_core::requests::{PendingApproval, full_access_override_explanation, pending_requests};
 
 use crate::app_state::{AppEvent, AppState, uuid_v4};
@@ -94,10 +95,11 @@ impl ComposerLineage {
         let Some(thread_id) = state.selected_thread.as_deref() else { return Snapshot::default() };
         let mut approvals = Vec::new();
         if let Some(snapshot) = &state.shell.snapshot {
-            for child in child_thread_inputs(&snapshot.threads, thread_id).into_iter().filter(|child| asks_approval(child)) {
-                let Some(projection) = state.thread_state(&child.id).projection.as_ref() else { continue };
+            let children = child_inputs(&snapshot.threads, thread_id, false).map(|inputs| inputs.children).unwrap_or_default();
+            for child in children.into_iter().filter(|child| child.approval) {
+                let Some(projection) = state.thread_state(&child.thread_id).projection.as_ref() else { continue };
                 for approval in pending_requests(projection).approvals {
-                    approvals.push(ChildApproval { thread_id: child.id.clone(), title: child.title.clone(), approval });
+                    approvals.push(ChildApproval { thread_id: child.thread_id.clone(), title: child.title.clone(), approval });
                 }
             }
         }

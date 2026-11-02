@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{Context, Task};
-use t3_core::lineage::{asks_approval, child_thread_inputs, latest_merge_back_run};
+use t3_core::lineage::latest_merge_back_run;
+use t3_core::timeline::child_inputs;
 use t3_core::right_panel::Surface;
 use t3_core::side_chat::{self, Parent};
 use t3_core::thread::ThreadState;
@@ -92,9 +93,9 @@ impl AppState {
             wanted.push(id.to_owned());
         }
         if let Some(snapshot) = &self.shell.snapshot {
-            for child in child_thread_inputs(&snapshot.threads, selected) {
-                if asks_approval(child) && !wanted.contains(&child.id) {
-                    wanted.push(child.id.clone());
+            for child in child_inputs(&snapshot.threads, selected, false).map(|inputs| inputs.children).unwrap_or_default() {
+                if child.approval && !wanted.contains(&child.thread_id) {
+                    wanted.push(child.thread_id);
                 }
             }
         }

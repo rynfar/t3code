@@ -203,32 +203,6 @@ fn merge_back_keeps_a_turn_capturing_its_checkpoint_unless_a_newer_turn_runs() {
 }
 
 #[test]
-fn child_inputs_walk_subagents_side_chats_and_delegations_at_any_depth() {
-    let approval = json!({"pendingRuntimeRequest": {"id": "q", "kind": "command_approval"}});
-    let question = json!({"pendingRuntimeRequest": {"id": "q", "kind": "user_input"}});
-    let side_chat = json!({"lineage": {"parentThreadId": "parent", "relationshipToParent": "fork", "rootThreadId": "parent", "sideChat": true}, "pendingRuntimeRequest": {"id": "s", "kind": "user_input"}});
-    let threads = vec![
-        shell("parent", "running", json!({})),
-        child("agent", "parent", "subagent", "running", json!({})),
-        child("nested", "agent", "subagent", "running", approval.clone()),
-        child("asks", "parent", "subagent", "running", question),
-        child("idle", "parent", "subagent", "completed", approval.clone()),
-        child("native", "parent", "subagent", "running", merge(approval.clone(), json!({"creationSource": "provider"}))),
-        shell("side", "completed", side_chat),
-        shell("delegated", "running", merge(approval, json!({"delegatedFrom": {"environmentId": "e", "threadId": "parent"}}))),
-        child("unrelated", "other", "subagent", "running", json!({"pendingRuntimeRequest": {"id": "u", "kind": "command_approval"}})),
-    ];
-    let inputs = child_thread_inputs(&threads, "parent");
-    let ids: Vec<&str> = inputs.iter().map(|thread| thread.id.as_str()).collect();
-    assert_eq!(ids, ["asks", "side", "delegated", "nested"]);
-    assert_eq!(child_thread_inputs_title(&inputs), "4 threads need you");
-    assert_eq!(child_thread_inputs_title(&inputs[1..2]), "Side chat needs input");
-    assert_eq!(child_thread_inputs_title(&inputs[2..]), "2 subagents need approval");
-    assert_eq!(child_inputs_waiting_label(&inputs[1..2]), "Side chat waiting");
-    assert_eq!(child_inputs_waiting_label(&inputs), "Subagent waiting");
-}
-
-#[test]
 fn the_turn_roster_follows_the_active_run_then_the_latest_started_one() {
     let at = |minute: u32| format!("2026-11-01T00:{minute:02}:00.000Z");
     let agents = decode_agents(vec![
