@@ -1,0 +1,166 @@
+//! The sidebar's project filter (`SidebarProjectScope` in `Sidebar.tsx`): a popover listing
+//! project groups, pinned first; checking groups scopes the thread list to them, All projects
+//! clears it. Right-click opens the project menu; hover shows the pin toggle where supported.
+
+use std::collections::HashSet;
+
+use gpui::{AnyElement, Context, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point, SharedString, Styled, anchored, deferred, div, prelude::*, px};
+use t3_core::sidebar::ENVIRONMENT_ID;
+use t3_core::sidebar::grouping::{ProjectGroup, build_project_groups};
+
+use super::SidebarPane;
+use crate::icons::Icon;
+use crate::theme::{hsla, palette};
+
+impl SidebarPane {
+    fn project_groups(&self, cx: &Context<Self>) -> Vec<ProjectGroup> {
+        let state = self.state.read(cx);
+        let Some(snapshot) = &state.shell.snapshot else { return Vec::new() };
+        let groups = build_project_groups(ENVIRONMENT_ID, &snapshot.projects, &state.sidebar.settings.grouping);
+        let open = groups.into_iter().filter(|group| !group.archived);
+        let (pinned, rest): (Vec<_>, Vec<_>) = open.partition(|group| group.pinned);
+        pinned.into_iter().chain(rest).collect()
+    }
+
+    pub(super) fn toggle_project_filter(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.project_filter = match self.project_filter {
+            Some(_) => None,
+            None => Some(position),
+        };
+        cx.notify();
+    }
+
+    fn toggle_scope(&mut self, group: &ProjectGroup, cx: &mut Context<Self>) {
+        let members: HashSet<String> = group.member_project_ids.iter().cloned().collect();
+        self.state.update(cx, |state, cx| {
+            let mut scope = state.sidebar.project_scope.clone().unwrap_or_default();
+            if members.iter().all(|id| scope.contains(id)) {
+                scope.retain(|id| !members.contains(id));
+            } else {
+                scope.extend(members);
+            }
+            state.set_project_scope((!scope.is_empty()).then_some(scope), cx);
+        });
+    }
+
+    pub(super) fn render_project_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let scoped = self.state.read(cx).sidebar.project_scope.is_some();
+        div()
+            .id("project-filter")
+            .size(px(28.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .cursor_pointer()
+            .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
+            .when(scoped, |this| this.bg(hsla(p.sidebar_row_selected)))
+            .child(Icon::FolderTree.render(px(16.), hsla(if scoped { p.sidebar_foreground } else { p.sidebar_icon })))
+            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| this.toggle_project_filter(event.position(), cx)))
+    }
+
+    pub(super) fn render_project_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let position = self.project_filter?;
+        let p = palette(cx);
+        let groups = self.project_groups(cx);
+        let state = self.state.read(cx);
+        let scope = state.sidebar.project_scope.clone();
+        let can_pin = state.can_pin_projects();
+        let row = |id: SharedString, checked: bool| {
+            div()
+                .id(id)
+                .group("project-row")
+                .min_h(px(28.))
+                .px(px(8.))
+                .py(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(4.))
+                .text_sm()
+                .text_color(hsla(p.popover_foreground))
+                .cursor_pointer()
+                .hover(|this| this.bg(hsla(p.accent)))
+                .child(div().w(px(16.)).flex_none().children(checked.then(|| Icon::Check.render(px(14.), hsla(p.foreground)))))
+        };
+        let mut rows: Vec<AnyElement> = vec![
+            row("project-filter-all".into(), scope.is_none())
+                .child("All projects")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state.update(cx, |state, cx| state.set_project_scope(None, cx));
+                    this.project_filter = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            div().h(px(1.)).my(px(4.)).mx(px(-4.)).bg(hsla(p.border)).into_any_element(),
+        ];
+        for group in groups {
+            let checked = scope.as_ref().is_some_and(|scope| group.member_project_ids.iter().all(|id| scope.contains(id)));
+            let (toggle_group, menu_project, pin_group) = (group.clone(), group.representative_id.clone(), group.clone());
+            rows.push(
+                row(SharedString::from(format!("project-filter-{}", group.key)), checked)
+                    .child(div().flex_1().min_w_0().truncate().child(group.label.clone()))
+                    .when(can_pin || group.pinned, |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("project-pin-{}", group.key)))
+                                .flex_none()
+                                .when(!group.pinned, |this| this.invisible().group_hover("project-row", |this| this.visible()))
+                                .child(Icon::Pin.render(px(14.), hsla(p.muted_foreground)))
+                                .when(can_pin, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        let pinned = !pin_group.pinned;
+                                        this.state.update(cx, |state, cx| {
+                                            for id in &pin_group.member_project_ids {
+                                                state.set_project_pinned(id, pinned, cx);
+                                            }
+                                        });
+                                    }))
+                                }),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_scope(&toggle_group, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.menu.update(cx, |menu, cx| menu.open_for_project(&menu_project, event.position, window, cx));
+                    }))
+                    .into_any_element(),
+            );
+        }
+        Some(
+            deferred(
+                div()
+                    .id("project-filter-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.project_filter = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        anchored().position(position + gpui::point(px(-8.), px(16.))).snap_to_window_with_margin(px(8.)).child(
+                            div()
+                                .id("project-filter-popup")
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .relative()
+                                .w(px(240.))
+                                .max_h(px(360.))
+                                .overflow_y_scroll()
+                                .p(px(5.))
+                                .rounded(px(8.))
+                                .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+                                .child(div().px(px(8.)).py(px(6.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Filter by project"))
+                                .children(rows),
+                        ),
+                    ),
+            )
+            .with_priority(130)
+            .into_any_element(),
+        )
+    }
+}

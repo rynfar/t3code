@@ -248,6 +248,8 @@ pub struct EnvironmentCapabilities {
     pub thread_stop: Option<bool>,
     #[serde(default)]
     pub thread_auto_settle_opt_out: Option<bool>,
+    #[serde(default)]
+    pub project_organization: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

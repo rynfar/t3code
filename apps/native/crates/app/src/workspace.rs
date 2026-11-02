@@ -140,6 +140,9 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| this.palette.update(cx, |palette, cx| palette.toggle(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::palette::OpenAddProject, window, cx| {
+                this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Browse, window, cx));
+            }))
             .on_action(cx.listener(|this, _: &ToggleFilePicker, window, cx| this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Files, window, cx))))
             .on_action(cx.listener(|this, _: &ToggleProjectSearch, window, cx| {
                 this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Content, window, cx));

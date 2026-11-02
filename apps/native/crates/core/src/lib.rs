@@ -11,6 +11,7 @@ pub mod notifications;
 pub mod pairing;
 pub mod palette;
 pub mod project_search;
+pub mod projects;
 pub mod providers;
 pub mod requests;
 pub mod right_panel;

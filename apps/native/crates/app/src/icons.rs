@@ -62,6 +62,7 @@ icons! {
     FileSymlink => "icons/lucide/file-symlink.svg",
     FlaskConical => "icons/lucide/flask-conical.svg",
     Folder => "icons/lucide/folder.svg",
+    FolderPlus => "icons/lucide/folder-plus.svg",
     FolderTree => "icons/lucide/folder-tree.svg",
     GitBranch => "icons/lucide/git-branch.svg",
     GitFork => "icons/lucide/git-fork.svg",
