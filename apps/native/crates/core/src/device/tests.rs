@@ -239,3 +239,53 @@ fn mjpeg_parts_parse_across_chunks_and_only_the_newest_is_kept() {
     let broken = format!("--frame\r\nContent-Length: {}\r\n\r\n", 64 * 1024 * 1024);
     assert_eq!(parser.push(&[broken.as_bytes(), &part(b"ok")].concat()), Some(b"ok".to_vec()));
 }
+
+#[test]
+fn a_restarted_server_replaces_newer_revisions_and_failures_matter_only_before_a_first_state() {
+    let mut feed = DeviceFeed::default();
+    assert!(feed.failed("socket closed".into()));
+    assert_eq!(feed.load_error(), Some("socket closed"));
+    assert!(feed.retry());
+    let before = state(json!({ "revision": 7, "devices": [device("local", "a", "ios", "iPhone", true)], "sessions": [{ "threadId": "t", "hostId": "local", "deviceId": "a", "platform": "ios", "openedAt": "x" }] }));
+    assert!(feed.snapshot(before.clone()));
+    assert!(!feed.snapshot(before), "an unchanged snapshot changes nothing");
+    // After a server restart the resubscribed feed starts again at revision 0 and wins.
+    let restarted = state(json!({ "revision": 0 }));
+    assert!(feed.snapshot(restarted));
+    assert_eq!(feed.service().map(|service| (service.revision, service.devices.len(), service.sessions.len())), Some((0, 0, 0)));
+    assert!(!feed.failed("socket closed".into()), "a dropped feed keeps the last state");
+    assert_eq!(feed.load_error(), None);
+}
+
+#[test]
+fn operations_from_an_earlier_connection_never_apply() {
+    let decoded = state(json!({ "devices": [device("local", "a", "ios", "iPhone", false)] }));
+    let mut operations = Operations::default();
+    let opening = operations.start("t", Some(decoded.devices[0].clone()));
+    assert!(operations.get("t").is_some_and(|operation| operation.pending.is_some()));
+    // The environment changed while the open was in flight.
+    operations.reset();
+    assert!(!operations.is_current(opening));
+    assert!(!operations.settle("t", opening, Some("late".into())));
+    assert!(operations.get("t").is_none());
+    // A newer operation on the thread is not settled by an older one.
+    let first = operations.start("t", None);
+    let second = operations.start("t", None);
+    assert!(!operations.settle("t", first, Some("superseded".into())));
+    assert!(operations.settle("t", second, Some("refused".into())));
+    assert_eq!(operations.get("t").and_then(|operation| operation.error.as_deref()), Some("refused"));
+    assert!(operations.dismiss("t"));
+}
+
+#[test]
+fn the_probe_runs_each_time_it_becomes_active_including_when_state_arrives_late() {
+    let mut gate = ProbeGate::default();
+    // Visible before the first state: nothing to probe yet.
+    assert!(!gate.update(false));
+    // The first state arrives while visible: probe once.
+    assert!(gate.update(true));
+    assert!(!gate.update(true));
+    // Hidden, then shown again: probe again.
+    assert!(!gate.update(false));
+    assert!(gate.update(true));
+}

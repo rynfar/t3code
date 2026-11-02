@@ -14,7 +14,7 @@ pub mod stream;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -467,6 +467,127 @@ impl ServiceState {
 /// `a.name.localeCompare(b.name)` for device names: case-insensitive first, then exact.
 fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
     a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
+}
+
+/// What a client knows of an environment's devices (`useDeviceState`): the newest snapshot
+/// `subscribeDeviceState` sent, or why none came. Snapshots replace each other in arrival order,
+/// because a restarted server counts revisions from zero again. Command replies are never applied,
+/// as the web ignores them; the subscription carries every change, so a late reply can neither
+/// undo a newer snapshot nor land in another environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceFeed {
+    service: Option<ServiceState>,
+    load_error: Option<String>,
+}
+
+impl DeviceFeed {
+    pub fn service(&self) -> Option<&ServiceState> {
+        self.service.as_ref()
+    }
+
+    /// The subscription failed before a first snapshot, so it never settles on its own.
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
+    /// Whether anything shown changed.
+    pub fn snapshot(&mut self, service: ServiceState) -> bool {
+        let changed = self.service.as_ref() != Some(&service) || self.load_error.is_some();
+        self.service = Some(service);
+        self.load_error = None;
+        changed
+    }
+
+    /// A failure matters only before the first snapshot; after it the last state stays.
+    pub fn failed(&mut self, error: String) -> bool {
+        if self.service.is_some() || self.load_error.as_ref() == Some(&error) {
+            return false;
+        }
+        self.load_error = Some(error);
+        true
+    }
+
+    /// The loading view's Retry.
+    pub fn retry(&mut self) -> bool {
+        self.load_error.take().is_some()
+    }
+}
+
+/// A thread's device open or power-off in flight, or how the last one failed (`operation` in
+/// `DevicePanel.tsx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operation {
+    pub pending: Option<Device>,
+    pub error: Option<String>,
+    id: u64,
+}
+
+/// Names one started operation, so its completion can tell whether it still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationTicket {
+    epoch: u64,
+    id: u64,
+}
+
+/// Every thread's operation. A new connection starts a new epoch: what an earlier connection
+/// started must not open or close tabs, or settle anything, once it completes.
+#[derive(Debug, Clone, Default)]
+pub struct Operations {
+    epoch: u64,
+    next: u64,
+    threads: HashMap<String, Operation>,
+}
+
+impl Operations {
+    pub fn get(&self, thread_id: &str) -> Option<&Operation> {
+        self.threads.get(thread_id)
+    }
+
+    /// `startOperation`: replaces the thread's previous operation.
+    pub fn start(&mut self, thread_id: &str, pending: Option<Device>) -> OperationTicket {
+        self.next += 1;
+        self.threads.insert(thread_id.to_owned(), Operation { pending, error: None, id: self.next });
+        OperationTicket { epoch: self.epoch, id: self.next }
+    }
+
+    /// Whether a completion belongs to the current connection.
+    pub fn is_current(&self, ticket: OperationTicket) -> bool {
+        ticket.epoch == self.epoch
+    }
+
+    /// `settleOperation`: only while the thread's operation is still this one.
+    pub fn settle(&mut self, thread_id: &str, ticket: OperationTicket, error: Option<String>) -> bool {
+        let Some(operation) = self.threads.get_mut(thread_id).filter(|operation| ticket.epoch == self.epoch && operation.id == ticket.id) else { return false };
+        operation.pending = None;
+        operation.error = error;
+        true
+    }
+
+    pub fn dismiss(&mut self, thread_id: &str) -> bool {
+        self.threads.remove(thread_id).is_some()
+    }
+
+    /// A new connection: nothing earlier applies.
+    pub fn reset(&mut self) {
+        self.epoch += 1;
+        self.threads.clear();
+    }
+}
+
+/// `deviceHostProbeAtom` mounted while `active`: one `device.list` each time it becomes active,
+/// including when the first state arrives after the view is already showing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeGate {
+    mounted: bool,
+}
+
+impl ProbeGate {
+    /// Whether to probe now.
+    pub fn update(&mut self, active: bool) -> bool {
+        let mount = active && !self.mounted;
+        self.mounted = active;
+        mount
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

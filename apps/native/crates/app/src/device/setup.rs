@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use serde_json::{Value, json};
-use t3_core::device::{AGENT_DESCRIPTION, HUB_DESCRIPTION, HostStatus, Platform, PlatformStatus, SETUP_STEPS, ServiceState, SetupStatus, configure_hub_payload};
+use t3_core::device::{AGENT_DESCRIPTION, HUB_DESCRIPTION, HostStatus, Platform, PlatformStatus, ProbeGate, SETUP_STEPS, ServiceState, SetupStatus, configure_hub_payload};
 use t3_core::right_panel::{Surface, SurfaceKind};
 
 use super::pane::{HostRetry, host_updates};
@@ -41,6 +41,7 @@ pub struct DeviceSetupDialog {
     state: Entity<AppState>,
     devices: Option<Entity<Devices>>,
     shown: Option<Shown>,
+    probe: ProbeGate,
     step: usize,
     pending: Option<Pending>,
     retrying: Option<String>,
@@ -70,6 +71,7 @@ impl DeviceSetupDialog {
             state,
             devices,
             shown: None,
+            probe: ProbeGate::default(),
             step: 0,
             pending: None,
             retrying: None,
@@ -93,18 +95,19 @@ impl DeviceSetupDialog {
         (matches!(surface.kind, SurfaceKind::Device { .. }) && needs_setup).then(|| Shown::Tab { surface_id: surface.id.clone(), thread_id })
     }
 
-    /// Opening starts on the first step and probes the hosts while the hub is on.
+    /// Opening starts on the first step. While it shows with the hub on, the hosts are probed
+    /// (`deviceHostProbeAtom`), again whenever the hub comes on.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let shown = self.compute_shown(cx);
         if shown != self.shown {
-            let opened = shown.is_some();
+            self.focus_pending = shown.is_some();
             self.shown = shown;
             self.step = 0;
             self.pending = None;
-            self.focus_pending = opened;
-            if let Some(devices) = self.devices.clone().filter(|_| opened)
-                && devices.read(cx).service().is_some_and(ServiceState::hub_enabled)
-            {
+        }
+        if let Some(devices) = self.devices.clone() {
+            let active = self.shown.is_some() && devices.read(cx).service().is_some_and(ServiceState::hub_enabled);
+            if self.probe.update(active) {
                 devices.update(cx, |devices, cx| devices.list(json!({}), cx)).detach();
             }
         }
@@ -141,6 +144,10 @@ impl DeviceSetupDialog {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.pending = None;
+                // The web reports a failed configure only as a console warning; the switch shows the state that stands.
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "device.configure failed");
+                }
                 if pending == Pending::Complete
                     && result.is_ok()
                     && let Some(Shown::Requested(thread_id)) = this.shown.clone()

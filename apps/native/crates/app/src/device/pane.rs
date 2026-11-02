@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use gpui::{AnyElement, App, AppContext, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, Window, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
-use t3_core::device::{ANDROID_HINT, Device, HOST_FAILED_HINT, ServiceState, retry_host_payload};
+use t3_core::device::{ANDROID_HINT, Device, HOST_FAILED_HINT, ProbeGate, ServiceState, retry_host_payload};
 use t3_core::right_panel::{DeviceTarget, SurfaceKind};
 
 use super::screen::DeviceScreen;
@@ -27,6 +27,7 @@ pub struct DevicePane {
     thread_id: String,
     surface_id: String,
     visible: bool,
+    probe: ProbeGate,
     screen: Option<Entity<DeviceScreen>>,
     /// Discovery warnings dismissed while this tab lives, by host and detail.
     dismissed: HashSet<(String, String)>,
@@ -38,6 +39,7 @@ pub struct DevicePane {
 impl DevicePane {
     pub fn new(state: Entity<AppState>, devices: Entity<Devices>, thread_id: String, surface_id: String, cx: &mut Context<Self>) -> Self {
         let device_events = cx.subscribe(&devices, |this, _, _: &DevicesEvent, cx| {
+            this.sync_probe(cx);
             this.sync_screen(cx);
             cx.notify();
         });
@@ -52,6 +54,7 @@ impl DevicePane {
             thread_id,
             surface_id,
             visible: false,
+            probe: ProbeGate::default(),
             screen: None,
             dismissed: HashSet::new(),
             retrying: None,
@@ -69,17 +72,22 @@ impl DevicePane {
         &self.thread_id
     }
 
-    /// Probes the hosts each time the tab comes into view, as `deviceHostProbeAtom` mounts.
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;
         }
         self.visible = visible;
-        if visible && self.devices.read(cx).service().is_some_and(ServiceState::hub_enabled) {
-            self.devices.update(cx, |devices, cx| devices.list(json!({}), cx)).detach();
-        }
+        self.sync_probe(cx);
         if let Some(screen) = &self.screen {
             screen.update(cx, |screen, cx| screen.set_visible(visible, cx));
+        }
+    }
+
+    /// `deviceHostProbeAtom`, mounted while the tab shows a loaded environment with the hub on.
+    fn sync_probe(&mut self, cx: &mut Context<Self>) {
+        let active = self.visible && self.devices.read(cx).service().is_some_and(ServiceState::hub_enabled);
+        if self.probe.update(active) {
+            self.devices.update(cx, |devices, cx| devices.list(json!({}), cx)).detach();
         }
     }
 

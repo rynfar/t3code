@@ -9,13 +9,12 @@ mod pane;
 mod screen;
 mod setup;
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global, Subscription, Task};
 use serde_json::{Value, json};
 use t3_client::session::RpcError;
-use t3_core::device::{Device, Opened, SETTINGS_WRITE_SCOPE, ServiceState, close_payload, method, open_payload};
+use t3_core::device::{Device, DeviceFeed, Opened, Operation, Operations, SETTINGS_WRITE_SCOPE, ServiceState, close_payload, method, open_payload};
 use t3_core::right_panel::{DeviceTarget, RightPanels, Surface};
 
 pub use pane::DevicePane;
@@ -39,28 +38,16 @@ impl Drop for Abort {
     }
 }
 
-/// A thread's device open or power-off in flight, or how the last one failed.
-#[derive(Debug, Clone, Default)]
-pub struct Operation {
-    pub pending: Option<Device>,
-    pub error: Option<String>,
-    id: u64,
-}
-
 pub struct Devices {
     state: Entity<AppState>,
     connection: Option<u64>,
-    /// `None` until the first state arrives.
-    service: Option<ServiceState>,
-    /// The subscription failed before a first state, so it never settles on its own.
-    load_error: Option<String>,
+    feed: DeviceFeed,
     /// `None` until the session state answers; unknown counts as granted.
     can_configure: Option<bool>,
-    operations: HashMap<String, Operation>,
-    next_operation: u64,
+    operations: Operations,
     /// The thread the launcher asked to set devices up for.
     setup_requested: Option<String>,
-    feed: Option<(Abort, Task<()>)>,
+    subscription: Option<(Abort, Task<()>)>,
     grants: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -84,7 +71,7 @@ pub fn devices(cx: &App) -> Option<Entity<Devices>> {
 /// set up, else the device list in a tab.
 pub fn add_device_surface(state: &mut AppState, cx: &mut Context<AppState>) {
     let Some(thread_id) = state.selected_thread.clone() else { return };
-    let needs_setup = devices(cx).and_then(|devices| devices.read(cx).service.as_ref().map(ServiceState::needs_setup)) == Some(true);
+    let needs_setup = devices(cx).and_then(|devices| devices.read(cx).service().map(ServiceState::needs_setup)) == Some(true);
     if needs_setup {
         cx.defer(move |cx| {
             if let Some(devices) = devices(cx) {
@@ -123,13 +110,11 @@ impl Devices {
         let mut devices = Devices {
             state,
             connection: None,
-            service: None,
-            load_error: None,
+            feed: DeviceFeed::default(),
             can_configure: None,
-            operations: HashMap::new(),
-            next_operation: 0,
+            operations: Operations::default(),
             setup_requested: None,
-            feed: None,
+            subscription: None,
             grants: None,
             _subscription: subscription,
         };
@@ -138,11 +123,11 @@ impl Devices {
     }
 
     pub fn service(&self) -> Option<&ServiceState> {
-        self.service.as_ref()
+        self.feed.service()
     }
 
     pub fn load_error(&self) -> Option<&str> {
-        self.load_error.as_deref()
+        self.feed.load_error()
     }
 
     /// `useEnvironmentScope(environmentId, AuthSettingsWriteScope)`.
@@ -166,11 +151,10 @@ impl Devices {
             return;
         }
         self.connection = current;
-        self.service = None;
-        self.load_error = None;
+        self.feed = DeviceFeed::default();
         self.can_configure = None;
-        self.operations.clear();
-        self.feed = None;
+        self.operations.reset();
+        self.subscription = None;
         self.grants = None;
         if let Some(client) = state.client_handle() {
             let mut grants = client.session_state();
@@ -262,99 +246,78 @@ impl Devices {
                 }
             }
         });
-        self.feed = Some((Abort(driver), pump));
+        self.subscription = Some((Abort(driver), pump));
     }
 
     fn apply(&mut self, next: Result<ServiceState, String>, cx: &mut Context<Self>) {
-        match next {
-            Ok(service) => {
-                self.load_error = None;
-                self.set_service(service, cx);
-            }
-            // A state already shown stays; only a first load reports its failure.
-            Err(error) if self.service.is_none() => {
-                self.load_error = Some(error);
-                cx.emit(DevicesEvent::Changed);
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn set_service(&mut self, service: ServiceState, cx: &mut Context<Self>) {
-        if self.service.as_ref().is_some_and(|current| current.revision > service.revision) || self.service.as_ref() == Some(&service) {
-            return;
-        }
-        self.service = Some(service);
-        cx.emit(DevicesEvent::Changed);
-    }
-
-    /// The loading view's Retry: subscribe again.
-    pub fn retry_load(&mut self, cx: &mut Context<Self>) {
-        self.load_error = None;
-        self.feed = None;
-        self.subscribe(cx);
-        cx.emit(DevicesEvent::Changed);
-    }
-
-    /// `device.list`: probes the hosts ("Refresh devices", the probe while the panel shows, and
-    /// setup's "Check again"); `retryHostId` retries one failed host. Never installs or starts
-    /// helpers. Its answer is the new state.
-    pub fn list(&mut self, input: Value, cx: &mut Context<Self>) -> Task<Result<(), String>> {
-        let Some(task) = self.state.read(cx).request(method::LIST, input, ServiceState::decode) else { return Task::ready(Err("Disconnected.".to_owned())) };
-        cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            this.update(cx, |this, cx| result.map(|service| this.set_service(service, cx))).unwrap_or(Ok(()))
-        })
-    }
-
-    /// `device.configure` from setup. Its answer is the new state.
-    pub fn configure(&mut self, input: Value, cx: &mut Context<Self>) -> Task<Result<(), String>> {
-        let Some(task) = self.state.read(cx).request(method::CONFIGURE, input, ServiceState::decode) else { return Task::ready(Err("Disconnected.".to_owned())) };
-        cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            this.update(cx, |this, cx| result.map(|service| this.set_service(service, cx))).unwrap_or(Ok(()))
-        })
-    }
-
-    fn start_operation(&mut self, thread_id: &str, pending: Option<Device>, cx: &mut Context<Self>) -> u64 {
-        self.next_operation += 1;
-        let id = self.next_operation;
-        self.operations.insert(thread_id.to_owned(), Operation { pending, error: None, id });
-        cx.emit(DevicesEvent::Changed);
-        id
-    }
-
-    /// Settles an operation unless a newer one on the same thread replaced it.
-    fn settle(&mut self, thread_id: &str, id: u64, error: Option<String>, cx: &mut Context<Self>) {
-        if let Some(operation) = self.operations.get_mut(thread_id).filter(|operation| operation.id == id) {
-            operation.pending = None;
-            operation.error = error;
+        let changed = match next {
+            Ok(service) => self.feed.snapshot(service),
+            Err(error) => self.feed.failed(error),
+        };
+        if changed {
             cx.emit(DevicesEvent::Changed);
         }
     }
 
+    /// The loading view's Retry: subscribe again.
+    pub fn retry_load(&mut self, cx: &mut Context<Self>) {
+        self.feed.retry();
+        self.subscription = None;
+        self.subscribe(cx);
+        cx.emit(DevicesEvent::Changed);
+    }
+
+    /// A command whose effect arrives through the subscription; it answers only success or why not.
+    fn command(&self, method: &'static str, input: Value, cx: &App) -> Task<Result<(), String>> {
+        let task = self.state.read(cx).rpc(method, input);
+        cx.background_spawn(async move { task.await.map(|_| ()).map_err(|error| error_text(&error)) })
+    }
+
+    /// `device.list`: probes the hosts ("Refresh devices", the probe while the panel shows, and
+    /// setup's "Check again"); `retryHostId` retries one failed host. Never installs or starts
+    /// helpers.
+    pub fn list(&mut self, input: Value, cx: &mut Context<Self>) -> Task<Result<(), String>> {
+        self.command(method::LIST, input, cx)
+    }
+
+    /// `device.configure` from setup.
+    pub fn configure(&mut self, input: Value, cx: &mut Context<Self>) -> Task<Result<(), String>> {
+        self.command(method::CONFIGURE, input, cx)
+    }
+
     pub fn dismiss_error(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if self.operations.remove(thread_id).is_some() {
+        if self.operations.dismiss(thread_id) {
             cx.emit(DevicesEvent::Changed);
         }
     }
 
     /// `selectDevice`: opens (booting if needed) a device for the thread, then its tab there.
     pub fn open_device(&mut self, thread_id: &str, device: Device, cx: &mut Context<Self>) {
-        let id = self.start_operation(thread_id, Some(device.clone()), cx);
+        let ticket = self.operations.start(thread_id, Some(device.clone()));
+        cx.emit(DevicesEvent::Changed);
         let thread_id = thread_id.to_owned();
         let Some(task) = self.state.read(cx).request(method::OPEN, open_payload(&thread_id, &device), Opened::decode) else {
-            return self.settle(&thread_id, id, Some("Disconnected.".to_owned()), cx);
+            self.operations.settle(&thread_id, ticket, Some("Disconnected.".to_owned()));
+            return cx.emit(DevicesEvent::Changed);
         };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(opened) => {
-                    let target = DeviceTarget { host_id: opened.host_id, device_id: opened.device_id, platform: device.platform, name: device.name.clone() };
-                    this.state.update(cx, |state, cx| edit_panels(state, &thread_id, cx, |panels, thread| panels.open_device(thread, target)));
-                    this.settle(&thread_id, id, None, cx);
+            let _ = this.update(cx, |this, cx| {
+                // An open from another environment must not open a tab in this one.
+                if !this.operations.is_current(ticket) {
+                    return;
                 }
-                Err(error) => this.settle(&thread_id, id, Some(error), cx),
+                let error = match result {
+                    Ok(opened) => {
+                        let target = DeviceTarget { host_id: opened.host_id, device_id: opened.device_id, platform: device.platform, name: device.name.clone() };
+                        this.state.update(cx, |state, cx| edit_panels(state, &thread_id, cx, |panels, thread| panels.open_device(thread, target)));
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+                if this.operations.settle(&thread_id, ticket, error) {
+                    cx.emit(DevicesEvent::Changed);
+                }
             });
         })
         .detach();
@@ -368,16 +331,25 @@ impl Devices {
             return;
         }
         let Some((host_id, device_id)) = session else { return };
-        let id = self.start_operation(&thread_id, None, cx);
+        let ticket = self.operations.start(&thread_id, None);
+        cx.emit(DevicesEvent::Changed);
         let task = self.state.read(cx).rpc(method::CLOSE, close_payload(&thread_id, &host_id, &device_id, true));
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(_) => {
-                    this.state.update(cx, |state, cx| edit_panels(state, &thread_id, cx, |panels, thread| panels.close_surface(thread, &surface_id)));
-                    this.settle(&thread_id, id, None, cx);
+            let _ = this.update(cx, |this, cx| {
+                if !this.operations.is_current(ticket) {
+                    return;
                 }
-                Err(error) => this.settle(&thread_id, id, Some(error_text(&error)), cx),
+                let error = match result {
+                    Ok(_) => {
+                        this.state.update(cx, |state, cx| edit_panels(state, &thread_id, cx, |panels, thread| panels.close_surface(thread, &surface_id)));
+                        None
+                    }
+                    Err(error) => Some(error_text(&error)),
+                };
+                if this.operations.settle(&thread_id, ticket, error) {
+                    cx.emit(DevicesEvent::Changed);
+                }
             });
         })
         .detach();
