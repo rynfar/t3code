@@ -114,6 +114,12 @@ impl ClientHandle {
         crate::pull_requests::fetch_diff(&self.credentials, payload).await
     }
 
+    /// An access endpoint `POST` with this device's credential (`auth::post_access`). Run it on the
+    /// network runtime.
+    pub async fn post_access(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
+        auth::post_access(&self.credentials, path, body).await
+    }
+
     /// Downloads a signed asset (`assets.createUrl`) over HTTP, at most `max_bytes`. Run it on
     /// the network runtime.
     pub async fn asset_bytes(&self, relative_url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {

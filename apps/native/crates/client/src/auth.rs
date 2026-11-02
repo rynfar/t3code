@@ -172,6 +172,25 @@ pub async fn fetch_session_state(credentials: &Credentials) -> Result<AuthSessio
     response.json().await.map_err(|source| AuthError::Unreachable { host, source })
 }
 
+/// An authenticated `POST` to an access endpoint (`/api/auth/pairing-token`,
+/// `/api/auth/clients/revoke`, …). A failure carries the server's `message` when it sends one.
+pub async fn post_access(credentials: &Credentials, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let request = http().post(format!("{}{path}", credentials.http_base)).bearer_auth(&credentials.access_token);
+    let request = match body {
+        Some(body) => request.json(&body),
+        None => request,
+    };
+    let response = request.send().await.map_err(|error| format!("Could not reach {}: {error}", credentials.http_base))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = value.get("message").and_then(serde_json::Value::as_str).filter(|message| !message.is_empty());
+        return Err(message.map_or_else(|| format!("The server answered {}.", status.as_u16()), str::to_owned));
+    }
+    Ok(value)
+}
+
 pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
     let mut url = url::Url::parse(&websocket_base(&credentials.http_base)).expect("valid ws base");
     url.query_pairs_mut()

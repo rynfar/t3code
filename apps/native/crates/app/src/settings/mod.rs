@@ -5,6 +5,7 @@
 //! sections take arrow keys, and closing commits the focused field first.
 
 mod about;
+mod access;
 mod appearance;
 mod archive;
 pub(crate) mod controls;
@@ -206,6 +207,7 @@ pub struct SettingsView {
     pub(crate) worktrees: worktrees::WorktreesState,
     pub(crate) source_control: source_control::SourceControlState,
     pub(crate) scheduled: scheduled_tasks::ScheduledTasksState,
+    pub(crate) access: access::AccessPageState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -250,6 +252,7 @@ impl SettingsView {
             worktrees: worktrees::WorktreesState::new(window, cx),
             source_control: source_control::SourceControlState::new(window, cx),
             scheduled: scheduled_tasks::ScheduledTasksState::new(window, cx),
+            access: access::AccessPageState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -288,6 +291,9 @@ impl SettingsView {
         }
         if section != Section::ScheduledTasks {
             self.scheduled.stream = None;
+        }
+        if section != Section::Access {
+            self.access.close();
         }
         cx.notify();
     }
@@ -429,6 +435,7 @@ impl SettingsView {
             .chain(self.providers.inputs())
             .chain(self.worktrees.inputs())
             .chain(self.scheduled.inputs())
+            .chain([&self.access.label])
             .any(|input| input.focus_handle(cx).is_focused(window))
             || [&self.worktrees.instructions, self.scheduled.textarea()].into_iter().chain(self.source_control.textareas()).any(|input| input.focus_handle(cx).is_focused(window))
     }
@@ -640,6 +647,7 @@ impl SettingsView {
             Section::Worktrees => self.worktrees_page(window, cx),
             Section::SourceControl => self.source_control_page(window, cx),
             Section::ScheduledTasks => self.scheduled_tasks_page(cx),
+            Section::Access => self.access_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
