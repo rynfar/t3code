@@ -12,7 +12,7 @@ import {
   encodeEvent,
   encodeProjection,
   Fixtures,
-  observed,
+  Interner,
   Projection,
 } from "./runtime.ts";
 import type { Item, Json, Row, ThreadProjection } from "./runtime.ts";
@@ -53,7 +53,9 @@ function reducerCase(name: string, initial: ThreadProjection, steps: ReadonlyArr
             latestLocalTurnOrdinal: step.options.latestLocalTurnOrdinal ?? null,
           } as Json),
   }));
+  const interner = new Interner();
   let state: ThreadProjection | null = decodeProjection(initialJson);
+  const states = [interner.record(encodeProjection(state))];
   for (const step of stepsJson) {
     const options = step.options as {
       partialTimeline: boolean;
@@ -64,13 +66,10 @@ function reducerCase(name: string, initial: ThreadProjection, steps: ReadonlyArr
       decodeEvent(step.event),
       options ?? undefined,
     );
+    if (state === null) throw new Error(`${name}: the reducer dropped the projection`);
+    states.push(interner.record(encodeProjection(state)));
   }
-  return {
-    name,
-    initial: initialJson,
-    steps: stepsJson,
-    expected: state === null ? null : observed(encodeProjection(state)),
-  };
+  return { name, initial: initialJson, steps: stepsJson, table: interner.table, states };
 }
 
 export function portedReducerCases() {
@@ -260,6 +259,20 @@ export function portedReducerCases() {
       "deduped body without its record stays marked",
       projectionOf({ runs: [completed] }),
       [{ event: itemEvent({ ...reply, text: "", textOmitted: true } as Item) }],
+    ),
+  );
+
+  const richUser = turnItem("user", "item-rich-user", 1, { runId, rich: true });
+  const richCommand = turnItem("command", "item-rich-command", 2, { runId, rich: true });
+  const richTask = turnItem("subagent", "item-rich-task", 3, { runId, rich: true });
+  cases.push(
+    reducerCase(
+      "optional fields the native types model",
+      projectionOf({ runs: [completed], items: [richUser, richCommand] }),
+      [
+        { event: itemEvent(richTask) },
+        { event: itemEvent({ ...richCommand, status: "failed" } as Item) },
+      ],
     ),
   );
 
