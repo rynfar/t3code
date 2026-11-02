@@ -103,7 +103,10 @@ impl Render for ConfirmDialog {
                         .id("confirm-dialog")
                         .track_focus(&self.focus)
                         .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| match event.keystroke.key.as_str() {
-                            "escape" => this.resolve(false, cx),
+                            "escape" => {
+                                cx.stop_propagation();
+                                this.resolve(false, cx);
+                            }
                             "enter" => this.resolve(true, cx),
                             _ => {}
                         }))

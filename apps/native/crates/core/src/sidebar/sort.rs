@@ -2,7 +2,9 @@
 //! `client-runtime/src/state/threadInbox.ts`.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
+use super::drag::Assignment;
 use super::thread::SidebarThread;
 use super::time::Ms;
 use crate::thread::locale_compare;
@@ -160,4 +162,59 @@ pub fn pin_order_key_between(before: Option<&str>, after: Option<&str>) -> Optio
 pub fn top_of_pinned_order_key<'a>(threads: impl IntoIterator<Item = &'a SidebarThread>) -> Option<String> {
     let first = threads.into_iter().filter(|thread| thread.pinned).filter_map(|thread| thread.pin_order_key.as_deref()).min();
     pin_order_key_between(None, first)
+}
+
+/// `generateSpreadPinOrderKeys`: evenly spaced keys that leave room between neighbours.
+pub fn generate_spread_pin_order_keys(count: usize) -> Vec<String> {
+    let base = PIN_ORDER_DIGITS.len() as u128;
+    let mut width = 2;
+    let mut space = base.pow(2);
+    while space <= (count as u128 + 1) * 2 {
+        width += 1;
+        space *= base;
+    }
+    let step = space as f64 / (count as f64 + 1.0);
+    (0..count)
+        .map(|i| {
+            let mut value = (step * (i as f64 + 1.0)).round() as u128;
+            if value.is_multiple_of(base) {
+                value += 1;
+            }
+            let mut key = vec![0u8; width];
+            for slot in key.iter_mut().rev() {
+                *slot = PIN_ORDER_DIGITS[(value % base) as usize];
+                value /= base;
+            }
+            String::from_utf8_lossy(&key).into_owned()
+        })
+        .collect()
+}
+
+/// `planPinnedReorder`: one key between the moved row's neighbours when they have keys, else a
+/// fresh spread for every listed row. `keys_by_id` may include hidden rows, whose keys stay
+/// reserved; only `ordered` rows receive writes.
+pub fn plan_pinned_reorder(ordered: &[String], keys_by_id: &HashMap<String, Option<String>>, moved: &str) -> Vec<Assignment> {
+    let visible: HashSet<&str> = ordered.iter().map(String::as_str).collect();
+    let reserved: HashSet<&str> = keys_by_id.iter().filter(|(id, _)| !visible.contains(id.as_str())).filter_map(|(_, key)| key.as_deref()).collect();
+    let Some(index) = ordered.iter().position(|id| id == moved) else { return Vec::new() };
+    let key_of = |id: Option<&String>| id.and_then(|id| keys_by_id.get(id).cloned().flatten());
+    let before_id = index.checked_sub(1).and_then(|i| ordered.get(i));
+    let after_id = ordered.get(index + 1);
+    let (before, after) = (key_of(before_id), key_of(after_id));
+    if (before_id.is_none() || before.is_some()) && (after_id.is_none() || after.is_some()) {
+        let mut key = pin_order_key_between(before.as_deref(), after.as_deref());
+        while let Some(candidate) = key.as_deref().filter(|candidate| reserved.contains(candidate)) {
+            key = pin_order_key_between(Some(candidate), after.as_deref());
+        }
+        if let Some(order_key) = key {
+            return vec![Assignment { id: moved.to_owned(), order_key }];
+        }
+    }
+    let keys: Vec<String> = generate_spread_pin_order_keys(ordered.len() + reserved.len()).into_iter().filter(|key| !reserved.contains(key.as_str())).take(ordered.len()).collect();
+    ordered
+        .iter()
+        .zip(keys)
+        .filter(|(id, key)| keys_by_id.get(*id).and_then(Option::as_deref) != Some(key.as_str()))
+        .map(|(id, order_key)| Assignment { id: id.clone(), order_key })
+        .collect()
 }

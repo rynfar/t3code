@@ -535,7 +535,7 @@ fn snapshot(threads: Vec<Value>) -> ShellSnapshot {
 
 fn build(snapshot: &ShellSnapshot, shelves: &ShelfState, selected: Option<&str>) -> SidebarModel {
     SidebarModel::build(
-        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, connected: true, now: iso(NOW) },
+        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, connected: true, now: iso(NOW), dragging: None },
         &mut InboxReturnTracker::default(),
     )
 }
@@ -548,6 +548,7 @@ fn labels(model: &SidebarModel) -> Vec<String> {
             SidebarRow::Thread { index, section } => format!("{:?}:{}", section, model.threads[*index].id),
             SidebarRow::Shelf { shelf, count, expanded } => format!("[{} {count}{}]", shelf.label(), if *expanded { " open" } else { "" }),
             SidebarRow::ShowMore { count } => format!("more {count}"),
+            SidebarRow::Marker(marker) => format!("<{marker:?}>"),
         })
         .collect()
 }
@@ -577,6 +578,26 @@ fn model_lists_sections_with_collapsed_shelves_and_the_open_thread() {
     assert_eq!(model.adjacent_thread(None, false), Some("done-2"));
     assert_eq!(model.jump_target(0), Some("pinned"));
     assert_eq!(model.section_of("napping"), Some(Section::Snoozed));
+}
+
+#[test]
+fn dragging_adds_drop_markers_and_slots_resolve_through_them() {
+    let snapshot = snapshot(vec![
+        wire_thread("pinned", json!({"pinnedAt": "2026-04-02T00:00:00.000Z"})),
+        wire_thread("active", json!({})),
+        wire_thread("done-1", json!({"settledOverride": "settled", "settledAt": "2026-04-03T00:00:00.000Z"})),
+    ]);
+    let model = SidebarModel::build(
+        &ModelInput { snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, connected: true, now: iso(NOW), dragging: Some(Section::Active) },
+        &mut InboxReturnTracker::default(),
+    );
+    assert_eq!(labels(&model), ["<PinnedHeader>", "Pinned:pinned", "<PinnedDivider>", "Active:active", "[Settled 1]", "<SettledPlaceholder>"]);
+    let items = model.drop_items();
+    let active = super::drag::position_of(&items, "active").unwrap();
+    let settle_slot = model.drop_slot(5, false).unwrap();
+    assert_eq!(super::drag::resolve_drop_target_at_slot(&items, active, settle_slot).map(|target| target.section), Some(Section::Settled));
+    let pin_slot = model.drop_slot(1, false).unwrap();
+    assert_eq!(super::drag::resolve_drop_target_at_slot(&items, active, pin_slot).map(|target| target.pinned_order), Some(vec!["active".to_owned(), "pinned".to_owned()]));
 }
 
 #[test]

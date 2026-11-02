@@ -154,6 +154,11 @@ impl Render for Workspace {
             .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
             }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.state.update(cx, |state, cx| state.clear_thread_selection(cx)) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &JumpToThread1, _, cx| this.jump(0, cx)))
             .on_action(cx.listener(|this, _: &JumpToThread2, _, cx| this.jump(1, cx)))
             .on_action(cx.listener(|this, _: &JumpToThread3, _, cx| this.jump(2, cx)))

@@ -22,7 +22,8 @@ enum Mode {
 
 pub struct SnoozeDialog {
     state: Entity<AppState>,
-    thread_id: Option<String>,
+    /// The threads the dialog snoozes; empty while closed.
+    thread_ids: Vec<String>,
     mode: Mode,
     unit: DurationUnit,
     date: Entity<InputState>,
@@ -56,15 +57,15 @@ impl SnoozeDialog {
                 })
             })
             .collect();
-        SnoozeDialog { state, thread_id: None, mode: Mode::Date, unit: DurationUnit::Hours, date, time, amount, error: None, _subscriptions: subscriptions }
+        SnoozeDialog { state, thread_ids: Vec::new(), mode: Mode::Date, unit: DurationUnit::Hours, date, time, amount, error: None, _subscriptions: subscriptions }
     }
 
-    pub fn open(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open(&mut self, thread_ids: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let (date, time) = local_snooze_fields(now_ms() + HOUR_MS, &SystemZone);
         self.date.update(cx, |input, cx| input.set_value(date, window, cx));
         self.time.update(cx, |input, cx| input.set_value(time, window, cx));
         self.amount.update(cx, |input, cx| input.set_value("2", window, cx));
-        self.thread_id = Some(thread_id.to_owned());
+        self.thread_ids = thread_ids;
         self.mode = Mode::Date;
         self.unit = DurationUnit::Hours;
         self.error = None;
@@ -73,12 +74,14 @@ impl SnoozeDialog {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
-        self.thread_id = None;
+        self.thread_ids.clear();
         cx.notify();
     }
 
     fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.thread_id.clone() else { return };
+        if self.thread_ids.is_empty() {
+            return;
+        }
         let (date, time, amount) = (self.date.read(cx).value(), self.time.read(cx).value(), self.amount.read(cx).value());
         let input = match self.mode {
             Mode::Date => CustomSnoozeInput::Date { date: date.as_ref(), time: time.as_ref() },
@@ -88,8 +91,13 @@ impl SnoozeDialog {
             self.error = Some(if self.mode == Mode::Date { "Choose a valid date and time in the future." } else { "Enter a positive duration." });
             return cx.notify();
         };
-        self.close(cx);
-        self.state.update(cx, |state, cx| state.snooze_thread(&thread_id, until, cx));
+        let thread_ids = std::mem::take(&mut self.thread_ids);
+        cx.notify();
+        self.state.update(cx, |state, cx| {
+            for thread_id in &thread_ids {
+                state.snooze_thread(thread_id, until, cx);
+            }
+        });
     }
 
     /// A segmented toggle group (design-system §6.7).
@@ -144,7 +152,7 @@ impl SnoozeDialog {
 
 impl Render for SnoozeDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.thread_id.is_none() {
+        if self.thread_ids.is_empty() {
             return div().into_any_element();
         }
         let p = palette(cx);

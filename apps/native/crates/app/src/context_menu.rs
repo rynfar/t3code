@@ -6,6 +6,7 @@ use gpui::{
     AnyElement, App, BoxShadow, Context, MouseButton, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
     ParentElement, Pixels, Point, Render, SharedString, Styled, Window, anchored, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
+use t3_core::sidebar::selection::{BulkAction, build_bulk_menu};
 use t3_core::sidebar::settled::{self, SnoozePreset};
 use t3_core::thread_actions::{Available, MenuItem, ProjectAction, Supports, ThreadAction, ThreadActionMenuState, build_menu, build_project_menu};
 
@@ -21,12 +22,14 @@ const ITEM_HEIGHT: f32 = 28.;
 pub enum MenuAction {
     Thread(ThreadAction),
     Project(ProjectAction),
+    Bulk(BulkAction),
 }
 
 pub enum ContextMenuEvent {
     Rename(String),
     Delete(String),
-    CustomSnooze(String),
+    CustomSnooze(Vec<String>),
+    BulkDelete(Vec<String>),
 }
 
 struct OpenMenu {
@@ -38,6 +41,8 @@ struct OpenMenu {
     submenu: Option<usize>,
     sub_highlighted: Option<usize>,
     presets: Vec<SnoozePreset>,
+    /// The selected threads a bulk menu acts on.
+    selection: Vec<String>,
 }
 
 pub struct ContextMenu {
@@ -85,7 +90,21 @@ impl ContextMenu {
             available: Available { new_thread_on_branch: false, custom_snooze: true, project_settings: false },
         });
         let items = items.into_iter().map(|item| item.map(&MenuAction::Thread)).collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new() });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The multi-select menu (`handleMultiSelectContextMenu`).
+    pub fn open_for_selection(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let (selection, summary) = state.bulk_selection();
+        if selection.is_empty() {
+            return;
+        }
+        let presets = state.snooze_presets();
+        let items = build_bulk_menu(&summary, &presets).into_iter().map(|item| item.map(&MenuAction::Bulk)).collect();
+        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -95,7 +114,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
-        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new() });
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -116,7 +135,7 @@ impl ContextMenu {
                 children: Vec::new(),
             })
             .collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -135,7 +154,13 @@ impl ContextMenu {
         match action {
             MenuAction::Thread(ThreadAction::Rename) => cx.emit(ContextMenuEvent::Rename(open.target_id)),
             MenuAction::Thread(ThreadAction::Delete) => cx.emit(ContextMenuEvent::Delete(open.target_id)),
-            MenuAction::Thread(ThreadAction::SnoozeCustom) => cx.emit(ContextMenuEvent::CustomSnooze(open.target_id)),
+            MenuAction::Thread(ThreadAction::SnoozeCustom) => cx.emit(ContextMenuEvent::CustomSnooze(vec![open.target_id])),
+            MenuAction::Bulk(BulkAction::Delete) => cx.emit(ContextMenuEvent::BulkDelete(open.selection)),
+            MenuAction::Bulk(BulkAction::SnoozeCustom) => {
+                self.state.update(cx, |state, cx| state.clear_thread_selection(cx));
+                cx.emit(ContextMenuEvent::CustomSnooze(open.selection));
+            }
+            MenuAction::Bulk(action) => self.state.update(cx, |state, cx| state.run_bulk_action(&open.selection, action, &open.presets, cx)),
             MenuAction::Thread(action) => self.state.update(cx, |state, cx| state.run_thread_action(&open.target_id, action, &open.presets, cx)),
             MenuAction::Project(action) => self.state.update(cx, |state, cx| match action {
                 ProjectAction::NewThread => state.start_draft(&open.target_id, cx),
@@ -166,8 +191,14 @@ impl ContextMenu {
         let key = event.keystroke.key.as_str();
         let in_submenu = open.submenu.is_some();
         match key {
-            "escape" if in_submenu => open.submenu = None,
-            "escape" => return self.close(cx),
+            "escape" if in_submenu => {
+                cx.stop_propagation();
+                open.submenu = None;
+            }
+            "escape" => {
+                cx.stop_propagation();
+                return self.close(cx);
+            }
             "down" | "up" => {
                 if let Some(parent) = open.submenu {
                     let enabled = Self::enabled(&open.items[parent].children);

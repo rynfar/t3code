@@ -1,5 +1,5 @@
 //! Headless check of the sidebar's thread actions against a live server: pins a thread, waits
-//! for the shell to carry `pinnedAt`, unpins it, then settles and un-settles it, printing the
+//! for the shell to carry `pinnedAt`, reorders the pin and the Active order, unpins it, then settles and un-settles it, printing the
 //! sidebar section the thread lands in after each step.
 //!
 //!   cargo run -p t3-client --example thread_actions -- [--thread <thread-id>]
@@ -28,6 +28,7 @@ fn section(shell: &ShellState, thread_id: &str) -> Option<Section> {
         selected_thread_id: Some(thread_id),
         project_scope: None,
         connected: true,
+        dragging: None,
         now: now(),
     };
     SidebarModel::build(&input, &mut Default::default()).section_of(thread_id)
@@ -92,10 +93,20 @@ async fn main() -> anyhow::Result<()> {
     println!("  shell pinnedAt={:?} -> section {:?}", shell.thread(&thread_id).and_then(|t| t.pinned_at.clone()), section(&shell, &thread_id));
     anyhow::ensure!(pinned, "pinnedAt never arrived");
 
+    // The drag-and-drop writes: move the pin to a fresh key, then an Active order key.
+    step(&client, "thread.pin.reorder", actions::reorder_pin(&id(), &thread_id, "n")).await?;
+    let reordered = wait_for(&mut events, &mut shell, &thread_id, |t| t.pin_order_key.as_deref() == Some("n")).await;
+    println!("  shell pinOrderKey={:?}", shell.thread(&thread_id).and_then(|t| t.pin_order_key.clone()));
+    anyhow::ensure!(reordered, "pin reorder never arrived");
+
     step(&client, "thread.unpin", actions::unpin(&id(), &thread_id)).await?;
     let unpinned = wait_for(&mut events, &mut shell, &thread_id, |t| t.pinned_at.is_none()).await;
     println!("  shell pinnedAt={:?} -> section {:?}", shell.thread(&thread_id).and_then(|t| t.pinned_at.clone()), section(&shell, &thread_id));
     anyhow::ensure!(unpinned, "unpin never arrived");
+    step(&client, "thread.active.reorder", actions::reorder_active(&id(), &thread_id, "m")).await?;
+    let ordered = wait_for(&mut events, &mut shell, &thread_id, |t| t.active_order_key.as_deref() == Some("m")).await;
+    println!("  shell activeOrderKey={:?}", shell.thread(&thread_id).and_then(|t| t.active_order_key.clone()));
+    anyhow::ensure!(ordered, "active reorder never arrived");
 
     let was_settled = shell.thread(&thread_id).is_some_and(|t| t.is_settled());
     if !was_settled {
