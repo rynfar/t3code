@@ -115,6 +115,22 @@ fn reopen_skips_missing_threads_and_drops_tabs_already_open() {
 }
 
 #[test]
+fn side_chat_tabs_persist_like_the_web_and_skip_deleted_chats_on_reopen() {
+    let json = r#"{ "threads": { "t": { "isOpen": true, "activeSurfaceId": "side-chat:s",
+        "surfaces": [{ "id": "side-chat:s", "kind": "side-chat", "threadId": "s" }] } } }"#;
+    let mut panels: RightPanels = serde_json::from_str(json).expect("decode");
+    assert_eq!(panels.active_surface("t"), Some(&Surface::side_chat("s")));
+    let round = serde_json::to_string(&panels).expect("encode");
+    assert!(round.contains(r#"{"id":"side-chat:s","kind":"side-chat","threadId":"s"}"#), "{round}");
+    panels.close_surface("t", "side-chat:s");
+    panels.open("t", Surface::side_chat("gone"));
+    panels.close_surface("t", "side-chat:gone");
+    // Newest first is the deleted side chat; it stays skipped and the live one comes back.
+    assert_eq!(panels.reopen_closed(|thread| thread != "gone").as_deref(), Some("t"));
+    assert_eq!(ids(&panels, "t"), ["side-chat:s"]);
+}
+
+#[test]
 fn closed_history_dedupes_and_is_bounded() {
     let mut panels = RightPanels::default();
     for round in 0..2 {

@@ -140,11 +140,22 @@ pub struct Composer {
     /// The question banner takes focus for its digit shortcuts while the prompt cannot type.
     question_focus: FocusHandle,
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
+    /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
+    pub(super) fixed: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_for(state, None, window, cx)
+    }
+
+    /// The composer of `thread_id` whatever is selected, for a side chat tab.
+    pub fn embedded(state: Entity<AppState>, thread_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_for(state, Some(thread_id), window, cx)
+    }
+
+    fn new_for(state: Entity<AppState>, fixed: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 9)
@@ -159,7 +170,7 @@ impl Composer {
                 _ => {}
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
-                if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig) {
+                if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
             }),
@@ -195,6 +206,7 @@ impl Composer {
             menu_dismissed: None,
             input_state: None,
             question_focus: cx.focus_handle(),
+            fixed,
             _subscriptions: subscriptions,
         };
         composer.refresh(true, window, cx);
@@ -207,7 +219,7 @@ impl Composer {
 
     fn read_snapshot(&self, cx: &App) -> Snapshot {
         let state = self.state.read(cx);
-        let target = match (&state.selected_thread, &state.draft_project) {
+        let target = match (self.fixed.as_ref().or(state.selected_thread.as_ref()), &state.draft_project) {
             (Some(id), _) => Some(Target::Thread(id.clone())),
             (None, Some(project)) => Some(Target::Draft(project.clone())),
             _ => None,
@@ -217,14 +229,14 @@ impl Composer {
             return Snapshot { target, project_id, ..Snapshot::default() };
         };
         let shell = state.thread_shell(thread_id);
-        let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
+        let projection = state.thread_state(thread_id).projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
         let pending_key = projection.map(PendingKey::of).unwrap_or_default();
         let pending = if pending_key == self.snapshot.pending_key {
             self.snapshot.pending.clone()
         } else {
             projection.map(requests::pending_requests).unwrap_or_default()
         };
-        let running = state.is_selected_thread_running();
+        let running = state.is_thread_running(thread_id);
         Snapshot {
             project_id: shell.map(|thread| thread.project_id.clone()),
             running,

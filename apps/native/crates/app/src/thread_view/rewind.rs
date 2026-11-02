@@ -58,7 +58,7 @@ impl ThreadView {
             return;
         }
         let state = self.state.read(cx);
-        let Some(projection) = state.thread.projection.as_ref() else {
+        let Some(projection) = self.thread_state(state).projection.as_ref() else {
             self.rewind.counts.clear();
             return;
         };
@@ -76,7 +76,7 @@ impl ThreadView {
         let input = RevertInput {
             entries: self.entries_cache.entries(),
             checkpoints: &projection.checkpoints,
-            thread_start_ready: !state.thread.history.has_more_history && find_revert_checkpoint(&projection.checkpoints, 0).is_some(),
+            thread_start_ready: !self.thread_state(state).history.has_more_history && find_revert_checkpoint(&projection.checkpoints, 0).is_some(),
             available: &available,
             unsettled_run_id: unsettled.as_deref(),
             inherited: &inherited,
@@ -122,7 +122,7 @@ impl ThreadView {
             return;
         }
         let state = self.state.read(cx);
-        let Some(projection) = state.thread.projection.as_ref() else { return };
+        let Some(projection) = self.thread_state(state).projection.as_ref() else { return };
         let Some(checkpoint) = find_revert_checkpoint(&projection.checkpoints, turn_count) else {
             self.show_local_error(REWIND_FAILED.to_owned(), cx);
             return;
@@ -172,7 +172,7 @@ impl ThreadView {
     pub(super) fn check_rewind(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self.rewind.active.as_ref() else { return };
         let state = self.state.read(cx);
-        let Some(projection) = state.thread.projection.as_ref().filter(|projection| projection.thread.id == active.watch.thread_id) else { return };
+        let Some(projection) = self.thread_state(state).projection.as_ref().filter(|projection| projection.thread.id == active.watch.thread_id) else { return };
         match rewind_progress(&active.watch, projection) {
             RewindProgress::Failed(message) => {
                 self.rewind.active = None;

@@ -47,6 +47,8 @@ pub enum AppEvent {
     SidebarSelection,
     /// A prompt is waiting for the composer (`take_composer_restore`).
     ComposerRestore,
+    /// A side subscription (side chat tab, child approval) changed, or an action on one did.
+    SideThread,
 }
 
 pub struct AppState {
@@ -69,6 +71,7 @@ pub struct AppState {
     /// Rows the shell leaves to on-demand reads: older settled pages and thread families.
     pub(crate) omitted: crate::omitted_rows::OmittedRows,
     pub(crate) notifications: crate::notifications::NotificationCenter,
+    pub(crate) side_threads: crate::side_chat::SideThreads,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
     /// A prompt handed back to the composer for a thread, as "Edit from here" restores one.
@@ -101,6 +104,7 @@ impl AppState {
             restore_thread: store::load_last_thread(),
             omitted: Default::default(),
             notifications: Default::default(),
+            side_threads: Default::default(),
             select_when_listed: None,
             composer_restore: None,
             client: None,
@@ -178,6 +182,7 @@ impl AppState {
         let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut config_changed) = (false, false, false, false);
         // A resubscribed shell is live again at its completion marker, even with nothing new.
         let mut resynchronized = false;
+        let mut side_changed = false;
         for event in batch {
             match event {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => {
@@ -197,6 +202,8 @@ impl AppState {
                 ClientEvent::Thread { thread_id, item } => {
                     if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
                         thread_changed |= self.thread.apply(*item);
+                    } else {
+                        side_changed |= self.apply_side_thread(&thread_id, *item);
                     }
                 }
                 ClientEvent::ServerConfig(event) => config_changed |= self.server_config.apply(*event),
@@ -205,12 +212,16 @@ impl AppState {
                 }
             }
         }
+        if side_changed {
+            cx.emit(AppEvent::SideThread);
+        }
         if shell_changed || resynchronized {
             // Transitions a disconnect held back are compared once the shell is live again.
             self.observe_notifications(cx);
         }
         if shell_changed {
             self.sync_omitted_rows(cx);
+            self.sync_side_threads(cx);
             if sidebar_changed {
                 self.rebuild_sidebar(cx);
             }
@@ -250,6 +261,7 @@ impl AppState {
         }
         self.release_families(None);
         self.thread = ThreadState::default();
+        self.sync_side_threads(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
     }
@@ -277,6 +289,7 @@ impl AppState {
         }
         self.selected_thread = Some(thread_id.to_owned());
         self.thread = ThreadState::default();
+        self.adopt_side_thread(thread_id);
         self.restore_thread = None;
         store::save_last_thread(thread_id);
         self.sidebar.history.visit(thread_id);
@@ -286,6 +299,7 @@ impl AppState {
         // An idle subagent or older settled thread opens from its family when the shell omits it.
         self.release_families(Some(thread_id));
         self.mount_selected_family(cx);
+        self.sync_side_threads(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
@@ -363,6 +377,7 @@ impl AppState {
         self.thread = ThreadState::default();
         self.restore_thread = None;
         self.draft_project = Some(project_id.to_owned());
+        self.sync_side_threads(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
@@ -373,6 +388,7 @@ impl AppState {
             client.close_thread(&previous);
         }
         self.thread = ThreadState::default();
+        self.sync_side_threads(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
@@ -437,8 +453,14 @@ impl AppState {
     /// or the settled run that left background work running.
     pub fn stop_selected_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread.clone() else { return };
+        self.stop_thread(&thread_id, cx);
+    }
+
+    /// `stop_selected_thread` for any thread with a loaded detail, such as a side chat.
+    pub fn stop_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let thread_id = thread_id.to_owned();
         let thread_stop = self.server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.thread_stop == Some(true));
-        let projection = self.thread.projection.as_ref().filter(|projection| projection.thread.id == thread_id);
+        let projection = self.thread_state(&thread_id).projection.as_ref().filter(|projection| projection.thread.id == thread_id);
         let command = match workflows::stop_target(projection, thread_stop) {
             StopTarget::Thread => commands::stop_thread(&uuid_v4(), &thread_id),
             StopTarget::Run(run_id) => commands::interrupt_run(&uuid_v4(), &thread_id, &run_id),

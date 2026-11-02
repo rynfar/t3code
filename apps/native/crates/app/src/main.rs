@@ -23,9 +23,11 @@ mod pull_requests;
 mod quit_hold;
 mod right_panel;
 mod settings;
+mod side_chat;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 mod sidebar;
+mod lineage;
 mod snooze_dialog;
 mod terminal;
 mod theme;

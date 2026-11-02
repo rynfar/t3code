@@ -59,6 +59,8 @@ pub struct AppThread {
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub lineage: Lineage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<Value>,
     #[serde(default)]
     pub active_provider_thread_id: Option<String>,
     /// `native`, or `v1_import` for threads migrated from the first orchestration engine.
@@ -102,6 +104,8 @@ pub struct Run {
     pub active_attempt_id: Option<String>,
     #[serde(default)]
     pub queue_held: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_preparation: Option<Value>,
 }
 
 impl Run {

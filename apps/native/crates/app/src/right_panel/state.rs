@@ -77,6 +77,7 @@ impl AppState {
     }
 
     pub(crate) fn save_panels(&mut self, cx: &mut Context<Self>) {
+        self.sync_side_threads(cx);
         cx.emit(AppEvent::RightPanel);
         store::save_ui_state(STORE, &self.panels);
     }
@@ -84,7 +85,11 @@ impl AppState {
     pub(crate) fn mutate_panels(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PanelState, &str) -> bool) {
         let Some(thread_id) = self.panel_thread() else { return };
         let diff_was_visible = self.panels.diff_visible(&thread_id);
+        let before = self.panels.panels.panel(&thread_id).surfaces.clone();
         if change(&mut self.panels, &thread_id) {
+            let after = &self.panels.panels.panel(&thread_id).surfaces;
+            let closed: Vec<Surface> = before.into_iter().filter(|surface| !after.contains(surface)).collect();
+            self.discard_closed_side_chats(&closed, cx);
             self.finish_panel_change(&thread_id, diff_was_visible, cx);
         } else {
             self.panels.explicit_diff_open = None;

@@ -89,7 +89,7 @@ impl ThreadView {
     fn sync_banners(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let mut next = BannerLines::default();
-        if let (Some(projection), Some(thread_id)) = (state.thread.projection.as_ref(), self.thread_id.as_deref()) {
+        if let (Some(projection), Some(thread_id)) = (self.thread_state(state).projection.as_ref(), self.thread_id.as_deref()) {
             let thread = &projection.thread;
             let local = self.local_error.clone().map(|message| ThreadError { message, class: None, code: None, reset_at: None, runtime_failed: false });
             next.error = local
@@ -117,7 +117,7 @@ impl ThreadView {
     /// Recomputes the footer lines; splices the footer item in or out when it appears or goes.
     fn sync_footer(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let working = state.is_selected_thread_running();
+        let working = self.thread_id.as_deref().is_some_and(|id| state.is_thread_running(id));
         let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
         let background = !working && shell.is_some_and(|shell| !shell.pending_background_tasks.is_empty());
         let now = chrono::Utc::now().timestamp_millis();
@@ -127,7 +127,8 @@ impl ThreadView {
             (Some(id), Some(snapshot)) => child_inputs(&snapshot.threads, id, parent_awaiting),
             _ => None,
         };
-        let unsynced = state.thread.projection.is_some() && !state.thread.synchronized;
+        let thread = self.thread_state(state);
+        let unsynced = thread.projection.is_some() && !thread.synchronized;
         let syncing = match (unsynced, self.footer.unsynced_since) {
             (false, _) => {
                 self.footer.unsynced_since = None;
@@ -147,7 +148,7 @@ impl ThreadView {
         let state = self.state.read(cx);
         let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
         let next = FooterLines {
-            stop: state.thread.projection.as_ref().and_then(|projection| run_stop(projection, background)),
+            stop: self.thread_state(state).projection.as_ref().and_then(|projection| run_stop(projection, background)),
             children,
             background: shell.filter(|_| !working).and_then(|shell| background_work(&shell.pending_background_tasks)),
             syncing,
@@ -370,7 +371,7 @@ impl ThreadView {
         if let Some(goal) = &self.footer.lines.goal {
             let pending = self.footer.goal_pending;
             let mut buttons: Vec<AnyElement> = Vec::new();
-            if goal.can_resume && !self.state.read(cx).is_selected_thread_running() {
+            if goal.can_resume && !self.thread_id.as_deref().is_some_and(|id| self.state.read(cx).is_thread_running(id)) {
                 buttons.push(inline_button(
                     "goal-resume",
                     "Resume",
