@@ -16,6 +16,8 @@ pub const MAX_IN_FLIGHT: usize = 6;
 pub enum AssetResource {
     Attachment { attachment_id: String },
     MediaFile { thread_id: String, path: String },
+    /// An image a tool returned, by its position among the item's output images.
+    ToolOutputImage { thread_id: String, item_id: String, index: usize },
 }
 
 impl AssetResource {
@@ -23,6 +25,9 @@ impl AssetResource {
         match self {
             AssetResource::Attachment { attachment_id } => json!({ "_tag": "attachment", "attachmentId": attachment_id }),
             AssetResource::MediaFile { thread_id, path } => json!({ "_tag": "media-file", "threadId": thread_id, "path": path }),
+            AssetResource::ToolOutputImage { thread_id, item_id, index } => {
+                json!({ "_tag": "tool-output-image", "threadId": thread_id, "itemId": item_id, "index": index })
+            }
         }
     }
 

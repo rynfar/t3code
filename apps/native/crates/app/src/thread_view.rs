@@ -22,7 +22,7 @@ use t3_core::history::HistoryControl;
 use t3_core::timeline::anchor::{self, Anchor, ScrollTop, VisibleRows};
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, open_command_items, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
-    derive_rows, detail_request, detail_revision, needs_detail_fetch, fork_support, rows_equal, turn_diffs_by_message, update_entries,
+    derive_rows, detail_request, detail_revision, entry_fetches_detail, fork_support, rows_equal, turn_diffs_by_message, update_entries,
 };
 use t3_core::diff::TurnDiffSummary;
 
@@ -320,10 +320,8 @@ impl ThreadView {
     /// Fetches withheld output for an open row: once while its item runs and again when it
     /// settles (`turnItemDetailRevision`).
     fn fetch_detail(&mut self, entry: &WorkLogEntry, cx: &mut Context<Self>) {
-        let Some(item) = entry.item.clone().filter(|item| needs_detail_fetch(item)) else { return };
-        if streams_output(&item) && self.streams_command_output(cx) {
-            return;
-        }
+        let streams = self.streams_command_output(cx);
+        let Some(item) = entry.item.clone().filter(|_| entry_fetches_detail(entry, streams)) else { return };
         let revision = detail_revision(&item);
         if self.details.get(&item.id).is_some_and(|detail| detail.revision() == revision) {
             return;
@@ -332,8 +330,10 @@ impl ThreadView {
             let open = &self.ui.expanded_entries;
             self.details.retain(|id, _| open.contains(id));
         }
+        // Decoded on the network runtime: a large output never parses on the UI thread.
+        let decode = |value| decode_detail(value).map_err(|error| error.to_string());
+        let Some(request) = self.state.read(cx).request(GET_TURN_ITEM, detail_request(&item), decode) else { return };
         self.details.insert(item.id.clone(), Detail::Loading { revision: revision.clone() });
-        let request = self.state.read(cx).rpc(GET_TURN_ITEM, detail_request(&item));
         let (id, entry_id) = (item.id.clone(), entry.id.clone());
         cx.spawn(async move |this, cx| {
             let result = request.await;
@@ -341,10 +341,10 @@ impl ThreadView {
                 if view.details.get(&id).is_none_or(|detail| detail.revision() != revision) {
                     return;
                 }
-                let detail = match result.map(decode_detail) {
+                let detail = match result {
                     Ok(Ok(Some(item))) => Detail::Loaded { revision, item: Arc::new(item) },
                     Ok(Ok(None)) => Detail::Missing { revision },
-                    Ok(Err(error)) => Detail::Failed { revision, message: error.to_string() },
+                    Ok(Err(message)) => Detail::Failed { revision, message },
                     Err(error) => Detail::Failed { revision, message: error.to_string() },
                 };
                 view.details.insert(id, detail);
@@ -598,10 +598,6 @@ impl ThreadView {
     pub fn render_group_member(&mut self, entry: &Arc<WorkLogEntry>, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.with_env(|env, markdown| render_group_member(entry, env, markdown, cx))
     }
-}
-
-fn streams_output(item: &t3_core::turn_item::TurnItem) -> bool {
-    matches!(item.kind, t3_core::turn_item::TurnItemKind::CommandExecution { .. })
 }
 
 /// Returns whether `key` is now in the set.

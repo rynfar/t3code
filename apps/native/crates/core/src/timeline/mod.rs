@@ -12,6 +12,7 @@ mod changed_files;
 mod find;
 mod folds;
 mod fork;
+mod inspector;
 pub mod minimap;
 mod now;
 mod presentation;
@@ -36,7 +37,15 @@ pub use activity::{
     Attribution, LatestRun, ThreadActivity, derive_activity, plan_title, should_collapse_user_message, strip_displayed_plan_markdown,
     user_message_attribution,
 };
-pub use detail::{GET_TURN_ITEM, command_output_text, decode_detail, detail_request, detail_revision, needs_detail_fetch, open_command_items};
+pub use detail::{
+    GET_TURN_ITEM, MAX_TOOL_OUTPUT_IMAGES, ToolCallLines, command_output_text, decode_detail, detail_request, detail_revision, format_tool_value, needs_detail_fetch,
+    open_command_items, read_tool_output_image, turn_item_has_detail, turn_item_output_images, turn_item_output_text,
+};
+pub use inspector::{
+    AnswerAttachment, AnsweredQuestion, EntryBody, FetchedDetail, OUTPUT_UNAVAILABLE, OutputLine, SEARCH_RESULT, TOOL_OUTPUT_IMAGE, ToolOutput, answered_questions, entry_body,
+    entry_can_expand, entry_fetches_detail, external_web_link, fetched_turn_item, file_change_line, plain_output, questions_text, search_result_location,
+    todo_text,
+};
 pub use entries::{EntriesCache, derive_entries, item_type_name, update_entries};
 pub use presentation::{
     SummaryKind, ToolGroupAction, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args,
@@ -66,7 +75,7 @@ pub use status::{
     thread_error, timeline_thread_error,
 };
 pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, format_upcoming, parse_iso_ms};
-pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name};
+pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name, is_javascript_repl_tool, with_visible_control_characters};
 pub use user_input::{has_question_answer, question_answer_preview, question_answer_text, question_text_preview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

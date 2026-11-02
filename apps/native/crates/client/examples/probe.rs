@@ -7,6 +7,7 @@
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --history 3     # page earlier history
 //!   cargo run -p t3-client --example probe -- --config
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --command-output   # stream every command's output
+//!   cargo run -p t3-client --example probe -- --thread <thread-id> --turn-items   # fetch withheld tool output
 //!   cargo run -p t3-client --example probe -- --local   # one-click pair with T3 Code on this Mac
 //!
 //! `--local` runs `t3 pair` against the server it finds under `T3CODE_HOME`. Point both
@@ -54,6 +55,30 @@ fn new_id() -> String {
 fn spawn_dispatch(client: &ClientHandle, label: String, command: serde_json::Value) {
     let client = client.clone();
     tokio::spawn(async move { println!("{label}: {:?}", client.dispatch(command).await.map(|v| v.to_string())) });
+}
+
+/// `orchestration.getTurnItem` for an item with withheld detail, as an open tool row asks for it:
+/// sizes only, so it is safe against real data.
+async fn fetch_turn_item(client: &ClientHandle, item: &t3_core::turn_item::TurnItem) -> String {
+    use t3_core::timeline::{GET_TURN_ITEM, ToolCallLines, decode_detail, detail_request, turn_item_output_images, turn_item_output_text};
+    let request = detail_request(item);
+    let name = t3_core::timeline::item_type_name(&item.kind);
+    let prefix = format!("turn-item {} ({name}, revision {})", item.id, request["revision"].as_str().unwrap_or_default());
+    match client.request(GET_TURN_ITEM, request).await.map_err(|error| error.to_string()).and_then(|value| decode_detail(value).map_err(|error| error.to_string())) {
+        Ok(Some(fetched)) => {
+            let args = match &fetched.kind {
+                t3_core::turn_item::TurnItemKind::DynamicTool { input, .. } => {
+                    let lines = ToolCallLines::args(input);
+                    format!(" args={} args_text_chars={}", lines.args.map_or(0, |args| args.len()), lines.args_text.map_or(0, |text| text.chars().count()))
+                }
+                _ => String::new(),
+            };
+            let output = turn_item_output_text(&fetched).map_or(0, |text| text.chars().count());
+            format!("{prefix}: loaded output_chars={output} images={}{args}", turn_item_output_images(&fetched).len())
+        }
+        Ok(None) => format!("{prefix}: {}", t3_core::timeline::OUTPUT_UNAVAILABLE),
+        Err(error) => format!("{prefix}: Couldn't load output: {error}"),
+    }
 }
 
 #[tokio::main]
@@ -251,6 +276,15 @@ async fn main() -> anyhow::Result<()> {
                                 println!("command-output {id}: stream ended");
                             });
                             command_outputs.insert(item.id.clone(), stream);
+                        }
+                    }
+                    if has("--turn-items") {
+                        for item in projection.turn_items.iter().filter(|item| t3_core::timeline::needs_detail_fetch(item)) {
+                            if !seen.insert(format!("turn-item:{}", item.id)) {
+                                continue;
+                            }
+                            let (client, item) = (client.clone(), item.clone());
+                            tokio::spawn(async move { println!("{}", fetch_turn_item(&client, &item).await) });
                         }
                     }
                     let pending = requests::pending_requests(projection);

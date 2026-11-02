@@ -6,7 +6,7 @@ mod decode;
 mod viewer;
 
 use gpui::{App, AppContext, Entity, EntityId, Global, WeakEntity};
-use t3_core::media::MediaSource;
+use t3_core::media::{AssetResource, MediaSource};
 
 pub use cache::{ImageState, MediaCache, Variant};
 pub use viewer::{MediaViewer, ViewerItem};
@@ -61,4 +61,11 @@ pub fn image(source: &MediaSource, variant: Variant, owner: EntityId, cx: &mut A
 
 pub fn dimensions(source: &MediaSource, cx: &App) -> Option<(u32, u32)> {
     cx.try_global::<Media>()?.cache.read(cx).dimensions(source, cx)
+}
+
+/// Opens an asset in the browser by its signed URL.
+pub fn open_asset(resource: &AssetResource, cx: &mut App) {
+    if let Some(cache) = cx.try_global::<Media>().map(|media| media.cache.clone()) {
+        cache.update(cx, |cache, cx| cache.open(resource, cx));
+    }
 }

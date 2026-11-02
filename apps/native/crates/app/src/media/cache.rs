@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Entity, EntityId, RenderImage, SharedString, Task, Window};
-use t3_core::media::MediaSource;
+use t3_core::media::{AssetResource, CREATE_ASSET_URL, MediaSource, decode_asset_url};
 
 use crate::app_state::AppState;
 
@@ -135,6 +135,21 @@ impl MediaCache {
         if let Some(key) = self.key(source, cx) {
             self.pinned.insert((key, variant));
         }
+    }
+
+    /// Opens `resource` by its signed URL in the browser, as the web's links to an asset do.
+    pub fn open(&self, resource: &AssetResource, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(environment) = state.environment().map(str::to_owned) else { return };
+        let Some(minted) = state.request(CREATE_ASSET_URL, resource.create_url_request(), |value| decode_asset_url(&value)) else { return };
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(asset)) = minted.await
+                && let Some(url) = t3_client::asset::asset_url(&environment, &asset.relative_url)
+            {
+                cx.update(|cx| cx.open_url(url.as_str()));
+            }
+        })
+        .detach();
     }
 
     pub fn unpin_all(&mut self) {
