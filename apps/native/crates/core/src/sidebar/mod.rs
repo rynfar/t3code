@@ -10,6 +10,7 @@ pub mod sort;
 pub mod status;
 pub mod thread;
 pub mod time;
+pub mod visits;
 
 #[cfg(test)]
 mod tests;
@@ -358,4 +359,39 @@ pub fn splice_range<T: PartialEq>(old: &[T], new: &[T]) -> Option<(Range<usize>,
     let max_suffix = old.len().min(new.len()) - prefix;
     let suffix = old.iter().rev().zip(new.iter().rev()).take(max_suffix).take_while(|(a, b)| a == b).count();
     Some((prefix..old.len() - suffix, new.len() - prefix - suffix))
+}
+
+/// `searchSidebarThreads`' local half: title, branch and project matches ranked as the palette
+/// ranks them, without picks.
+pub fn search_titles(model: &SidebarModel, query: &str, now: Ms) -> Vec<String> {
+    use crate::search::{ThreadSearchOptions, ThreadSearchSubject, fold_search_query, rank_search_items, score_thread_search};
+    let normalized = fold_search_query(query);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let subjects: Vec<(usize, ThreadSearchSubject)> = model
+        .threads
+        .iter()
+        .enumerate()
+        .map(|(index, thread)| {
+            let activity_at = match thread.latest_user_authored_message_at {
+                None => sort::thread_sort_timestamp(thread, sort::ThreadSortOrder::UpdatedAt),
+                Some(authored) => authored.or(thread.created_at),
+            };
+            let subject = ThreadSearchSubject {
+                id: Some(thread.id.clone()),
+                title: thread.title.clone(),
+                branch: thread.branch.clone(),
+                project_title: model.project_names.get(&thread.project_id).cloned(),
+                activity_at,
+                opens: thread.opens.clone(),
+                ..Default::default()
+            };
+            (index, subject)
+        })
+        .collect();
+    rank_search_items(&subjects, |(_, subject), typos| score_thread_search(&normalized, subject, now, ThreadSearchOptions { typos, picks: false }))
+        .into_iter()
+        .map(|ranked| model.threads[ranked.item.0].id.clone())
+        .collect()
 }

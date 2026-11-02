@@ -40,7 +40,7 @@ pub enum SettledOverride {
     Active,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SidebarThread {
     pub id: String,
     pub project_id: String,
@@ -78,6 +78,7 @@ pub struct SidebarThread {
     pub auto_settle_disabled: bool,
     pub last_visited_at: Option<Ms>,
     pub regenerating_title: bool,
+    pub opens: Option<crate::search::ThreadOpenStats>,
 }
 
 impl SidebarThread {
@@ -178,6 +179,7 @@ pub fn present_thread(thread: &ThreadShell, pending_subagent_request: Option<Sub
         auto_settle_disabled: thread.auto_settle_disabled_at.is_some(),
         last_visited_at: parse_opt(thread.last_visited_at.as_deref()),
         regenerating_title: thread.title_regeneration.as_ref().is_some_and(|value| !value.is_null()),
+        opens: thread.opens.clone().and_then(|opens| serde_json::from_value(opens).ok()),
     }
 }
 

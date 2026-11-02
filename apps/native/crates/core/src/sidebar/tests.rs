@@ -57,6 +57,7 @@ fn base(id: &str) -> SidebarThread {
         auto_settle_disabled: false,
         last_visited_at: None,
         regenerating_title: false,
+        opens: None,
     }
 }
 
@@ -607,4 +608,16 @@ fn splice_range_finds_the_smallest_change() {
     assert_eq!(splice_range(&[1, 2, 3], &[1, 2, 3, 4]), Some((3..3, 1)));
     assert_eq!(splice_range(&[1, 2, 3], &[3]), Some((0..2, 0)));
     assert_eq!(splice_range::<i32>(&[], &[1]), Some((0..0, 1)));
+}
+
+#[test]
+fn search_ranks_title_matches_before_branch_matches() {
+    let snapshot = snapshot(vec![
+        wire_thread("a", json!({"title": "Polish the sidebar", "branch": "feature/menu"})),
+        wire_thread("b", json!({"title": "Fix menu bug"})),
+        wire_thread("c", json!({"title": "Unrelated"})),
+    ]);
+    let model = build(&snapshot, &ShelfState::default(), None);
+    assert_eq!(search_titles(&model, "menu", iso(NOW)), ["b", "a"]);
+    assert!(search_titles(&model, "  ", iso(NOW)).is_empty());
 }

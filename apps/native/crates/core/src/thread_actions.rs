@@ -199,6 +199,19 @@ pub struct ThreadActionMenuState<'a> {
     pub is_running: bool,
     pub supports: Supports,
     pub snooze_presets: &'a [SnoozePreset],
+    /// Surfaces this client has yet to build stay out of the menu instead of doing nothing.
+    pub available: Available,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Available {
+    pub new_thread_on_branch: bool,
+    pub custom_snooze: bool,
+    pub project_settings: bool,
+}
+
+impl Available {
+    pub const ALL: Available = Available { new_thread_on_branch: true, custom_snooze: true, project_settings: true };
 }
 
 /// `buildThreadActionMenuItems`, without guest sharing and project promotion.
@@ -208,7 +221,7 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
     if state.can_find {
         items.push(MenuItem::new(A::Find, "Find in thread", Some("text-search")));
     }
-    if let Some(branch) = state.branch {
+    if let Some(branch) = state.branch.filter(|_| state.available.new_thread_on_branch) {
         items.push(MenuItem::new(A::NewThreadOnBranch, format!("New thread on {branch}"), Some("message-square-plus")));
     }
     if state.supports.pinning {
@@ -235,8 +248,10 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
                 .iter()
                 .map(|preset| MenuItem::new(A::SnoozePreset(preset.id.clone()), format!("{} ({})", preset.label, preset.when_label), None))
                 .collect();
-            let custom = MenuItem::new(A::SnoozeCustom, "Custom…", None);
-            snooze.children.push(if state.snooze_presets.is_empty() { custom } else { custom.separated() });
+            if state.available.custom_snooze {
+                let custom = MenuItem::new(A::SnoozeCustom, "Custom…", None);
+                snooze.children.push(if state.snooze_presets.is_empty() { custom } else { custom.separated() });
+            }
             items.push(snooze);
         }
     }
@@ -266,7 +281,9 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
     copy.children.push(MenuItem::new(A::CopyThread, "Thread", Some("message-square")));
     copy.children.push(MenuItem::new(A::CopyThreadId, "Thread ID", Some("hash")));
     items.push(copy);
-    items.push(MenuItem::new(A::ProjectSettings, "Project settings", Some("settings")));
+    if state.available.project_settings {
+        items.push(MenuItem::new(A::ProjectSettings, "Project settings", Some("settings")));
+    }
     items.push(MenuItem::new(A::Archive, "Archive thread", Some("archive")).disabled(state.is_running).separated());
     items.push(MenuItem { destructive: true, ..MenuItem::new(A::Delete, "Delete", Some("trash")) });
     if state.can_operate {
@@ -540,6 +557,7 @@ mod tests {
             is_running: false,
             supports: supports(),
             snooze_presets: presets,
+            available: Available::ALL,
         }
     }
 
