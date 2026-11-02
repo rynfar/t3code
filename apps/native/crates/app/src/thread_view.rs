@@ -1,10 +1,12 @@
 //! Transcript view: `t3_core::timeline` turns the projection into rows, a bottom-aligned
 //! `list()` renders them so streaming keeps the tail pinned. Rows are shared and keep their
 //! identity across updates, so only rows whose pointer changed are spliced and remeasured.
-//! Item 0 is the "Load earlier turns" control while there is history to load.
+//! Item 0 is the "Load earlier turns" control while there is history to load. A change keeps the
+//! first row in view where it was (`t3_core::timeline::anchor`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 mod find;
@@ -15,8 +17,9 @@ mod status;
 
 pub use limit_recovery::LimitRecoveryBanner;
 
-use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Window, actions, div, list, prelude::*, px};
+use gpui::{Bounds, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render, Styled, Subscription, Window, actions, canvas, div, list, point, prelude::*, px, size};
 use t3_core::history::HistoryControl;
+use t3_core::timeline::anchor::{self, Anchor, ScrollTop, VisibleRows};
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, open_command_items, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
     derive_rows, detail_request, detail_revision, needs_detail_fetch, fork_support, rows_equal, turn_diffs_by_message, update_entries,
@@ -50,6 +53,9 @@ pub struct ThreadView {
     /// `commandOutputStreaming`, as of the last sync.
     streams_output: bool,
     group_lists: RefCell<HashMap<String, ListState>>,
+    /// A row whose top must sit this far below the viewport's top; its next prepaint asks the
+    /// list to scroll up into the rows above it, which only then have heights.
+    anchor_gap: Rc<RefCell<Option<(String, f32)>>>,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
     minimap: minimap::MinimapUi,
@@ -114,6 +120,7 @@ impl ThreadView {
             command_outputs: HashMap::new(),
             streams_output: false,
             group_lists: RefCell::new(HashMap::new()),
+            anchor_gap: Rc::default(),
             working_timer: None,
             find: None,
             minimap: minimap::MinimapUi::default(),
@@ -168,6 +175,7 @@ impl ThreadView {
             self.turn_diffs.clear();
             self.turn_diff_source = None;
             self.reset_rewind();
+            self.anchor_gap.borrow_mut().take();
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -185,8 +193,10 @@ impl ThreadView {
                 self.activity = ThreadActivity::default();
             }
         }
+        let visible = self.visible_rows();
         self.sync_history(cx);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
         self.sync_revert_counts(cx);
         self.check_rewind(cx);
         self.sync_turn_diffs(cx);
@@ -219,6 +229,43 @@ impl ThreadView {
     }
 
     fn rederive(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_rows();
+        self.rederive_rows(cx);
+        self.keep_place(visible);
+    }
+
+    /// The rows in view and where they sit, before a change. A gap not yet scrolled into still
+    /// counts: that row sits below the viewport's top.
+    fn visible_rows(&self) -> Option<VisibleRows> {
+        let top = self.list.logical_scroll_top();
+        let row = top.item_ix.checked_sub(self.header_count()).and_then(|index| self.rows.get(index));
+        let pending = self.anchor_gap.borrow().as_ref().filter(|(id, _)| row.is_some_and(|row| row.id == *id)).map_or(0., |(_, gap)| *gap);
+        let top = ScrollTop { item: top.item_ix, offset: f32::from(top.offset_in_item) - pending };
+        let viewport = f32::from(self.list.viewport_bounds().size.height);
+        anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)))
+    }
+
+    /// Puts the first row that was in view back where it was, as the web list's
+    /// `maintainVisibleContentPosition` does; the list's own splice keeps only rows below the change.
+    fn keep_place(&mut self, visible: Option<VisibleRows>) {
+        let Some(visible) = visible else { return };
+        let current = self.list.logical_scroll_top();
+        let current = ScrollTop { item: current.item_ix, offset: f32::from(current.offset_in_item) };
+        match anchor::restore(&visible, &self.rows, |row| row.id.as_str(), self.header_count(), current) {
+            Some(Anchor::At(top)) => {
+                self.anchor_gap.borrow_mut().take();
+                self.list.scroll_to(ListOffset { item_ix: top.item, offset_in_item: px(top.offset) });
+            }
+            Some(Anchor::Below { item, gap }) => {
+                self.list.scroll_to(ListOffset { item_ix: item, offset_in_item: px(0.) });
+                let row = self.rows.get(item - self.header_count()).map(|row| row.id.clone());
+                *self.anchor_gap.borrow_mut() = row.map(|row| (row, gap));
+            }
+            None => {}
+        }
+    }
+
+    fn rederive_rows(&mut self, cx: &mut Context<Self>) {
         let input = RowsInput {
             entries: self.entries_cache.entries(),
             activity: &self.activity,
@@ -628,7 +675,25 @@ impl Render for ThreadView {
                     return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx), this.gutter());
                 };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
-                lane(content, ix == 0, crate::theme::chat_max_width(cx), this.gutter())
+                let lane = lane(content, ix == 0, crate::theme::chat_max_width(cx), this.gutter());
+                if this.anchor_gap.borrow().as_ref().is_none_or(|(id, _)| *id != row.id) {
+                    return lane;
+                }
+                let gap = this.anchor_gap.clone();
+                // Scrolling up into rows above this one in the same frame, so it never shows moved.
+                let request = canvas(
+                    move |bounds, window, _| {
+                        if let Some((_, gap)) = gap.borrow_mut().take() {
+                            window.request_autoscroll(Bounds::new(point(bounds.left(), bounds.top() - px(gap)), size(bounds.size.width, px(1.))));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full();
+                div().relative().child(lane).child(request).into_any_element()
             }),
         )
         .size_full();

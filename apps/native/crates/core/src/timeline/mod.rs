@@ -4,6 +4,7 @@
 //! labelled by `packages/client-runtime/src/work-log/*`.
 
 mod activity;
+pub mod anchor;
 mod compaction;
 mod detail;
 mod entries;
