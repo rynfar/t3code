@@ -188,7 +188,14 @@ impl ShellState {
                 }
             }
             ShellStreamItem::Snapshot { snapshot, resolved_repository_identity_roots: None } => {
-                self.snapshot = Some(*snapshot);
+                let mut snapshot = *snapshot;
+                if let Some(previous) = &self.snapshot {
+                    for project in &mut snapshot.projects {
+                        let prior = previous.projects.iter().find(|p| p.id == project.id);
+                        retain_repository_identity(prior, project);
+                    }
+                }
+                self.snapshot = Some(snapshot);
                 true
             }
             ShellStreamItem::Unknown => false,
@@ -219,7 +226,9 @@ fn apply_delta(snapshot: &mut ShellSnapshot, item: ShellStreamItem) -> bool {
     snapshot.snapshot_sequence = sequence;
     match item {
         ShellStreamItem::ProjectUpdated { project, .. } => {
-            upsert(&mut snapshot.projects, *project, |p| &p.id);
+            let mut project = *project;
+            retain_repository_identity(snapshot.projects.iter().find(|p| p.id == project.id), &mut project);
+            upsert(&mut snapshot.projects, project, |p| &p.id);
         }
         ShellStreamItem::ProjectRemoved { project_id, .. } => {
             snapshot.projects.retain(|project| project.id != project_id);
@@ -244,6 +253,16 @@ fn apply_delta(snapshot: &mut ShellSnapshot, item: ShellStreamItem) -> bool {
         _ => {}
     }
     true
+}
+
+/// Enrichment is async: a project can arrive without the identity an earlier snapshot resolved for
+/// the same workspace root. Keep it so multi-environment grouping does not split.
+fn retain_repository_identity(previous: Option<&ProjectShell>, next: &mut ProjectShell) {
+    if next.repository_identity.is_none()
+        && let Some(previous) = previous.filter(|p| p.workspace_root == next.workspace_root)
+    {
+        next.repository_identity = previous.repository_identity.clone();
+    }
 }
 
 /// `mergeShellSnapshotProjects` with enrichment options: only repository identities change.
