@@ -445,17 +445,16 @@ impl Terminal {
         // Trim each write to max_chars columns so results do not depend on chunk boundaries.
         if line.len > self.max_chars {
             let mut removed = line.len - self.max_chars;
-            // The window's first line loses its start from the front of everything after it.
-            let head: Option<Vec<u16>> = (self.row == 0).then(|| line.runs.iter().flat_map(|run| run.text.iter().copied()).take(removed + 1).collect());
+            // The lost start moves the window's start on: a line this long fills the tail, so
+            // nothing above it is drawn while the offsets after it stay put.
+            let head: Vec<u16> = line.runs.iter().flat_map(|run| run.text.iter().copied()).take(removed + 1).collect();
             trim_line_start(&mut line.runs, removed);
             // Never start on a lone low surrogate.
             if line.runs.first().and_then(|run| run.text.first()).is_some_and(|&unit| is_low_surrogate(unit)) {
                 trim_line_start(&mut line.runs, 1);
                 removed += 1;
             }
-            if let Some(head) = head {
-                self.window_start += utf8_len(&head[..removed]);
-            }
+            self.window_start += utf8_len(&head[..removed]);
             line.len -= removed;
             self.dropped = true;
             self.col = self.col.saturating_sub(removed);

@@ -133,4 +133,9 @@ fn origin_counts_the_plain_bytes_the_tail_dropped() {
     state.append(&"x".repeat(40), 16);
     state.append(&"y".repeat(10), 16);
     assert_eq!((state.text.as_str(), state.origin), ("xxxxxxyyyyyyyyyy", 34));
+    // A line below another trims its start, then the line above scrolls out.
+    let mut state = TerminalOutputState::default();
+    state.append("header\nabcdefghij", 16);
+    state.append("klmnopqrst", 16);
+    assert_eq!((state.text.as_str(), state.origin), ("efghijklmnopqrst", 11));
 }

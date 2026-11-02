@@ -80,8 +80,10 @@ struct State {
     /// dismisses it, must not clear the selection it copies.
     menu: Option<Subscription>,
     scroll: Option<ScrollHandle>,
-    /// The last painted layout and drag position, for auto-scroll steps between pointer moves.
+    /// The last painted layout, the scroll offset it was painted at, and the drag position, for
+    /// drag steps between paints.
     layout: Option<TextLayout>,
+    painted_scroll: Pixels,
     pointer: Point<Pixels>,
     autoscrolling: bool,
 }
@@ -107,13 +109,21 @@ impl State {
     fn drag_to(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         self.pointer = pointer;
         let scrolled = self.scroll.as_ref().is_some_and(|scroll| autoscroll(scroll, pointer));
-        let text = self.text.clone();
-        let hit = self.layout.as_ref().map(|layout| hit_test(layout, pointer));
-        let extended = hit.is_some_and(|hit| self.selection.as_mut().is_some_and(|selection| selection.extend(&text, hit)));
-        if scrolled || extended {
+        if self.extend_to(pointer) || scrolled {
             cx.notify();
         }
         scrolled
+    }
+
+    /// Extends the selection to what is under `pointer` now, though the scroller may have moved
+    /// the text since the last paint. Returns whether the selection changed.
+    fn extend_to(&mut self, pointer: Point<Pixels>) -> bool {
+        let Some(layout) = self.layout.as_ref() else { return false };
+        let scrolled = self.scroll.as_ref().map_or(px(0.), |scroll| scroll.offset().y - self.painted_scroll);
+        let lines = layout.line_layouts();
+        let hit = Lines::new(&lines, layout).hit_scrolled(pointer, scrolled);
+        let text = self.text.clone();
+        self.selection.as_mut().is_some_and(|selection| selection.extend(&text, hit))
     }
 
     /// Keeps scrolling while the drag holds the pointer past the scroller's edge.
@@ -199,6 +209,7 @@ impl RenderOnce for SelectableText {
             menu: None,
             scroll: None,
             layout: None,
+            painted_scroll: px(0.),
             pointer: Point::default(),
             autoscrolling: false,
         });
@@ -304,6 +315,7 @@ impl Element for TextElement {
         let text_layout = self.text.layout().clone();
         let (range, dragging, selected) = self.state.update(cx, |state, _| {
             state.layout = Some(text_layout.clone());
+            state.painted_scroll = state.scroll.as_ref().map_or(px(0.), |scroll| scroll.offset().y);
             (state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()), state.dragging, state.selection.is_some())
         });
         if let Some(range) = range {
@@ -369,6 +381,8 @@ impl Element for TextElement {
             move |event: &MouseUpEvent, phase, _, cx| {
                 if phase.capture() && event.button == MouseButton::Left && state.read(cx).dragging {
                     state.update(cx, |state, cx| {
+                        // The release settles the end, even where an auto-scroll step left it behind.
+                        state.extend_to(event.position);
                         state.dragging = false;
                         cx.notify();
                     });
@@ -408,6 +422,11 @@ struct Lines<'a> {
 impl<'a> Lines<'a> {
     fn new(lines: &'a [Arc<WrappedLineLayout>], layout: &TextLayout) -> Self {
         Lines { lines, origin: layout.bounds().origin, line_height: layout.line_height() }
+    }
+
+    /// `hit` for a pointer over text the scroller moved by `scrolled` since these lines were painted.
+    fn hit_scrolled(&self, position: Point<Pixels>, scrolled: Pixels) -> Hit {
+        self.hit(point(position.x, position.y - scrolled))
     }
 
     /// Above the text is its start and below it its end; beside a row is that row's edge.
@@ -599,5 +618,14 @@ mod tests {
         assert_eq!(step(-500., 900.), None, "already at the end");
         assert_eq!(step(-100., 50.), Some(-52.), "above scrolls back up");
         assert_eq!(step(0., 50.), None, "already at the top");
+    }
+
+    #[test]
+    fn a_drag_hits_text_where_a_scroll_since_the_last_paint_moved_it() {
+        let rows: Vec<_> = (0..6).map(|n| line(&format!("row {n}"), &[])).collect();
+        let text = lines(&rows);
+        // Painted at the top, then scrolled 40px (two rows) before the pointer moved.
+        assert_eq!(text.hit_scrolled(at(10., 5.), px(-40.)).caret, 2 * 6 + 1, "the third row, drawn where the first was");
+        assert_eq!(text.hit_scrolled(at(10., 5.), px(0.)).caret, 1);
     }
 }

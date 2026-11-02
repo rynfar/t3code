@@ -361,6 +361,18 @@ mod tests {
         assert_eq!(moved.text(&texts[1].0), "ghij");
     }
 
+    /// A long line below another loses its start, and the line above it scrolls out later.
+    #[test]
+    fn a_selection_follows_a_long_line_cut_below_another() {
+        let texts = fold(&["header\nabcdefghij", "klmnopqrst"], 16);
+        assert_eq!(texts[1].0, "efghijklmnopqrst");
+        let mut selection = Selection::press(&texts[0].0, hit(at(&texts[0].0, "ghij")), Granularity::Char);
+        selection.extend(&texts[0].0, hit(texts[0].0.len()));
+        assert_eq!(selection.text(&texts[0].0), "ghij");
+        let moved = follow(&selection, &texts[0], &texts[1]).expect("`ghij` is still drawn");
+        assert_eq!(moved.text(&texts[1].0), "ghij");
+    }
+
     /// Remapping compares the selected bytes once, whatever repeats around them.
     #[test]
     fn a_redraw_under_a_selection_among_many_repeated_lines_drops_it() {
