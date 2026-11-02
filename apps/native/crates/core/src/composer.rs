@@ -92,9 +92,24 @@ pub enum SubmitIntent {
     Background,
 }
 
+/// The Enter keystroke as the prompt saw it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EnterKey {
+    /// Cmd (or Ctrl) was held.
+    pub modifier: bool,
+    /// The key is held down and the OS repeated it.
+    pub repeat: bool,
+    /// An input method is composing text, so Enter commits the composition.
+    pub composing: bool,
+}
+
 /// `composerSubmissionIntentForKey` for Enter with the default keybindings. `None` means the
-/// key inserts a newline.
-pub fn submit_intent(modifier: bool, running: bool, draft: bool, shortcut: SendShortcut, prompt: &str) -> Option<SubmitIntent> {
+/// key does not send.
+pub fn submit_intent(key: EnterKey, running: bool, draft: bool, shortcut: SendShortcut, prompt: &str) -> Option<SubmitIntent> {
+    let EnterKey { modifier, repeat, composing } = key;
+    if repeat || composing {
+        return None;
+    }
     if modifier && running {
         return Some(SubmitIntent::Alternate);
     }
@@ -167,14 +182,15 @@ pub struct DraftDefaults {
 }
 
 /// The draft defaults `useNewThreadHandler` resolves: the project's default model (project
-/// override, then the environment default), else the model the current thread runs, else the
-/// first ready provider's default; the project's default permissions; and the current thread's
-/// interaction mode.
+/// override, then the environment default), swapped for the fallback model when its quota is
+/// spent; else the model the current thread runs; else the first ready provider's default. Then
+/// the project's default permissions and the current thread's interaction mode.
 pub fn draft_defaults(
     config: Option<&ServerConfig>,
     project_id: &str,
     carry_model: Option<&ModelSelection>,
     carry_interaction: Option<InteractionMode>,
+    now_ms: i64,
 ) -> DraftDefaults {
     let overrides = config.and_then(|config| config.settings.project_settings_overrides.get(project_id));
     let configured_default = match overrides.and_then(|overrides| overrides.default_model_selection.clone()) {
@@ -182,10 +198,13 @@ pub fn draft_defaults(
         None => config.and_then(|config| config.settings.default_model_selection.clone()),
     }
     .filter(|selection| config.is_none_or(|config| providers::instance_enabled(&config.settings, Some(project_id), &selection.instance_id)));
-    let model_selection = configured_default.or_else(|| carry_model.cloned()).or_else(|| {
-        let config = config?;
-        providers::project_default_selection(&providers::entries(config, Some(project_id)))
-    });
+    let project_default = || config.and_then(|config| providers::project_default_selection(&providers::entries(config, Some(project_id))));
+    let checked = configured_default.clone().or_else(|| if carry_model.is_some() { None } else { project_default() });
+    let fallback = config
+        .map(|config| providers::with_usage_fallback(config, Some(project_id), checked, now_ms))
+        .and_then(|(selection, fell_back)| selection.filter(|_| fell_back));
+    let model_selection =
+        fallback.or(configured_default).or_else(|| carry_model.cloned()).or_else(project_default);
     let runtime_mode = overrides
         .and_then(|overrides| overrides.default_runtime_mode)
         .or_else(|| config.map(|config| config.settings.default_runtime_mode))

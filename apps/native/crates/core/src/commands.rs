@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::model::ModelSelection;
 use crate::server_config::{InteractionMode, RuntimeMode};
+use crate::workspace::Strategy;
 
 pub mod method {
     pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
@@ -16,6 +17,8 @@ pub mod method {
     pub const SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
     pub const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
     pub const LAUNCH_THREAD: &str = "orchestration.launchThread";
+    pub const PROJECTS_READ_FILE: &str = "projects.readFile";
+    pub const VCS_LIST_REFS: &str = "vcs.listRefs";
 }
 
 pub const CREATION_SOURCE: &str = "web";
@@ -256,8 +259,7 @@ pub fn dismiss_user_input(command_id: &str, thread_id: &str, request_id: &str) -
 }
 
 /// `OrchestrationV2ThreadLaunchInput` for a draft's first send, as `startThreadTurn` builds it
-/// with `bootstrap.createThread`. Threads start in the project checkout; worktree launches come
-/// with the branch toolbar (ledger CO-WORKSPACE).
+/// with `bootstrap.createThread` and, for a new worktree, `bootstrap.prepareWorktree`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchThread<'a> {
     pub command_id: &'a str,
@@ -267,6 +269,7 @@ pub struct LaunchThread<'a> {
     pub model_selection: &'a ModelSelection,
     pub runtime_mode: RuntimeMode,
     pub interaction_mode: InteractionMode,
+    pub workspace: &'a Strategy,
     pub message_id: &'a str,
     pub text: &'a str,
 }
@@ -282,7 +285,7 @@ pub fn launch_thread(launch: &LaunchThread) -> Value {
         "modelSelection": launch.model_selection,
         "runtimeMode": launch.runtime_mode,
         "interactionMode": launch.interaction_mode,
-        "workspaceStrategy": { "type": "root" },
+        "workspaceStrategy": launch.workspace.to_json(),
         "initialMessage": {
             "messageId": launch.message_id,
             "text": launch.text,

@@ -125,3 +125,43 @@ fn initials_split_on_punctuation_and_keep_inner_apostrophes() {
     assert_eq!(initials("Codex 'hub'"), "CH");
     assert_eq!(initials("  "), "");
 }
+
+#[test]
+fn exhausted_windows_follow_each_providers_pools() {
+    let provider = |driver: &str, windows: Value| -> ServerProvider {
+        serde_json::from_value(json!({"instanceId": driver, "driver": driver, "enabled": true, "installed": true, "status": "ready",
+            "models": [], "usageLimits": {"checkedAt": "2026-11-02T00:00:00Z", "windows": windows}})).unwrap()
+    };
+    let spent = |id: &str| json!({"id": id, "kind": "other", "label": id, "usedPercent": 100});
+    let now = 1_793_613_600_000;
+    let cursor = provider("cursor", json!([spent("apiPercentUsed")]));
+    assert!(exhausted_window(&cursor, now, "claude-sonnet").is_some());
+    assert!(exhausted_window(&cursor, now, "composer-1").is_none());
+    let antigravity = provider("antigravity", json!([spent("gemini-pro")]));
+    assert!(exhausted_window(&antigravity, now, "gemini-3").is_some());
+    assert!(exhausted_window(&antigravity, now, "claude-opus").is_none());
+    let opencode = provider("opencode", json!([spent("go_monthly")]));
+    assert!(exhausted_window(&opencode, now, "anthropic/claude").is_none());
+    assert!(exhausted_window(&opencode, now, "opencode-go/x").is_some());
+    let unparseable = provider("codex", json!([{"id": "w", "kind": "weekly", "label": "w", "usedPercent": 100, "resetsAt": "later"}]));
+    assert!(exhausted_window(&unparseable, now, "gpt").is_some());
+}
+
+#[test]
+fn accents_and_badges_mark_instances_apart() {
+    let config = config(
+        json!([
+            {"instanceId": "codex", "driver": "codex", "enabled": true, "installed": true, "status": "ready", "models": []},
+            {"instanceId": "codex_work", "driver": "codex", "enabled": true, "installed": true, "status": "ready", "models": [], "accentColor": " #ffcc00 "},
+            {"instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true, "installed": true, "status": "ready", "models": [], "accentColor": "red"}
+        ]),
+        json!({"providerInstances": {"codex_work": {"driver": "codex"}}}),
+    );
+    let entries = entries(&config, None);
+    assert_eq!(accent_color(entries[1].provider), Some(0xffcc00ff));
+    assert_eq!(accent_color(entries[2].provider), None);
+    assert!(accent_wants_black(0xffcc00ff));
+    assert!(!accent_wants_black(0x1b4ed8ff));
+    assert!(shows_instance_badge(&entries[0], &entries));
+    assert!(!shows_instance_badge(&entries[2], &entries));
+}

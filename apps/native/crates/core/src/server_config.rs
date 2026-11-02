@@ -48,6 +48,14 @@ impl Default for RuntimeMode {
     }
 }
 
+/// `ThreadEnvMode`: where a new thread works, the project checkout or a new worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadEnvMode {
+    Local,
+    Worktree,
+}
+
 /// `ProviderInteractionMode`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -204,6 +212,25 @@ pub struct ServerProvider {
     pub availability: Option<String>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub models: Vec<ProviderModel>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub usage_limits: Option<UsageLimits>,
+}
+
+/// `ServerProviderUsageWindow`: how much of one quota is spent and when it resets.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    pub id: String,
+    #[serde(default)]
+    pub used_percent: f64,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct UsageLimits {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub windows: Vec<UsageWindow>,
 }
 
 impl ServerProvider {
@@ -275,6 +302,10 @@ pub struct ProjectSettingsOverrides {
     pub default_model_selection: Option<Option<ModelSelection>>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub default_runtime_mode: Option<RuntimeMode>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub default_thread_env_mode: Option<ThreadEnvMode>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub new_worktrees_start_from_origin: Option<bool>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub provider_instances: HashMap<String, ProjectInstanceOverride>,
 }
@@ -292,6 +323,14 @@ pub struct ServerSettings {
     pub default_model_selection: Option<ModelSelection>,
     #[serde(default, deserialize_with = "lenient")]
     pub default_runtime_mode: RuntimeMode,
+    /// Absent means inherit: the project's `t3.json`, then local.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub default_thread_env_mode: Option<ThreadEnvMode>,
+    /// Absent means true, the contract's default.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub new_worktrees_start_from_origin: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub fallback_model_selection: Option<ModelSelection>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub project_settings_overrides: HashMap<String, ProjectSettingsOverrides>,
     #[serde(default, deserialize_with = "lenient_map")]

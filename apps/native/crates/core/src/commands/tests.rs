@@ -1,4 +1,5 @@
 use super::*;
+use crate::workspace::Strategy;
 
 fn selection() -> ModelSelection {
     ModelSelection { instance_id: "devReplay".into(), model: "showcase".into(), options: None }
@@ -49,6 +50,7 @@ fn launch_thread_matches_thread_launch_input() {
         model_selection: &selection,
         runtime_mode: RuntimeMode::ApprovalRequired,
         interaction_mode: InteractionMode::Default,
+        workspace: &Strategy::Root,
         message_id: "m1",
         text: "Fix the build",
     });
@@ -58,6 +60,20 @@ fn launch_thread_matches_thread_launch_input() {
     assert_eq!(launch["generateTitle"], true);
     assert_eq!(launch["initialMessage"], json!({ "messageId": "m1", "text": "Fix the build", "attachments": [] }));
     assert!(launch.get("reuseExistingThread").is_none());
+    let worktree = Strategy::Worktree { base_ref: "main".into(), start_from_origin: true };
+    let launch = launch_thread(&LaunchThread {
+        command_id: "c1",
+        thread_id: "t1",
+        project_id: "p1",
+        title: "t",
+        model_selection: &selection,
+        runtime_mode: RuntimeMode::FullAccess,
+        interaction_mode: InteractionMode::Default,
+        workspace: &worktree,
+        message_id: "m1",
+        text: "t",
+    });
+    assert_eq!(launch["workspaceStrategy"], json!({ "type": "worktree", "baseRef": "main", "startFromOrigin": true }));
 }
 
 #[test]
