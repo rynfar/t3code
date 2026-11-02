@@ -24,6 +24,8 @@ import type * as DedupedBodiesModule from "../../../packages/shared/src/orchestr
 import type * as TimelineModule from "../../../packages/shared/src/orchestrationV2Timeline.ts";
 import type * as ThreadStreamModule from "../../../apps/server/src/orchestration-v2/ThreadStream.ts";
 import type * as HistoryPagingModule from "../../../apps/server/src/orchestration-v2/threadHistoryPaging.ts";
+import type * as OlderSettledModule from "../../../packages/client-runtime/src/state/olderSettledThreads.ts";
+import type * as ThreadFamiliesModule from "../../../packages/client-runtime/src/state/threadFamilies.ts";
 import type * as WireProjectionModule from "../../../apps/server/src/orchestration-v2/WireProjection.ts";
 
 export const ROOT = NodePath.resolve(
@@ -69,6 +71,12 @@ export const ThreadStream = await importSource<typeof ThreadStreamModule>(
 export const HistoryPaging = await importSource<typeof HistoryPagingModule>(
   "apps/server/src/orchestration-v2/threadHistoryPaging.ts",
 );
+export const OlderSettled = await importSource<typeof OlderSettledModule>(
+  "packages/client-runtime/src/state/olderSettledThreads.ts",
+);
+export const ThreadFamilies = await importSource<typeof ThreadFamiliesModule>(
+  "packages/client-runtime/src/state/threadFamilies.ts",
+);
 export const WireProjection = await importSource<typeof WireProjectionModule>(
   "apps/server/src/orchestration-v2/WireProjection.ts",
 );
@@ -86,6 +94,7 @@ const codecs = {
   historyPage: Schema.toCodecJson(Contracts.OrchestrationV2ThreadHistoryPage),
   shellItem: Schema.toCodecJson(Contracts.OrchestrationV2ShellStreamItem),
   shellSnapshot: Schema.toCodecJson(Contracts.OrchestrationV2ShellSnapshot),
+  threadShell: Schema.toCodecJson(Contracts.OrchestrationV2ThreadShell),
 };
 
 export const toJson = (value: unknown): Json => JSON.parse(JSON.stringify(value)) as Json;
@@ -103,6 +112,9 @@ const encodeShellItemSync = Schema.encodeSync(codecs.shellItem);
 export const encodeShellItem = (value: OrchestrationV2ShellStreamItem) =>
   toJson(encodeShellItemSync(value));
 const encodeShellSnapshotSync = Schema.encodeSync(codecs.shellSnapshot);
+const encodeThreadShellSync = Schema.encodeSync(codecs.threadShell);
+export const encodeThreadShell = (value: ContractsModule.OrchestrationV2ThreadShell) =>
+  toJson(encodeThreadShellSync(value));
 export const encodeShellSnapshot = (value: OrchestrationV2ShellSnapshot) =>
   toJson(encodeShellSnapshotSync(value));
 // Decoding mutates parsed JSON (the ID table is consumed in place), so decode a copy.

@@ -3,12 +3,17 @@
 //! Rust state and compares every field the Rust types model against the TypeScript state.
 //! Regenerate with `node apps/native/conformance/generate.ts`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use t3_core::families::{FamilyRead, rows_missing_from_shell};
 use t3_core::history::{HistoryStep, decode_history_page};
-use t3_core::shell::{ShellState, ShellStreamItem};
+use t3_core::sidebar::older_settled::{
+    Cursor, OlderSettled, PageStatus, SettledPages, count_key, is_listed_settled, unloaded_count,
+};
+use t3_core::sidebar::time::{format_iso, parse_iso};
+use t3_core::shell::{ShellState, ShellStreamItem, ThreadShell};
 use t3_core::thread::{ApplyOptions, DomainEvent, ThreadProjection, ThreadState, apply_event, decode_thread_stream_item};
 
 /// One case per line.
@@ -269,4 +274,87 @@ fn shell_matches_typescript() {
         }
     }
     report.finish("shell", 40);
+}
+
+fn shells(value: &Value) -> Vec<ThreadShell> {
+    serde_json::from_value(value.clone()).expect("thread shells decode")
+}
+
+fn removals(value: &Value) -> HashMap<String, u64> {
+    list(value, "removedAt").iter().filter_map(|pair| Some((pair[0].as_str()?.to_owned(), pair[1].as_u64()?))).collect()
+}
+
+fn cursor(value: &Value) -> Option<Cursor> {
+    Some(Cursor { settled_at: parse_iso(value.get("settledAt")?.as_str()?)?, thread_id: text(value, "threadId") })
+}
+
+fn cursor_json(cursor: Option<&Cursor>) -> Value {
+    cursor.map_or(Value::Null, |cursor| serde_json::json!({"settledAt": format_iso(cursor.settled_at), "threadId": cursor.thread_id}))
+}
+
+#[test]
+fn shelf_matches_typescript() {
+    let mut report = Report::default();
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for case in fixture("shelf.jsonl") {
+        let name = text(&case, "name").unwrap_or_default();
+        let kind = text(&case, "kind").unwrap_or_default();
+        *kinds.entry(kind.clone()).or_default() += 1;
+        let before = text(&case, "before").and_then(|before| parse_iso(&before));
+        match kind.as_str() {
+            "countKey" => {
+                let key = count_key(&shells(&case["threads"]), before.expect("cut"), &removals(&case));
+                report.check(&name, key, text(&case, "expected").unwrap_or_default());
+            }
+            "listed" => {
+                for (index, check) in list(&case, "checks").iter().enumerate() {
+                    let thread: ThreadShell = serde_json::from_value(check["thread"].clone()).expect("thread decodes");
+                    let settled_at = thread.settled_at.as_deref().and_then(parse_iso);
+                    let listed = is_listed_settled(&thread.id, settled_at, cursor(&check["cursor"]).as_ref());
+                    report.check(&format!("{name} check {index}"), listed, check["expected"].as_bool() == Some(true));
+                }
+            }
+            "unloaded" => {
+                let threads = shells(&case["threads"]);
+                let rows: Vec<&ThreadShell> = threads.iter().collect();
+                let counts = list(&case, "counts").iter().filter_map(|pair| Some((pair[0].as_str()?.to_owned(), pair[1].as_u64()?))).collect();
+                let older = OlderSettled { before: text(&case, "before").unwrap_or_default(), before_ms: before.expect("cut"), counts };
+                let scope: Option<HashSet<String>> =
+                    case["projectIds"].as_array().map(|ids| ids.iter().filter_map(Value::as_str).map(str::to_owned).collect());
+                report.check(&name, unloaded_count(&older, scope.as_ref(), &rows) as u64, case["expected"].as_u64().unwrap_or(u64::MAX));
+            }
+            "shelf" => {
+                let older = text(&case, "older").and_then(|before| {
+                    Some(OlderSettled { before_ms: parse_iso(&before)?, before, counts: HashMap::new() })
+                });
+                let requested = case["requested"].as_u64().unwrap_or_default() as usize;
+                let mut pages = SettledPages::default();
+                pages.reads = vec![FamilyRead::default(); requested];
+                pages.frontier = cursor(&case["frontier"]);
+                pages.status = match text(&case, "status").as_deref() {
+                    Some("pending") => PageStatus::Pending,
+                    Some("failed") => PageStatus::Failed,
+                    _ => PageStatus::Ready,
+                };
+                pages.requested = requested;
+                report.check(&format!("{name} frontier"), cursor_json(pages.listing_frontier(older.as_ref())), case["expectedFrontier"].clone());
+                let listed = case["listedCount"].as_u64().unwrap_or_default() as usize;
+                let visible = case["visibleCount"].as_u64().unwrap_or_default() as usize;
+                pages.grow(older.as_ref(), listed, visible);
+                report.check(&format!("{name} requested"), pages.requested as u64, case["expectedRequested"].as_u64().unwrap_or(u64::MAX));
+            }
+            "rowsMissing" => {
+                let shell_threads = shells(&case["shellThreads"]);
+                let families: Vec<FamilyRead> = serde_json::from_value(case["families"].clone()).expect("families decode");
+                let missing: Vec<String> =
+                    rows_missing_from_shell(&shell_threads, &families, &removals(&case)).into_iter().map(|t| t.id.clone()).collect();
+                let expected: Vec<String> = list(&case, "expected").iter().filter_map(Value::as_str).map(str::to_owned).collect();
+                report.check(&name, missing, expected);
+            }
+            other => panic!("{name}: unknown kind {other}"),
+        }
+        report.compared += 1;
+    }
+    assert_eq!(kinds.len(), 5, "every kind has cases: {kinds:?}");
+    report.finish("shelf", 80);
 }
