@@ -90,7 +90,7 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
 
 async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, oneshot::Sender<Result<Value, RpcError>>) {
     match rx.recv().await {
-        Some(Command::Dispatch { command, reply }) => (command, reply),
+        Some(Command::Request { method: method::DISPATCH_COMMAND, payload, reply }) => (payload, reply),
         _ => panic!("expected a dispatch"),
     }
 }
@@ -116,4 +116,32 @@ async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
     let result = run.await.unwrap();
     assert!(matches!(result, Err((1, RpcError::Closed))));
     assert!(rx.try_recv().is_err(), "a command after the failure still went out");
+}
+
+#[tokio::test]
+async fn dispatches_reach_the_server_in_call_order_with_requests_and_streams() {
+    let mut server = FakeServer::start().await;
+    let (client, _events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut connection = server.connection().await;
+    answer_config(&mut connection, None).await;
+    connection.request(method::SUBSCRIBE_SHELL).await;
+
+    let dispatch = client.dispatch(json!({"type": "thread.turn.interrupt"}));
+    let request = client.request("terminal.write", json!({"data": "a"}));
+    let stream = client.stream("terminal.attach", json!({}));
+    let received = tokio::spawn(async move {
+        let mut tags = Vec::new();
+        while tags.len() < 3 {
+            let message = connection.recv().await;
+            let tag = message["tag"].as_str().unwrap_or_default().to_owned();
+            if message["_tag"] == "Request" {
+                tags.push(tag);
+            }
+        }
+        tags
+    });
+    tokio::select! {
+        tags = received => assert_eq!(tags.expect("reader"), [method::DISPATCH_COMMAND, "terminal.write", "terminal.attach"]),
+        _ = async { tokio::join!(stream, request, dispatch) } => unreachable!("the fake server never replies"),
+    }
 }

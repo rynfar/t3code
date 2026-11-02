@@ -216,7 +216,7 @@ impl AppState {
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
     ) {
         let Some(client) = self.client_handle() else { return };
-        let task = self.runtime().spawn(async move { client.dispatch(command).await });
+        let task = self.runtime().spawn(client.dispatch(command));
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or(Err(RpcError::Closed));
             let _ = this.update(cx, |state, cx| {

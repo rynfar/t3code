@@ -38,7 +38,6 @@ pub enum ClientEvent {
 enum Command {
     OpenThread(String),
     CloseThread(String),
-    Dispatch { command: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
     Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>> },
 }
@@ -64,10 +63,9 @@ impl ClientHandle {
     }
 
     /// Sends an orchestration command. Resolves with the committed sequence or the server's error.
-    pub async fn dispatch(&self, command: Value) -> Result<Value, RpcError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands.send(Command::Dispatch { command, reply }).map_err(|_| RpcError::Closed)?;
-        rx.await.unwrap_or(Err(RpcError::Closed))
+    /// Queued before this returns, in order with `request` and `stream`.
+    pub fn dispatch(&self, command: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
+        self.request(method::DISPATCH_COMMAND, command)
     }
 
     /// Fetches and decodes one page of earlier history over HTTP. Run it on the network runtime.
@@ -200,7 +198,7 @@ async fn wait_draining(delay: Duration, commands: &mut mpsc::UnboundedReceiver<C
                 None => return false,
                 Some(Command::OpenThread(id)) => { resume.threads.entry(id).or_insert(None); }
                 Some(Command::CloseThread(id)) => { resume.threads.remove(&id); }
-                Some(Command::Dispatch { reply, .. }) | Some(Command::Request { reply, .. }) => {
+                Some(Command::Request { reply, .. }) => {
                     let _ = reply.send(Err(RpcError::Closed));
                 }
                 Some(Command::Stream { reply, .. }) => {
@@ -287,12 +285,6 @@ async fn run_session(
                 Some(Command::CloseThread(thread_id)) => {
                     resume.threads.remove(&thread_id);
                     if let Some(task) = forwarders.remove(&thread_id) { task.abort(); }
-                }
-                Some(Command::Dispatch { command, reply }) => {
-                    let session = session.clone();
-                    tokio::spawn(async move {
-                        let _ = reply.send(session.request(method::DISPATCH_COMMAND, command).await);
-                    });
                 }
                 Some(Command::Request { method, payload, reply }) => {
                     let response = session.send_request(method, payload);
