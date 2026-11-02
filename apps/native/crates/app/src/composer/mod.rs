@@ -5,6 +5,7 @@
 //! way the web persists them: permissions and mode with their `thread.*.set` commands before the
 //! next turn, the model on the turn itself.
 
+mod attachments;
 pub(crate) mod controls;
 mod menu;
 mod model_picker;
@@ -34,11 +35,15 @@ use crate::sidebar::controller::now_ms;
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions]);
+actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText]);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
-    cx.bind_keys([KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input"))]);
+    cx.bind_keys([
+        KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input")),
+        // Keeps a large paste inline instead of attaching it (`isPasteAsTextShortcut`).
+        KeyBinding::new("cmd-shift-v", PasteAsText, Some("Composer > Input")),
+    ]);
     model_picker::init(cx);
 }
 
@@ -146,6 +151,8 @@ pub struct Composer {
     pub(super) fixed: Option<String>,
     /// The `@`, `/` and `$` menus.
     menu: Menu,
+    /// Staged images and files per target.
+    attachments: attachments::Attachments,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -176,6 +183,12 @@ impl Composer {
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
+                }
+                if *event == AppEvent::ComposerMention {
+                    let mentions = this.state.update(cx, |state, _| std::mem::take(&mut state.composer_mentions));
+                    for mention in mentions {
+                        this.insert_mention(&mention.path, window, cx);
+                    }
                 }
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
@@ -214,6 +227,7 @@ impl Composer {
             question_focus: cx.focus_handle(),
             fixed,
             menu: Menu::default(),
+            attachments: Default::default(),
             _subscriptions: subscriptions,
         };
         composer.refresh(true, window, cx);
@@ -294,6 +308,10 @@ impl Composer {
         self.snapshot = next;
         self.sync_answering(window, cx);
         self.sync_menu(true, cx);
+        // The provider, its skills or the compact rule may have changed under the open menu.
+        if self.menu_open() {
+            self.refresh_menu(cx);
+        }
         if self.picker_open {
             let input = self.picker_input(cx);
             self.picker.update(cx, |picker, cx| picker.update_input(input, config_changed, cx));

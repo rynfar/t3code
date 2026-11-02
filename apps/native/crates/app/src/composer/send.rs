@@ -7,9 +7,11 @@
 use gpui::{Context, Window};
 use serde_json::Value;
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
+use t3_core::composer::attachments::{self, Attachment};
+use t3_core::composer::menu::SlashCommand;
 use t3_core::composer::{self as rules, FollowUpBehavior, SubmitIntent};
 use t3_core::model::ModelSelection;
-use t3_core::server_config::ThreadEnvMode;
+use t3_core::server_config::{InteractionMode, ThreadEnvMode};
 use t3_core::traits;
 use t3_core::workspace::{self, VcsRefs};
 
@@ -17,6 +19,17 @@ use super::{Composer, Resolved, Target};
 use crate::app_state::uuid_v4;
 
 const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
+
+/// What one send carries, resolved before the prompt clears.
+struct Outgoing {
+    /// The prompt as typed, put back if the send fails.
+    prompt: String,
+    /// What the message says: the prompt, or the attachment-only prompt.
+    text: String,
+    title: String,
+    context: Option<Value>,
+    attachments: Vec<Value>,
+}
 
 impl Composer {
     /// Submit, as the send button and Enter do.
@@ -29,13 +42,44 @@ impl Composer {
             return;
         }
         let text = self.prompt(cx).trim().to_owned();
-        if text.is_empty() {
+        let staged = self.staged_attachments();
+        if text.is_empty() && staged.is_empty() {
             return;
         }
+        if let Some(reason) = attachments::send_block_reason(&staged) {
+            self.error = Some(reason);
+            cx.notify();
+            return;
+        }
+        // `/plan` or `/default` alone switches the mode instead of sending.
+        if let Some(command) = t3_core::composer::menu::parse_standalone_slash_command(&text)
+            && staged.is_empty()
+            && self.resolve(cx).plan_enabled
+        {
+            let mode = if command == SlashCommand::Plan { InteractionMode::Plan } else { InteractionMode::Default };
+            if let Some(choices) = self.choices_mut() {
+                choices.interaction_mode = Some(mode);
+            }
+            self.set_prompt("", window, cx);
+            cx.notify();
+            return;
+        }
+        let outgoing = self.outgoing(text, &staged);
         match self.snapshot.target.clone() {
-            Some(Target::Draft(project_id)) => self.launch(project_id, text, intent, window, cx),
-            Some(Target::Thread(thread_id)) => self.send(thread_id, text, intent, window, cx),
+            Some(Target::Draft(project_id)) => self.launch(project_id, outgoing, intent, window, cx),
+            Some(Target::Thread(thread_id)) => self.send(thread_id, outgoing, intent, window, cx),
             None => {}
+        }
+    }
+
+    fn outgoing(&self, prompt: String, staged: &[Attachment]) -> Outgoing {
+        let text = attachments::text_for_send(&prompt, !staged.is_empty());
+        Outgoing {
+            title: rules::thread_title_seed(&prompt, staged),
+            context: self.message_context(&prompt, staged),
+            attachments: attachments::chat_attachments(staged).unwrap_or_default(),
+            text,
+            prompt,
         }
     }
 
@@ -45,7 +89,7 @@ impl Composer {
         Some(traits::model_selection(&model.instance_id, &model.model, &resolved.dispatch_options))
     }
 
-    fn launch(&mut self, project_id: String, text: String, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+    fn launch(&mut self, project_id: String, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         let resolved = self.resolve(cx);
         let Some(selection) = Self::dispatch_selection(&resolved) else {
             self.error = Some(NO_PROVIDER.into());
@@ -64,10 +108,10 @@ impl Composer {
         });
         let start_from_origin = config.is_some_and(|config| workspace::start_from_origin(&config.settings, &project_id, ThreadEnvMode::Worktree));
         let cwd = root.clone().unwrap_or_default();
-        let context = self.message_context(&text);
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
         let refs = state.rpc(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd));
-        self.begin_send(window, cx);
+        let target = Target::Draft(project_id.clone());
+        let taken = self.begin_send(&target, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let file_mode = match (&configured, &root) {
                 (None, Some(_)) => project_file
@@ -85,20 +129,19 @@ impl Composer {
             let launch = this.update_in(cx, |this, _, cx| {
                 let strategy = strategy.map_err(str::to_owned)?;
                 let (thread_id, command_id, message_id) = (uuid_v4(), uuid_v4(), uuid_v4());
-                let title = rules::title_seed(&text);
                 let payload = commands::launch_thread(&LaunchThread {
                     command_id: &command_id,
                     thread_id: &thread_id,
                     project_id: &project_id,
-                    title: &title,
+                    title: &outgoing.title,
                     model_selection: &selection,
                     runtime_mode: resolved.runtime_mode,
                     interaction_mode: resolved.interaction_mode,
                     workspace: &strategy,
                     message_id: &message_id,
-                    text: &text,
-                    context: context.as_ref(),
-                    attachments: &[],
+                    text: &outgoing.text,
+                    context: outgoing.context.as_ref(),
+                    attachments: &outgoing.attachments,
                 });
                 Ok::<_, String>((thread_id, this.state.read(cx).rpc(method::LAUNCH_THREAD, payload)))
             });
@@ -110,12 +153,12 @@ impl Composer {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 if result.is_ok() {
-                    this.clear_mentions(&Target::Draft(project_id.clone()));
+                    this.clear_mentions(&target);
                 }
                 match result {
                     Ok(_) if intent == SubmitIntent::Background => {}
                     Ok(thread_id) => this.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx)),
-                    Err(error) => this.restore(&text, error, window, cx),
+                    Err(error) => this.restore(&target, &outgoing.prompt, taken, error, window, cx),
                 }
                 cx.notify();
             });
@@ -123,7 +166,7 @@ impl Composer {
         .detach();
     }
 
-    fn send(&mut self, thread_id: String, text: String, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+    fn send(&mut self, thread_id: String, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         let resolved = self.resolve(cx);
         let Some(selection) = Self::dispatch_selection(&resolved) else {
             self.error = Some(NO_PROVIDER.into());
@@ -136,9 +179,14 @@ impl Composer {
         let can_steer = !self.snapshot.compacting;
         let dispatch = rules::dispatch_mode(self.snapshot.running, intent == SubmitIntent::Alternate, follow_up, can_steer);
         let feedback = approvals.first().filter(|approval| approval.supports_feedback && approval.live).map(|approval| approval.request_id.clone());
+        if feedback.is_some() && (!outgoing.attachments.is_empty() || outgoing.context.is_some()) {
+            self.error = Some("Send approval feedback without attachments or added context.".to_owned());
+            cx.notify();
+            return;
+        }
         let mut steps: Vec<(Value, &'static str)> = Vec::new();
         if let Some(request_id) = &feedback {
-            let command = commands::respond_to_approval(&uuid_v4(), &thread_id, request_id, ApprovalDecision::Decline, Some(&text));
+            let command = commands::respond_to_approval(&uuid_v4(), &thread_id, request_id, ApprovalDecision::Decline, Some(&outgoing.text));
             steps.push((command, "Failed to submit approval decision."));
         } else {
             for approval in approvals.iter().filter(|approval| approval.live) {
@@ -152,31 +200,30 @@ impl Composer {
                 steps.push((commands::set_interaction_mode(&uuid_v4(), &thread_id, resolved.interaction_mode), "Failed to send message."));
             }
             let (command_id, message_id) = (uuid_v4(), uuid_v4());
-            let title = rules::title_seed(&text);
-            let context = self.message_context(&text);
             let message = ComposerMessage {
                 command_id: &command_id,
                 thread_id: &thread_id,
                 message_id: &message_id,
-                text: &text,
-                title_seed: &title,
+                text: &outgoing.text,
+                title_seed: &outgoing.title,
                 model_selection: &selection,
                 dispatch,
-                context: context.as_ref(),
-                attachments: &[],
+                context: outgoing.context.as_ref(),
+                attachments: &outgoing.attachments,
             };
             steps.push((commands::composer_message(&message), "Failed to send message."));
         }
         let failures: Vec<&'static str> = steps.iter().map(|(_, failure)| *failure).collect();
         let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(command, _)| command).collect());
-        self.begin_send(window, cx);
+        let target = Target::Thread(thread_id);
+        let taken = self.begin_send(&target, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let failure = request.await.err().map(|(index, error)| format!("{} {error}", failures.get(index).copied().unwrap_or("Failed to send message.")));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match failure {
-                    Some(error) => this.restore(&text, error, window, cx),
-                    None => this.clear_mentions(&Target::Thread(thread_id)),
+                    Some(error) => this.restore(&target, &outgoing.prompt, taken, error, window, cx),
+                    None => this.clear_mentions(&target),
                 }
                 cx.notify();
             });
@@ -184,18 +231,30 @@ impl Composer {
         .detach();
     }
 
-    fn begin_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Clears the prompt and takes the attachments, as the web clears the composer on send.
+    fn begin_send(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) -> Vec<super::attachments::Staged> {
         self.sending = true;
         self.error = None;
         self.set_prompt("", window, cx);
         cx.notify();
+        self.take_attachments(target)
     }
 
-    /// A failed send puts the text back unless the user already typed something new.
-    fn restore(&mut self, text: &str, error: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A failed send puts the text back unless the user already typed something new, and its
+    /// attachments back in front of any added since.
+    fn restore(
+        &mut self,
+        target: &Target,
+        text: &str,
+        taken: Vec<super::attachments::Staged>,
+        error: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.prompt(cx).trim().is_empty() {
             self.set_prompt(text, window, cx);
         }
+        self.restore_attachments(target, taken);
         self.error = Some(error);
     }
 

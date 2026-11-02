@@ -173,3 +173,22 @@ fn a_spent_default_falls_back_when_the_fallback_can_take_work() {
     assert_eq!(model(&config(limits(80.0, "2026-11-03T00:00:00Z"), true)), Some("luna".into()));
     assert_eq!(model(&config(limits(100.0, "2026-11-03T00:00:00Z"), false)), Some("luna".into()));
 }
+
+#[test]
+fn title_seeds_fall_back_to_attachments() {
+    use attachments::{Attachment, AttachmentKind, Upload};
+    let attached = |kind, name: &str| Attachment {
+        id: name.into(),
+        kind,
+        name: name.into(),
+        mime_type: "text/plain".into(),
+        size_bytes: 1,
+        pasted_text: false,
+        upload: Upload::Uploading,
+    };
+    assert_eq!(thread_title_seed("", &[attached(AttachmentKind::Image, "a.png")]), "Attached image");
+    assert_eq!(thread_title_seed("", &[attached(AttachmentKind::Image, "a"), attached(AttachmentKind::Image, "b")]), "Attached images");
+    assert_eq!(thread_title_seed(" ", &[attached(AttachmentKind::File, "notes  v2.md")]), "File: notes v2.md");
+    assert_eq!(thread_title_seed("Look at this", &[attached(AttachmentKind::File, "x")]), "Look at this");
+    assert_eq!(thread_title_seed("", &[]), "New thread");
+}

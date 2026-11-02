@@ -2,7 +2,7 @@
 //! (`apps/web/src/hooks/useActiveProjectTarget.ts`), the composer mention hook, and opening a
 //! file in the preferred editor (`apps/web/src/editorPreferences.ts`).
 
-use gpui::{ClipboardItem, Context};
+use gpui::Context;
 use t3_core::project_search::{OPEN_IN_EDITOR, editor_target, open_in_editor_request, preferred_editor};
 
 use crate::app_state::{AppEvent, AppState};
@@ -23,13 +23,6 @@ pub struct ComposerMention {
     pub line: Option<u64>,
 }
 
-impl ComposerMention {
-    /// The `@path` text a composer mention reads as.
-    pub fn text(&self) -> String {
-        format!("@{}", self.path)
-    }
-}
-
 impl AppState {
     /// The open thread's worktree or project root, else the new-thread draft's project.
     pub fn active_project_target(&self) -> Option<ProjectTarget> {
@@ -40,11 +33,8 @@ impl AppState {
         Some(ProjectTarget { cwd, project_name: project.title.clone() })
     }
 
-    /// Hands a file to the composer. Until a composer drains the queue, the mention text is also
-    /// put on the clipboard so it can be pasted.
+    /// Hands a file to the composer, which inserts `[name](path) ` at the end of the prompt.
     pub fn request_composer_mention(&mut self, mention: ComposerMention, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(mention.text()));
-        self.show_toast(Toast::new(ToastKind::Success, "Mention copied").description(mention.text()), cx);
         // Bounded: a composer that never drains the queue must not grow it forever.
         if self.composer_mentions.len() >= MENTION_QUEUE_LIMIT {
             self.composer_mentions.remove(0);

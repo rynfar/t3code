@@ -290,3 +290,29 @@ fn messages_carry_only_the_threads_they_still_reference() {
     }));
     assert_eq!(message_context("no links", &[kept]), None);
 }
+
+#[test]
+fn context_links_match_the_web_pattern() {
+    // Spans from the TypeScript `CONTEXT_LINK` regex.
+    let spans = |text: &str| -> Vec<(usize, usize, bool, String)> {
+        context_references(text).into_iter().map(|r| (r.start, r.end, r.image, r.label.to_owned())).collect()
+    };
+    assert_eq!(spans("a [b [c](t3-context://v1/thread/thread_1) d"), [(2, 41, false, "b [c".to_owned())]);
+    assert_eq!(
+        spans("x ![shot.png](t3-context://v1/image/image_a) and [T](t3-context://v1/thread/t2)"),
+        [(2, 44, true, "shot.png".to_owned()), (49, 79, false, "T".to_owned())]
+    );
+    assert_eq!(spans("[bad](t3-context://v1/Thread/x) [ok](t3-context://v1/file/f_1)"), [(32, 62, false, "ok".to_owned())]);
+    assert!(spans("[a]b](t3-context://v1/thread/x)").is_empty());
+    assert!(spans("[line\nbreak](t3-context://v1/thread/x)").is_empty());
+    assert!(spans("[open](t3-context://v1/thread/x").is_empty());
+}
+
+#[test]
+fn titles_read_links_as_labels() {
+    let thread = ThreadContext::new("env", "t1", "Fix login");
+    assert_eq!(title_text(&format!("compare {} now", thread.reference())), "compare Fix login now");
+    assert_eq!(title_text("![a.png](t3-context://v1/image/image_1)"), "Attached image");
+    assert_eq!(title_text("![a](t3-context://v1/image/i1) ![b](t3-context://v1/image/i2)"), "Attached images");
+    assert_eq!(title_text("  "), "");
+}

@@ -304,6 +304,9 @@ impl ServerProvider {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentCapabilities {
+    /// File attachments and the largest upload the server takes; absent when it takes none.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub file_attachments: Option<FileAttachmentsCapability>,
     #[serde(default)]
     pub thread_auto_settlement_scope: Option<bool>,
     #[serde(default)]
@@ -316,6 +319,12 @@ pub struct EnvironmentCapabilities {
     pub thread_auto_settle_opt_out: Option<bool>,
     #[serde(default)]
     pub project_organization: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAttachmentsCapability {
+    pub max_upload_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

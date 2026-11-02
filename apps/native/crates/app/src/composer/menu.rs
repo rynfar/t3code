@@ -264,7 +264,12 @@ impl Composer {
     fn compact_available(&self, trigger: &Trigger, cx: &App) -> bool {
         let Some(Target::Thread(thread_id)) = &self.snapshot.target else { return false };
         let snapshot = &self.snapshot;
-        if snapshot.running || !snapshot.loaded || !snapshot.pending.approvals.is_empty() || !snapshot.pending.user_inputs.is_empty() {
+        if snapshot.running
+            || !snapshot.loaded
+            || !snapshot.pending.approvals.is_empty()
+            || !snapshot.pending.user_inputs.is_empty()
+            || !self.staged().is_empty()
+        {
             return false;
         }
         let text = self.prompt(cx);
@@ -414,10 +419,11 @@ impl Composer {
         self.focus(window, cx);
     }
 
-    /// The thread references a send to the current target carries.
-    pub(super) fn message_context(&self, text: &str) -> Option<serde_json::Value> {
-        let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target))?;
-        rules::message_context(text, threads)
+    /// The `context` a send to the current target carries: the threads its text still links,
+    /// then its attachments.
+    pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
+        let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
+        t3_core::composer::attachments::message_context(text, threads, attachments)
     }
 
     /// Forgets a target's mentioned threads once its message went out.

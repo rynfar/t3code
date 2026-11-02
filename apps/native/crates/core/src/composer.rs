@@ -7,6 +7,7 @@
 //! `client-runtime/src/operations/threadTitle.ts`, and the draft defaults in
 //! `web/src/hooks/useHandleNewThread.ts`.
 
+pub mod attachments;
 pub mod menu;
 
 use serde::Deserialize;
@@ -191,15 +192,28 @@ pub fn interaction_mode(plan_mode_enabled: bool, provider: Option<&ServerProvide
 
 /// `deriveThreadTitleSeed` for a text-only prompt.
 pub fn title_seed(text: &str) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return "New thread".to_owned();
+    thread_title_seed(text, &[])
+}
+
+/// `deriveThreadTitleSeed`: the prompt's prose, else what is attached, truncated to 50 chars.
+pub fn thread_title_seed(text: &str, attachments: &[attachments::Attachment]) -> String {
+    let truncate = |text: &str| {
+        let characters: Vec<char> = text.trim().chars().collect();
+        if characters.len() <= 50 { characters.iter().collect() } else { format!("{}...", characters[..50].iter().collect::<String>()) }
+    };
+    let prose = menu::title_text(text);
+    if !prose.is_empty() {
+        return truncate(&prose);
     }
-    let characters: Vec<char> = normalized.chars().collect();
-    if characters.len() <= 50 {
-        return normalized;
+    let images = attachments.iter().filter(|attached| attached.kind == attachments::AttachmentKind::Image).count();
+    if images > 0 {
+        return if images == 1 { "Attached image".to_owned() } else { "Attached images".to_owned() };
     }
-    format!("{}...", characters[..50].iter().collect::<String>())
+    let name = attachments.first().map(|attached| attached.name.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    if !name.is_empty() {
+        return truncate(&format!("File: {name}"));
+    }
+    "New thread".to_owned()
 }
 
 /// What a new thread starts with before the user picks anything.

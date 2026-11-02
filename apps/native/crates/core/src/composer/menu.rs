@@ -873,33 +873,96 @@ impl ThreadContext {
     }
 }
 
+/// One inline `[label](t3-context://v1/kind/id)` link (`ComposerContextReferenceOccurrence`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextReference<'a> {
+    pub kind: &'a str,
+    pub context_id: &'a str,
+    pub label: &'a str,
+    /// Written `![label](…)`.
+    pub image: bool,
+    pub start: usize,
+    pub end: usize,
+}
+
+fn is_context_kind(kind: &str) -> bool {
+    let bytes = kind.as_bytes();
+    (1..=40).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+/// `collectComposerContextReferences`: the links `CONTEXT_LINK` matches, in order.
+pub fn context_references(text: &str) -> Vec<ContextReference<'_>> {
+    let marker = format!("]({CONTEXT_HREF_PREFIX}");
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(&marker) {
+        let close = from + offset;
+        from = close + marker.len();
+        let href_start = close + 2;
+        let rest = &text[href_start..];
+        let Some(href_len) = rest.find(|c: char| c == ')' || c.is_whitespace()) else { break };
+        let href = &rest[..href_len];
+        if !rest[href_len..].starts_with(')') || !(1..=200).contains(&href.chars().count()) {
+            continue;
+        }
+        // The leftmost `[` the regex would start at: after the last `]` or newline, label ≤ 512.
+        let floor = text[..close].rfind([']', '\n']).map_or(0, |at| at + 1);
+        let floor = floor.max(found.last().map_or(0, |previous: &ContextReference| previous.end));
+        let Some(open) = text[floor..close]
+            .match_indices('[')
+            .map(|(at, _)| floor + at)
+            .find(|open| text[open + 1..close].chars().count() <= 512)
+        else {
+            continue;
+        };
+        let label = &text[open + 1..close];
+        let Some((kind, context_id)) = href[CONTEXT_HREF_PREFIX.len()..].split_once('/') else { continue };
+        if !is_context_kind(kind) || !is_context_id(context_id) {
+            continue;
+        }
+        let image = open > floor && text[..open].ends_with('!');
+        let start = if image { open - 1 } else { open };
+        found.push(ContextReference { kind, context_id, label, image, start, end: href_start + href_len + 1 });
+        from = href_start + href_len + 1;
+    }
+    found
+}
+
 /// The context ids the prompt still references (`collectInlineContextIds`), so a record whose
 /// link the user deleted is not sent.
 pub fn referenced_context_ids(text: &str) -> Vec<&str> {
-    let marker = format!("]({CONTEXT_HREF_PREFIX}");
-    let mut ids = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(&marker) {
-        let after = &rest[start + marker.len()..];
-        let end = after.find(|c: char| c == ')' || c.is_whitespace()).unwrap_or(after.len());
-        if after[end..].starts_with(')')
-            && let Some((kind, id)) = after[..end].split_once('/')
-            && !kind.is_empty()
-            && is_context_id(id)
-        {
-            ids.push(id);
-        }
-        rest = &after[end..];
-    }
-    ids
+    context_references(text).into_iter().map(|reference| reference.context_id).collect()
 }
 
-/// `buildMessageContext` for thread references: the `context` a message carries, or `None`.
+/// `threadTitleTextFromPrompt`: links read as their labels; images drop out, and a prompt of
+/// only images reads "Attached image(s)".
+pub fn title_text(text: &str) -> String {
+    let mut prose = String::new();
+    let mut images = std::collections::HashSet::new();
+    let mut cursor = 0;
+    for reference in context_references(text) {
+        prose.push_str(&text[cursor..reference.start]);
+        if reference.kind == "image" {
+            images.insert(reference.context_id);
+        } else {
+            prose.push_str(&sanitize_context_label(reference.label, reference.kind));
+        }
+        cursor = reference.end;
+    }
+    prose.push_str(&text[cursor..]);
+    let normalized = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+    match (normalized.is_empty(), images.len()) {
+        (false, _) | (true, 0) => normalized,
+        (true, 1) => "Attached image".to_owned(),
+        (true, _) => "Attached images".to_owned(),
+    }
+}
+
+/// `buildMessageContext` for thread references alone.
 pub fn message_context(text: &str, threads: &[ThreadContext]) -> Option<Value> {
-    let referenced = referenced_context_ids(text);
-    let records: Vec<Value> =
-        threads.iter().filter(|thread| referenced.contains(&thread.context_id.as_str())).map(ThreadContext::to_record).collect();
-    (!records.is_empty()).then(|| json!({ "version": 1, "records": records }))
+    super::attachments::message_context(text, threads, &[])
 }
 
 #[cfg(test)]
