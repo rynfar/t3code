@@ -420,6 +420,116 @@ impl Lifecycle {
     }
 }
 
+/// A terminal surface's font (`resolveTerminalFontPreference`, `resolveTerminalFontSizePreference`
+/// and `terminalFontOptions`): the code font and size, or the terminal's own once typography is
+/// split (`t3code:typography-advanced`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalTypography {
+    /// The first family of the preference; `None` keeps the default code font.
+    pub family: Option<String>,
+    pub size: f32,
+}
+
+/// A `ClientSettingsSchema` font size: an integer in `min..=max`, else `default`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FontSizeRange {
+    pub default: f32,
+    pub min: f32,
+    pub max: f32,
+}
+
+impl TerminalTypography {
+    pub fn resolve(settings: &serde_json::Map<String, Value>, advanced: bool, code: FontSizeRange, terminal: FontSizeRange) -> Self {
+        let (family_key, size_key, range) =
+            if advanced { ("fontFamilyTerminal", "fontSizeTerminal", terminal) } else { ("fontFamilyCode", "fontSizeCode", code) };
+        let size = settings
+            .get(size_key)
+            .and_then(Value::as_u64)
+            .map(|size| size as f32)
+            .filter(|size| (range.min..=range.max).contains(size))
+            .unwrap_or(range.default);
+        let family = settings.get(family_key).and_then(Value::as_str).and_then(|families| {
+            let first = families.split(',').next()?.trim().trim_matches(['"', '\'']).trim();
+            (!first.is_empty()).then(|| first.to_owned())
+        });
+        TerminalTypography { family, size }
+    }
+}
+
+/// What this device may do with terminals, from its session's grants. Unknown (still loading)
+/// grants allow nothing, as `sessionHasScope` reads a pending session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalAccess {
+    pub read: bool,
+    pub operate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMode {
+    Attached,
+    Observing,
+}
+
+impl TerminalAccess {
+    pub fn of(session: Option<&crate::auth::AuthSessionState>) -> TerminalAccess {
+        session.map_or_else(TerminalAccess::default, |session| TerminalAccess {
+            read: session.grants(crate::auth::TERMINAL_READ_SCOPE),
+            operate: session.grants(crate::auth::TERMINAL_OPERATE_SCOPE),
+        })
+    }
+
+    /// `attachedTerminalSessionFamily`: operate attaches, read observes, neither follows nothing.
+    pub fn mode(self) -> Option<SessionMode> {
+        if self.operate {
+            Some(SessionMode::Attached)
+        } else if self.read {
+            Some(SessionMode::Observing)
+        } else {
+            None
+        }
+    }
+}
+
+/// One shown terminal's lifecycle across what it follows (`createTerminalSession`'s driver).
+/// Only leaving the attachment detaches; a transport retry resubscribes the same mode and
+/// leaves the lifecycle alone, as the web's retries keep their outer scan.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionFollow {
+    lifecycle: Lifecycle,
+    mode: Option<SessionMode>,
+}
+
+impl SessionFollow {
+    pub fn mode(&self) -> Option<SessionMode> {
+        self.mode
+    }
+
+    /// Follows what `access` allows now and returns it.
+    pub fn follow(&mut self, access: TerminalAccess) -> Option<SessionMode> {
+        let next = access.mode();
+        if self.mode == Some(SessionMode::Attached) && next != self.mode {
+            self.lifecycle.transition(LifecycleEvent::Detached { can_operate: access.operate });
+        }
+        if next == Some(SessionMode::Observing) {
+            self.lifecycle.transition(LifecycleEvent::Observed);
+        }
+        self.mode = next;
+        next
+    }
+
+    /// An attached session's status; observers only read.
+    pub fn status(&mut self, status: BufferStatus, version: u64) -> Option<LifecycleCommand> {
+        if self.mode != Some(SessionMode::Attached) {
+            return None;
+        }
+        self.lifecycle.transition(LifecycleEvent::Status { status, version })
+    }
+
+    pub fn reopen_failed(&mut self) {
+        self.lifecycle.transition(LifecycleEvent::ReopenFailed);
+    }
+}
+
 fn terminal_number(terminal_id: &str) -> Option<&str> {
     let lower = terminal_id.to_ascii_lowercase();
     let prefix = if lower.starts_with("terminal-") {

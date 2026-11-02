@@ -145,6 +145,78 @@ fn lifecycle_leaves_history_alone_for_read_only_viewers() {
     assert!(revoked.observed && !revoked.was_running);
 }
 
+const OPERATE: TerminalAccess = TerminalAccess { read: true, operate: true };
+const READ: TerminalAccess = TerminalAccess { read: true, operate: false };
+
+fn status(follow: &mut SessionFollow, status: BufferStatus, version: u64) -> Option<LifecycleCommand> {
+    follow.status(status, version)
+}
+
+#[test]
+fn a_shell_that_exits_across_a_reconnect_is_closed_not_reopened() {
+    let mut follow = SessionFollow::default();
+    assert_eq!(follow.follow(OPERATE), Some(SessionMode::Attached));
+    assert_eq!(status(&mut follow, BufferStatus::Running, 1), None);
+    // The transport drops and resubscribes the same attachment.
+    assert_eq!(follow.follow(OPERATE), Some(SessionMode::Attached));
+    assert_eq!(status(&mut follow, BufferStatus::Exited, 2), Some(LifecycleCommand::Exit));
+}
+
+#[test]
+fn access_picks_attach_or_observe_and_upgrades_keep_history() {
+    assert_eq!(TerminalAccess::default().mode(), None);
+    let mut follow = SessionFollow::default();
+    assert_eq!(follow.follow(TerminalAccess::default()), None);
+    assert_eq!(follow.follow(READ), Some(SessionMode::Observing));
+    assert_eq!(status(&mut follow, BufferStatus::Exited, 1), None, "observers never close or reopen");
+    assert_eq!(follow.follow(OPERATE), Some(SessionMode::Attached));
+    assert_eq!(status(&mut follow, BufferStatus::Exited, 1), None, "a granted viewer keeps the history they read");
+
+    let mut revoked = SessionFollow::default();
+    revoked.follow(OPERATE);
+    status(&mut revoked, BufferStatus::Running, 1);
+    assert_eq!(revoked.follow(READ), Some(SessionMode::Observing));
+    assert_eq!(revoked.follow(OPERATE), Some(SessionMode::Attached));
+    assert_eq!(status(&mut revoked, BufferStatus::Exited, 2), None);
+
+    let mut fresh = SessionFollow::default();
+    fresh.follow(OPERATE);
+    assert_eq!(status(&mut fresh, BufferStatus::Exited, 1), Some(LifecycleCommand::Reopen));
+}
+
+#[test]
+fn typography_follows_the_code_font_until_split() {
+    let code = FontSizeRange { default: 13., min: 10., max: 18. };
+    let terminal = FontSizeRange { default: 12., min: 8., max: 20. };
+    let settings = |value: serde_json::Value| value.as_object().cloned().expect("object");
+    let resolve = |value, advanced| TerminalTypography::resolve(&settings(value), advanced, code, terminal);
+    assert_eq!(resolve(json!({}), false), TerminalTypography { family: None, size: 13. });
+    assert_eq!(resolve(json!({}), true), TerminalTypography { family: None, size: 12. });
+    let chosen = json!({
+        "fontFamilyCode": "Menlo", "fontSizeCode": 15,
+        "fontFamilyTerminal": " \"JetBrains Mono\", monospace", "fontSizeTerminal": 9
+    });
+    assert_eq!(resolve(chosen.clone(), false), TerminalTypography { family: Some("Menlo".into()), size: 15. });
+    assert_eq!(resolve(chosen, true), TerminalTypography { family: Some("JetBrains Mono".into()), size: 9. });
+    let invalid = json!({"fontFamilyTerminal": "  ", "fontSizeTerminal": 30, "fontSizeCode": 12.5});
+    assert_eq!(resolve(invalid.clone(), true), TerminalTypography { family: None, size: 12. });
+    assert_eq!(resolve(invalid, false).size, 13.);
+}
+
+#[test]
+fn session_grants_follow_permissions_then_legacy_scopes() {
+    let session = |value: serde_json::Value| -> crate::auth::AuthSessionState { serde_json::from_value(value).expect("decodes") };
+    let current = session(json!({"authenticated": true, "auth": {}, "permissions": ["terminal:read"], "scopes": ["terminal:operate"]}));
+    assert_eq!(TerminalAccess::of(Some(&current)), READ);
+    let legacy = session(json!({"authenticated": true, "auth": {"policy": "x"}, "scopes": ["terminal:operate"]}));
+    assert_eq!(TerminalAccess::of(Some(&legacy)), OPERATE);
+    let pinned = session(json!({"authenticated": true, "auth": {"serverUpdateScope": "environment:maintain"}, "scopes": ["terminal:operate"]}));
+    assert_eq!(TerminalAccess::of(Some(&pinned)), TerminalAccess { read: false, operate: true });
+    let signed_out = session(json!({"authenticated": false, "auth": {}, "permissions": ["terminal:operate", "brand:new"]}));
+    assert_eq!(TerminalAccess::of(Some(&signed_out)), TerminalAccess::default());
+    assert_eq!(TerminalAccess::of(None), TerminalAccess::default());
+}
+
 #[test]
 fn labels_follow_terminal_labels_ts() {
     assert_eq!(terminal_label("term-3"), "Terminal 3");

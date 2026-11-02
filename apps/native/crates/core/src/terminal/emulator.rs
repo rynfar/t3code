@@ -1,7 +1,7 @@
 //! The VT core: `alacritty_terminal`'s `Term` driven by vte's `Processor`. Bytes go in, a
 //! snapshot of the visible rows comes out with every color already resolved. The app shares one
-//! per session with its network task behind a [`FairMutex`], so output is parsed off the UI
-//! thread and the UI locks it only to read what it paints.
+//! per session with its network task behind a [`FairMutex`]: output is parsed off the UI thread
+//! in bounded slices, and the renderer paints published snapshots instead of locking it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -72,6 +72,34 @@ pub struct CellView {
     pub wide: bool,
     pub spacer: bool,
     pub selected: bool,
+    /// Zero-width characters (combining marks, variation selectors) follow `c`; see
+    /// [`Snapshot::combining`].
+    pub combining: bool,
+}
+
+/// A pointer button as mouse reports number them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    /// Motion with no button held.
+    None,
+}
+
+impl MouseButton {
+    fn is_wheel(self) -> bool {
+        matches!(self, MouseButton::WheelUp | MouseButton::WheelDown)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,11 +127,30 @@ pub struct Snapshot {
     pub cursor: Option<CursorView>,
     pub display_offset: usize,
     pub history: usize,
+    /// Zero-width characters by cell index, in index order.
+    pub combining: Vec<(usize, char)>,
 }
 
 impl Snapshot {
     pub fn row(&self, row: usize) -> &[CellView] {
         &self.cells[row * self.cols..(row + 1) * self.cols]
+    }
+
+    /// The zero-width characters drawn on the cell at `index` (`row * cols + col`).
+    pub fn combining(&self, index: usize) -> impl Iterator<Item = char> + '_ {
+        let start = self.combining.partition_point(|(at, _)| *at < index);
+        self.combining[start..].iter().take_while(move |(at, _)| *at == index).map(|(_, c)| *c)
+    }
+
+    /// Every codepoint of one cell, as `ghosttyCellText` reads a grapheme.
+    pub fn cell_text(&self, row: usize, col: usize) -> String {
+        let index = row * self.cols + col;
+        let cell = &self.cells[index];
+        let mut text = String::from(cell.c);
+        if cell.combining {
+            text.extend(self.combining(index));
+        }
+        text
     }
 }
 
@@ -143,13 +190,24 @@ impl Emulator {
         self.take_replies()
     }
 
-    /// Starts over from a session's history. Replies are dropped: they answered queries from
-    /// a program that has long moved on, and writing them would type garbage into the shell.
-    pub fn reset(&mut self, history: &str) {
-        let grid = self.grid();
-        *self = Emulator { cell_size: self.cell_size, ..Emulator::new(grid, self.theme) };
+    /// An empty emulator with this one's grid, theme and cell size. A session replays history
+    /// into it without holding the lock the UI needs, then swaps it in.
+    pub fn blank(&self) -> Emulator {
+        Emulator { cell_size: self.cell_size, ..Emulator::new(self.grid(), self.theme) }
+    }
+
+    /// Parses a session's history. Replies are dropped: they answered queries from a program
+    /// that has long moved on, and writing them would type garbage into the shell.
+    pub fn replay(&mut self, history: &str) {
         self.parser.advance(&mut self.term, history.as_bytes());
         self.take_replies();
+    }
+
+    /// Keeps what the UI changed on `previous` while this one replayed: theme, cell size, grid.
+    pub fn adopt_view(&mut self, previous: &Emulator) {
+        self.theme = previous.theme;
+        self.cell_size = previous.cell_size;
+        self.resize(previous.grid());
     }
 
     /// Prints a client-side note into the grid without answering anything.
@@ -256,18 +314,19 @@ impl Emulator {
         self.term.selection_to_string().filter(|text| !text.is_empty())
     }
 
-    /// What a wheel step means: input for a program that tracks the mouse (SGR reports) or owns
-    /// the alternate screen (arrow keys, as xterm sends), or `None` to scroll the scrollback.
-    /// Positive `lines` scroll up.
-    pub fn wheel_input(&self, lines: i32, row: usize, col: usize) -> Option<String> {
+    /// What a wheel step means: wheel reports for a program that tracks the mouse (when the
+    /// modifiers let it, see `shouldReportTerminalMouse`), arrow keys for one that owns the
+    /// alternate screen (as xterm sends), or `None` to scroll the scrollback. Positive `lines`
+    /// scroll up.
+    pub fn wheel_input(&self, lines: i32, row: usize, col: usize, report: bool) -> Option<String> {
         let mode = self.mode();
         let count = lines.unsigned_abs() as usize;
         if count == 0 {
             return None;
         }
-        if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
-            let button = if lines > 0 { 64 } else { 65 };
-            return Some(format!("\x1b[<{button};{};{}M", col + 1, row + 1).repeat(count));
+        if report && self.mouse_tracking() {
+            let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+            return self.mouse_report(MouseAction::Press, button, false, row, col).map(|report| report.repeat(count));
         }
         if mode.contains(TermMode::ALT_SCREEN) {
             let app = mode.contains(TermMode::APP_CURSOR);
@@ -280,6 +339,54 @@ impl Emulator {
             return Some(arrow.repeat(count));
         }
         None
+    }
+
+    /// The program asked for mouse reports (DEC 1000, 1002 or 1003).
+    pub fn mouse_tracking(&self) -> bool {
+        self.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// One pointer event at a visible cell, encoded the way the program asked: SGR (1006), UTF-8
+    /// coordinates (1005) or legacy bytes. `None` when its tracking mode skips the event.
+    pub fn mouse_report(&self, action: MouseAction, button: MouseButton, alt: bool, row: usize, col: usize) -> Option<String> {
+        let mode = self.mode();
+        let reports = match action {
+            MouseAction::Press => mode.intersects(TermMode::MOUSE_MODE),
+            MouseAction::Release => mode.intersects(TermMode::MOUSE_MODE) && !button.is_wheel(),
+            MouseAction::Motion => {
+                mode.contains(TermMode::MOUSE_MOTION) || (mode.contains(TermMode::MOUSE_DRAG) && button != MouseButton::None)
+            }
+        };
+        if !reports {
+            return None;
+        }
+        let mut code = match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::None => 3,
+            MouseButton::WheelUp => 64,
+            MouseButton::WheelDown => 65,
+        };
+        if action == MouseAction::Motion {
+            code += 32;
+        }
+        if alt {
+            code += 8;
+        }
+        let (x, y) = (col as u32 + 1, row as u32 + 1);
+        if mode.contains(TermMode::SGR_MOUSE) {
+            let end = if action == MouseAction::Release { 'm' } else { 'M' };
+            return Some(format!("\x1b[<{code};{x};{y}{end}"));
+        }
+        if action == MouseAction::Release {
+            code = 3 + if alt { 8 } else { 0 };
+        }
+        // Input travels as text, so legacy coordinates stop at 7-bit bytes; UTF-8 mode goes on to
+        // xterm's limit of 2015.
+        let limit = if mode.contains(TermMode::UTF8_MOUSE) { 2047 } else { 127 };
+        let encode = |value: u32| char::from_u32(32 + value).filter(|_| 32 + value <= limit);
+        Some(format!("\x1b[M{}{}{}", encode(code)?, encode(x)?, encode(y)?))
     }
 
     /// Focus reports for programs that asked for them (DEC 1004).
@@ -295,6 +402,7 @@ impl Emulator {
         out.display_offset = content.display_offset;
         out.history = self.term.grid().history_size();
         out.cells.clear();
+        out.combining.clear();
         let blank = CellView {
             c: ' ',
             fg: self.theme.foreground,
@@ -307,6 +415,7 @@ impl Emulator {
             wide: false,
             spacer: false,
             selected: false,
+            combining: false,
         };
         out.cells.resize(cols * rows, blank);
         let offset = content.display_offset as i32;
@@ -332,8 +441,12 @@ impl Emulator {
                 fg = bg.unwrap_or(self.theme.background);
             }
             let selected = content.selection.is_some_and(|range| range.contains(indexed.point));
-            out.cells[row as usize * cols + indexed.point.column.0] = CellView {
-                c: if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c },
+            let index = row as usize * cols + indexed.point.column.0;
+            let hidden = flags.contains(Flags::HIDDEN);
+            let zerowidth = cell.zerowidth().filter(|_| !hidden).unwrap_or_default();
+            out.combining.extend(zerowidth.iter().map(|&c| (index, c)));
+            out.cells[index] = CellView {
+                c: if hidden { ' ' } else { cell.c },
                 fg,
                 bg,
                 bold: flags.contains(Flags::BOLD),
@@ -344,6 +457,7 @@ impl Emulator {
                 wide: flags.contains(Flags::WIDE_CHAR),
                 spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
                 selected,
+                combining: !zerowidth.is_empty(),
             };
         }
         let cursor = content.cursor;
@@ -450,9 +564,13 @@ mod tests {
     fn reset_replays_history_without_replying() {
         let mut emulator = Emulator::new(Grid::new(20, 4), theme());
         emulator.feed(b"old");
-        emulator.reset("fresh\x1b[6n");
-        assert_eq!(text(&emulator, 0), "fresh");
-        assert_eq!(emulator.feed(b""), "");
+        let mut fresh = emulator.blank();
+        fresh.replay("fresh\x1b[6n");
+        emulator.resize(Grid::new(12, 3));
+        fresh.adopt_view(&emulator);
+        assert_eq!(text(&fresh, 0), "fresh");
+        assert_eq!(fresh.grid(), Grid::new(12, 3));
+        assert_eq!(fresh.feed(b""), "");
     }
 
     #[test]
@@ -495,6 +613,17 @@ mod tests {
         assert!(row[0].wide && row[1].spacer && row[2].c == 'w');
         assert_eq!(snapshot.cursor.map(|cursor| cursor.col), Some(3));
     }
+
+    #[test]
+    fn combining_marks_stay_with_their_base_character() {
+        let mut emulator = Emulator::new(Grid::new(10, 2), theme());
+        emulator.feed("e\u{301}x a\u{308}\u{323}".as_bytes());
+        let mut snapshot = Snapshot::default();
+        emulator.snapshot(&mut snapshot);
+        let cells: Vec<String> = (0..5).map(|col| snapshot.cell_text(0, col)).collect();
+        assert_eq!(cells, ["e\u{301}", "x", " ", "a\u{308}\u{323}", " "]);
+    }
+
     #[test]
     fn pointer_maps_to_cells_and_clamps_with_a_forced_side() {
         assert_eq!(hit_cell(25., 45., 10., 20., 8, 4), (2, 2, Side::Left));
@@ -508,13 +637,48 @@ mod tests {
     #[test]
     fn wheel_goes_to_mouse_programs_and_the_alternate_screen() {
         let mut emulator = Emulator::new(Grid::new(20, 5), theme());
-        assert_eq!(emulator.wheel_input(2, 0, 0), None);
+        assert_eq!(emulator.wheel_input(2, 0, 0, true), None);
         emulator.feed(b"\x1b[?1049h");
-        assert_eq!(emulator.wheel_input(-2, 0, 0).as_deref(), Some("\x1b[B\x1b[B"));
-        emulator.feed(b"\x1b[?1000h\x1b[?1006h");
-        assert_eq!(emulator.wheel_input(1, 2, 3).as_deref(), Some("\x1b[<64;4;3M"));
+        assert_eq!(emulator.wheel_input(-2, 0, 0, true).as_deref(), Some("\x1b[B\x1b[B"));
+        emulator.feed(b"\x1b[?1000h");
+        assert_eq!(emulator.wheel_input(1, 2, 3, true).as_deref(), Some("\x1b[M`$#"));
+        assert_eq!(emulator.wheel_input(1, 2, 3, false).as_deref(), Some("\x1b[A"));
+        emulator.feed(b"\x1b[?1006h");
+        assert_eq!(emulator.wheel_input(1, 2, 3, true).as_deref(), Some("\x1b[<64;4;3M"));
         assert_eq!(emulator.focus_input(true), None);
         emulator.feed(b"\x1b[?1004h");
         assert_eq!(emulator.focus_input(false), Some("\x1b[O"));
+    }
+
+    #[test]
+    fn clicks_and_drags_reach_mouse_programs_in_the_encoding_they_asked_for() {
+        use MouseAction::{Motion, Press, Release};
+        let mut emulator = Emulator::new(Grid::new(300, 5), theme());
+        let report = |emulator: &Emulator, action, button, alt, row, col| emulator.mouse_report(action, button, alt, row, col);
+        assert!(!emulator.mouse_tracking());
+        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 0, 0), None);
+
+        emulator.feed(b"\x1b[?1000h");
+        assert!(emulator.mouse_tracking());
+        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 2, 3).as_deref(), Some("\x1b[M $#"));
+        assert_eq!(report(&emulator, Release, MouseButton::Left, false, 2, 3).as_deref(), Some("\x1b[M#$#"));
+        assert_eq!(report(&emulator, Motion, MouseButton::Left, false, 2, 4), None);
+        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 0, 200), None, "legacy bytes cannot reach column 201");
+
+        emulator.feed(b"\x1b[?1002h");
+        assert_eq!(report(&emulator, Motion, MouseButton::Left, false, 2, 4).as_deref(), Some("\x1b[M@%#"));
+        assert_eq!(report(&emulator, Motion, MouseButton::None, false, 2, 4), None);
+
+        emulator.feed(b"\x1b[?1005h");
+        assert_eq!(report(&emulator, Press, MouseButton::Middle, false, 0, 200).as_deref(), Some("\x1b[M!\u{e9}!"));
+
+        emulator.feed(b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(report(&emulator, Press, MouseButton::Right, true, 1, 9).as_deref(), Some("\x1b[<10;10;2M"));
+        assert_eq!(report(&emulator, Release, MouseButton::Right, true, 1, 9).as_deref(), Some("\x1b[<10;10;2m"));
+        assert_eq!(report(&emulator, Motion, MouseButton::None, false, 0, 0).as_deref(), Some("\x1b[<35;1;1M"));
+        assert_eq!(report(&emulator, Release, MouseButton::WheelUp, false, 0, 0), None);
+
+        emulator.feed(b"\x1b[?1003l");
+        assert!(!emulator.mouse_tracking());
     }
 }
