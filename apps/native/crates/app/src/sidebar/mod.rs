@@ -275,6 +275,29 @@ impl SidebarPane {
                     .child(div().text_color(hsla(p.sidebar_foreground)).font_weight(FontWeight::SEMIBOLD).child("T3"))
                     .child(div().text_color(hsla(p.muted_foreground)).child("Code")),
             )
+            .child(self.render_history_button(true, cx))
+            .child(self.render_history_button(false, cx))
+    }
+
+    /// `HistoryNavigationButton`: ghost `icon-sm` with a 14px arrow, disabled at either end.
+    fn render_history_button(&self, back: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let enabled = self.state.read(cx).can_navigate(back);
+        let command = if back { "navigation.back" } else { "navigation.forward" };
+        let label = format!("{}{}", if back { "Go back" } else { "Go forward" }, crate::keymap::label(command, cx).map_or_else(String::new, |key| format!(" ({key})")));
+        div()
+            .id(if back { "history-back" } else { "history-forward" })
+            .size(px(28.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .when(!enabled, |this| this.opacity(0.64))
+            .when(enabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.sidebar_accent))))
+            .child((if back { Icon::ArrowLeft } else { Icon::ArrowRight }).render(px(14.), hsla(p.sidebar_icon)))
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+            .when(enabled, |this| this.on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.navigate_history(back, cx)))))
     }
 
     fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -36,6 +36,8 @@ icons! {
     AlarmClockOff => "icons/lucide/alarm-clock-off.svg",
     Archive => "icons/lucide/archive.svg",
     ArchiveX => "icons/lucide/archive-x.svg",
+    ArrowLeft => "icons/lucide/arrow-left.svg",
+    ArrowRight => "icons/lucide/arrow-right.svg",
     ArrowRightLeft => "icons/lucide/arrow-right-left.svg",
     ArrowUp => "icons/lucide/arrow-up.svg",
     Bot => "icons/lucide/bot.svg",

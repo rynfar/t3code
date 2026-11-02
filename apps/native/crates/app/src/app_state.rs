@@ -264,6 +264,7 @@ impl AppState {
         self.thread = ThreadState::default();
         self.restore_thread = None;
         store::save_last_thread(thread_id);
+        self.sidebar.history.visit(thread_id);
         if let Some(client) = &self.client {
             client.open_thread(thread_id);
         }
