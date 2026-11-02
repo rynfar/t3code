@@ -101,31 +101,43 @@ fn row_key(row: &ProjectedTurnItem) -> (&str, &str) {
 /// `mergeOlderHistoryIntoProjection` without a work anchor: page rows go before the window,
 /// rows the window already holds keep their current version, and a page row whose item the
 /// projection holds but hides stays out (unless it is a visible interrupt request).
-/// Returns true when the projection changed.
+/// Indexes the page, not the transcript, so the transcript is scanned by borrowed key once
+/// and never cloned. Returns true when the projection changed.
 pub fn merge_older_history(projection: &mut ThreadProjection, older: Vec<ProjectedTurnItem>) -> bool {
     if older.is_empty() {
         return false;
     }
-    let thread_id = projection.thread.id.clone();
-    let local = |row: &ProjectedTurnItem| row.visibility == Visibility::Local || row.source_thread_id == thread_id;
-    let current: HashMap<(&str, &str), &ProjectedTurnItem> =
-        projection.visible_turn_items.iter().map(|row| (row_key(row), row)).collect();
-    let known: HashMap<&str, &Arc<TurnItem>> =
-        projection.turn_items.iter().map(|item| (item.id.as_str(), item)).collect();
-    let mut page_keys: HashSet<(String, String)> = HashSet::new();
+    let local = |row: &ProjectedTurnItem| row.visibility == Visibility::Local || row.source_thread_id == projection.thread.id;
+    let mut first: HashMap<(&str, &str), usize> = HashMap::new();
+    for (index, row) in older.iter().enumerate() {
+        first.entry(row_key(row)).or_insert(index);
+    }
+    // Current rows that repeat a page key: the last one is its current version (`Map` semantics).
+    let mut repeated: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, row) in projection.visible_turn_items.iter().enumerate() {
+        if let Some(&page_index) = first.get(&row_key(row)) {
+            repeated.entry(page_index).or_default().push(index);
+        }
+    }
+    let page_item_ids: HashSet<&str> = older.iter().filter(|row| local(row)).map(|row| row.source_item_id.as_str()).collect();
+    let mut known: HashMap<&str, &Arc<TurnItem>> = HashMap::new();
+    for item in projection.turn_items.iter().filter(|item| page_item_ids.contains(item.id.as_str())) {
+        known.insert(item.id.as_str(), item);
+    }
     let mut page: Vec<ProjectedTurnItem> = Vec::new();
+    let mut dropped: HashSet<usize> = HashSet::new();
     let mut appended: Vec<Arc<TurnItem>> = Vec::new();
-    let mut appended_ids: HashSet<String> = HashSet::new();
-    for page_row in &older {
-        let key = (page_row.source_thread_id.clone(), page_row.source_item_id.clone());
-        if page_keys.contains(&key) {
+    let mut appended_ids: HashSet<&str> = HashSet::new();
+    for (index, page_row) in older.iter().enumerate() {
+        if first.get(&row_key(page_row)) != Some(&index) {
             continue;
         }
-        let mut row = match current.get(&row_key(page_row)) {
-            Some(existing) => (*existing).clone(),
+        let current = repeated.get(&index);
+        let mut row = match current.and_then(|rows| rows.last()) {
+            Some(&existing) => projection.visible_turn_items[existing].clone(),
             None => page_row.clone(),
         };
-        if !current.contains_key(&row_key(page_row))
+        if current.is_none()
             && local(&row)
             && let Some(item) = known.get(row.source_item_id.as_str())
         {
@@ -134,28 +146,33 @@ pub fn merge_older_history(projection: &mut ThreadProjection, older: Vec<Project
             }
             row.item = Arc::clone(item);
         }
-        if local(&row) && !known.contains_key(row.source_item_id.as_str()) && appended_ids.insert(row.source_item_id.clone()) {
+        if local(&row) && !known.contains_key(page_row.source_item_id.as_str()) && appended_ids.insert(page_row.source_item_id.as_str()) {
             appended.push(row.item.clone());
         }
-        page_keys.insert(key);
+        dropped.extend(current.into_iter().flatten());
         page.push(row);
     }
     if page.is_empty() {
         return false;
     }
-    let unchanged = page.iter().all(|row| current.contains_key(&row_key(row)))
-        && projection.visible_turn_items.iter().take(page.len()).zip(&page).all(|(a, b)| row_key(a) == row_key(b));
+    let unchanged = dropped.len() == page.len() && (0..page.len()).all(|index| dropped.contains(&index))
+        && projection.visible_turn_items.iter().zip(&page).all(|(a, b)| row_key(a) == row_key(b));
     if unchanged {
         return false;
     }
-    let rest = std::mem::take(&mut projection.visible_turn_items)
-        .into_iter()
-        .filter(|row| !page_keys.contains(&(row.source_thread_id.clone(), row.source_item_id.clone())));
-    let mut visible: Vec<ProjectedTurnItem> = page.into_iter().chain(rest).collect();
-    for (position, row) in visible.iter_mut().enumerate() {
+    let mut rest = std::mem::take(&mut projection.visible_turn_items);
+    if !dropped.is_empty() {
+        let mut index = 0;
+        rest.retain(|_| {
+            index += 1;
+            !dropped.contains(&(index - 1))
+        });
+    }
+    rest.splice(0..0, page);
+    for (position, row) in rest.iter_mut().enumerate() {
         row.position = position;
     }
-    projection.visible_turn_items = visible;
+    projection.visible_turn_items = rest;
     projection.turn_items.extend(appended);
     true
 }
@@ -171,7 +188,61 @@ pub enum HistoryStep {
     Failed(String),
 }
 
+/// A fetched page ready to merge off the UI thread: `ThreadState::begin_history_merge` checks
+/// the projection out, `run` merges, and `ThreadState::finish_history_merge` swaps it back.
+#[derive(Debug)]
+pub struct HistoryMerge {
+    projection: ThreadProjection,
+    items: Vec<ProjectedTurnItem>,
+    generation: u64,
+    next: HistoryStep,
+}
+
+impl HistoryMerge {
+    pub fn run(self) -> MergedHistory {
+        let HistoryMerge { mut projection, items, generation, next } = self;
+        merge_older_history(&mut projection, items);
+        MergedHistory { projection, generation, next }
+    }
+}
+
+#[derive(Debug)]
+pub struct MergedHistory {
+    projection: ThreadProjection,
+    generation: u64,
+    next: HistoryStep,
+}
+
+#[derive(Debug)]
+pub enum PageOutcome {
+    Merge(Box<HistoryMerge>),
+    Step(HistoryStep),
+}
+
+/// What the transcript's history control shows, as `TimelineHistoryControl` in
+/// `MessagesTimeline.tsx` does; `None` when there is no earlier history and no error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryControl {
+    /// Offer the load button. Clicking it, or retrying after an error, is
+    /// `AppState::load_older_history`.
+    pub has_more: bool,
+    /// The button is disabled and says it is loading, until the rows are in.
+    pub loading: bool,
+    /// The status line under the button.
+    pub error: Option<String>,
+}
+
 impl ThreadState {
+    /// A page still merging keeps the control up and loading until its rows are in.
+    pub fn history_control(&self) -> Option<HistoryControl> {
+        let merging = self.is_merging_history();
+        (self.history.should_show_load_earlier_control() || merging).then(|| HistoryControl {
+            has_more: self.history.has_more_history || merging,
+            loading: self.history.loading || merging,
+            error: self.history.error.clone(),
+        })
+    }
+
     /// Starts loading earlier history. Returns the cursor to fetch, or `None` when there is
     /// nothing to load or a load is already running.
     pub fn begin_history_load(&mut self) -> Option<String> {
@@ -185,21 +256,24 @@ impl ThreadState {
         Some(cursor)
     }
 
-    /// Merges one fetched page requested with `request_cursor`.
-    pub fn apply_history_page(&mut self, request_cursor: &str, page: HistoryPage) -> HistoryStep {
+    /// Accepts one fetched page requested with `request_cursor`. A page to merge checks the
+    /// projection out; the history meta changes now, as the web's single update does.
+    pub fn begin_history_merge(&mut self, request_cursor: &str, page: HistoryPage) -> PageOutcome {
         let keep_paging = page.has_more_history && !page.has_user_turn;
         if keep_paging && page.next_cursor.as_deref().is_none_or(|next| next == request_cursor) {
-            return self.fail_history_load(request_cursor, "History did not advance.".into());
+            return PageOutcome::Step(self.fail_history_load(request_cursor, "History did not advance.".into()));
         }
         if !self.history.is_active_request(request_cursor) {
-            return HistoryStep::Stale;
+            return PageOutcome::Step(HistoryStep::Stale);
         }
-        let Some(projection) = self.projection.as_mut() else {
+        let Some(projection) = self.projection.take() else {
             self.history = ThreadHistoryMeta::default();
-            return HistoryStep::Stale;
+            return PageOutcome::Step(HistoryStep::Stale);
         };
-        merge_older_history(projection, page.items);
-        let next_cursor = page.next_cursor.clone();
+        let next = match &page.next_cursor {
+            Some(next) if keep_paging => HistoryStep::Continue(next.clone()),
+            _ => HistoryStep::Done,
+        };
         self.history = ThreadHistoryMeta {
             history_cursor: page.next_cursor,
             has_more_history: page.has_more_history,
@@ -208,9 +282,27 @@ impl ThreadState {
             expanded: true,
             latest_local_turn_ordinal: self.history.latest_local_turn_ordinal,
         };
-        match next_cursor {
-            Some(next) if keep_paging => HistoryStep::Continue(next),
-            _ => HistoryStep::Done,
+        self.merging = Some(Vec::new());
+        PageOutcome::Merge(Box::new(HistoryMerge { projection, items: page.items, generation: self.generation, next }))
+    }
+
+    /// Swaps a merged projection back in and applies the events that arrived meanwhile.
+    /// A snapshot or deletion since `begin_history_merge` wins: the merge is dropped.
+    pub fn finish_history_merge(&mut self, merged: MergedHistory) -> HistoryStep {
+        if merged.generation != self.generation {
+            return HistoryStep::Stale;
+        }
+        let Some(pending) = self.merging.take() else { return HistoryStep::Stale };
+        self.projection = Some(merged.projection);
+        self.replay_pending(pending);
+        merged.next
+    }
+
+    /// Merges a page on the calling thread: `begin_history_merge`, `run`, `finish_history_merge`.
+    pub fn apply_history_page(&mut self, request_cursor: &str, page: HistoryPage) -> HistoryStep {
+        match self.begin_history_merge(request_cursor, page) {
+            PageOutcome::Merge(merge) => self.finish_history_merge(merge.run()),
+            PageOutcome::Step(step) => step,
         }
     }
 
@@ -224,3 +316,6 @@ impl ThreadState {
         HistoryStep::Failed(message)
     }
 }
+
+#[cfg(test)]
+mod tests;

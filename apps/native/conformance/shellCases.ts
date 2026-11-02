@@ -12,9 +12,11 @@ import {
   decodeShellItem,
   encodeShellItem,
   encodeShellSnapshot,
+  Interner,
   Fixtures,
   ShellReducer,
 } from "./runtime.ts";
+import type { Json } from "./runtime.ts";
 
 const repositoryIdentity = {
   canonicalKey: "github.com/example/repo",
@@ -33,35 +35,53 @@ const otherIdentity = {
   },
 } as unknown as NonNullable<OrchestrationProjectShell["repositoryIdentity"]>;
 
+function applyShellItem(
+  snapshot: OrchestrationV2ShellSnapshot | null,
+  item: OrchestrationV2ShellStreamItem,
+): OrchestrationV2ShellSnapshot | null {
+  if (item.kind === "synchronized") return snapshot;
+  if (item.kind === "snapshot") {
+    return ShellReducer.mergeShellSnapshotProjects(
+      snapshot,
+      item.snapshot,
+      item.resolvedRepositoryIdentityRoots === undefined
+        ? undefined
+        : { resolvedRepositoryIdentityRoots: item.resolvedRepositoryIdentityRoots },
+    );
+  }
+  return snapshot === null ? null : ShellReducer.applyShellStreamEvents(snapshot, [item]);
+}
+
+/** States after every item, applying deltas one at a time; shell.ts batches a frame's deltas,
+ *  and its own invariant says that is the same, which this checks before writing. */
 function shellCase(name: string, items: ReadonlyArray<OrchestrationV2ShellStreamItem>) {
   const json = items.map(encodeShellItem);
+  const decoded = json.map(decodeShellItem);
+  const interner = new Interner();
+  const states: Json[] = [];
   let snapshot: OrchestrationV2ShellSnapshot | null = null;
-  let deltas: ShellReducerModule.ShellStreamEvent[] = [];
-  const flush = () => {
-    if (snapshot !== null && deltas.length > 0)
-      snapshot = ShellReducer.applyShellStreamEvents(snapshot, deltas);
-    deltas = [];
-  };
-  for (const decoded of json.map(decodeShellItem)) {
-    if (decoded.kind === "synchronized") {
-      flush();
-      continue;
-    }
-    if (decoded.kind === "snapshot") {
-      flush();
-      snapshot = ShellReducer.mergeShellSnapshotProjects(
-        snapshot,
-        decoded.snapshot,
-        decoded.resolvedRepositoryIdentityRoots === undefined
-          ? undefined
-          : { resolvedRepositoryIdentityRoots: decoded.resolvedRepositoryIdentityRoots },
-      );
-      continue;
-    }
-    deltas.push(decoded);
+  for (const item of decoded) {
+    snapshot = applyShellItem(snapshot, item);
+    states.push(snapshot === null ? null : interner.record(encodeShellSnapshot(snapshot)));
   }
-  flush();
-  return { name, items: json, expected: snapshot === null ? null : encodeShellSnapshot(snapshot) };
+  let batched: OrchestrationV2ShellSnapshot | null = null;
+  let deltas: ShellReducerModule.ShellStreamEvent[] = [];
+  for (const item of [...decoded, { kind: "synchronized" } as const]) {
+    if (item.kind !== "snapshot" && item.kind !== "synchronized") {
+      deltas.push(item);
+      continue;
+    }
+    if (batched !== null && deltas.length > 0)
+      batched = ShellReducer.applyShellStreamEvents(batched, deltas);
+    deltas = [];
+    batched = applyShellItem(batched, item);
+  }
+  const finalState = (value: OrchestrationV2ShellSnapshot | null) =>
+    JSON.stringify(value === null ? null : encodeShellSnapshot(value));
+  if (finalState(batched) !== finalState(snapshot)) {
+    throw new Error(`${name}: batched shell deltas differ from sequential ones`);
+  }
+  return { name, items: json, table: interner.table, states };
 }
 
 export function shellCases() {
@@ -217,6 +237,35 @@ export function shellCases() {
       update(3, { ...thread, archivedAt: thread.updatedAt }, "archive"),
       update(4, thread),
       update(5, shellRow("archived-old"), "archive"),
+    ]),
+    shellCase("optional row fields the native types model", [
+      snapshot({
+        projects: [{ ...project, pinnedAt: "2026-06-20T01:00:00.000Z", archivedAt: null }],
+        threads: [
+          shellRow("rich", {
+            lineage: { ...thread.lineage, sideChat: false },
+            activityRunStatus: "running",
+            lastError: "Provider unavailable",
+            snoozedUntil: thread.updatedAt,
+            pinnedAt: thread.updatedAt,
+            pinOrderKey: "a0",
+            activeOrderKey: "b0",
+          }),
+        ],
+        archivedThreads: [
+          shellRow("archived-rich", {
+            lineage: { ...thread.lineage, sideChat: true },
+            activityRunStatus: null,
+            lastError: null,
+            snoozedUntil: null,
+            pinnedAt: null,
+            pinOrderKey: null,
+            activeOrderKey: null,
+            archivedAt: thread.updatedAt,
+          }),
+        ],
+      }),
+      update(1, shellRow("rich", { activityRunStatus: null, pinOrderKey: "a1" })),
     ]),
     shellCase("mixed deltas in one batch and across batches", [
       snapshot({

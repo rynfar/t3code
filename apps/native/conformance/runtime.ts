@@ -117,87 +117,46 @@ export const decodeHistoryPage = (json: Json) => decodeHistoryPageSync(structure
 const decodeShellItemSync = Schema.decodeUnknownSync(codecs.shellItem);
 export const decodeShellItem = (json: Json) => decodeShellItemSync(structuredClone(json));
 
-const pick = (value: Json, keys: ReadonlyArray<string>): Json => {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
-  const out: { [key: string]: Json } = {};
-  for (const key of keys) if (key in value) out[key] = value[key]!;
-  return out;
-};
-const ITEM_KEYS = [
-  "id",
-  "type",
-  "status",
-  "ordinal",
-  "runId",
-  "title",
-  "text",
-  "textOmitted",
-  "output",
-  "files",
-  "filesOmitted",
-  "prompt",
-  "result",
-  "promptOmitted",
-  "resultOmitted",
-];
-const ids = (value: Json) =>
-  Array.isArray(value) ? value.map((entry) => pick(entry, ["id"])) : value;
+const isObject = (value: Json | undefined): value is { [key: string]: Json } =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** Expected projections keep only what crates/core/tests/conformance.rs compares; a field it
- *  compares but this drops fails the test instead of passing silently. */
-export function observed(projection: Json): Json {
-  if (projection === null || typeof projection !== "object" || Array.isArray(projection))
-    return projection;
-  const list = (key: string, keys: ReadonlyArray<string>) => {
-    const value = projection[key];
-    return Array.isArray(value) ? value.map((entry) => pick(entry, keys)) : null;
-  };
-  return {
-    updatedAt: projection.updatedAt ?? null,
-    thread: pick(projection.thread ?? null, [
-      "id",
-      "title",
-      "archivedAt",
-      "updatedAt",
-      "branch",
-      "worktreePath",
-      "runtimeMode",
-      "interactionMode",
-      "modelSelection",
-    ]),
-    runs: list("runs", ["id", "status", "restartCancelledBackgroundWork"]),
-    attempts: list("attempts", ["id", "runId", "rootNodeId", "status"]),
-    turnItems: list("turnItems", ITEM_KEYS),
-    visibleTurnItems: Array.isArray(projection.visibleTurnItems)
-      ? projection.visibleTurnItems.map((entry) => {
-          const trimmed = pick(entry, [
-            "position",
-            "visibility",
-            "sourceThreadId",
-            "sourceItemId",
-            "item",
-          ]) as { [key: string]: Json };
-          return { ...trimmed, item: pick(trimmed.item ?? null, ITEM_KEYS) };
-        })
-      : null,
-    messages: list("messages", ["id", "text"]),
-    subagents: list("subagents", [
-      "id",
-      "prompt",
-      "result",
-      "progress",
-      "promptOmitted",
-      "resultOmitted",
-    ]),
-    providerTurns: list("providerTurns", ["id", "status", "tokenUsage"]),
-    nodes: ids(projection.nodes ?? null),
-    providerSessions: ids(projection.providerSessions ?? null),
-    providerThreads: ids(projection.providerThreads ?? null),
-    runtimeRequests: ids(projection.runtimeRequests ?? null),
-    plans: ids(projection.plans ?? null),
-    checkpointScopes: ids(projection.checkpointScopes ?? null),
-    checkpoints: ids(projection.checkpoints ?? null),
-    contextHandoffs: ids(projection.contextHandoffs ?? null),
-    contextTransfers: ids(projection.contextTransfers ?? null),
-  };
+/** One case's table of distinct records. States refer into it, so a record that persists
+ *  across operations is written once. */
+export class Interner {
+  readonly table: Json[] = [];
+  readonly #index = new Map<string, number>();
+
+  ref(value: Json): number {
+    const key = JSON.stringify(value);
+    let index = this.#index.get(key);
+    if (index === undefined) {
+      index = this.table.length;
+      this.table.push(value);
+      this.#index.set(key, index);
+    }
+    return index;
+  }
+
+  /** A projection or shell snapshot as scalars, objects, and lists of refs. A listed row keeps
+   *  its position beside the ref, so a row that only shifted reuses its entry. */
+  record(value: Json): Json {
+    if (!isObject(value)) return value;
+    const scalars: { [key: string]: Json } = {};
+    const objects: { [key: string]: Json } = {};
+    const lists: { [key: string]: Json } = {};
+    for (const [key, field] of Object.entries(value)) {
+      if (Array.isArray(field)) {
+        lists[key] = field.map((entry) => {
+          if (!isObject(entry) || typeof entry.position !== "number") return this.ref(entry);
+          const { position, ...rest } = entry;
+          return [position, this.ref(rest)];
+        });
+      } else if (isObject(field)) {
+        objects[key] = this.ref(field);
+      } else {
+        scalars[key] = field;
+      }
+    }
+    return { scalars, objects, lists };
+  }
 }

@@ -3,10 +3,10 @@
 //! `ForwardCompatibleUnionArray` does. Nested shapes the native UI does not render yet stay
 //! as `Value`. `deferredWork` is never requested (no `acceptDeferredWork`), so it is not modeled.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnItem {
     // Defaults let an unknown `type` decode with only its discriminator, as
@@ -34,13 +34,13 @@ pub struct TurnItem {
     #[serde(default)]
     pub updated_at: String,
     // Wire-only dedupe markers (`DedupedBodyMarker`); `wire::restore_turn_item_bodies` clears them.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub text_omitted: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub files_omitted: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prompt_omitted: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub result_omitted: bool,
     #[serde(flatten)]
     pub kind: TurnItemKind,
@@ -60,7 +60,7 @@ impl TurnItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanStep {
     pub id: String,
@@ -68,7 +68,7 @@ pub struct PlanStep {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointFileSummary {
     pub path: String,
@@ -77,7 +77,7 @@ pub struct CheckpointFileSummary {
     pub deletions: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderFailure {
     pub class: String,
@@ -87,7 +87,7 @@ pub struct ProviderFailure {
     pub reset_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRetry {
     pub attempt: u64,
@@ -95,7 +95,7 @@ pub struct ProviderRetry {
     pub retry_delay_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChangeDetail {
     #[serde(default)]
@@ -105,7 +105,7 @@ pub struct FileChangeDetail {
     pub old_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum TurnItemKind {
     Notification {
@@ -189,7 +189,7 @@ pub enum TurnItemKind {
         output_indicates_failure: Option<bool>,
         #[serde(default)]
         exit_code: Option<i64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         output_omitted: bool,
     },
     FileSearch {
@@ -298,7 +298,7 @@ pub enum TurnItemKind {
         output: Option<Value>,
         #[serde(default)]
         viewed_image_path: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         output_omitted: bool,
     },
     #[serde(other)]

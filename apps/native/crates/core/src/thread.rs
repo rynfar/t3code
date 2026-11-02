@@ -4,8 +4,9 @@
 //! meta, the partial-timeline watermark). The reducer is in `thread/reduce.rs`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::history::ThreadHistoryMeta;
@@ -26,6 +27,12 @@ pub struct Entity {
     pub value: Value,
 }
 
+impl Serialize for Entity {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
 impl<'de> Deserialize<'de> for Entity {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = Value::deserialize(deserializer)?;
@@ -38,7 +45,7 @@ impl<'de> Deserialize<'de> for Entity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppThread {
     pub id: String,
@@ -56,7 +63,7 @@ pub struct AppThread {
     pub archived_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
     pub id: String,
@@ -79,7 +86,7 @@ impl Run {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunAttempt {
     pub id: String,
@@ -88,7 +95,7 @@ pub struct RunAttempt {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectedTurnItem {
     pub position: usize,
@@ -98,7 +105,7 @@ pub struct ProjectedTurnItem {
     pub item: Arc<TurnItem>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Local,
@@ -106,7 +113,7 @@ pub enum Visibility {
     Synthetic,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadProjection {
     pub thread: AppThread,
@@ -154,6 +161,8 @@ pub struct DomainEvent {
 pub enum EventBody {
     /// Every `thread.*` event that carries the whole thread and counts as activity.
     ThreadReplaced(Box<AppThread>),
+    /// `thread.deleted`: the reducer replaces the thread; `ThreadState` clears it instead.
+    ThreadDeleted(Box<AppThread>),
     /// `thread.visited`, `thread.tags-updated`, `thread.marked-unread`: not activity.
     ThreadTouched(Box<AppThread>),
     ThreadPullRequestLinkUpdated,
@@ -205,7 +214,8 @@ impl<'de> Deserialize<'de> for DomainEvent {
 fn decode_body(kind: &str, payload: Value) -> Result<EventBody, serde_json::Error> {
     use serde_json::from_value as from;
     Ok(match kind {
-        "thread.created" | "thread.archived" | "thread.unarchived" | "thread.deleted"
+        "thread.deleted" => EventBody::ThreadDeleted(Box::new(from(payload)?)),
+        "thread.created" | "thread.archived" | "thread.unarchived"
         | "thread.settled" | "thread.unsettled" | "thread.snoozed" | "thread.unsnoozed"
         | "thread.auto-settle-set" | "thread.pinned" | "thread.unpinned" | "thread.pin-reordered"
         | "thread.active-reordered" | "thread.metadata-updated" | "thread.pull-request-synced"
@@ -312,9 +322,29 @@ pub struct ThreadState {
     pub sequence: Option<u64>,
     pub synchronized: bool,
     pub history: ThreadHistoryMeta,
+    /// `thread.deleted` arrived: the projection and history are gone until a new snapshot.
+    pub deleted: bool,
+    /// Bumped whenever the projection is replaced, so a stale history merge is dropped.
+    pub(crate) generation: u64,
+    /// While a history page merges off the UI thread the projection is checked out; live
+    /// events wait here and apply after it, in order, as if the merge were instant.
+    pub(crate) merging: Option<Vec<DomainEvent>>,
 }
 
 impl ThreadState {
+    /// A history page is merging off the UI thread. Views keep showing what they have.
+    pub fn is_merging_history(&self) -> bool {
+        self.merging.is_some()
+    }
+
+    fn replace_projection(&mut self, projection: Option<ThreadProjection>) {
+        // Process-wide, so a merge started for one thread can never match another's state.
+        static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+        self.projection = projection;
+        self.generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        self.merging = None;
+    }
+
     /// Returns true when visible state changed.
     pub fn apply(&mut self, item: ThreadStreamItem) -> bool {
         match item {
@@ -333,7 +363,8 @@ impl ThreadState {
                     latest_local_turn_ordinal,
                     ..ThreadHistoryMeta::default()
                 };
-                self.projection = Some(*projection);
+                self.replace_projection(Some(*projection));
+                self.deleted = false;
                 self.sequence = Some(snapshot_sequence);
                 true
             }
@@ -342,24 +373,50 @@ impl ThreadState {
                     return false;
                 }
                 self.sequence = Some(sequence);
-                let Some(projection) = self.projection.as_mut() else { return false };
-                // Only an incomplete window is partial; `expanded` outlives the last page.
-                let options = self.history.apply_options();
-                let ordinal = match &event.body {
-                    EventBody::TurnItemUpserted(item) => Some(item.ordinal),
-                    _ => None,
-                };
-                let changed = apply_event(projection, *event, options);
-                if changed
-                    && options.partial_timeline
-                    && let Some(ordinal) = ordinal
-                    && self.history.latest_local_turn_ordinal.is_none_or(|watermark| ordinal > watermark)
-                {
-                    self.history.latest_local_turn_ordinal = Some(ordinal);
-                }
-                changed
+                self.apply_live_event(*event)
             }
             ThreadStreamItem::Unknown => false,
+        }
+    }
+
+    /// `applyEvent` in `threads.ts`: deletion clears the thread, a deleted thread ignores
+    /// events, and everything else goes through the reducer with the window's options.
+    fn apply_live_event(&mut self, event: DomainEvent) -> bool {
+        if self.deleted {
+            return false;
+        }
+        if matches!(event.body, EventBody::ThreadDeleted(_)) {
+            self.replace_projection(None);
+            self.history = ThreadHistoryMeta::default();
+            self.deleted = true;
+            return true;
+        }
+        if let Some(pending) = self.merging.as_mut() {
+            pending.push(event);
+            return false;
+        }
+        let Some(projection) = self.projection.as_mut() else { return false };
+        // Only an incomplete window is partial; `expanded` outlives the last page.
+        let options = self.history.apply_options();
+        let ordinal = match &event.body {
+            EventBody::TurnItemUpserted(item) => Some(item.ordinal),
+            _ => None,
+        };
+        let changed = apply_event(projection, event, options);
+        if changed
+            && options.partial_timeline
+            && let Some(ordinal) = ordinal
+            && self.history.latest_local_turn_ordinal.is_none_or(|watermark| ordinal > watermark)
+        {
+            self.history.latest_local_turn_ordinal = Some(ordinal);
+        }
+        changed
+    }
+
+    /// Applies events that arrived during a history merge, after it.
+    pub(crate) fn replay_pending(&mut self, pending: Vec<DomainEvent>) {
+        for event in pending {
+            self.apply_live_event(event);
         }
     }
 }

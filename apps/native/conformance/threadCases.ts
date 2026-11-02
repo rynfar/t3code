@@ -16,13 +16,14 @@ import {
   encodeStreamItem,
   HistoryMerge,
   HistoryPaging,
-  observed,
+  Interner,
   Projection,
   ThreadStream,
   WireProjection,
 } from "./runtime.ts";
 import type { HistoryMeta, Item, Json, ThreadProjection } from "./runtime.ts";
 import {
+  at,
   attempt,
   checkpointFor,
   event,
@@ -45,17 +46,25 @@ type ThreadClient = {
   projection: ThreadProjection | null;
   sequence: number | null;
   history: HistoryMeta;
+  deleted: boolean;
 };
 
 function newClient(): ThreadClient {
-  return { projection: null, sequence: null, history: HistoryMerge.EMPTY_THREAD_HISTORY_META };
+  return {
+    projection: null,
+    sequence: null,
+    history: HistoryMerge.EMPTY_THREAD_HISTORY_META,
+    deleted: false,
+  };
 }
 
-/** `applyItemLocked` / `applyEventsLocked` for one decoded item. */
+/** `applyItemLocked` / `applyEventsLocked` for one decoded item; `setThread` revives a
+ *  deleted thread and `setDeleted` clears one. */
 function applyStreamItem(client: ThreadClient, item: OrchestrationV2ThreadStreamItem) {
   if (item.kind === "synchronized") return;
   if (item.kind === "snapshot") {
     client.sequence = item.snapshotSequence;
+    client.deleted = false;
     const progressive =
       item.historyCursor !== undefined ||
       item.hasMoreHistory !== undefined ||
@@ -75,7 +84,14 @@ function applyStreamItem(client: ThreadClient, item: OrchestrationV2ThreadStream
   }
   if (client.sequence !== null && item.sequence <= client.sequence) return;
   client.sequence = item.sequence;
-  if (item.kind !== "event" || client.projection === null) return;
+  if (item.kind !== "event" || client.deleted) return;
+  if (item.event.type === "thread.deleted") {
+    client.projection = null;
+    client.history = HistoryMerge.EMPTY_THREAD_HISTORY_META;
+    client.deleted = true;
+    return;
+  }
+  if (client.projection === null) return;
   const history = client.history;
   const partial =
     history.hasMoreHistory || history.historyCursor !== null
@@ -100,6 +116,7 @@ function applyStreamItem(client: ThreadClient, item: OrchestrationV2ThreadStream
 function beginLoad(client: ThreadClient): string | null {
   const cursor = client.history.historyCursor;
   if (
+    client.deleted ||
     client.projection === null ||
     cursor === null ||
     !client.history.hasMoreHistory ||
@@ -129,7 +146,7 @@ function applyPage(
     return failLoad(client, requestCursor, "History did not advance.");
   }
   if (!HistoryMerge.isActiveHistoryRequestCursor(requestCursor, client.history)) return "stale";
-  if (client.projection === null) {
+  if (client.projection === null || client.deleted) {
     client.history = HistoryMerge.EMPTY_THREAD_HISTORY_META;
     return "stale";
   }
@@ -143,6 +160,8 @@ function applyPage(
 
 class ThreadCase {
   readonly ops: ThreadOp[] = [];
+  readonly states: Json[] = [];
+  readonly interner = new Interner();
   readonly client = newClient();
   readonly dedupe = WireProjection.makeLiveBodyDeduper();
   readonly name: string;
@@ -155,30 +174,39 @@ class ThreadCase {
     this.raw(encodeStreamItem(this.dedupe(item)));
   }
 
+  /** Records the client's observable state after every operation. */
+  #push(op: ThreadOp) {
+    const { projection, sequence, history, deleted } = this.client;
+    this.ops.push(op);
+    this.states.push({
+      projection: projection === null ? null : this.interner.record(encodeProjection(projection)),
+      sequence,
+      history: history as unknown as Json,
+      deleted,
+    });
+  }
+
   raw(json: Json) {
-    this.ops.push({ stream: json });
     applyStreamItem(this.client, decodeStreamItem(json));
+    this.#push({ stream: json });
   }
 
   begin() {
     const cursor = beginLoad(this.client);
-    this.ops.push({ begin: cursor });
+    this.#push({ begin: cursor });
     return cursor;
   }
 
   page(requestCursor: string, page: OrchestrationV2ThreadHistoryPage) {
     const json = encodeHistoryPage(page);
     const step = applyPage(this.client, requestCursor, decodeHistoryPage(json));
-    this.ops.push({ page: json, requestCursor, step });
+    this.#push({ page: json, requestCursor, step });
     return step;
   }
 
   fail(requestCursor: string, message: string) {
-    this.ops.push({
-      fail: message,
-      requestCursor,
-      step: failLoad(this.client, requestCursor, message),
-    });
+    const step = failLoad(this.client, requestCursor, message);
+    this.#push({ fail: message, requestCursor, step });
   }
 
   /** Loads every earlier page the way a user scrolling up would. */
@@ -195,16 +223,7 @@ class ThreadCase {
   }
 
   done() {
-    const { projection, sequence, history } = this.client;
-    return {
-      name: this.name,
-      ops: this.ops,
-      expected: {
-        projection: projection === null ? null : observed(encodeProjection(projection)),
-        sequence,
-        history: history as unknown as Json,
-      },
-    };
+    return { name: this.name, ops: this.ops, table: this.interner.table, states: this.states };
   }
 }
 
@@ -263,11 +282,14 @@ function longThread(turns: number, work: number, options: { agentOnly?: boolean 
       turnItem("user", `turn-${turn}-user`, ordinal++, {
         runId,
         createdBy: options.agentOnly ? "agent" : "user",
+        rich: turn % 5 === 0,
       }),
     );
     for (let step = 0; step < work; step += 1) {
       const kind = step % 3 === 0 ? "reasoning" : step % 3 === 1 ? "command" : "checkpoint";
-      items.push(turnItem(kind, `turn-${turn}-work-${step}`, ordinal++, { runId }));
+      items.push(
+        turnItem(kind, `turn-${turn}-work-${step}`, ordinal++, { runId, rich: turn % 5 === 0 }),
+      );
     }
     items.push(
       turnItem("assistant", `turn-${turn}-reply`, ordinal++, { runId, text: `Reply ${turn}` }),
@@ -303,7 +325,7 @@ export function threadCases() {
     c.stream({ kind: "event", sequence: ++sequence, event: itemEvent(reply) });
     c.stream({ kind: "event", sequence: sequence, event: itemEvent({ ...reply, ordinal: 1 }) });
     c.raw({ kind: "event", sequence: ++sequence, event: { type: "brand.new-event", payload: {} } });
-    const sub = turnItem("subagent", "live-task", 1001, { runId });
+    const sub = turnItem("subagent", "live-task", 1001, { runId, rich: true });
     c.stream({
       kind: "event",
       sequence: ++sequence,
@@ -326,6 +348,11 @@ export function threadCases() {
       kind: "event",
       sequence: ++sequence,
       event: runEvent({ ...live, status: "completed" }),
+    });
+    c.stream({
+      kind: "event",
+      sequence: ++sequence,
+      event: event("run.background-work-cancelled", { runId, restartCancelledBackgroundWork: [] }),
     });
     cases.push(c.done());
   }
@@ -384,6 +411,53 @@ export function threadCases() {
     c.stream(boundedSnapshot(longThread(33, 2), 600));
     c.page(cursor, serverHistoryPage(big, cursor, 500));
     c.begin();
+    cases.push(c.done());
+  }
+
+  {
+    // threads.ts intercepts the delete: it clears the projection and history, ignores later
+    // events and pages, and a new snapshot (a recreated thread) revives it.
+    const c = new ThreadCase("deletion during a load clears the thread and rejects the page");
+    c.stream(boundedSnapshot(big, 500));
+    const cursor = c.begin();
+    if (cursor === null) throw new Error("expected more history");
+    const thread = big.thread;
+    c.stream({
+      kind: "event",
+      sequence: 501,
+      event: event("thread.deleted", { ...thread, deletedAt: at(900) }),
+    });
+    c.page(cursor, serverHistoryPage(big, cursor, 500));
+    c.fail(cursor, "Environment is not connected.");
+    c.begin();
+    c.stream({
+      kind: "event",
+      sequence: 502,
+      event: itemEvent(turnItem("command", "after-delete", 9000, { runId: "run-0" })),
+    });
+    c.stream({
+      kind: "event",
+      sequence: 503,
+      event: event("thread.metadata-updated", { ...thread, title: "Ghost" }),
+    });
+    c.stream(boundedSnapshot(longThread(12, 1), 600));
+    c.begin();
+    cases.push(c.done());
+  }
+
+  {
+    const c = new ThreadCase("deletion before any snapshot, then a snapshot");
+    c.stream({
+      kind: "event",
+      sequence: 3,
+      event: event("thread.deleted", { ...small.thread, deletedAt: at(5) }),
+    });
+    c.stream({
+      kind: "event",
+      sequence: 4,
+      event: itemEvent(turnItem("command", "orphan", 1, { runId: "run-0" })),
+    });
+    c.stream(boundedSnapshot(small, 7));
     cases.push(c.done());
   }
 

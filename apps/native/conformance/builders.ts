@@ -31,7 +31,11 @@ type ItemOptions = {
   readonly status?: Item["status"];
   readonly text?: string;
   readonly createdBy?: "user" | "agent";
+  /** Sets every optional field the native types model, so the replay compares them too. */
+  readonly rich?: boolean;
 };
+
+const MODEL = { instanceId: "codex", model: "gpt-5.4" };
 
 export function turnItem(
   kind: ItemKind,
@@ -54,6 +58,12 @@ export function turnItem(
     startedAt: NOW,
     completedAt: NOW,
     updatedAt: NOW,
+    ...(options.rich
+      ? {
+          toolSurface: "browser",
+          toolSource: { key: "browser-1", name: "Browser", kind: "browser" },
+        }
+      : {}),
   };
   const text = options.text ?? `${kind} ${id}`;
   switch (kind) {
@@ -76,6 +86,15 @@ export function turnItem(
         inputIntent: kind === "queued" ? "queued_turn" : "turn_start",
         text,
         attachments: [],
+        ...(options.rich
+          ? {
+              scheduledTaskId: "scheduled-1",
+              senderThreadId: "thread-sender",
+              idleCompaction: "onReturn",
+              modelSwitch: { from: MODEL, to: { ...MODEL, model: "gpt-5.5" } },
+              context: { version: 1, records: [] },
+            }
+          : {}),
       } as Item;
     case "command":
       return {
@@ -84,6 +103,7 @@ export function turnItem(
         input: "pwd",
         output: text,
         exitCode: 0,
+        ...(options.rich ? { outputIndicatesFailure: true } : {}),
       } as Item;
     case "reasoning":
       return { ...base, type: "reasoning", text, streaming: false } as Item;
@@ -110,6 +130,7 @@ export function turnItem(
         childThreadId: null,
         prompt: `brief ${id}`,
         result: null,
+        ...(options.rich ? { progress: "halfway" } : {}),
       } as Item;
   }
 }
@@ -228,12 +249,19 @@ function recordsFor(items: ReadonlyArray<Item>) {
   };
 }
 
+/** The fixture thread, with every optional lineage field set. */
+const baseThread = {
+  ...Fixtures.v2Projection.thread,
+  lineage: { ...Fixtures.v2Projection.thread.lineage, sideChat: false },
+};
+
 export function projectionOf(
   parts: Partial<ThreadProjection> & { readonly items?: ReadonlyArray<Item> } = {},
 ): ThreadProjection {
   const { items = [], ...rest } = parts;
   return {
     ...Fixtures.v2Projection,
+    thread: baseThread,
     turnItems: items,
     visibleTurnItems: rowsOf(items),
     ...rest,
@@ -253,6 +281,7 @@ export function fullProjection(
   );
   return {
     ...Fixtures.v2Projection,
+    thread: baseThread,
     ...recordsFor(sorted),
     runs,
     turnItems: sorted,

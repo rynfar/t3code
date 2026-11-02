@@ -12,7 +12,7 @@ use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
 use t3_core::commands::{self, method};
 use t3_core::composer::ClientSettings;
-use t3_core::history::HistoryStep;
+use t3_core::history::{HistoryStep, PageOutcome};
 use t3_core::pairing::parse_pairing_link;
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
@@ -34,6 +34,8 @@ pub enum AppEvent {
     Selection,
     Thread,
     ServerConfig,
+    /// Only `thread.history_control()` changed: loading, error, or more history.
+    History,
 }
 
 pub struct AppState {
@@ -177,12 +179,24 @@ impl AppState {
                 self.select_thread(&id, cx);
             }
         }
-        if thread_changed {
+        if thread_changed && self.thread.deleted {
+            // The web treats a deleted open thread as missing and goes home.
+            self.close_selected_thread(cx);
+        } else if thread_changed {
             cx.emit(AppEvent::Thread);
         }
         if config_changed {
             cx.emit(AppEvent::ServerConfig);
         }
+    }
+
+    fn close_selected_thread(&mut self, cx: &mut Context<Self>) {
+        if let (Some(client), Some(thread_id)) = (&self.client, self.selected_thread.take()) {
+            client.close_thread(&thread_id);
+        }
+        self.thread = ThreadState::default();
+        cx.emit(AppEvent::Selection);
+        cx.emit(AppEvent::Thread);
     }
 
     fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
@@ -212,14 +226,17 @@ impl AppState {
     }
 
     /// Loads the page of history before the open thread's window, and keeps paging while pages
-    /// hold no user turn (`threads.ts` `loadEarlier`). A no-op while loading or at the start.
+    /// hold no user turn (`threads.ts` `loadEarlier`). The transcript's "Load earlier turns"
+    /// control and its retry call this. A no-op while loading or at the start.
     pub fn load_older_history(&mut self, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(client)) = (self.selected_thread.clone(), self.client.clone()) else { return };
         let Some(cursor) = self.thread.begin_history_load() else { return };
-        cx.emit(AppEvent::Thread);
+        cx.emit(AppEvent::History);
         self.fetch_history_page(thread_id, cursor, client, cx);
     }
 
+    /// Fetches and decodes on the network runtime, merges on the background executor, and
+    /// touches the UI thread only to check the projection out and swap the result back.
     fn fetch_history_page(&mut self, thread_id: String, cursor: String, client: ClientHandle, cx: &mut Context<Self>) {
         let task = {
             let (client, thread_id, cursor) = (client.clone(), thread_id.clone(), cursor.clone());
@@ -227,17 +244,39 @@ impl AppState {
         };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Could not load earlier activity.".into()));
+            let started = this.update(cx, |state, cx| {
+                if state.selected_thread.as_deref() != Some(thread_id.as_str()) {
+                    return None;
+                }
+                let outcome = match result {
+                    Ok(page) => state.thread.begin_history_merge(&cursor, page),
+                    Err(message) => PageOutcome::Step(state.thread.fail_history_load(&cursor, message)),
+                };
+                match outcome {
+                    PageOutcome::Merge(merge) => {
+                        cx.emit(AppEvent::History);
+                        Some(merge)
+                    }
+                    PageOutcome::Step(step) => {
+                        if step != HistoryStep::Stale {
+                            cx.emit(AppEvent::History);
+                        }
+                        None
+                    }
+                }
+            });
+            let Ok(Some(merge)) = started else { return };
+            let merged = cx.background_executor().spawn(async move { merge.run() }).await;
             let _ = this.update(cx, |state, cx| {
                 if state.selected_thread.as_deref() != Some(thread_id.as_str()) {
                     return;
                 }
-                let step = match result {
-                    Ok(page) => state.thread.apply_history_page(&cursor, page),
-                    Err(message) => state.thread.fail_history_load(&cursor, message),
-                };
-                if step != HistoryStep::Stale {
-                    cx.emit(AppEvent::Thread);
+                let step = state.thread.finish_history_merge(merged);
+                if step == HistoryStep::Stale {
+                    return;
                 }
+                cx.emit(AppEvent::Thread);
+                cx.emit(AppEvent::History);
                 if let HistoryStep::Continue(next) = step {
                     state.fetch_history_page(thread_id, next, client, cx);
                 }

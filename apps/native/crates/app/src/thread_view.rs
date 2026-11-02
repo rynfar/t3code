@@ -68,6 +68,9 @@ impl ThreadView {
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let selected = state.selected_thread.clone();
+        if selected == self.thread_id && state.thread.is_merging_history() {
+            return;
+        }
         if selected != self.thread_id {
             self.thread_id = selected;
             self.ui = TranscriptUi::default();
@@ -202,7 +205,8 @@ fn toggle(set: &mut std::collections::HashSet<String>, key: &str) {
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let loading = self.state.read(cx).thread.projection.is_none();
+        let thread = &self.state.read(cx).thread;
+        let loading = thread.projection.is_none() && !thread.is_merging_history();
         let muted = hsla(palette(cx).muted_foreground);
         if loading {
             return div().size_full().flex().items_center().justify_center().text_sm().text_color(muted).child("Loading thread…").into_any_element();
