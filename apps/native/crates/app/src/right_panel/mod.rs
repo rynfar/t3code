@@ -10,7 +10,7 @@ mod tabs;
 use std::time::Duration;
 
 use gpui::{
-    App, Context, DragMoveEvent, Entity, EmptyView, IntoElement, KeyBinding, ParentElement, Render, StyleRefinement,
+    App, Context, DragMoveEvent, Entity, EmptyView, IntoElement, ParentElement, Render, StyleRefinement,
     Styled, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 use gpui_component::v_flex;
@@ -27,7 +27,8 @@ use crate::workspace::SIDEBAR_WIDTH;
 
 actions!(right_panel, [ToggleRightPanel, ToggleDiff, CloseActiveSurface, ReopenClosedView, ToggleMaximized]);
 
-/// Default bindings from `packages/shared/src/keybindings.ts`.
+/// The actions behind `rightPanel.toggle`, `rightPanel.toggleMaximized`, `rightPanel.close`,
+/// `view.reopenClosed` and `diff.toggle`; `keymap` binds their keys and `when` clauses.
 pub fn init(state: Entity<AppState>, cx: &mut App) {
     let bind = |state: &Entity<AppState>, run: fn(&mut AppState, &mut Context<AppState>)| {
         let state = state.clone();
@@ -43,12 +44,6 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     cx.on_action(move |_: &ReopenClosedView, cx| reopen(cx));
     let maximize = bind(&state, AppState::toggle_right_panel_maximized);
     cx.on_action(move |_: &ToggleMaximized, cx| maximize(cx));
-    cx.bind_keys([
-        KeyBinding::new("cmd-alt-b", ToggleRightPanel, None),
-        KeyBinding::new("cmd-d", ToggleDiff, None),
-        KeyBinding::new("cmd-w", CloseActiveSurface, None),
-        KeyBinding::new("cmd-shift-t", ReopenClosedView, None),
-    ]);
 }
 
 struct ResizeDrag;
@@ -83,7 +78,8 @@ impl RightPanelView {
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = f32::from(window.viewport_size().width);
-        let width = clamp_width(f32::from(event.bounds.right() - event.event.position.x), viewport, viewport - SIDEBAR_WIDTH);
+        let row = viewport - sidebar_width(self.state.read(cx));
+        let width = clamp_width(f32::from(event.bounds.right() - event.event.position.x), viewport, row);
         self.state.update(cx, |state, cx| state.set_right_panel_width(width, false, cx));
         // Persist once the drag settles, not on every frame of it.
         self._save_width = Some(cx.spawn(async move |this, cx| {
@@ -128,7 +124,10 @@ impl Render for RightPanelView {
         }
         let viewport = f32::from(window.viewport_size().width);
         let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
-        let width = clamp_width(stored, viewport, viewport - SIDEBAR_WIDTH);
+        let width = clamp_width(stored, viewport, viewport - sidebar_width(state));
+        // Maximized beside a hidden sidebar, the tab bar clears the traffic lights and the
+        // sidebar toggle as the thread header does (design-system §5).
+        let titlebar_inset = panel.maximized && state.sidebar.collapsed;
         let p = palette(cx);
         let content = match panel.active().map(|surface| &surface.kind) {
             // Cached: transcript streaming redraws the window, but only diff changes repaint it.
@@ -147,10 +146,14 @@ impl Render for RightPanelView {
             })
             .on_drag_move(cx.listener(Self::resize))
             .when(!panel.maximized, |this| this.child(self.render_resize_handle(cx)))
-            .child(tabs::tab_bar(self.state.clone(), &panel, window, cx))
+            .child(tabs::tab_bar(self.state.clone(), &panel, titlebar_inset, window, cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(content))
             .into_any_element()
     }
+}
+
+fn sidebar_width(state: &AppState) -> f32 {
+    if state.sidebar.collapsed { 0. } else { SIDEBAR_WIDTH }
 }
 
 /// The window's top-right controls (`PanelLayoutControls.tsx` right panel toggle and
@@ -183,7 +186,7 @@ pub fn header_controls(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                 .icon(Icon::PanelRight)
                 .pressed(open)
                 .disabled(thread.is_none())
-                .tooltip("Toggle right panel (⌥⌘B)")
+                .tooltip(crate::keymap::label("rightPanel.toggle", cx).map_or_else(|| "Toggle right panel".to_owned(), |key| format!("Toggle right panel ({key})")))
                 .on_click(move |_, _, cx| toggle_state.update(cx, |state, cx| state.toggle_right_panel(cx))),
         )
 }

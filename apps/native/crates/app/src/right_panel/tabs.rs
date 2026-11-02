@@ -29,7 +29,7 @@ fn surface_icon(surface: &Surface) -> Icon {
     }
 }
 
-pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, window: &mut Window, cx: &mut App) -> AnyElement {
+pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let count = panel.surfaces.len();
     let tabs: Vec<_> = panel
         .surfaces
@@ -44,7 +44,7 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, window: &mut Window
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
         .flex_none()
-        .pl(px(8.))
+        .pl(px(if titlebar_inset { 130. } else { 8. }))
         .pr(px(12.))
         .gap(px(4.))
         .window_control_area(WindowControlArea::Drag)
