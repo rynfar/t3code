@@ -5,10 +5,12 @@
 mod child_work;
 mod relationships;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, canvas, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{ApprovalDecision, respond_to_approval};
 use t3_core::lineage::{
@@ -62,7 +64,26 @@ pub struct ComposerLineage {
     errors: HashMap<String, String>,
     child_work: Option<Entity<child_work::ChildWorkDialog>>,
     ticker: Option<Task<()>>,
+    /// The bar's width at the last paint: the web sizes it by the composer surface.
+    bar_width: Rc<Cell<f32>>,
     _subscription: Subscription,
+}
+
+/// `ProviderSubagentBar.tsx`'s `@max-[N]/composer-surface` breakpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BarLayout {
+    /// At 560px or less the status drops to its own line.
+    stacked: bool,
+    /// At 640px or less "Runs on its own" hides.
+    hide_note: bool,
+    /// At 320px or less "Open parent" shows only its icon.
+    icon_only: bool,
+}
+
+impl BarLayout {
+    fn of(width: f32) -> BarLayout {
+        BarLayout { stacked: width <= 560., hide_note: width <= 640., icon_only: width <= 320. }
+    }
 }
 
 impl ComposerLineage {
@@ -79,6 +100,7 @@ impl ComposerLineage {
             errors: HashMap::new(),
             child_work: None,
             ticker: None,
+            bar_width: Rc::new(Cell::new(f32::INFINITY)),
             _subscription: subscription,
         };
         view.refresh(cx);
@@ -236,13 +258,13 @@ impl ComposerLineage {
             .into_any_element()
     }
 
-    fn render_bar(&self, bar: &SubagentBar, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_bar(&self, bar: &SubagentBar, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let muted = hsla(p.muted_foreground);
         let status = format_provider_subagent_status(bar.status.as_ref(), chrono::Utc::now().timestamp_millis());
-        // The web sizes this by the composer: a narrow column puts the status on its own line.
-        let narrow = f32::from(window.viewport_size().width) < 900.;
+        // Sized by the chat column, not the window: a docked side panel narrows it on a wide window.
+        let layout = BarLayout::of(self.bar_width.get());
         let parent = bar.parent_id.clone();
         let surface = hsla(if dark { p.surface_raised } else { p.card });
         let outline = if dark { gpui::white().opacity(0.05) } else { gpui::black().opacity(0.08) };
@@ -271,12 +293,12 @@ impl ComposerLineage {
                     .flex()
                     .flex_1()
                     .min_w_0()
-                    .when(narrow, |this| this.flex_col().items_start().gap(px(2.)))
-                    .when(!narrow, |this| this.items_center().gap(px(12.)))
+                    .when(layout.stacked, |this| this.flex_col().items_start().gap(px(2.)))
+                    .when(!layout.stacked, |this| this.items_center().gap(px(12.)))
                     .child(model)
-                    .child(div().min_w_0().max_w_full().truncate().text_color(muted).when(narrow, |this| this.text_xs()).child(status)),
+                    .child(div().min_w_0().max_w_full().truncate().text_color(muted).when(layout.stacked, |this| this.text_xs()).child(status)),
             )
-            .when(!narrow, |this| this.child(div().flex_none().text_color(muted).child("Runs on its own")))
+            .when(!layout.hide_note, |this| this.child(div().flex_none().text_color(muted).child("Runs on its own")))
             .when(bar.child_work, |this| {
                 this.child(
                     Button::new("subagent-work")
@@ -288,12 +310,9 @@ impl ComposerLineage {
                 )
             })
             .children(parent.map(|parent| {
-                Button::new("subagent-open-parent")
-                    .variant(Variant::Ghost)
-                    .size(Size::Xs)
-                    .icon(Icon::ArrowUpLeft)
-                    .label("Open parent")
-                    .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.select_thread(&parent, cx))))
+                let button = Button::new("subagent-open-parent").variant(Variant::Ghost).icon(Icon::ArrowUpLeft);
+                let button = if layout.icon_only { button.size(Size::IconXs).tooltip("Open parent") } else { button.size(Size::Xs).label("Open parent") };
+                button.on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.select_thread(&parent, cx))))
             }))
             .into_any_element()
     }
@@ -312,13 +331,28 @@ impl ComposerLineage {
 }
 
 impl Render for ComposerLineage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.snapshot.approvals.is_empty() && self.snapshot.bar.is_none() {
             return div().into_any_element();
         }
         let entries = self.snapshot.approvals.clone();
         let approvals: Vec<AnyElement> = entries.iter().map(|entry| self.render_approval(entry, cx)).collect();
-        let bar = self.snapshot.bar.clone().map(|bar| self.render_bar(&bar, window, cx));
+        let bar = self.snapshot.bar.clone().map(|bar| self.render_bar(&bar, cx));
+        // Measures the bar's column; crossing a breakpoint lays the bar out again.
+        let measure = bar.is_some().then(|| {
+            let (width, view) = (self.bar_width.clone(), cx.entity_id());
+            canvas(
+                move |bounds, _, cx| {
+                    let next = f32::from(bounds.size.width);
+                    if BarLayout::of(next) != BarLayout::of(width.replace(next)) {
+                        cx.notify(view);
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        });
         let has_approvals = !approvals.is_empty();
         let has_bar = bar.is_some();
         div()
@@ -330,7 +364,9 @@ impl Render for ComposerLineage {
             .child(
                 v_flex()
                     .w_full()
+                    .relative()
                     .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
+                    .children(measure)
                     .when(has_approvals, |this| {
                         this.child(v_flex().id("child-thread-approvals").max_h(px(320.)).overflow_y_scroll().gap(px(8.)).mb(px(8.)).children(approvals))
                     })
