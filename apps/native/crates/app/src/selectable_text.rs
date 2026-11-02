@@ -4,16 +4,18 @@
 //! extends. `mod+c` copies, `mod+a` selects all of the focused text, the context menu offers Copy,
 //! and a click anywhere else clears it. The rules live in `t3_core::text_selection`; this maps the
 //! pointer to offsets and paints. The text takes its font and colour from the parent, and the
-//! selection holds while text grows underneath it. It redraws only when the selection changes.
+//! selection holds while text grows underneath it or a bounded tail drops its front. It redraws only
+//! when the selection changes, and a drag past its scroller's edge scrolls it.
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, GlobalElementId, HighlightStyle, Hitbox,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, GlobalElementId, HighlightStyle, Hitbox,
     HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, RenderOnce, SharedString, Styled, StyledText, Subscription, TextLayout, TextStyleRefinement, Window, WrappedLineLayout, div,
-    fill, point, px,
+    ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Styled, StyledText, Subscription, TextLayout, TextStyleRefinement, Window,
+    WrappedLineLayout, div, fill, point, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Copy, SelectAll};
@@ -21,6 +23,10 @@ use gpui_component::menu::ContextMenuExt;
 use t3_core::text_selection::{Granularity, Hit, Selection};
 
 const CONTEXT: &str = "SelectableText";
+/// A drag held past the scroller's edge scrolls it this often, by how far past it is, up to
+/// `AUTOSCROLL_MAX` a step.
+const AUTOSCROLL_STEP: Duration = Duration::from_millis(33);
+const AUTOSCROLL_MAX: f32 = 48.;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("cmd-c", Copy, Some(CONTEXT)), KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT))]);
@@ -33,12 +39,14 @@ pub struct SelectableText {
     id: ElementId,
     text: SharedString,
     highlights: Option<Highlights>,
+    origin: usize,
+    scroll: Option<ScrollHandle>,
 }
 
 impl SelectableText {
     /// `id` keys the selection, so it stays the same while the text is on screen.
     pub fn new(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        SelectableText { id: id.into(), text: text.into(), highlights: None }
+        SelectableText { id: id.into(), text: text.into(), highlights: None, origin: 0, scroll: None }
     }
 
     /// Styled byte ranges, sorted and not overlapping, as `StyledText::with_highlights` takes them.
@@ -46,32 +54,129 @@ impl SelectableText {
         self.highlights = Some(highlights);
         self
     }
+
+    /// Where `text` starts in a stream that loses bytes from its front, such as a bounded tail:
+    /// as the origin grows the selection moves with its text. An origin that falls back starts over.
+    pub fn origin(mut self, origin: usize) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// The scroller the text sits in: a drag held past its top or bottom edge scrolls it.
+    pub fn autoscroll(mut self, scroll: &ScrollHandle) -> Self {
+        self.scroll = Some(scroll.clone());
+        self
+    }
 }
 
 struct State {
     focus: FocusHandle,
-    /// The text the selection's offsets index.
+    /// The text the selection's offsets index, and where it starts in its stream.
     text: SharedString,
+    origin: usize,
     selection: Option<Selection>,
     dragging: bool,
     /// Held while this text's context menu is open: a click on the menu, or the one that
     /// dismisses it, must not clear the selection it copies.
     menu: Option<Subscription>,
+    scroll: Option<ScrollHandle>,
+    /// The last painted layout and drag position, for auto-scroll steps between pointer moves.
+    layout: Option<TextLayout>,
+    pointer: Point<Pixels>,
+    autoscrolling: bool,
 }
 
 impl State {
     /// Takes the text being drawn; a changed text carries the selection over or drops it.
-    fn sync(&mut self, text: &SharedString) {
-        if self.text.as_ptr() == text.as_ptr() && self.text.len() == text.len() {
+    fn sync(&mut self, text: &SharedString, origin: usize) {
+        if self.text.as_ptr() == text.as_ptr() && self.text.len() == text.len() && self.origin == origin {
             return;
         }
-        self.selection = self.selection.take().and_then(|selection| selection.remap(&self.text, text));
+        let dropped = origin.saturating_sub(self.origin);
+        self.selection = self.selection.take().and_then(|selection| selection.remap(&self.text, text, dropped));
         self.text = text.clone();
+        self.origin = origin;
     }
 
     fn selected(&self) -> Option<&str> {
         self.selection.as_ref().map(|selection| selection.text(&self.text)).filter(|text| !text.is_empty())
     }
+
+    /// A drag step at `pointer`: scrolls the scroller when the pointer is past its edge, then
+    /// extends the selection to what is under the pointer. Returns whether it scrolled.
+    fn drag_to(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        self.pointer = pointer;
+        let scrolled = self.scroll.as_ref().is_some_and(|scroll| autoscroll(scroll, pointer));
+        let text = self.text.clone();
+        let hit = self.layout.as_ref().map(|layout| hit_test(layout, pointer));
+        let extended = hit.is_some_and(|hit| self.selection.as_mut().is_some_and(|selection| selection.extend(&text, hit)));
+        if scrolled || extended {
+            cx.notify();
+        }
+        scrolled
+    }
+
+    /// Keeps scrolling while the drag holds the pointer past the scroller's edge.
+    fn keep_scrolling(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.autoscrolling, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_STEP).await;
+                let more = this.update(cx, |state, cx| state.dragging && state.drag_to(state.pointer, cx));
+                if !more.unwrap_or(false) {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |state, _| state.autoscrolling = false);
+        })
+        .detach();
+    }
+}
+
+/// Scrolls toward a pointer past the scroller's top or bottom edge. Returns whether it moved.
+fn autoscroll(scroll: &ScrollHandle, pointer: Point<Pixels>) -> bool {
+    let offset = scroll.offset();
+    let Some(y) = autoscroll_offset(scroll.bounds(), offset.y, scroll.max_offset().y, pointer.y) else { return false };
+    scroll.set_offset(point(offset.x, y));
+    true
+}
+
+/// The offset one step takes a scroller (`offset` from 0 down to `-max`) toward a pointer past
+/// its top or bottom edge, by how far past it is; `None` inside it or with no further to go.
+fn autoscroll_offset(bounds: Bounds<Pixels>, offset: Pixels, max: Pixels, pointer: Pixels) -> Option<Pixels> {
+    let past = if pointer < bounds.top() {
+        pointer - bounds.top()
+    } else if pointer > bounds.bottom() {
+        pointer - bounds.bottom()
+    } else {
+        return None;
+    };
+    let step = f32::from(past).clamp(-AUTOSCROLL_MAX, AUTOSCROLL_MAX);
+    let y = px((f32::from(offset) - step).clamp(-f32::from(max), 0.));
+    (y != offset).then_some(y)
+}
+
+/// `highlights` with their fills lifted where `selected` runs, so the selection shows over a
+/// coloured span as `::selection` does in the browser.
+fn lift_fills(highlights: &[(Range<usize>, HighlightStyle)], selected: Range<usize>) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut out = Vec::with_capacity(highlights.len() + 2);
+    for (range, style) in highlights {
+        if style.background_color.is_none() || range.end <= selected.start || range.start >= selected.end {
+            out.push((range.clone(), *style));
+            continue;
+        }
+        let inner = range.start.max(selected.start)..range.end.min(selected.end);
+        if range.start < inner.start {
+            out.push((range.start..inner.start, *style));
+        }
+        out.push((inner.clone(), HighlightStyle { background_color: None, ..*style }));
+        if inner.end < range.end {
+            out.push((inner.end..range.end, *style));
+        }
+    }
+    out
 }
 
 fn copy(state: &Entity<State>, cx: &mut App) {
@@ -84,12 +189,23 @@ fn copy(state: &Entity<State>, cx: &mut App) {
 
 impl RenderOnce for SelectableText {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let initial = self.text.clone();
-        let state =
-            window.use_keyed_state(self.id.clone(), cx, |_, cx| State { focus: cx.focus_handle(), text: initial, selection: None, dragging: false, menu: None });
-        let focus = state.update(cx, |state, _| {
-            state.sync(&self.text);
-            state.focus.clone()
+        let initial = (self.text.clone(), self.origin);
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| State {
+            focus: cx.focus_handle(),
+            text: initial.0,
+            origin: initial.1,
+            selection: None,
+            dragging: false,
+            menu: None,
+            scroll: None,
+            layout: None,
+            pointer: Point::default(),
+            autoscrolling: false,
+        });
+        let (focus, selected) = state.update(cx, |state, _| {
+            state.sync(&self.text, self.origin);
+            state.scroll = self.scroll;
+            (state.focus.clone(), state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()))
         });
         let (copy_state, all_state, menu_state, menu_focus) = (state.clone(), state.clone(), state.clone(), focus.clone());
         // The context menu draws inside this div: it gets the app's font, the text keeps the caller's.
@@ -106,7 +222,7 @@ impl RenderOnce for SelectableText {
                     cx.notify();
                 })
             })
-            .child(TextElement::new(state, self.text, self.highlights, font_family))
+            .child(TextElement::new(state, self.text, self.highlights, selected, font_family))
             .context_menu(move |menu, _, cx| {
                 let popup = cx.entity();
                 let selected = menu_state.update(cx, |state, cx| {
@@ -126,11 +242,12 @@ struct TextElement {
 }
 
 impl TextElement {
-    fn new(state: Entity<State>, text: SharedString, highlights: Option<Highlights>, font_family: SharedString) -> Self {
+    fn new(state: Entity<State>, text: SharedString, highlights: Option<Highlights>, selected: Option<Range<usize>>, font_family: SharedString) -> Self {
         let text = StyledText::new(text);
-        let text = match highlights {
-            Some(highlights) => text.with_highlights(highlights.iter().cloned()),
-            None => text,
+        let text = match (highlights, selected) {
+            (Some(highlights), Some(selected)) => text.with_highlights(lift_fills(&highlights, selected)),
+            (Some(highlights), None) => text.with_highlights(highlights.iter().cloned()),
+            (None, _) => text,
         };
         TextElement { state, text, font_family }
     }
@@ -185,10 +302,10 @@ impl Element for TextElement {
         cx: &mut App,
     ) {
         let text_layout = self.text.layout().clone();
-        let (range, dragging, selected) = {
-            let state = self.state.read(cx);
+        let (range, dragging, selected) = self.state.update(cx, |state, _| {
+            state.layout = Some(text_layout.clone());
             (state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()), state.dragging, state.selection.is_some())
-        };
+        });
         if let Some(range) = range {
             let color = cx.theme().selection;
             let lines = text_layout.line_layouts();
@@ -231,24 +348,18 @@ impl Element for TextElement {
         });
         // Capture phase, so the drag follows the pointer over anything that stops it.
         window.on_mouse_event({
-            let (state, text_layout) = (self.state.clone(), text_layout);
+            let state = self.state.clone();
             move |event: &MouseMoveEvent, phase, _, cx| {
                 if !phase.capture() || !state.read(cx).dragging {
                     return;
                 }
-                if event.pressed_button != Some(MouseButton::Left) {
-                    // Released where the window could not see it.
-                    state.update(cx, |state, cx| {
+                state.update(cx, |state, cx| {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        // Released where the window could not see it.
                         state.dragging = false;
                         cx.notify();
-                    });
-                    return;
-                }
-                let hit = hit_test(&text_layout, event.position);
-                state.update(cx, |state, cx| {
-                    let text = state.text.clone();
-                    if state.selection.as_mut().is_some_and(|selection| selection.extend(&text, hit)) {
-                        cx.notify();
+                    } else if state.drag_to(event.position, cx) {
+                        state.keep_scrolling(cx);
                     }
                 });
             }
@@ -462,5 +573,31 @@ mod tests {
         let right = px(ORIGIN.0 + RIGHT);
         assert_eq!(text.selection_rects(3..8, right), vec![rect(30., 0., RIGHT - 30.), rect(0., 20., 20.)]);
         assert_eq!(text.selection_rects(5..6, right), vec![rect(50., 0., RIGHT - 50.)], "only the newline");
+    }
+
+    #[test]
+    fn a_selection_lifts_span_fills_only_where_it_runs() {
+        let fill = |color: u32| HighlightStyle { background_color: Some(gpui::rgb(color).into()), ..HighlightStyle::default() };
+        let bold = HighlightStyle { font_weight: Some(gpui::FontWeight::BOLD), ..HighlightStyle::default() };
+        let lifted = HighlightStyle { background_color: None, ..fill(0xff0000) };
+        let highlights = [(0..5, fill(0xff0000)), (5..8, bold), (8..12, fill(0x0000ff))];
+        assert_eq!(
+            lift_fills(&highlights, 3..10),
+            vec![(0..3, fill(0xff0000)), (3..5, lifted), (5..8, bold), (8..10, HighlightStyle { background_color: None, ..fill(0x0000ff) }), (10..12, fill(0x0000ff))]
+        );
+        assert_eq!(lift_fills(&highlights, 12..12), highlights.to_vec(), "nothing selected over them");
+    }
+
+    #[test]
+    fn a_drag_past_the_scrollers_edge_scrolls_toward_it() {
+        let scroller = Bounds::new(point(px(0.), px(100.)), size(px(400.), px(320.)));
+        let step = |offset: f32, pointer: f32| autoscroll_offset(scroller, px(offset), px(500.), px(pointer)).map(f32::from);
+        assert_eq!(step(0., 300.), None, "inside the scroller");
+        assert_eq!(step(0., 430.), Some(-10.), "10px below scrolls down 10px");
+        assert_eq!(step(-10., 900.), Some(-58.), "far below, one step is capped");
+        assert_eq!(step(-490., 900.), Some(-500.));
+        assert_eq!(step(-500., 900.), None, "already at the end");
+        assert_eq!(step(-100., 50.), Some(-52.), "above scrolls back up");
+        assert_eq!(step(0., 50.), None, "already at the top");
     }
 }

@@ -14,3 +14,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
 unicode-normalization = "0.1"
+unicode-segmentation = "1.13"

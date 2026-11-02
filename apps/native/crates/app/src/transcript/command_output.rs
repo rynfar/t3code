@@ -135,7 +135,12 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
         .child(
             mono_frame(cx)
                 .text_color(hsla(palette(cx).muted_foreground))
-                .child(SelectableText::new(SharedString::from(format!("command-output-text:{entry_id}")), display.text).highlights(display.highlights)),
+                .child(
+                    SelectableText::new(SharedString::from(format!("command-output-text:{entry_id}")), display.text)
+                        .highlights(display.highlights)
+                        .origin(output.origin)
+                        .autoscroll(&slot.scroll),
+                ),
         );
     Some(v_flex().w_full().min_w_0().when(output.truncated, |this| this.child(note(TRUNCATED, cx))).child(scroller).into_any_element())
 }

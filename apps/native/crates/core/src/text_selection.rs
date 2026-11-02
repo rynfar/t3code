@@ -1,10 +1,13 @@
 //! Selecting plain text the way a browser selects the web's: `CommandOutputPanel.tsx` (and every
 //! transcript row) leaves its text to native DOM selection. A press places a caret or takes the
 //! word or line under the pointer; a drag or shift-click grows the selection from that unit by the
-//! same granularity. Offsets are UTF-8 byte offsets into the drawn text. The view turns pointer
-//! positions into a [`Hit`], and paints and copies [`Selection::range`].
+//! same granularity. Offsets are UTF-8 byte offsets into the drawn text, and every edge falls on a
+//! grapheme boundary. The view turns pointer positions into a [`Hit`], and paints and copies
+//! [`Selection::range`].
 
 use std::ops::Range;
+
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 /// What a press takes and a drag then grows by: characters, words (double-click) or lines
 /// (triple-click).
@@ -77,21 +80,16 @@ impl Selection {
         text.get(self.range()).unwrap_or_default()
     }
 
-    /// The same selection after the text changed from `old` to `new`: kept while everything up to
-    /// its end is unchanged (output appended or redrawn below it), moved when a bounded tail
-    /// dropped its oldest lines, and `None` once the selected text itself was redrawn or dropped.
-    pub fn remap(&self, old: &str, new: &str) -> Option<Self> {
+    /// The same selection after the text changed from `old` to `new`, where `dropped` bytes left
+    /// the front in between (a bounded tail; zero for text that only grows or is redrawn). It moves
+    /// with its text, and is `None` once that text was dropped or redrawn.
+    pub fn remap(&self, old: &str, new: &str, dropped: usize) -> Option<Self> {
         let range = self.range();
-        if range.end <= common_prefix(old, new) {
-            return Some(self.clone());
+        let start = range.start.checked_sub(dropped)?;
+        if new.get(start..start + range.len())? != old.get(range)? {
+            return None;
         }
-        // A tail that drops its oldest lines starts at a line of the old text, and at least as
-        // far in as the old text outgrew the new one.
-        let lowest = old.len().saturating_sub(new.len());
-        let shift = (lowest..=range.start)
-            .filter(|&at| at == lowest || old.as_bytes()[at - 1] == b'\n')
-            .find(|&at| old.is_char_boundary(at) && new.as_bytes().starts_with(&old.as_bytes()[at..range.end]))?;
-        let moved = |range: &Range<usize>| range.start - shift..range.end - shift;
+        let moved = |range: &Range<usize>| range.start - dropped..range.end - dropped;
         Some(Selection { anchor: moved(&self.anchor), head: moved(&self.head), granularity: self.granularity })
     }
 }
@@ -99,7 +97,7 @@ impl Selection {
 fn unit(text: &str, hit: Hit, granularity: Granularity) -> Range<usize> {
     match granularity {
         Granularity::Char => {
-            let caret = text.floor_char_boundary(hit.caret);
+            let caret = grapheme_start(text, hit.caret);
             caret..caret
         }
         Granularity::Word => word_range_at(text, hit.under),
@@ -107,10 +105,14 @@ fn unit(text: &str, hit: Hit, granularity: Granularity) -> Range<usize> {
     }
 }
 
-/// The longest shared prefix, ending on a character boundary.
-fn common_prefix(a: &str, b: &str) -> usize {
-    let same = a.bytes().zip(b.bytes()).take_while(|(a, b)| a == b).count();
-    a.floor_char_boundary(same)
+/// The start of the grapheme `index` falls in: a caret never splits a base from its marks.
+fn grapheme_start(text: &str, index: usize) -> usize {
+    let index = text.floor_char_boundary(index);
+    let mut cursor = GraphemeCursor::new(index, text.len(), true);
+    match cursor.is_boundary(text, 0) {
+        Ok(false) => cursor.prev_boundary(text, 0).ok().flatten().unwrap_or(0),
+        _ => index,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,25 +135,30 @@ fn kind(character: char) -> Kind {
     }
 }
 
-/// What a double-click on the character at `index` selects: its word, its run of spaces, or the
-/// punctuation mark alone. Past a line's end it is the line's last character; an empty line
-/// selects nothing.
+/// A grapheme's kind is its base character's: combining marks and emoji modifiers ride along.
+fn grapheme_kind(grapheme: &str) -> Kind {
+    grapheme.chars().next().map_or(Kind::Other, kind)
+}
+
+/// What a double-click on the grapheme at `index` selects: its word, its run of spaces, or the
+/// punctuation mark or symbol alone. Past a line's end it is the line's last grapheme; an empty
+/// line selects nothing.
 pub fn word_range_at(text: &str, index: usize) -> Range<usize> {
-    let mut index = text.floor_char_boundary(index);
+    let mut index = grapheme_start(text, index);
     if matches!(text[index..].chars().next(), None | Some('\n')) {
-        match text[..index].chars().next_back() {
-            Some(previous) if previous != '\n' => index -= previous.len_utf8(),
+        match text[..index].graphemes(true).next_back() {
+            Some(previous) if previous != "\n" => index -= previous.len(),
             _ => return index..index,
         }
     }
-    let Some(character) = text[index..].chars().next() else { return index..index };
-    let kind = kind(character);
+    let Some(grapheme) = text[index..].graphemes(true).next() else { return index..index };
+    let kind = grapheme_kind(grapheme);
     if kind == Kind::Other {
-        return index..index + character.len_utf8();
+        return index..index + grapheme.len();
     }
-    let same = |other: &char| self::kind(*other) == kind;
-    let start = index - text[..index].chars().rev().take_while(same).map(char::len_utf8).sum::<usize>();
-    let end = index + text[index..].chars().take_while(same).map(char::len_utf8).sum::<usize>();
+    let same = |other: &&str| grapheme_kind(other) == kind;
+    let start = index - text[..index].graphemes(true).rev().take_while(same).map(str::len).sum::<usize>();
+    let end = index + text[index..].graphemes(true).take_while(same).map(str::len).sum::<usize>();
     start..end
 }
 
@@ -270,42 +277,98 @@ mod tests {
     }
 
     #[test]
+    fn a_double_click_keeps_marks_and_modifiers_with_their_base() {
+        // `e` plus a combining acute, and a thumbs-up with a skin tone: one grapheme each.
+        let text = "cafe\u{301} au lait 👍🏽!";
+        let word = |index| &text[word_range_at(text, index)];
+        assert_eq!(word(at(text, "f")), "cafe\u{301}");
+        assert_eq!(word(at(text, "\u{301}")), "cafe\u{301}", "on the mark itself");
+        assert_eq!(word(at(text, "👍")), "👍🏽");
+        assert_eq!(word(at(text, "🏽")), "👍🏽", "on the modifier itself");
+        // A caret that lands between a base and its mark falls back before the base.
+        let caret = Selection::press(text, hit(at(text, "\u{301}")), Granularity::Char);
+        assert_eq!(caret.range(), at(text, "e\u{301}")..at(text, "e\u{301}"));
+    }
+
+    #[test]
     fn appended_or_redrawn_output_below_keeps_the_selection() {
         let old = "compiling a\ncompiling b\n10%";
         let mut selection = Selection::press(old, hit(at(old, "a")), Granularity::Word);
         selection.extend(old, hit(at(old, "b\n")));
         let appended = format!("{old}\ncompiling c");
-        assert_eq!(selection.remap(old, &appended), Some(selection.clone()));
+        assert_eq!(selection.remap(old, &appended, 0), Some(selection.clone()));
         // A progress line redrawn below the selection leaves it alone.
         let redrawn = "compiling a\ncompiling b\n20%";
-        assert_eq!(selection.remap(old, redrawn).map(|kept| kept.text(redrawn).to_owned()), Some("a\ncompiling b".into()));
+        assert_eq!(selection.remap(old, redrawn, 0).map(|kept| kept.text(redrawn).to_owned()), Some("a\ncompiling b".into()));
         // Redrawing the selected text drops it.
         let rewritten = "compiling a\nCOMPILED b\n10%";
-        assert_eq!(selection.remap(old, rewritten), None);
+        assert_eq!(selection.remap(old, rewritten, 0), None);
+    }
+
+    /// Folds `chunks` in order, returning each drawn text with its origin.
+    fn fold(chunks: &[&str], max_chars: usize) -> Vec<(String, usize)> {
+        let mut state = TerminalOutputState::default();
+        chunks
+            .iter()
+            .map(|chunk| {
+                state.append(chunk, max_chars);
+                (terminal_output_display(&state.text, &DARK_PALETTE).text, state.origin)
+            })
+            .collect()
+    }
+
+    fn follow(selection: &Selection, (old, old_origin): &(String, usize), (new, new_origin): &(String, usize)) -> Option<Selection> {
+        selection.remap(old, new, new_origin - old_origin)
     }
 
     /// Past its cap the tail drops its oldest lines; a selection below them moves with its text.
     #[test]
     fn a_tail_that_drops_its_oldest_lines_moves_the_selection() {
-        let line = |n: usize| format!("line {n:02}\n");
-        let mut state = TerminalOutputState::default();
-        for n in 0..6 {
-            state.append(&line(n), 64);
-        }
-        let old = terminal_output_display(&state.text, &DARK_PALETTE).text;
-        let mut selection = Selection::press(&old, hit(at(&old, "line 04")), Granularity::Line);
-        selection.extend(&old, hit(at(&old, "line 05")));
-        assert_eq!(selection.text(&old), "line 04\nline 05");
-        for n in 6..9 {
-            state.append(&line(n), 64);
-        }
-        assert!(state.truncated);
-        let new = terminal_output_display(&state.text, &DARK_PALETTE).text;
-        assert!(!new.starts_with(&old[..old.find('\n').unwrap()]), "the oldest lines are gone: {new:?}");
-        let moved = selection.remap(&old, &new).expect("the selected lines are still there");
-        assert_eq!(moved.text(&new), "line 04\nline 05");
+        let lines: Vec<String> = (0..9).map(|n| format!("line {n:02}\n")).collect();
+        let chunks: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let texts = fold(&chunks, 64);
+        let (old, new) = (&texts[5], &texts[8]);
+        assert!(!new.0.starts_with("line 00"), "the oldest lines are gone: {:?}", new.0);
+        let mut selection = Selection::press(&old.0, hit(at(&old.0, "line 04")), Granularity::Line);
+        selection.extend(&old.0, hit(at(&old.0, "line 05")));
+        let moved = follow(&selection, old, new).expect("the selected lines are still there");
+        assert_eq!(moved.text(&new.0), "line 04\nline 05");
         // Selected lines that scrolled out of the tail take the selection with them.
-        let first = Selection::press(&old, hit(0), Granularity::Line);
-        assert_eq!(first.remap(&old, &new), None);
+        let first = Selection::press(&old.0, hit(0), Granularity::Line);
+        assert_eq!(follow(&first, old, new), None);
+    }
+
+    /// Identical lines can't tell a dropped front from a redrawn end; the fold's origin can.
+    #[test]
+    fn a_selection_follows_its_line_among_identical_ones() {
+        let texts = fold(&["tick\ntick\ntick", "\ndone"], 14);
+        assert_eq!(texts[0].0, "tick\ntick\ntick");
+        assert_eq!(texts[1].0, "tick\ntick\ndone");
+        let second = Selection::press(&texts[0].0, hit(5), Granularity::Line);
+        assert_eq!(second.range(), 5..9);
+        assert_eq!(follow(&second, &texts[0], &texts[1]).map(|moved| moved.range()), Some(0..4));
+    }
+
+    /// Output with no newlines loses its front mid-line.
+    #[test]
+    fn a_selection_follows_a_line_cut_mid_way() {
+        let texts = fold(&["abcdefghij", "klmnopqrst"], 16);
+        assert_eq!(texts[1].0, "efghijklmnopqrst");
+        let selection = Selection::press(&texts[0].0, hit(at(&texts[0].0, "ghij")), Granularity::Char);
+        let mut selection = selection;
+        selection.extend(&texts[0].0, hit(10));
+        let moved = follow(&selection, &texts[0], &texts[1]).expect("`ghij` is still drawn");
+        assert_eq!(moved.text(&texts[1].0), "ghij");
+    }
+
+    /// Remapping compares the selected bytes once, whatever repeats around them.
+    #[test]
+    fn a_redraw_under_a_selection_among_many_repeated_lines_drops_it() {
+        let old = format!("{}X", "a\n".repeat(32 * 1024));
+        let new = format!("{}Y", "a\n".repeat(32 * 1024));
+        let selection = Selection::press(&old, hit(old.len() - 1), Granularity::Word);
+        assert_eq!(selection.text(&old), "X");
+        assert_eq!(selection.remap(&old, &new, 0), None);
+        assert_eq!(selection.remap(&old, &new, 2), None);
     }
 }
