@@ -473,7 +473,7 @@ impl Render for ThreadView {
                     };
                     return lane(content, true, crate::theme::chat_max_width(cx));
                 }
-                let Some(row) = this.rows.get(ix - offset).cloned() else { return lane(this.render_footer(cx), ix == 0) };
+                let Some(row) = this.rows.get(ix - offset).cloned() else { return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx)) };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
                 lane(content, ix == 0, crate::theme::chat_max_width(cx))
             }),
