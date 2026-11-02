@@ -14,6 +14,7 @@ use t3_core::sidebar::older_settled::{
 };
 use t3_core::sidebar::time::{format_iso, parse_iso};
 use t3_core::shell::{ShellState, ShellStreamItem, ThreadShell};
+use t3_core::notifications::{NotificationGate, NotificationKind, Observation};
 use t3_core::thread::{ApplyOptions, DomainEvent, ThreadProjection, ThreadState, apply_event, decode_thread_stream_item};
 
 /// One case per line.
@@ -357,4 +358,37 @@ fn shelf_matches_typescript() {
     }
     assert_eq!(kinds.len(), 5, "every kind has cases: {kinds:?}");
     report.finish("shelf", 80);
+}
+
+fn observation(value: &Value) -> Option<Observation> {
+    (!value.is_null()).then(|| Observation {
+        attention: text(value, "attention"),
+        settled: value["settled"].as_bool() == Some(true),
+        completed_at: value["completedAt"].as_i64(),
+    })
+}
+
+#[test]
+fn notification_gate_matches_typescript() {
+    let mut report = Report::default();
+    for case in fixture("notify.jsonl") {
+        let name = text(&case, "name").unwrap_or_default();
+        let mut gate = NotificationGate::<String>::default();
+        for (index, step) in list(&case, "steps").iter().enumerate() {
+            if let Some(kept) = step.get("retain") {
+                gate.retain(&kept.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect());
+                continue;
+            }
+            let key = text(step, "key").unwrap_or_default();
+            let next = observation(&step["next"]).expect("next observation");
+            let fired = gate.observe(&key, observation(&step["prior"]).as_ref(), &next, step["archived"] == true, step["quiet"] == true);
+            let expected = list(step, "fired").first().and_then(Value::as_str).map(|kind| match kind {
+                "input" => NotificationKind::Input,
+                _ => NotificationKind::Completion,
+            });
+            report.check(&format!("{name} step {index}"), fired, expected);
+            report.compared += 1;
+        }
+    }
+    report.finish("notify", 500);
 }

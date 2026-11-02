@@ -26,6 +26,7 @@ import type * as ThreadStreamModule from "../../../apps/server/src/orchestration
 import type * as HistoryPagingModule from "../../../apps/server/src/orchestration-v2/threadHistoryPaging.ts";
 import type * as OlderSettledModule from "../../../packages/client-runtime/src/state/olderSettledThreads.ts";
 import type * as ThreadFamiliesModule from "../../../packages/client-runtime/src/state/threadFamilies.ts";
+import type * as NotificationGateModule from "../../../apps/web/src/components/ThreadNotificationCoordinator.logic.ts";
 import type * as WireProjectionModule from "../../../apps/server/src/orchestration-v2/WireProjection.ts";
 
 export const ROOT = NodePath.resolve(
@@ -76,6 +77,9 @@ export const OlderSettled = await importSource<typeof OlderSettledModule>(
 );
 export const ThreadFamilies = await importSource<typeof ThreadFamiliesModule>(
   "packages/client-runtime/src/state/threadFamilies.ts",
+);
+export const NotificationGate = await importSource<typeof NotificationGateModule>(
+  "apps/web/src/components/ThreadNotificationCoordinator.logic.ts",
 );
 export const WireProjection = await importSource<typeof WireProjectionModule>(
   "apps/server/src/orchestration-v2/WireProjection.ts",

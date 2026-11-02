@@ -9,6 +9,7 @@ import { collationCase, fuzzReducerCases, portedReducerCases } from "./reducerCa
 import { threadCases } from "./threadCases.ts";
 import { shellCases } from "./shellCases.ts";
 import { shelfCases } from "./shelfCases.ts";
+import { notifyCases } from "./notifyCases.ts";
 
 const OUTPUT_DIR = "apps/native/crates/core/tests/conformance";
 
@@ -19,6 +20,7 @@ function fixtures(): Record<string, ReadonlyArray<unknown>> {
     "thread.jsonl": threadCases(),
     "shell.jsonl": shellCases(),
     "shelf.jsonl": shelfCases(),
+    "notify.jsonl": notifyCases(),
   };
 }
 
