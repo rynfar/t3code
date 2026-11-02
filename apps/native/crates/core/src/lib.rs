@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod composer;
+pub mod diff;
 pub mod history;
 pub mod keybindings;
 pub mod model;
@@ -7,6 +8,7 @@ pub mod pairing;
 pub mod palette;
 pub mod providers;
 pub mod requests;
+pub mod right_panel;
 pub mod rpc;
 pub mod search;
 pub mod server_config;
