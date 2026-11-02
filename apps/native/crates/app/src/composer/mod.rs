@@ -9,6 +9,7 @@ pub(crate) mod controls;
 mod model_picker;
 mod pending;
 mod send;
+pub(crate) use pending::banner_surface;
 mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -138,6 +139,7 @@ pub struct Composer {
     input_state: Option<(&'static str, bool)>,
     /// The question banner takes focus for its digit shortcuts while the prompt cannot type.
     question_focus: FocusHandle,
+    limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -163,7 +165,9 @@ impl Composer {
             }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| this.on_picker(event, window, cx)),
         ];
+        let limit_recovery = cx.new(|cx| crate::thread_view::LimitRecoveryBanner::new(state.clone(), cx));
         let mut composer = Composer {
+            limit_recovery,
             state,
             input,
             picker,

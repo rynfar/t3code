@@ -273,6 +273,7 @@ impl Render for Composer {
                 .children(error.map(|error| {
                     div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
+                .child(self.limit_recovery.clone())
                 .children(question.as_ref().map(|input| self.render_question(input, cx)))
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))

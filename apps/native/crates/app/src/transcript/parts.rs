@@ -173,6 +173,70 @@ pub fn ghost_text_button(
     focusable(button, cx).into_any_element()
 }
 
+/// `InlineButton` tones (`button.tsx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineTone {
+    Default,
+    Muted,
+}
+
+/// `InlineButton`: text-sized, 500 weight, underlined on hover; dimmed to 64% when disabled.
+pub fn inline_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    tone: InlineTone,
+    disabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let (text, hover) = match tone {
+        InlineTone::Default => (hsla(p.foreground), hsla(p.foreground)),
+        InlineTone::Muted => (hsla(p.muted_foreground), hsla(p.foreground)),
+    };
+    let button = div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(2.))
+        .whitespace_nowrap()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(text)
+        .child(label.into());
+    if disabled {
+        return button.opacity(0.64).into_any_element();
+    }
+    focusable(button.cursor_pointer().hover(move |style| style.underline().text_color(hover)).on_click(on_click), cx).into_any_element()
+}
+
+/// An `xs` ghost text button (24 tall, pad-x 7, 12px text in `foreground`, hover `accent`).
+pub fn ghost_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    disabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let button = div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(24.))
+        .px(px(7.))
+        .rounded(px(6.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(hsla(p.foreground))
+        .child(label.into());
+    if disabled {
+        return button.opacity(0.64).into_any_element();
+    }
+    focusable(button.cursor_pointer().hover(|style| style.bg(hsla(p.accent))).on_click(on_click), cx).into_any_element()
+}
+
 /// An `icon-xs` ghost button (24 square) with a 12px icon.
 pub fn ghost_icon_button(id: impl Into<ElementId>, icon: Icon, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
     let p = palette(cx);

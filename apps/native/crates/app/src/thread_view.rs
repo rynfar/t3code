@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod find;
+mod limit_recovery;
+mod status;
+
+pub use limit_recovery::LimitRecoveryBanner;
 
 use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Window, actions, div, list, prelude::*, px};
 use t3_core::history::HistoryControl;
@@ -19,7 +23,7 @@ use t3_core::timeline::{
 use crate::app_state::{AppEvent, AppState};
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::MarkdownStore;
-use crate::transcript::{Clock, Detail, RowEnv, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+use crate::transcript::{Clock, Detail, RowEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
 
 actions!(thread_view, [FindInThread]);
 
@@ -41,6 +45,10 @@ pub struct ThreadView {
     group_lists: RefCell<HashMap<String, ListState>>,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
+    footer: status::ThreadFooter,
+    banners: status::Banners,
+    /// A failure from an action taken here, shown in the error banner like the web's local error.
+    local_error: Option<String>,
     clock: Clock,
     window_height: f32,
     _subscription: Subscription,
@@ -51,6 +59,7 @@ impl ThreadView {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
             AppEvent::Thread | AppEvent::Selection => this.sync(cx),
             AppEvent::History => this.sync_history(cx),
+            AppEvent::Shell | AppEvent::ServerConfig => this.sync_status(cx),
             _ => {}
         });
         ThreadView {
@@ -69,6 +78,9 @@ impl ThreadView {
             group_lists: RefCell::new(HashMap::new()),
             working_timer: None,
             find: None,
+            footer: status::ThreadFooter::default(),
+            banners: status::Banners::default(),
+            local_error: None,
             clock: Clock::now(),
             window_height: 0.,
             _subscription: subscription,
@@ -96,6 +108,7 @@ impl ThreadView {
             self.rows.clear();
             self.history = None;
             self.find = None;
+            self.reset_status();
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -114,6 +127,7 @@ impl ThreadView {
         }
         self.sync_history(cx);
         self.rederive(cx);
+        self.sync_status(cx);
         self.refresh_open_details(cx);
         self.refresh_find_after_change(cx);
     }
@@ -172,9 +186,10 @@ impl ThreadView {
             (RowKind::Working { compacting }, Some(started)) => Some((started.clone(), *compacting)),
             _ => None,
         });
+        let working = working.map(|(started, compacting)| (started, if compacting { TimerKind::Compacting } else { TimerKind::Working }));
         match working {
-            Some((started, compacting)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, compacting)) => {}
-            Some((started, compacting)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, compacting, cx))),
+            Some((started, kind)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, kind)) => {}
+            Some((started, kind)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, kind, cx))),
             None => self.working_timer = None,
         }
     }
@@ -337,8 +352,10 @@ impl Render for ThreadView {
         if loading {
             return div().size_full().flex().items_center().justify_center().text_sm().text_color(muted).child("Loading thread…").into_any_element();
         }
-        if self.rows.is_empty() && self.history.is_none() {
+        if self.rows.is_empty() && self.history.is_none() && !self.footer_shown() {
+            let banners = self.render_banners(cx);
             return div()
+                .relative()
                 .size_full()
                 .flex()
                 .items_center()
@@ -346,12 +363,14 @@ impl Render for ThreadView {
                 .text_sm()
                 .text_color(muted)
                 .child("Send a message to start the conversation.")
+                .children(banners)
                 .into_any_element();
         }
         self.clock = Clock::now();
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
         let find_bar = self.render_find_bar(cx);
+        let banners = self.render_banners(cx);
         let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, _window, cx| {
@@ -363,12 +382,12 @@ impl Render for ThreadView {
                     };
                     return lane(content, true, crate::theme::chat_max_width(cx));
                 }
-                let Some(row) = this.rows.get(ix - offset).cloned() else { return div().into_any_element() };
+                let Some(row) = this.rows.get(ix - offset).cloned() else { return lane(this.render_footer(cx), ix == 0) };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
                 lane(content, ix == 0, crate::theme::chat_max_width(cx))
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(find_bar).into_any_element()
+        div().relative().size_full().child(transcript).children(banners).children(find_bar).into_any_element()
     }
 }

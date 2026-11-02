@@ -19,8 +19,8 @@ use t3_core::turn_item::TurnItem;
 use crate::thread_view::ThreadView;
 use markdown::MarkdownStore;
 pub use notices::history_control;
-pub use parts::{Clock, ghost_icon_button, ghost_text_button};
-pub use timer::WorkingTimer;
+pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_button, inline_button};
+pub use timer::{TimerKind, WorkingTimer};
 
 /// Disclosure state the user controls. Folds and groups feed row derivation; the rest only
 /// change how a row draws.
