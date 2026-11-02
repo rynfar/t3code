@@ -177,7 +177,7 @@ impl FilesPanel {
                 reveal_line: *reveal_line,
                 reveal_request_id: *reveal_request_id,
             }),
-            SurfaceKind::Diff | SurfaceKind::PullRequests => None,
+            SurfaceKind::Diff | SurfaceKind::PullRequests | SurfaceKind::SideChat { .. } => None,
         });
         let projection = state
             .thread
