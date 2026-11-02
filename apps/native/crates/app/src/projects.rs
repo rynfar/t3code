@@ -1,9 +1,11 @@
 //! Project actions: add an existing folder (`project.create` through `projects.mutate`), create a
-//! new one (`projects.createNew`), pin and unpin (`useProjectPin`), copy its path, and start a
-//! thread in it. Shared by the palette's Add project flows and the project menu.
+//! new one (`projects.createNew`), pin and unpin (`useProjectPin`), copy its path, start a thread
+//! in it, and remove it (`project.delete` after Settings → Projects confirms). Shared by the
+//! palette's Add project flows, the project menu and the Projects settings page.
 
 use gpui::{ClipboardItem, Context};
 use t3_core::projects::{CreateNewResult, PROJECTS_CREATE_NEW, PROJECTS_MUTATE, add_target, create_new_project, create_project, find_project_by_path, infer_project_title, set_project_pinned};
+use t3_core::settings::projects::delete_project;
 
 use crate::app_state::AppState;
 use crate::sidebar::controller::uuid;
@@ -78,5 +80,36 @@ impl AppState {
         let Some(path) = self.shell.project(project_id).map(|project| project.workspace_root.clone()) else { return };
         cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
         self.show_toast(Toast::new(ToastKind::Success, "Path copied").description(path), cx);
+    }
+
+    /// `removeMembers` once confirmed: a forced `project.delete` per member, in order, stopping at
+    /// the first failure. A draft in a removed project closes. Removing the whole project returns
+    /// Settings to the project list.
+    pub fn remove_projects(&mut self, project_ids: Vec<String>, back_to_list: bool, cx: &mut Context<Self>) {
+        let requests: Vec<(String, String, _)> = project_ids
+            .iter()
+            .map(|id| {
+                let title = self.shell.project(id).map_or_else(|| id.clone(), |project| project.title.clone());
+                (id.clone(), title, self.rpc(PROJECTS_MUTATE, delete_project(&uuid(), id)))
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            for (id, title, request) in requests {
+                if let Err(error) = request.await {
+                    cx.update(|cx| crate::settings::store::show_error(format!("Failed to remove \"{title}\": {error}"), cx));
+                    return;
+                }
+                let _ = this.update(cx, |state, cx| {
+                    if state.draft_project.as_deref() == Some(id.as_str()) {
+                        state.draft_project = None;
+                        state.clear_selection(cx);
+                    }
+                });
+            }
+            if back_to_list {
+                cx.update(crate::settings::show_project_list);
+            }
+        })
+        .detach();
     }
 }

@@ -362,7 +362,7 @@ impl SettingsView {
     fn writing_section(&mut self, config: &ServerConfig, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = &config.settings.source_control;
         let style = &settings.source_control_writing_style;
-        let options = model_options(config);
+        let options = model_options(config, None);
         let mode_state = self.state.clone();
         let custom = style.mode == WritingMode::Custom;
         let instructions = self.source_control.custom_instructions.clone();

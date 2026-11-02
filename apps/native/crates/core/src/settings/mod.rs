@@ -7,6 +7,8 @@
 pub mod access;
 pub mod archive;
 pub mod keybindings;
+pub mod project_actions;
+pub mod projects;
 pub mod providers;
 pub mod quit_hold;
 pub mod search;

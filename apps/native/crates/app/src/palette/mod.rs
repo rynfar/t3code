@@ -109,6 +109,11 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     if state.server_config.config.is_some() {
         items.push(action("action:pull-requests", "Open pull requests", &["pull requests", "prs", "pr", "github", "review", "merge", "branch"], None));
     }
+    if let Some(project_id) = crate::new_thread::default_project(state) {
+        let name = state.sidebar.model.project_names.get(&project_id).cloned().or_else(|| state.shell.project(&project_id).map(|project| project.title.clone()));
+        let terms = ["project", "settings", "name", "icon", "scripts", "model", "workspace", "grouping", "checkout", "remove", "t3.json"];
+        items.push(CommandPaletteItem { description: name, ..action("action:project-settings", "Project settings", &terms, None) });
+    }
     items.push(action("action:previous-thread", "Previous thread", &["navigate"], Some("thread.previous")));
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
     items.push(action("action:settings", "Open settings", &["settings", "preferences", "configuration", "keybindings"], None));
@@ -411,6 +416,12 @@ impl CommandPalette {
                 "usage" => keymap::action_for("usage.open"),
                 "settings" => {
                     crate::settings::open(t3_core::settings::search::Section::General, cx);
+                    return;
+                }
+                "project-settings" => {
+                    if let Some(project_id) = crate::new_thread::default_project(self.state.read(cx)) {
+                        crate::settings::open_project(&project_id, cx);
+                    }
                     return;
                 }
                 _ => return,

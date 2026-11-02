@@ -19,7 +19,7 @@ use t3_core::usage::{UsageMetric, UsagePeriod};
 use crate::app_state::AppState;
 
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
-[--settings <section>] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
+[--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
 [--click <x>,<y>]... [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
@@ -181,8 +181,20 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         }
     }
     if let Some(name) = &options.settings {
+        // `projects:<project id>` opens a project's page; `:add-action` opens its action editor.
+        let (name, project) = name.split_once(':').map_or((name.as_str(), None), |(name, project)| (name, Some(project)));
         let section = section(name).ok_or_else(|| format!("unknown settings section {name:?}"))?;
-        cx.update(|cx| crate::settings::open(section, cx));
+        match project {
+            Some(project) => {
+                let (project, add_action) = project.strip_suffix(":add-action").map_or((project, false), |project| (project, true));
+                cx.update(|cx| crate::settings::open_project(project, cx));
+                if add_action {
+                    pump(&mut cx, 1., |_| false);
+                    cx.update(crate::settings::open_add_action);
+                }
+            }
+            None => cx.update(|cx| crate::settings::open(section, cx)),
+        }
     }
     if options.pull_requests || options.pull_request.is_some() {
         if let Some(number) = options.pull_request {

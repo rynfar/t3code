@@ -73,10 +73,16 @@ pub enum ButtonVariant {
 pub enum ButtonSize {
     /// 20 square, 12px icon, radius 4.
     IconMicro,
+    /// 24 square, 14px icon.
+    IconXs,
     /// 28 square, 16px icon.
     IconSm,
     /// 32 square, 16px icon (`icon`).
     Icon,
+    /// 36 square, 16px icon.
+    IconLg,
+    /// 24 tall, 12px text, 14px icon.
+    Xs,
     /// 28 tall, 12px text, radius 6.
     Compact,
     /// 28 tall, 14px text.
@@ -92,6 +98,7 @@ pub struct Button {
     variant: ButtonVariant,
     size: ButtonSize,
     icon: Option<Icon>,
+    trailing: Option<Icon>,
     label: Option<SharedString>,
     tooltip: Option<SharedString>,
     disabled: bool,
@@ -100,11 +107,17 @@ pub struct Button {
 
 impl Button {
     pub fn new(id: impl Into<ElementId>, variant: ButtonVariant, size: ButtonSize) -> Self {
-        Button { id: id.into(), variant, size, icon: None, label: None, tooltip: None, disabled: false, on_click: None }
+        Button { id: id.into(), variant, size, icon: None, trailing: None, label: None, tooltip: None, disabled: false, on_click: None }
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// An icon after the label, such as a menu trigger's chevron.
+    pub fn trailing(mut self, icon: Icon) -> Self {
+        self.trailing = Some(icon);
         self
     }
 
@@ -138,8 +151,11 @@ impl RenderOnce for Button {
         let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         let (height, pad, radius, icon_size, square) = match self.size {
             ButtonSize::IconMicro => (20., 0., 4., 12., true),
+            ButtonSize::IconXs => (24., 0., 8., 14., true),
             ButtonSize::IconSm => (28., 0., 8., 16., true),
             ButtonSize::Icon => (32., 0., 8., 16., true),
+            ButtonSize::IconLg => (36., 0., 8., 16., true),
+            ButtonSize::Xs => (24., 7., 8., 14., false),
             ButtonSize::Compact => (28., 7., 6., 14., false),
             ButtonSize::Sm => (28., 9., 8., 16., false),
             ButtonSize::Default => (32., 11., 8., 16., false),
@@ -169,7 +185,7 @@ impl RenderOnce for Button {
             }
         };
         let outlined = matches!(self.variant, ButtonVariant::Outline | ButtonVariant::DestructiveOutline);
-        let compact_text = self.size == ButtonSize::Compact;
+        let compact_text = matches!(self.size, ButtonSize::Compact | ButtonSize::Xs);
         h_flex()
             .id(self.id)
             .flex_none()
@@ -177,7 +193,7 @@ impl RenderOnce for Button {
             .when(square, |this| this.w(r(height)).justify_center())
             .px(r(pad))
             .gap(r(match self.size {
-                ButtonSize::Compact => 4.,
+                ButtonSize::Compact | ButtonSize::Xs => 4.,
                 ButtonSize::Default => 8.,
                 _ => 6.,
             }))
@@ -195,6 +211,7 @@ impl RenderOnce for Button {
             .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.bg(hover_fill).text_color(hover_text)))
             .children(self.icon.map(|glyph| icon(glyph, icon_size, icon_color)))
             .children(self.label.map(|label| div().truncate().child(label)))
+            .children(self.trailing.map(|glyph| icon(glyph, icon_size, icon_color)))
             .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| {
@@ -647,13 +664,24 @@ pub struct Row {
     status: Option<SharedString>,
     control: Option<AnyElement>,
     reset: Option<ClickHandler>,
+    reset_tooltip: Option<SharedString>,
     below: Option<AnyElement>,
     highlighted: bool,
 }
 
 impl Row {
     pub fn new(id: impl Into<SharedString>, title: impl Into<SharedString>) -> Self {
-        Row { id: id.into(), title: title.into(), description: None, status: None, control: None, reset: None, below: None, highlighted: false }
+        Row {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            status: None,
+            control: None,
+            reset: None,
+            reset_tooltip: None,
+            below: None,
+            highlighted: false,
+        }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
@@ -680,6 +708,12 @@ impl Row {
         self
     }
 
+    /// The reset button's tooltip when it is not "Reset to default".
+    pub fn reset_tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.reset_tooltip = Some(text.into());
+        self
+    }
+
     pub fn below(mut self, content: impl IntoElement) -> Self {
         self.below = Some(content.into_any_element());
         self
@@ -697,10 +731,11 @@ impl RenderOnce for Row {
         let p = palette(cx);
         let stacked = ModalLayout::of(window).rows_stacked;
         let has_below = self.below.is_some();
+        let reset_tooltip = self.reset_tooltip.unwrap_or_else(|| "Reset to default".into());
         let reset = self.reset.map(|handler| {
             Button::new(ElementId::Name(format!("{}-reset", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                 .icon(Icon::Undo2)
-                .tooltip("Reset to default")
+                .tooltip(reset_tooltip)
                 .on_click(move |event, window, cx| handler(event, window, cx))
         });
         v_flex()

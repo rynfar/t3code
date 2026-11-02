@@ -459,7 +459,7 @@ impl SettingsView {
             WorkspaceMode::Root => None,
         };
 
-        let options = model_options(config);
+        let options = model_options(config, None);
         let model_state = cx.entity().downgrade();
         let model: AnyElement = match &draft.model {
             _ if options.is_empty() => muted_text("No providers available", cx).into_any_element(),
