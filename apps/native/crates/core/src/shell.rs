@@ -59,6 +59,24 @@ pub struct LatestVisibleMessage {
     pub updated_at: String,
 }
 
+/// Distinguishes an absent optional field (`None`) from an explicit `null` (`Some(None)`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBackgroundTask {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub awaited: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadShell {
@@ -72,17 +90,43 @@ pub struct ThreadShell {
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub lineage: Lineage,
+    #[serde(default)]
+    pub creation_source: Option<String>,
+    #[serde(default)]
+    pub delegated_from: Option<serde_json::Value>,
+    #[serde(default)]
+    pub active_provider_thread_id: Option<String>,
     pub latest_run_id: Option<String>,
+    #[serde(default)]
+    pub latest_run_requested_at: Option<String>,
+    #[serde(default)]
+    pub latest_run_started_at: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub latest_run_completed_at: Option<Option<String>>,
     pub active_run_id: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub activity_run_started_at: Option<Option<String>>,
     #[serde(default)]
     pub activity_run_status: Option<String>,
+    #[serde(default)]
+    pub blocked_on_thread_wait: Option<bool>,
     pub status: String,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_class: Option<String>,
     pub pending_runtime_request: Option<PendingRuntimeRequestSummary>,
+    #[serde(default)]
+    pub pending_guest_message_count: Option<u64>,
     pub latest_visible_message: Option<LatestVisibleMessage>,
     pub latest_user_message_at: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub latest_user_authored_message_at: Option<Option<String>>,
     pub has_actionable_proposed_plan: bool,
+    #[serde(default)]
+    pub pending_background_tasks: Vec<PendingBackgroundTask>,
+    #[serde(default)]
+    pub goal: Option<serde_json::Value>,
     pub item_count: u64,
     pub visible_item_count: u64,
     pub created_at: String,
@@ -91,7 +135,17 @@ pub struct ThreadShell {
     pub settled_override: Option<String>,
     pub settled_at: Option<String>,
     #[serde(default)]
+    pub unsettled_at: Option<String>,
+    #[serde(default)]
     pub snoozed_until: Option<String>,
+    #[serde(default)]
+    pub snoozed_at: Option<String>,
+    #[serde(default)]
+    pub auto_settle_disabled_at: Option<String>,
+    #[serde(default)]
+    pub opens: Option<serde_json::Value>,
+    #[serde(default)]
+    pub title_regeneration: Option<serde_json::Value>,
     #[serde(default)]
     pub pinned_at: Option<String>,
     #[serde(default)]
@@ -126,6 +180,25 @@ pub struct ShellSnapshot {
     pub threads: Vec<ThreadShell>,
     #[serde(default)]
     pub archived_threads: Vec<ThreadShell>,
+    /// Present when the shell was subscribed with `omitOlderSettled`.
+    #[serde(default)]
+    pub older_settled: Option<OlderSettledCut>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OlderSettledCount {
+    pub project_id: String,
+    pub count: u64,
+}
+
+/// `OrchestrationV2OlderSettledThreads`: where the shell cut settled threads, and how many it left out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OlderSettledCut {
+    pub before: String,
+    pub as_of_sequence: u64,
+    pub counts: Vec<OlderSettledCount>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

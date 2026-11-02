@@ -2,7 +2,6 @@
 //! channel from the client's runtime and are applied in batches, one notify per batch.
 
 use std::future::Future;
-use std::sync::Arc;
 
 use gpui::{Context, EventEmitter, Task};
 use serde_json::Value;
@@ -16,8 +15,10 @@ use t3_core::history::{HistoryStep, PageOutcome};
 use t3_core::pairing::parse_pairing_link;
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
-use t3_core::sidebar::{SidebarRow, sidebar_rows};
 use t3_core::thread::ThreadState;
+
+use crate::sidebar::controller::SidebarController;
+use crate::toast::Toast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -36,12 +37,16 @@ pub enum AppEvent {
     ServerConfig,
     /// Only `thread.history_control()` changed: loading, error, or more history.
     History,
+    /// Toasts and the Undo notice.
+    Notice,
 }
 
 pub struct AppState {
     pub phase: Phase,
     pub shell: ShellState,
-    pub sidebar_rows: Arc<Vec<SidebarRow>>,
+    pub sidebar: SidebarController,
+    pub toast: Option<Toast>,
+    pub(crate) toast_timer: Option<Task<()>>,
     pub selected_thread: Option<String>,
     pub thread: ThreadState,
     pub last_error: Option<String>,
@@ -66,7 +71,9 @@ impl AppState {
         let mut state = AppState {
             phase: Phase::Unpaired { error: None },
             shell: ShellState::default(),
-            sidebar_rows: Arc::new(Vec::new()),
+            sidebar: SidebarController::default(),
+            toast: None,
+            toast_timer: None,
             selected_thread: None,
             thread: ThreadState::default(),
             last_error: None,
@@ -115,7 +122,7 @@ impl AppState {
         self.client = None;
         self._pump = None;
         self.shell = ShellState::default();
-        self.sidebar_rows = Arc::new(Vec::new());
+        self.sidebar = SidebarController::default();
         self.selected_thread = None;
         self.thread = ThreadState::default();
         self.server_config = ServerConfigState::default();
@@ -146,7 +153,7 @@ impl AppState {
     }
 
     fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
-        let (mut shell_changed, mut thread_changed, mut config_changed) = (false, false, false);
+        let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut config_changed) = (false, false, false, false);
         for event in batch {
             match event {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => {
@@ -155,7 +162,13 @@ impl AppState {
                     self.set_phase(Phase::Unpaired { error: Some(reason) }, cx);
                 }
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
-                ClientEvent::Shell(item) => shell_changed |= self.shell.apply(item),
+                ClientEvent::Shell(item) => {
+                    let quiet = crate::sidebar::controller::is_streaming_tick(&self.shell, &item);
+                    if self.shell.apply(item) {
+                        shell_changed = true;
+                        sidebar_changed |= !quiet;
+                    }
+                }
                 ClientEvent::Thread { thread_id, item } => {
                     if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
                         thread_changed |= self.thread.apply(*item);
@@ -168,7 +181,9 @@ impl AppState {
             }
         }
         if shell_changed {
-            self.sidebar_rows = Arc::new(self.shell.snapshot.as_ref().map(sidebar_rows).unwrap_or_default());
+            if sidebar_changed {
+                self.rebuild_sidebar(cx);
+            }
             cx.emit(AppEvent::Shell);
             if let Some(id) = self.select_when_listed.take_if(|id| self.shell.thread(id).is_some()) {
                 self.select_thread(&id, cx);
@@ -186,6 +201,7 @@ impl AppState {
             cx.emit(AppEvent::Thread);
         }
         if config_changed {
+            self.sync_server_config(cx);
             cx.emit(AppEvent::ServerConfig);
         }
     }
@@ -203,6 +219,11 @@ impl AppState {
         if self.phase != phase {
             self.phase = phase;
             cx.emit(AppEvent::Phase);
+            // Connection state places threads on the Working shelf.
+            if self.shell.snapshot.is_some() {
+                self.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+            }
         }
     }
 
@@ -221,6 +242,7 @@ impl AppState {
         if let Some(client) = &self.client {
             client.open_thread(thread_id);
         }
+        self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
     }
@@ -296,6 +318,17 @@ impl AppState {
         self.thread = ThreadState::default();
         self.restore_thread = None;
         self.draft_project = Some(project_id.to_owned());
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Selection);
+        cx.emit(AppEvent::Thread);
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
+            client.close_thread(&previous);
+        }
+        self.thread = ThreadState::default();
+        self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
     }
@@ -318,6 +351,14 @@ impl AppState {
                 None => Err(RpcError::Closed),
             }
         }
+    }
+
+    pub(crate) fn client_handle(&self) -> Option<ClientHandle> {
+        self.client.clone()
+    }
+
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
     }
 
     pub fn is_selected_thread_running(&self) -> bool {

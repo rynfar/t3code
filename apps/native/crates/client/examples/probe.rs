@@ -294,6 +294,25 @@ async fn main() -> anyhow::Result<()> {
                 thread.pending_runtime_request.as_ref().map(|p| &p.kind)
             );
         }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let model = t3_core::sidebar::SidebarModel::build(
+            &t3_core::sidebar::ModelInput {
+                snapshot,
+                settings: &Default::default(),
+                shelves: &Default::default(),
+                selected_thread_id: None,
+                project_scope: None,
+                connected: true,
+                now,
+            },
+            &mut Default::default(),
+        );
+        for row in model.rows.iter().take(12) {
+            match row {
+                t3_core::sidebar::SidebarRow::Thread { index, section } => println!("  {section:?}: {}", model.threads[*index].title),
+                other => println!("  {other:?}"),
+            }
+        }
     }
     Ok(())
 }

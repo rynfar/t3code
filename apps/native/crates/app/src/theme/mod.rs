@@ -13,6 +13,9 @@ use serde_json::json;
 
 pub use tokens::{Palette, metrics};
 
+/// The web's `text-white` on solid destructive buttons (design-system §6.1); not a theme role.
+pub const WHITE: u32 = 0xffff_ffff;
+
 struct ActivePalette(&'static Palette);
 
 impl Global for ActivePalette {}

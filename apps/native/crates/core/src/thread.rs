@@ -19,6 +19,7 @@ mod reduce;
 
 pub use reduce::apply_event;
 pub(crate) use reduce::is_item_visible;
+pub(crate) use reduce::locale_compare;
 
 /// An entity the client stores but does not interpret yet. Upserted by `id`.
 #[derive(Debug, Clone, PartialEq)]

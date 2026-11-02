@@ -31,12 +31,8 @@ use model_picker::{ModelPicker, PickerEvent, PickerInput};
 actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input")),
-        KeyBinding::new("cmd-shift-m", ToggleModelPicker, None),
-        KeyBinding::new("cmd-shift-e", ToggleModelPicker, None),
-        KeyBinding::new("cmd-shift-a", OpenPermissions, None),
-    ]);
+    // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
+    cx.bind_keys([KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input"))]);
     model_picker::init(cx);
 }
 

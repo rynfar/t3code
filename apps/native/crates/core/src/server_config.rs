@@ -217,6 +217,8 @@ impl ServerProvider {
 pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub thread_stop: Option<bool>,
+    #[serde(default)]
+    pub thread_auto_settle_opt_out: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

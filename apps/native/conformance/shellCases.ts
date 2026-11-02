@@ -241,6 +241,11 @@ export function shellCases() {
     shellCase("optional row fields the native types model", [
       snapshot({
         projects: [{ ...project, pinnedAt: "2026-06-20T01:00:00.000Z", archivedAt: null }],
+        olderSettled: {
+          before: "2026-06-01T00:00:00.000Z",
+          asOfSequence: 0,
+          counts: [{ projectId: project.id, count: 3 }],
+        },
         threads: [
           shellRow("rich", {
             lineage: { ...thread.lineage, sideChat: false },
@@ -250,7 +255,35 @@ export function shellCases() {
             pinnedAt: thread.updatedAt,
             pinOrderKey: "a0",
             activeOrderKey: "b0",
-          }),
+            delegatedFrom: {
+              environmentId: "environment-linked",
+              threadId: "thread-linked",
+              title: "Linked",
+            },
+            activeProviderThreadId: "provider-thread-rich",
+            latestRunRequestedAt: thread.updatedAt,
+            latestRunStartedAt: thread.updatedAt,
+            latestRunCompletedAt: null,
+            activityRunStartedAt: thread.updatedAt,
+            blockedOnThreadWait: true,
+            lastErrorClass: "usage_limit",
+            pendingGuestMessageCount: 2,
+            latestUserAuthoredMessageAt: thread.updatedAt,
+            pendingBackgroundTasks: [
+              { taskId: "task-1", kind: "subagent" },
+              { taskId: "task-2", kind: "command", awaited: true },
+            ],
+            goal: { objective: "Ship the sidebar", status: "active" },
+            unsettledAt: thread.updatedAt,
+            snoozedAt: thread.updatedAt,
+            autoSettleDisabledAt: thread.updatedAt,
+            opens: {
+              openedAt: 1_750_000_000_000,
+              score: 2,
+              picks: [{ query: "side", at: 1_750_000_000_000 }],
+            },
+            titleRegeneration: { requestId: "command-regenerate", startedAt: thread.updatedAt },
+          } as Partial<OrchestrationV2ThreadShell>),
         ],
         archivedThreads: [
           shellRow("archived-rich", {
@@ -262,7 +295,23 @@ export function shellCases() {
             pinOrderKey: null,
             activeOrderKey: null,
             archivedAt: thread.updatedAt,
-          }),
+            delegatedFrom: {
+              environmentId: "environment-linked",
+              threadId: "thread-archived",
+              title: "Archived",
+            },
+            latestRunRequestedAt: null,
+            latestRunStartedAt: null,
+            blockedOnThreadWait: false,
+            lastErrorClass: null,
+            pendingGuestMessageCount: 0,
+            goal: null,
+            unsettledAt: null,
+            snoozedAt: null,
+            autoSettleDisabledAt: null,
+            opens: null,
+            titleRegeneration: null,
+          } as Partial<OrchestrationV2ThreadShell>),
         ],
       }),
       update(1, shellRow("rich", { activityRunStatus: null, pinOrderKey: "a1" })),
