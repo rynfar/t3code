@@ -52,7 +52,9 @@ running `t3 pair`. Never let it reach the live install: point `T3CODE_HOME` at a
 `userdata/server-runtime.json` is a copy of the dev server's, and `T3_NATIVE_T3_BIN` at a script
 that drops the app's `pair` and `--base-dir` arguments and runs
 `node src/bin.ts pair --base-dir <dev server home> …` from `apps/server`. With the override set,
-the app never falls back to the installed `t3`. `probe -- --local` runs the same flow headless.
+the app never falls back to the installed `t3`. Before `pair`, the app runs `<t3> --version` and
+refuses unless it prints exactly the runtime file's `serverVersion`; the wrapper passes `--version`
+through, so it matches the dev server. `probe -- --local` runs the same flow headless.
 
 ## 3. Drive and capture
 

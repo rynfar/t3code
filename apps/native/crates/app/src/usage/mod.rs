@@ -162,6 +162,8 @@ pub struct UsageView {
     open_top_model: bool,
     _subscriptions: Vec<Subscription>,
     _grants: Option<Task<()>>,
+    /// The connection it reads from; another one closes it.
+    connection: Option<u64>,
 }
 
 impl Focusable for UsageView {
@@ -172,12 +174,14 @@ impl Focusable for UsageView {
 
 impl UsageView {
     fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let connection = state.read(cx).connection_id();
         let subscriptions = vec![cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
             AppEvent::ServerConfig => {
                 this.data.config_changed();
                 this.auto_refresh_limits(cx);
                 cx.notify();
             }
+            AppEvent::Phase if this.state.read(cx).connection_id() != this.connection => close(cx),
             AppEvent::Phase => {
                 this.sync_access(cx);
                 cx.notify();
@@ -199,6 +203,7 @@ impl UsageView {
             open_top_model: false,
             _subscriptions: subscriptions,
             _grants: None,
+            connection,
         };
         if let Some((metric, period, model)) = cx.global_mut::<Host>().initial.take() {
             view.data.preferences.metric = metric;

@@ -26,7 +26,11 @@ pub struct FakeServer {
     connections: mpsc::UnboundedReceiver<Connection>,
     session: Arc<Mutex<Value>>,
     descriptor: Arc<Mutex<Option<Value>>>,
+    refusal: Refusal,
 }
+
+/// What `/ws` answers instead of upgrading, when set.
+type Refusal = Arc<Mutex<Option<(u16, Value)>>>;
 
 pub struct Connection {
     pub path: String,
@@ -42,17 +46,24 @@ impl FakeServer {
         let served = session.clone();
         let descriptor = Arc::new(Mutex::new(None));
         let described = descriptor.clone();
+        let refusal: Refusal = Arc::new(Mutex::new(None));
+        let refused = refusal.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (tx, session, descriptor) = (tx.clone(), served.clone(), described.clone());
+                let (tx, session, descriptor, refusal) = (tx.clone(), served.clone(), described.clone(), refused.clone());
                 tokio::spawn(async move {
-                    if let Some(connection) = serve(stream, session, descriptor).await {
+                    if let Some(connection) = serve(stream, session, descriptor, refusal).await {
                         let _ = tx.send(connection);
                     }
                 });
             }
         });
-        FakeServer { addr, connections, session, descriptor }
+        FakeServer { addr, connections, session, descriptor, refusal }
+    }
+
+    /// `/ws` answers this status and JSON body instead of upgrading; `None` upgrades again.
+    pub fn refuse_upgrades(&self, refusal: Option<(u16, Value)>) {
+        *self.refusal.lock().expect("refusal") = refusal;
     }
 
     /// What `GET /.well-known/t3/environment` answers from now on; `None` answers 404.
@@ -91,17 +102,21 @@ async fn read_head(stream: &mut TcpStream) -> Option<String> {
     String::from_utf8(head).ok()
 }
 
-async fn respond_json(mut stream: TcpStream, body: Value) {
+async fn respond_json(stream: TcpStream, body: Value) {
+    respond_status(stream, 200, body).await;
+}
+
+async fn respond_status(mut stream: TcpStream, status: u16, body: Value) {
     let body = body.to_string();
     let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
 }
 
-async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>) -> Option<Connection> {
+async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>, refusal: Refusal) -> Option<Connection> {
     let head = read_head(&mut stream).await?;
     let path = head.split_whitespace().nth(1)?.to_owned();
     let header = |name: &str| {
@@ -127,6 +142,11 @@ async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Ar
     if head.starts_with("GET /api/auth/session") {
         let state = session.lock().expect("session").clone();
         respond_json(stream, state).await;
+        return None;
+    }
+    let refused = refusal.lock().expect("refusal").clone();
+    if let Some((status, body)) = refused {
+        respond_status(stream, status, body).await;
         return None;
     }
     let accept = derive_accept_key(header("sec-websocket-key")?.as_bytes());

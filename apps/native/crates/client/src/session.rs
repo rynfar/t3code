@@ -39,6 +39,19 @@ const TIMING: Timing = Timing {
     stream_queue: 256,
 };
 
+/// Why a WebSocket did not open.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenError {
+    #[error("This device is no longer authorized. Pair again.")]
+    Unauthorized,
+    /// HTTP 426 (`orchestration_protocol_incompatible` in `apps/server/src/ws.ts`): the server
+    /// speaks another orchestration protocol, the one it names when it does.
+    #[error("The server speaks another orchestration protocol.")]
+    Incompatible { server_protocol: Option<u32> },
+    #[error("{0}")]
+    Failed(String),
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RpcError {
     #[error(transparent)]
@@ -91,11 +104,11 @@ impl Drop for StreamHandle {
 }
 
 impl Session {
-    pub async fn connect(url: &str) -> Result<Session, String> {
+    pub async fn connect(url: &str) -> Result<Session, OpenError> {
         Self::connect_with(url, TIMING).await
     }
 
-    async fn connect_with(url: &str, timing: Timing) -> Result<Session, String> {
+    async fn connect_with(url: &str, timing: Timing) -> Result<Session, OpenError> {
         let config = WebSocketConfig {
             max_message_size: Some(MAX_MESSAGE_BYTES),
             max_frame_size: Some(MAX_MESSAGE_BYTES),
@@ -104,8 +117,8 @@ impl Session {
         let connect = tokio_tungstenite::connect_async_with_config(url, Some(config), false);
         let (socket, _) = tokio::time::timeout(OPEN_TIMEOUT, connect)
             .await
-            .map_err(|_| "Timed out opening the WebSocket.".to_owned())?
-            .map_err(describe_ws_error)?;
+            .map_err(|_| OpenError::Failed("Timed out opening the WebSocket.".to_owned()))?
+            .map_err(open_error)?;
         let (mut sink, mut stream) = socket.split();
         let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
         let pending: PendingMap = Arc::new(Mutex::new(Some(HashMap::new())));
@@ -300,13 +313,22 @@ fn route(message: ServerMessage, pending: &PendingMap) -> Option<SessionEnd> {
     }
 }
 
+fn open_error(error: tokio_tungstenite::tungstenite::Error) -> OpenError {
+    let tokio_tungstenite::tungstenite::Error::Http(response) = &error else { return OpenError::Failed(describe_ws_error(error)) };
+    match response.status().as_u16() {
+        401 | 403 => OpenError::Unauthorized,
+        426 => {
+            let body = response.body().as_deref().and_then(|body| serde_json::from_slice::<Value>(body).ok());
+            let server_protocol = body.as_ref().and_then(|body| body.get("orchestrationProtocolVersion")?.as_u64()?.try_into().ok());
+            OpenError::Incompatible { server_protocol }
+        }
+        status => OpenError::Failed(format!("The server refused the WebSocket ({status}).")),
+    }
+}
+
 fn describe_ws_error(error: tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error;
     match error {
-        Error::Http(response) => match response.status().as_u16() {
-            401 | 403 => "This device is no longer authorized. Pair again.".to_owned(),
-            status => format!("The server refused the WebSocket ({status})."),
-        },
         Error::Io(error) => format!("Could not connect: {error}"),
         other => other.to_string(),
     }

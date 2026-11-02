@@ -38,6 +38,10 @@ pub struct ConnectScreen {
     pub rejected: Option<Rejected>,
     pub local_server: Option<LocalServer>,
     pub discovering: bool,
+    /// Counts pairings started or cancelled; a result for an earlier one is dropped.
+    attempt: u64,
+    /// The pairing running on the network runtime. Aborting it stops `t3 pair`.
+    pairing_task: Option<tokio::task::AbortHandle>,
 }
 
 impl AppState {
@@ -48,8 +52,7 @@ impl AppState {
     /// The saved entry for T3 Code on this Mac, if it was paired before.
     pub fn local_saved_environment(&self) -> Option<&SavedEnvironment> {
         let server = self.connect.local_server.as_ref()?;
-        let environment_id = server.descriptor.as_ref().map(|d| d.environment_id.as_str()).filter(|id| !id.is_empty());
-        self.environments.find(environment_id, &server.state.origin)
+        self.environments.find(server.environment_id(), &server.state.origin)
     }
 
     /// Looks for T3 Code running on this Mac, off the UI thread.
@@ -108,13 +111,22 @@ impl AppState {
     }
 
     fn await_pairing(&mut self, source: PairingSource, task: tokio::task::JoinHandle<Result<Paired, String>>, cx: &mut Context<Self>) {
+        self.connect.attempt += 1;
+        let attempt = self.connect.attempt;
         self.connect.pairing = Some(source);
+        self.connect.pairing_task = Some(task.abort_handle());
         self.connect.error = None;
         cx.emit(AppEvent::Phase);
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|_| Err("Pairing stopped unexpectedly. Try again.".to_owned()));
+            let result = task.await;
             let _ = this.update(cx, |state, cx| {
+                // A cancelled attempt can finish before its abort lands; it changes nothing.
+                if state.connect.attempt != attempt {
+                    return;
+                }
+                let result = result.unwrap_or_else(|_| Err("Pairing stopped unexpectedly. Try again.".to_owned()));
                 state.connect.pairing = None;
+                state.connect.pairing_task = None;
                 match result {
                     Ok(paired) => {
                         tracing::info!(origin = %paired.credentials.http_base, ?source, "paired");
@@ -135,19 +147,37 @@ impl AppState {
         cx.emit(AppEvent::Phase);
     }
 
+    /// Stops a pairing in flight, `t3 pair` included, and drops its result.
+    fn cancel_pairing(&mut self) {
+        if let Some(task) = self.connect.pairing_task.take() {
+            task.abort();
+        }
+        self.connect.attempt += 1;
+        self.connect.pairing = None;
+    }
+
+    /// The connect screen as a new connection leaves it, still knowing the local server.
+    fn reset_connect_screen(&mut self) {
+        self.cancel_pairing();
+        let (local_server, attempt) = (self.connect.local_server.take(), self.connect.attempt);
+        self.connect = ConnectScreen { local_server, attempt, ..Default::default() };
+    }
+
     /// Saves a new pairing and connects to it.
     fn adopt(&mut self, paired: Paired, local: bool, cx: &mut Context<Self>) {
         self.environments.upsert(&paired, local);
         self.persist_environments();
-        self.connect = ConnectScreen { local_server: self.connect.local_server.take(), ..Default::default() };
+        self.reset_connect_screen();
         self.reset_connection(cx);
         self.start_client(paired.credentials, cx);
     }
 
     /// Connects a saved environment, or asks to pair it again when its credential was rejected.
+    /// T3 Code on this Mac is reached where it runs now, which moves when its port does.
     pub fn connect_environment(&mut self, id: &str, cx: &mut Context<Self>) {
+        let moved = self.relocate_local(id);
         let Some(environment) = self.environments.get(id).cloned() else { return };
-        if self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
+        if !moved && self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
             return self.close_switcher(cx);
         }
         let Some(credentials) = environment.credentials() else {
@@ -159,14 +189,28 @@ impl AppState {
         };
         self.environments.active = Some(environment.id);
         self.persist_environments();
-        self.connect = ConnectScreen { local_server: self.connect.local_server.take(), ..Default::default() };
+        self.reset_connect_screen();
         self.reset_connection(cx);
         self.start_client(credentials, cx);
+    }
+
+    /// Points a saved local pairing at the address the running server recorded, when discovery
+    /// found the same server elsewhere. Returns whether it moved.
+    fn relocate_local(&mut self, id: &str) -> bool {
+        let Some(origin) = self.connect.local_server.as_ref().map(|server| server.state.origin.clone()) else { return false };
+        let same_server = self.local_saved_environment().is_some_and(|saved| saved.id == id && saved.local);
+        if !same_server || !self.environments.relocate(id, &origin) {
+            return false;
+        }
+        tracing::info!(%origin, "T3 Code on this Mac moved");
+        self.persist_environments();
+        true
     }
 
     /// Ends the connection and shows the connect screen. The environment stays saved, and the
     /// next launch waits here instead of reconnecting.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.cancel_pairing();
         self.environments.active = None;
         self.persist_environments();
         self.reset_connection(cx);
@@ -201,6 +245,7 @@ impl AppState {
     }
 
     pub fn close_switcher(&mut self, cx: &mut Context<Self>) {
+        self.cancel_pairing();
         self.connect.switching = false;
         self.connect.error = None;
         cx.emit(AppEvent::Phase);
@@ -243,10 +288,11 @@ impl AppState {
         }
     }
 
-    fn persist_environments(&self) {
-        if let Err(error) = store::save_environments(&self.environments) {
-            tracing::warn!(%error, "could not save environments");
-        }
+    /// Hands the edits since the last save to the store's writer, off the UI thread. It applies
+    /// them to the file as it is then, so another instance's entries survive.
+    fn persist_environments(&mut self) {
+        store::save_environment_changes(self.environments.changes_since(&self.environments_saved));
+        self.environments_saved = self.environments.clone();
     }
 
     /// Stops the connection and drops everything that belonged to it.

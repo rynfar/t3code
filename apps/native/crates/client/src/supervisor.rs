@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 use t3_core::auth::AuthSessionState;
 use t3_core::commands::{self, ShellOptions, method};
-use t3_core::compatibility::{ProtocolMismatch, protocol_mismatch};
+use t3_core::compatibility::{ProtocolMismatch, mismatch_with, protocol_mismatch};
 use t3_core::server_config::ServerConfigStreamEvent;
 use t3_core::shell::ShellStreamItem;
 use t3_core::history::HistoryPage;
@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, AuthError, Credentials};
-use crate::session::{RpcError, Session, StreamHandle};
+use crate::session::{OpenError, RpcError, Session, StreamHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -247,12 +247,14 @@ async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
         AuthError::Unauthorized | AuthError::Rejected(_) => ConnectError::Unauthorized(error.to_string()),
         other => ConnectError::Transient(other.to_string()),
     })?;
-    Session::connect(&auth::socket_url(credentials, &ticket)).await.map_err(|reason| {
-        if reason.contains("no longer authorized") {
-            ConnectError::Unauthorized(reason)
-        } else {
-            ConnectError::Transient(reason)
+    Session::connect(&auth::socket_url(credentials, &ticket)).await.map_err(|error| match error {
+        OpenError::Unauthorized => ConnectError::Unauthorized(error.to_string()),
+        // Only a server on a newer protocol answers 426 to ours, unless it says otherwise.
+        OpenError::Incompatible { server_protocol } => {
+            let mismatch = server_protocol.and_then(mismatch_with).unwrap_or(ProtocolMismatch::ClientOutdated);
+            ConnectError::Unsupported { reason: mismatch.message(""), server_outdated: mismatch == ProtocolMismatch::ServerOutdated }
         }
+        OpenError::Failed(reason) => ConnectError::Transient(reason),
     })
 }
 

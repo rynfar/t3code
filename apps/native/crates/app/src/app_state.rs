@@ -29,7 +29,8 @@ pub enum Phase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
-    /// The connection, the saved environments, or the connect screen changed.
+    /// The connection, the saved environments, or the connect screen changed. Also sent for
+    /// every new connection, so whatever follows one can check `connection_id`.
     Phase,
     Shell,
     Selection,
@@ -54,6 +55,8 @@ pub enum AppEvent {
 pub struct AppState {
     pub phase: Phase,
     pub environments: SavedEnvironments,
+    /// `environments` as last handed to the store; saves send only the edits since.
+    pub(crate) environments_saved: SavedEnvironments,
     pub connect: ConnectScreen,
     pub shell: ShellState,
     pub sidebar: SidebarController,
@@ -79,6 +82,8 @@ pub struct AppState {
     /// A prompt handed back to the composer for a thread, as "Edit from here" restores one.
     composer_restore: Option<(String, String)>,
     client: Option<ClientHandle>,
+    /// Counts clients started, so state tied to one never outlives a switch to the next.
+    connection: u64,
     runtime: tokio::runtime::Handle,
     _pump: Option<Task<()>>,
 }
@@ -89,9 +94,11 @@ const MAX_BATCH: usize = 512;
 
 impl AppState {
     pub fn new(runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
+        let environments = store::load_environments();
         let mut state = AppState {
             phase: Phase::Unpaired,
-            environments: store::load_environments(),
+            environments_saved: environments.clone(),
+            environments,
             connect: ConnectScreen::default(),
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
@@ -112,6 +119,7 @@ impl AppState {
             select_when_listed: None,
             composer_restore: None,
             client: None,
+            connection: 0,
             runtime,
             _pump: None,
         };
@@ -156,9 +164,14 @@ impl AppState {
     pub(crate) fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
         let (client, mut events) = t3_client::supervisor::start(&self.runtime, credentials);
         self.client = Some(client);
+        self.connection += 1;
         self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
         cx.emit(AppEvent::RightPanel);
-        self.set_phase(Phase::Online(ConnectionStatus::Connecting), cx);
+        let connecting = Phase::Online(ConnectionStatus::Connecting);
+        if self.phase == connecting {
+            cx.emit(AppEvent::Phase);
+        }
+        self.set_phase(connecting, cx);
         self._pump = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = events.recv().await {
                 let mut batch = vec![first];
@@ -430,6 +443,12 @@ impl AppState {
 
     pub(crate) fn client_handle(&self) -> Option<ClientHandle> {
         self.client.clone()
+    }
+
+    /// Which client is current, `None` without one. Anything that holds a `ClientHandle` past
+    /// one call compares this on `AppEvent::Phase` and lets go when it changes.
+    pub(crate) fn connection_id(&self) -> Option<u64> {
+        self.client.is_some().then_some(self.connection)
     }
 
     pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {

@@ -34,6 +34,8 @@ pub struct TerminalDrawer {
     panes: HashMap<String, Entity<TerminalPane>>,
     panes_thread: Option<String>,
     metadata: Option<(tokio::task::JoinHandle<()>, Task<()>)>,
+    /// The connection `metadata`, `grants`, and the panes belong to.
+    connection: Option<u64>,
     access: TerminalAccess,
     grants: Option<Task<()>>,
     save: Option<Task<()>>,
@@ -64,6 +66,7 @@ impl TerminalDrawer {
             panes: HashMap::new(),
             panes_thread: None,
             metadata: None,
+            connection: None,
             access: TerminalAccess::default(),
             grants: None,
             save: None,
@@ -88,16 +91,23 @@ impl TerminalDrawer {
         self.layout(cx).is_some_and(|(_, layout)| layout.terminal_open)
     }
 
+    /// Follows the current connection; switching environments drops everything the last one
+    /// started, which still holds its client.
     fn connection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let online = matches!(self.app.read(cx).phase, Phase::Online(_));
-        if !online {
+        let state = self.app.read(cx);
+        let current = if matches!(state.phase, Phase::Online(_)) { state.connection_id() } else { None };
+        if current != self.connection {
             if let Some((driver, _)) = self.metadata.take() {
                 driver.abort();
             }
             self.grants = None;
+            self.access = TerminalAccess::default();
             self.summaries = None;
             self.panes.clear();
+            self.connection = current;
             cx.notify();
+        }
+        if current.is_none() {
             return;
         }
         if self.metadata.is_none()

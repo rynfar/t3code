@@ -29,7 +29,11 @@ impl ProtocolMismatch {
 
 /// `orchestrationProtocolCompatibilityError`. Servers shipped before negotiation speak protocol 1.
 pub fn protocol_mismatch(descriptor: &EnvironmentDescriptor) -> Option<ProtocolMismatch> {
-    let server = descriptor.orchestration_protocol_version.unwrap_or(1);
+    mismatch_with(descriptor.orchestration_protocol_version.unwrap_or(1))
+}
+
+/// How a server speaking `server` relates to this client's protocol.
+pub fn mismatch_with(server: u32) -> Option<ProtocolMismatch> {
     match server.cmp(&ORCHESTRATION_PROTOCOL_VERSION) {
         std::cmp::Ordering::Equal => None,
         std::cmp::Ordering::Less => Some(ProtocolMismatch::ServerOutdated),

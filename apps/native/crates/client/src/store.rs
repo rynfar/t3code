@@ -33,6 +33,8 @@ fn base() -> Option<PathBuf> {
 }
 
 const ENVIRONMENTS: &str = "environments.json";
+/// The writer queue's key for `ENVIRONMENTS`.
+const ENVIRONMENTS_KEY: &str = "environments";
 /// The single saved connection of earlier builds.
 const LEGACY_CONNECTION: &str = "connection.json";
 
@@ -146,6 +148,55 @@ impl SavedEnvironments {
         id
     }
 
+    /// Points a saved environment at another address of the same server, as when T3 Code on this
+    /// Mac comes back on a new port. Returns whether it moved.
+    pub fn relocate(&mut self, id: &str, http_base: &str) -> bool {
+        match self.environments.iter_mut().find(|environment| environment.id == id) {
+            Some(environment) if environment.http_base != http_base => {
+                environment.http_base = http_base.to_owned();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The edits that turn `before` into this list.
+    pub fn changes_since(&self, before: &SavedEnvironments) -> Vec<EnvironmentChange> {
+        let mut changes: Vec<EnvironmentChange> =
+            before.environments.iter().filter(|old| self.get(&old.id).is_none()).map(|old| EnvironmentChange::Remove(old.id.clone())).collect();
+        changes.extend(self.environments.iter().filter(|environment| before.get(&environment.id) != Some(*environment)).cloned().map(EnvironmentChange::Put));
+        if self.active != before.active {
+            changes.push(EnvironmentChange::SetActive(self.active.clone()));
+        }
+        changes
+    }
+
+    /// Applies one edit. An entry is matched by its id, else by the server it names, so two
+    /// instances that paired the same server keep one entry.
+    pub fn apply(&mut self, change: EnvironmentChange) {
+        match change {
+            EnvironmentChange::Put(environment) => {
+                let slot = self.environments.iter().position(|entry| entry.id == environment.id).or_else(|| {
+                    let wanted = environment.environment_id.as_deref()?;
+                    self.environments.iter().position(|entry| entry.environment_id.as_deref() == Some(wanted))
+                });
+                match slot {
+                    Some(index) => {
+                        let replaced = std::mem::replace(&mut self.environments[index], environment);
+                        if self.active.as_deref() == Some(replaced.id.as_str()) {
+                            self.active = Some(self.environments[index].id.clone());
+                        }
+                    }
+                    None => self.environments.push(environment),
+                }
+            }
+            EnvironmentChange::Remove(id) => {
+                self.remove(&id);
+            }
+            EnvironmentChange::SetActive(active) => self.active = active,
+        }
+    }
+
     /// Forgets an environment and its credential. Returns whether it was saved.
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.environments.len();
@@ -181,6 +232,15 @@ impl SavedEnvironments {
     }
 }
 
+/// One edit to the saved environments. The writer applies edits to the file as it is when it
+/// writes, so a second app instance's entries survive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentChange {
+    Put(SavedEnvironment),
+    Remove(String),
+    SetActive(Option<String>),
+}
+
 fn decode_environments(environments: Option<&str>, legacy: Option<&str>) -> SavedEnvironments {
     if let Some(text) = environments {
         return serde_json::from_str(text).unwrap_or_default();
@@ -194,18 +254,42 @@ pub fn load_environments() -> SavedEnvironments {
     let environments = std::fs::read_to_string(base.join(ENVIRONMENTS)).ok();
     let legacy = environments.is_none().then(|| std::fs::read_to_string(base.join(LEGACY_CONNECTION)).ok()).flatten();
     let saved = decode_environments(environments.as_deref(), legacy.as_deref());
-    if legacy.is_some()
-        && let Err(error) = save_environments(&saved)
-    {
-        tracing::warn!(%error, "could not migrate the saved connection");
+    if legacy.is_some() {
+        save_environment_changes(saved.changes_since(&SavedEnvironments::default()));
     }
     saved
 }
 
+/// Queues edits for the background writer, which re-reads the file and applies them in order.
+pub fn save_environment_changes(changes: Vec<EnvironmentChange>) {
+    if !changes.is_empty() {
+        queue(ENVIRONMENTS_KEY, Save::Environments(changes));
+    }
+}
+
+/// Writes the whole list now. For tools; the app queues edits with `save_environment_changes`.
 pub fn save_environments(saved: &SavedEnvironments) -> std::io::Result<()> {
-    let base = base().ok_or_else(|| std::io::Error::other("no config directory"))?;
+    write_environments(&base().ok_or_else(|| std::io::Error::other("no config directory"))?, saved)
+}
+
+/// Lays edits over the saved environments as they are now. A file that exists but cannot be
+/// read is left alone.
+fn write_environment_changes(base: &Path, changes: Vec<EnvironmentChange>) -> std::io::Result<()> {
+    let current = match std::fs::read_to_string(base.join(ENVIRONMENTS)) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut saved = decode_environments(current.as_deref(), None);
+    for change in changes {
+        saved.apply(change);
+    }
+    write_environments(base, &saved)
+}
+
+fn write_environments(base: &Path, saved: &SavedEnvironments) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(saved).map_err(std::io::Error::other)?;
-    write_private(&base, ENVIRONMENTS, &text)?;
+    write_private(base, ENVIRONMENTS, &text)?;
     // Earlier builds read the legacy file; keep a forgotten credential from lingering there.
     let legacy = base.join(LEGACY_CONNECTION);
     if let Some(credentials) = std::fs::read_to_string(&legacy).ok().and_then(|text| serde_json::from_str::<Credentials>(&text).ok())
@@ -268,8 +352,9 @@ pub fn load_ui_state(name: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// Queues a save. One writer thread owns every UI state file: saves land in order, coalesced to
-/// the newest value per file, so an older snapshot can never overwrite a newer one.
+/// Queues a save. One writer thread owns every UI state file and the saved environments, off the
+/// UI thread: saves land in order, coalesced to the newest value per file, so an older snapshot
+/// can never overwrite a newer one.
 pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
     let Ok(text) = serde_json::to_string(value) else { return };
     queue(name, Save::Replace(text));
@@ -279,6 +364,7 @@ pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
 enum Save {
     Replace(String),
     Patch(serde_json::Map<String, serde_json::Value>),
+    Environments(Vec<EnvironmentChange>),
 }
 
 fn queue(name: &str, save: Save) {
@@ -293,6 +379,11 @@ fn queue(name: &str, save: Save) {
                         match save {
                             Save::Replace(text) => write_atomically(&base, &name, &text),
                             Save::Patch(patch) => write_patch(&base, &name, &patch),
+                            Save::Environments(changes) => {
+                                if let Err(error) = write_environment_changes(&base, changes) {
+                                    tracing::warn!(%error, "could not save environments");
+                                }
+                            }
                         }
                     }
                 }
@@ -322,7 +413,11 @@ fn coalesce(saves: impl Iterator<Item = (String, Save)>) -> Vec<(String, Save)> 
             (Save::Replace(text), Save::Patch(later)) => {
                 Save::Replace(t3_core::client_settings::merge_patch(Some(&text), &later).text)
             }
-            (_, replace @ Save::Replace(_)) => replace,
+            (Save::Environments(mut earlier), Save::Environments(later)) => {
+                earlier.extend(later);
+                Save::Environments(earlier)
+            }
+            (_, later) => later,
         };
     }
     pending
@@ -479,6 +574,60 @@ mod tests {
         assert!(saved.remove(&mac));
         assert_eq!((saved.active.clone(), saved.environments.len()), (None, 0));
         assert!(!saved.remove(&mac));
+    }
+
+    #[test]
+    fn edits_land_on_the_file_as_another_instance_left_it() {
+        let dir = std::env::temp_dir().join(format!("t3-environments-merge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let read = |dir: &Path| decode_environments(std::fs::read_to_string(dir.join(ENVIRONMENTS)).ok().as_deref(), None);
+
+        // Both instances start from the same file.
+        let mut mine = SavedEnvironments::default();
+        let mac = mine.upsert(&paired("http://127.0.0.1:3773", "t", "env-mac", "MacBook Pro"), true);
+        write_environments(&dir, &mine).expect("writes");
+        let mut theirs = mine.clone();
+        // The other instance pairs a second server and writes first.
+        let studio = theirs.upsert(&paired("https://studio.ts.net", "s", "env-studio", "Studio"), false);
+        write_environments(&dir, &theirs).expect("writes");
+
+        // This one, still holding the old list, disconnects and renames its entry.
+        let before = mine.clone();
+        mine.active = None;
+        mine.update_identity(&mac, "env-mac", "Mac mini", "0.1.8");
+        write_environment_changes(&dir, mine.changes_since(&before)).expect("writes");
+        let saved = read(&dir);
+        assert_eq!(saved.get(&studio).map(|e| e.label.as_str()), Some("Studio"), "the other instance's pairing survives");
+        assert_eq!((saved.get(&mac).map(|e| e.label.as_str()), saved.active.as_deref()), (Some("Mac mini"), None));
+
+        // Removing only removes what this instance removed.
+        let before = mine.clone();
+        mine.remove(&mac);
+        write_environment_changes(&dir, mine.changes_since(&before)).expect("writes");
+        assert_eq!(read(&dir).environments.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), [studio.as_str()]);
+
+        // Both instances paired the same server: one entry, and the active one follows it.
+        let mut file = read(&dir);
+        let mut other = SavedEnvironments::default();
+        other.upsert(&paired("http://127.0.0.1:3773", "t2", "env-mac", "MacBook Pro"), true);
+        let mut again = SavedEnvironments::default();
+        let mine_id = again.upsert(&paired("http://127.0.0.1:3773", "t3", "env-mac", "MacBook Pro"), true);
+        for change in other.changes_since(&SavedEnvironments::default()).into_iter().chain(again.changes_since(&SavedEnvironments::default())) {
+            file.apply(change);
+        }
+        assert_eq!((file.environments.len(), file.active.as_deref()), (2, Some(mine_id.as_str())));
+        assert_eq!(file.active().and_then(|e| e.access_token.as_deref()), Some("t3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_server_moves_to_its_new_address() {
+        let mut saved = SavedEnvironments::default();
+        let mac = saved.upsert(&paired("http://127.0.0.1:3773", "t", "env-mac", "MacBook Pro"), true);
+        assert!(!saved.relocate(&mac, "http://127.0.0.1:3773"));
+        assert!(saved.relocate(&mac, "http://127.0.0.1:3774"));
+        assert_eq!(saved.get(&mac).and_then(SavedEnvironment::credentials).map(|c| c.http_base), Some("http://127.0.0.1:3774".to_owned()));
+        assert!(!saved.relocate("missing", "http://127.0.0.1:1"));
     }
 
     #[test]

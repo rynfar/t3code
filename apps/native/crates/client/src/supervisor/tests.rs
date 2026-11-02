@@ -237,3 +237,23 @@ async fn a_server_on_another_protocol_blocks_until_retried() {
     server.connection().await;
     assert_eq!(next_status(&mut events).await, ConnectionStatus::Connected);
 }
+
+#[tokio::test]
+async fn a_socket_refused_for_its_protocol_blocks_instead_of_retrying() {
+    let mut server = FakeServer::start().await;
+    // No descriptor to check first: the socket's 426 is the only signal.
+    let newer = t3_core::compatibility::ORCHESTRATION_PROTOCOL_VERSION + 1;
+    let body = json!({"code": "orchestration_protocol_incompatible", "message": "Update this client.", "orchestrationProtocolVersion": newer});
+    server.refuse_upgrades(Some((426, body)));
+    let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connecting);
+    let ConnectionStatus::Unsupported { reason, server_outdated: false } = next_status(&mut events).await else { panic!("blocked as unsupported") };
+    assert!(reason.starts_with("This client is not supported by this server."), "{reason}");
+
+    // Nothing retries on its own; Retry checks again.
+    server.refuse_upgrades(None);
+    client.retry_now();
+    assert!(matches!(next_status(&mut events).await, ConnectionStatus::Reconnecting { reason: last, .. } if last == reason));
+    server.connection().await;
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connected);
+}
