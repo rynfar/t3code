@@ -337,6 +337,8 @@ struct Entry {
 pub struct PreparedCache {
     entries: Vec<Entry>,
     tick: u64,
+    /// Views whose queued entry was dropped for room; each holds at most one place here.
+    starved: Vec<EntityId>,
 }
 
 struct Store(Entity<PreparedCache>);
@@ -373,13 +375,11 @@ impl PreparedCache {
         if key.inline() {
             let prepared = Rc::new(Prepared { blocks: key.derive() });
             self.entries.push(Entry { key, used: tick, slot: Slot::Ready(prepared.clone()) });
-            let dropped = self.trim();
-            wake(dropped, cx);
+            self.trim();
             return Some(prepared);
         }
         self.entries.push(Entry { key, used: tick, slot: Slot::Queued { waiters: vec![owner] } });
-        let dropped = self.trim();
-        wake(dropped, cx);
+        self.trim();
         self.start_queued(cx);
         None
     }
@@ -415,23 +415,31 @@ impl PreparedCache {
     }
 
     /// Lands a background derive, wakes the views waiting for it, and starts the next one.
-    fn finish(&mut self, (key, blocks): (Key, Vec<Block>), cx: &mut Context<Self>) {
-        let mut waiters = Vec::new();
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key))
-            && let Slot::Running { waiters: waiting, .. } = std::mem::replace(&mut entry.slot, Slot::Ready(Rc::new(Prepared { blocks })))
-        {
-            waiters = waiting;
-        }
-        waiters.extend(self.trim());
+    fn finish(&mut self, derived: (Key, Vec<Block>), cx: &mut Context<Self>) {
+        let views = self.complete(derived);
         self.start_queued(cx);
-        wake(waiters, cx);
+        wake(views, cx);
+    }
+
+    /// Lands a derive. Returns the views to redraw: its own waiters, and the views whose queued
+    /// entries were dropped, which ask again now that a derive is free. Only a completion wakes
+    /// anyone, so a redraw always follows progress.
+    fn complete(&mut self, (key, blocks): (Key, Vec<Block>)) -> Vec<EntityId> {
+        let mut views = Vec::new();
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key))
+            && let Slot::Running { waiters, .. } = std::mem::replace(&mut entry.slot, Slot::Ready(Rc::new(Prepared { blocks })))
+        {
+            views = waiters;
+        }
+        self.trim();
+        views.append(&mut self.starved);
+        views
     }
 
     /// Drops the least recently asked-for entries past `CACHE_LIMIT`: ready ones first, then
-    /// queued ones. Running ones stay, and there are never more than `RUNNING_LIMIT`. Returns the
-    /// views that waited on a dropped entry, which must draw again to ask for it again.
-    fn trim(&mut self) -> Vec<EntityId> {
-        let mut dropped = Vec::new();
+    /// queued ones. Running ones stay, and there are never more than `RUNNING_LIMIT`. The views
+    /// waiting on a dropped entry are kept as starved, to be woken by the next completion.
+    fn trim(&mut self) {
         while self.entries.len() > CACHE_LIMIT {
             let oldest = |queued: bool| {
                 self.entries
@@ -443,10 +451,13 @@ impl PreparedCache {
             };
             let Some(index) = oldest(false).or_else(|| oldest(true)) else { break };
             if let Slot::Queued { waiters } = self.entries.swap_remove(index).slot {
-                dropped.extend(waiters);
+                for view in waiters {
+                    if !self.starved.contains(&view) {
+                        self.starved.push(view);
+                    }
+                }
             }
         }
-        dropped
     }
 }
 
@@ -875,7 +886,7 @@ mod tests {
         let mut cache = PreparedCache::default();
         cache.entries.extend((0..RUNNING_LIMIT as u64).map(|used| entry(running(), used)));
         cache.entries.extend((0..CACHE_LIMIT as u64 * 2).map(|used| entry(queued(), 100 + used)));
-        let _ = cache.trim();
+        cache.trim();
         assert_eq!(cache.entries.len(), CACHE_LIMIT);
         assert_eq!(cache.entries.iter().filter(|entry| matches!(entry.slot, Slot::Running { .. })).count(), RUNNING_LIMIT, "running derives stay");
         assert!(cache.entries.iter().all(|entry| matches!(entry.slot, Slot::Running { .. }) || entry.used >= 100 + CACHE_LIMIT as u64 + RUNNING_LIMIT as u64), "the oldest queued ones go");
@@ -883,21 +894,30 @@ mod tests {
         let mut cache = PreparedCache::default();
         cache.entries.push(entry(queued(), 50));
         cache.entries.extend((0..CACHE_LIMIT as u64).map(|used| entry(Slot::Ready(Rc::new(Prepared { blocks: Vec::new() })), used)));
-        let _ = cache.trim();
+        cache.trim();
         assert_eq!(cache.entries.len(), CACHE_LIMIT);
         assert!(cache.entries.iter().any(|entry| matches!(entry.slot, Slot::Queued { .. })), "ready entries go before waiting ones");
     }
 
     #[test]
-    fn a_view_whose_waiting_derive_is_dropped_is_woken_to_ask_again() {
+    fn a_dropped_waiting_row_is_retried_only_after_a_derive_completes() {
         let (side_chat, main) = (EntityId::from(1u64), EntityId::from(2u64));
         let mut cache = PreparedCache::default();
-        cache.entries.extend((0..RUNNING_LIMIT as u64).map(|used| entry(Slot::Running { waiters: vec![main], _task: Task::ready(()) }, used)));
+        let finishing = key(tool("finishing"), Fetch::None);
+        cache.entries.push(Entry { key: finishing.clone(), used: 0, slot: Slot::Running { waiters: vec![main], _task: Task::ready(()) } });
+        cache.entries.extend((1..RUNNING_LIMIT as u64).map(|used| entry(Slot::Running { waiters: vec![main], _task: Task::ready(()) }, used)));
         cache.entries.push(entry(Slot::Queued { waiters: vec![side_chat] }, 10));
         cache.entries.extend((0..CACHE_LIMIT as u64).map(|used| entry(Slot::Queued { waiters: vec![main] }, 20 + used)));
-        let woken = cache.trim();
-        assert!(woken.contains(&side_chat), "the side chat's dropped row is woken, though only the main view's derives run");
-        assert!(!cache.entries.iter().any(|entry| matches!(&entry.slot, Slot::Queued { waiters } if waiters.contains(&side_chat))));
+        cache.trim();
+        assert!(!cache.entries.iter().any(|entry| matches!(&entry.slot, Slot::Queued { waiters } if waiters.contains(&side_chat))), "the oldest queued row is dropped");
+        assert_eq!(cache.starved, vec![side_chat, main], "eviction alone wakes nobody: the owners wait, each once");
+        cache.trim();
+        assert_eq!(cache.starved, vec![side_chat, main], "and trimming again adds nothing");
+
+        let woken = cache.complete((finishing, Vec::new()));
+        assert!(woken.contains(&main), "the finished derive's own view");
+        assert!(woken.contains(&side_chat), "and the starved one, now that a derive is free");
+        assert!(cache.starved.is_empty());
     }
 
     #[test]
