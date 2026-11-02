@@ -117,6 +117,9 @@ impl SidebarPane {
                     dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| state.delete_threads(ids, cx), window, cx));
                 }
                 ContextMenuEvent::Delete(thread_id) => {
+                    if !crate::settings::client_settings(cx).confirm_thread_delete() {
+                        return this.state.update(cx, |state, cx| state.delete_thread(thread_id, cx));
+                    }
                     let Some(title) = this.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
                     let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
                     let id = thread_id.clone();

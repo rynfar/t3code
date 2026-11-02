@@ -80,6 +80,11 @@ pub fn palette_items() -> Vec<t3_core::palette::CommandPaletteItem> {
         .collect()
 }
 
+/// The per-device settings every view reads (`useClientSettings`).
+pub fn client_settings(cx: &App) -> &t3_core::client_settings::ClientSettingsDoc {
+    store::client(cx)
+}
+
 fn close(cx: &mut App) {
     cx.global_mut::<Host>().view = None;
     store::clear_error(cx);

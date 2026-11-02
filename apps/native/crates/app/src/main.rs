@@ -18,6 +18,7 @@ mod project_files;
 mod projects;
 mod provider_icon;
 mod pull_requests;
+mod quit_hold;
 mod right_panel;
 mod settings;
 mod sidebar;

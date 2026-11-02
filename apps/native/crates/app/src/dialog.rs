@@ -1,13 +1,75 @@
 //! A confirm dialog (design-system §6.4): scrim, dialog glass, title, description, and a footer
-//! with Cancel and a destructive action. Escape cancels, Enter confirms.
+//! with Cancel and a destructive action. Escape cancels, Enter confirms. The thread actions the
+//! General settings can ask to confirm (unpin, archive) go through here from every entry point
+//! (`useThreadActions.ts` `confirmAndUnpinThread`, `useThreadActionMenu.ts` archive).
 
 use gpui::{
-    App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
-    Styled, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
+    App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    SharedString, Styled, WeakEntity, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
+use t3_core::thread_actions::{archive_confirmation, unpin_confirmation};
 
 use crate::app_state::AppState;
 use crate::theme::{WHITE, hsla, palette};
+
+struct Host(WeakEntity<ConfirmDialog>);
+
+impl Global for Host {}
+
+/// Asks before running `on_confirm`, from code that has no window at hand. Without a dialog
+/// nothing runs: a confirmation that cannot be shown is a "no".
+fn ask(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    confirm_label: impl Into<SharedString>,
+    on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
+    cx: &mut App,
+) {
+    let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return };
+    let focus = dialog.update(cx, |dialog, cx| {
+        dialog.pending = Some(Pending {
+            title: title.into(),
+            description: description.into(),
+            confirm_label: confirm_label.into(),
+            on_confirm: Box::new(on_confirm),
+        });
+        cx.notify();
+        dialog.focus.clone()
+    });
+    // The caller may be inside a window update; focus once it returns.
+    cx.defer(move |cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
+        }
+    });
+}
+
+impl AppState {
+    fn thread_title(&self, thread_id: &str) -> String {
+        self.sidebar.model.thread(thread_id).map_or_else(|| "this thread".to_owned(), |thread| thread.title.clone())
+    }
+
+    /// Unpins, asking first while "Confirm thread unpin" is on.
+    pub fn request_unpin_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if !crate::settings::client_settings(cx).confirm_thread_unpin() {
+            return self.unpin_thread(thread_id, cx);
+        }
+        let (title, description) = unpin_confirmation(&self.thread_title(thread_id));
+        let id = thread_id.to_owned();
+        ask(title, description, "Unpin", move |state, cx| state.unpin_thread(&id, cx), cx);
+    }
+
+    /// Archives, asking first while "Confirm thread archive" is on. A thread that cannot be
+    /// archived says why without asking.
+    pub fn request_archive_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let archivable = self.sidebar.model.thread(thread_id).is_some_and(|thread| thread.can_archive());
+        if !archivable || !crate::settings::client_settings(cx).confirm_thread_archive() {
+            return self.archive_thread(thread_id, cx);
+        }
+        let id = thread_id.to_owned();
+        ask(archive_confirmation(&self.thread_title(thread_id)), "", "Archive", move |state, cx| state.archive_thread(&id, cx), cx);
+    }
+}
 
 type OnConfirm = Box<dyn FnOnce(&mut AppState, &mut Context<AppState>)>;
 
@@ -32,6 +94,7 @@ impl Focusable for ConfirmDialog {
 
 impl ConfirmDialog {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        cx.set_global(Host(cx.weak_entity()));
         ConfirmDialog { state, pending: None, focus: cx.focus_handle() }
     }
 
@@ -130,7 +193,9 @@ impl Render for ConfirmDialog {
                                 .flex_col()
                                 .gap(px(8.))
                                 .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(pending.title.clone()))
-                                .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(pending.description.clone())),
+                                .when(!pending.description.is_empty(), |this| {
+                                    this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(pending.description.clone()))
+                                }),
                         )
                         .child(
                             div()

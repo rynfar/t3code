@@ -373,7 +373,7 @@ impl CommandPalette {
             return cx.propagate();
         };
         self.state.update(cx, |state, cx| match state.sidebar.model.thread(&thread_id).map(|thread| thread.pinned) {
-            Some(true) => state.unpin_thread(&thread_id, cx),
+            Some(true) => state.request_unpin_thread(&thread_id, cx),
             Some(false) => state.pin_thread(&thread_id, None, cx),
             None => {}
         });
