@@ -45,6 +45,8 @@ pub enum AppEvent {
     ComposerMention,
     /// The sidebar's multi-selection or thread drag changed.
     SidebarSelection,
+    /// A prompt is waiting for the composer (`take_composer_restore`).
+    ComposerRestore,
 }
 
 pub struct AppState {
@@ -69,6 +71,8 @@ pub struct AppState {
     pub(crate) notifications: crate::notifications::NotificationCenter,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
+    /// A prompt handed back to the composer for a thread, as "Edit from here" restores one.
+    composer_restore: Option<(String, String)>,
     client: Option<ClientHandle>,
     runtime: tokio::runtime::Handle,
     _pump: Option<Task<()>>,
@@ -98,6 +102,7 @@ impl AppState {
             omitted: Default::default(),
             notifications: Default::default(),
             select_when_listed: None,
+            composer_restore: None,
             client: None,
             runtime,
             _pump: None,
@@ -401,6 +406,16 @@ impl AppState {
             let Some(client) = client else { return Err((0, RpcError::Closed)) };
             runtime.spawn(async move { client.dispatch_in_order(commands).await }).await.unwrap_or(Err((0, RpcError::Closed)))
         }
+    }
+
+    /// Hands `prompt` to the composer of `thread_id`, which joins it to its draft and focuses.
+    pub fn restore_composer_prompt(&mut self, thread_id: &str, prompt: String, cx: &mut Context<Self>) {
+        self.composer_restore = Some((thread_id.to_owned(), prompt));
+        cx.emit(AppEvent::ComposerRestore);
+    }
+
+    pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<String> {
+        if self.composer_restore.as_ref().is_some_and(|(thread, _)| thread == thread_id) { self.composer_restore.take().map(|(_, prompt)| prompt) } else { None }
     }
 
     pub(crate) fn client_handle(&self) -> Option<ClientHandle> {

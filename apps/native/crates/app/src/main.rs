@@ -10,6 +10,7 @@ mod git;
 mod glass;
 mod icons;
 mod keymap;
+mod media;
 mod menus;
 mod new_thread;
 mod omitted_rows;

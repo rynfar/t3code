@@ -214,7 +214,7 @@ fn request_of(kind: &str) -> SubagentRequest {
     if kind == "user_input" { SubagentRequest::UserInput } else { SubagentRequest::Approval }
 }
 
-fn subagent_request(thread: &ThreadShell) -> Option<SubagentRequest> {
+pub(crate) fn subagent_request(thread: &ThreadShell) -> Option<SubagentRequest> {
     let kind = thread.pending_runtime_request.as_ref()?.kind.as_str();
     let subagent = thread.lineage.relationship_to_parent.as_deref() == Some("subagent");
     let provider_native = subagent && thread.creation_source.as_deref() == Some("provider");
@@ -224,7 +224,7 @@ fn subagent_request(thread: &ThreadShell) -> Option<SubagentRequest> {
     Some(request_of(kind))
 }
 
-fn side_chat_request(thread: &ThreadShell) -> Option<SubagentRequest> {
+pub(crate) fn side_chat_request(thread: &ThreadShell) -> Option<SubagentRequest> {
     let kind = thread.pending_runtime_request.as_ref()?.kind.as_str();
     (kind != "auth_refresh" && thread.lineage.side_chat == Some(true)).then(|| request_of(kind))
 }

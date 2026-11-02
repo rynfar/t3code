@@ -163,6 +163,11 @@ impl Composer {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
             }),
+            cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
+                if *event == AppEvent::ComposerRestore {
+                    this.restore_prompt(window, cx);
+                }
+            }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| this.on_picker(event, window, cx)),
         ];
         let limit_recovery = cx.new(|cx| crate::thread_view::LimitRecoveryBanner::new(state.clone(), cx));
@@ -473,6 +478,16 @@ impl Composer {
     fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.has_text = !text.trim().is_empty();
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+    }
+
+    /// "Edit from here": the restored prompt joins the draft (`rewindToMessage`), cursor at the end.
+    fn restore_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.thread_id() else { return };
+        let Some(restored) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else { return };
+        let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
+        self.set_prompt(&prompt, window, cx);
+        self.focus(window, cx);
+        cx.notify();
     }
 
     fn on_enter(&mut self, modifier: bool, window: &mut Window, cx: &mut Context<Self>) {

@@ -271,8 +271,13 @@ export function shellCases() {
             pendingGuestMessageCount: 2,
             latestUserAuthoredMessageAt: thread.updatedAt,
             pendingBackgroundTasks: [
-              { taskId: "task-1", kind: "subagent" },
-              { taskId: "task-2", kind: "command", awaited: true },
+              {
+                taskId: "task-1",
+                kind: "subagent",
+                description: "Explore the repo",
+                childThreadId: "thread-child",
+              },
+              { taskId: "task-2", kind: "command", description: "npm run dev", awaited: true },
             ],
             goal: { objective: "Ship the sidebar", status: "active" },
             limitRecovery: {

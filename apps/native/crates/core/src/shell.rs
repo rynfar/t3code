@@ -77,7 +77,13 @@ where
 #[serde(rename_all = "camelCase")]
 pub struct PendingBackgroundTask {
     #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
     #[serde(default)]
     pub awaited: Option<bool>,
 }

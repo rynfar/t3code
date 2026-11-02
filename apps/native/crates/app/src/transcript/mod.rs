@@ -3,6 +3,7 @@
 
 mod changed_files;
 pub mod markdown;
+mod media;
 mod messages;
 mod notices;
 mod parts;
@@ -72,6 +73,10 @@ pub struct RowEnv<'a> {
     /// Fork capability by provider thread, and the runs a fork is being created from.
     pub fork_support: &'a HashMap<String, bool>,
     pub forking: &'a HashSet<String>,
+    /// The turn count each user message's "Edit from here" rewinds to.
+    pub revert_counts: &'a HashMap<String, u64>,
+    /// A rewind is out or a turn is running.
+    pub rewind_disabled: bool,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.

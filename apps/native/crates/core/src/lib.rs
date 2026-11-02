@@ -9,6 +9,7 @@ pub mod git_actions;
 pub mod history;
 pub mod keybindings;
 pub mod lists;
+pub mod media;
 pub mod model;
 pub mod notifications;
 pub mod pairing;

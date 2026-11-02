@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod find;
 mod limit_recovery;
+mod rewind;
 mod status;
 
 pub use limit_recovery::LimitRecoveryBanner;
@@ -57,6 +58,9 @@ pub struct ThreadView {
     local_error: Option<String>,
     clock: Clock,
     window_height: f32,
+    rewind: rewind::RewindUi,
+    media: Entity<crate::media::MediaCache>,
+    viewer: Entity<crate::media::MediaViewer>,
     _subscription: Subscription,
 }
 
@@ -68,6 +72,8 @@ impl ThreadView {
             AppEvent::Shell | AppEvent::ServerConfig => this.sync_status(cx),
             _ => {}
         });
+        let media = crate::media::cache(&state, cx);
+        let viewer = cx.new(crate::media::MediaViewer::new);
         ThreadView {
             state,
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
@@ -93,6 +99,9 @@ impl ThreadView {
             local_error: None,
             clock: Clock::now(),
             window_height: 0.,
+            rewind: rewind::RewindUi::default(),
+            media,
+            viewer,
             _subscription: subscription,
         }
     }
@@ -121,6 +130,7 @@ impl ThreadView {
             self.reset_status();
             self.turn_diffs.clear();
             self.turn_diff_source = None;
+            self.reset_rewind();
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -140,6 +150,8 @@ impl ThreadView {
         }
         self.sync_history(cx);
         self.rederive(cx);
+        self.sync_revert_counts(cx);
+        self.check_rewind(cx);
         self.sync_turn_diffs(cx);
         self.sync_status(cx);
         self.refresh_open_details(cx);
@@ -304,6 +316,10 @@ impl ThreadView {
         cx.notify();
     }
 
+    pub fn open_media(&mut self, items: Vec<crate::media::ViewerItem>, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.viewer.update(cx, |viewer, cx| viewer.open(items, index, window, cx));
+    }
+
     pub fn open_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| state.select_thread(thread_id, cx));
     }
@@ -406,6 +422,8 @@ impl ThreadView {
             turn_diffs: &self.turn_diffs,
             fork_support: &self.fork_support,
             forking: &self.forking,
+            revert_counts: &self.rewind.counts,
+            rewind_disabled: self.rewind.busy() || self.activity.is_working,
         };
         render(&env, &mut self.markdown)
     }
@@ -460,6 +478,14 @@ impl Render for ThreadView {
         self.clock = Clock::now();
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
+        self.media.update(cx, |media, cx| media.begin_frame(window, cx));
+        let scope = crate::media::MediaScope {
+            owner: cx.entity_id(),
+            thread_id: self.thread_id.clone(),
+            workspace_root: self.workspace_root.clone(),
+            viewer: self.viewer.downgrade(),
+        };
+        crate::media::set_scope(scope, cx);
         let find_bar = self.render_find_bar(cx);
         let banners = self.render_banners(cx);
         let transcript = list(
@@ -479,6 +505,6 @@ impl Render for ThreadView {
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(banners).children(find_bar).into_any_element()
+        div().relative().size_full().child(transcript).children(banners).children(find_bar).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }

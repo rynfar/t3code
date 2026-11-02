@@ -22,7 +22,34 @@ struct Cached {
     text: Arc<str>,
     state: Entity<TextViewState>,
     drawn: u64,
+    /// Set once the text holds image syntax; it stays on so the parse is not redone.
+    media: bool,
     _repaint: Subscription,
+}
+
+/// A message's markdown state, and whether it parses images as media (`super::media`). Only
+/// texts with image syntax take the extension, since applying it reparses the text once.
+#[derive(Clone)]
+pub struct MarkdownState {
+    pub entity: Entity<TextViewState>,
+    media: bool,
+}
+
+impl From<&MarkdownState> for MarkdownState {
+    fn from(state: &MarkdownState) -> Self {
+        state.clone()
+    }
+}
+
+/// A state made outside the store (file previews) draws without transcript media.
+impl From<&Entity<TextViewState>> for MarkdownState {
+    fn from(entity: &Entity<TextViewState>) -> Self {
+        MarkdownState { entity: entity.clone(), media: false }
+    }
+}
+
+fn has_image_syntax(text: &str) -> bool {
+    text.contains("![")
 }
 
 /// Markdown states keyed by the row that shows them, created lazily when a row renders.
@@ -49,9 +76,10 @@ impl MarkdownStore {
     }
 
     /// The state for `key`, brought up to `text`. Appends stream; anything else replaces.
-    pub fn state(&mut self, key: &str, text: &Arc<str>, cx: &mut App) -> Entity<TextViewState> {
+    pub fn state(&mut self, key: &str, text: &Arc<str>, cx: &mut App) -> MarkdownState {
         if let Some(cached) = self.states.get_mut(key) {
             cached.drawn = self.frame;
+            cached.media |= has_image_syntax(text);
             if !Arc::ptr_eq(&cached.text, text) && *cached.text != **text {
                 let previous = cached.text.clone();
                 cached.text = text.clone();
@@ -60,13 +88,14 @@ impl MarkdownStore {
                     _ => state.set_text(text, cx),
                 });
             }
-            return cached.state.clone();
+            return MarkdownState { entity: cached.state.clone(), media: cached.media };
         }
         let state = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
         let owner = self.owner;
         let repaint = cx.observe(&state, move |_, cx| cx.notify(owner));
-        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, _repaint: repaint });
-        state
+        let media = has_image_syntax(text);
+        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, _repaint: repaint });
+        MarkdownState { entity: state, media }
     }
 
     pub fn clear(&mut self) {
@@ -105,9 +134,11 @@ fn style(cx: &App) -> TextViewStyle {
 }
 
 /// The prose view: §7.6 rhythm, §7.8 code blocks with a language label and Copy.
-pub fn markdown_view(state: &Entity<TextViewState>, cx: &App) -> TextView {
-    TextView::new(state)
-        .style(style(cx))
+pub fn markdown_view(state: impl Into<MarkdownState>, cx: &App) -> TextView {
+    let state = state.into();
+    let view = TextView::new(&state.entity);
+    let view = if state.media { view.markdown_extensions(super::media::markdown_extensions()) } else { view };
+    view.style(style(cx))
         .selectable(true)
         .code_block_actions(|block, _window, cx| {
             let p = palette(cx);
@@ -139,7 +170,7 @@ pub fn markdown_view(state: &Entity<TextViewState>, cx: &App) -> TextView {
 }
 
 /// Assistant prose: 14px on a 22.75px line, `foreground` at 90% (§3.3).
-pub fn prose(state: &Entity<TextViewState>, cx: &App) -> impl IntoElement {
+pub fn prose(state: &MarkdownState, cx: &App) -> impl IntoElement {
     div()
         .w_full()
         .min_w_0()

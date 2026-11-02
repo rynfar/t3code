@@ -1,5 +1,6 @@
 // Synthetic, deterministic orchestration values in contract (Type) form.
 import type {
+  CommandId,
   OrchestrationV2DomainEvent,
   OrchestrationV2Run,
 } from "../../../packages/contracts/src/index.ts";
@@ -260,6 +261,10 @@ const baseThread = {
   ...Fixtures.v2Projection.thread,
   lineage: { ...Fixtures.v2Projection.thread.lineage, sideChat: false },
   historyOrigin: "native" as const,
+  rollbackFailure: {
+    requestId: "command-rollback" as CommandId,
+    message: "Checkpoint unavailable.",
+  },
 };
 
 export function projectionOf(

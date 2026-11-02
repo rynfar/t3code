@@ -7,7 +7,8 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, ClipboardItem, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div, linear_color_stop, linear_gradient, prelude::FluentBuilder, px, relative};
 use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
-use t3_core::timeline::{Attribution, ChatMessage, FORK_LABEL, can_fork, ProposedPlan, RowKind, TimelineRow, plan_title, should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution};
+use t3_core::media::MediaPlacement;
+use t3_core::timeline::{EDIT_FROM_HERE, Attribution, ChatMessage, FORK_LABEL, can_fork, ProposedPlan, RowKind, TimelineRow, plan_title, should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution};
 
 use super::markdown::{MarkdownStore, markdown_view, prose};
 use super::parts::{ROW_GROUP, Clock, DividerTone, ghost_icon_button, ghost_text_button, system_divider, tooltip_icon_button};
@@ -86,14 +87,21 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         let state = markdown.state(&format!("user:{id}"), &source, cx);
         Some(markdown_view(&state, cx))
     };
-    let attachments: Vec<String> = match message.item.as_ref().map(|item| &item.kind) {
-        Some(t3_core::turn_item::TurnItemKind::UserMessage { attachments, .. }) => attachments
-            .iter()
-            .filter_map(|attachment| attachment.get("name").and_then(Value::as_str).map(str::to_owned))
-            .collect(),
-        _ => Vec::new(),
+    let attachments: &[Value] = match message.item.as_ref().map(|item| &item.kind) {
+        Some(t3_core::turn_item::TurnItemKind::UserMessage { attachments, .. }) => attachments,
+        _ => &[],
+    };
+    let images = t3_core::media::image_attachments(attachments);
+    let other_files = t3_core::media::other_attachment_names(attachments);
+    let inline_media = matches!(attribution, Some(Attribution::Guest | Attribution::Agent));
+    let placement = t3_core::media::media_placement(images.len(), body.is_none(), other_files.len(), inline_media);
+    let media = placement.map(|placement| super::media::user_media(id, &images, placement, grouped_with_previous, grouped_with_next, cx));
+    let (media_above, media_in_bubble) = match placement {
+        Some(MediaPlacement::InBubble) => (None, media),
+        _ => (media, None),
     };
     let small = |radius: bool| if radius { px(6.) } else { px(16.) };
+    let media_alone = placement == Some(MediaPlacement::Alone);
     let bubble = v_flex()
         .relative()
         .min_w_0()
@@ -101,22 +109,14 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .p(px(12.))
         .rounded_tl(px(16.))
         .rounded_bl(px(16.))
-        .rounded_tr(small(grouped_with_previous))
+        .rounded_tr(small(grouped_with_previous || placement == Some(MediaPlacement::AboveText)))
         .rounded_br(small(grouped_with_next))
         .bg(surface)
         .text_size(px(14.))
         .line_height(px(22.75))
         .text_color(hsla(p.message_foreground))
-        .when(!attachments.is_empty(), |this| {
-            this.child(v_flex().gap(px(4.)).mb(px(8.)).children(attachments.iter().map(|name| {
-                h_flex()
-                    .min_w_0()
-                    .gap(px(8.))
-                    .text_size(px(14.))
-                    .child(Icon::Link.render(px(14.), hsla(p.muted_foreground)))
-                    .child(div().min_w_0().truncate().child(name.clone()))
-            })))
-        })
+        .children(media_in_bubble)
+        .children(super::media::other_files(&other_files, cx))
         .children(body.map(|body| {
             div()
                 .relative()
@@ -154,6 +154,17 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .invisible()
         .group_hover(ROW_GROUP, |style| style.visible())
         .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(env.clock.format(&message.created_at)))
+        .children(env.revert_counts.get(&message.id).map(|&turn_count| {
+            let (message_id, text) = (message.id.clone(), message.text.to_string());
+            tooltip_icon_button(
+                SharedString::from(format!("rewind:{id}")),
+                Icon::Pencil,
+                EDIT_FROM_HERE,
+                env.rewind_disabled,
+                cx.listener(move |view, _, window, cx| view.request_rewind(&message_id, turn_count, &text, window, cx)),
+                cx,
+            )
+        }))
         .child(ghost_icon_button(
             SharedString::from(format!("copy-user:{id}")),
             Icon::Copy,
@@ -187,7 +198,8 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                             .child("Steer"),
                     )
                 })
-                .child(bubble)
+                .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
+                .when(!media_alone, |this| this.child(bubble))
                 .child(actions),
         )
         .into_any_element()

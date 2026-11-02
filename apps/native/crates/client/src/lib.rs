@@ -1,4 +1,5 @@
 pub mod asset;
+pub mod assets;
 pub mod auth;
 pub mod favicon;
 pub mod history;
