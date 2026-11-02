@@ -18,7 +18,8 @@ use t3_core::traits::{self, OptionSelection, OptionValue, Speed};
 
 use super::controls::{Float, Segment, floating, menu_surface, segmented_track};
 use super::runtime_mode_icon;
-use crate::app_state::{AppEvent, AppState};
+use crate::app_state::AppState;
+use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -73,7 +74,7 @@ enum Row {
         slug: String,
         name: SharedString,
         sub_provider: Option<SharedString>,
-        initials: SharedString,
+        mark: ProviderMark,
         badge_new: bool,
         favorite: bool,
         selected: bool,
@@ -112,12 +113,6 @@ impl ModelPicker {
                 if matches!(event, InputEvent::Change) {
                     this.refresh_rows(cx);
                     this.highlighted = this.first_enabled();
-                    cx.notify();
-                }
-            }),
-            cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
-                if matches!(event, AppEvent::ServerConfig) {
-                    this.refresh_rows(cx);
                     cx.notify();
                 }
             }),
@@ -163,9 +158,10 @@ impl ModelPicker {
         cx.notify();
     }
 
-    /// Keeps an open picker in step with the composer, such as after a level was picked.
-    pub fn update_input(&mut self, input: PickerInput, cx: &mut Context<Self>) {
-        if self.input != input {
+    /// Keeps an open picker in step with the composer, such as after a level was picked or the
+    /// server config changed. A closed picker rebuilds its rows when it opens.
+    pub fn update_input(&mut self, input: PickerInput, config_changed: bool, cx: &mut Context<Self>) {
+        if self.input != input || config_changed {
             self.input = input;
             self.refresh_rows(cx);
             cx.notify();
@@ -202,7 +198,7 @@ impl ModelPicker {
                 slug: model.slug.clone(),
                 name: providers::model_name(model).to_owned().into(),
                 sub_provider: model.sub_provider.clone().map(SharedString::from),
-                initials: providers::initials(&entry.display_name).into(),
+                mark: ProviderMark::of(entry, &entries),
                 badge_new: model.badge.as_deref() == Some("new"),
                 favorite,
                 selected: selected.is_some_and(|s| s.instance_id == entry.instance_id() && s.model == model.slug),
@@ -316,7 +312,7 @@ impl ModelPicker {
         }
     }
 
-    fn render_rail(&self, entries: &[(String, SharedString, SharedString, bool)], has_favorites: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_rail(&self, entries: &[(String, SharedString, ProviderMark, bool)], has_favorites: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let button = |id: SharedString, active: bool, disabled: bool, content: gpui::AnyElement, tooltip: SharedString| {
             div()
@@ -349,10 +345,12 @@ impl ModelPicker {
                         .on_click(cx.listener(|this, _, _, cx| this.select_tab(Tab::Favorites, cx))),
                 )
             })
-            .children(entries.iter().map(|(instance_id, name, initials, locked)| {
+            .children(entries.iter().map(|(instance_id, name, mark, locked)| {
                 let active = self.tab == Tab::Instance(instance_id.clone());
                 let id = instance_id.clone();
-                button(format!("rail-{instance_id}").into(), active, *locked, monogram(initials.clone(), cx).into_any_element(), name.clone())
+                let ring = if active { hsla(p.background) } else { hsla(p.popover) };
+                let icon = ProviderIcon::new(mark.clone()).size(px(20.)).badge(BadgeSize::Default, ring);
+                button(format!("rail-{instance_id}").into(), active, *locked, icon.into_any_element(), name.clone())
                     .when(!*locked, |this| this.on_click(cx.listener(move |this, _, _, cx| this.select_tab(Tab::Instance(id.clone()), cx))))
             }))
     }
@@ -376,7 +374,7 @@ impl ModelPicker {
                 .child(if *expanded { Icon::ChevronUp } else { Icon::ChevronDown }.render(px(14.), hsla(p.muted_foreground)))
                 .on_click(cx.listener(move |this, _, _, cx| this.activate(index, cx)))
                 .into_any_element(),
-            Row::Model { instance_id, slug, name, sub_provider, initials, badge_new, favorite, selected, disabled } => {
+            Row::Model { instance_id, slug, name, sub_provider, mark, badge_new, favorite, selected, disabled } => {
                 let star_id = (instance_id.clone(), slug.clone(), *favorite);
                 base.when(disabled.is_none(), |this| this.cursor_pointer())
                     .when(disabled.is_some(), |this| this.opacity(0.64))
@@ -386,7 +384,7 @@ impl ModelPicker {
                             cx.notify();
                         }
                     }))
-                    .child(monogram(initials.clone(), cx))
+                    .child(ProviderIcon::new(mark.clone()).badge(BadgeSize::Compact, hsla(p.popover)))
                     .child(
                         h_flex()
                             .flex_1()
@@ -633,23 +631,6 @@ impl ModelPicker {
 const LOCKED_REASON: &str =
     "This thread does not support switching providers after it has started. Start a new thread to use this model.";
 
-/// The provider monogram (`ProviderInstanceIcon` without a logo): 16px rounded square.
-fn monogram(initials: SharedString, cx: &App) -> impl IntoElement {
-    let p = palette(cx);
-    div()
-        .size(px(16.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .bg(hsla(p.foreground).opacity(0.08))
-        .text_size(px(8.))
-        .font_weight(FontWeight::BOLD)
-        .text_color(hsla(p.muted_foreground))
-        .child(initials)
-}
-
 /// `ComposerPermissionsSection`: the modes as one segmented row, the picked one named below.
 pub fn permissions_section<V: 'static>(
     mode: RuntimeMode,
@@ -689,12 +670,12 @@ impl Render for ModelPicker {
             let state = self.state.read(cx);
             let config = state.server_config.config.as_ref();
             let entries = config.map(|config| providers::entries(config, self.input.project_id.as_deref())).unwrap_or_default();
-            let rail: Vec<(String, SharedString, SharedString, bool)> = entries
+            let rail: Vec<(String, SharedString, ProviderMark, bool)> = entries
                 .iter()
                 .filter(|entry| entry.enabled)
                 .map(|entry| {
                     let locked = self.input.locked_instance.as_deref().is_some_and(|locked| locked != entry.instance_id());
-                    (entry.instance_id().to_owned(), entry.display_name.clone().into(), providers::initials(&entry.display_name).into(), locked)
+                    (entry.instance_id().to_owned(), entry.display_name.clone().into(), ProviderMark::of(entry, &entries), locked)
                 })
                 .collect();
             let has_favorites = config.is_some_and(|config| !providers::favorites(&config.settings).is_empty());

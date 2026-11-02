@@ -94,7 +94,9 @@ impl Composer {
         }
     }
 
+    /// Every question change lands here, so it also drops a pending auto-advance.
     fn show_active_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.auto_advance = None;
         let text = self.progress().map(|progress| progress.custom_answer).unwrap_or_default();
         self.set_prompt(&text, window, cx);
         if self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer()) {
@@ -146,11 +148,15 @@ impl Composer {
         }
         self.set_prompt("", window, cx);
         if !question.multi_select {
+            let picked = (request_id, question.id);
             self.auto_advance = Some(cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.auto_advance = None;
-                    this.advance(window, cx);
+                    let active = this.active_question().map(|(request_id, question)| (request_id, question.id));
+                    if active.as_ref() == Some(&picked) && !this.responding.contains(&picked.0) {
+                        this.advance(window, cx);
+                    }
                 });
             }));
         }

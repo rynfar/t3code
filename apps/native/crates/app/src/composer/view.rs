@@ -5,14 +5,13 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Window,
+    AnyElement, Context, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
 use gpui_component::input::{Escape, Textarea};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
-use t3_core::providers;
 use t3_core::requests;
 use t3_core::server_config::InteractionMode;
 use t3_core::traits;
@@ -21,6 +20,7 @@ use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float,
 use super::model_picker::permissions_section;
 use super::{Composer, Resolved, Target, TogglePlanMode, runtime_mode_icon};
 use crate::icons::Icon;
+use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, metrics, palette};
 
 /// The web's collapsed-composer prompt. Its full placeholder names @ files, $ skills and
@@ -72,17 +72,9 @@ impl Composer {
 
     fn render_model_trigger(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let (initials, suffix) = {
-            let state = self.state.read(cx);
-            let config = state.server_config.config.as_ref();
-            let initials = resolved
-                .model
-                .as_ref()
-                .and_then(|model| config?.provider(&model.instance_id))
-                .map(|provider| providers::initials(&providers::display_name(provider)))
-                .unwrap_or_default();
-            (initials, traits::effort_suffix(&resolved.driver, &resolved.descriptors))
-        };
+        let suffix = traits::effort_suffix(&resolved.driver, &resolved.descriptors);
+        let surface = hsla(if cx.theme().is_dark() { p.surface_raised } else { p.card });
+        let mark = resolved.mark.clone().map(|mark| ProviderIcon::new(mark).badge(BadgeSize::Compact, surface));
         let label = if resolved.model_label.is_empty() { "Choose model".to_owned() } else { resolved.model_label.clone() };
         let suffix_color = if self.picker_open { hsla(p.foreground) } else { hsla(p.muted_foreground) };
         let suffix = h_flex()
@@ -96,20 +88,7 @@ impl Composer {
             .min_w(px(52.))
             .child(
                 ComposerControl::new("model-picker")
-                    .leading(
-                        div()
-                            .size(px(16.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.))
-                            .bg(hsla(p.foreground).opacity(0.08))
-                            .text_size(px(8.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(hsla(p.muted_foreground))
-                            .child(initials),
-                    )
+                    .when_some(mark, |control, mark| control.leading(mark))
                     .label(label)
                     .max_label_width(224.)
                     .suffix(suffix)
@@ -224,8 +203,9 @@ impl Composer {
         }
         let settings = self.state.read(cx).client_settings;
         let follow_up = if self.snapshot.pending.approvals.is_empty() { settings.follow_up_behavior } else { rules::FollowUpBehavior::Steer };
-        let dispatch = rules::dispatch_mode(running, false, follow_up, true);
-        let alternate = rules::dispatch_mode(running, true, follow_up, true);
+        let can_steer = !self.snapshot.compacting;
+        let dispatch = rules::dispatch_mode(running, false, follow_up, can_steer);
+        let alternate = rules::dispatch_mode(running, true, follow_up, can_steer);
         let (kind, label) = match (running, dispatch) {
             (true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
             (true, _) => (RoundKind::Steer, "Steer message"),
@@ -236,7 +216,7 @@ impl Composer {
             "No provider available".into()
         } else if self.sending {
             "Submitting message".into()
-        } else if running {
+        } else if running && can_steer {
             let action = |mode| if mode == ComposerDispatch::Queue { "queue" } else { "steer" };
             format!("Click to {}, ⌘-click to {}", action(dispatch), action(alternate)).into()
         } else {
@@ -247,7 +227,8 @@ impl Composer {
             .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                 let modifier = event.modifiers().platform || event.modifiers().control;
                 let draft = matches!(this.snapshot.target, Some(Target::Draft(_)));
-                let intent = rules::submit_intent(modifier, this.snapshot.running, draft, rules::SendShortcut::Enter, "");
+                let key = rules::EnterKey { modifier, ..rules::EnterKey::default() };
+                let intent = rules::submit_intent(key, this.snapshot.running, draft, rules::SendShortcut::Enter, "");
                 if let Some(intent) = intent {
                     this.submit(intent, window, cx);
                 }
@@ -272,6 +253,11 @@ impl Render for Composer {
         div().w_full().flex().justify_center().px(px(48.)).pb(px(16.)).pt(px(8.)).child(
             v_flex()
                 .key_context("Composer")
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
+                    if event.keystroke.key == "enter" {
+                        this.enter_repeat = event.is_held;
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
                 .on_action(cx.listener(|this, _: &Escape, _, cx| {
                     if this.permissions_open || this.approval_menu_open {

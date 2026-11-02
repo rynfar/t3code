@@ -8,24 +8,27 @@
 pub(crate) mod controls;
 mod model_picker;
 mod pending;
+mod send;
 mod view;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, Entity, FocusHandle, KeyBinding, Subscription, Task, Window, actions, prelude::*};
+use gpui::{App, Context, Entity, EntityInputHandler, FocusHandle, KeyBinding, Subscription, Task, Window, actions, prelude::*};
 use gpui_component::input::{InputEvent, OutdentInline, TextareaState};
-use serde_json::Value;
-use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
-use t3_core::composer::{self as rules, FollowUpBehavior, SubmitIntent};
+use t3_core::composer::{self as rules, EnterKey};
+use t3_core::lists;
 use t3_core::model::ModelSelection;
 use t3_core::providers;
-use t3_core::requests::{self, DraftAnswer, PendingRequests};
+use t3_core::requests::{self, DraftAnswer, PendingKey, PendingRequests};
 use t3_core::server_config::{InteractionMode, OptionDescriptor, RuntimeMode};
 use t3_core::traits::{self, OptionSelection};
+use t3_core::workflows;
 
-use crate::app_state::{AppEvent, AppState, uuid_v4};
+use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
+use crate::provider_icon::ProviderMark;
+use crate::sidebar::controller::now_ms;
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
 actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions]);
@@ -74,8 +77,11 @@ struct Snapshot {
     /// The thread has run, so switching providers needs a handoff it may not support.
     started: bool,
     handoff: bool,
+    /// A `/compact` turn is running, which a send cannot steer into.
+    compacting: bool,
     /// The thread's projection has arrived, so `pending` is authoritative.
     loaded: bool,
+    pending_key: PendingKey,
     pending: PendingRequests,
 }
 
@@ -85,7 +91,10 @@ struct Resolved {
     model: Option<ModelSelection>,
     model_label: String,
     driver: String,
+    mark: Option<ProviderMark>,
     descriptors: Vec<OptionDescriptor>,
+    /// The options a turn carries (`modelOptionsForDispatch`).
+    dispatch_options: Vec<OptionSelection>,
     runtime_modes: Vec<RuntimeMode>,
     runtime_mode: RuntimeMode,
     default_runtime_mode: RuntimeMode,
@@ -121,6 +130,9 @@ pub struct Composer {
     has_text: bool,
     error: Option<String>,
     auto_advance: Option<Task<()>>,
+    /// Whether the last Enter key-down was an OS key repeat. Recorded by the key listener, which
+    /// runs before the textarea's `PressEnter` event reaches the composer.
+    enter_repeat: bool,
     picker_dismissed: Option<Instant>,
     menu_dismissed: Option<Instant>,
     input_state: Option<(&'static str, bool)>,
@@ -169,6 +181,7 @@ impl Composer {
             has_text: false,
             error: None,
             auto_advance: None,
+            enter_repeat: false,
             picker_dismissed: None,
             menu_dismissed: None,
             input_state: None,
@@ -196,20 +209,28 @@ impl Composer {
         };
         let shell = state.shell.thread(thread_id);
         let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
+        let pending_key = projection.map(PendingKey::of).unwrap_or_default();
+        let pending = if pending_key == self.snapshot.pending_key {
+            self.snapshot.pending.clone()
+        } else {
+            projection.map(requests::pending_requests).unwrap_or_default()
+        };
+        let running = state.is_selected_thread_running();
         Snapshot {
             project_id: shell.map(|thread| thread.project_id.clone()),
-            running: state.is_selected_thread_running(),
+            running,
             thread_model: shell.map(|thread| thread.model_selection.clone()),
             thread_runtime: shell.and_then(|thread| RuntimeMode::parse(&thread.runtime_mode)),
             thread_interaction: shell.and_then(|thread| InteractionMode::parse(&thread.interaction_mode)),
             started: projection.is_some_and(|projection| !projection.runs.is_empty()),
-            handoff: projection.is_some_and(|projection| {
-                projection.provider_sessions.iter().any(|session| {
-                    session.value.pointer("/capabilities/sessions/supportsProviderSwitchingViaHandoff") == Some(&Value::Bool(true))
-                })
-            }),
+            handoff: projection.is_some_and(workflows::supports_provider_handoff),
+            compacting: running
+                && projection.is_some_and(|projection| {
+                    workflows::is_compacting(projection, workflows::active_run(projection).map(|run| run.id.as_str()))
+                }),
             loaded: projection.is_some(),
-            pending: projection.map(requests::pending_requests).unwrap_or_default(),
+            pending_key,
+            pending,
             target,
         }
     }
@@ -229,6 +250,7 @@ impl Composer {
             self.permissions_open = false;
             self.approval_menu_open = false;
             self.error = None;
+            self.auto_advance = None;
             if matches!(next.target, Some(Target::Draft(_))) {
                 self.focus(window, cx);
             }
@@ -245,7 +267,7 @@ impl Composer {
         self.sync_answering(window, cx);
         if self.picker_open {
             let input = self.picker_input(cx);
-            self.picker.update(cx, |picker, cx| picker.update_input(input, cx));
+            self.picker.update(cx, |picker, cx| picker.update_input(input, config_changed, cx));
         }
         cx.notify();
     }
@@ -269,7 +291,7 @@ impl Composer {
         let choices = self.choices().cloned().unwrap_or_default();
         let draft = match &self.snapshot.target {
             Some(Target::Draft(project)) => {
-                Some(rules::draft_defaults(config, project, self.carry.0.as_ref(), self.carry.1))
+                Some(rules::draft_defaults(config, project, self.carry.0.as_ref(), self.carry.1, now_ms()))
             }
             _ => None,
         };
@@ -282,15 +304,12 @@ impl Composer {
             Some(_) => rules::effective_selection(&entries, chosen.as_ref()),
             None => chosen,
         };
+        let mark = model
+            .as_ref()
+            .and_then(|model| entries.iter().find(|entry| entry.instance_id() == model.instance_id))
+            .map(|entry| ProviderMark::of(entry, &entries));
         let provider = model.as_ref().and_then(|model| config?.provider(&model.instance_id));
         let provider_model = model.as_ref().and_then(|selection| provider?.models.iter().find(|m| m.slug == selection.model));
-        let descriptors = provider_model
-            .and_then(|model| model.capabilities.as_ref())
-            .map(|caps| {
-                let explicit = traits::selections(model.as_ref().and_then(|m| m.options.as_ref()));
-                traits::resolve_descriptors(&caps.option_descriptors, &explicit)
-            })
-            .unwrap_or_default();
         let runtime = choices
             .runtime_mode
             .or(self.snapshot.thread_runtime)
@@ -303,6 +322,9 @@ impl Composer {
             .or_else(|| draft.as_ref().map(|draft| draft.interaction_mode))
             .unwrap_or_default();
         let (plan_enabled, interaction_mode) = rules::interaction_mode(state.client_settings.plan_mode_enabled, provider, interaction);
+        let driver = provider.map(|p| p.driver.clone()).unwrap_or_default();
+        let explicit = traits::selections(model.as_ref().and_then(|m| m.options.as_ref()));
+        let options = traits::composer_options(&driver, provider_model, plan_enabled, &explicit);
         let default_runtime_mode = config
             .map(|config| {
                 self.target_project()
@@ -316,9 +338,11 @@ impl Composer {
             .flatten();
         Resolved {
             model_label: provider_model.map(|m| providers::trigger_model_name(m).to_owned()).or_else(|| model.as_ref().map(|m| m.model.clone())).unwrap_or_default(),
-            driver: provider.map(|p| p.driver.clone()).unwrap_or_default(),
+            driver,
+            mark,
             model,
-            descriptors,
+            descriptors: options.descriptors,
+            dispatch_options: options.dispatch,
             runtime_modes,
             runtime_mode,
             default_runtime_mode,
@@ -388,7 +412,7 @@ impl Composer {
         }
         if self.picker_open {
             let input = self.picker_input(cx);
-            self.picker.update(cx, |picker, cx| picker.update_input(input, cx));
+            self.picker.update(cx, |picker, cx| picker.update_input(input, false, cx));
         }
         cx.notify();
     }
@@ -408,7 +432,21 @@ impl Composer {
         cx.notify();
     }
 
+    /// Shift+Tab: outdent the list item under the caret, else toggle plan mode.
     fn toggle_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let edit = {
+            let input = self.input.read(cx);
+            let range = input.selected_range();
+            lists::outdent_for_tab(&input.value(), range.start, range.end)
+        };
+        if let Some(edit) = edit {
+            self.input.update(cx, |input, cx| {
+                input.set_selected_range(edit.start..edit.end, cx);
+                input.replace(edit.replacement, window, cx);
+                input.set_selected_range(edit.cursor_after..edit.cursor_after, cx);
+            });
+            return;
+        }
         let resolved = self.resolve(cx);
         if !resolved.plan_enabled {
             window.dispatch_action(Box::new(OutdentInline), cx);
@@ -434,11 +472,15 @@ impl Composer {
     }
 
     fn on_enter(&mut self, modifier: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
+        let key = EnterKey { modifier, repeat: std::mem::take(&mut self.enter_repeat), composing };
         let prompt = self.prompt(cx);
         let settings = self.state.read(cx).client_settings;
         let draft = matches!(self.snapshot.target, Some(Target::Draft(_)));
-        match rules::submit_intent(modifier, self.snapshot.running, draft, settings.send_shortcut, &prompt) {
+        match rules::submit_intent(key, self.snapshot.running, draft, settings.send_shortcut, &prompt) {
             Some(intent) => self.submit(intent, window, cx),
+            // The input method commits its composition on Enter.
+            None if composing => {}
             None => self.input.update(cx, |input, cx| input.insert("\n", window, cx)),
         }
     }
@@ -466,182 +508,6 @@ impl Composer {
             Some(Target::Thread(id)) => Some(id.clone()),
             _ => None,
         }
-    }
-
-    /// Submit, as the send button and Enter do.
-    fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sending {
-            return;
-        }
-        if !self.snapshot.pending.user_inputs.is_empty() {
-            self.advance(window, cx);
-            return;
-        }
-        let text = self.prompt(cx).trim().to_owned();
-        if text.is_empty() {
-            return;
-        }
-        match self.snapshot.target.clone() {
-            Some(Target::Draft(project_id)) => self.launch(project_id, text, intent, window, cx),
-            Some(Target::Thread(thread_id)) => self.send(thread_id, text, intent, window, cx),
-            None => {}
-        }
-    }
-
-    /// The model selection a turn carries: only the options the user chose.
-    fn dispatch_selection(resolved: &Resolved) -> Option<ModelSelection> {
-        let model = resolved.model.as_ref()?;
-        let explicit = traits::selections(model.options.as_ref());
-        Some(traits::model_selection(
-            &model.instance_id,
-            &model.model,
-            &traits::explicit_selections(&resolved.descriptors, &explicit),
-        ))
-    }
-
-    fn launch(&mut self, project_id: String, text: String, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
-        let resolved = self.resolve(cx);
-        let Some(selection) = Self::dispatch_selection(&resolved) else {
-            self.error = Some("Enable a provider in Settings to send a message".into());
-            cx.notify();
-            return;
-        };
-        let (thread_id, command_id, message_id) = (uuid_v4(), uuid_v4(), uuid_v4());
-        let title = rules::title_seed(&text);
-        let payload = commands::launch_thread(&LaunchThread {
-            command_id: &command_id,
-            thread_id: &thread_id,
-            project_id: &project_id,
-            title: &title,
-            model_selection: &selection,
-            runtime_mode: resolved.runtime_mode,
-            interaction_mode: resolved.interaction_mode,
-            message_id: &message_id,
-            text: &text,
-        });
-        let request = self.state.read(cx).rpc(method::LAUNCH_THREAD, payload);
-        self.begin_send(window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let result = request.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
-                match result {
-                    Ok(_) if intent == SubmitIntent::Background => {}
-                    Ok(_) => this.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx)),
-                    Err(error) => this.restore(&text, error.to_string(), window, cx),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn send(&mut self, thread_id: String, text: String, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
-        let resolved = self.resolve(cx);
-        let Some(selection) = Self::dispatch_selection(&resolved) else {
-            self.error = Some("Enable a provider in Settings to send a message".into());
-            cx.notify();
-            return;
-        };
-        let settings = self.state.read(cx).client_settings;
-        let approvals = self.snapshot.pending.approvals.clone();
-        let follow_up = if approvals.is_empty() { settings.follow_up_behavior } else { FollowUpBehavior::Steer };
-        let dispatch = rules::dispatch_mode(self.snapshot.running, intent == SubmitIntent::Alternate, follow_up, true);
-        let feedback = approvals.first().filter(|approval| approval.supports_feedback).map(|approval| approval.request_id.clone());
-        let mut steps: Vec<(Value, &'static str)> = Vec::new();
-        if let Some(request_id) = &feedback {
-            let command = commands::respond_to_approval(&uuid_v4(), &thread_id, request_id, ApprovalDecision::Decline, Some(&text));
-            steps.push((command, "Failed to submit approval decision."));
-        } else {
-            for approval in approvals.iter().filter(|approval| approval.live) {
-                let command = commands::respond_to_approval(&uuid_v4(), &thread_id, &approval.request_id, ApprovalDecision::Decline, None);
-                steps.push((command, "Failed to submit approval decision."));
-            }
-            if Some(resolved.runtime_mode) != self.snapshot.thread_runtime {
-                steps.push((commands::set_runtime_mode(&uuid_v4(), &thread_id, resolved.runtime_mode), "Failed to send message."));
-            }
-            if Some(resolved.interaction_mode) != self.snapshot.thread_interaction {
-                steps.push((commands::set_interaction_mode(&uuid_v4(), &thread_id, resolved.interaction_mode), "Failed to send message."));
-            }
-            let (command_id, message_id) = (uuid_v4(), uuid_v4());
-            let title = rules::title_seed(&text);
-            let message = ComposerMessage {
-                command_id: &command_id,
-                thread_id: &thread_id,
-                message_id: &message_id,
-                text: &text,
-                title_seed: &title,
-                model_selection: &selection,
-                dispatch,
-            };
-            steps.push((commands::composer_message(&message), "Failed to send message."));
-        }
-        let requests: Vec<_> = steps
-            .into_iter()
-            .map(|(command, failure)| (self.state.read(cx).rpc(method::DISPATCH_COMMAND, command), failure))
-            .collect();
-        self.begin_send(window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let mut failure = None;
-            for (request, message) in requests {
-                if let Err(error) = request.await {
-                    failure = Some(format!("{message} {error}"));
-                    break;
-                }
-            }
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
-                if let Some(error) = failure {
-                    this.restore(&text, error, window, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn begin_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sending = true;
-        self.error = None;
-        self.set_prompt("", window, cx);
-        cx.notify();
-    }
-
-    /// A failed send puts the text back unless the user already typed something new.
-    fn restore(&mut self, text: &str, error: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prompt(cx).trim().is_empty() {
-            self.set_prompt(text, window, cx);
-        }
-        self.error = Some(error);
-    }
-
-    fn respond_to_approval(&mut self, request_id: String, decision: ApprovalDecision, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
-        if !self.snapshot.pending.approvals.iter().any(|approval| approval.request_id == request_id && approval.live) {
-            return;
-        }
-        if !self.responding.insert(request_id.clone()) {
-            return;
-        }
-        self.approval_menu_open = false;
-        let command = commands::respond_to_approval(&uuid_v4(), &thread_id, &request_id, decision, None);
-        self.run_request(request_id, command, "Failed to submit approval decision.", cx);
-    }
-
-    fn run_request(&mut self, request_id: String, command: Value, failure: &'static str, cx: &mut Context<Self>) {
-        let request = self.state.read(cx).rpc(method::DISPATCH_COMMAND, command);
-        cx.spawn(async move |this, cx| {
-            let result = request.await;
-            let _ = this.update(cx, |this, cx| {
-                this.responding.remove(&request_id);
-                if let Err(error) = result {
-                    this.error = Some(format!("{failure} {error}"));
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 }
 

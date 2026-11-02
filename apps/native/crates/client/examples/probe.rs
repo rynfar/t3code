@@ -14,7 +14,12 @@
 //!     --provider devReplay --model showcase --runtime-mode approval-required \
 //!     --approve accept --answer --seconds 40
 //!
-//! Send as the composer does to a thread: permissions first, then the turn with its model:
+//! Add `--worktree <workspace-root>` to launch into a new worktree the way the composer resolves
+//! one: the project's `t3.json`, then the default branch from `vcs.listRefs`. `--dry-run` prints
+//! the launch instead of sending it.
+//!
+//! Send as the composer does to a thread: permissions first, then the turn with its model, each
+//! only after the one before it committed:
 //!
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --compose "go on" \
 //!     --provider devReplay --model showcase --runtime-mode auto-accept-edits
@@ -29,9 +34,10 @@ use t3_core::composer::title_seed;
 use t3_core::model::ModelSelection;
 use t3_core::providers;
 use t3_core::requests::{self, DraftAnswer};
-use t3_core::server_config::{InteractionMode, RuntimeMode, ServerConfigState};
+use t3_core::server_config::{InteractionMode, RuntimeMode, ServerConfigState, ThreadEnvMode};
 use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::thread::{ThreadState, ThreadStreamItem};
+use t3_core::workspace::{self, Strategy, VcsRefs};
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -74,8 +80,9 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("--compose needs --provider and --model (use devReplay / showcase on a dev server)");
             };
             let selection = ModelSelection { instance_id: provider, model, options: None };
+            let mut steps = Vec::new();
             if let Some(mode) = flag("--runtime-mode").as_deref().and_then(RuntimeMode::parse) {
-                println!("runtime-mode.set: {:?}", client.dispatch(commands::set_runtime_mode(&new_id(), thread_id, mode)).await);
+                steps.push(commands::set_runtime_mode(&new_id(), thread_id, mode));
             }
             let (command_id, message_id, title) = (new_id(), new_id(), title_seed(&text));
             let message = commands::composer_message(&commands::ComposerMessage {
@@ -87,7 +94,9 @@ async fn main() -> anyhow::Result<()> {
                 model_selection: &selection,
                 dispatch: commands::ComposerDispatch::Auto,
             });
-            println!("message.dispatch: {:?}", client.dispatch(message).await);
+            steps.push(message);
+            let count = steps.len();
+            println!("ordered dispatch of {count} commands: {:?}", client.dispatch_in_order(steps).await);
         }
         if let Some(text) = flag("--send") {
             let command = commands::send_message(&new_id(), thread_id, &text, &commands::DispatchMode::QueueAfterActive);
@@ -109,6 +118,19 @@ async fn main() -> anyhow::Result<()> {
             Some(mode) => RuntimeMode::parse(&mode).ok_or_else(|| anyhow::anyhow!("unknown runtime mode {mode}"))?,
             None => RuntimeMode::ApprovalRequired,
         };
+        let workspace = match flag("--worktree") {
+            None => Strategy::Root,
+            Some(cwd) => {
+                let file = client.request(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd)).await;
+                let file_mode = file.as_ref().ok().and_then(workspace::project_file_contents).and_then(workspace::project_file_env_mode);
+                println!("projects.readFile t3.json: ok={} defaultThreadEnvMode={file_mode:?}", file.is_ok());
+                let refs = client.request(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd)).await;
+                let refs = refs.ok().and_then(|value| serde_json::from_value::<VcsRefs>(value).ok());
+                println!("vcs.listRefs: isRepo={:?} refs={:?}", refs.as_ref().map(|r| r.is_repo), refs.as_ref().map(|r| r.refs.len()));
+                workspace::launch_strategy(ThreadEnvMode::Worktree, refs.as_ref(), true).map_err(anyhow::Error::msg)?
+            }
+        };
+        println!("workspaceStrategy: {}", workspace.to_json());
         let thread_id = new_id();
         let selection = ModelSelection { instance_id: provider, model, options: None };
         let (command_id, message_id, title) = (new_id(), new_id(), title_seed(&text));
@@ -120,9 +142,14 @@ async fn main() -> anyhow::Result<()> {
             model_selection: &selection,
             runtime_mode,
             interaction_mode: InteractionMode::Default,
+            workspace: &workspace,
             message_id: &message_id,
             text: &text,
         });
+        if has("--dry-run") {
+            println!("launch (dry run): {payload}");
+            return Ok(());
+        }
         match client.request(method::LAUNCH_THREAD, payload).await {
             Ok(value) => {
                 println!(
@@ -218,6 +245,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    if let Some(projection) = &thread.projection {
+        let active = t3_core::workflows::active_run(projection).map(|run| run.id.as_str());
+        let thread_stop = config.config.as_ref().is_some_and(|c| c.environment.capabilities.thread_stop == Some(true));
+        println!(
+            "workflows: handoff={} compacting={} stop={:?} stop_without_thread_stop={:?}",
+            t3_core::workflows::supports_provider_handoff(projection),
+            t3_core::workflows::is_compacting(projection, active),
+            t3_core::workflows::stop_target(Some(projection), thread_stop),
+            t3_core::workflows::stop_target(Some(projection), false),
+        );
+    }
     if let (Some(thread_id), Some(loads)) = (flag("--thread"), flag("--history").and_then(|n| n.parse::<usize>().ok())) {
         for _ in 0..loads {
             let Some(mut cursor) = thread.begin_history_load() else { break };
@@ -281,7 +319,7 @@ async fn main() -> anyhow::Result<()> {
         );
         if has("--config") {
             for project in &snapshot.projects {
-                println!("  project {} {}", project.id, project.title);
+                println!("  project {} {} {}", project.id, project.title, project.workspace_root);
             }
         }
         if let Some(thread) = watched.as_deref().and_then(|id| snapshot.threads.iter().find(|t| t.id == id)) {

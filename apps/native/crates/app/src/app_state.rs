@@ -16,6 +16,7 @@ use t3_core::pairing::parse_pairing_link;
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
 use t3_core::thread::ThreadState;
+use t3_core::workflows::{self, StopTarget};
 
 use crate::sidebar::controller::SidebarController;
 use crate::toast::Toast;
@@ -365,13 +366,23 @@ impl AppState {
     }
 
     /// Any RPC on the network runtime. The future resolves wherever it is awaited.
-    pub fn rpc(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + 'static {
-        let task = self.client.clone().map(|client| self.runtime.spawn(async move { client.request(method, payload).await }));
+    /// Nothing is sent until the future is first polled, so futures built together still run in
+    /// the order they are awaited.
+    pub fn rpc(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + use<> {
+        let (client, runtime) = (self.client.clone(), self.runtime.clone());
         async move {
-            match task {
-                Some(task) => task.await.unwrap_or(Err(RpcError::Closed)),
-                None => Err(RpcError::Closed),
-            }
+            let Some(client) = client else { return Err(RpcError::Closed) };
+            runtime.spawn(async move { client.request(method, payload).await }).await.unwrap_or(Err(RpcError::Closed))
+        }
+    }
+
+    /// Dispatches commands in order, each after the previous one committed, stopping at the
+    /// first failure with its index.
+    pub fn dispatch_in_order(&self, commands: Vec<Value>) -> impl Future<Output = Result<(), (usize, RpcError)>> + use<> {
+        let (client, runtime) = (self.client.clone(), self.runtime.clone());
+        async move {
+            let Some(client) = client else { return Err((0, RpcError::Closed)) };
+            runtime.spawn(async move { client.dispatch_in_order(commands).await }).await.unwrap_or(Err((0, RpcError::Closed)))
         }
     }
 
@@ -390,13 +401,16 @@ impl AppState {
             .is_some_and(|thread| thread.is_live())
     }
 
-    /// `interruptThreadTurn`: `thread.stop` where the server has it, else interrupt the active run.
+    /// `interruptThreadTurn`: `thread.stop` where the server has it, else interrupt the live run
+    /// or the settled run that left background work running.
     pub fn stop_selected_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread.clone() else { return };
         let thread_stop = self.server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.thread_stop == Some(true));
-        let command = match self.thread_shell(&thread_id).and_then(|t| t.active_run_id.clone()) {
-            Some(run_id) if !thread_stop => commands::interrupt_run(&uuid_v4(), &thread_id, &run_id),
-            _ => commands::stop_thread(&uuid_v4(), &thread_id),
+        let projection = self.thread.projection.as_ref().filter(|projection| projection.thread.id == thread_id);
+        let command = match workflows::stop_target(projection, thread_stop) {
+            StopTarget::Thread => commands::stop_thread(&uuid_v4(), &thread_id),
+            StopTarget::Run(run_id) => commands::interrupt_run(&uuid_v4(), &thread_id, &run_id),
+            StopTarget::Nothing => return,
         };
         self.dispatch(command, cx);
     }

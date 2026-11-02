@@ -75,6 +75,16 @@ impl ClientHandle {
         crate::history::fetch_history_page(&self.credentials, thread_id, cursor).await
     }
 
+    /// Dispatches commands one after another, each only once the previous one committed, and
+    /// stops at the first failure, returning its index. A send's prerequisites (declining
+    /// approvals, persisting permissions) must land before its message, as the web awaits them.
+    pub async fn dispatch_in_order(&self, commands: Vec<Value>) -> Result<(), (usize, RpcError)> {
+        for (index, command) in commands.into_iter().enumerate() {
+            self.dispatch(command).await.map_err(|error| (index, error))?;
+        }
+        Ok(())
+    }
+
     /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
     /// `Closed` while disconnected rather than waiting for a reconnect. The request is queued
     /// before this returns, so calls made in order reach the server in order (terminal input
@@ -396,3 +406,4 @@ async fn report(events: &Events, context: &str, message: String) {
 
 #[cfg(test)]
 mod tests;
+
