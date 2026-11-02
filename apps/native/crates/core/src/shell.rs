@@ -176,6 +176,9 @@ pub struct ThreadShell {
     #[serde(default)]
     pub last_visited_at: Option<String>,
     pub deleted_at: Option<String>,
+    /// Linked pull requests; links that do not decode are dropped.
+    #[serde(default, deserialize_with = "crate::pull_requests::link::thread_links", skip_serializing)]
+    pub pull_requests: Vec<crate::pull_requests::link::ThreadLink>,
 }
 
 impl ThreadShell {
