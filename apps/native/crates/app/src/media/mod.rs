@@ -13,9 +13,8 @@ pub use viewer::{MediaViewer, ViewerItem};
 
 use crate::app_state::AppState;
 
-/// Who draws transcript media right now: the transcript view, its thread, and its viewer.
-/// Media outside that view (markdown in other panels) draws as a plain link instead, since only
-/// the transcript stamps the frames the cache evicts by.
+/// Who draws transcript media right now: the transcript view (notified when an image arrives),
+/// its thread, and its viewer. Only the transcript calls `begin_frame`, so only it draws media.
 #[derive(Clone)]
 pub struct MediaScope {
     pub owner: EntityId,

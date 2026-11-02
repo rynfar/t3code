@@ -209,9 +209,11 @@ pub fn markdown_extensions() -> MarkdownExtensions {
     static EXTENSIONS: OnceLock<MarkdownExtensions> = OnceLock::new();
     EXTENSIONS
         .get_or_init(|| {
-            MarkdownExtensions::default().block_parser(parse_media_paragraph).block_renderer(MEDIA_NODE, |node: &MarkdownNode, window: &mut Window, cx: &mut App| {
+            MarkdownExtensions::default().block_parser(parse_media_paragraph).block_renderer(MEDIA_NODE, |node: &MarkdownNode, _: &mut Window, cx: &mut App| {
                 let images = node.data::<Vec<MarkdownImage>>().cloned().unwrap_or_default();
-                let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone()).filter(|scope| window.current_view() == scope.owner);
+                // Only the transcript's markdown store parses with these extensions, so the scope is
+                // the transcript's; the block renders inside its text state's own view.
+                let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
                 v_flex().gap(px(8.)).items_start().children(images.iter().enumerate().map(|(index, image)| markdown_image(image, index, scope.as_ref(), cx)))
             })
         })
