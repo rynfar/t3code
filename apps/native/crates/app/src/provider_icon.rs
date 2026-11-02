@@ -72,7 +72,9 @@ impl RenderOnce for ProviderIcon {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let mark = match provider_logo(&self.mark.driver) {
-            Some(ProviderLogo::Mono(path)) => gpui::svg().path(path).size(self.size).flex_none().into_any_element(),
+            Some(ProviderLogo::Mono(path)) => {
+                gpui::svg().path(path).size(self.size).flex_none().text_color(hsla(p.foreground)).into_any_element()
+            }
             Some(ProviderLogo::Image { light, dark }) => {
                 img(if cx.theme().is_dark() { dark } else { light }).size(self.size).flex_none().into_any_element()
             }
