@@ -14,6 +14,7 @@ use t3_core::timeline::{
 };
 use t3_core::turn_item::TurnItemKind;
 
+use super::command_output;
 use super::markdown::{MarkdownStore, prose};
 use super::parts::{chevron, focusable, icon_slot, mono_block, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
@@ -238,14 +239,15 @@ fn entry_row(
                 .child(prose(&state, cx)),
         );
     } else if expanded && let Some(details) = entry_details(entry, env, cx) {
+        // Streamed output scrolls in its own capped panel, which follows the tail.
+        let streams = env.command_outputs.is_some() && matches!(entry.item.as_ref().map(|item| &item.kind), Some(TurnItemKind::CommandExecution { .. }));
         frame = frame.child(
             div()
                 .id(SharedString::from(format!("work-detail:{}", entry.id)))
                 .mt(px(2.))
                 .mb(px(6.))
                 .ml(px(28.))
-                .max_h(px(256.))
-                .overflow_y_scroll()
+                .when(!streams, |this| this.max_h(px(256.)).overflow_y_scroll())
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(details),
         );
@@ -360,6 +362,14 @@ fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Context<ThreadView
     match &item.kind {
         TurnItemKind::CommandExecution { input, output, output_omitted, exit_code, .. } => {
             parts.push(mono_block(format!("$ {}", t3_core::timeline::command_display_text(input)), cx).text_color(hsla(p.foreground).opacity(0.85)).into_any_element());
+            // The server streams the output, live and then final, in place of the item's own.
+            if let Some(outputs) = env.command_outputs {
+                parts.extend(command_output::panel(&entry.id, outputs.get(&entry.id), cx));
+                if let Some(code) = exit_code.filter(|code| *code != 0) {
+                    parts.push(mono_block(format!("exit {code}"), cx).text_color(hsla(p.destructive)).into_any_element());
+                }
+                return Some(v_flex().gap(px(6.)).w_full().min_w_0().children(parts).into_any_element());
+            }
             let fetched = fetched_item(entry, env);
             let output = match (*output_omitted, fetched) {
                 (true, Some(item)) => match &item.kind {

@@ -1,6 +1,7 @@
 pub mod asset;
 pub mod assets;
 pub mod auth;
+pub mod command_output;
 pub mod device_stream;
 pub mod favicon;
 pub mod history;

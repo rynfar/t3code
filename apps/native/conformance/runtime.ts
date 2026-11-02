@@ -28,6 +28,8 @@ import type * as OlderSettledModule from "../../../packages/client-runtime/src/s
 import type * as ThreadFamiliesModule from "../../../packages/client-runtime/src/state/threadFamilies.ts";
 import type * as NotificationGateModule from "../../../apps/web/src/components/ThreadNotificationCoordinator.logic.ts";
 import type * as WireProjectionModule from "../../../apps/server/src/orchestration-v2/WireProjection.ts";
+import type * as TerminalOutputModule from "../../../packages/shared/src/terminalOutput.ts";
+import type * as CommandOutputModule from "../../../packages/client-runtime/src/state/commandOutput.ts";
 
 export const ROOT = NodePath.resolve(
   NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
@@ -83,6 +85,12 @@ export const NotificationGate = await importSource<typeof NotificationGateModule
 );
 export const WireProjection = await importSource<typeof WireProjectionModule>(
   "apps/server/src/orchestration-v2/WireProjection.ts",
+);
+export const TerminalOutput = await importSource<typeof TerminalOutputModule>(
+  "packages/shared/src/terminalOutput.ts",
+);
+export const CommandOutput = await importSource<typeof CommandOutputModule>(
+  "packages/client-runtime/src/state/commandOutput.ts",
 );
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };

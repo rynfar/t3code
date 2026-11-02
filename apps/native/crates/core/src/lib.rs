@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod client_settings;
+pub mod command_output;
 pub mod commands;
 pub mod compatibility;
 pub mod composer;
@@ -35,6 +36,7 @@ pub mod shell;
 pub mod side_chat;
 pub mod sidebar;
 pub mod terminal;
+pub mod terminal_output;
 pub mod thread;
 pub mod thread_actions;
 pub mod timeline;

@@ -314,6 +314,11 @@ pub fn tooltip_icon_button(
 
 /// Mono text block for expanded tool details: code size on a 1.625 line, `secondary_label`.
 pub fn mono_block(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
+    mono_frame(cx).child(text.into())
+}
+
+/// `mono_block` without its text, for a styled child.
+pub fn mono_frame(cx: &App) -> gpui::Div {
     div()
         .w_full()
         .min_w_0()
@@ -321,5 +326,4 @@ pub fn mono_block(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
         .text_size(px(crate::theme::metrics::DEFAULT_CODE_FONT_SIZE))
         .line_height(px(crate::theme::metrics::DEFAULT_CODE_FONT_SIZE * 1.625))
         .text_color(hsla(palette(cx).secondary_label))
-        .child(text.into())
 }
