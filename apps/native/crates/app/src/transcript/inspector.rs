@@ -328,6 +328,8 @@ enum Slot {
 struct Entry {
     key: Key,
     used: u64,
+    /// The frame that last drew it; what the current frame drew is never dropped.
+    drawn: u64,
     slot: Slot,
 }
 
@@ -339,6 +341,10 @@ pub struct PreparedCache {
     tick: u64,
     /// Views whose queued entry was dropped for room; each holds at most one place here.
     starved: Vec<EntityId>,
+    /// The frame drawing now, or that drew last: it opens with its first request and closes
+    /// once the draw's updates settle.
+    frame: u64,
+    frame_open: bool,
 }
 
 struct Store(Entity<PreparedCache>);
@@ -358,10 +364,23 @@ impl PreparedCache {
     /// The derived blocks for `key`; `None` while a background derive is due, after which
     /// `owner` is notified.
     fn get(&mut self, key: Key, owner: EntityId, cx: &mut Context<Self>) -> Option<Rc<Prepared>> {
+        if !self.frame_open {
+            self.frame_open = true;
+            self.frame += 1;
+            let this = cx.entity().downgrade();
+            // Rows that stopped drawing are trimmed once the frame that skipped them is done.
+            cx.defer(move |cx| {
+                let _ = this.update(cx, |cache, _| {
+                    cache.frame_open = false;
+                    cache.trim();
+                });
+            });
+        }
         self.tick += 1;
-        let tick = self.tick;
+        let (tick, frame) = (self.tick, self.frame);
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key)) {
             entry.used = tick;
+            entry.drawn = frame;
             return match &mut entry.slot {
                 Slot::Ready(prepared) => Some(prepared.clone()),
                 Slot::Queued { waiters } | Slot::Running { waiters, .. } => {
@@ -374,11 +393,11 @@ impl PreparedCache {
         }
         if key.inline() {
             let prepared = Rc::new(Prepared { blocks: key.derive() });
-            self.entries.push(Entry { key, used: tick, slot: Slot::Ready(prepared.clone()) });
+            self.entries.push(Entry { key, used: tick, drawn: frame, slot: Slot::Ready(prepared.clone()) });
             self.trim();
             return Some(prepared);
         }
-        self.entries.push(Entry { key, used: tick, slot: Slot::Queued { waiters: vec![owner] } });
+        self.entries.push(Entry { key, used: tick, drawn: frame, slot: Slot::Queued { waiters: vec![owner] } });
         self.trim();
         self.start_queued(cx);
         None
@@ -437,14 +456,17 @@ impl PreparedCache {
     }
 
     /// Drops the least recently asked-for entries past `CACHE_LIMIT`: ready ones first, then
-    /// queued ones. Running ones stay, and there are never more than `RUNNING_LIMIT`. The views
-    /// waiting on a dropped entry are kept as starved, to be woken by the next completion.
+    /// queued ones. Running ones stay, and so does whatever the current frame drew, so the cache
+    /// grows past the limit by what is on screen rather than recompute it. The views waiting on a
+    /// dropped entry are kept as starved, to be woken by the next completion.
     fn trim(&mut self) {
         while self.entries.len() > CACHE_LIMIT {
+            let frame = self.frame;
             let oldest = |queued: bool| {
                 self.entries
                     .iter()
                     .enumerate()
+                    .filter(|(_, entry)| entry.drawn != frame)
                     .filter(|(_, entry)| if queued { matches!(entry.slot, Slot::Queued { .. }) } else { matches!(entry.slot, Slot::Ready(_)) })
                     .min_by_key(|(_, entry)| entry.used)
                     .map(|(index, _)| index)
@@ -870,7 +892,7 @@ mod tests {
     }
 
     fn entry(slot: Slot, used: u64) -> Entry {
-        Entry { key: key(tool("x"), Fetch::None), used, slot }
+        Entry { key: key(tool("x"), Fetch::None), used, drawn: 0, slot }
     }
 
     fn running() -> Slot {
@@ -883,7 +905,7 @@ mod tests {
 
     #[test]
     fn the_cache_stays_bounded_while_derives_wait() {
-        let mut cache = PreparedCache::default();
+        let mut cache = PreparedCache { frame: 1, ..PreparedCache::default() };
         cache.entries.extend((0..RUNNING_LIMIT as u64).map(|used| entry(running(), used)));
         cache.entries.extend((0..CACHE_LIMIT as u64 * 2).map(|used| entry(queued(), 100 + used)));
         cache.trim();
@@ -891,7 +913,7 @@ mod tests {
         assert_eq!(cache.entries.iter().filter(|entry| matches!(entry.slot, Slot::Running { .. })).count(), RUNNING_LIMIT, "running derives stay");
         assert!(cache.entries.iter().all(|entry| matches!(entry.slot, Slot::Running { .. }) || entry.used >= 100 + CACHE_LIMIT as u64 + RUNNING_LIMIT as u64), "the oldest queued ones go");
 
-        let mut cache = PreparedCache::default();
+        let mut cache = PreparedCache { frame: 1, ..PreparedCache::default() };
         cache.entries.push(entry(queued(), 50));
         cache.entries.extend((0..CACHE_LIMIT as u64).map(|used| entry(Slot::Ready(Rc::new(Prepared { blocks: Vec::new() })), used)));
         cache.trim();
@@ -902,9 +924,9 @@ mod tests {
     #[test]
     fn a_dropped_waiting_row_is_retried_only_after_a_derive_completes() {
         let (side_chat, main) = (EntityId::from(1u64), EntityId::from(2u64));
-        let mut cache = PreparedCache::default();
+        let mut cache = PreparedCache { frame: 1, ..PreparedCache::default() };
         let finishing = key(tool("finishing"), Fetch::None);
-        cache.entries.push(Entry { key: finishing.clone(), used: 0, slot: Slot::Running { waiters: vec![main], _task: Task::ready(()) } });
+        cache.entries.push(Entry { key: finishing.clone(), used: 0, drawn: 0, slot: Slot::Running { waiters: vec![main], _task: Task::ready(()) } });
         cache.entries.extend((1..RUNNING_LIMIT as u64).map(|used| entry(Slot::Running { waiters: vec![main], _task: Task::ready(()) }, used)));
         cache.entries.push(entry(Slot::Queued { waiters: vec![side_chat] }, 10));
         cache.entries.extend((0..CACHE_LIMIT as u64).map(|used| entry(Slot::Queued { waiters: vec![main] }, 20 + used)));
@@ -921,8 +943,37 @@ mod tests {
     }
 
     #[test]
+    fn rows_on_screen_derive_once_even_past_the_limit() {
+        let on_screen = CACHE_LIMIT + 8;
+        let mut cache = PreparedCache { frame: 1, ..PreparedCache::default() };
+        let keys: Vec<Key> = (0..on_screen).map(|n| key(tool(&n.to_string()), Fetch::None)).collect();
+        let mut completions = vec![0; on_screen];
+        for round in 0..on_screen * 4 {
+            // The frame draws every row, queueing those the cache lacks.
+            for (n, wanted) in keys.iter().enumerate() {
+                match cache.entries.iter_mut().find(|entry| entry.key.same(wanted)) {
+                    Some(entry) => entry.drawn = cache.frame,
+                    None => cache.entries.push(Entry { key: wanted.clone(), used: (round * on_screen + n) as u64, drawn: cache.frame, slot: queued() }),
+                }
+            }
+            cache.trim();
+            let Some(index) = cache.next_to_start() else { break };
+            let started = cache.entries[index].key.clone();
+            cache.entries[index].slot = running();
+            let _ = cache.complete((started.clone(), Vec::new()));
+            completions[keys.iter().position(|wanted| wanted.same(&started)).expect("a drawn key")] += 1;
+        }
+        assert!(completions.iter().all(|count| *count == 1), "each row derives exactly once: {completions:?}");
+        assert_eq!(cache.entries.len(), on_screen, "the cache holds what is on screen");
+
+        cache.frame += 1;
+        cache.trim();
+        assert_eq!(cache.entries.len(), CACHE_LIMIT, "rows that stop drawing are trimmed back to the limit");
+    }
+
+    #[test]
     fn only_a_few_derives_run_at_once_newest_first() {
-        let mut cache = PreparedCache::default();
+        let mut cache = PreparedCache { frame: 1, ..PreparedCache::default() };
         cache.entries.extend((0..RUNNING_LIMIT as u64).map(|used| entry(running(), used)));
         cache.entries.push(entry(queued(), 10));
         cache.entries.push(entry(queued(), 20));
