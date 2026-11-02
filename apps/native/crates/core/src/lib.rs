@@ -10,6 +10,7 @@ pub mod server_config;
 pub mod shell;
 pub mod sidebar;
 pub mod thread;
+pub mod thread_actions;
 pub mod timeline;
 pub mod traits;
 pub mod turn_item;

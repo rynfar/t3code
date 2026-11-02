@@ -1,0 +1,273 @@
+//! Project grouping: `client-runtime/src/state/projectGrouping.ts`, the path rules from
+//! `packages/shared/src/path.ts`, and the project sort from `apps/web/src/components/Sidebar.logic.ts`
+//! (`sortLogicalProjectsForSidebar`).
+
+use std::collections::{HashMap, HashSet};
+
+use serde_json::Value;
+
+use super::sort::{ThreadSortOrder, thread_sort_timestamp};
+use super::thread::SidebarThread;
+use super::time::{Ms, parse_iso};
+use crate::shell::ProjectShell;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupingMode {
+    #[default]
+    Repository,
+    RepositoryPath,
+    Separate,
+}
+
+impl GroupingMode {
+    pub fn parse(value: &str) -> Option<GroupingMode> {
+        match value {
+            "repository" => Some(GroupingMode::Repository),
+            "repository_path" => Some(GroupingMode::RepositoryPath),
+            "separate" => Some(GroupingMode::Separate),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupingSettings {
+    pub mode: GroupingMode,
+    /// Keyed by physical project key (`<environmentId>:<normalized path>`).
+    pub overrides: HashMap<String, GroupingMode>,
+}
+
+fn is_windows_drive_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn is_root_path(value: &str) -> bool {
+    value == "/" || value == "\\" || (value.len() == 3 && is_windows_drive_path(value))
+}
+
+fn trim_trailing_separators(value: &str) -> String {
+    if value.is_empty() || is_root_path(value) {
+        return value.to_owned();
+    }
+    let trimmed = if value.starts_with('/') { value.trim_end_matches('/') } else { value.trim_end_matches(['/', '\\']) };
+    if trimmed.is_empty() {
+        return value.to_owned();
+    }
+    if trimmed.len() == 2 && is_windows_drive_path(trimmed) { format!("{trimmed}\\") } else { trimmed.to_owned() }
+}
+
+/// `normalizeProjectPathForComparison`.
+pub fn normalize_project_path(value: &str) -> String {
+    let normalized = trim_trailing_separators(value.trim());
+    if is_windows_drive_path(&normalized) || normalized.starts_with("\\\\") {
+        normalized.replace('/', "\\").to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+pub fn physical_project_key(environment_id: &str, workspace_root: &str) -> String {
+    format!("{environment_id}:{}", normalize_project_path(workspace_root))
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str().map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn grouping_key_of(identity: &Value) -> Option<&str> {
+    identity.get("origin").and_then(|origin| text(origin, "canonicalKey")).or_else(|| text(identity, "canonicalKey"))
+}
+
+fn grouping_display_name_of(identity: &Value) -> Option<&str> {
+    match identity.get("origin").filter(|origin| origin.is_object()) {
+        Some(origin) => text(origin, "displayName").or_else(|| text(origin, "canonicalKey")),
+        None => text(identity, "displayName"),
+    }
+}
+
+fn identity(project: &ProjectShell) -> Option<&Value> {
+    project.repository_identity.as_ref().filter(|value| value.is_object())
+}
+
+fn repository_relative_path(project: &ProjectShell) -> Option<String> {
+    let root = text(identity(project)?, "rootPath")?;
+    let (project_path, root_path) = (normalize_project_path(&project.workspace_root), normalize_project_path(root));
+    if project_path.is_empty() || root_path.is_empty() {
+        return None;
+    }
+    if project_path == root_path {
+        return Some(String::new());
+    }
+    let separator = if root_path.contains('\\') { '\\' } else { '/' };
+    project_path.strip_prefix(&format!("{root_path}{separator}")).map(|rest| rest.replace('\\', "/"))
+}
+
+fn repository_scoped_key(project: &ProjectShell, mode: GroupingMode) -> Option<String> {
+    let canonical = grouping_key_of(identity(project)?).filter(|key| !key.contains('\0'))?;
+    if mode == GroupingMode::Repository {
+        return Some(canonical.to_owned());
+    }
+    Some(match repository_relative_path(project) {
+        Some(relative) if !relative.is_empty() => format!("{canonical}::{relative}"),
+        _ => canonical.to_owned(),
+    })
+}
+
+fn resolve_mode(environment_id: &str, project: &ProjectShell, settings: &GroupingSettings) -> GroupingMode {
+    settings.overrides.get(&physical_project_key(environment_id, &project.workspace_root)).copied().unwrap_or(settings.mode)
+}
+
+fn logical_key(environment_id: &str, project: &ProjectShell, mode: GroupingMode) -> String {
+    if mode == GroupingMode::Separate {
+        return physical_project_key(environment_id, &project.workspace_root);
+    }
+    repository_scoped_key(project, mode).unwrap_or_else(|| physical_project_key(environment_id, &project.workspace_root))
+}
+
+fn unique_non_empty<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Vec<&'a str> {
+    let mut unique = Vec::new();
+    for value in values.flatten().map(str::trim).filter(|value| !value.is_empty()) {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
+/// `deriveProjectGroupLabel`.
+pub fn group_label(representative: &ProjectShell, members: &[&ProjectShell]) -> String {
+    let titles = unique_non_empty(members.iter().map(|member| Some(member.title.as_str())));
+    let display_names = unique_non_empty(members.iter().map(|member| identity(member).and_then(grouping_display_name_of)));
+    let repository_names = unique_non_empty(members.iter().map(|member| identity(member).and_then(|identity| text(identity, "name"))));
+    if let [title] = titles.as_slice()
+        && !display_names.contains(title)
+        && !repository_names.contains(title)
+    {
+        return (*title).to_owned();
+    }
+    if let [name] = display_names.as_slice() {
+        return (*name).to_owned();
+    }
+    if let [name] = repository_names.as_slice() {
+        return (*name).to_owned();
+    }
+    representative.title.clone()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGroup {
+    pub key: String,
+    pub label: String,
+    pub representative_id: String,
+    pub member_project_ids: Vec<String>,
+    pub pinned: bool,
+    pub archived: bool,
+}
+
+fn freshness(project: &ProjectShell) -> Ms {
+    parse_iso(&project.updated_at).or_else(|| parse_iso(&project.created_at)).unwrap_or(0)
+}
+
+fn replaces_winner(existing: &ProjectShell, candidate: &ProjectShell) -> bool {
+    let delta = freshness(candidate) - freshness(existing);
+    delta > 0 || (delta == 0 && candidate.id > existing.id)
+}
+
+/// `buildProjectGroups` for one environment.
+pub fn build_project_groups(environment_id: &str, projects: &[ProjectShell], settings: &GroupingSettings) -> Vec<ProjectGroup> {
+    let mut by_physical: Vec<(String, Vec<&ProjectShell>)> = Vec::new();
+    for project in projects {
+        let key = physical_project_key(environment_id, &project.workspace_root);
+        match by_physical.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, members)) => members.push(project),
+            None => by_physical.push((key, vec![project])),
+        }
+    }
+    let mut groups: Vec<(String, Vec<&ProjectShell>)> = Vec::new();
+    let mut logical_by_physical = HashMap::new();
+    for (physical, members) in &by_physical {
+        let Some(mut winner) = members.first().copied() else { continue };
+        for candidate in members.iter().skip(1) {
+            if replaces_winner(winner, candidate) {
+                winner = candidate;
+            }
+        }
+        let identity_source = if winner.repository_identity.is_some() {
+            winner
+        } else {
+            members.iter().copied().filter(|member| member.repository_identity.is_some()).reduce(|a, b| if replaces_winner(a, b) { b } else { a }).unwrap_or(winner)
+        };
+        let key = logical_key(environment_id, identity_source, resolve_mode(environment_id, winner, settings));
+        logical_by_physical.insert(physical.clone(), key.clone());
+        match groups.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, group)) => group.push(winner),
+            None => groups.push((key, vec![winner])),
+        }
+    }
+    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen = HashSet::new();
+    for project in projects {
+        if !seen.insert(project.id.as_str()) {
+            continue;
+        }
+        let physical = physical_project_key(environment_id, &project.workspace_root);
+        let key = logical_by_physical.get(&physical).cloned().unwrap_or_else(|| logical_key(environment_id, project, resolve_mode(environment_id, project, settings)));
+        refs.entry(key).or_default().push(project.id.clone());
+    }
+    groups
+        .into_iter()
+        .filter_map(|(key, members)| {
+            let representative = *members.first()?;
+            Some(ProjectGroup {
+                label: if members.len() > 1 { group_label(representative, &members) } else { representative.title.clone() },
+                representative_id: representative.id.clone(),
+                member_project_ids: refs.remove(&key).unwrap_or_default(),
+                pinned: members.iter().any(|member| member.pinned_at.is_some()),
+                archived: members.iter().all(|member| member.archived_at.is_some()),
+                key,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectSortOrder {
+    #[default]
+    UpdatedAt,
+    CreatedAt,
+    Manual,
+}
+
+/// `sortLogicalProjectsForSidebar`: by newest thread activity, ties by label then key.
+pub fn sort_project_groups(groups: &mut [ProjectGroup], projects: &[ProjectShell], threads: &[SidebarThread], order: ProjectSortOrder) {
+    let thread_order = match order {
+        ProjectSortOrder::Manual => return,
+        ProjectSortOrder::CreatedAt => ThreadSortOrder::CreatedAt,
+        ProjectSortOrder::UpdatedAt => ThreadSortOrder::UpdatedAt,
+    };
+    let group_of: HashMap<&str, usize> =
+        groups.iter().enumerate().flat_map(|(index, group)| group.member_project_ids.iter().map(move |id| (id.as_str(), index))).collect();
+    let mut latest: Vec<Option<Option<Ms>>> = vec![None; groups.len()];
+    for thread in threads.iter().filter(|thread| !thread.archived) {
+        if let Some(&index) = group_of.get(thread.project_id.as_str()) {
+            let timestamp = thread_sort_timestamp(thread, thread_order);
+            latest[index] = Some(latest[index].flatten().max(timestamp));
+        }
+    }
+    let project_time = |group: &ProjectGroup| {
+        let project = projects.iter().find(|project| project.id == group.representative_id)?;
+        match order {
+            ProjectSortOrder::CreatedAt => parse_iso(&project.created_at),
+            _ => parse_iso(&project.updated_at).or_else(|| parse_iso(&project.created_at)),
+        }
+    };
+    let mut keyed: Vec<(Option<Ms>, ProjectGroup)> =
+        groups.iter().enumerate().map(|(index, group)| (latest[index].unwrap_or_else(|| project_time(group)), group.clone())).collect();
+    keyed.sort_by(|(left_time, left), (right_time, right)| {
+        right_time.cmp(left_time).then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase())).then_with(|| left.key.cmp(&right.key))
+    });
+    for (slot, (_, group)) in groups.iter_mut().zip(keyed) {
+        *slot = group;
+    }
+}
