@@ -99,7 +99,7 @@ async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, one
 async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
     let (commands, mut rx) = mpsc::unbounded_channel();
     let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() });
-    let handle = ClientHandle { commands, credentials };
+    let handle = ClientHandle { commands, credentials, session_state: watch::channel(None).1 };
     let sends = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
     let run = tokio::spawn(async move { handle.dispatch_in_order(sends).await });
 
@@ -144,4 +144,26 @@ async fn dispatches_reach_the_server_in_call_order_with_requests_and_streams() {
         tags = received => assert_eq!(tags.expect("reader"), [method::DISPATCH_COMMAND, "terminal.write", "terminal.attach"]),
         _ = async { tokio::join!(stream, request, dispatch) } => unreachable!("the fake server never replies"),
     }
+}
+
+async fn next_grants(grants: &mut watch::Receiver<Option<AuthSessionState>>) -> AuthSessionState {
+    tokio::time::timeout(Duration::from_secs(10), grants.changed()).await.expect("grants arrive").expect("open");
+    grants.borrow_and_update().clone().expect("grants")
+}
+
+#[tokio::test]
+async fn each_connection_fetches_the_grants_and_a_refresh_picks_up_changes() {
+    let mut server = FakeServer::start().await;
+    let (client, _events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut grants = client.session_state();
+    assert!(grants.borrow().is_none());
+    let mut connection = server.connection().await;
+    assert!(next_grants(&mut grants).await.grants("terminal:operate"));
+    answer_config(&mut connection, None).await;
+    connection.request(method::SUBSCRIBE_SHELL).await;
+
+    server.set_session(json!({"authenticated": true, "auth": {}, "permissions": ["terminal:read"]}));
+    client.refresh_session_state();
+    let state = next_grants(&mut grants).await;
+    assert!(state.grants("terminal:read") && !state.grants("terminal:operate"));
 }

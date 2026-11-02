@@ -3,6 +3,7 @@
 //! `POST /api/auth/websocket-ticket/rpc` → `wsTicket` on the socket URL.
 
 use serde::{Deserialize, Serialize};
+use t3_core::auth::AuthSessionState;
 use t3_core::pairing::{PairingLink, websocket_base};
 
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -109,6 +110,23 @@ async fn post_ticket(credentials: &Credentials, path: &str) -> Result<String, Au
         .await
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
     Ok(ticket.ticket)
+}
+
+/// `GET /api/auth/session`: what this device's credential may do now (`fetchEnvironmentSessionState`).
+pub async fn fetch_session_state(credentials: &Credentials) -> Result<AuthSessionState, AuthError> {
+    let host = credentials.http_base.clone();
+    let response = http()
+        .get(format!("{}/api/auth/session", credentials.http_base))
+        .bearer_auth(&credentials.access_token)
+        .send()
+        .await
+        .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AuthError::Unexpected { host, status: status.as_u16(), body });
+    }
+    response.json().await.map_err(|source| AuthError::Unreachable { host, source })
 }
 
 pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
