@@ -382,6 +382,7 @@ impl Composer {
                     choices.interaction_mode = Some(mode);
                 }
                 self.replace_prompt_range(trigger.range_start, trigger.range_end, "", window, cx);
+                self.draft_changed(cx);
             }
             MenuAction::Slash(command @ (SlashCommand::Side | SlashCommand::Btw)) => {
                 self.replace_prompt_range(trigger.range_start, trigger.range_end, &format!("/{} ", command.name()), window, cx);
@@ -399,6 +400,7 @@ impl Composer {
                     threads.retain(|existing| existing.context_id != context.context_id);
                     threads.push(context);
                 }
+                self.draft_changed(cx);
             }
         }
         self.menu.highlighted = None;
@@ -424,6 +426,16 @@ impl Composer {
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
         t3_core::composer::attachments::message_context(text, threads, attachments)
+    }
+
+    pub(super) fn mentions(&self, target: &Target) -> &[ThreadContext] {
+        self.menu.threads.get(target).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    pub(super) fn seed_mentions(&mut self, target: &Target, threads: Vec<ThreadContext>) {
+        if !threads.is_empty() {
+            self.menu.threads.insert(target.clone(), threads);
+        }
     }
 
     /// Forgets a target's mentioned threads once its message went out.

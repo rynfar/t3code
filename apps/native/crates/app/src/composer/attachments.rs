@@ -54,7 +54,20 @@ fn image_format(mime_type: &str) -> Option<ImageFormat> {
 
 impl Composer {
     pub(super) fn staged(&self) -> &[Staged] {
-        self.snapshot.target.as_ref().and_then(|target| self.attachments.staged.get(target)).map(Vec::as_slice).unwrap_or_default()
+        self.snapshot.target.as_ref().map(|target| self.staged_for(target)).unwrap_or_default()
+    }
+
+    pub(super) fn staged_for(&self, target: &Target) -> &[Staged] {
+        self.attachments.staged.get(target).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// Attachments a saved draft restores: uploaded, without their bytes or preview.
+    pub(super) fn seed_attachments(&mut self, target: &Target, restored: Vec<Attachment>) {
+        if restored.is_empty() {
+            return;
+        }
+        let staged = restored.into_iter().map(|attachment| Staged { attachment, preview: None, bytes: None, _upload: None });
+        self.attachments.staged.entry(target.clone()).or_default().extend(staged);
     }
 
     pub(super) fn staged_attachments(&self) -> Vec<Attachment> {
@@ -203,6 +216,7 @@ impl Composer {
                     Ok(attachment_id) => {
                         staged.attachment.upload = Upload::Ready { attachment_id };
                         staged.bytes = None;
+                        this.record_draft(&task_target, cx);
                     }
                     Err(reason) => staged.attachment.upload = Upload::Failed { reason },
                 }
@@ -235,6 +249,7 @@ impl Composer {
         if let Some(attachment_id) = removed.attachment.attachment_id() {
             self.release_upload(attachment_id, cx);
         }
+        self.draft_changed(cx);
         cx.notify();
     }
 

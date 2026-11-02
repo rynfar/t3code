@@ -7,6 +7,7 @@
 
 mod attachments;
 pub(crate) mod controls;
+mod drafts;
 mod menu;
 mod model_picker;
 mod pending;
@@ -153,6 +154,7 @@ pub struct Composer {
     menu: Menu,
     /// Staged images and files per target.
     attachments: attachments::Attachments,
+    drafts: drafts::Drafts,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -228,8 +230,10 @@ impl Composer {
             fixed,
             menu: Menu::default(),
             attachments: Default::default(),
+            drafts: Default::default(),
             _subscriptions: subscriptions,
         };
+        composer.load_drafts();
         composer.refresh(true, window, cx);
         composer
     }
@@ -288,6 +292,8 @@ impl Composer {
                 let resolved = self.resolve(cx);
                 self.carry = (resolved.model, Some(resolved.interaction_mode));
             }
+            let previous = self.snapshot.target.clone();
+            self.switch_draft(previous.as_ref(), next.target.as_ref(), window, cx);
             self.picker_open = false;
             self.permissions_open = false;
             self.approval_menu_open = false;
@@ -449,8 +455,12 @@ impl Composer {
                 if let Some(choices) = self.choices_mut() {
                     choices.model = Some(selection);
                 }
+                self.draft_changed(cx);
             }
-            PickerEvent::Options(selections) => self.set_options(selections, cx),
+            PickerEvent::Options(selections) => {
+                self.set_options(selections, cx);
+                self.draft_changed(cx);
+            }
             PickerEvent::RuntimeMode(mode) => self.set_runtime_mode(*mode, cx),
             PickerEvent::Dismiss => {
                 self.picker_open = false;
@@ -475,6 +485,7 @@ impl Composer {
         if let Some(choices) = self.choices_mut() {
             choices.runtime_mode = Some(mode);
         }
+        self.draft_changed(cx);
         self.permissions_open = false;
         cx.notify();
     }
@@ -506,6 +517,7 @@ impl Composer {
         if let Some(choices) = self.choices_mut() {
             choices.interaction_mode = Some(next);
         }
+        self.draft_changed(cx);
         cx.notify();
     }
 
@@ -546,6 +558,9 @@ impl Composer {
     /// text: the send button's enabled state, or the active answer.
     fn on_prompt_change(&mut self, cx: &mut Context<Self>) {
         self.sync_menu(true, cx);
+        if self.answering.is_none() {
+            self.draft_changed(cx);
+        }
         let text = self.prompt(cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();

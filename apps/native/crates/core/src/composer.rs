@@ -8,6 +8,7 @@
 //! `web/src/hooks/useHandleNewThread.ts`.
 
 pub mod attachments;
+pub mod drafts;
 pub mod menu;
 
 use serde::Deserialize;

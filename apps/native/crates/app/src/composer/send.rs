@@ -61,6 +61,7 @@ impl Composer {
                 choices.interaction_mode = Some(mode);
             }
             self.set_prompt("", window, cx);
+            self.draft_changed(cx);
             cx.notify();
             return;
         }
@@ -154,6 +155,10 @@ impl Composer {
                 this.sending = false;
                 if result.is_ok() {
                     this.clear_mentions(&target);
+                    // A background launch leaves the draft open for the next thread.
+                    if intent != SubmitIntent::Background {
+                        this.discard_draft(&target, cx);
+                    }
                 }
                 match result {
                     Ok(_) if intent == SubmitIntent::Background => {}
