@@ -3,6 +3,7 @@ mod chat_header;
 mod composer;
 mod connect;
 mod context_menu;
+mod device;
 mod dialog;
 mod diff;
 mod environments;
@@ -112,6 +113,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     new_thread::init(state.clone(), cx);
     right_panel::init(state.clone(), cx);
     preview::init(state.clone(), cx);
+    device::init(state.clone(), cx);
     pull_requests::init(state.clone(), cx);
     terminal::init(cx);
     files::init(cx);

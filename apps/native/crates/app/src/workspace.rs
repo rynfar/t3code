@@ -51,6 +51,7 @@ pub struct Workspace {
     git_dialogs: Entity<GitDialogs>,
     pull_requests: Entity<PullRequestsPage>,
     link_dialog: Entity<LinkPullRequestDialog>,
+    device_setup: Entity<crate::device::DeviceSetupDialog>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -76,6 +77,7 @@ impl Workspace {
         let details = cx.new(|cx| DetailsView::new(state.clone(), details_model.clone(), git_dialogs.clone(), window, cx));
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
+        let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
         let subscriptions = vec![
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
@@ -119,6 +121,7 @@ impl Workspace {
             git_dialogs,
             pull_requests,
             link_dialog,
+            device_setup,
             _subscriptions: subscriptions,
         }
     }
@@ -314,6 +317,7 @@ impl Render for Workspace {
             .child(self.snooze.clone())
             .child(self.palette.clone())
             .child(self.link_dialog.clone())
+            .child(self.device_setup.clone())
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))
             .children(crate::usage::overlay(window, cx))
