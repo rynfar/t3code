@@ -3,12 +3,14 @@ mod composer;
 mod connect;
 mod context_menu;
 mod dialog;
+mod diff;
 mod glass;
 mod icons;
 mod keymap;
 mod menus;
 mod new_thread;
 mod palette;
+mod right_panel;
 mod sidebar;
 mod snooze_dialog;
 mod theme;
@@ -50,6 +52,7 @@ fn main() {
         let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
         menus::init(state.clone(), cx);
         new_thread::init(state.clone(), cx);
+        right_panel::init(state.clone(), cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(
             WindowOptions {

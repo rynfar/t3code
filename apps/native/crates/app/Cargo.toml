@@ -34,6 +34,8 @@ gpui-component = { workspace = true, features = [
   "tree-sitter-typescript",
   "tree-sitter-yaml",
 ] }
+gpui-component-assets.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

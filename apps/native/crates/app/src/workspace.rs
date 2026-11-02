@@ -16,6 +16,7 @@ use crate::keymap::{
     JumpToThread9, NextThread, PinThread, PreviousThread, SettleThread, ToggleCommandPalette, ToggleSidebar, UndoThreadAction, Unimplemented,
 };
 use crate::palette::CommandPalette;
+use crate::right_panel::{self, RightPanelView};
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
 use crate::theme::{hsla, palette};
@@ -35,6 +36,7 @@ pub struct Workspace {
     dialog: Entity<ConfirmDialog>,
     palette: Entity<CommandPalette>,
     snooze: Entity<SnoozeDialog>,
+    right_panel: Entity<RightPanelView>,
     _subscription: Subscription,
 }
 
@@ -49,12 +51,13 @@ impl Workspace {
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
+        let right_panel = cx.new(|cx| RightPanelView::new(state.clone(), window, cx));
         let subscription = cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
-            if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice) {
+            if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
                 cx.notify();
             }
         });
-        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, _subscription: subscription }
+        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, right_panel, _subscription: subscription }
     }
 
     fn render_titlebar(&self, cx: &App) -> impl IntoElement {
@@ -66,6 +69,7 @@ impl Workspace {
             Phase::Online(ConnectionStatus::NeedsPairing { reason }) => Some(reason.clone()),
             Phase::Pairing | Phase::Unpaired { .. } => None,
         };
+        let panel_open = state.selected_thread.as_deref().is_some_and(|thread| state.panels.panels.is_open(thread));
         let theme = cx.theme();
         let collapsed = state.sidebar.collapsed;
         h_flex()
@@ -80,6 +84,7 @@ impl Workspace {
             .child(new_thread::breadcrumb(&self.state, cx))
             .children(status.map(|status| div().text_xs().text_color(theme.muted_foreground).child(status)))
             .child(new_thread::new_thread_button(cx))
+            .when(!panel_open, |this| this.child(right_panel::header_controls(&self.state, cx)))
     }
 }
 
@@ -90,11 +95,15 @@ impl Render for Workspace {
         if !paired {
             return div().size_full().bg(theme.background).child(self.connect.clone()).into_any_element();
         }
-        let has_thread = self.state.read(cx).selected_thread.is_some();
-        let has_draft = !has_thread && self.state.read(cx).draft_project.is_some();
-        let collapsed = self.state.read(cx).sidebar.collapsed;
-        let toast = self.state.read(cx).toast.clone();
-        let running = self.state.read(cx).is_selected_thread_running();
+        let state = self.state.read(cx);
+        let has_thread = state.selected_thread.is_some();
+        let has_draft = !has_thread && state.draft_project.is_some();
+        let collapsed = state.sidebar.collapsed;
+        let toast = state.toast.clone();
+        let running = state.is_selected_thread_running();
+        let panel = state.selected_thread.as_deref().map(|thread| state.panels.panels.panel(thread));
+        let right_panel_open = panel.is_some_and(|panel| panel.is_open);
+        let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
         h_flex()
             .relative()
             .size_full()
@@ -104,7 +113,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
             }))
-            .key_context(keymap::root_context(false, running))
+            .key_context(keymap::root_context(right_panel_open, running))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar(cx))))
             .on_action(cx.listener(|this, _: &PreviousThread, _, cx| this.traverse(false, cx)))
             .on_action(cx.listener(|this, _: &NextThread, _, cx| this.traverse(true, cx)))
@@ -144,7 +153,8 @@ impl Render for Workspace {
                         .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
                 )
             })
-            .child(
+            .when(!maximized, |this| {
+                this.child(
                 v_flex()
                     .flex_1()
                     .h_full()
@@ -167,7 +177,9 @@ impl Render for Workspace {
                                 .child("Select a thread"),
                         )
                     }),
-            )
+                )
+            })
+            .child(self.right_panel.clone())
             .child(self.render_sidebar_toggle(cx))
             .child(self.menu.clone())
             .child(self.dialog.clone())

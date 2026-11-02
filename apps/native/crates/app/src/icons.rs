@@ -1,6 +1,7 @@
 //! Lucide icons vendored at the web's version (`lucide-react` 0.564.0) with the web's stroke
 //! baked in (design system §8): 1.75 by default, 2 under `stroke-2/` for work-row icons. The
 //! composer's own glyphs (send arrow, stop square, filled star and bolt) live under `composer/`.
+//! The asset source also serves gpui-component's own icons, which its `IconName` widgets load.
 
 use std::borrow::Cow;
 
@@ -40,16 +41,23 @@ icons! {
     ChevronDown => "icons/lucide/chevron-down.svg",
     ChevronRight => "icons/lucide/chevron-right.svg",
     ChevronUp => "icons/lucide/chevron-up.svg",
+    ChevronsDownUp => "icons/lucide/chevrons-down-up.svg",
+    ChevronsUpDown => "icons/lucide/chevrons-up-down.svg",
     CircleAlert => "icons/lucide/circle-alert.svg",
     CircleCheck => "icons/lucide/circle-check.svg",
     CircleDashed => "icons/lucide/circle-dashed.svg",
     CircleDotDashed => "icons/lucide/circle-dot-dashed.svg",
     CircleStop => "icons/lucide/circle-stop.svg",
     Clock => "icons/lucide/clock.svg",
+    Columns2 => "icons/lucide/columns-2.svg",
     Copy => "icons/lucide/copy.svg",
     CornerUpRight => "icons/lucide/corner-up-right.svg",
     Ellipsis => "icons/lucide/ellipsis.svg",
     Eye => "icons/lucide/eye.svg",
+    FileDiff => "icons/lucide/file-diff.svg",
+    FileMinus => "icons/lucide/file-minus.svg",
+    FilePlus => "icons/lucide/file-plus.svg",
+    FileSymlink => "icons/lucide/file-symlink.svg",
     Folder => "icons/lucide/folder.svg",
     FolderTree => "icons/lucide/folder-tree.svg",
     GitBranch => "icons/lucide/git-branch.svg",
@@ -60,19 +68,25 @@ icons! {
     ListPlus => "icons/lucide/list-plus.svg",
     Lock => "icons/lucide/lock.svg",
     MailOpen => "icons/lucide/mail-open.svg",
+    Maximize2 => "icons/lucide/maximize-2.svg",
     MessageCircleQuestion => "icons/lucide/message-circle-question-mark.svg",
     MessageSquare => "icons/lucide/message-square.svg",
     MessageSquarePlus => "icons/lucide/message-square-plus.svg",
     Minimize2 => "icons/lucide/minimize-2.svg",
     PanelLeft => "icons/lucide/panel-left.svg",
+    PanelRight => "icons/lucide/panel-right.svg",
     PenLine => "icons/lucide/pen-line.svg",
     Pencil => "icons/lucide/pencil.svg",
     PencilRuler => "icons/lucide/pencil-ruler.svg",
+    Pilcrow => "icons/lucide/pilcrow.svg",
     Pin => "icons/lucide/pin.svg",
     PinOff => "icons/lucide/pin-off.svg",
+    Plus => "icons/lucide/plus.svg",
     Redo2 => "icons/lucide/redo-2.svg",
     RefreshCw => "icons/lucide/refresh-cw.svg",
+    Rows3 => "icons/lucide/rows-3.svg",
     Search => "icons/lucide/search.svg",
+    Send => "icons/composer/send.svg",
     Settings => "icons/lucide/settings.svg",
     Shield => "icons/lucide/shield.svg",
     ShieldOff => "icons/lucide/shield-off.svg",
@@ -80,8 +94,11 @@ icons! {
     Sparkles => "icons/lucide/sparkles.svg",
     SquarePen => "icons/lucide/square-pen.svg",
     Star => "icons/lucide/star.svg",
+    StarFill => "icons/composer/star-fill.svg",
+    Stop => "icons/composer/stop.svg",
     Terminal => "icons/lucide/terminal.svg",
     TextSearch => "icons/lucide/text-search.svg",
+    TextWrap => "icons/lucide/text-wrap.svg",
     Timer => "icons/lucide/timer.svg",
     Trash => "icons/lucide/trash.svg",
     TriangleAlert => "icons/lucide/triangle-alert.svg",
@@ -89,6 +106,7 @@ icons! {
     UserRound => "icons/lucide/user-round.svg",
     Wrench => "icons/lucide/wrench.svg",
     X => "icons/lucide/x.svg",
+    ZapFill => "icons/composer/zap-fill.svg",
     WorkBot => "icons/lucide/stroke-2/bot.svg",
     WorkBrain => "icons/lucide/stroke-2/brain.svg",
     WorkCheck => "icons/lucide/stroke-2/check.svg",
@@ -107,10 +125,6 @@ icons! {
     WorkWrench => "icons/lucide/stroke-2/wrench.svg",
     WorkX => "icons/lucide/stroke-2/x.svg",
     WorkZap => "icons/lucide/stroke-2/zap.svg",
-    Send => "icons/composer/send.svg",
-    Stop => "icons/composer/stop.svg",
-    StarFill => "icons/composer/star-fill.svg",
-    ZapFill => "icons/composer/zap-fill.svg",
 }
 
 impl Icon {
@@ -128,6 +142,11 @@ impl Icon {
     pub fn from_name(name: &str) -> Option<Icon> {
         Self::ALL.iter().copied().find(|icon| icon.path().strip_prefix("icons/lucide/").and_then(|file| file.strip_suffix(".svg")) == Some(name))
     }
+
+    /// The bare icon, for callers that size it and style hover or position themselves.
+    pub fn svg(self) -> Svg {
+        svg().path(self.path()).flex_none()
+    }
 }
 
 /// Serves the vendored icons to GPUI.
@@ -135,10 +154,15 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        Ok(FILES.iter().find(|(candidate, _)| *candidate == path).map(|(_, bytes)| Cow::Borrowed(*bytes)))
+        match FILES.iter().find(|(candidate, _)| *candidate == path) {
+            Some((_, bytes)) => Ok(Some(Cow::Borrowed(*bytes))),
+            None => gpui_component_assets::Assets.load(path),
+        }
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(FILES.iter().filter(|(candidate, _)| candidate.starts_with(path)).map(|(candidate, _)| (*candidate).into()).collect())
+        let mut paths = gpui_component_assets::Assets.list(path)?;
+        paths.extend(FILES.iter().filter(|(candidate, _)| candidate.starts_with(path)).map(|(candidate, _)| SharedString::from(*candidate)));
+        Ok(paths)
     }
 }

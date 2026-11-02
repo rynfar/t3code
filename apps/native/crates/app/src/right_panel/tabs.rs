@@ -1,0 +1,226 @@
+//! The tab bar (`RightPanelTab`, the add-surface menu, `PanelTabCloseButton`) and the empty
+//! "Open a surface" launcher (`RightPanelEmptyState`) from `components/RightPanelTabs.tsx`.
+
+use gpui::{App, Entity, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, WindowControlArea, div, prelude::*, px};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_component::{h_flex, v_flex};
+use t3_core::right_panel::{Surface, SurfaceKind, ThreadPanel};
+
+use super::{Button, Size, Variant, header_controls};
+use crate::app_state::AppState;
+use crate::icons::Icon;
+use crate::theme::{hsla, palette};
+use crate::workspace::TITLEBAR_HEIGHT;
+
+/// What the launcher and the add menu offer. Native ships the diff; other surfaces join here.
+struct SurfaceAction {
+    label: &'static str,
+    icon: Icon,
+    shortcut: &'static str,
+    open: fn(&mut AppState, &mut gpui::Context<AppState>),
+}
+
+const SURFACE_ACTIONS: &[SurfaceAction] =
+    &[SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface }];
+
+fn surface_icon(surface: &Surface) -> Icon {
+    match surface.kind {
+        SurfaceKind::Diff => Icon::FileDiff,
+    }
+}
+
+pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, cx: &App) -> impl IntoElement {
+    let count = panel.surfaces.len();
+    let tabs = panel.surfaces.iter().enumerate().map(|(index, surface)| {
+        let active = panel.active_surface_id.as_deref() == Some(surface.id.as_str());
+        tab(state.clone(), surface, index, count, active, cx)
+    });
+    let add_state = state.clone();
+    h_flex()
+        .h(px(TITLEBAR_HEIGHT))
+        .flex_none()
+        .pl(px(8.))
+        .pr(px(12.))
+        .gap(px(4.))
+        .window_control_area(WindowControlArea::Drag)
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(4.))
+                .overflow_hidden()
+                .children(tabs)
+                .child(
+                    Button::new("right-panel-add")
+                        .variant(Variant::GhostMuted)
+                        .size(Size::IconXs)
+                        .icon(Icon::Plus)
+                        .tooltip("Add panel surface")
+                        .dropdown_menu(move |menu, _, _| {
+                            SURFACE_ACTIONS.iter().fold(menu, |menu, action| {
+                                let state = add_state.clone();
+                                let open = action.open;
+                                menu.item(
+                                    PopupMenuItem::new(action.label)
+                                        .on_click(move |_, _, cx| state.update(cx, open)),
+                                )
+                            })
+                        }),
+                ),
+        )
+        .child(header_controls(&state, cx))
+}
+
+fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, cx: &App) -> impl IntoElement {
+    let p = palette(cx);
+    let title: SharedString = surface.title().into();
+    let id = surface.id.clone();
+    let (activate, close, middle) = (state.clone(), state.clone(), state.clone());
+    let (activate_id, close_id, middle_id) = (id.clone(), id.clone(), id.clone());
+    let group: SharedString = format!("tab-{id}").into();
+    let icon_color = hsla(if active { p.foreground } else { p.muted_foreground });
+    div()
+        .id(SharedString::from(format!("right-panel-tab-{id}")))
+        .group(group.clone())
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(24.))
+        .max_w(px(144.))
+        .gap(px(2.))
+        .pl(px(6.))
+        .pr(px(8.))
+        .rounded(px(6.))
+        .text_xs()
+        .cursor_pointer()
+        .when(active, |this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
+        .when(!active, |this| {
+            this.text_color(hsla(p.muted_foreground))
+                .hover(|style| style.bg(hsla(p.accent).opacity(0.6)).text_color(hsla(p.foreground)))
+        })
+        .on_click(move |_, _, cx| activate.update(cx, |state, cx| state.activate_surface(&activate_id, cx)))
+        .on_mouse_up(MouseButton::Middle, move |_, _, cx| {
+            middle.update(cx, |state, cx| state.close_surface(&middle_id, cx));
+        })
+        .child(
+            div()
+                .id(SharedString::from(format!("right-panel-tab-close-{id}")))
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(16.))
+                .rounded(px(4.))
+                .hover(|style| style.bg(hsla(p.muted)))
+                .tooltip({
+                    let label: SharedString = format!("Close {title}").into();
+                    move |window, cx| super::tooltip_view(label.clone(), window, cx)
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    close.update(cx, |state, cx| state.close_surface(&close_id, cx));
+                })
+                .child(
+                    surface_icon(surface)
+                        .svg()
+                        .absolute()
+                        .top(px(2.))
+                        .left(px(2.))
+                        .size(px(12.))
+                        .text_color(icon_color)
+                        .group_hover(group.clone(), |style| style.invisible()),
+                )
+                .child(
+                    Icon::X
+                        .svg()
+                        .absolute()
+                        .top(px(2.))
+                        .left(px(2.))
+                        .size(px(12.))
+                        .text_color(hsla(p.foreground))
+                        .invisible()
+                        .group_hover(group, |style| style.visible()),
+                ),
+        )
+        .child(div().min_w_0().truncate().child(title))
+        .context_menu(move |menu, _, _| {
+            let item = |label: &'static str, disabled: bool, run: fn(&mut AppState, &str, &mut gpui::Context<AppState>)| {
+                let state = state.clone();
+                let id = id.clone();
+                PopupMenuItem::new(label)
+                    .disabled(disabled)
+                    .on_click(move |_, _, cx| state.update(cx, |state, cx| run(state, &id, cx)))
+            };
+            menu.item(item("Close", false, |state, id, cx| state.close_surface(id, cx)))
+                .item(item("Close others", count <= 1, |state, id, cx| state.close_other_surfaces(id, cx)))
+                .item(item("Close to the right", index + 1 >= count, |state, id, cx| state.close_surfaces_to_right(id, cx)))
+                .item(item("Close all", false, |state, _, cx| state.close_all_surfaces(cx)))
+        })
+}
+
+/// `RightPanelEmptyState`: shown while the panel has no tab.
+pub fn empty_state(state: Entity<AppState>, cx: &App) -> impl IntoElement {
+    let p = palette(cx);
+    let rows = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
+        let state = state.clone();
+        let open = action.open;
+        h_flex()
+            .id(("surface-launcher", index))
+            .h(px(32.))
+            .w_full()
+            .px(px(10.))
+            .gap(px(10.))
+            .rounded(px(8.))
+            .text_sm()
+            .text_color(hsla(p.foreground))
+            .cursor_pointer()
+            .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
+            .on_click(move |_, _, cx| state.update(cx, open))
+            .child(action.icon.svg().size(px(16.)).text_color(hsla(p.foreground)))
+            .child(div().flex_1().min_w_0().truncate().child(action.label))
+            .child(kbd(action.shortcut, cx))
+    });
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(24.))
+        .pb(px(TITLEBAR_HEIGHT))
+        .child(
+            v_flex()
+                .w_full()
+                .max_w(px(320.))
+                .py(px(24.))
+                .child(
+                    div()
+                        .mb(px(12.))
+                        .text_center()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.foreground))
+                        .child("Open a surface"),
+                )
+                .child(v_flex().gap(px(2.)).children(rows)),
+        )
+}
+
+/// `components/ui/kbd.tsx`.
+fn kbd(text: &'static str, cx: &App) -> impl IntoElement {
+    let p = palette(cx);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(20.))
+        .min_w(px(20.))
+        .px(px(4.))
+        .rounded(px(4.))
+        .bg(hsla(p.foreground).opacity(0.07))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(hsla(p.muted_foreground))
+        .child(text)
+}
