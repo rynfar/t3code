@@ -8,7 +8,7 @@ mod tokens;
 
 use std::rc::Rc;
 
-use gpui::{App, Global, Hsla, Window, WindowAppearance, px};
+use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
 use serde_json::json;
 use t3_core::client_settings::{AppearanceMode, ChatWidth, ThemePreference};
@@ -79,11 +79,18 @@ pub fn set_preferences(preferences: Preferences, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// The transcript and composer lane: 736 comfortable, 1152 wide, `None` for full width.
-pub fn chat_max_width(cx: &App) -> Option<f32> {
+/// A `// rem` metric (web px at the 16px root) as rems, so it follows the interface font size
+/// the way the root element's rem size does (design system §10.5).
+pub fn rem(px: f32) -> Rems {
+    rems(px / metrics::ROOT_FONT_SIZE)
+}
+
+/// The transcript and composer lane: 46rem comfortable, 72rem wide, `None` for full width
+/// (`index.css` `--chat-content-max-width`).
+pub fn chat_max_width(cx: &App) -> Option<Rems> {
     match preferences(cx).chat_width {
-        ChatWidth::Comfortable => Some(metrics::CHAT_CONTENT_MAX_WIDTH),
-        ChatWidth::Wide => Some(metrics::CHAT_CONTENT_MAX_WIDTH_WIDE),
+        ChatWidth::Comfortable => Some(rem(metrics::CHAT_CONTENT_MAX_WIDTH)),
+        ChatWidth::Wide => Some(rem(metrics::CHAT_CONTENT_MAX_WIDTH_WIDE)),
         ChatWidth::Full => None,
     }
 }
