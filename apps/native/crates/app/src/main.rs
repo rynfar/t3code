@@ -11,6 +11,7 @@ mod menus;
 mod new_thread;
 mod omitted_rows;
 mod palette;
+mod provider_icon;
 mod right_panel;
 mod sidebar;
 mod snooze_dialog;
