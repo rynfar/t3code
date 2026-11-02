@@ -159,6 +159,29 @@ fn hex(color: u32) -> String {
     format!("#{color:08x}")
 }
 
+/// The web's syntax palette (`SYNTAX_*` from `@pierre/highlights`) over the code surface, as
+/// gpui-component's Zed-format highlight theme.
+fn highlight(p: &Palette, dark: bool) -> serde_json::Value {
+    let styles = if dark { tokens::SYNTAX_DARK } else { tokens::SYNTAX_LIGHT };
+    let syntax: serde_json::Map<String, serde_json::Value> = styles
+        .iter()
+        .map(|style| {
+            let mut value = serde_json::Map::new();
+            if let Some(color) = style.color {
+                value.insert("color".to_owned(), hex(color).into());
+            }
+            if style.italic {
+                value.insert("font_style".to_owned(), "italic".into());
+            }
+            if style.bold {
+                value.insert("font_weight".to_owned(), 700.into());
+            }
+            (style.capture.to_owned(), serde_json::Value::Object(value))
+        })
+        .collect();
+    json!({ "editor.background": hex(p.code_background), "editor.foreground": hex(p.code_foreground), "syntax": syntax })
+}
+
 fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str) -> ThemeConfig {
     let colors: serde_json::Map<String, serde_json::Value> = [
         ("background", hex(p.background)),
@@ -223,6 +246,7 @@ fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str) -> Th
         "radius": metrics::CONTROL_RADIUS as usize,
         "radius.lg": metrics::RADIUS_XL as usize,
         "colors": colors,
+        "highlight": highlight(p, dark),
     });
     serde_json::from_value(value).unwrap_or_else(|error| {
         tracing::warn!(%error, "invalid theme config");
