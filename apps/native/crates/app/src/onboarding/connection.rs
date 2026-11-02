@@ -86,7 +86,7 @@ fn computers(listing: &Listing) -> Vec<Computer> {
                 id: format!("welcome-computer-{}", environment.id).into(),
                 label: environment.label.clone(),
                 status,
-                detail: environment.http_base.clone(),
+                detail: environment.address(),
                 note: unsupported.or_else(|| local_error.clone().filter(|_| local)),
                 checked: online.is_some(),
                 action: online.is_none().then(|| Pick::Saved(environment.id.clone())),
@@ -376,6 +376,7 @@ mod tests {
             access_token: token.map(str::to_owned),
             server_version: Some("0.1.6".into()),
             local: id == "mac",
+            ssh: None,
         }
     }
 

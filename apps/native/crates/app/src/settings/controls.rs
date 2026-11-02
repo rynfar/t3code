@@ -104,12 +104,20 @@ pub struct Button {
     label: Option<SharedString>,
     tooltip: Option<SharedString>,
     disabled: bool,
+    full_width: bool,
     on_click: Option<ClickHandler>,
 }
 
 impl Button {
     pub fn new(id: impl Into<ElementId>, variant: ButtonVariant, size: ButtonSize) -> Self {
-        Button { id: id.into(), variant, size, icon: None, trailing: None, label: None, tooltip: None, disabled: false, on_click: None }
+        Button { id: id.into(), variant, size, icon: None, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, on_click: None }
+    }
+
+    /// Spans the parent's width with its content centered (`w-full`), which a parent cannot set
+    /// on a component's own box.
+    pub fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
@@ -193,6 +201,7 @@ impl RenderOnce for Button {
             .flex_none()
             .h(r(height))
             .when(square, |this| this.w(r(height)).justify_center())
+            .when(self.full_width, |this| this.w_full().justify_center())
             .px(r(pad))
             .gap(r(match self.size {
                 ButtonSize::Compact | ButtonSize::Xs => 4.,

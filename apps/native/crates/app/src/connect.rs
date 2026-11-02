@@ -1,14 +1,20 @@
 //! The connect screen: connect to T3 Code on this Mac in one click, pick a saved environment, or
-//! add one with a pairing link. Over a live connection it is the environment switcher.
+//! add one with a pairing link or over SSH. Over a live connection it is the environment switcher.
 //! Web: `settings/SavedEnvironmentRows.tsx` (rows and their status copy),
-//! `settings/AddEnvironmentDialog.tsx` (paste a pairing URL), `ConnectionStatusDot.tsx`.
+//! `settings/AddEnvironmentDialog.tsx` (the Remote link and SSH modes), `ConnectionStatusDot.tsx`.
+//! The SSH host suggestions list inline under the field rather than in a popup.
 
-use gpui::{App, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::*, px,
+    uniform_list,
+};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use t3_client::local::LocalServer;
+use t3_client::ssh::{DiscoveredSshHost, SshTarget};
 use t3_client::status::DotTone;
 use t3_client::store::SavedEnvironment;
+use t3_core::ssh::{filter_hosts, format_target, parse_manual_target};
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::environments::{ConnectScreen, PairingSource};
@@ -16,13 +22,32 @@ use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
 
+/// How "Add environment" pairs (`savedBackendMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddMode {
+    Link,
+    Ssh,
+}
+
+/// `max-h-72` of the host list, in rows of `h-8`.
+const HOST_ROW_HEIGHT: f32 = 32.;
+const HOST_LIST_MAX_HEIGHT: f32 = 288.;
+
 pub struct ConnectView {
     state: Entity<AppState>,
     link: Entity<InputState>,
+    mode: AddMode,
+    ssh_host: Entity<InputState>,
+    ssh_username: Entity<InputState>,
+    ssh_port: Entity<InputState>,
+    /// The unsaved discovered hosts that match the host field, as last rendered.
+    ssh_matches: Vec<DiscoveredSshHost>,
     /// The saved environment whose Remove awaits confirmation.
     confirm_remove: Option<String>,
     /// A pasted link is pairing; the field clears once it succeeds.
     submitted: bool,
+    /// An SSH host is being added; the fields clear once it succeeds.
+    ssh_submitted: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -68,6 +93,26 @@ pub(crate) fn local_details(server: &LocalServer) -> (String, Option<String>) {
     (details.join(" · "), server.mismatch().map(|mismatch| mismatch.message(server.label())))
 }
 
+/// `Alert variant="error"`: radius 12, `error` border at 32%, `error_surface`.
+fn error_alert(text: impl Into<SharedString>, cx: &App) -> Div {
+    let p = palette(cx);
+    div()
+        .px(px(14.))
+        .py(px(12.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(hsla(p.error).opacity(0.32))
+        .bg(hsla(p.error_surface))
+        .text_sm()
+        .text_color(hsla(p.error_foreground))
+        .child(text.into())
+}
+
+/// A field label: `text-xs font-medium text-foreground`, 6px above the control.
+fn field(label: &'static str, control: impl IntoElement, cx: &App) -> Div {
+    v_flex().gap(px(6.)).child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(palette(cx).foreground)).child(label)).child(control)
+}
+
 /// `SettingsGroup`: radius 12, `border` at 60%, `card` at 40%.
 fn card(cx: &App) -> Div {
     let p = palette(cx);
@@ -77,7 +122,10 @@ fn card(cx: &App) -> Div {
 impl ConnectView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let link = cx.new(|cx| InputState::new(window, cx).placeholder("https://your-server:3773/pair#token=…"));
-        let subscriptions = vec![
+        let ssh_host = cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or type devbox"));
+        let ssh_username = cx.new(|cx| InputState::new(window, cx).placeholder("root"));
+        let ssh_port = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
+        let mut subscriptions = vec![
             cx.subscribe_in(&link, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     this.add(cx);
@@ -97,16 +145,75 @@ impl ConnectView {
                         this.link.update(cx, |input, cx| input.set_value("", window, cx));
                     }
                 }
+                if this.ssh_submitted && !pairing {
+                    this.ssh_submitted = false;
+                    if !failed {
+                        for input in [&this.ssh_host, &this.ssh_username, &this.ssh_port] {
+                            input.update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                    }
+                }
                 cx.notify();
             }),
         ];
-        ConnectView { state, link, confirm_remove: None, submitted: false, _subscriptions: subscriptions }
+        // Typing filters the hosts; Enter adds the typed host (`handleSavedBackendSshFieldKeyDown`).
+        for input in [&ssh_host, &ssh_username, &ssh_port] {
+            subscriptions.push(cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } if !this.ssh_host.read(cx).value().trim().is_empty() => this.add_ssh(cx),
+                _ => {}
+            }));
+        }
+        ConnectView {
+            state,
+            link,
+            mode: AddMode::Link,
+            ssh_host,
+            ssh_username,
+            ssh_port,
+            ssh_matches: Vec::new(),
+            confirm_remove: None,
+            submitted: false,
+            ssh_submitted: false,
+            _subscriptions: subscriptions,
+        }
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
         let link = self.link.read(cx).value().to_string();
         self.state.update(cx, |state, cx| state.pair_link(&link, cx));
         self.submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Link);
+    }
+
+    /// The SSH fields as a target (`parseManualDesktopSshTarget`), added over SSH.
+    fn add_ssh(&mut self, cx: &mut Context<Self>) {
+        let value = |input: &Entity<InputState>, cx: &App| input.read(cx).value().to_string();
+        let parsed = parse_manual_target(&value(&self.ssh_host, cx), &value(&self.ssh_username, cx), &value(&self.ssh_port, cx));
+        self.state.update(cx, |state, cx| match parsed {
+            Ok(target) => state.add_ssh(target, cx),
+            Err(message) => state.fail_pairing(PairingSource::Ssh, message, cx),
+        });
+        self.ssh_submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
+    }
+
+    /// A suggested host connects at once, as `ssh -G` resolves it.
+    fn add_ssh_host(&mut self, alias: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).connect.pairing.is_some() {
+            return;
+        }
+        self.ssh_host.update(cx, |input, cx| input.set_value(alias.clone(), window, cx));
+        let target = SshTarget { alias: alias.clone(), hostname: alias, username: None, port: None };
+        self.state.update(cx, |state, cx| state.add_ssh(target, cx));
+        self.ssh_submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
+    }
+
+    fn set_mode(&mut self, mode: AddMode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        // The SSH config is read again each time the SSH form shows.
+        if mode == AddMode::Ssh {
+            self.state.update(cx, |state, cx| state.refresh_ssh_hosts(cx));
+        }
+        cx.notify();
     }
 
     fn render_header(&self, switching: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -134,7 +241,7 @@ impl ConnectView {
     fn render_rejected(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let state = self.state.read(cx);
         let rejected = state.connect.rejected.clone()?;
-        let can_pair_locally = rejected.local && state.local_saved_environment().is_some_and(|local| local.id == rejected.id);
+        let can_pair_again = rejected.ssh || (rejected.local && state.local_saved_environment().is_some_and(|local| local.id == rejected.id));
         let busy = state.connect.pairing.is_some();
         let p = palette(cx);
         Some(
@@ -149,17 +256,20 @@ impl ConnectView {
                 .text_sm()
                 .text_color(hsla(p.error_foreground))
                 .child(div().font_weight(FontWeight::MEDIUM).child(format!("T3 Code on {} did not accept this device", rejected.label)))
-                .child(div().opacity(0.8).child(if can_pair_locally {
+                .child(div().opacity(0.8).child(if can_pair_again {
                     format!("{} Pair again to reconnect.", rejected.reason)
                 } else {
                     format!("{} Paste a new pairing link from {} below to reconnect.", rejected.reason, rejected.label)
                 }))
-                .when(can_pair_locally, |this| {
+                .when(can_pair_again, |this| {
+                    let (id, ssh) = (rejected.id.clone(), rejected.ssh);
                     this.child(div().pt(px(2.)).child(
                         Button::new("connect-repair", ButtonVariant::Default, ButtonSize::Sm)
                             .label(if busy { "Pairing…" } else { "Pair again" })
                             .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.pair_local(cx)))),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.update(cx, |state, cx| if ssh { state.pair_ssh_again(&id, cx) } else { state.pair_local(cx) })
+                            })),
                     ))
                 }),
         )
@@ -284,7 +394,7 @@ impl ConnectView {
                             .text_xs()
                             .line_height(px(18.))
                             .text_color(if error_tone { hsla(p.destructive_foreground) } else { hsla(p.muted_foreground) })
-                            .child(format!("{} · {status}", environment.http_base)),
+                            .child(format!("{} · {status}", environment.address())),
                     ),
             )
             .child(actions)
@@ -304,14 +414,59 @@ impl ConnectView {
         Some(v_flex().gap(px(8.)).child(label("Saved environments", cx)).child(card(cx).children(rows)))
     }
 
-    fn render_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `renderConnectionModeCard`.
+    fn mode_card(&self, mode: AddMode, title: &'static str, description: &'static str, glyph: Icon, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let selected = self.mode == mode;
+        let disabled = self.state.read(cx).connect.pairing.is_some();
+        h_flex()
+            .id(match mode {
+                AddMode::Link => "connect-mode-link",
+                AddMode::Ssh => "connect-mode-ssh",
+            })
+            .flex_1()
+            .min_w_0()
+            .min_h(px(96.))
+            .items_start()
+            .gap(px(12.))
+            .p(px(16.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(if selected { hsla(p.primary).opacity(0.5) } else { hsla(p.border).opacity(0.6) })
+            .when(selected, |this| this.bg(hsla(p.primary).opacity(0.05)))
+            .when(!selected && !disabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.muted).opacity(0.4))))
+            .when(disabled, |this| this.opacity(0.64))
+            .child(
+                div()
+                    .mt(px(2.))
+                    .size(px(32.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if selected { hsla(p.primary).opacity(0.3) } else { hsla(p.border).opacity(0.7) })
+                    .bg(if selected { hsla(p.primary).opacity(0.1) } else { hsla(p.background) })
+                    .child(glyph.render(px(16.), if selected { hsla(p.primary) } else { hsla(p.muted_foreground) })),
+            )
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title))
+                    .child(div().text_xs().line_height(px(19.5)).text_color(hsla(p.muted_foreground)).child(description)),
+            )
+            .when(!disabled, |this| this.on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx))))
+    }
+
+    fn render_link_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let busy = state.connect.pairing == Some(PairingSource::Link);
         let primary = state.connect.local_server.is_none() && state.environments.environments.is_empty();
         let error = pairing_error(&state.connect, PairingSource::Link);
         v_flex()
             .gap(px(8.))
-            .child(label("Add environment", cx))
             .child(muted(
                 "On the machine running T3 Code, open Settings → Sharing & access and create a pairing link, or run `t3 pair` there. Paste the full pairing URL here.",
                 cx,
@@ -328,6 +483,116 @@ impl ConnectView {
                     ),
             )
             .children(error.map(|error| error_text(error, cx)))
+    }
+
+    fn render_host_row(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(host) = self.ssh_matches.get(index) else { return div().h(px(HOST_ROW_HEIGHT)).into_any_element() };
+        let p = palette(cx);
+        let busy = self.state.read(cx).connect.pairing.is_some();
+        let address = format_target(&host.target());
+        let alias = host.alias.clone();
+        h_flex()
+            .id(SharedString::from(format!("ssh-host-{index}")))
+            .w_full()
+            .h(px(HOST_ROW_HEIGHT))
+            .px(px(8.))
+            .gap(px(8.))
+            .rounded(px(4.))
+            .whitespace_nowrap()
+            .when(!busy, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.accent))))
+            .child(div().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(host.alias.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(hsla(p.muted_foreground))
+                    .when(address != host.alias, |this| this.child(address)),
+            )
+            .when(!busy, |this| this.on_click(cx.listener(move |this, _, window, cx| this.add_ssh_host(alias.clone(), window, cx))))
+            .into_any_element()
+    }
+
+    /// The discovered hosts that match the field, or why there are none to show.
+    fn render_host_list(&mut self, busy: bool, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let p = palette(cx);
+        let query = self.ssh_host.read(cx).value().to_string();
+        let state = self.state.read(cx);
+        let loading = state.connect.ssh_discovering && state.connect.ssh_hosts.is_none();
+        let unsaved = state.unsaved_ssh_hosts();
+        self.ssh_matches = filter_hosts(&unsaved, &query).into_iter().cloned().collect();
+        let empty = |text: String| div().px(px(12.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child(text);
+        let body = if loading {
+            empty("Loading hosts…".to_owned()).into_any_element()
+        } else if unsaved.is_empty() {
+            return None;
+        } else if self.ssh_matches.is_empty() {
+            empty(format!("No hosts match \"{}\".", query.trim())).into_any_element()
+        } else {
+            let count = self.ssh_matches.len();
+            uniform_list("ssh-hosts", count, cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.render_host_row(index, cx)).collect::<Vec<_>>()))
+                .h(px((count as f32 * HOST_ROW_HEIGHT).min(HOST_LIST_MAX_HEIGHT)))
+                .into_any_element()
+        };
+        Some(
+            div()
+                .p(px(4.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(hsla(p.border).opacity(0.6))
+                .bg(hsla(p.card).opacity(0.4))
+                .when(busy, |this| this.opacity(0.64))
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    fn render_ssh_fields(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (busy, error) = {
+            let connect = &self.state.read(cx).connect;
+            (connect.pairing.is_some(), pairing_error(connect, PairingSource::Ssh))
+        };
+        let adding = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
+        let hosts = self.render_host_list(busy, cx);
+        v_flex()
+            .gap(px(12.))
+            .child(field("SSH host or alias", Input::new(&self.ssh_host).disabled(busy), cx))
+            .children(hosts)
+            .child(
+                h_flex()
+                    .gap(px(12.))
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(field("Username", Input::new(&self.ssh_username).disabled(busy), cx)))
+                    .child(div().w(px(112.)).flex_none().child(field("Port", Input::new(&self.ssh_port).disabled(busy), cx))),
+            )
+            .children(error.map(|error| error_alert(error, cx)))
+            .child(
+                Button::new("connect-add-ssh", ButtonVariant::Outline, ButtonSize::Default)
+                    .icon(Icon::Plus)
+                    .label(if adding { "Adding…" } else { "Add environment" })
+                    .disabled(busy)
+                    .full_width()
+                    .on_click(cx.listener(|this, _, _, cx| this.add_ssh(cx))),
+            )
+    }
+
+    fn render_add(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.mode {
+            AddMode::Link => self.render_link_fields(cx).into_any_element(),
+            AddMode::Ssh => self.render_ssh_fields(cx).into_any_element(),
+        };
+        v_flex()
+            .gap(px(12.))
+            .child(label("Add environment", cx))
+            .child(
+                h_flex()
+                    .gap(px(12.))
+                    .items_stretch()
+                    .child(self.mode_card(AddMode::Link, "Remote link", "Paste a pairing link from the backend.", Icon::ChevronsLeftRightEllipsis, cx))
+                    .child(self.mode_card(AddMode::Ssh, "SSH", "Use local SSH config, agent, and tunnels for the backend.", Icon::Terminal, cx)),
+            )
+            .child(body)
     }
 }
 

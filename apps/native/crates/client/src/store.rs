@@ -56,9 +56,22 @@ pub struct SavedEnvironment {
     /// Paired with this Mac's own T3 Code through `t3 pair`, which can pair it again.
     #[serde(default)]
     pub local: bool,
+    /// Reached over an SSH tunnel the app manages (`SshConnectionProfile`). `http_base` is then
+    /// the tunnel's local address for the current session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<t3_core::ssh::SshTarget>,
 }
 
 impl SavedEnvironment {
+    /// How the environment is reached, as its row shows it: `SSH user@host` over SSH, else its
+    /// address (`environmentTransportLabel`).
+    pub fn address(&self) -> String {
+        match &self.ssh {
+            Some(target) => format!("SSH {}", t3_core::ssh::format_target(target)),
+            None => self.http_base.clone(),
+        }
+    }
+
     pub fn credentials(&self) -> Option<Credentials> {
         let access_token = self.access_token.clone()?;
         Some(Credentials { http_base: self.http_base.clone(), access_token })
@@ -95,6 +108,7 @@ impl SavedEnvironments {
             access_token: Some(credentials.access_token),
             server_version: None,
             local: false,
+            ssh: None,
         };
         SavedEnvironments { active: Some(id), environments: vec![environment] }
     }
@@ -115,8 +129,18 @@ impl SavedEnvironments {
     }
 
     /// Saves a pairing and makes it active. Pairing a saved server again refreshes its entry
-    /// instead of adding a second one. Returns the entry's id.
+    /// instead of adding a second one, reached the way it was just paired: over `ssh` when that
+    /// is set, else directly. Returns the entry's id.
     pub fn upsert(&mut self, paired: &Paired, local: bool) -> String {
+        self.upsert_route(paired, local, None)
+    }
+
+    /// `upsert` for a pairing made over SSH.
+    pub fn upsert_ssh(&mut self, paired: &Paired, target: t3_core::ssh::SshTarget) -> String {
+        self.upsert_route(paired, false, Some(target))
+    }
+
+    fn upsert_route(&mut self, paired: &Paired, local: bool, ssh: Option<t3_core::ssh::SshTarget>) -> String {
         let descriptor = paired.descriptor.as_ref();
         let environment_id = descriptor.map(|d| d.environment_id.clone()).filter(|id| !id.is_empty());
         let http_base = &paired.credentials.http_base;
@@ -138,7 +162,8 @@ impl SavedEnvironments {
                 .map(|d| d.server_version.clone())
                 .filter(|version| !version.is_empty())
                 .or_else(|| previous.as_ref().and_then(|environment| environment.server_version.clone())),
-            local: local || previous.is_some_and(|environment| environment.local),
+            local: ssh.is_none() && (local || previous.is_some_and(|environment| environment.local)),
+            ssh,
         };
         match self.environments.iter_mut().find(|entry| entry.id == id) {
             Some(entry) => *entry = environment,
@@ -164,7 +189,7 @@ impl SavedEnvironments {
     pub fn changes_since(&self, before: &SavedEnvironments) -> Vec<EnvironmentChange> {
         let mut changes: Vec<EnvironmentChange> =
             before.environments.iter().filter(|old| self.get(&old.id).is_none()).map(|old| EnvironmentChange::Remove(old.id.clone())).collect();
-        changes.extend(self.environments.iter().filter(|environment| before.get(&environment.id) != Some(*environment)).cloned().map(EnvironmentChange::Put));
+        changes.extend(self.environments.iter().filter(|environment| before.get(&environment.id) != Some(*environment)).cloned().map(|environment| EnvironmentChange::Put(Box::new(environment))));
         if self.active != before.active {
             changes.push(EnvironmentChange::SetActive(self.active.clone()));
         }
@@ -176,6 +201,7 @@ impl SavedEnvironments {
     pub fn apply(&mut self, change: EnvironmentChange) {
         match change {
             EnvironmentChange::Put(environment) => {
+                let environment = *environment;
                 let slot = self.environments.iter().position(|entry| entry.id == environment.id).or_else(|| {
                     let wanted = environment.environment_id.as_deref()?;
                     self.environments.iter().position(|entry| entry.environment_id.as_deref() == Some(wanted))
@@ -236,7 +262,7 @@ impl SavedEnvironments {
 /// writes, so a second app instance's entries survive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentChange {
-    Put(SavedEnvironment),
+    Put(Box<SavedEnvironment>),
     Remove(String),
     SetActive(Option<String>),
 }
@@ -618,6 +644,25 @@ mod tests {
         assert_eq!((file.environments.len(), file.active.as_deref()), (2, Some(mine_id.as_str())));
         assert_eq!(file.active().and_then(|e| e.access_token.as_deref()), Some("t3"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_server_paired_over_ssh_keeps_its_target_until_paired_another_way() {
+        let target = t3_core::ssh::SshTarget { alias: "devbox".into(), hostname: "devbox.example.com".into(), username: Some("julius".into()), port: None };
+        let mut saved = SavedEnvironments::default();
+        let devbox = saved.upsert_ssh(&paired("http://127.0.0.1:52001", "t", "env-devbox", "devbox"), target.clone());
+        let text = serde_json::to_string(&saved).unwrap_or_default();
+        assert!(text.contains(r#""ssh":{"alias":"devbox","hostname":"devbox.example.com","username":"julius","port":null}"#), "{text}");
+        assert_eq!(decode_environments(Some(&text), None), saved);
+        // The next session's tunnel listens elsewhere: the same entry, still over SSH.
+        let again = saved.upsert_ssh(&paired("http://127.0.0.1:52002", "t2", "env-devbox", "devbox"), target.clone());
+        assert_eq!((again.as_str(), saved.environments.len()), (devbox.as_str(), 1));
+        assert_eq!(saved.get(&devbox).and_then(|e| e.ssh.clone()), Some(target));
+        // A pairing link for the same machine reaches it directly from now on.
+        saved.upsert(&paired("https://devbox.ts.net", "t3", "env-devbox", "devbox"), false);
+        assert_eq!(saved.get(&devbox).map(|e| (e.ssh.is_none(), e.http_base.as_str())), Some((true, "https://devbox.ts.net")));
+        // Entries saved before SSH existed read as direct.
+        assert_eq!(decode_environments(Some(r#"{"environments":[{"id":"a","label":"A","httpBase":"http://h"}]}"#), None).environments[0].ssh, None);
     }
 
     #[test]

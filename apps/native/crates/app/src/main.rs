@@ -35,6 +35,7 @@ mod snapshot;
 mod sidebar;
 mod lineage;
 mod snooze_dialog;
+mod ssh_prompt;
 mod terminal;
 mod theme;
 mod thread_details;

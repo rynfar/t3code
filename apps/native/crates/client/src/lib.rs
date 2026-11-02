@@ -9,6 +9,7 @@ pub mod local;
 pub mod preview_stream;
 pub mod pull_requests;
 pub mod session;
+pub mod ssh;
 pub mod status;
 pub mod store;
 pub mod supervisor;

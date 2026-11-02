@@ -1,15 +1,23 @@
-//! Saved environments and how the app reaches one: pairing with a link or with T3 Code on this
-//! Mac, switching, disconnecting, removing, retrying, and the re-pair prompt after a server
-//! rejects this device. One environment is connected at a time; the saved list holds the rest.
-//! The pairing and discovery work runs on the network runtime (`t3_client::local`, `auth`).
+//! Saved environments and how the app reaches one: pairing with a link, with T3 Code on this
+//! Mac, or over SSH, switching, disconnecting, removing, retrying, and the re-pair prompt after a
+//! server rejects this device. One environment is connected at a time; the saved list holds the
+//! rest. The pairing, discovery and SSH work runs on the network runtime (`t3_client::local`,
+//! `auth`, `ssh`). SSH follows the desktop's registry (`client-runtime/src/connection/registry.ts`):
+//! removing or disconnecting an SSH environment closes its tunnel and stops the remote server
+//! this app started; the SSH password prompts queue here for `ssh_prompt.rs`.
+
+use std::sync::Arc;
 
 use gpui::Context;
-use t3_client::auth::{self, Paired};
+use t3_client::auth::{self, Credentials, Paired};
 use t3_client::local::{self, LocalServer};
+use t3_client::ssh::{DiscoveredSshHost, PasswordRequest, SshPairing, SshTarget};
 use t3_client::store::{self, SavedEnvironment};
+use t3_client::supervisor::Prepare;
 use t3_core::pairing::parse_pairing_link;
 
 use crate::app_state::{AppEvent, AppState, Phase};
+use crate::toast::{Toast, ToastKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingSource {
@@ -17,6 +25,8 @@ pub enum PairingSource {
     Local,
     /// A pasted pairing link.
     Link,
+    /// An SSH host: the app starts T3 Code there and pairs over SSH.
+    Ssh,
 }
 
 /// A saved environment whose server stopped accepting this device.
@@ -26,6 +36,8 @@ pub struct Rejected {
     pub label: String,
     pub reason: String,
     pub local: bool,
+    /// Reached over SSH, which can pair it again.
+    pub ssh: bool,
 }
 
 /// What the connect screen shows besides the saved list.
@@ -38,6 +50,9 @@ pub struct ConnectScreen {
     pub rejected: Option<Rejected>,
     pub local_server: Option<LocalServer>,
     pub discovering: bool,
+    /// Hosts from `~/.ssh/config` and `known_hosts`; `None` until first read.
+    pub ssh_hosts: Option<Vec<DiscoveredSshHost>>,
+    pub ssh_discovering: bool,
     /// Counts pairings started or cancelled; a result for an earlier one is dropped.
     attempt: u64,
     /// The pairing running on the network runtime. Aborting it stops `t3 pair`.
@@ -87,7 +102,7 @@ impl AppState {
             Err(error) => return self.fail_pairing(PairingSource::Link, error.to_string(), cx),
         };
         let task = self.runtime().spawn(async move { auth::pair_with_link(&link).await.map_err(|error| error.to_string()) });
-        self.await_pairing(PairingSource::Link, task, cx);
+        self.await_pairing(PairingSource::Link, task, |state, paired, cx| state.adopt(paired, false, cx), cx);
     }
 
     /// "Connect to T3 Code on this Mac": reuses a saved credential for it, else pairs.
@@ -107,10 +122,66 @@ impl AppState {
             return self.fail_pairing(PairingSource::Local, local::LocalPairError::NotRunning.to_string(), cx);
         };
         let task = self.runtime().spawn(async move { local::pair(&server).await.map_err(|error| error.to_string()) });
-        self.await_pairing(PairingSource::Local, task, cx);
+        self.await_pairing(PairingSource::Local, task, |state, paired, cx| state.adopt(paired, true, cx), cx);
     }
 
-    fn await_pairing(&mut self, source: PairingSource, task: tokio::task::JoinHandle<Result<Paired, String>>, cx: &mut Context<Self>) {
+    /// Reads the SSH config and known hosts again, off the UI thread, each time the SSH form
+    /// shows. The last list stays while it refreshes.
+    pub fn refresh_ssh_hosts(&mut self, cx: &mut Context<Self>) {
+        if self.connect.ssh_discovering {
+            return;
+        }
+        self.connect.ssh_discovering = true;
+        cx.emit(AppEvent::Phase);
+        let task = self.runtime().spawn_blocking(t3_client::ssh::discover_hosts);
+        cx.spawn(async move |this, cx| {
+            let hosts = task.await.unwrap_or_default();
+            let _ = this.update(cx, |state, cx| {
+                state.connect.ssh_discovering = false;
+                state.connect.ssh_hosts = Some(hosts);
+                cx.emit(AppEvent::Phase);
+            });
+        })
+        .detach();
+    }
+
+    /// The discovered hosts no saved SSH environment reaches yet.
+    pub fn unsaved_ssh_hosts(&self) -> Vec<DiscoveredSshHost> {
+        let saved: Vec<SshTarget> = self.environments.environments.iter().filter_map(|environment| environment.ssh.clone()).collect();
+        t3_core::ssh::unsaved_hosts(self.connect.ssh_hosts.as_deref().unwrap_or_default(), &saved)
+    }
+
+    /// "Add environment" over SSH: starts T3 Code on the host, pairs over SSH, saves the
+    /// environment, and connects it.
+    pub fn add_ssh(&mut self, target: SshTarget, cx: &mut Context<Self>) {
+        if self.connect.pairing.is_some() {
+            return;
+        }
+        let ssh = self.ssh.clone();
+        let task = self.runtime().spawn(async move { ssh.provision(&target, None).await.map_err(|error| error.to_string()) });
+        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| state.adopt_ssh(pairing, cx), cx);
+    }
+
+    /// Pairs a saved SSH environment again over SSH, refusing a host that now reaches another
+    /// machine.
+    pub fn pair_ssh_again(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.connect.pairing.is_some() {
+            return;
+        }
+        let Some(environment) = self.environments.get(id).cloned() else { return };
+        let Some(target) = environment.ssh else { return };
+        let (ssh, expected) = (self.ssh.clone(), environment.environment_id);
+        let task = self.runtime().spawn(async move { ssh.provision(&target, expected.as_deref()).await.map_err(|error| error.to_string()) });
+        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| state.adopt_ssh(pairing, cx), cx);
+    }
+
+    fn await_pairing<T: Send + 'static>(
+        &mut self,
+        source: PairingSource,
+        task: tokio::task::JoinHandle<Result<T, String>>,
+        adopt: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         self.connect.attempt += 1;
         let attempt = self.connect.attempt;
         self.connect.pairing = Some(source);
@@ -129,8 +200,8 @@ impl AppState {
                 state.connect.pairing_task = None;
                 match result {
                     Ok(paired) => {
-                        tracing::info!(origin = %paired.credentials.http_base, ?source, "paired");
-                        state.adopt(paired, source == PairingSource::Local, cx);
+                        tracing::info!(?source, "paired");
+                        adopt(state, paired, cx);
                     }
                     Err(message) => {
                         tracing::warn!(%message, ?source, "pairing failed");
@@ -142,7 +213,7 @@ impl AppState {
         .detach();
     }
 
-    fn fail_pairing(&mut self, source: PairingSource, message: String, cx: &mut Context<Self>) {
+    pub(crate) fn fail_pairing(&mut self, source: PairingSource, message: String, cx: &mut Context<Self>) {
         self.connect.error = Some((source, message));
         cx.emit(AppEvent::Phase);
     }
@@ -156,20 +227,56 @@ impl AppState {
         self.connect.pairing = None;
     }
 
-    /// The connect screen as a new connection leaves it, still knowing the local server.
+    /// The connect screen as a new connection leaves it, still knowing the local server and the
+    /// SSH hosts.
     fn reset_connect_screen(&mut self) {
         self.cancel_pairing();
-        let (local_server, attempt) = (self.connect.local_server.take(), self.connect.attempt);
-        self.connect = ConnectScreen { local_server, attempt, ..Default::default() };
+        let (local_server, ssh_hosts, attempt) = (self.connect.local_server.take(), self.connect.ssh_hosts.take(), self.connect.attempt);
+        self.connect = ConnectScreen { local_server, ssh_hosts, attempt, ..Default::default() };
     }
 
     /// Saves a new pairing and connects to it.
     fn adopt(&mut self, paired: Paired, local: bool, cx: &mut Context<Self>) {
-        self.environments.upsert(&paired, local);
+        let id = self.environments.upsert(&paired, local);
         self.persist_environments();
         self.reset_connect_screen();
         self.reset_connection(cx);
-        self.start_client(paired.credentials, cx);
+        self.start_environment(&id, cx);
+    }
+
+    /// Saves a pairing made over SSH and connects to it through its tunnel.
+    fn adopt_ssh(&mut self, pairing: SshPairing, cx: &mut Context<Self>) {
+        let alias = pairing.target.alias.clone();
+        let id = self.environments.upsert_ssh(&pairing.paired, pairing.target);
+        self.persist_environments();
+        self.reset_connect_screen();
+        self.reset_connection(cx);
+        self.start_environment(&id, cx);
+        self.show_toast(Toast::new(ToastKind::Success, "Environment connected").description(format!("{alias} is ready over an SSH-managed tunnel.")), cx);
+    }
+
+    /// Starts the client for a saved environment with a credential. An SSH environment connects
+    /// through its tunnel on this session's port, which the supervisor readies before each attempt.
+    pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(environment) = self.environments.get(id).cloned() else { return };
+        let Some(access_token) = environment.access_token.clone() else { return };
+        let Some(target) = environment.ssh.clone() else {
+            return self.start_client(Credentials { http_base: environment.http_base, access_token }, None, cx);
+        };
+        let port = match self.ssh.session_port(&target) {
+            Ok(port) => port,
+            Err(error) => return self.fail_pairing(PairingSource::Ssh, format!("Could not reserve a local port for the SSH tunnel: {error}"), cx),
+        };
+        let http_base = format!("http://127.0.0.1:{port}");
+        if self.environments.relocate(id, &http_base) {
+            self.persist_environments();
+        }
+        let (ssh, expected) = (self.ssh.clone(), environment.environment_id);
+        let prepare: Prepare = Arc::new(move || {
+            let (ssh, target, expected) = (ssh.clone(), target.clone(), expected.clone());
+            Box::pin(async move { ssh.prepare(&target, expected.as_deref()).await })
+        });
+        self.start_client(Credentials { http_base, access_token }, Some(prepare), cx);
     }
 
     /// Connects a saved environment, or asks to pair it again when its credential was rejected.
@@ -180,18 +287,21 @@ impl AppState {
         if !moved && self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
             return self.close_switcher(cx);
         }
-        let Some(credentials) = environment.credentials() else {
+        if environment.access_token.is_none() {
             if environment.local && self.local_saved_environment().is_some_and(|local| local.id == environment.id) {
                 return self.pair_local(cx);
             }
+            if environment.ssh.is_some() {
+                return self.pair_ssh_again(&environment.id, cx);
+            }
             let message = format!("Paste a new pairing link from {} to connect it again.", environment.label);
             return self.fail_pairing(PairingSource::Link, message, cx);
-        };
-        self.environments.active = Some(environment.id);
+        }
+        self.environments.active = Some(environment.id.clone());
         self.persist_environments();
         self.reset_connect_screen();
         self.reset_connection(cx);
-        self.start_client(credentials, cx);
+        self.start_environment(&environment.id, cx);
     }
 
     /// Points a saved local pairing at the address the running server recorded, when discovery
@@ -210,6 +320,7 @@ impl AppState {
     /// Ends the connection and shows the connect screen. The environment stays saved, and the
     /// next launch waits here instead of reconnecting.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        let ssh = self.active_environment().and_then(|environment| environment.ssh.clone());
         self.cancel_pairing();
         self.environments.active = None;
         self.persist_environments();
@@ -217,11 +328,26 @@ impl AppState {
         self.connect.switching = false;
         self.set_phase(Phase::Unpaired, cx);
         self.refresh_local_server(cx);
+        if let Some(target) = ssh {
+            self.stop_ssh(target);
+        }
+    }
+
+    /// Closes an SSH environment's tunnel and stops the remote server this app started, in the
+    /// background. The supervisor that used it is already gone.
+    fn stop_ssh(&self, target: SshTarget) {
+        let ssh = self.ssh.clone();
+        self.runtime().spawn(async move {
+            if let Err(error) = ssh.disconnect(&target).await {
+                tracing::warn!(%error, alias = %target.alias, "could not disconnect the managed SSH environment");
+            }
+        });
     }
 
     /// "Remove from this device": forgets the environment and its credential.
     pub fn remove_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.environments.active.as_deref() == Some(id) && self.client_handle().is_some();
+        let ssh = self.environments.get(id).and_then(|environment| environment.ssh.clone());
         if !self.environments.remove(id) {
             return;
         }
@@ -231,6 +357,9 @@ impl AppState {
             self.reset_connection(cx);
             self.connect.switching = false;
             self.set_phase(Phase::Unpaired, cx);
+        }
+        if let Some(target) = ssh {
+            self.stop_ssh(target);
         }
         cx.emit(AppEvent::Phase);
     }
@@ -267,6 +396,7 @@ impl AppState {
             label: environment.label.clone(),
             reason,
             local: environment.local,
+            ssh: environment.ssh.is_some(),
         });
         if let Some(rejected) = &rejected {
             self.environments.revoke(&rejected.id);
@@ -286,6 +416,23 @@ impl AppState {
         if self.environments.update_identity(&id, &environment.environment_id, &environment.label, &environment.server_version) {
             self.persist_environments();
         }
+    }
+
+    /// Queues an SSH password prompt for the dialog.
+    pub(crate) fn queue_ssh_prompt(&mut self, request: PasswordRequest, cx: &mut Context<Self>) {
+        self.ssh_prompt_sequence += 1;
+        self.ssh_prompts.push_back((self.ssh_prompt_sequence, request));
+        cx.emit(AppEvent::SshPrompt);
+    }
+
+    /// Takes the shown SSH prompt to answer or dismiss it.
+    pub(crate) fn take_ssh_prompt(&mut self, sequence: u64, cx: &mut Context<Self>) -> Option<PasswordRequest> {
+        if self.ssh_prompts.front().is_none_or(|(front, _)| *front != sequence) {
+            return None;
+        }
+        let (_, request) = self.ssh_prompts.pop_front()?;
+        cx.emit(AppEvent::SshPrompt);
+        Some(request)
     }
 
     /// Hands the edits since the last save to the store's writer, off the UI thread. It applies

@@ -37,6 +37,7 @@ pub mod settings;
 pub mod shell;
 pub mod side_chat;
 pub mod sidebar;
+pub mod ssh;
 pub mod terminal;
 pub mod terminal_output;
 pub mod text_selection;

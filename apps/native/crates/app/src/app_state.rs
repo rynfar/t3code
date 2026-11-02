@@ -1,14 +1,16 @@
 //! App-wide state: the connection, the shell, and the open thread. Network events arrive on a
 //! channel from the client's runtime and are applied in batches, one notify per batch.
 
+use std::collections::VecDeque;
 use std::future::Future;
 
-use gpui::{Context, EventEmitter, Task};
+use gpui::{Context, EventEmitter, Subscription, Task};
 use serde_json::Value;
 use t3_client::auth::Credentials;
 use t3_client::session::RpcError;
+use t3_client::ssh::{PasswordRequest, SshEnvironments};
 use t3_client::store::{self, SavedEnvironments};
-use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
+use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus, Prepare};
 use t3_core::commands::{self, method};
 use t3_core::composer::ClientSettings;
 use t3_core::history::{HistoryStep, PageOutcome};
@@ -53,6 +55,8 @@ pub enum AppEvent {
     ComposerTerminalContext,
     /// A side subscription (side chat tab, child approval) changed, or an action on one did.
     SideThread,
+    /// An SSH password prompt arrived or was answered (`ssh_prompts`).
+    SshPrompt,
 }
 
 pub struct AppState {
@@ -92,7 +96,13 @@ pub struct AppState {
     /// Counts clients started, so state tied to one never outlives a switch to the next.
     connection: u64,
     runtime: tokio::runtime::Handle,
+    /// SSH environments' tunnels, owned for the life of the app.
+    pub(crate) ssh: SshEnvironments,
+    /// SSH password prompts waiting for an answer, oldest first, each with its sequence number.
+    pub ssh_prompts: VecDeque<(u64, PasswordRequest)>,
+    pub(crate) ssh_prompt_sequence: u64,
     _pump: Option<Task<()>>,
+    _ssh_quit: Option<Subscription>,
 }
 
 impl EventEmitter<AppEvent> for AppState {}
@@ -102,6 +112,15 @@ const MAX_BATCH: usize = 512;
 impl AppState {
     pub fn new(runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
         let environments = store::load_environments();
+        let (prompts, mut prompt_requests) = tokio::sync::mpsc::unbounded_channel();
+        cx.spawn(async move |this, cx| {
+            while let Some(request) = prompt_requests.recv().await {
+                if this.update(cx, |state, cx| state.queue_ssh_prompt(request, cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
         let mut state = AppState {
             phase: Phase::Unpaired,
             environments_saved: environments.clone(),
@@ -130,10 +149,23 @@ impl AppState {
             client: None,
             connection: 0,
             runtime,
+            ssh: SshEnvironments::new(Some(prompts)),
+            ssh_prompts: VecDeque::new(),
+            ssh_prompt_sequence: 0,
             _pump: None,
+            _ssh_quit: None,
         };
-        match state.environments.active().and_then(|environment| environment.credentials()) {
-            Some(credentials) => state.start_client(credentials, cx),
+        // Quitting stops the tunnels this app started, by the PIDs it spawned.
+        state._ssh_quit = Some(cx.on_app_quit(|state, _| {
+            let stopping = state.ssh.shutdown();
+            async move {
+                for tunnel in stopping {
+                    let _ = tunnel.await;
+                }
+            }
+        }));
+        match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
+            Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
         }
         state
@@ -172,8 +204,8 @@ impl AppState {
         cx.emit(AppEvent::Thread);
     }
 
-    pub(crate) fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
-        let (client, mut events) = t3_client::supervisor::start(&self.runtime, credentials);
+    pub(crate) fn start_client(&mut self, credentials: Credentials, prepare: Option<Prepare>, cx: &mut Context<Self>) {
+        let (client, mut events) = t3_client::supervisor::start_prepared(&self.runtime, credentials, prepare);
         self.client = Some(client);
         self.connection += 1;
         self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());

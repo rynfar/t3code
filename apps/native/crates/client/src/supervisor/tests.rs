@@ -257,3 +257,37 @@ async fn a_socket_refused_for_its_protocol_blocks_instead_of_retrying() {
     server.connection().await;
     assert_eq!(next_status(&mut events).await, ConnectionStatus::Connected);
 }
+
+#[tokio::test]
+async fn a_prepared_route_is_readied_before_every_attempt_and_a_blocked_one_waits_for_retry() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut server = FakeServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let outcomes = Arc::new(Mutex::new(vec![Err(PrepareError::Blocked("SSH authentication cancelled for devbox.".to_owned()))]));
+    let prepare: Prepare = {
+        let (calls, outcomes) = (calls.clone(), outcomes.clone());
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = outcomes.lock().expect("outcomes").pop().unwrap_or(Ok(()));
+            Box::pin(async move { outcome })
+        })
+    };
+    let (client, mut events) = start_prepared(&tokio::runtime::Handle::current(), server.credentials(), Some(prepare));
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connecting);
+    let blocked = ConnectionStatus::Blocked { reason: "SSH authentication cancelled for devbox.".to_owned() };
+    assert_eq!(next_status(&mut events).await, blocked);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Nothing retries on its own; Retry prepares again and connects.
+    client.retry_now();
+    assert!(matches!(next_status(&mut events).await, ConnectionStatus::Reconnecting { reason, attempt: 1 } if reason.contains("cancelled")));
+    let first = server.connection().await;
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connected);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // A dropped session prepares the route again before reconnecting.
+    drop(first);
+    server.connection().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
