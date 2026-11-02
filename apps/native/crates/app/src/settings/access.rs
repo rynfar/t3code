@@ -23,6 +23,7 @@ use t3_core::settings::access::{
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, group, muted_text, r, section, section_title};
 use super::providers::Stream;
 use super::source_control::{Tone, tone_badge};
+use super::worktrees::disclosure;
 use super::{Block, SettingsView, store};
 use crate::composer::controls::checkbox;
 use crate::icons::Icon;
@@ -52,6 +53,7 @@ pub(crate) struct AccessPageState {
     sharing: Option<String>,
     revoking: Option<String>,
     revoking_others: bool,
+    permissions_open: bool,
     /// Ticks once a second while a pairing link counts down.
     ticker: Option<Task<()>>,
 }
@@ -68,6 +70,7 @@ impl AccessPageState {
             sharing: None,
             revoking: None,
             revoking_others: false,
+            permissions_open: false,
             ticker: None,
         }
     }
@@ -115,8 +118,7 @@ fn qr_code(text: &str) -> Option<AnyElement> {
 impl SettingsView {
     fn session(&self, cx: &App) -> Option<AuthSessionState> {
         let handle = self.state.read(cx).client_handle()?;
-        let session = handle.session_state().borrow().clone();
-        session
+        handle.session_state().borrow().clone()
     }
 
     /// Whether this connection may `scope`; unknown grants leave the server to decide.
@@ -244,7 +246,12 @@ impl SettingsView {
         let version = Row::new("access-version", "Version")
             .description(format!("{} \u{00b7} {address}", config.environment.server_version))
             .into_any_element();
-        let machine = section(label, vec![version, self.permissions_row(cx)], cx);
+        let toggle = cx.listener(|this, _, _, cx| {
+            this.access.permissions_open = !this.access.permissions_open;
+            cx.notify();
+        });
+        let permissions = disclosure("access-permissions", "Permissions", self.access.permissions_open, vec![self.permissions_row(cx)], toggle, cx);
+        let machine = section(label, vec![version, permissions], cx);
         let mut blocks = vec![Block::new(&["connections-environment"], machine)];
         if self.may(ACCESS_READ, cx) || self.may(ACCESS_WRITE, cx) {
             blocks.push(Block::new(&["authorized-clients"], self.authorized_clients(&address, now, window, cx)));
@@ -252,7 +259,7 @@ impl SettingsView {
         blocks
     }
 
-    /// The "Permissions" disclosure, open: each scope and whether this connection has it.
+    /// The "Permissions" disclosure's content: each scope and whether this connection has it.
     fn permissions_row(&self, cx: &App) -> AnyElement {
         let p = palette(cx);
         let session = self.session(cx);
@@ -270,9 +277,12 @@ impl SettingsView {
                 }))
                 .into_any_element(),
         };
-        Row::new("access-permissions", "Permissions")
-            .description("These permissions apply to this client\u{2019}s current connection.")
-            .below(div().max_w(r(420.)).pt(r(8.)).pb(r(12.)).child(body))
+        v_flex()
+            .px(r(16.))
+            .py(r(12.))
+            .gap(r(8.))
+            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("These permissions apply to this client\u{2019}s current connection."))
+            .child(div().max_w(r(420.)).child(body))
             .into_any_element()
     }
 

@@ -135,6 +135,18 @@ impl WorktreesState {
 
 /// `AdvancedSettings`: a disclosure at the end of a group whose rows fold under it.
 pub(super) fn advanced(id: &'static str, open: bool, rows: Vec<AnyElement>, on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
+    disclosure(id, "Advanced", open, rows, on_toggle, cx)
+}
+
+/// A labelled disclosure row whose content folds under it.
+pub(super) fn disclosure(
+    id: &'static str,
+    label: &'static str,
+    open: bool,
+    rows: Vec<AnyElement>,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
     let p = palette(cx);
     let divider = hsla(p.border).opacity(0.5);
     v_flex()
@@ -150,7 +162,7 @@ pub(super) fn advanced(id: &'static str, open: bool, rows: Vec<AnyElement>, on_t
                 .cursor_pointer()
                 .hover(|this| this.text_color(hsla(p.foreground)))
                 .child(icon(if open { Icon::ChevronDown } else { Icon::ChevronRight }, 14., hsla(p.muted_foreground)))
-                .child("Advanced")
+                .child(label)
                 .on_click(on_toggle),
         )
         .when(open, |this| this.children(rows.into_iter().map(move |row| div().border_t_1().border_color(divider).child(row))))
