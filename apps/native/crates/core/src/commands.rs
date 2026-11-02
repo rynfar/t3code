@@ -133,6 +133,10 @@ pub struct ComposerMessage<'a> {
     pub title_seed: &'a str,
     pub model_selection: &'a ModelSelection,
     pub dispatch: ComposerDispatch,
+    /// `OrchestrationMessageContext`: the records the text references.
+    pub context: Option<&'a Value>,
+    /// Persisted `ChatAttachment`s.
+    pub attachments: &'a [Value],
 }
 
 pub fn composer_message(message: &ComposerMessage) -> Value {
@@ -144,10 +148,13 @@ pub fn composer_message(message: &ComposerMessage) -> Value {
         "threadId": message.thread_id,
         "messageId": message.message_id,
         "text": message.text,
-        "attachments": [],
+        "attachments": message.attachments,
         "titleSeed": message.title_seed,
         "modelSelection": message.model_selection,
     });
+    if let Some(context) = message.context {
+        command["context"] = context.clone();
+    }
     match message.dispatch {
         ComposerDispatch::Queue => command["dispatchMode"] = json!({ "type": "queue_after_active" }),
         ComposerDispatch::Auto | ComposerDispatch::Steer => {
@@ -272,10 +279,12 @@ pub struct LaunchThread<'a> {
     pub workspace: &'a Strategy,
     pub message_id: &'a str,
     pub text: &'a str,
+    pub context: Option<&'a Value>,
+    pub attachments: &'a [Value],
 }
 
 pub fn launch_thread(launch: &LaunchThread) -> Value {
-    json!({
+    let mut payload = json!({
         "commandId": launch.command_id,
         "creationSource": CREATION_SOURCE,
         "threadId": launch.thread_id,
@@ -289,9 +298,13 @@ pub fn launch_thread(launch: &LaunchThread) -> Value {
         "initialMessage": {
             "messageId": launch.message_id,
             "text": launch.text,
-            "attachments": [],
+            "attachments": launch.attachments,
         },
-    })
+    });
+    if let Some(context) = launch.context {
+        payload["initialMessage"]["context"] = context.clone();
+    }
+    payload
 }
 
 /// `server.updateSettings` with `setModelFavorites`, as `useToggleEnvironmentModelFavorite` saves.

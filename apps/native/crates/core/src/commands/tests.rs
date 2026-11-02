@@ -27,6 +27,8 @@ fn composer_message_steers_with_delivery_intent_and_queues_without_it() {
         title_seed: "go",
         model_selection: &selection,
         dispatch,
+        context: None,
+        attachments: &[],
     };
     let steer = composer_message(&message(ComposerDispatch::Steer));
     assert_eq!(steer["dispatchMode"], json!({ "type": "start_immediately" }));
@@ -37,6 +39,12 @@ fn composer_message_steers_with_delivery_intent_and_queues_without_it() {
     let queue = composer_message(&message(ComposerDispatch::Queue));
     assert_eq!(queue["dispatchMode"], json!({ "type": "queue_after_active" }));
     assert!(queue.get("deliveryIntent").is_none());
+    assert!(queue.get("context").is_none());
+    let context = json!({ "version": 1, "records": [] });
+    let attachments = [json!({ "type": "image", "id": "a1" })];
+    let with_context = composer_message(&ComposerMessage { context: Some(&context), attachments: &attachments, ..message(ComposerDispatch::Auto) });
+    assert_eq!(with_context["context"], context);
+    assert_eq!(with_context["attachments"], json!([{ "type": "image", "id": "a1" }]));
 }
 
 #[test]
@@ -53,6 +61,8 @@ fn launch_thread_matches_thread_launch_input() {
         workspace: &Strategy::Root,
         message_id: "m1",
         text: "Fix the build",
+        context: None,
+        attachments: &[],
     });
     assert_eq!(launch["runtimeMode"], "approval-required");
     assert_eq!(launch["interactionMode"], "default");
@@ -72,8 +82,11 @@ fn launch_thread_matches_thread_launch_input() {
         workspace: &worktree,
         message_id: "m1",
         text: "t",
+        context: Some(&json!({ "version": 1, "records": [] })),
+        attachments: &[],
     });
     assert_eq!(launch["workspaceStrategy"], json!({ "type": "worktree", "baseRef": "main", "startFromOrigin": true }));
+    assert_eq!(launch["initialMessage"]["context"], json!({ "version": 1, "records": [] }));
 }
 
 #[test]

@@ -152,14 +152,15 @@ impl AppState {
     /// `useSideChat.open`: forks the open thread's latest stable point, sends `prompt` there,
     /// then shows the side chat's tab. The composer's `/side` and `/btw` call this with the
     /// prompt; the panel launcher without one. A reason it cannot start shows as a toast.
-    pub fn open_side_chat(&mut self, prompt: Option<String>, cx: &mut Context<Self>) {
-        let Some(parent) = self.selected_thread.clone() else { return };
+    /// Returns whether the start began.
+    pub fn open_side_chat(&mut self, prompt: Option<String>, cx: &mut Context<Self>) -> bool {
+        let Some(parent) = self.selected_thread.clone() else { return false };
         if self.side_threads.starting.is_some() {
-            return;
+            return false;
         }
         if let Some(reason) = self.side_chat_disabled_reason() {
             self.show_toast(Toast::new(ToastKind::Warning, "Side chat unavailable").description(reason), cx);
-            return;
+            return false;
         }
         let target = uuid_v4();
         let prompt = prompt.map(|text| text.trim().to_owned()).filter(|text| !text.is_empty());
@@ -183,6 +184,7 @@ impl AppState {
             }
             state.continue_side_chat_start(cx);
         });
+        true
     }
 
     fn continue_side_chat_start(&mut self, cx: &mut Context<Self>) {

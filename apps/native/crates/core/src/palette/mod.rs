@@ -250,7 +250,7 @@ pub struct PaletteThread {
     pub local_opened_at: Option<i64>,
 }
 
-fn thread_search_subject(
+pub fn thread_search_subject(
     thread: &PaletteThread,
     project_title: Option<&str>,
     environment_label: Option<String>,

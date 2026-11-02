@@ -39,7 +39,7 @@ fn a_held_or_composing_enter_never_sends() {
 #[test]
 fn client_settings_read_web_keys_and_ignore_bad_values() {
     let settings = ClientSettings::from_json(
-        r#"{"sendShortcut": "mod-enter", "followUpBehavior": "queue", "planModeEnabled": true, "notificationMode": "notifications-and-sound", "inAppNotificationsEnabled": true}"#,
+        r#"{"sendShortcut": "mod-enter", "followUpBehavior": "queue", "planModeEnabled": true, "notificationMode": "notifications-and-sound", "inAppNotificationsEnabled": true, "showSkillsInSlashMenu": false}"#,
     );
     assert_eq!(
         settings,
@@ -49,11 +49,13 @@ fn client_settings_read_web_keys_and_ignore_bad_values() {
             plan_mode_enabled: true,
             notification_mode: crate::notifications::NotificationMode::NotificationsAndSound,
             in_app_notifications_enabled: true,
+            show_skills_in_slash_menu: false,
         }
     );
     let partial = ClientSettings::from_json(r#"{"sendShortcut": "shift-enter", "planModeEnabled": "yes"}"#);
     assert_eq!(partial, ClientSettings::default());
     assert_eq!(ClientSettings::from_json("not json"), ClientSettings::default());
+    assert!(ClientSettings::default().show_skills_in_slash_menu, "the web shows skills in the / menu by default");
 }
 
 fn provider(value: serde_json::Value) -> ServerProvider {
@@ -170,4 +172,23 @@ fn a_spent_default_falls_back_when_the_fallback_can_take_work() {
     assert_eq!(model(&config(limits(100.0, "2026-11-01T00:00:00Z"), true)), Some("luna".into()));
     assert_eq!(model(&config(limits(80.0, "2026-11-03T00:00:00Z"), true)), Some("luna".into()));
     assert_eq!(model(&config(limits(100.0, "2026-11-03T00:00:00Z"), false)), Some("luna".into()));
+}
+
+#[test]
+fn title_seeds_fall_back_to_attachments() {
+    use attachments::{Attachment, AttachmentKind, Upload};
+    let attached = |kind, name: &str| Attachment {
+        id: name.into(),
+        kind,
+        name: name.into(),
+        mime_type: "text/plain".into(),
+        size_bytes: 1,
+        pasted_text: false,
+        upload: Upload::Uploading,
+    };
+    assert_eq!(thread_title_seed("", &[attached(AttachmentKind::Image, "a.png")]), "Attached image");
+    assert_eq!(thread_title_seed("", &[attached(AttachmentKind::Image, "a"), attached(AttachmentKind::Image, "b")]), "Attached images");
+    assert_eq!(thread_title_seed(" ", &[attached(AttachmentKind::File, "notes  v2.md")]), "File: notes v2.md");
+    assert_eq!(thread_title_seed("Look at this", &[attached(AttachmentKind::File, "x")]), "Look at this");
+    assert_eq!(thread_title_seed("", &[]), "New thread");
 }

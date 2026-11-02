@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
                 title_seed: &title,
                 model_selection: &selection,
                 dispatch: commands::ComposerDispatch::Auto,
+                context: None,
+                attachments: &[],
             });
             steps.push(message);
             let count = steps.len();
@@ -159,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
             workspace: &workspace,
             message_id: &message_id,
             text: &text,
+            context: None,
+            attachments: &[],
         });
         if has("--dry-run") {
             println!("launch (dry run): {payload}");

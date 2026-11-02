@@ -78,6 +78,7 @@ cd apps/native
 export T3_NATIVE_HOME="$(git rev-parse --show-toplevel)/.t3/native"   # whose saved environments to use
 cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   [--thread <id>] [--right-panel diff] [--settings appearance] [--palette] \
+  [--new-thread] [--attach <file>]... [--prompt "@src"] \
   [--width 1440] [--height 900] [--dark | --light] [--wait 6]
 ```
 
@@ -85,7 +86,10 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   `--settings` a section (`appearance`, `chat`, `keybindings`, …).
 - A home with no saved environment renders the connect screen (set `T3CODE_HOME` as above to
   show the one-click local option).
-- It only subscribes and reads; it never writes to the server. Local UI state goes to a
+- `--new-thread` opens the new-thread draft; `--prompt` types into the composer last, so a trigger
+  (`@src`, `/`, `$rev`) shows its menu; `--attach` drops files on the composer. Attaching uploads
+  them (pending uploads the server sweeps after a day), so use it only against a scratch server.
+- Otherwise it only subscribes and reads; it never writes to the server. Local UI state goes to a
   throwaway copy of the home, so `T3_NATIVE_HOME` keeps its panels and last thread.
 - One PNG per run at 2x. The first build with the feature compiles GPUI's test support once.
 - Backdrop blur (dialogs, menus, the composer) may render without blur offscreen.

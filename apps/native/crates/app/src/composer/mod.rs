@@ -5,10 +5,15 @@
 //! way the web persists them: permissions and mode with their `thread.*.set` commands before the
 //! next turn, the model on the turn itself.
 
+mod attachments;
 pub(crate) mod controls;
+mod drafts;
+mod menu;
 mod model_picker;
 mod pending;
+mod queue;
 mod send;
+mod stash;
 pub(crate) use pending::banner_surface;
 mod view;
 
@@ -30,13 +35,18 @@ use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::provider_icon::ProviderMark;
 use crate::sidebar::controller::now_ms;
+use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions]);
+actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt]);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
-    cx.bind_keys([KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input"))]);
+    cx.bind_keys([
+        KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input")),
+        // Keeps a large paste inline instead of attaching it (`isPasteAsTextShortcut`).
+        KeyBinding::new("cmd-shift-v", PasteAsText, Some("Composer > Input")),
+    ]);
     model_picker::init(cx);
 }
 
@@ -84,6 +94,8 @@ struct Snapshot {
     loaded: bool,
     pending_key: PendingKey,
     pending: PendingRequests,
+    /// Messages waiting behind the active turn.
+    queue: t3_core::composer::queue::QueueState,
 }
 
 /// Everything the footer and send read, resolved against the server config.
@@ -142,6 +154,13 @@ pub struct Composer {
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
     /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
     pub(super) fixed: Option<String>,
+    /// The `@`, `/` and `$` menus.
+    menu: Menu,
+    /// Staged images and files per target.
+    attachments: attachments::Attachments,
+    drafts: drafts::Drafts,
+    queue: queue::Queue,
+    stash_state: stash::Stashed,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -173,6 +192,12 @@ impl Composer {
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
+                if *event == AppEvent::ComposerMention {
+                    let mentions = this.state.update(cx, |state, _| std::mem::take(&mut state.composer_mentions));
+                    for mention in mentions {
+                        this.insert_mention(&mention.path, window, cx);
+                    }
+                }
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
                 if *event == AppEvent::ComposerRestore {
@@ -180,6 +205,8 @@ impl Composer {
                 }
             }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| this.on_picker(event, window, cx)),
+            // Caret moves change the token under it; blinks find the caret unchanged and stop.
+            cx.observe(&input, |this, _, cx| this.sync_menu(false, cx)),
         ];
         let limit_recovery = cx.new(|cx| crate::thread_view::LimitRecoveryBanner::new(state.clone(), cx));
         let mut composer = Composer {
@@ -207,8 +234,15 @@ impl Composer {
             input_state: None,
             question_focus: cx.focus_handle(),
             fixed,
+            menu: Menu::default(),
+            attachments: Default::default(),
+            drafts: Default::default(),
+            queue: Default::default(),
+            stash_state: Default::default(),
             _subscriptions: subscriptions,
         };
+        composer.load_drafts();
+        composer.load_stash();
         composer.refresh(true, window, cx);
         composer
     }
@@ -252,6 +286,7 @@ impl Composer {
             loaded: projection.is_some(),
             pending_key,
             pending,
+            queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
             target,
         }
     }
@@ -267,6 +302,8 @@ impl Composer {
                 let resolved = self.resolve(cx);
                 self.carry = (resolved.model, Some(resolved.interaction_mode));
             }
+            let previous = self.snapshot.target.clone();
+            self.switch_draft(previous.as_ref(), next.target.as_ref(), window, cx);
             self.picker_open = false;
             self.permissions_open = false;
             self.approval_menu_open = false;
@@ -285,7 +322,13 @@ impl Composer {
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
+        self.sync_queued_edit(window, cx);
         self.sync_answering(window, cx);
+        self.sync_menu(true, cx);
+        // The provider, its skills or the compact rule may have changed under the open menu.
+        if self.menu_open() {
+            self.refresh_menu(cx);
+        }
         if self.picker_open {
             let input = self.picker_input(cx);
             self.picker.update(cx, |picker, cx| picker.update_input(input, config_changed, cx));
@@ -423,8 +466,12 @@ impl Composer {
                 if let Some(choices) = self.choices_mut() {
                     choices.model = Some(selection);
                 }
+                self.draft_changed(cx);
             }
-            PickerEvent::Options(selections) => self.set_options(selections, cx),
+            PickerEvent::Options(selections) => {
+                self.set_options(selections, cx);
+                self.draft_changed(cx);
+            }
             PickerEvent::RuntimeMode(mode) => self.set_runtime_mode(*mode, cx),
             PickerEvent::Dismiss => {
                 self.picker_open = false;
@@ -449,6 +496,7 @@ impl Composer {
         if let Some(choices) = self.choices_mut() {
             choices.runtime_mode = Some(mode);
         }
+        self.draft_changed(cx);
         self.permissions_open = false;
         cx.notify();
     }
@@ -480,6 +528,7 @@ impl Composer {
         if let Some(choices) = self.choices_mut() {
             choices.interaction_mode = Some(next);
         }
+        self.draft_changed(cx);
         cx.notify();
     }
 
@@ -519,6 +568,11 @@ impl Composer {
     /// The textarea draws itself; the composer repaints only when what it shows depends on the
     /// text: the send button's enabled state, or the active answer.
     fn on_prompt_change(&mut self, cx: &mut Context<Self>) {
+        self.sync_menu(true, cx);
+        self.close_stash_menu(cx);
+        if self.answering.is_none() {
+            self.draft_changed(cx);
+        }
         let text = self.prompt(cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();

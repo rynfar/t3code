@@ -5,10 +5,10 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
+    AnyElement, Context, ExternalPaths, Focusable, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
-use gpui_component::input::{Escape, Textarea};
+use gpui_component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Paste, Textarea};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
@@ -18,14 +18,13 @@ use t3_core::traits;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
 use super::model_picker::permissions_section;
-use super::{Composer, Resolved, Target, TogglePlanMode, runtime_mode_icon};
+use super::{Composer, MenuKey, PasteAsText, Resolved, StashPrompt, Target, TogglePlanMode, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
 
-/// The web's collapsed-composer prompt. Its full placeholder names @ files, $ skills and
-/// / commands, which come with the composer menus (ledger CO-TRIGGERS).
-pub const DEFAULT_PLACEHOLDER: &str = "Ask anything...";
+/// `DEFAULT_COMPOSER_PLACEHOLDER` (`web/src/composerPlaceholder.ts`).
+pub const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / commands";
 
 /// A click that closed a popup must not reopen it through the trigger it landed on.
 const REOPEN_GUARD: Duration = Duration::from_millis(300);
@@ -203,26 +202,31 @@ impl Composer {
                 )
                 .into_any_element();
         }
-        let has_text = self.has_text;
-        if running && !has_text {
+        let has_text = self.has_text || !self.staged().is_empty();
+        let editing_queued = self.editing_queued().is_some();
+        if running && !has_text && !editing_queued {
             return stop().into_any_element();
         }
+        let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
         let settings = self.state.read(cx).client_settings;
         let follow_up = if self.snapshot.pending.approvals.is_empty() { settings.follow_up_behavior } else { rules::FollowUpBehavior::Steer };
         let can_steer = !self.snapshot.compacting;
         let dispatch = rules::dispatch_mode(running, false, follow_up, can_steer);
         let alternate = rules::dispatch_mode(running, true, follow_up, can_steer);
-        let (kind, label) = match (running, dispatch) {
-            (true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
-            (true, _) => (RoundKind::Steer, "Steer message"),
+        let (kind, label) = match (editing_queued, running, dispatch) {
+            (true, _, _) => (RoundKind::Send, "Update queued message"),
+            (false, true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
+            (false, true, _) => (RoundKind::Steer, "Steer message"),
             _ => (RoundKind::Send, "Submit message"),
         };
-        let disabled = self.sending || !has_text || resolved.model.is_none();
+        let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some();
         let tooltip: SharedString = if resolved.model.is_none() {
             "No provider available".into()
+        } else if let Some(reason) = attachment_block {
+            reason.into()
         } else if self.sending {
-            "Submitting message".into()
-        } else if running && can_steer {
+            if editing_queued { "Updating queued message".into() } else { "Submitting message".into() }
+        } else if running && can_steer && !editing_queued {
             let action = |mode| if mode == ComposerDispatch::Queue { "queue" } else { "steer" };
             format!("Click to {}, ⌘-click to {}", action(dispatch), action(alternate)).into()
         } else {
@@ -256,6 +260,8 @@ impl Render for Composer {
         let surface = hsla(if dark { p.surface_raised } else { p.card });
         let outline = if dark { gpui::white().opacity(0.05) } else { gpui::black().opacity(0.08) };
         let show_permissions = resolved.runtime_mode != resolved.default_runtime_mode;
+        let show_attach = self.shows_attach_button(cx);
+        let (drop_fill, drop_ring) = (hsla(p.accent).opacity(0.45), hsla(p.primary).opacity(0.7));
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
@@ -266,6 +272,45 @@ impl Render for Composer {
                     }
                 }))
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
+                // The open menu takes these keys before the prompt does (`composerCommandKey`).
+                .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                    if this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                    if this.stash_key(MenuKey::Down, window, cx)
+                        || this.menu_key(MenuKey::Down, window, cx)
+                        || this.history_key(false, window, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                    if !action.secondary
+                        && !action.shift
+                        && (this.stash_key(MenuKey::Accept, window, cx) || this.menu_key(MenuKey::Accept, window, cx))
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                    if this.menu_key(MenuKey::Accept, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                    if this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &StashPrompt, window, cx| this.stash_prompt(window, cx)))
+                .capture_action(cx.listener(|this, _: &Paste, window, cx| {
+                    if this.input.read(cx).focus_handle(cx).is_focused(window) && this.paste(window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &PasteAsText, window, cx| this.paste_as_text(window, cx)))
                 .on_action(cx.listener(|this, _: &Escape, _, cx| {
                     if this.permissions_open || this.approval_menu_open {
                         this.permissions_open = false;
@@ -277,6 +322,7 @@ impl Render for Composer {
                 }))
                 .w_full()
                 .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
+                .children(self.render_queue(cx))
                 .children(error.map(|error| {
                     div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
@@ -285,8 +331,12 @@ impl Render for Composer {
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))
                 })
+                .children(self.render_stash_badge(cx))
+                .children(self.render_stash_menu(cx))
                 .child(
+                    div().relative().children(self.render_menu(cx)).child(
                     v_flex()
+                        .id("composer-card")
                         .rounded(px(16.))
                         .border_1()
                         .border_color(outline)
@@ -300,11 +350,15 @@ impl Render for Composer {
                                 inset: false,
                             }])
                         })
+                        // Files dragged in from Finder (`isDragOverComposer`).
+                        .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))
+                        .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| this.on_drop_paths(paths, window, cx)))
                         .child(
                             div()
                                 .px(px(16.))
                                 .pt(px(16.))
                                 .pb(px(8.))
+                                .children(self.render_attachments(cx))
                                 .child(Textarea::new(&self.input).appearance(false).line_height(px(22.75))),
                         )
                         .child(
@@ -312,12 +366,23 @@ impl Render for Composer {
                                 .px(px(8.))
                                 .pb(px(8.))
                                 .gap(px(2.))
+                                .when(show_attach, |this| {
+                                    this.child(
+                                        div().mr(px(8.)).child(
+                                            Button::new("attach-files", ButtonVariant::Ghost, ButtonSize::IconSm)
+                                                .icon(Icon::Paperclip)
+                                                .tooltip("Attach files")
+                                                .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx))),
+                                        ),
+                                    )
+                                })
                                 .child(self.render_model_trigger(&resolved, cx))
                                 .when(show_permissions, |this| this.child(self.render_permissions_chip(&resolved, cx)))
                                 .when(resolved.plan_enabled, |this| this.child(self.render_plan_toggle(&resolved, cx)))
                                 .child(div().flex_1().min_w(px(8.)))
                                 .child(self.render_primary(&resolved, cx)),
                         ),
+                    ),
                 ),
         )
     }

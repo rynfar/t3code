@@ -7,6 +7,12 @@
 //! `client-runtime/src/operations/threadTitle.ts`, and the draft defaults in
 //! `web/src/hooks/useHandleNewThread.ts`.
 
+pub mod attachments;
+pub mod drafts;
+pub mod menu;
+pub mod queue;
+pub mod stash;
+
 use serde::Deserialize;
 
 use crate::commands::ComposerDispatch;
@@ -33,7 +39,7 @@ pub enum FollowUpBehavior {
 
 /// The `ClientSettingsSchema` keys the composer reads. They are per-device on the web, so the
 /// native client keeps its own copy with the web's names and defaults.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSettings {
     pub send_shortcut: SendShortcut,
     pub follow_up_behavior: FollowUpBehavior,
@@ -42,6 +48,21 @@ pub struct ClientSettings {
     pub notification_mode: crate::notifications::NotificationMode,
     /// Toasts for other threads while the window is focused.
     pub in_app_notifications_enabled: bool,
+    /// Skills also show in the `/` menu as `/skill:name`.
+    pub show_skills_in_slash_menu: bool,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        ClientSettings {
+            send_shortcut: SendShortcut::default(),
+            follow_up_behavior: FollowUpBehavior::default(),
+            plan_mode_enabled: false,
+            notification_mode: Default::default(),
+            in_app_notifications_enabled: false,
+            show_skills_in_slash_menu: true,
+        }
+    }
 }
 
 impl ClientSettings {
@@ -66,6 +87,9 @@ impl ClientSettings {
         }
         if let Some(value) = field("inAppNotificationsEnabled").and_then(|v| v.as_bool()) {
             settings.in_app_notifications_enabled = value;
+        }
+        if let Some(value) = field("showSkillsInSlashMenu").and_then(|v| v.as_bool()) {
+            settings.show_skills_in_slash_menu = value;
         }
         settings
     }
@@ -171,15 +195,28 @@ pub fn interaction_mode(plan_mode_enabled: bool, provider: Option<&ServerProvide
 
 /// `deriveThreadTitleSeed` for a text-only prompt.
 pub fn title_seed(text: &str) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return "New thread".to_owned();
+    thread_title_seed(text, &[])
+}
+
+/// `deriveThreadTitleSeed`: the prompt's prose, else what is attached, truncated to 50 chars.
+pub fn thread_title_seed(text: &str, attachments: &[attachments::Attachment]) -> String {
+    let truncate = |text: &str| {
+        let characters: Vec<char> = text.trim().chars().collect();
+        if characters.len() <= 50 { characters.iter().collect() } else { format!("{}...", characters[..50].iter().collect::<String>()) }
+    };
+    let prose = menu::title_text(text);
+    if !prose.is_empty() {
+        return truncate(&prose);
     }
-    let characters: Vec<char> = normalized.chars().collect();
-    if characters.len() <= 50 {
-        return normalized;
+    let images = attachments.iter().filter(|attached| attached.kind == attachments::AttachmentKind::Image).count();
+    if images > 0 {
+        return if images == 1 { "Attached image".to_owned() } else { "Attached images".to_owned() };
     }
-    format!("{}...", characters[..50].iter().collect::<String>())
+    let name = attachments.first().map(|attached| attached.name.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    if !name.is_empty() {
+        return truncate(&format!("File: {name}"));
+    }
+    "New thread".to_owned()
 }
 
 /// What a new thread starts with before the user picks anything.

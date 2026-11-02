@@ -67,6 +67,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
+        "composer.stash" => Box::new(crate::composer::StashPrompt),
         "rightPanel.toggle" => Box::new(crate::right_panel::ToggleRightPanel),
         "rightPanel.toggleMaximized" => Box::new(crate::right_panel::ToggleMaximized),
         "rightPanel.close" => Box::new(crate::right_panel::CloseActiveSurface),

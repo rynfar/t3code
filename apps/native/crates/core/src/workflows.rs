@@ -25,7 +25,7 @@ fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 /// `resolveThreadProviderSession`: the session of the run's provider thread, else of the thread's
 /// attached provider thread, else the newest session still alive.
-fn provider_session(projection: &ThreadProjection) -> Option<&Value> {
+pub(crate) fn provider_session(projection: &ThreadProjection) -> Option<&Value> {
     let provider_thread_id = active_run(projection)
         .and_then(|run| run.provider_thread_id.as_deref())
         .or(projection.thread.active_provider_thread_id.as_deref());

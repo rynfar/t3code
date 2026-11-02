@@ -273,6 +273,8 @@ impl RenderOnce for Pill {
 pub enum ButtonVariant {
     Default,
     Outline,
+    /// No fill or border until hovered (`ghost`).
+    Ghost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +285,8 @@ pub enum ButtonSize {
     Sm,
     /// 24 square, icon only (`icon-xs`).
     IconXs,
+    /// 28 square, icon only (`icon-sm`).
+    IconSm,
 }
 
 /// `button.tsx` in the variants and sizes the composer uses.
@@ -337,6 +341,7 @@ impl RenderOnce for Button {
             ButtonSize::Xs => (24., 7., 14.),
             ButtonSize::Sm => (28., 9., 16.),
             ButtonSize::IconXs => (24., 0., 14.),
+            ButtonSize::IconSm => (28., 0., 16.),
         };
         let (fill, hover, text, border, icon_color) = match self.variant {
             ButtonVariant::Default => {
@@ -348,11 +353,15 @@ impl RenderOnce for Button {
                 let hover = if dark { hsla(p.input).opacity(0.64) } else { hsla(p.accent).opacity(0.5) };
                 (fill, hover, hsla(p.foreground), hsla(p.input), hsla(p.muted_foreground))
             }
+            ButtonVariant::Ghost => {
+                let clear = hsla(p.accent).opacity(0.);
+                (clear, hsla(p.accent), hsla(p.foreground), clear, hsla(p.muted_foreground))
+            }
         };
         h_flex()
             .id(self.id)
             .h(px(height))
-            .when(self.size == ButtonSize::IconXs, |this| this.w(px(height)).justify_center())
+            .when(matches!(self.size, ButtonSize::IconXs | ButtonSize::IconSm), |this| this.w(px(height)).justify_center())
             .px(px(pad))
             .flex_none()
             .gap(px(if self.size == ButtonSize::Sm { 6. } else { 4. }))

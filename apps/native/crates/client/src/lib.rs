@@ -9,6 +9,7 @@ pub mod session;
 pub mod status;
 pub mod store;
 pub mod supervisor;
+pub mod upload;
 
 #[cfg(test)]
 mod test_server;
