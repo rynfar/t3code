@@ -39,16 +39,23 @@ fn snapshot_then_deltas_track_sequence_and_ignore_stale_events() {
     assert!(state.apply(item(json!({"kind": "synchronized"}))));
     assert!(!state.apply(item(json!({"kind": "synchronized"}))));
 
+    let first = state.revision("t1");
+    assert!(first.is_some());
+
     let stale = item(json!({"kind": "thread.updated", "sequence": 10, "location": "active", "thread": thread("t1", "Stale")}));
     assert!(!state.apply(stale));
     assert_eq!(state.thread("t1").unwrap().title, "First");
+    assert_eq!(state.revision("t1"), first, "a stale delta leaves the row as it was");
 
     assert!(state.apply(item(json!({"kind": "thread.updated", "sequence": 11, "location": "active", "thread": thread("t2", "Second")}))));
     assert_eq!(state.sequence(), Some(11));
     assert_eq!(state.snapshot.as_ref().unwrap().threads.len(), 2);
+    assert!(state.revision("t2").is_some());
+    assert_eq!(state.revision("t1"), first, "another row's delta leaves this one as it was");
 
     assert!(state.apply(item(json!({"kind": "thread.updated", "sequence": 12, "location": "archive", "thread": thread("t2", "Second")}))));
     assert!(state.thread("t2").is_none());
+    assert_eq!(state.revision("t2"), None);
 
     assert!(state.apply(item(json!({"kind": "project.removed", "sequence": 13, "projectId": "p1"}))));
     assert!(state.project("p1").is_none());
@@ -58,8 +65,16 @@ fn snapshot_then_deltas_track_sequence_and_ignore_stale_events() {
 fn identical_thread_update_only_advances_sequence() {
     let mut state = ShellState::default();
     state.apply(snapshot_item(1));
+    let before = state.revision("t1");
     assert!(!state.apply(item(json!({"kind": "thread.updated", "sequence": 2, "location": "active", "thread": thread("t1", "First")}))));
     assert_eq!(state.sequence(), Some(2));
+    assert_eq!(state.revision("t1"), before, "an identical row keeps its revision");
+
+    assert!(state.apply(item(json!({"kind": "thread.updated", "sequence": 3, "location": "active", "thread": thread("t1", "Renamed")}))));
+    let renamed = state.revision("t1");
+    assert_ne!(renamed, before);
+    state.apply(snapshot_item(4));
+    assert_ne!(state.revision("t1"), renamed, "a new snapshot replaces every row");
 }
 
 #[test]

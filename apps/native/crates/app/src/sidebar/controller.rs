@@ -260,18 +260,6 @@ impl AppState {
         .detach();
     }
 
-    pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
-        self.toast = Some(toast);
-        cx.emit(AppEvent::Notice);
-        self.toast_timer = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(4)).await;
-            let _ = this.update(cx, |state, cx| {
-                state.toast = None;
-                cx.emit(AppEvent::Notice);
-            });
-        }));
-    }
-
     fn after_undo_change(&mut self, cx: &mut Context<Self>) {
         cx.emit(AppEvent::Notice);
         let Some(at) = self.sidebar.undo.expires_at() else {

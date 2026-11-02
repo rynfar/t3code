@@ -267,11 +267,32 @@ pub struct ShellState {
     /// `thread.removed` sequences since the last authoritative snapshot, so a family or page
     /// read from before a removal cannot bring the thread back (`shell.ts` `removedAt`).
     pub removed_at: HashMap<String, u64>,
+    /// A fresh stamp whenever a row is replaced, so observers skip unchanged rows the way the web
+    /// compares row identity, without comparing or cloning them.
+    revisions: HashMap<String, u64>,
+}
+
+/// Process-wide, so stamps from a replaced `ShellState` (a new pairing) never repeat.
+static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl ShellState {
     pub fn sequence(&self) -> Option<u64> {
         self.snapshot.as_ref().map(|snapshot| snapshot.snapshot_sequence)
+    }
+
+    /// The row's current stamp; it changes whenever the shell replaces the row.
+    pub fn revision(&self, thread_id: &str) -> Option<u64> {
+        self.revisions.get(thread_id).copied()
+    }
+
+    fn stamp_all(&mut self) {
+        let revision = next_revision();
+        let threads = self.snapshot.as_ref().map_or(&[][..], |snapshot| &snapshot.threads);
+        self.revisions = threads.iter().map(|thread| (thread.id.clone(), revision)).collect();
     }
 
     /// Returns true when visible state changed.
@@ -283,6 +304,7 @@ impl ShellState {
                     Some(previous) => merge_identity_enrichment(previous, &snapshot, &roots),
                     None => {
                         self.snapshot = Some(*snapshot);
+                        self.stamp_all();
                         true
                     }
                 }
@@ -298,17 +320,26 @@ impl ShellState {
                 self.snapshot = Some(snapshot);
                 self.generation += 1;
                 self.removed_at.clear();
+                self.stamp_all();
                 true
             }
             ShellStreamItem::Unknown => false,
             delta => {
-                let removed = match &delta {
-                    ShellStreamItem::ThreadRemoved { thread_id, sequence } => Some((thread_id.clone(), *sequence)),
-                    _ => None,
+                let (touched, removed) = match &delta {
+                    ShellStreamItem::ThreadUpdated { thread, location, .. } => (Some((thread.id.clone(), location == "active")), None),
+                    ShellStreamItem::ThreadRemoved { thread_id, sequence } => (Some((thread_id.clone(), false)), Some(*sequence)),
+                    _ => (None, None),
                 };
                 let applied = self.snapshot.as_mut().is_some_and(|snapshot| apply_delta(snapshot, delta));
-                if applied && let Some((thread_id, sequence)) = removed {
-                    self.removed_at.insert(thread_id, sequence);
+                if applied && let Some((thread_id, listed)) = touched {
+                    if let Some(sequence) = removed {
+                        self.removed_at.insert(thread_id.clone(), sequence);
+                    }
+                    if listed {
+                        self.revisions.insert(thread_id, next_revision());
+                    } else {
+                        self.revisions.remove(&thread_id);
+                    }
                 }
                 applied
             }

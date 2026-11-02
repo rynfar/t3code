@@ -17,8 +17,11 @@ use crate::toast::{Toast, ToastKind};
 #[derive(Default)]
 pub struct NotificationCenter {
     watcher: ThreadNotifications,
-    /// Delivered OS notifications: tag to thread.
+    /// Delivered OS notifications that focus retires: tag to thread.
     pending: HashMap<String, String>,
+    /// Where each delivered notification leads, kept past retirement: a click can arrive after
+    /// the focus it caused cleared `pending`. Tags are per thread, so this is bounded by threads.
+    destinations: HashMap<String, String>,
     applied_mode: Option<NotificationMode>,
 }
 
@@ -41,8 +44,10 @@ impl AppState {
         }
         // A reconnecting shell is not live; its next live state is compared with the last one.
         let live = self.shell.synchronized && matches!(self.phase, Phase::Online(ConnectionStatus::Connected));
-        let Some(snapshot) = self.shell.snapshot.as_ref().filter(|_| live) else { return };
-        for notification in self.notifications.watcher.observe(&snapshot.threads) {
+        if !live {
+            return;
+        }
+        for notification in self.notifications.watcher.observe(&self.shell) {
             self.present_notification(notification, cx);
         }
     }
@@ -73,12 +78,14 @@ impl AppState {
             body: notification.body.into(),
             actions: Vec::new(),
         });
+        self.notifications.destinations.insert(tag.clone(), notification.thread_id.clone());
         self.notifications.pending.insert(tag, notification.thread_id);
     }
 
     /// An OS notification was clicked: bring the app forward on its thread.
     pub fn open_notification(&mut self, tag: &str, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.notifications.pending.remove(tag) else { return };
+        self.notifications.pending.remove(tag);
+        let Some(thread_id) = self.notifications.destinations.get(tag).cloned() else { return };
         cx.activate(true);
         self.select_thread(&thread_id, cx);
     }

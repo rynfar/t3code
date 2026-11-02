@@ -376,7 +376,8 @@ fn notification_gate_matches_typescript() {
         let mut gate = NotificationGate::<String>::default();
         for (index, step) in list(&case, "steps").iter().enumerate() {
             if let Some(kept) = step.get("retain") {
-                gate.retain(&kept.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect());
+                let kept: HashSet<String> = kept.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+                gate.retain(|key| kept.contains(key));
                 continue;
             }
             let key = text(step, "key").unwrap_or_default();

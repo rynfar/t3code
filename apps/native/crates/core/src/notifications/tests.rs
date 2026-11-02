@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use super::*;
+use crate::shell::{ShellSnapshot, ShellStreamItem};
 
 fn thread(id: &str, status: &str, extra: Value) -> ThreadShell {
     let mut value = json!({
@@ -20,13 +21,33 @@ fn thread(id: &str, status: &str, extra: Value) -> ThreadShell {
     serde_json::from_value(value).unwrap()
 }
 
+/// The live shell the watcher reads: each step is a new snapshot, as a reconnect would send.
+#[derive(Default)]
+struct Watched {
+    shell: ShellState,
+    watcher: ThreadNotifications,
+}
+
+impl Watched {
+    fn observe(&mut self, threads: &[ThreadShell]) -> Vec<ThreadNotification> {
+        let snapshot = ShellSnapshot { threads: threads.to_vec(), ..ShellSnapshot::default() };
+        self.shell.apply(ShellStreamItem::Snapshot { snapshot: Box::new(snapshot), resolved_repository_identity_roots: None });
+        self.watcher.observe(&self.shell)
+    }
+
+    fn update(&mut self, sequence: u64, thread: ThreadShell) -> Vec<ThreadNotification> {
+        self.shell.apply(ShellStreamItem::ThreadUpdated { sequence, location: "active".into(), thread: Box::new(thread) });
+        self.watcher.observe(&self.shell)
+    }
+}
+
 fn kinds(notifications: &[ThreadNotification]) -> Vec<(&str, &str)> {
     notifications.iter().map(|n| (n.thread_id.as_str(), n.title)).collect()
 }
 
 #[test]
 fn transitions_notify_and_first_sightings_do_not() {
-    let mut watcher = ThreadNotifications::default();
+    let mut watcher = Watched::default();
     let completed = json!({"latestRunCompletedAt": "2026-11-01T00:05:00.000Z"});
     assert!(watcher.observe(&[thread("a", "completed", completed.clone()), thread("b", "running", json!({}))]).is_empty());
 
@@ -38,11 +59,17 @@ fn transitions_notify_and_first_sightings_do_not() {
     let finished = json!({"latestRunCompletedAt": "2026-11-01T00:09:00.000Z"});
     assert_eq!(kinds(&watcher.observe(&[thread("a", "completed", completed.clone()), thread("b", "completed", finished.clone())])), [("b", "Thread completed")]);
     assert!(watcher.observe(&[thread("a", "completed", completed), thread("b", "completed", finished)]).is_empty(), "one completion notifies once");
+
+    // A delta replaces one row; the next observation reads it and keeps the rest.
+    let asking = json!({"latestRunId": "run-2", "pendingRuntimeRequest": {"id": "r2", "kind": "command_approval", "createdAt": "2026-11-01T00:10:00.000Z"}});
+    assert_eq!(kinds(&watcher.update(1, thread("a", "running", asking))), [("a", "Approval needed")]);
+    let renamed = json!({"latestRunCompletedAt": "2026-11-01T00:09:00.000Z", "title": "Renamed"});
+    assert!(watcher.update(2, thread("b", "completed", renamed)).is_empty());
 }
 
 #[test]
 fn archived_stopped_and_nested_threads_stay_quiet() {
-    let mut watcher = ThreadNotifications::default();
+    let mut watcher = Watched::default();
     let child = json!({"lineage": {"parentThreadId": "p", "relationshipToParent": "subagent", "rootThreadId": "p"}});
     watcher.observe(&[thread("archived", "running", json!({})), thread("stopped", "running", json!({})), thread("child", "running", child.clone())]);
     let done = |extra: Value| {
