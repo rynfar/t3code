@@ -4,19 +4,19 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px};
+use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListSizingBehavior, ListState, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, list, prelude::FluentBuilder, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use serde_json::Value;
 use t3_core::timeline::{
     RowKind, TimelineRow, WorkIcon, has_question_answer, question_answer_preview, question_text_preview, WorkLogEntry, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args, summary_icon,
     tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group,
-    work_entry_read_output, work_log_entry_is_tool_like, ToolGroupAction, ToolStatus,
+    work_entry_read_output, work_log_entry_is_tool_like, ToolGroupAction, ToolStatus, command_output_text,
 };
 use t3_core::turn_item::TurnItemKind;
 
 use super::markdown::{MarkdownStore, prose};
-use super::parts::{chevron, icon_slot, mono_block, timestamp, work_line, work_row_frame};
-use super::RowEnv;
+use super::parts::{chevron, focusable, icon_slot, mono_block, timestamp, work_line, work_row_frame};
+use super::{Detail, RowEnv};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::thread_view::ThreadView;
@@ -50,58 +50,69 @@ fn pending_approval<'a>(entry: &'a WorkLogEntry, env: &RowEnv) -> Option<&'a Wor
     }
 }
 
-/// `WorkGroupSection`: one standalone row per entry, or the expanded list of a group.
-pub fn work_section(
-    id: &str,
-    entries: &[Arc<WorkLogEntry>],
-    expanded_group: bool,
-    display_label: Option<&str>,
-    env: &RowEnv,
-    markdown: &mut MarkdownStore,
-    cx: &mut Context<ThreadView>,
-) -> AnyElement {
-    let visible: Vec<&Arc<WorkLogEntry>> = entries
+/// `WorkGroupSection`: one standalone row per entry, or the open list of a group.
+pub fn work_section(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
+    let RowKind::Work { entries, expanded_group, display_label } = &row.kind else { return div().into_any_element() };
+    let visible: Vec<Arc<WorkLogEntry>> = entries
         .iter()
-        .filter(|e| pending_approval(e, env).is_some() || work_entry_is_visible_in_group(e, expanded_group))
+        .filter(|e| pending_approval(e, env).is_some() || work_entry_is_visible_in_group(e, *expanded_group))
+        .cloned()
         .collect();
     if visible.is_empty() {
         return div().into_any_element();
     }
-    if expanded_group && visible.iter().all(|e| e.item_type == Some("reasoning")) {
-        return reasoning_trace(id, &visible, markdown, cx);
+    if *expanded_group {
+        return group_list(&row.id, visible, env, cx);
     }
-    let rows: Vec<AnyElement> = visible.iter().map(|entry| entry_row(entry, display_label, expanded_group, env, markdown, cx)).collect();
-    if expanded_group {
-        let viewport = env.window_height * 0.5;
-        return div()
-            .id(SharedString::from(format!("{id}:list")))
-            .w_full()
-            .max_h(px(288f32.min(viewport)))
-            .overflow_y_scroll()
-            .child(v_flex().w_full().min_w_0().children(rows))
-            .into_any_element();
-    }
+    let rows: Vec<AnyElement> = visible.iter().map(|entry| entry_row(entry, display_label.as_deref(), false, env, markdown, cx)).collect();
     v_flex().w_full().min_w_0().children(rows).into_any_element()
 }
 
-fn reasoning_trace(id: &str, entries: &[&Arc<WorkLogEntry>], markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
-    let blocks: Vec<AnyElement> = entries
-        .iter()
-        .filter_map(|entry| {
-            let text: Arc<str> = Arc::from(entry.detail.as_deref()?);
-            let state = markdown.state(&format!("reasoning:{}", entry.id), &text, cx);
-            Some(prose(&state, cx).into_any_element())
-        })
-        .collect();
-    div()
-        .id(SharedString::from(format!("{id}:trace")))
-        .ml(px(28.))
-        .px(px(2.))
-        .py(px(4.))
-        .max_h(px(384.))
-        .overflow_y_scroll()
-        .child(v_flex().gap(px(12.)).children(blocks))
-        .into_any_element()
+/// The open group's members in their own virtualized list (`ExpandedWorkGroupEntries`, a
+/// LegendList on the web): `min(288px, 50% of the window)` tall, plus room for members the user
+/// opened, so only the rows in view are built. A group of thoughts is the reasoning trace,
+/// capped at 384.
+fn group_list(id: &str, members: Vec<Arc<WorkLogEntry>>, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+    let count = members.len();
+    let reasoning = members.iter().all(|e| e.item_type == Some("reasoning"));
+    let opened = members.iter().filter(|e| env.ui.expanded_entries.contains(&e.id)).count() as f32;
+    let cap = if reasoning { 384. } else { 288f32.min(env.window_height * 0.5) + opened * 264. };
+    let state = {
+        let mut lists = env.group_lists.borrow_mut();
+        let state = lists.entry(id.to_owned()).or_insert_with(|| ListState::new(count, ListAlignment::Top, px(240.)));
+        let previous = state.item_count();
+        if count > previous {
+            state.splice(previous..previous, count - previous);
+        } else if count < previous {
+            state.reset(count);
+        }
+        state.clone()
+    };
+    let members = Arc::new(members);
+    let list = list(
+        state,
+        cx.processor(move |view: &mut ThreadView, ix: usize, _window, cx| match members.get(ix) {
+            Some(entry) => view.render_group_member(entry, cx),
+            None => div().into_any_element(),
+        }),
+    )
+    .with_sizing_behavior(ListSizingBehavior::Infer)
+    .w_full()
+    .max_h(px(cap));
+    let body = div().w_full().min_w_0().child(list);
+    if reasoning { body.ml(px(28.)).px(px(2.)).py(px(4.)).into_any_element() } else { body.into_any_element() }
+}
+
+/// One member of an open group: a work row, or one thought of a reasoning trace.
+pub fn group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
+    if entry.item_type == Some("reasoning")
+        && let Some(detail) = entry.detail.as_deref()
+    {
+        let text: Arc<str> = Arc::from(detail);
+        let state = markdown.state(&format!("reasoning:{}", entry.id), &text, cx);
+        return div().pb(px(12.)).child(prose(&state, cx)).into_any_element();
+    }
+    entry_row(entry, None, true, env, markdown, cx)
 }
 
 /// `WorkEntryLogRow`.
@@ -210,9 +221,7 @@ fn entry_row(
     let mut frame = work_row_frame(SharedString::from(format!("work-entry:{}", entry.id)), grouped)
         .child(work_line(Some(icon_slot(icon, icon_color)), label, trailing, false, cx));
     if can_expand {
-        frame = frame
-            .cursor_pointer()
-            .on_click(cx.listener(move |view, _, _, cx| view.toggle_entry(&entry_id, cx)));
+        frame = focusable(frame, cx).cursor_pointer().on_click(cx.listener(move |view, _, _, cx| view.toggle_entry(&entry_id, cx)));
     }
     if expanded && reasoning && let Some(detail) = entry.detail.as_deref() {
         let text: Arc<str> = Arc::from(detail);
@@ -317,6 +326,26 @@ fn muted_line(text: impl Into<SharedString>, cx: &App) -> AnyElement {
     div().text_xs().italic().text_color(hsla(palette(cx).muted_foreground)).child(text.into()).into_any_element()
 }
 
+fn fetched_item<'a>(entry: &WorkLogEntry, env: &'a RowEnv) -> Option<&'a Arc<t3_core::turn_item::TurnItem>> {
+    match env.details.get(&entry.item.as_ref()?.id)? {
+        Detail::Loaded { item, .. } => Some(item),
+        _ => None,
+    }
+}
+
+/// `ToolOutput`'s states for output fetched with `getTurnItem`.
+fn fetch_status(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> AnyElement {
+    let detail = entry.item.as_ref().and_then(|item| env.details.get(&item.id));
+    match detail {
+        Some(Detail::Failed { message, .. }) => {
+            div().text_xs().text_color(hsla(palette(cx).destructive)).child(format!("Couldn't load output: {message}")).into_any_element()
+        }
+        Some(Detail::Missing { .. }) => muted_line("Output is no longer available.", cx),
+        Some(Detail::Loaded { .. }) => muted_line("No output.", cx),
+        Some(Detail::Loading { .. }) | None => muted_line("Loading output…", cx),
+    }
+}
+
 /// The expanded body: `V2ItemInspector` for projected items, plain output for reads and skills.
 fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> Option<AnyElement> {
     let p = palette(cx);
@@ -331,11 +360,23 @@ fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> Option<AnyElem
     match &item.kind {
         TurnItemKind::CommandExecution { input, output, output_omitted, exit_code, .. } => {
             parts.push(mono_block(format!("$ {}", t3_core::timeline::command_display_text(input)), cx).text_color(hsla(p.foreground).opacity(0.85)).into_any_element());
-            match output.as_deref().map(str::trim_end).filter(|o| !o.trim().is_empty()) {
-                Some(output) => parts.push(mono_block(output.to_owned(), cx).into_any_element()),
-                None if *output_omitted => parts.push(muted_line("Output not loaded.", cx)),
+            let fetched = fetched_item(entry, env);
+            let output = match (*output_omitted, fetched) {
+                (true, Some(item)) => match &item.kind {
+                    TurnItemKind::CommandExecution { output, .. } => output.clone(),
+                    _ => None,
+                },
+                _ => output.clone(),
+            };
+            match output.as_deref().and_then(command_output_text) {
+                Some(output) => parts.push(mono_block(output.trim_end().to_owned(), cx).into_any_element()),
+                None if *output_omitted => parts.push(fetch_status(entry, env, cx)),
                 None => {}
             }
+            let exit_code = match fetched.map(|item| &item.kind) {
+                Some(TurnItemKind::CommandExecution { exit_code, .. }) => exit_code.or(*exit_code),
+                _ => *exit_code,
+            };
             if let Some(code) = exit_code.filter(|code| *code != 0) {
                 parts.push(mono_block(format!("exit {code}"), cx).text_color(hsla(p.destructive)).into_any_element());
             }
@@ -411,10 +452,15 @@ fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> Option<AnyElem
                     }
                 }
             }
+            let output = match (*output_omitted, fetched_item(entry, env).map(|item| &item.kind)) {
+                (true, Some(TurnItemKind::DynamicTool { output, .. })) => output.clone(),
+                (true, _) => None,
+                (false, _) => output.clone(),
+            };
             match output.as_ref().and_then(tool_value_text) {
-                Some(text) if !output_omitted => parts.push(mono_block(text, cx).text_color(hsla(p.muted_foreground)).into_any_element()),
-                _ if *output_omitted => parts.push(muted_line("Output not loaded.", cx)),
-                _ => {}
+                Some(text) => parts.push(mono_block(text, cx).text_color(hsla(p.muted_foreground)).into_any_element()),
+                None if *output_omitted => parts.push(fetch_status(entry, env, cx)),
+                None => {}
             }
         }
         TurnItemKind::ApprovalRequest { prompt: Some(prompt), .. } => parts.push(mono_block(prompt.clone(), cx).into_any_element()),
@@ -574,7 +620,7 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
     };
     let group_id = group_id.to_owned();
     let row_id = id.to_owned();
-    work_row_frame(SharedString::from(format!("live:{id}")), false)
+    focusable(work_row_frame(SharedString::from(format!("live:{id}")), false), cx)
         .cursor_pointer()
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_group(&group_id, &row_id, cx)))
         .when(!thought_line.is_empty(), |this| {
@@ -596,15 +642,14 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
 }
 
 /// `ThinkingTimelineRow`.
-pub fn thinking_row(id: &str, group_id: Option<&str>, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn thinking_row(id: &str, group_id: Option<&str>, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
     let activity = live_activity(div().text_color(hsla(p.secondary_label)).child("Thinking").into_any_element(), Icon::WorkBrain, false, cx);
     let frame = work_row_frame(SharedString::from(format!("thinking:{id}")), false).child(activity);
-    let _ = env;
     match group_id {
         Some(group_id) => {
             let (group_id, row_id) = (group_id.to_owned(), id.to_owned());
-            frame.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| view.toggle_group(&group_id, &row_id, cx))).into_any_element()
+            focusable(frame, cx).cursor_pointer().on_click(cx.listener(move |view, _, _, cx| view.toggle_group(&group_id, &row_id, cx))).into_any_element()
         }
         None => frame.into_any_element(),
     }
@@ -618,7 +663,7 @@ pub fn group_header(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView
     let icon = if tool_surface.is_some() { Icon::WorkMonitor } else { work_icon(summary_icon(*summary_kind)) };
     let trailing = row.created_at.as_deref().map(|at| vec![timestamp(&env.clock, at, false, cx)]).unwrap_or_default();
     let (group_id, row_id) = (group_id.to_owned(), id.to_owned());
-    work_row_frame(SharedString::from(format!("toggle:{id}")), false)
+    focusable(work_row_frame(SharedString::from(format!("toggle:{id}")), false), cx)
         .cursor_pointer()
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_group(&group_id, &row_id, cx)))
         .child(work_line(

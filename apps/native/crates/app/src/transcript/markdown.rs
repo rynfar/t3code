@@ -6,35 +6,45 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{App, AppContext, ClipboardItem, Entity, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, div, px, rems};
+use gpui::{App, AppContext, ClipboardItem, Entity, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, div, px, rems};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
 
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
-const CACHE_LIMIT: usize = 400;
+/// States kept regardless of when they were drawn; beyond this, states not drawn in the last
+/// few frames (rows the list no longer renders) are dropped and rebuilt if scrolled back to.
+const SOFT_LIMIT: usize = 48;
+const KEEP_FRAMES: u64 = 2;
 
 struct Cached {
     text: Arc<str>,
     state: Entity<TextViewState>,
-    used: u64,
+    drawn: u64,
 }
 
-/// Markdown states keyed by the row that shows them. Bounded: past the limit the least
-/// recently drawn half is dropped and rebuilt if scrolled back into view.
+/// Markdown states keyed by the row that shows them, created lazily when a row renders.
 #[derive(Default)]
 pub struct MarkdownStore {
     states: HashMap<String, Cached>,
-    clock: u64,
+    frame: u64,
 }
 
 impl MarkdownStore {
+    /// Called once per transcript render, before rows draw.
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+        if self.states.len() > SOFT_LIMIT {
+            let frame = self.frame;
+            self.states.retain(|_, cached| cached.drawn + KEEP_FRAMES >= frame);
+        }
+    }
+
     /// The state for `key`, brought up to `text`. Appends stream; anything else replaces.
     pub fn state(&mut self, key: &str, text: &Arc<str>, cx: &mut App) -> Entity<TextViewState> {
-        self.clock += 1;
         if let Some(cached) = self.states.get_mut(key) {
-            cached.used = self.clock;
+            cached.drawn = self.frame;
             if !Arc::ptr_eq(&cached.text, text) && *cached.text != **text {
                 let previous = cached.text.clone();
                 cached.text = text.clone();
@@ -45,14 +55,8 @@ impl MarkdownStore {
             }
             return cached.state.clone();
         }
-        if self.states.len() >= CACHE_LIMIT {
-            let mut used: Vec<u64> = self.states.values().map(|cached| cached.used).collect();
-            used.sort_unstable();
-            let cutoff = used[used.len() / 2];
-            self.states.retain(|_, cached| cached.used > cutoff);
-        }
         let state = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
-        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), used: self.clock });
+        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame });
         state
     }
 
@@ -111,19 +115,12 @@ pub fn markdown_view(state: &Entity<TextViewState>, cx: &App) -> TextView {
                         .text_color(hsla(p.foreground).opacity(0.72))
                         .child(lang)
                 }))
-                .child(
-                    div()
-                        .id("copy-code")
-                        .size(px(24.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(hsla(p.accent)))
-                        .child(Icon::Copy.render(px(12.), hsla(p.muted_foreground)))
-                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()))),
-                )
+                .child(super::parts::ghost_icon_button(
+                    "copy-code",
+                    Icon::Copy,
+                    move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(code.to_string())),
+                    cx,
+                ))
         })
         .on_link_click(|url: &SharedString, _, _, cx| {
             if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {

@@ -5,16 +5,22 @@ pub mod markdown;
 mod messages;
 mod notices;
 mod parts;
+mod timer;
 mod work;
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div, px};
-use t3_core::timeline::{Role, RowKind, TimelineRow};
+use gpui::{AnyElement, Context, Entity, IntoElement, ListState, ParentElement, Styled, div, px};
+use t3_core::timeline::{Role, RowKind, TimelineRow, WorkLogEntry};
+use t3_core::turn_item::TurnItem;
 
 use crate::thread_view::ThreadView;
 use markdown::MarkdownStore;
+pub use notices::history_control;
 pub use parts::Clock;
+pub use timer::WorkingTimer;
 
 /// Disclosure state the user controls. Folds and groups feed row derivation; the rest only
 /// change how a row draws.
@@ -28,12 +34,32 @@ pub struct TranscriptUi {
     pub expanded_plans: HashSet<String>,
 }
 
+/// Withheld output fetched with `orchestration.getTurnItem`, keyed by item id.
+pub enum Detail {
+    Loading { revision: String },
+    Loaded { revision: String, item: Arc<TurnItem> },
+    Missing { revision: String },
+    Failed { revision: String, message: String },
+}
+
+impl Detail {
+    pub fn revision(&self) -> &str {
+        match self {
+            Detail::Loading { revision } | Detail::Loaded { revision, .. } | Detail::Missing { revision } | Detail::Failed { revision, .. } => revision,
+        }
+    }
+}
+
 pub struct RowEnv<'a> {
     pub clock: Clock,
     pub workspace_root: Option<&'a str>,
     pub ui: &'a TranscriptUi,
     pub pending_approvals: &'a HashSet<String>,
     pub window_height: f32,
+    pub details: &'a HashMap<String, Detail>,
+    /// Scroll state of each open work group's own virtualized list.
+    pub group_lists: &'a RefCell<HashMap<String, ListState>>,
+    pub working_timer: Option<&'a Entity<WorkingTimer>>,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.
@@ -55,16 +81,14 @@ fn bottom_space(row: &TimelineRow) -> f32 {
     }
 }
 
-pub fn render_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
     let id = row.id.as_str();
     let content = match &row.kind {
-        RowKind::Work { entries, expanded_group, display_label } => {
-            work::work_section(id, entries, *expanded_group, display_label.as_deref(), env, markdown, cx)
-        }
+        RowKind::Work { .. } => work::work_section(row, env, markdown, cx),
         RowKind::WorkLive { .. } => work::live_row(row, env, cx),
-        RowKind::Thinking { group_id, .. } => work::thinking_row(id, group_id.as_deref(), env, cx),
+        RowKind::Thinking { group_id, .. } => work::thinking_row(id, group_id.as_deref(), cx),
         RowKind::WorkToggle { .. } => work::group_header(row, env, cx),
-        RowKind::Working { compacting } => notices::working_row(row.created_at.as_deref(), *compacting, env, cx),
+        RowKind::Working { compacting } => notices::working_row(*compacting, env, cx),
         RowKind::TurnFold { run_id, label, expanded } => notices::turn_fold(id, run_id, label, *expanded, row.created_at.as_deref(), env, cx),
         RowKind::AttemptFold { attempt_id, label, expanded } => notices::attempt_fold(id, attempt_id, label, *expanded, cx),
         RowKind::ContextCompaction { label, tokens, title, failed, failure, .. } => {
@@ -77,4 +101,9 @@ pub fn render_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore,
         RowKind::ProposedPlan(plan) => messages::plan_card(id, plan, env, markdown, cx),
     };
     div().w_full().min_w_0().pb(px(bottom_space(row))).child(content).into_any_element()
+}
+
+/// One member of an open work group, drawn by the group's own virtualized list.
+pub fn render_group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
+    work::group_member(entry, env, markdown, cx)
 }

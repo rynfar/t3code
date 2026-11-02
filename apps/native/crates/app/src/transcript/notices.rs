@@ -11,7 +11,7 @@ use gpui_component::{h_flex, v_flex};
 use t3_core::timeline::{CompactionTokens, format_duration, parse_iso_ms};
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
-use super::parts::{ROW_GROUP, DividerTone, icon_slot, system_divider, timestamp, work_line, work_row_frame};
+use super::parts::{ROW_GROUP, DividerTone, focusable, icon_slot, system_divider, timestamp, work_line, work_row_frame};
 use super::RowEnv;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -30,7 +30,7 @@ pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at
         .pr(px(2.))
         .border_b_1()
         .border_color(hsla(p.border).opacity(0.6))
-        .child(
+        .child(focusable(
             h_flex()
                 .id(SharedString::from(format!("fold-button:{id}")))
                 .gap(px(4.))
@@ -44,7 +44,8 @@ pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at
                 .on_click(cx.listener(move |view, _, _, cx| view.toggle_run(&run_id, cx)))
                 .child(label.to_owned())
                 .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(14.), hsla(p.muted_foreground))),
-        )
+            cx,
+        ))
         .child(div().flex_1())
         .children(created_at.map(|at| timestamp(&env.clock, at, false, cx)))
         .into_any_element()
@@ -53,7 +54,7 @@ pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at
 pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
     let attempt_id = attempt_id.to_owned();
-    h_flex()
+    let fold = h_flex()
         .id(SharedString::from(format!("attempt:{id}")))
         .w_full()
         .gap(px(8.))
@@ -68,22 +69,16 @@ pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, cx:
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_attempt(&attempt_id, cx)))
         .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(14.), hsla(p.muted_foreground)))
         .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground).opacity(0.8)).child(label.to_owned()))
-        .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Cut off by a steer"))
-        .into_any_element()
+        .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Cut off by a steer"));
+    focusable(fold, cx).into_any_element()
 }
 
-/// `WorkingTimelineRow`: "Working for 12s", ticking once a second.
-pub fn working_row(created_at: Option<&str>, compacting: bool, env: &RowEnv, cx: &App) -> AnyElement {
+/// `WorkingTimelineRow`: "Working for 12s". The label is its own view that ticks itself.
+pub fn working_row(compacting: bool, env: &RowEnv, cx: &App) -> AnyElement {
     let p = palette(cx);
-    let elapsed = created_at.and_then(parse_iso_ms).map(|start| {
-        let seconds = ((env.clock.now_ms - start).max(0) / 1_000) as f64;
-        format_duration((seconds * 1_000.).max(1_000.))
-    });
-    let label = match (compacting, elapsed) {
-        (true, Some(elapsed)) => format!("Compacting for {elapsed}"),
-        (true, None) => "Compacting…".to_owned(),
-        (false, Some(elapsed)) => format!("Working for {elapsed}"),
-        (false, None) => "Working...".to_owned(),
+    let label = match env.working_timer {
+        Some(timer) => timer.clone().into_any_element(),
+        None => div().child(if compacting { "Compacting…" } else { "Working..." }).into_any_element(),
     };
     div()
         .w_full()
@@ -101,6 +96,41 @@ pub fn working_row(created_at: Option<&str>, compacting: bool, env: &RowEnv, cx:
                 .when(compacting, |this| this.child(Icon::Minimize2.render(px(12.), hsla(p.muted_foreground))))
                 .child(label),
         )
+        .into_any_element()
+}
+
+/// `TimelineHistoryControl`: "Load earlier turns" between two hairlines, its loading state, and
+/// the last error. Clicking again retries.
+pub fn history_control(has_more: bool, loading: bool, error: Option<&str>, cx: &mut Context<ThreadView>) -> AnyElement {
+    let p = palette(cx);
+    let line = || div().h(px(1.)).flex_1().bg(hsla(p.border).opacity(0.7));
+    let button = has_more.then(|| {
+        let button = h_flex()
+            .id("load-earlier-turns")
+            .w_full()
+            .gap(px(12.))
+            .py(px(6.))
+            .text_xs()
+            .text_color(hsla(p.muted_foreground))
+            .child(line())
+            .child(div().flex_none().child(if loading { "Loading earlier turns…" } else { "Load earlier turns" }))
+            .child(line());
+        if loading {
+            button.into_any_element()
+        } else {
+            focusable(button, cx)
+                .cursor_pointer()
+                .hover(|style| style.text_color(hsla(p.foreground)))
+                .on_click(cx.listener(|view, _, _, cx| view.load_earlier(cx)))
+                .into_any_element()
+        }
+    });
+    v_flex()
+        .w_full()
+        .gap(px(6.))
+        .pb(px(8.))
+        .children(button)
+        .children(error.map(|error| div().w_full().text_center().text_xs().text_color(hsla(p.muted_foreground)).child(error.to_owned())))
         .into_any_element()
 }
 
@@ -220,7 +250,7 @@ fn subagent_row(item: &Arc<TurnItem>, env: &RowEnv, cx: &mut Context<ThreadView>
         })
         .children(elapsed_label(item, env.clock.now_ms).map(|elapsed| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(elapsed)));
     if let Some(child) = child_thread_id.clone() {
-        row = row
+        row = focusable(row, cx)
             .cursor_pointer()
             .hover(|style| style.bg(hsla(p.accent).opacity(0.2)))
             .child(Icon::ChevronRight.render(px(14.), hsla(p.muted_foreground).opacity(0.6)))
@@ -248,8 +278,11 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], env: &RowEnv, cx: &mut Co
     }
     let label = format!("{} {}", members.len(), if members.len() == 1 { "subagent" } else { "subagents" });
     let key = format!("subagent-group:{id}");
+    let ring = hsla(p.ring);
     let header = h_flex()
         .id(SharedString::from(format!("subagents:{id}")))
+        .tab_index(0)
+        .focus_visible(move |style| style.border_2().border_color(ring))
         .w_full()
         .gap(px(10.))
         .py(px(8.))
@@ -355,8 +388,7 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
             } else {
                 target_thread_id.clone()
             };
-            div()
-                .id(SharedString::from(format!("fork:{id}")))
+            focusable(div().id(SharedString::from(format!("fork:{id}"))), cx)
                 .cursor_pointer()
                 .on_click(cx.listener(move |view, _, _, cx| view.open_thread(&target, cx)))
                 .child(system_divider(
@@ -371,8 +403,7 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
         TurnItemKind::ThreadCreated { target_thread_id, .. } => {
             let title = item.title.clone().unwrap_or_else(|| "Created thread".into());
             let target = target_thread_id.clone();
-            let open = div()
-                .id(SharedString::from(format!("open-thread:{id}")))
+            let open = focusable(div().id(SharedString::from(format!("open-thread:{id}"))), cx)
                 .flex_none()
                 .text_size(px(14.))
                 .text_color(hsla(p.primary))
