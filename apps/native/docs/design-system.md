@@ -133,6 +133,21 @@ are evaluated inside `[data-app-sidebar]`, which redefines the surface variables
 | `pill_plan_dot`                  | `bg-violet-500 dark:bg-violet-300/90`                  | `#8e51ff`   | `#c4b4ffe6` |
 | `pill_completed`                 | `text-emerald-600 dark:text-emerald-300/90`            | `#009966`   | `#5ee9b5e6` |
 | `pill_completed_dot`             | `bg-emerald-500 dark:bg-emerald-300/90`                | `#00bc7d`   | `#5ee9b5e6` |
+| `usage_codex`                    | `usageProviders.ts codex`                              | `#18181b`   | `#f5f5f5`   |
+| `usage_claude`                   | `usageProviders.ts claude`                             | `#d97757`   | `#d97757`   |
+| `usage_grok`                     | `usageProviders.ts grok`                               | `#4f4f52`   | `#9e9e9e`   |
+| `usage_cursor`                   | `usageProviders.ts cursor`                             | `#8b8b8b`   | `#8b8b8b`   |
+| `usage_opencode`                 | `usageProviders.ts opencode`                           | `#5b9bbd`   | `#5b9bbd`   |
+| `usage_antigravity`              | `usageProviders.ts antigravity`                        | `#8c7bd1`   | `#8c7bd1`   |
+| `usage_pi`                       | `usageProviders.ts pi`                                 | `#4d9f8a`   | `#4d9f8a`   |
+| `usage_muse`                     | `usageProviders.ts muse`                               | `#0866ff`   | `#0866ff`   |
+| `usage_ink_30`                   | `usageBreakdown.ts ink(30)`                            | `#b0b0b1`   | `#2b2b2b`   |
+| `usage_ink_34`                   | `usageBreakdown.ts ink(34)`                            | `#a6a6a8`   | `#353535`   |
+| `usage_ink_44`                   | `usageBreakdown.ts ink(44)`                            | `#8e8e90`   | `#4f4f4f`   |
+| `usage_ink_60`                   | `usageBreakdown.ts ink(60)`                            | `#69696c`   | `#7b7b7b`   |
+| `usage_ink_66`                   | `usageBreakdown.ts ink(66)`                            | `#5c5c5f`   | `#8c8c8c`   |
+| `usage_ink_72`                   | `usageBreakdown.ts ink(72)`                            | `#4f4f52`   | `#9e9e9e`   |
+| `usage_ink_100`                  | `usageBreakdown.ts ink(100)`                           | `#18181b`   | `#f5f5f5`   |
 | `glass_surface`                  | `@utility surface-glass`                               | `#fcfcfccc` | `#000000cc` |
 | `dialog_surface`                 | `@utility dialog-glass`                                | `#fcfcfccc` | `#000000cc` |
 | `dialog_border`                  | `@utility dialog-glass`                                | `#18181b1a` | `#ffffff14` |
@@ -167,6 +182,7 @@ are evaluated inside `[data-app-sidebar]`, which redefines the surface variables
 | Diff        | `diff_*`                                                                             | Diff panel and stats. Background mixes are in §7.8                                                                                                                 |
 | Toolbar     | `toolbar_*`                                                                          | Chat-header controls under named themes only (`html[data-theme-id] [data-chat-header]`). The default theme uses plain button variants, whose colors are the same   |
 | Status hues | `status_input_icon`, `terminal_running`, `pill_*`                                    | Hues the web hard-codes as Tailwind classes. They are not themeable                                                                                                |
+| Usage       | `usage_<provider>`, `usage_ink_*`                                                    | Usage page series, dots and limit bars per provider; share-bar segments (foreground mixed into the background)                                                     |
 | Glass       | `glass_surface`, `dialog_*`, `dropdown_*`                                            | Fills to use with backdrop blur (§4.6). `dialog_backdrop` is the modal scrim                                                                                       |
 | Sidebar     | `sidebar*`                                                                           | Everything inside the app sidebar. Ghost-button hover inside the sidebar is `sidebar_accent`, not `accent`                                                         |
 

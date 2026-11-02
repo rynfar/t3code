@@ -112,6 +112,7 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     items.push(action("action:previous-thread", "Previous thread", &["navigate"], Some("thread.previous")));
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
     items.push(action("action:settings", "Open settings", &["settings", "preferences", "configuration", "keybindings"], None));
+    items.push(action("action:usage", "Open usage", &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"], Some("usage.open")));
     items.push(action("action:switch-environment", "Switch environment...", &["environment", "server", "connect", "pair", "machine", "disconnect"], None));
     items
 }
@@ -407,6 +408,7 @@ impl CommandPalette {
                 "open-thread-pull-requests" => Box::new(crate::pull_requests::ShowLinkedPullRequests),
                 "pull-requests" => Box::new(crate::pull_requests::OpenPullRequests),
                 "switch-environment" => Box::new(crate::menus::SwitchEnvironment),
+                "usage" => keymap::action_for("usage.open"),
                 "settings" => {
                     crate::settings::open(t3_core::settings::search::Section::General, cx);
                     return;

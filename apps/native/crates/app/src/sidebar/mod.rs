@@ -416,19 +416,51 @@ impl SidebarPane {
         }
     }
 
+    /// The footer row (`SidebarUtilityMenu`): Settings, Pull requests and Usage, then the undo notice.
+    /// The pull requests page shows only its Back button there.
+    fn render_utilities(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let pull_requests_open = self.state.read(cx).pull_requests_open;
+        let button = |id: &'static str, icon: Icon, label: &'static str, action: fn() -> Box<dyn gpui::Action>| {
+            div()
+                .id(id)
+                .size(px(32.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
+                .child(icon.render(px(16.), hsla(p.sidebar_icon)))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
+                .on_click(move |_, window, cx| window.dispatch_action(action(), cx))
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .pt(px(4.))
+            .pb(px(8.))
+            .when(!pull_requests_open, |this| this.child(button("sidebar-settings", Icon::Settings, "Settings", || Box::new(crate::settings::OpenSettings))))
+            .child(crate::pull_requests::sidebar_item(&self.state, window, cx))
+            .when(!pull_requests_open, |this| this.child(button("sidebar-usage", Icon::ChartNoAxesColumn, "Usage", || Box::new(crate::usage::OpenUsage))))
+            .children(self.render_footer(cx))
+    }
+
     fn render_footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let notice = self.state.read(cx).sidebar.undo.notice()?;
         let p = palette(cx);
         let label = crate::keymap::label("thread.undo", cx).map_or_else(|| "Undo".to_owned(), |shortcut| format!("{shortcut} to undo"));
         Some(
             div()
-                .flex_none()
                 .flex()
+                .min_w_0()
                 .items_center()
                 .gap(px(4.))
                 .h(px(24.))
-                .mx(px(8.))
-                .mb(px(8.))
                 .px(px(4.))
                 .text_size(px(11.))
                 .text_color(hsla(p.sidebar_muted_foreground))
@@ -489,8 +521,7 @@ impl Render for SidebarPane {
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .children(self.render_footer(cx))
+            .child(self.render_utilities(window, cx))
             .children(self.render_project_filter(cx))
-            .child(crate::pull_requests::sidebar_item(&self.state, window, cx))
     }
 }

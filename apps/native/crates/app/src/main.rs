@@ -36,6 +36,7 @@ mod thread_details;
 mod thread_view;
 mod toast;
 mod transcript;
+mod usage;
 mod workspace;
 
 use gpui::{App, Bounds, Entity, TitlebarOptions, Window, WindowBounds, WindowOptions, point, prelude::*, px, size};
@@ -105,6 +106,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     let state = cx.new(|cx| app_state::AppState::new(runtime, cx));
     menus::init(state.clone(), cx);
     settings::init(state.clone(), cx);
+    usage::init(state.clone(), cx);
     new_thread::init(state.clone(), cx);
     right_panel::init(state.clone(), cx);
     pull_requests::init(state.clone(), cx);
