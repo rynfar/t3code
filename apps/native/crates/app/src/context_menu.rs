@@ -140,6 +140,10 @@ impl ContextMenu {
         cx.notify();
     }
 
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.open.take().is_some() {
             cx.emit(DismissEvent);
