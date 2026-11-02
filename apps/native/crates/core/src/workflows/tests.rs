@@ -112,18 +112,21 @@ fn compacting_covers_a_running_compaction_and_an_unsettled_compact_turn() {
 #[test]
 fn stop_targets_the_live_run_or_background_work_when_thread_stop_is_missing() {
     let live = projection(vec![run("r1", 1, "completed", None), run("r2", 2, "waiting", None)], vec![], json!({}));
-    assert_eq!(stop_target(Some(&live), true), StopTarget::Thread);
-    assert_eq!(stop_target(Some(&live), false), StopTarget::Run("r2".into()));
+    assert_eq!(stop_target(Some(&live), None, true), StopTarget::Thread);
+    assert_eq!(stop_target(Some(&live), None, false), StopTarget::Run("r2".into()));
 
     let command = item("i1", "r1", "running", json!({"type": "command_execution", "input": "npm run dev"}));
     let background = projection(vec![run("r1", 1, "completed", None)], vec![command], json!({}));
-    assert_eq!(stop_target(Some(&background), false), StopTarget::Run("r1".into()));
+    assert_eq!(stop_target(Some(&background), None, false), StopTarget::Run("r1".into()));
 
     let persistent = item("i1", "r1", "running", json!({"type": "dynamic_tool", "toolName": "watch", "input": {"persistent": true}}));
     let idle = projection(vec![run("r1", 1, "completed", None)], vec![persistent], json!({}));
-    assert_eq!(stop_target(Some(&idle), false), StopTarget::Nothing);
+    assert_eq!(stop_target(Some(&idle), Some("r1"), false), StopTarget::Nothing, "a loaded detail outranks the shell");
 
     let tasks = json!({"providerThreads": [{"id": "pt1", "pendingBackgroundTasks": [{"taskId": "bash-1", "kind": "command"}]}]});
-    assert_eq!(stop_target(Some(&projection(vec![run("r1", 1, "interrupted", None)], vec![], tasks)), false), StopTarget::Run("r1".into()));
-    assert_eq!(stop_target(None, false), StopTarget::Nothing);
+    assert_eq!(stop_target(Some(&projection(vec![run("r1", 1, "interrupted", None)], vec![], tasks)), None, false), StopTarget::Run("r1".into()));
+    assert_eq!(stop_target(None, None, false), StopTarget::Nothing);
+    // A thread whose detail is not loaded here, such as an app-owned subagent's child.
+    assert_eq!(stop_target(None, Some("r7"), false), StopTarget::Run("r7".into()));
+    assert_eq!(stop_target(None, Some("r7"), true), StopTarget::Thread);
 }

@@ -342,12 +342,27 @@ fn labels_and_stop_rules_follow_the_relationships_panel() {
     assert_eq!(relationship_status_label(None), "Unknown");
 
     let agent = |extra: Value| decode_agents(vec![subagent("a", Some("r1"), "running", T, extra)]).remove(0);
-    assert!(agent(json!({"origin": "app_owned"})).can_stop());
-    assert!(!agent(json!({"origin": "app_owned", "startedAt": null})).can_stop(), "not started yet");
+    assert!(agent(json!({"origin": "app_owned"})).can_stop(None));
+    assert!(!agent(json!({"origin": "app_owned", "startedAt": null})).can_stop(None), "not started yet");
     let strong = json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}});
-    assert!(agent(strong.clone()).can_stop());
-    assert!(!agent(json!({"origin": "provider_native", "driver": "codex", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}})).can_stop());
-    assert!(!agent(json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "weak", "nativeId": "x"}})).can_stop());
+    assert!(agent(strong.clone()).can_stop(None));
+    assert!(!agent(json!({"origin": "provider_native", "driver": "codex", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}})).can_stop(None));
+    assert!(!agent(json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "weak", "nativeId": "x"}})).can_stop(None));
     assert!(agent(merge(strong.clone(), json!({"workflow": {"phases": [], "agents": []}}))).can_stop_workflow());
-    assert!(!agent(strong).can_stop_workflow());
+    assert!(!agent(strong.clone()).can_stop_workflow());
+
+    // A finished task whose child thread runs again takes the child's run (`currentSubagent`).
+    let later = "2026-11-01T00:05:00.000Z";
+    let done = |extra: Value| decode_agents(vec![subagent("a", Some("r1"), "completed", T, merge(json!({"childThreadId": "kid", "completedAt": T}), extra))]).remove(0);
+    let resumed = child("kid", "t1", "subagent", "running", json!({"activityRunStatus": "running", "activityRunStartedAt": later, "latestRunRequestedAt": later}));
+    let app_owned = done(json!({"origin": "app_owned"}));
+    assert!(!app_owned.can_stop(None));
+    assert!(app_owned.can_stop(Some(&resumed)), "a resumed child keeps Stop");
+    let current = app_owned.current(Some(&resumed));
+    assert_eq!((current.status.as_str(), current.started_at.as_deref(), current.completed_at), ("running", Some(later), None));
+    let queued = child("kid", "t1", "subagent", "queued", json!({"latestRunRequestedAt": later}));
+    assert_eq!(app_owned.current(Some(&queued)).status, "pending");
+    let idle = child("kid", "t1", "subagent", "completed", json!({"latestRunRequestedAt": T}));
+    assert_eq!(app_owned.current(Some(&idle)), app_owned, "no newer run, no live run");
+    assert!(!done(strong).can_stop(Some(&resumed)), "a provider task's own status decides");
 }

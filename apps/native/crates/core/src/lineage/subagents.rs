@@ -452,16 +452,43 @@ pub fn reported_model_selection(projection: &ThreadProjection) -> Option<crate::
 }
 
 impl Subagent {
+    /// `currentSubagent` in `ThreadRelationshipsControl.tsx`: a finished task whose child thread
+    /// runs again, or ran since, takes that run's status and times.
+    pub fn current(&self, child: Option<&crate::shell::ThreadShell>) -> Subagent {
+        let Some(child) = child.filter(|_| !is_active_status(&self.status)) else { return self.clone() };
+        let live = child.activity_run_status.clone().or_else(|| (child.status == "queued").then(|| "queued".to_owned()));
+        let since = self.completed_at.as_deref().or(self.started_at.as_deref()).unwrap_or(&self.updated_at);
+        let newer = child.latest_run_requested_at.as_deref().and_then(parse_iso_ms).zip(parse_iso_ms(since)).is_some_and(|(run, task)| run > task);
+        if live.is_none() && !newer {
+            return self.clone();
+        }
+        let (started_at, completed_at) = match live {
+            Some(_) => (child.activity_run_started_at.clone().flatten(), None),
+            None => (child.latest_run_started_at.clone(), child.latest_run_completed_at.clone().flatten()),
+        };
+        let status = match live.as_deref().unwrap_or(&child.status) {
+            "preparing" | "starting" | "queued" => "pending",
+            "rolled_back" => "interrupted",
+            status => status,
+        };
+        Subagent { status: status.to_owned(), started_at, completed_at, progress: None, result: None, ..self.clone() }
+    }
+
     /// `canStop` in `ThreadRelationshipsControl.tsx`: app-owned tasks, and Claude's native tasks
-    /// with a strong reference, once started and while they work.
-    pub fn can_stop(&self) -> bool {
-        let live = is_active_status(&self.status);
+    /// with a strong reference, once started and while they work. `child` is the task's thread,
+    /// which may run again after the task finished.
+    pub fn can_stop(&self, child: Option<&crate::shell::ThreadShell>) -> bool {
+        let current = self.current(child);
         let strong = self.native_task_ref.as_ref().is_some_and(|reference| {
             reference.get("strength").and_then(Value::as_str) == Some("strong") && reference.get("nativeId").is_some_and(|id| !id.is_null())
         });
         let stoppable = self.origin.as_deref() == Some("app_owned")
-            || (self.origin.as_deref() == Some("provider_native") && self.driver.as_deref() == Some("claudeAgent") && self.run_id.is_some() && strong && live);
-        stoppable && self.started_at.is_some() && live
+            || (self.origin.as_deref() == Some("provider_native")
+                && self.driver.as_deref() == Some("claudeAgent")
+                && self.run_id.is_some()
+                && strong
+                && is_active_status(&self.status));
+        stoppable && current.started_at.is_some() && is_active_status(&current.status)
     }
 
     /// `canStopWorkflow`: a running Claude workflow coordinator.

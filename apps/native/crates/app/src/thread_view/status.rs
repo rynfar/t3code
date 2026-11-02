@@ -461,12 +461,13 @@ impl ThreadView {
     /// `handleStopBackgroundWork`: the thread's Stop, which ends its background work; the line
     /// reads "Stopping..." while those tasks are still listed, for up to ten seconds.
     fn stop_background_work(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.thread_id.clone() else { return };
         if self.footer.background_stop.is_some() {
             return;
         }
         let ids = self.footer.lines.background.iter().flat_map(|work| work.items.iter().map(|item| item.task_id.clone())).collect();
         self.footer.background_stop = Some((ids, std::time::Instant::now()));
-        self.state.update(cx, |state, cx| state.stop_selected_thread(cx));
+        self.state.update(cx, |state, cx| state.stop_thread(&thread_id, cx));
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(BACKGROUND_STOP_RETRY).await;
             let _ = this.update(cx, |view, cx| {

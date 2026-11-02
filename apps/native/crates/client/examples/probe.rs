@@ -270,8 +270,8 @@ async fn main() -> anyhow::Result<()> {
             "workflows: handoff={} compacting={} stop={:?} stop_without_thread_stop={:?}",
             t3_core::workflows::supports_provider_handoff(projection),
             t3_core::workflows::is_compacting(projection, active),
-            t3_core::workflows::stop_target(Some(projection), thread_stop),
-            t3_core::workflows::stop_target(Some(projection), false),
+            t3_core::workflows::stop_target(Some(projection), None, thread_stop),
+            t3_core::workflows::stop_target(Some(projection), None, false),
         );
     }
     if let (Some(thread_id), Some(loads)) = (flag("--thread"), flag("--history").and_then(|n| n.parse::<usize>().ok())) {
