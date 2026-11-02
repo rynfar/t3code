@@ -37,6 +37,7 @@ pub mod thread_actions;
 pub mod timeline;
 pub mod traits;
 pub mod turn_item;
+pub mod usage;
 pub mod vcs;
 pub mod wire;
 pub mod workflows;

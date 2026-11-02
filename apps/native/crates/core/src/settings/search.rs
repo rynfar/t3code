@@ -163,6 +163,7 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("quit-confirmation", "Quit shortcut", General, &["confirmation desktop app exit direct hold double click press twice"]),
         SearchItem::new("app-version", "Version", About, &["about check for updates download install upgrade release"]),
         SearchItem::new("legacy-plan-mode", "Plan mode (legacy)", Labs, &["build plan composer old"]),
+        SearchItem::new("legacy-context-window-indicator", "Context window indicator (legacy)", Labs, &["composer meter usage tokens circle old"]),
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),

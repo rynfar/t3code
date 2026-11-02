@@ -50,6 +50,8 @@ pub struct ClientSettings {
     pub in_app_notifications_enabled: bool,
     /// Skills also show in the `/` menu as `/skill:name`.
     pub show_skills_in_slash_menu: bool,
+    /// Legacy context window indicator beside Send.
+    pub context_window_meter: bool,
 }
 
 impl Default for ClientSettings {
@@ -61,6 +63,7 @@ impl Default for ClientSettings {
             notification_mode: Default::default(),
             in_app_notifications_enabled: false,
             show_skills_in_slash_menu: true,
+            context_window_meter: false,
         }
     }
 }
@@ -90,6 +93,9 @@ impl ClientSettings {
         }
         if let Some(value) = field("showSkillsInSlashMenu").and_then(|v| v.as_bool()) {
             settings.show_skills_in_slash_menu = value;
+        }
+        if let Some(value) = field("contextWindowMeterEnabled").and_then(|v| v.as_bool()) {
+            settings.context_window_meter = value;
         }
         settings
     }
