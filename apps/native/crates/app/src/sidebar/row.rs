@@ -250,10 +250,7 @@ impl SidebarPane {
         let settle_id = thread.id.clone();
         let snooze_id = thread.id.clone();
         let actions = div()
-            .absolute()
-            .right_0()
-            .top_0()
-            .bottom_0()
+            .when(!state.is_woke, |this| this.absolute().right_0().top_0().bottom_0())
             .flex()
             .items_stretch()
             .invisible()
@@ -321,8 +318,11 @@ impl SidebarPane {
                                         .items_center()
                                         .justify_end()
                                         .text_xs()
-                                        .child(div().group_hover("sidebar-row", |this| this.invisible()).child(status_slot))
-                                        .child(actions),
+                                        .when_some(self.jump_hint(thread, cx), |this, hint| this.child(hint))
+                                        .when(!self.jump_hints_visible(), |this| {
+                                            this.child(div().when(!state.is_woke, |this| this.group_hover("sidebar-row", |this| this.invisible())).child(status_slot))
+                                                .child(actions)
+                                        }),
                                 ),
                         )
                         .child(div().mt(px(4.)).flex().items_center().gap(px(6.)).min_w_0().child(self.render_title(thread, title_color, state.recede, cx)))
@@ -349,7 +349,29 @@ impl SidebarPane {
             Section::Snoozed => thread.snoozed_until.map(|until| {
                 div().flex().items_center().gap(px(4.)).text_xs().text_color(hsla(p.info_foreground)).child(Icon::AlarmClock.sized(px(12.))).child(snooze_wake_label(until, now)).into_any_element()
             }),
-            _ if state.is_woke => Some(div().flex().items_center().gap(px(4.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.warning_foreground)).child(Icon::AlarmClock.sized(px(12.))).child("Woke").into_any_element()),
+            _ if state.is_woke => {
+                let id = thread.id.clone();
+                let woke_at = state.woke_at;
+                Some(
+                    div()
+                        .id(SharedString::from(format!("woke-{}", thread.id)))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.warning_foreground))
+                        .child(Icon::AlarmClock.sized(px(12.)))
+                        .child("Woke")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(woke_at) = woke_at {
+                                this.state.update(cx, |state, cx| state.acknowledge_woke(&id, woke_at, cx));
+                            }
+                        }))
+                        .into_any_element(),
+                )
+            }
             Section::Settled => settled_timestamp(thread).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
             _ => thread.latest_user_message_at.or(thread.updated_at).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
         };
@@ -389,12 +411,46 @@ impl SidebarPane {
                                 .flex()
                                 .items_center()
                                 .justify_end()
-                                .child(div().group_hover("sidebar-row", |this| this.invisible()).children(time))
-                                .child(div().absolute().right(px(-4.)).top_0().bottom_0().flex().invisible().group_hover("sidebar-row", |this| this.visible()).child(action)),
+                                .when_some(self.jump_hint(thread, cx), |this, hint| this.child(hint))
+                                .when(!self.jump_hints_visible(), |this| {
+                                    this.child(div().when(!state.is_woke, |this| this.group_hover("sidebar-row", |this| this.invisible())).children(time))
+                                        .child(div().absolute().right(px(-4.)).top_0().bottom_0().flex().invisible().group_hover("sidebar-row", |this| this.visible()).child(action))
+                                }),
                         ),
                 ),
             )
             .into_any_element()
+    }
+
+    fn jump_hints_visible(&self) -> bool {
+        self.jump_hints
+    }
+
+    /// The `mod+N` badge on the first nine rows while the jump modifier is held (`JumpHintBadge`).
+    fn jump_hint(&self, thread: &SidebarThread, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.jump_hints {
+            return None;
+        }
+        let model = self.state.read(cx).sidebar.model.clone();
+        let position = model.ordered.iter().take(9).position(|index| model.threads[*index].id == thread.id)?;
+        let label = crate::keymap::label(t3_core::keybindings::thread_jump_command_for_index(position)?, cx)?;
+        let p = palette(cx);
+        Some(
+            div()
+                .h(px(20.))
+                .min_w(px(20.))
+                .px(px(4.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(hsla(p.foreground).opacity(0.07))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.muted_foreground))
+                .child(label)
+                .into_any_element(),
+        )
     }
 
     fn render_shelf(&self, shelf: Shelf, count: usize, expanded: bool, cx: &mut Context<Self>) -> AnyElement {

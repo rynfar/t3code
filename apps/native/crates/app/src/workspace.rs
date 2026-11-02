@@ -115,6 +115,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| this.palette.update(cx, |palette, cx| palette.toggle(window, cx))))
             .on_action(|_: &Unimplemented, _, cx| cx.propagate())
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
+            }))
             .on_action(cx.listener(|this, _: &JumpToThread1, _, cx| this.jump(0, cx)))
             .on_action(cx.listener(|this, _: &JumpToThread2, _, cx| this.jump(1, cx)))
             .on_action(cx.listener(|this, _: &JumpToThread3, _, cx| this.jump(2, cx)))

@@ -15,7 +15,7 @@ use gpui::{
     Task, Window, div, list, prelude::*, px,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
-use t3_core::keybindings::{default_resolved_keybindings, shortcut_label_for_command};
+use t3_core::keybindings::{ShortcutMatchContext, ShortcutModifierState, should_show_thread_jump_hints_for_modifiers};
 use t3_core::sidebar::RowKey;
 use t3_core::sidebar::time::{MINUTE_MS, Ms};
 
@@ -28,6 +28,8 @@ use crate::workspace::TITLEBAR_HEIGHT;
 use controller::now_ms;
 use search::SearchState;
 
+const JUMP_HINT_SHOW_DELAY_MS: u64 = 200;
+
 pub struct SidebarPane {
     state: Entity<AppState>,
     menu: Entity<ContextMenu>,
@@ -36,6 +38,8 @@ pub struct SidebarPane {
     search_input: Entity<InputState>,
     search: SearchState,
     rename: Option<(String, Entity<InputState>)>,
+    jump_hints: bool,
+    jump_hint_timer: Option<Task<()>>,
     now: Ms,
     _clock: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -81,6 +85,8 @@ impl SidebarPane {
             search_input,
             search: SearchState::default(),
             rename: None,
+            jump_hints: false,
+            jump_hint_timer: None,
             now: now_ms(),
             _clock: None,
             _subscriptions: subscriptions,
@@ -117,6 +123,33 @@ impl SidebarPane {
             });
         }));
         self.now = now;
+    }
+
+    /// Jump hints appear once the jump modifier has been held for a moment, so a quick shortcut
+    /// never flashes them (`useThreadJumpHintsVisible`), and hide when it is released.
+    pub fn set_modifiers(&mut self, modifiers: gpui::Modifiers, cx: &mut Context<Self>) {
+        let mac = cfg!(target_os = "macos");
+        let state = ShortcutModifierState { meta_key: modifiers.platform, ctrl_key: modifiers.control, shift_key: modifiers.shift, alt_key: modifiers.alt };
+        let rules = cx.try_global::<crate::keymap::Keymap>().map(|keymap| keymap.rules.clone()).unwrap_or_default();
+        let show = should_show_thread_jump_hints_for_modifiers(&state, &rules, &ShortcutMatchContext::default(), mac);
+        if !show {
+            self.jump_hint_timer = None;
+            if std::mem::take(&mut self.jump_hints) {
+                cx.notify();
+            }
+            return;
+        }
+        if self.jump_hints || self.jump_hint_timer.is_some() {
+            return;
+        }
+        self.jump_hint_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(JUMP_HINT_SHOW_DELAY_MS)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.jump_hint_timer = None;
+                this.jump_hints = true;
+                cx.notify();
+            });
+        }));
     }
 
     fn start_rename(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -245,8 +278,7 @@ impl SidebarPane {
     fn render_footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let notice = self.state.read(cx).sidebar.undo.notice()?;
         let p = palette(cx);
-        let shortcut = shortcut_label_for_command(default_resolved_keybindings(), "thread.undo", &Default::default(), cfg!(target_os = "macos"));
-        let label = shortcut.map_or_else(|| "Undo".to_owned(), |shortcut| format!("{shortcut} to undo"));
+        let label = crate::keymap::label("thread.undo", cx).map_or_else(|| "Undo".to_owned(), |shortcut| format!("{shortcut} to undo"));
         Some(
             div()
                 .flex_none()
