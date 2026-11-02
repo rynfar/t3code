@@ -48,6 +48,16 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     cx.on_action(move |_: &ClosePullRequests, cx| state.update(cx, |state, cx| state.set_pull_requests_open(false, cx)));
 }
 
+/// The snapshot tool's `--pull-request <number>`: selected once the list holds it, on `tab`.
+#[cfg(feature = "snapshot")]
+pub struct SnapshotSelection {
+    pub number: u64,
+    pub code: bool,
+}
+
+#[cfg(feature = "snapshot")]
+impl gpui::Global for SnapshotSelection {}
+
 pub(crate) type Read<T> = Option<JoinHandle<Result<T, String>>>;
 
 /// One read, run and decoded on the network runtime, with tagged errors worded as the page

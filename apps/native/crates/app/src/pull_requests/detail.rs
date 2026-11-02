@@ -364,7 +364,7 @@ impl DetailView {
         cx.notify();
     }
 
-    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    pub(super) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.disarm(cx);
         self.tab = tab;
         if tab == Tab::Code && self.code.is_none() {
