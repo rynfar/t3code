@@ -1,37 +1,11 @@
-//! The Keybindings panel's read-only table: the environment's resolved keymap
-//! (`ResolvedKeybindingsConfig` in `contracts/src/keybindings.ts`) grouped by command, labelled
-//! with `commandLabel` from `web/src/components/settings/KeybindingsSettings.logic.ts` and
-//! `formatShortcutLabel` from `web/src/keybindings.ts`. Rules that fail to decode are dropped.
+//! The Keybindings panel's read-only table: the environment's resolved keymap, decoded by
+//! `crate::keybindings`, grouped by command and labelled with `commandLabel` and
+//! `groupKeybindingRows` from `web/src/components/settings/KeybindingsSettings.logic.ts`.
 
-use serde::Deserialize;
 use serde_json::Value;
 
 use super::search::normalize;
-
-/// `KeybindingShortcut`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Shortcut {
-    pub key: String,
-    #[serde(default)]
-    pub meta_key: bool,
-    #[serde(default)]
-    pub ctrl_key: bool,
-    #[serde(default)]
-    pub shift_key: bool,
-    #[serde(default)]
-    pub alt_key: bool,
-    #[serde(default)]
-    pub mod_key: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ResolvedRule {
-    command: String,
-    shortcut: Shortcut,
-    #[serde(default, rename = "whenAst")]
-    when_ast: Option<Value>,
-}
+use crate::keybindings::{decode_resolved_keybindings, format_shortcut_label};
 
 /// One command and every shortcut bound to it, in keymap order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,55 +15,6 @@ pub struct KeybindingRow {
     pub shortcuts: Vec<String>,
     /// Some binding only applies in a context (`when`).
     pub conditional: bool,
-}
-
-/// `formatShortcutKeyLabel`.
-pub fn key_label(key: &str) -> String {
-    match key {
-        " " => "Space".to_owned(),
-        "escape" => "Esc".to_owned(),
-        "arrowup" => "Up".to_owned(),
-        "arrowdown" => "Down".to_owned(),
-        "arrowleft" => "Left".to_owned(),
-        "arrowright" => "Right".to_owned(),
-        _ if key.chars().count() == 1 => key.to_uppercase(),
-        _ => {
-            let mut chars = key.chars();
-            chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
-        }
-    }
-}
-
-/// `formatShortcutLabel`: macOS glyphs in ⌃⌥⇧⌘ order, `Ctrl+Alt+Shift+Meta+Key` elsewhere.
-pub fn shortcut_label(shortcut: &Shortcut, mac: bool) -> String {
-    let key = key_label(&shortcut.key);
-    let meta = shortcut.meta_key || (shortcut.mod_key && mac);
-    let ctrl = shortcut.ctrl_key || (shortcut.mod_key && !mac);
-    if mac {
-        let glyph = |on: bool, glyph: &'static str| if on { glyph } else { "" };
-        return format!(
-            "{}{}{}{}{key}",
-            glyph(ctrl, "\u{2303}"),
-            glyph(shortcut.alt_key, "\u{2325}"),
-            glyph(shortcut.shift_key, "\u{21e7}"),
-            glyph(meta, "\u{2318}")
-        );
-    }
-    let mut parts: Vec<&str> = Vec::new();
-    if ctrl {
-        parts.push("Ctrl");
-    }
-    if shortcut.alt_key {
-        parts.push("Alt");
-    }
-    if shortcut.shift_key {
-        parts.push("Shift");
-    }
-    if meta {
-        parts.push("Meta");
-    }
-    parts.push(&key);
-    parts.join("+")
 }
 
 /// `commandLabel` for commands without a bespoke label: segments title-cased and joined by ": ".
@@ -137,10 +62,9 @@ fn title_case_segment(segment: &str) -> String {
 
 /// The table: one row per bound command, sorted by label.
 pub fn rows(keybindings: &Value, mac: bool) -> Vec<KeybindingRow> {
-    let Value::Array(rules) = keybindings else { return Vec::new() };
     let mut rows: Vec<KeybindingRow> = Vec::new();
-    for rule in rules.iter().filter_map(|rule| serde_json::from_value::<ResolvedRule>(rule.clone()).ok()) {
-        let label = shortcut_label(&rule.shortcut, mac);
+    for rule in decode_resolved_keybindings(keybindings) {
+        let label = format_shortcut_label(&rule.shortcut, mac);
         let conditional = rule.when_ast.is_some();
         match rows.iter_mut().find(|row| row.command == rule.command) {
             Some(row) => {

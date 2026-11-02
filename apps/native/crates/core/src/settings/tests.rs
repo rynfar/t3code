@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::archive;
-use super::keybindings::{self, Shortcut};
+use super::keybindings;
 use super::search::{self, Section};
 use super::snooze::{self, DurationUnit, SnoozeDay, SnoozePreset};
 use super::*;
@@ -190,8 +190,6 @@ fn keybinding_rows_group_by_command_and_label_like_the_web() {
     assert_eq!(keybindings::command_label("sidebar.toggleProjectFilter"), "Sidebar: Toggle Project Filter");
     assert_eq!(keybindings::command_label("script.build-app.run"), "Run Script: Build App");
     assert_eq!(keybindings::command_label("composer.sendAlternate"), "Composer: Opposite Queue or Steer Action");
-    let escape = Shortcut { key: "escape".into(), meta_key: false, ctrl_key: false, shift_key: false, alt_key: false, mod_key: false };
-    assert_eq!(keybindings::shortcut_label(&escape, true), "Esc");
 }
 
 #[test]
