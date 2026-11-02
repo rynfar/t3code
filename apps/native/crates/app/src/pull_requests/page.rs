@@ -1,6 +1,8 @@
 //! The pull requests page (`PullRequestsPage.tsx`, `PullRequestsColumn.tsx`): one list read per
 //! scope with a debounced host search, line counts read after the rows, grouped and sorted rows
-//! in a virtualized list, and the selected pull request's detail beside it.
+//! in a virtualized list, and the selected pull request's detail beside it. While open it follows
+//! `pullRequests.subscribeRefreshes`, re-reading the list and the open detail on each new epoch
+//! (`refreshTrigger` in `client-runtime/src/state/pullRequests.ts`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -14,11 +16,15 @@ use gpui_component::{h_flex, v_flex};
 use t3_client::store;
 use t3_core::pull_requests::list::{Group, Shown, entry_key, needs_stats, shown_groups};
 use t3_core::pull_requests::query::parse_query;
-use t3_core::pull_requests::wire::{Action, FilterOptions, ListResult, ListStats, PrState, decode};
-use t3_core::pull_requests::{ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_input, list_input, method, stats_input};
+use t3_core::pull_requests::wire::{Action, FilterOptions, ListResult, ListStats, MergeMethod, PrState, decode};
+use t3_core::pull_requests::{
+    ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_input, method, project_default_merge_method,
+    stats_inputs,
+};
 
 use super::controls::{Button, Size, Variant};
 use super::detail::DetailView;
+use super::mutations::{self, MergePicks, Mutations};
 use super::thread_panel::PendingSelection;
 use super::{read, settle};
 use crate::app_state::{AppEvent, AppState};
@@ -51,7 +57,24 @@ pub(super) struct ListData {
     pub error: Option<String>,
     pub page_size: u32,
     pub loading_more: bool,
+    /// Rows from the first page; later ones came from cursors and outlive a refresh.
+    pub first_page: usize,
 }
+
+/// Follows the refresh signal on the network runtime; dropping it unsubscribes.
+struct Refreshes {
+    net: tokio::task::JoinHandle<()>,
+    _ui: Task<()>,
+}
+
+impl Drop for Refreshes {
+    fn drop(&mut self) {
+        self.net.abort();
+    }
+}
+
+const REFRESH_RETRY_MIN: Duration = Duration::from_secs(1);
+const REFRESH_RETRY_MAX: Duration = Duration::from_secs(30);
 
 pub struct PullRequestsPage {
     pub(super) state: Entity<AppState>,
@@ -66,13 +89,16 @@ pub struct PullRequestsPage {
     pub(super) selected: Option<PrRef>,
     detail: Option<Entity<DetailView>>,
     pub(super) shift: bool,
-    pub(super) acting: HashSet<String>,
     pub(super) options: FilterOptions,
     /// Line counts by `pullRequestDiffStatKey`, kept across reads (GitHub listings omit them).
     stats: HashMap<String, (u64, u64)>,
     requested: HashSet<String>,
     focus: FocusHandle,
     connected: bool,
+    open: bool,
+    refreshes: Option<Refreshes>,
+    /// The refresh epoch the held reads answer to.
+    epoch: Option<u64>,
     _debounce: Option<Task<()>>,
     _list: Option<Task<()>>,
     _options: Option<Task<()>>,
@@ -101,6 +127,7 @@ impl PullRequestsPage {
                     this.sync(cx);
                 }
             }),
+            cx.observe_global::<Mutations>(|_, cx| cx.notify()),
         ];
         let mut page = PullRequestsPage {
             state,
@@ -115,12 +142,14 @@ impl PullRequestsPage {
             selected: None,
             detail: None,
             shift: false,
-            acting: HashSet::new(),
             options: FilterOptions::default(),
             stats: HashMap::new(),
             requested: HashSet::new(),
             focus: cx.focus_handle(),
             connected: false,
+            open: false,
+            refreshes: None,
+            epoch: None,
             _debounce: None,
             _list: None,
             _options: None,
@@ -130,22 +159,92 @@ impl PullRequestsPage {
         page
     }
 
-    /// Reads when the page is shown and connected, and on reconnecting.
+    /// Reads when the page is shown and connected, again on reopening and on reconnecting, and
+    /// follows the refresh signal only while both hold.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let connected = state.client_handle().is_some() && matches!(state.phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected));
         let open = state.pull_requests_open;
-        let reconnected = connected && !self.connected;
+        let returned = connected && open && (!self.connected || !self.open);
         if open && let Some(reference) = cx.try_global::<PendingSelection>().and_then(|pending| pending.0.clone()) {
             cx.set_global(PendingSelection(None));
             self.select(reference, cx);
         }
         self.connected = connected;
-        if open && connected && (reconnected || self.data.key.is_none()) && !self.data.pending {
+        self.open = open;
+        if !(open && connected) {
+            self.refreshes = None;
+            self.epoch = None;
+        } else if self.refreshes.is_none() {
+            self.follow_refreshes(cx);
+        }
+        if open && connected && (returned || self.data.key.is_none()) {
             self.refetch(cx);
             self.fetch_options(cx);
+            if returned && let Some(detail) = &self.detail {
+                detail.update(cx, |detail, cx| detail.refresh(cx));
+            }
         }
         cx.notify();
+    }
+
+    fn follow_refreshes(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let net = state.runtime().spawn(async move {
+            let mut delay = REFRESH_RETRY_MIN;
+            loop {
+                match client.stream(method::SUBSCRIBE_REFRESHES, serde_json::json!({})).await {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.receiver.recv().await {
+                            match item {
+                                Ok(value) => {
+                                    delay = REFRESH_RETRY_MIN;
+                                    if let Some(epoch) = value.as_u64()
+                                        && tx.send(epoch).is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                    Err(_) => {}
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(REFRESH_RETRY_MAX);
+            }
+        });
+        let ui = cx.spawn(async move |this, cx| {
+            while let Some(mut epoch) = rx.recv().await {
+                while let Ok(later) = rx.try_recv() {
+                    epoch = later;
+                }
+                if this.update(cx, |this, cx| this.refreshed(epoch, cx)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.refreshes = Some(Refreshes { net, _ui: ui });
+    }
+
+    /// A new epoch means the host's reads moved on (a turn ended, or any client wrote). The first
+    /// one heard only marks where the reads made on opening stand.
+    fn refreshed(&mut self, epoch: u64, cx: &mut Context<Self>) {
+        let moved = self.epoch.is_some_and(|held| held != epoch);
+        self.epoch = Some(epoch);
+        if !moved {
+            return;
+        }
+        self.requested.clear();
+        self.fetch(None, true, cx);
+        if let Some(detail) = &self.detail {
+            detail.update(cx, |detail, cx| detail.refresh(cx));
+        }
     }
 
     fn scope_key(&self) -> String {
@@ -207,10 +306,11 @@ impl PullRequestsPage {
     }
 
     pub(super) fn refetch(&mut self, cx: &mut Context<Self>) {
-        self.fetch(None, cx);
+        self.fetch(None, false, cx);
     }
 
-    fn fetch(&mut self, cursors: Option<HashMap<String, String>>, cx: &mut Context<Self>) {
+    /// `refreshing` re-reads the first page under rows that later cursors added.
+    fn fetch(&mut self, cursors: Option<HashMap<String, String>>, refreshing: bool, cx: &mut Context<Self>) {
         let appending = cursors.is_some();
         let key = self.scope_key();
         let input = list_input(&self.prefs, &self.sent, self.data.page_size, cursors.as_ref());
@@ -219,12 +319,12 @@ impl PullRequestsPage {
         self.data.loading_more = appending;
         self._list = Some(cx.spawn(async move |this, cx| {
             let result = settle(task).await;
-            let _ = this.update(cx, |this, cx| this.apply_list(key, appending, result, cx));
+            let _ = this.update(cx, |this, cx| this.apply_list(key, appending, refreshing, result, cx));
         }));
         cx.notify();
     }
 
-    fn apply_list(&mut self, key: String, appending: bool, result: Result<ListResult, String>, cx: &mut Context<Self>) {
+    fn apply_list(&mut self, key: String, appending: bool, refreshing: bool, result: Result<ListResult, String>, cx: &mut Context<Self>) {
         if key != self.scope_key() {
             return;
         }
@@ -232,10 +332,22 @@ impl PullRequestsPage {
         self.data.loading_more = false;
         match result {
             Ok(mut answer) => {
+                let first_page = answer.entries.len();
                 if appending && let Some(previous) = self.data.result.take() {
                     let seen: HashSet<String> = previous.entries.iter().map(entry_key).collect();
                     let fresh: Vec<_> = answer.entries.drain(..).filter(|entry| !seen.contains(&entry_key(entry))).collect();
                     answer.entries = previous.entries.into_iter().chain(fresh).collect();
+                } else if refreshing
+                    && let Some(previous) = self.data.result.take().filter(|previous| previous.entries.len() > self.data.first_page && self.data.key.as_deref() == Some(key.as_str()))
+                {
+                    let seen: HashSet<String> = answer.entries.iter().map(entry_key).collect();
+                    let later = previous.entries.into_iter().skip(self.data.first_page).filter(|entry| !seen.contains(&entry_key(entry)));
+                    answer.entries.extend(later);
+                    answer.next_cursors = previous.next_cursors;
+                    answer.truncated = previous.truncated;
+                }
+                if !appending {
+                    self.data.first_page = first_page;
                 }
                 for entry in answer.entries.iter_mut().filter(|entry| needs_stats(entry)) {
                     if let Some((additions, deletions)) = self.stats.get(&stat_key(&entry.project_id, entry.number)) {
@@ -254,16 +366,26 @@ impl PullRequestsPage {
         cx.notify();
     }
 
-    /// `pullRequests.listStats` for rows the listing left unmeasured, once per row.
+    /// `pullRequests.listStats` for rows the listing left unmeasured, once per row per epoch, in
+    /// batches the contract takes.
     fn fetch_stats(&mut self, cx: &mut Context<Self>) {
         let Some(result) = &self.data.result else { return };
         let wanted: Vec<_> = result.entries.iter().filter(|entry| needs_stats(entry) && !self.requested.contains(&stat_key(&entry.project_id, entry.number))).collect();
-        let Some(input) = stats_input(wanted.iter().copied()) else { return };
+        let batches = stats_inputs(wanted.iter().copied());
+        if batches.is_empty() {
+            return;
+        }
         if self.stats.len() > MAX_HELD_STATS {
             self.stats.clear();
             self.requested.clear();
         }
         self.requested.extend(wanted.iter().map(|entry| stat_key(&entry.project_id, entry.number)));
+        for input in batches {
+            self.fetch_stats_batch(input, cx);
+        }
+    }
+
+    fn fetch_stats_batch(&mut self, input: serde_json::Value, cx: &mut Context<Self>) {
         let task = read(self.state.read(cx), method::LIST_STATS, input, decode::<ListStats>);
         cx.spawn(async move |this, cx| {
             let Ok(stats) = settle(task).await else { return };
@@ -308,11 +430,11 @@ impl PullRequestsPage {
         let Some(result) = &self.data.result else { return };
         if !result.next_cursors.is_empty() {
             let cursors = result.next_cursors.clone();
-            self.fetch(Some(cursors), cx);
+            self.fetch(Some(cursors), false, cx);
         } else if self.data.page_size < MAX_PAGE_SIZE {
             self.data.page_size = (self.data.page_size + PAGE_SIZE).min(MAX_PAGE_SIZE);
             self.data.loading_more = true;
-            self.fetch(None, cx);
+            self.fetch(None, false, cx);
         }
     }
 
@@ -322,7 +444,7 @@ impl PullRequestsPage {
 
     /// "Check again": the host is asked afresh (`pullRequests.invalidate`), then the list re-read.
     pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
-        let task = read(self.state.read(cx), method::INVALIDATE, serde_json::json!({}), |_| Ok(()));
+        let task = read(self.state.read(cx), method::INVALIDATE, t3_core::pull_requests::invalidate_input(None), |_| Ok(()));
         self.data.pending = true;
         self.stats.clear();
         self.requested.clear();
@@ -353,6 +475,7 @@ impl PullRequestsPage {
                 text: &parsed.text,
                 answered,
                 sort: self.prefs.sort,
+                state: self.prefs.state,
             }),
             None => Vec::new(),
         };
@@ -388,7 +511,7 @@ impl PullRequestsPage {
         let entry = self.data.result.as_ref().and_then(|result| result.entries.iter().find(|entry| PrRef::of(entry) == reference)).cloned();
         let state = self.state.clone();
         let page = cx.entity().downgrade();
-        self.detail = Some(cx.new(|cx| DetailView::new(state, page, reference.clone(), entry, self.prefs.merge_method, cx)));
+        self.detail = Some(cx.new(|cx| DetailView::new(state, page, reference.clone(), entry, cx)));
         self.selected = Some(reference);
         cx.notify();
     }
@@ -399,7 +522,8 @@ impl PullRequestsPage {
         cx.notify();
     }
 
-    /// A finished action: the row shows its new state until the next host read.
+    /// A finished action: the row shows its new state, and leaves a listing of another state,
+    /// until the next host read.
     pub(super) fn acted(&mut self, reference: &PrRef, action: Action, cx: &mut Context<Self>) {
         let Some(result) = self.data.result.as_mut() else { return };
         if let Some(entry) = result.entries.iter_mut().find(|entry| PrRef::of(entry) == *reference) {
@@ -415,42 +539,47 @@ impl PullRequestsPage {
         self.rebuild(cx);
     }
 
-    pub(super) fn remember_merge_method(&mut self, method: t3_core::pull_requests::wire::MergeMethod) {
+    pub(super) fn remember_merge_method(&mut self, method: MergeMethod) {
         if self.prefs.merge_method != Some(method) {
             self.prefs.merge_method = Some(method);
             self.save_prefs();
         }
     }
 
+    /// The project's and the last-picked merge methods, read when a merge is asked for.
+    pub(super) fn merge_picks(&self, project_id: &str, current: Option<MergeMethod>, cx: &App) -> MergePicks {
+        let project_default = self.state.read(cx).server_config.config.as_ref().and_then(|config| project_default_merge_method(&config.settings, project_id));
+        MergePicks { current, project_default, last: self.prefs.merge_method }
+    }
+
     /// A list row's quick action (`PullRequestSpeedActions`): runs immediately, no confirmation.
+    /// A merge is only requested, since some hosts accept one before it lands, so the row waits
+    /// for the host to say it merged.
     pub(super) fn quick_action(&mut self, index: usize, action: Action, cx: &mut Context<Self>) {
         let Some(entry) = self.data.result.as_ref().and_then(|result| result.entries.get(index)).cloned() else { return };
-        let key = entry_key(&entry);
-        if !self.acting.insert(key.clone()) {
+        let reference = PrRef::of(&entry);
+        if !mutations::begin(&reference, action, cx) {
             return;
         }
-        let reference = PrRef::of(&entry);
         let term = t3_core::pull_requests::detail::change_request_term(&entry.provider);
-        let state = self.state.read(cx);
         let task = if action == Action::Merge {
-            super::detail::merge_with_detail(state, reference.clone(), self.prefs.merge_method)
+            let picks = self.merge_picks(&entry.project_id, None, cx);
+            mutations::merge(self.state.read(cx), reference.clone(), picks, cx)
         } else {
-            read(state, method::RUN_ACTION, action_input(&reference, action, None), |_| Ok(()))
+            mutations::run_action(self.state.read(cx), action_input(&reference, action, None), cx)
         };
-        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |this, cx| {
-                this.acting.remove(&key);
+                mutations::finish(&reference, cx);
                 let toast = match &result {
-                    Ok(()) => Toast::new(ToastKind::Success, t3_core::pull_requests::action_done_label(action, term)).description(format!("#{} {}", entry.number, entry.title)),
-                    Err(error) => Toast::new(ToastKind::Error, format!("Could not {} #{}", action_verb(action), entry.number)).description(error.clone()),
+                    Ok(()) => Toast::new(ToastKind::Success, action_done_label(action, term)),
+                    Err(error) => Toast::new(ToastKind::Error, action_failed_label(action, term)).description(error.clone()),
                 };
-                if result.is_ok() {
+                if result.is_ok() && action != Action::Merge {
                     this.acted(&reference, action, cx);
                 }
                 this.state.update(cx, |state, cx| state.show_toast(toast, cx));
-                cx.notify();
             });
         })
         .detach();
@@ -509,17 +638,6 @@ impl PullRequestsPage {
         list(self.list.clone(), cx.processor(|this, index: usize, window, cx| super::row::render(this, index, window, cx)))
             .flex_1()
             .into_any_element()
-    }
-}
-
-pub(super) fn action_verb(action: Action) -> &'static str {
-    match action {
-        Action::Merge => "merge",
-        Action::Close => "close",
-        Action::Reopen => "reopen",
-        Action::Ready => "mark ready",
-        Action::Draft => "convert",
-        _ => "update",
     }
 }
 

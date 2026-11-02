@@ -7,6 +7,7 @@ mod code;
 mod controls;
 mod detail;
 mod link_dialog;
+mod mutations;
 mod page;
 mod row;
 mod summary;
@@ -41,6 +42,7 @@ impl AppState {
 }
 
 pub fn init(state: Entity<AppState>, cx: &mut App) {
+    mutations::init(state.read(cx).runtime().clone(), cx);
     let open = state.clone();
     cx.on_action(move |_: &OpenPullRequests, cx| open.update(cx, |state, cx| state.set_pull_requests_open(true, cx)));
     cx.on_action(move |_: &ClosePullRequests, cx| state.update(cx, |state, cx| state.set_pull_requests_open(false, cx)));
@@ -71,13 +73,13 @@ pub(crate) async fn settle<T>(task: Read<T>) -> Result<T, String> {
 pub(crate) const NOT_CONNECTED: &str = "Not connected to the server.";
 
 /// The sidebar footer's utility item (`SidebarUtilityMenu`): an icon button for "Pull requests",
-/// or "Back" with its label while the page is open. Sidebar menu buttons (design-system §6.8).
-pub fn sidebar_item(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+/// or "Back" with its label while the page is open. Sidebar menu buttons (design-system §6.8),
+/// a tab stop that Enter and Space press.
+pub fn sidebar_item(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> impl IntoElement {
     let p = palette(cx);
     let open = state.read(cx).pull_requests_open;
     let state = state.clone();
-    let button = div()
-        .id("sidebar-pull-requests")
+    let button = crate::right_panel::focusable(div().id("sidebar-pull-requests"), "sidebar-pull-requests".into(), true, window, cx)
         .flex()
         .items_center()
         .gap(px(8.))

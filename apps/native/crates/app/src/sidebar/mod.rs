@@ -452,7 +452,7 @@ impl SidebarPane {
 }
 
 impl Render for SidebarPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.state.read(cx).sidebar.model.clone();
         let synchronized = self.state.read(cx).shell.synchronized;
         self.live_rendered = false;
@@ -491,6 +491,6 @@ impl Render for SidebarPane {
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .children(self.render_footer(cx))
             .children(self.render_project_filter(cx))
-            .child(crate::pull_requests::sidebar_item(&self.state, cx))
+            .child(crate::pull_requests::sidebar_item(&self.state, window, cx))
     }
 }
