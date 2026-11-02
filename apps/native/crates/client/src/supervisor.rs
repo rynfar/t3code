@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use t3_core::commands::{self, method};
+use t3_core::server_config::ServerConfigStreamEvent;
 use t3_core::shell::ShellStreamItem;
 use t3_core::history::HistoryPage;
 use t3_core::thread::{ThreadStreamItem, decode_thread_stream_item};
@@ -15,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, AuthError, Credentials};
-use crate::session::{RpcError, Session};
+use crate::session::{RpcError, Session, StreamHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -30,6 +31,7 @@ pub enum ClientEvent {
     Status(ConnectionStatus),
     Shell(ShellStreamItem),
     Thread { thread_id: String, item: Box<ThreadStreamItem> },
+    ServerConfig(Box<ServerConfigStreamEvent>),
     StreamError { context: String, message: String },
 }
 
@@ -37,6 +39,7 @@ enum Command {
     OpenThread(String),
     CloseThread(String),
     Dispatch { command: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
+    Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
 }
 
 #[derive(Clone)]
@@ -64,6 +67,14 @@ impl ClientHandle {
     /// Fetches and decodes one page of earlier history over HTTP. Run it on the network runtime.
     pub async fn history_page(&self, thread_id: &str, cursor: &str) -> Result<HistoryPage, String> {
         crate::history::fetch_history_page(&self.credentials, thread_id, cursor).await
+    }
+
+    /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
+    /// `Closed` while disconnected rather than waiting for a reconnect.
+    pub async fn request(&self, method: &'static str, payload: Value) -> Result<Value, RpcError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands.send(Command::Request { method, payload, reply }).map_err(|_| RpcError::Closed)?;
+        rx.await.unwrap_or(Err(RpcError::Closed))
     }
 }
 
@@ -153,7 +164,9 @@ async fn wait_draining(delay: Duration, commands: &mut mpsc::UnboundedReceiver<C
                 None => return false,
                 Some(Command::OpenThread(id)) => { resume.threads.entry(id).or_insert(None); }
                 Some(Command::CloseThread(id)) => { resume.threads.remove(&id); }
-                Some(Command::Dispatch { reply, .. }) => { let _ = reply.send(Err(RpcError::Closed)); }
+                Some(Command::Dispatch { reply, .. }) | Some(Command::Request { reply, .. }) => {
+                    let _ = reply.send(Err(RpcError::Closed));
+                }
             }
         }
     }
@@ -175,6 +188,7 @@ async fn run_session(
     let Ok(mut shell) = session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell)) else {
         return SessionEnd::Closed("Could not subscribe to the shell.".into());
     };
+    let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, commands::subscribe_server_config()).ok();
     let (thread_tx, mut thread_rx) = mpsc::channel::<ThreadFrame>(256);
     let mut forwarders: HashMap<String, JoinHandle<()>> = HashMap::new();
     for (thread_id, sequence) in resume.threads.clone() {
@@ -192,6 +206,18 @@ async fn run_session(
                 },
                 Some(Err(error)) => break SessionEnd::Closed(format!("Shell subscription failed: {error}")),
                 None => break SessionEnd::Closed("Shell subscription ended.".into()),
+            },
+            value = next_config(&mut server_config) => match value {
+                Some(Ok(value)) => match serde_json::from_value::<ServerConfigStreamEvent>(value) {
+                    Ok(event) => { let _ = events.send(ClientEvent::ServerConfig(Box::new(event))).await; }
+                    Err(error) => report(events, "server config", error.to_string()).await,
+                },
+                // The rest of the session works without it; the next session subscribes again.
+                Some(Err(error)) => {
+                    server_config = None;
+                    report(events, "server config", error.to_string()).await;
+                }
+                None => server_config = None,
             },
             frame = thread_rx.recv() => {
                 let Some((thread_id, value)) = frame else { continue };
@@ -228,6 +254,12 @@ async fn run_session(
                         let _ = reply.send(session.request(method::DISPATCH_COMMAND, command).await);
                     });
                 }
+                Some(Command::Request { method, payload, reply }) => {
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(session.request(method, payload).await);
+                    });
+                }
             },
             reason = session.closed() => break SessionEnd::Closed(reason),
         }
@@ -236,6 +268,13 @@ async fn run_session(
         task.abort();
     }
     end
+}
+
+async fn next_config(stream: &mut Option<StreamHandle>) -> Option<Result<Value, RpcError>> {
+    match stream {
+        Some(stream) => stream.receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Keeps one thread subscribed for the life of the session. A stream that ends or fails on a

@@ -1,22 +1,47 @@
 //! Headless check against a live server: pairs (or reuses saved credentials), subscribes the
-//! shell, optionally one thread, and prints what arrives.
+//! shell and server config, optionally one thread, and prints what arrives.
 //!
 //!   cargo run -p t3-client --example probe -- --pair 'http://127.0.0.1:3773/pair#token=…'
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --seconds 10
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --send "hello"   # costs a turn
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --history 3     # page earlier history
+//!   cargo run -p t3-client --example probe -- --config
+//!
+//! Launch a thread and drive it. The provider and model are required so a probe can never fall
+//! back to a paid default; use the free `devReplay` / `showcase` pair on a dev server:
+//!
+//!   cargo run -p t3-client --example probe -- --launch <project-id> "go" \
+//!     --provider devReplay --model showcase --runtime-mode approval-required \
+//!     --approve accept --answer --seconds 40
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use t3_client::supervisor::{ClientEvent, start};
+use t3_client::supervisor::{ClientEvent, ClientHandle, start};
 use t3_client::{auth, store};
+use t3_core::commands::{self, ApprovalDecision, LaunchThread, method};
+use t3_core::composer::title_seed;
+use t3_core::model::ModelSelection;
+use t3_core::providers;
+use t3_core::requests::{self, DraftAnswer};
+use t3_core::server_config::{InteractionMode, RuntimeMode, ServerConfigState};
 use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::thread::{ThreadState, ThreadStreamItem};
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn spawn_dispatch(client: &ClientHandle, label: String, command: serde_json::Value) {
+    let client = client.clone();
+    tokio::spawn(async move { println!("{label}: {:?}", client.dispatch(command).await.map(|v| v.to_string())) });
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let has = |name: &str| args.iter().any(|a| a == name);
     let credentials = match flag("--pair") {
         Some(link) => {
             let link = t3_core::pairing::parse_pairing_link(&link, None)?;
@@ -28,23 +53,69 @@ async fn main() -> anyhow::Result<()> {
         None => store::load().ok_or_else(|| anyhow::anyhow!("no saved connection; pass --pair <link>"))?,
     };
     let seconds: u64 = flag("--seconds").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let approve = flag("--approve")
+        .map(|value| {
+            ApprovalDecision::parse(&value)
+                .ok_or_else(|| anyhow::anyhow!("--approve takes accept, acceptForSession, decline or cancel"))
+        })
+        .transpose()?;
+    let answer = has("--answer");
     let (client, mut events) = start(&tokio::runtime::Handle::current(), credentials);
-    if let Some(thread_id) = flag("--thread") {
-        client.open_thread(&thread_id);
+    let mut watched = flag("--thread");
+    if let Some(thread_id) = &watched {
+        client.open_thread(thread_id);
         if let Some(text) = flag("--send") {
-            let command_id = uuid::Uuid::new_v4().to_string();
-            let command = t3_core::commands::send_message(
-                &command_id,
-                &thread_id,
-                &text,
-                &t3_core::commands::DispatchMode::QueueAfterActive,
-            );
-            let client = client.clone();
-            tokio::spawn(async move { println!("dispatch: {:?}", client.dispatch(command).await) });
+            let command = commands::send_message(&new_id(), thread_id, &text, &commands::DispatchMode::QueueAfterActive);
+            spawn_dispatch(&client, "dispatch".into(), command);
+        }
+    }
+    if let Some(project_id) = flag("--launch") {
+        let text = args
+            .iter()
+            .position(|a| a == "--launch")
+            .and_then(|i| args.get(i + 2))
+            .filter(|text| !text.starts_with("--"))
+            .cloned()
+            .unwrap_or_else(|| "go".into());
+        let (Some(provider), Some(model)) = (flag("--provider"), flag("--model")) else {
+            anyhow::bail!("--launch needs --provider and --model (use devReplay / showcase on a dev server)");
+        };
+        let runtime_mode = match flag("--runtime-mode") {
+            Some(mode) => RuntimeMode::parse(&mode).ok_or_else(|| anyhow::anyhow!("unknown runtime mode {mode}"))?,
+            None => RuntimeMode::ApprovalRequired,
+        };
+        let thread_id = new_id();
+        let selection = ModelSelection { instance_id: provider, model, options: None };
+        let (command_id, message_id, title) = (new_id(), new_id(), title_seed(&text));
+        let payload = commands::launch_thread(&LaunchThread {
+            command_id: &command_id,
+            thread_id: &thread_id,
+            project_id: &project_id,
+            title: &title,
+            model_selection: &selection,
+            runtime_mode,
+            interaction_mode: InteractionMode::Default,
+            message_id: &message_id,
+            text: &text,
+        });
+        match client.request(method::LAUNCH_THREAD, payload).await {
+            Ok(value) => {
+                println!(
+                    "launch: threadId={} resumed={} sequence={}",
+                    value["threadId"],
+                    value["resumed"],
+                    value.get("sequence").map(|s| s.to_string()).unwrap_or_default()
+                );
+                client.open_thread(&thread_id);
+                watched = Some(thread_id);
+            }
+            Err(error) => println!("launch failed: {error}"),
         }
     }
     let mut shell = ShellState::default();
     let mut thread = ThreadState::default();
+    let mut config = ServerConfigState::default();
+    let mut seen: HashSet<String> = HashSet::new();
     let deadline = tokio::time::sleep(Duration::from_secs(seconds));
     tokio::pin!(deadline);
     loop {
@@ -53,6 +124,12 @@ async fn main() -> anyhow::Result<()> {
             event = events.recv() => match event {
                 None => break,
                 Some(ClientEvent::Status(status)) => println!("status: {status:?}"),
+                Some(ClientEvent::ServerConfig(event)) => {
+                    let label: String = format!("{event:?}").chars().take(48).collect();
+                    if config.apply(*event) {
+                        println!("server config: {label}…");
+                    }
+                }
                 Some(ClientEvent::Shell(item)) => {
                     let label = match &item {
                         ShellStreamItem::Snapshot { snapshot, .. } => format!(
@@ -62,7 +139,9 @@ async fn main() -> anyhow::Result<()> {
                         other => format!("{other:?}").chars().take(120).collect(),
                     };
                     shell.apply(item);
-                    println!("shell: {label}");
+                    if !has("--quiet-shell") {
+                        println!("shell: {label}");
+                    }
                 }
                 Some(ClientEvent::Thread { thread_id, item }) => {
                     let label = match item.as_ref() {
@@ -73,8 +152,42 @@ async fn main() -> anyhow::Result<()> {
                         ThreadStreamItem::Event { sequence, .. } => format!("event seq={sequence}"),
                         other => format!("{other:?}"),
                     };
-                    thread.apply(*item);
-                    println!("thread {thread_id}: {label}");
+                    if thread.apply(*item) && !has("--quiet-thread") {
+                        println!("thread {thread_id}: {label}");
+                    }
+                    let Some(projection) = &thread.projection else { continue };
+                    let pending = requests::pending_requests(projection);
+                    for approval in &pending.approvals {
+                        if !seen.insert(approval.request_id.clone()) { continue }
+                        let (label, _) = approval.presentation();
+                        let options: Vec<&str> = approval.options.iter().map(|o| o.label.as_str()).collect();
+                        println!("pending {label}: {:?} live={} options={options:?}", approval.detail, approval.live);
+                        if let Some(decision) = approve.filter(|_| approval.live) {
+                            let command = commands::respond_to_approval(&new_id(), &thread_id, &approval.request_id, decision, None);
+                            spawn_dispatch(&client, format!("respond {}", decision.as_str()), command);
+                        }
+                    }
+                    for input in &pending.user_inputs {
+                        if !seen.insert(input.request_id.clone()) { continue }
+                        for question in &input.questions {
+                            let options: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
+                            println!("pending question [{}] {}: {options:?}", question.header, question.question);
+                        }
+                        if !answer || !input.can_respond() { continue }
+                        let drafts: HashMap<String, DraftAnswer> = input
+                            .questions
+                            .iter()
+                            .filter_map(|q| Some((q.id.clone(), requests::toggle_option(q, None, q.options.first()?.answer_value()))))
+                            .collect();
+                        match requests::build_answers(&input.questions, &drafts) {
+                            Some(answers) => {
+                                println!("answering: {}", serde_json::Value::Object(answers.clone()));
+                                let command = commands::respond_to_user_input(&new_id(), &thread_id, &input.request_id, answers);
+                                spawn_dispatch(&client, "answer".into(), command);
+                            }
+                            None => println!("cannot answer: a question has no options"),
+                        }
+                    }
                 }
                 Some(ClientEvent::StreamError { context, message }) => println!("decode error in {context}: {message}"),
             }
@@ -106,10 +219,55 @@ async fn main() -> anyhow::Result<()> {
         let visible = thread.projection.as_ref().map_or(0, |p| p.visible_turn_items.len());
         println!("history: visible={visible} has_more={} expanded={}", thread.history.has_more_history, thread.history.expanded);
     }
+    if let Some(config) = &config.config {
+        println!(
+            "config: environment={} threadStop={:?} defaultRuntimeMode={:?} favorites={:?}",
+            config.environment.label,
+            config.environment.capabilities.thread_stop,
+            config.settings.default_runtime_mode,
+            config.settings.favorites
+        );
+        for entry in providers::entries(config, None) {
+            let models = providers::model_options(&config.settings, entry.provider);
+            println!(
+                "  provider {} ({}) driver={} enabled={} ready={} status={} models={}",
+                entry.display_name,
+                entry.instance_id(),
+                entry.driver(),
+                entry.enabled,
+                entry.is_ready(),
+                entry.provider.status,
+                models.len()
+            );
+            if has("--config") {
+                for model in models.iter().take(6) {
+                    let descriptors = model.capabilities.as_ref().map(|c| c.option_descriptors.len()).unwrap_or(0);
+                    println!("    model {} ({}) descriptors={descriptors}", providers::model_name(model), model.slug);
+                }
+            }
+        }
+    }
     if let Some(snapshot) = &shell.snapshot {
-        println!("final: {} projects, {} threads, synchronized={}", snapshot.projects.len(), snapshot.threads.len(), shell.synchronized);
-        for row in t3_core::sidebar::sidebar_rows(snapshot).iter().take(12) {
-            println!("  {row:?}");
+        println!(
+            "final: {} projects, {} threads, synchronized={}",
+            snapshot.projects.len(),
+            snapshot.threads.len(),
+            shell.synchronized
+        );
+        if has("--config") {
+            for project in &snapshot.projects {
+                println!("  project {} {}", project.id, project.title);
+            }
+        }
+        if let Some(thread) = watched.as_deref().and_then(|id| snapshot.threads.iter().find(|t| t.id == id)) {
+            println!(
+                "watched: {} \"{}\" status={} runtimeMode={} pending={:?}",
+                thread.id,
+                thread.title,
+                thread.status,
+                thread.runtime_mode,
+                thread.pending_runtime_request.as_ref().map(|p| &p.kind)
+            );
         }
     }
     Ok(())

@@ -3,6 +3,7 @@ mod composer;
 mod connect;
 mod icons;
 mod menus;
+mod new_thread;
 mod sidebar;
 mod theme;
 mod thread_view;
@@ -37,8 +38,10 @@ fn main() {
     gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         theme::init(cx);
+        composer::init(cx);
         let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
         menus::init(state.clone(), cx);
+        new_thread::init(state.clone(), cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(
             WindowOptions {

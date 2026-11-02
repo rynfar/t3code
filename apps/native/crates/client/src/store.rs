@@ -24,6 +24,11 @@ pub fn save_last_thread(thread_id: &str) {
     }
 }
 
+/// Per-device settings the web keeps in local storage (`ClientSettingsSchema` keys).
+pub fn load_client_settings() -> Option<String> {
+    std::fs::read_to_string(base()?.join("settings.json")).ok()
+}
+
 pub fn load() -> Option<Credentials> {
     let text = std::fs::read_to_string(path()?).ok()?;
     serde_json::from_str(&text).ok()

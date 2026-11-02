@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
             ClientEvent::StreamError { context, message } => {
                 errors.insert(context, message.chars().take(300).collect());
             }
-            ClientEvent::Status(_) => {}
+            ClientEvent::Status(_) | ClientEvent::ServerConfig(_) => {}
         }
         let total = shell.snapshot.as_ref().map(|s| s.threads.len()).unwrap_or(usize::MAX);
         if opened && snapshots.len() + errors.len() >= total {

@@ -1,6 +1,7 @@
 //! App-wide state: the connection, the shell, and the open thread. Network events arrive on a
 //! channel from the client's runtime and are applied in batches, one notify per batch.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use gpui::{Context, EventEmitter, Task};
@@ -9,9 +10,11 @@ use t3_client::auth::{self, Credentials};
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
-use t3_core::commands::{self, DispatchMode};
+use t3_core::commands::{self, method};
+use t3_core::composer::ClientSettings;
 use t3_core::history::HistoryStep;
 use t3_core::pairing::parse_pairing_link;
+use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
 use t3_core::sidebar::{SidebarRow, sidebar_rows};
 use t3_core::thread::ThreadState;
@@ -30,6 +33,7 @@ pub enum AppEvent {
     Shell,
     Selection,
     Thread,
+    ServerConfig,
 }
 
 pub struct AppState {
@@ -39,7 +43,13 @@ pub struct AppState {
     pub selected_thread: Option<String>,
     pub thread: ThreadState,
     pub last_error: Option<String>,
+    pub server_config: ServerConfigState,
+    pub client_settings: ClientSettings,
+    /// The project of the new-thread draft, while the user composes a thread that does not exist.
+    pub draft_project: Option<String>,
     restore_thread: Option<String>,
+    /// A thread just launched from the draft, selected once the shell lists it.
+    select_when_listed: Option<String>,
     client: Option<ClientHandle>,
     runtime: tokio::runtime::Handle,
     _pump: Option<Task<()>>,
@@ -58,7 +68,11 @@ impl AppState {
             selected_thread: None,
             thread: ThreadState::default(),
             last_error: None,
+            server_config: ServerConfigState::default(),
+            client_settings: ClientSettings::from_json(&store::load_client_settings().unwrap_or_default()),
+            draft_project: None,
             restore_thread: store::load_last_thread(),
+            select_when_listed: None,
             client: None,
             runtime,
             _pump: None,
@@ -102,6 +116,8 @@ impl AppState {
         self.sidebar_rows = Arc::new(Vec::new());
         self.selected_thread = None;
         self.thread = ThreadState::default();
+        self.server_config = ServerConfigState::default();
+        self.draft_project = None;
         self.set_phase(Phase::Unpaired { error: None }, cx);
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::Selection);
@@ -128,7 +144,7 @@ impl AppState {
     }
 
     fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
-        let (mut shell_changed, mut thread_changed) = (false, false);
+        let (mut shell_changed, mut thread_changed, mut config_changed) = (false, false, false);
         for event in batch {
             match event {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => {
@@ -143,6 +159,7 @@ impl AppState {
                         thread_changed |= self.thread.apply(*item);
                     }
                 }
+                ClientEvent::ServerConfig(event) => config_changed |= self.server_config.apply(*event),
                 ClientEvent::StreamError { context, message } => {
                     self.last_error = Some(format!("Could not read {context}: {message}"));
                 }
@@ -151,7 +168,10 @@ impl AppState {
         if shell_changed {
             self.sidebar_rows = Arc::new(self.shell.snapshot.as_ref().map(sidebar_rows).unwrap_or_default());
             cx.emit(AppEvent::Shell);
-            if self.selected_thread.is_none()
+            if let Some(id) = self.select_when_listed.take_if(|id| self.shell.thread(id).is_some()) {
+                self.select_thread(&id, cx);
+            } else if self.selected_thread.is_none()
+                && self.draft_project.is_none()
                 && let Some(id) = self.restore_thread.take_if(|id| self.shell.thread(id).is_some())
             {
                 self.select_thread(&id, cx);
@@ -159,6 +179,9 @@ impl AppState {
         }
         if thread_changed {
             cx.emit(AppEvent::Thread);
+        }
+        if config_changed {
+            cx.emit(AppEvent::ServerConfig);
         }
     }
 
@@ -173,6 +196,7 @@ impl AppState {
         if self.selected_thread.as_deref() == Some(thread_id) {
             return;
         }
+        self.draft_project = None;
         if let (Some(client), Some(previous)) = (&self.client, &self.selected_thread) {
             client.close_thread(previous);
         }
@@ -222,6 +246,41 @@ impl AppState {
         .detach();
     }
 
+    /// Opens the new-thread draft for `project_id`, leaving the open thread.
+    pub fn start_draft(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
+            return;
+        }
+        if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
+            client.close_thread(&previous);
+        }
+        self.thread = ThreadState::default();
+        self.restore_thread = None;
+        self.draft_project = Some(project_id.to_owned());
+        cx.emit(AppEvent::Selection);
+        cx.emit(AppEvent::Thread);
+    }
+
+    /// Selects a thread the draft launched as soon as the shell lists it.
+    pub fn select_when_listed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if self.shell.thread(thread_id).is_some() {
+            self.select_thread(thread_id, cx);
+        } else {
+            self.select_when_listed = Some(thread_id.to_owned());
+        }
+    }
+
+    /// Any RPC on the network runtime. The future resolves wherever it is awaited.
+    pub fn rpc(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + 'static {
+        let task = self.client.clone().map(|client| self.runtime.spawn(async move { client.request(method, payload).await }));
+        async move {
+            match task {
+                Some(task) => task.await.unwrap_or(Err(RpcError::Closed)),
+                None => Err(RpcError::Closed),
+            }
+        }
+    }
+
     pub fn is_selected_thread_running(&self) -> bool {
         self.selected_thread
             .as_deref()
@@ -229,27 +288,21 @@ impl AppState {
             .is_some_and(|thread| thread.is_live())
     }
 
-    pub fn send_message(&mut self, text: String, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.selected_thread.clone() else { return };
-        let mode = match self.shell.thread(&thread_id).and_then(|t| t.active_run_id.clone()) {
-            Some(_) => DispatchMode::QueueAfterActive,
-            None => DispatchMode::StartImmediately,
-        };
-        let command_id = uuid_v4();
-        self.dispatch(commands::send_message(&command_id, &thread_id, &text, &mode), cx);
-    }
-
+    /// `interruptThreadTurn`: `thread.stop` where the server has it, else interrupt the active run.
     pub fn stop_selected_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread.clone() else { return };
-        self.dispatch(commands::stop_thread(&uuid_v4(), &thread_id), cx);
+        let thread_stop = self.server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.thread_stop == Some(true));
+        let command = match self.shell.thread(&thread_id).and_then(|t| t.active_run_id.clone()) {
+            Some(run_id) if !thread_stop => commands::interrupt_run(&uuid_v4(), &thread_id, &run_id),
+            _ => commands::stop_thread(&uuid_v4(), &thread_id),
+        };
+        self.dispatch(command, cx);
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        let task = self.runtime.spawn(async move { client.dispatch(command).await });
+        let task = self.rpc(method::DISPATCH_COMMAND, command);
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or(Err(RpcError::Closed));
-            if let Err(error) = result {
+            if let Err(error) = task.await {
                 let _ = this.update(cx, |state, cx| {
                     state.last_error = Some(error.to_string());
                     cx.emit(AppEvent::Thread);
@@ -260,6 +313,6 @@ impl AppState {
     }
 }
 
-fn uuid_v4() -> String {
+pub fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
 }

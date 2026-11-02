@@ -5,8 +5,9 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
 
 use crate::app_state::{AppEvent, AppState, Phase};
-use crate::composer::Composer;
+use crate::composer::{Composer, OpenPermissions, ToggleModelPicker};
 use crate::connect::ConnectView;
+use crate::new_thread::{self, DraftHero};
 use crate::sidebar::SidebarPane;
 use crate::thread_view::ThreadView;
 
@@ -18,6 +19,7 @@ pub struct Workspace {
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
+    draft: Entity<DraftHero>,
     connect: Entity<ConnectView>,
     _subscription: Subscription,
 }
@@ -27,23 +29,18 @@ impl Workspace {
         let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+        let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
         let subscription = cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
             if matches!(event, AppEvent::Phase | AppEvent::Selection) {
                 cx.notify();
             }
         });
-        Workspace { state, sidebar, thread, composer, connect, _subscription: subscription }
+        Workspace { state, sidebar, thread, composer, draft, connect, _subscription: subscription }
     }
 
     fn render_titlebar(&self, cx: &App) -> impl IntoElement {
         let state = self.state.read(cx);
-        let title = state
-            .selected_thread
-            .as_deref()
-            .and_then(|id| state.shell.thread(id))
-            .map(|thread| thread.title.clone())
-            .unwrap_or_default();
         let status = match &state.phase {
             Phase::Online(ConnectionStatus::Connected) => None,
             Phase::Online(ConnectionStatus::Connecting) => Some("Connecting…".to_owned()),
@@ -61,8 +58,9 @@ impl Workspace {
             .gap_3()
             .border_b_1()
             .border_color(theme.border)
-            .child(div().flex_1().truncate().text_sm().font_weight(gpui::FontWeight::MEDIUM).text_color(theme.foreground).child(title))
+            .child(new_thread::breadcrumb(&self.state, cx))
             .children(status.map(|status| div().text_xs().text_color(theme.muted_foreground).child(status)))
+            .child(new_thread::new_thread_button(cx))
     }
 }
 
@@ -74,8 +72,15 @@ impl Render for Workspace {
             return div().size_full().bg(theme.background).child(self.connect.clone()).into_any_element();
         }
         let has_thread = self.state.read(cx).selected_thread.is_some();
+        let has_draft = !has_thread && self.state.read(cx).draft_project.is_some();
         h_flex()
             .size_full()
+            .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
+                this.composer.update(cx, |composer, cx| composer.toggle_picker(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
+                this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
+            }))
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
@@ -98,7 +103,8 @@ impl Render for Workspace {
                         this.child(div().flex_1().min_h_0().child(self.thread.clone()))
                             .child(self.composer.clone())
                     })
-                    .when(!has_thread, |this| {
+                    .when(has_draft, |this| this.child(div().flex_1().min_h_0().child(self.draft.clone())))
+                    .when(!has_thread && !has_draft, |this| {
                         this.child(
                             div()
                                 .flex_1()
