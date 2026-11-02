@@ -10,10 +10,9 @@ use t3_client::status::DotTone;
 use t3_client::store::SavedEnvironment;
 
 use crate::app_state::{AppEvent, AppState, Phase};
-use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::environments::PairingSource;
 use crate::icons::Icon;
-use crate::right_panel::{Button as IconButton, Size, Variant};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
 
 pub struct ConnectView {
@@ -21,6 +20,8 @@ pub struct ConnectView {
     link: Entity<InputState>,
     /// The saved environment whose Remove awaits confirmation.
     confirm_remove: Option<String>,
+    /// A pasted link is pairing; the field clears once it succeeds.
+    submitted: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -63,18 +64,30 @@ impl ConnectView {
                     this.add(cx);
                 }
             }),
-            cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
-                if matches!(event, AppEvent::Phase) {
-                    cx.notify();
+            cx.subscribe_in(&state, window, |this, state, event: &AppEvent, window, cx| {
+                if !matches!(event, AppEvent::Phase) {
+                    return;
                 }
+                let (pairing, failed) = {
+                    let connect = &state.read(cx).connect;
+                    (connect.pairing.is_some(), connect.error.is_some())
+                };
+                if this.submitted && !pairing {
+                    this.submitted = false;
+                    if !failed {
+                        this.link.update(cx, |input, cx| input.set_value("", window, cx));
+                    }
+                }
+                cx.notify();
             }),
         ];
-        ConnectView { state, link, confirm_remove: None, _subscriptions: subscriptions }
+        ConnectView { state, link, confirm_remove: None, submitted: false, _subscriptions: subscriptions }
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
         let link = self.link.read(cx).value().to_string();
         self.state.update(cx, |state, cx| state.pair_link(&link, cx));
+        self.submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Link);
     }
 
     fn render_header(&self, switching: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -148,9 +161,13 @@ impl ConnectView {
                     h_flex()
                         .gap_2()
                         .child(div().flex_1().min_w_0().child(muted(message, cx)))
-                        .child(IconButton::new("connect-local-refresh").variant(Variant::GhostMuted).size(Size::Xs).icon(Icon::RefreshCw).label("Check again").disabled(connect.discovering).on_click(
-                            cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_local_server(cx))),
-                        )),
+                        .child(
+                            Button::new("connect-local-refresh", ButtonVariant::GhostMuted, ButtonSize::Compact)
+                                .icon(Icon::RefreshCw)
+                                .label("Check again")
+                                .disabled(connect.discovering)
+                                .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_local_server(cx)))),
+                        ),
                 )
                 .children(error.map(|error| error_text(error, cx)))
                 .into_any_element();
@@ -178,10 +195,12 @@ impl ConnectView {
                     ),
             )
             .child(
-                Button::new("connect-local", ButtonVariant::Default, ButtonSize::Sm)
-                    .label(if busy { "Connecting…" } else { "Connect to T3 Code on this Mac" })
-                    .disabled(busy || blocked.is_some() || connect.pairing.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.connect_local(cx)))),
+                h_flex().child(
+                    Button::new("connect-local", ButtonVariant::Default, ButtonSize::Default)
+                        .label(if busy { "Connecting…" } else { "Connect to T3 Code on this Mac" })
+                        .disabled(busy || blocked.is_some() || connect.pairing.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.connect_local(cx)))),
+                ),
             )
             .children(blocked.or(error).map(|message| error_text(message, cx)))
             .into_any_element()
@@ -206,11 +225,11 @@ impl ConnectView {
             let (remove, keep) = (id.clone(), id.clone());
             h_flex()
                 .gap_1()
-                .child(Button::new(SharedString::from(format!("remove-confirm-{remove}")), ButtonVariant::Outline, ButtonSize::Xs).label("Remove").on_click(cx.listener(move |this, _, _, cx| {
+                .child(Button::new(SharedString::from(format!("remove-confirm-{remove}")), ButtonVariant::DestructiveOutline, ButtonSize::Compact).label("Remove").on_click(cx.listener(move |this, _, _, cx| {
                     this.confirm_remove = None;
                     this.state.update(cx, |state, cx| state.remove_environment(&remove, cx));
                 })))
-                .child(IconButton::new(SharedString::from(format!("remove-cancel-{keep}"))).variant(Variant::GhostMuted).size(Size::Xs).label("Keep").on_click(cx.listener(
+                .child(Button::new(SharedString::from(format!("remove-cancel-{keep}")), ButtonVariant::GhostMuted, ButtonSize::Compact).label("Keep").on_click(cx.listener(
                     |this, _, _, cx| {
                         this.confirm_remove = None;
                         cx.notify();
@@ -222,11 +241,11 @@ impl ConnectView {
             h_flex()
                 .gap_1()
                 .children(action.map(|action| {
-                    Button::new(SharedString::from(format!("connect-{connect}")), ButtonVariant::Outline, ButtonSize::Xs).label(action).disabled(busy).on_click(cx.listener(
+                    Button::new(SharedString::from(format!("connect-{connect}")), ButtonVariant::Outline, ButtonSize::Compact).label(action).disabled(busy).on_click(cx.listener(
                         move |this, _, _, cx| this.state.update(cx, |state, cx| state.connect_environment(&connect, cx)),
                     ))
                 }))
-                .child(IconButton::new(SharedString::from(format!("remove-{remove}"))).variant(Variant::GhostMuted).size(Size::IconSm).icon(Icon::Trash2).tooltip("Remove from this device…").on_click(
+                .child(Button::new(SharedString::from(format!("remove-{remove}")), ButtonVariant::GhostMuted, ButtonSize::IconSm).icon(Icon::Trash2).tooltip("Remove from this device…").on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.confirm_remove = Some(remove.clone());
                         cx.notify();
@@ -286,7 +305,7 @@ impl ConnectView {
                     .gap_2()
                     .child(div().flex_1().min_w_0().child(Input::new(&self.link)))
                     .child(
-                        Button::new("connect-add", if primary { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Sm)
+                        Button::new("connect-add", if primary { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Default)
                             .label(if busy { "Adding…" } else { "Add environment" })
                             .disabled(state.connect.pairing.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.add(cx))),

@@ -7,7 +7,7 @@
 mod about;
 mod appearance;
 mod archive;
-mod controls;
+pub(crate) mod controls;
 mod general;
 mod keybindings;
 mod store;
