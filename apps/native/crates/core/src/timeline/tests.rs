@@ -261,7 +261,6 @@ fn the_showcase_fixture_folds_into_prompt_fold_and_answer() {
         &projection.attempts,
         &projection.nodes,
         &projection.plans,
-        &projection.messages,
     );
     assert!(!entries.iter().any(|e| matches!(&e.kind, EntryKind::Work(w) if w.command.as_deref() == Some("Preparing workspace"))));
     let mut input = Input::idle();
@@ -299,7 +298,7 @@ fn entries_reuse_unchanged_items_between_derives() {
     let projection = fixture();
     let mut cache = EntriesCache::default();
     let mut derive = || {
-        derive_entries(&mut cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans, &projection.messages)
+        derive_entries(&mut cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans)
     };
     let first = derive();
     let second = derive();

@@ -282,13 +282,10 @@ fn is_standalone(kind: &TurnItemKind) -> bool {
     )
 }
 
-fn chat_message(item: &Arc<TurnItem>, messages: &[Entity]) -> Option<ChatMessage> {
-    let omitted_text = |message_id: &str| {
-        messages.iter().rev().find(|m| m.id == message_id).and_then(|m| m.value.get("text")).and_then(Value::as_str).unwrap_or_default()
-    };
+fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
     let (id, role, text, streaming, meta) = match &item.kind {
         TurnItemKind::UserMessage {
-            message_id, text, input_intent, model_switch, scheduled_task_id, sender_thread_id, created_by, creation_source, idle_compaction, context, text_omitted, ..
+            message_id, text, input_intent, model_switch, scheduled_task_id, sender_thread_id, created_by, creation_source, idle_compaction, context, ..
         } => {
             let guest = context.as_ref().and_then(|c| c.get("guest"));
             let meta = MessageMeta {
@@ -302,11 +299,9 @@ fn chat_message(item: &Arc<TurnItem>, messages: &[Entity]) -> Option<ChatMessage
                 guest_text: guest.and_then(|g| g.get("text")).and_then(Value::as_str).map(str::to_owned),
                 model_switch: model_switch.clone(),
             };
-            let text = if *text_omitted { omitted_text(message_id) } else { text };
             (message_id, Role::User, text, false, meta)
         }
-        TurnItemKind::AssistantMessage { message_id, text, streaming, text_omitted, .. } => {
-            let text = if *text_omitted { omitted_text(message_id) } else { text };
+        TurnItemKind::AssistantMessage { message_id, text, streaming, .. } => {
             (message_id, Role::Assistant, text, *streaming, MessageMeta::default())
         }
         _ => return None,
@@ -314,7 +309,7 @@ fn chat_message(item: &Arc<TurnItem>, messages: &[Entity]) -> Option<ChatMessage
     Some(ChatMessage {
         id: id.clone(),
         role,
-        text: Arc::from(text),
+        text: Arc::from(text.as_str()),
         run_id: item.run_id.clone(),
         streaming,
         created_at: created_at(item),
@@ -381,7 +376,6 @@ pub fn derive_entries(
     attempts: &[RunAttempt],
     nodes: &[Entity],
     plans: &[Entity],
-    messages: &[Entity],
 ) -> Vec<Arc<TimelineEntry>> {
     let attempt_key: Vec<(String, String, Option<String>)> =
         attempts.iter().map(|a| (a.id.clone(), a.status.clone(), None)).collect();
@@ -401,7 +395,7 @@ pub fn derive_entries(
     let mut entries = Vec::with_capacity(visible.len());
     for row in visible {
         let item = &row.item;
-        if is_workspace_preparation(item) && item.deferred_work.is_none() {
+        if is_workspace_preparation(item) {
             continue;
         }
         match &item.kind {
@@ -419,7 +413,7 @@ pub fn derive_entries(
             continue;
         }
         let lookups = lookups.get_or_insert_with(|| Lookups::new(attempts, nodes));
-        let kind = if let Some(message) = chat_message(item, messages) {
+        let kind = if let Some(message) = chat_message(item) {
             EntryKind::Message(Arc::new(message))
         } else if let TurnItemKind::ProposedPlan { plan_id, markdown, .. } = &item.kind {
             let plan = plans.iter().find(|p| p.id == *plan_id && p.value.get("kind").and_then(Value::as_str) == Some("proposed_plan"));

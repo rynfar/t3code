@@ -19,6 +19,12 @@ pub struct TurnItem {
     pub node_id: Option<String>,
     pub parent_item_id: Option<String>,
     #[serde(default)]
+    pub provider_turn_id: Option<String>,
+    #[serde(default)]
+    pub tool_surface: Option<String>,
+    #[serde(default)]
+    pub tool_source: Option<Value>,
+    #[serde(default)]
     pub ordinal: u64,
     #[serde(default)]
     pub status: String,
@@ -27,15 +33,6 @@ pub struct TurnItem {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub updated_at: String,
-    #[serde(default)]
-    pub provider_turn_id: Option<String>,
-    /// Wire-only cursor for collapsed work the bounded snapshot left out.
-    #[serde(default)]
-    pub deferred_work: Option<Value>,
-    #[serde(default)]
-    pub tool_surface: Option<String>,
-    #[serde(default)]
-    pub tool_source: Option<Value>,
     #[serde(flatten)]
     pub kind: TurnItemKind,
 }
@@ -129,8 +126,6 @@ pub enum TurnItemKind {
         idle_compaction: Option<String>,
         #[serde(default)]
         context: Option<Value>,
-        #[serde(default)]
-        text_omitted: bool,
     },
     AssistantMessage {
         message_id: String,
@@ -138,8 +133,6 @@ pub enum TurnItemKind {
         streaming: bool,
         #[serde(default)]
         attachments: Option<Vec<Value>>,
-        #[serde(default)]
-        text_omitted: bool,
     },
     Reasoning {
         text: String,
