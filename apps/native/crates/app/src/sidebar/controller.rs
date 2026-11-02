@@ -13,7 +13,9 @@ use t3_core::settings::snooze::menu_settings;
 use t3_core::sidebar::settled::{self, DEFAULT_SNOOZE_PRESETS, SnoozePreset, SnoozePresetSetting};
 use t3_core::sidebar::sort::top_of_pinned_order_key;
 use t3_core::sidebar::time::{LocalTime, Ms, Zone};
+use t3_core::families::MountedReads;
 use t3_core::shell::{ShellState, ShellStreamItem};
+use t3_core::sidebar::history::NavEntry;
 use t3_core::sidebar::thread::same_apart_from_streaming;
 use t3_core::sidebar::visits::{VisitDecision, VisitTracker, VisitedShell};
 use t3_core::sidebar::{ModelInput, OlderSettledShelf, Shelf, ShelfState, SidebarModel, SidebarSettings};
@@ -101,6 +103,13 @@ pub struct SidebarController {
     undo_timer: Option<Task<()>>,
 }
 
+fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, entry: &NavEntry) -> bool {
+    match entry {
+        NavEntry::Thread(id) => mounts.thread(shell, id).is_some(),
+        NavEntry::Draft(project_id) => shell.project(project_id).is_some(),
+    }
+}
+
 fn connected(phase: &Phase) -> bool {
     matches!(phase, Phase::Online(ConnectionStatus::Connected))
 }
@@ -172,14 +181,17 @@ impl AppState {
     }
 
     pub fn can_navigate(&self, back: bool) -> bool {
-        self.sidebar.history.can_go(back, |id| self.thread_shell(id).is_some())
+        let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+        self.sidebar.history.can_go(back, |entry| history_entry_exists(shell, mounts, entry))
     }
 
     /// `navigation.back` / `navigation.forward`.
     pub fn navigate_history(&mut self, back: bool, cx: &mut Context<Self>) {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        if let Some(id) = self.sidebar.history.go(back, |id| mounts.thread(shell, id).is_some()).map(str::to_owned) {
-            self.select_thread(&id, cx);
+        match self.sidebar.history.go(back, |entry| history_entry_exists(shell, mounts, entry)).cloned() {
+            Some(NavEntry::Thread(id)) => self.select_thread(&id, cx),
+            Some(NavEntry::Draft(project_id)) => self.start_draft(&project_id, cx),
+            None => {}
         }
     }
 

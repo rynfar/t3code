@@ -373,17 +373,29 @@ fn conflicts_compare_resolved_chords_per_platform() {
 
 #[test]
 fn recording_turns_keystrokes_into_keybinding_inputs() {
-    use keybindings::keybinding_from_keystroke as record;
-    assert_eq!(record("k", true, false, false, true, true).as_deref(), Some("mod+shift+k"));
-    assert_eq!(record("k", false, true, false, false, true).as_deref(), Some("ctrl+k"));
-    assert_eq!(record("k", true, true, true, false, false).as_deref(), Some("mod+meta+alt+k"));
+    let us = |key, platform, control, alt, shift, mac| keybindings::keybinding_from_keystroke(key, platform, control, alt, shift, mac, None::<&std::collections::HashMap<char, char>>);
+    assert_eq!(us("k", true, false, false, true, true).as_deref(), Some("mod+shift+k"));
+    assert_eq!(us("k", false, true, false, false, true).as_deref(), Some("ctrl+k"));
+    assert_eq!(us("k", true, true, true, false, false).as_deref(), Some("mod+meta+alt+k"));
     // macOS reports Cmd+Shift+[ as cmd-{ without Shift.
-    assert_eq!(record("{", true, false, false, false, true).as_deref(), Some("mod+shift+["));
-    assert_eq!(record("up", false, false, true, false, true).as_deref(), Some("alt+arrowup"));
-    assert_eq!(record("space", true, false, false, false, true).as_deref(), Some("mod+space"));
-    assert_eq!(record("f6", false, false, false, true, true).as_deref(), Some("shift+f6"));
-    assert_eq!(record("capslock", false, false, false, false, true), None);
-    assert_eq!(record("shift", false, false, false, true, true), None);
+    assert_eq!(us("{", true, false, false, false, true).as_deref(), Some("mod+shift+["));
+    assert_eq!(us("up", false, false, true, false, true).as_deref(), Some("alt+arrowup"));
+    assert_eq!(us("space", true, false, false, false, true).as_deref(), Some("mod+space"));
+    assert_eq!(us("f6", false, false, false, true, true).as_deref(), Some("shift+f6"));
+    assert_eq!(us("capslock", false, false, false, false, true), None);
+    assert_eq!(us("shift", false, false, false, true, true), None);
+    // Other layouts keep their glyph, as the web's `recordedLayoutShortcutKey` does. GPUI's key
+    // equivalents map each US character to the layout's at the same position.
+    let layout = |pairs: &[(char, char)]| pairs.iter().copied().collect::<std::collections::HashMap<char, char>>();
+    let british = layout(&[('#', '£')]);
+    let record = |key, shift, layout| keybindings::keybinding_from_keystroke(key, true, false, false, shift, true, Some(layout));
+    assert_eq!(record("£", false, &british).as_deref(), Some("mod+shift+£"));
+    assert_eq!(record("@", false, &british).as_deref(), Some("mod+shift+2"));
+    let unshifted_hash = layout(&[('\\', '#'), ('#', '§')]);
+    assert_eq!(record("#", false, &unshifted_hash).as_deref(), Some("mod+#"));
+    assert_eq!(record("§", false, &unshifted_hash).as_deref(), Some("mod+shift+§"));
+    // GPUI clears Shift on a shifted non-ASCII letter and reports it upper-cased.
+    assert_eq!(record("Ö", false, &layout(&[(';', 'ö')])).as_deref(), Some("mod+shift+ö"));
     assert_eq!(keybindings::key_pill_parts("mod+shift+k", true), vec!["⌘", "⇧", "K"]);
     assert_eq!(keybindings::key_pill_parts("mod+alt+arrowup", false), vec!["Ctrl", "Alt", "arrowup"]);
 }

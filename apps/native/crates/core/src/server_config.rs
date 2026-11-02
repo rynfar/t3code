@@ -761,6 +761,8 @@ pub struct ServerConfigState {
     /// Counts settings the stream delivered. The protocol carries no revision, so an
     /// `updateSettings` reply applies only while nothing has streamed since it was sent.
     settings_revision: u64,
+    /// The same for keymaps, so a keybinding edit's reply never overwrites a newer stream.
+    keybindings_revision: u64,
 }
 
 impl ServerConfigState {
@@ -770,6 +772,7 @@ impl ServerConfigState {
         match event {
             ServerConfigStreamEvent::Snapshot { mut config } => {
                 self.settings_revision += 1;
+                self.keybindings_revision += 1;
                 // `serverConfigProjection.ts`: sources follow their own event once known.
                 if let Some(current) = self.config.as_ref().filter(|current| !current.usage_limit_sources.is_empty()) {
                     config.usage_limit_sources = current.usage_limit_sources.clone();
@@ -781,6 +784,7 @@ impl ServerConfigState {
                 true
             }
             ServerConfigStreamEvent::KeybindingsUpdated { payload } => {
+                self.keybindings_revision += 1;
                 self.update(|config| replace(&mut config.keybindings, payload.keybindings))
             }
             ServerConfigStreamEvent::ProviderStatuses { payload } => self.apply_providers(payload.providers),
@@ -815,10 +819,17 @@ impl ServerConfigState {
         sent_at == self.settings_revision && self.update(|config| replace(&mut config.settings, settings))
     }
 
-    /// Applies the `keybindings` a `server.upsertKeybinding` / `server.removeKeybinding` reply
-    /// carries, so an edit shows before `keybindingsUpdated` streams the same set. Returns true
-    /// when the config changed.
-    pub fn apply_keybindings_reply(&mut self, reply: &Value) -> bool {
+    pub fn keybindings_revision(&self) -> u64 {
+        self.keybindings_revision
+    }
+
+    /// Applies the `keybindings` a `server.upsertKeybinding` / `server.removeKeybinding` sent at
+    /// `sent_at` answered with, so an edit shows before `keybindingsUpdated` streams the same
+    /// set, unless a keymap streamed since. Returns true when the config changed.
+    pub fn apply_keybindings_reply(&mut self, reply: &Value, sent_at: u64) -> bool {
+        if sent_at != self.keybindings_revision {
+            return false;
+        }
         match reply.get("keybindings") {
             Some(keybindings @ Value::Array(_)) => self.update(|config| replace(&mut config.keybindings, keybindings.clone())),
             _ => false,

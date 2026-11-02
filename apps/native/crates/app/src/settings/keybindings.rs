@@ -56,6 +56,13 @@ impl Draft {
     }
 }
 
+/// A row's tab stops: the shortcut pill, the shortcut field, and the when trigger.
+struct RowFocus {
+    pill: FocusHandle,
+    field: FocusHandle,
+    when: FocusHandle,
+}
+
 /// The table built from one server keymap, rebuilt only when the keymap changes.
 struct Catalog {
     source: Value,
@@ -67,15 +74,16 @@ pub(crate) struct KeybindingsState {
     pub(crate) filter: Entity<InputState>,
     /// The expression field of the open when builder.
     pub(crate) when_input: Entity<InputState>,
-    /// Held by the shortcut field of the row in `recording`.
-    capture: FocusHandle,
+    /// Each row's tab stops, by row id.
+    focus: HashMap<String, RowFocus>,
     catalog: Option<Catalog>,
     /// Edited rows by row id; untouched rows show their saved binding.
     drafts: HashMap<String, Draft>,
     adding: bool,
     new_command: Option<String>,
+    /// The row whose shortcut field took a chord since it was focused; the field records again
+    /// only while `armed` (`isRecording`), and lets Tab through otherwise.
     recording: Option<String>,
-    /// The focused field records the next chord (`isRecording`); after one it lets Tab through.
     armed: bool,
     when_open: Option<String>,
     menu: Option<String>,
@@ -88,7 +96,6 @@ impl KeybindingsState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search keybindings"));
         let when_input = cx.new(|cx| InputState::new(window, cx).placeholder("Always"));
-        let capture = cx.focus_handle();
         let view = cx.entity().downgrade();
         let subscriptions = vec![
             cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
@@ -102,10 +109,6 @@ impl KeybindingsState {
                     this.when_text_changed(&text, cx);
                 }
             }),
-            cx.on_blur(&capture, window, |this, _, cx| {
-                this.keybindings.armed = false;
-                cx.notify();
-            }),
             // Bound chords (Cmd+K, Escape) dispatch as actions before key listeners see them.
             cx.intercept_keystrokes(move |event, window, cx| {
                 let _ = view.update(cx, |this, cx| this.capture_keystroke(&event.keystroke, window, cx));
@@ -114,7 +117,7 @@ impl KeybindingsState {
         KeybindingsState {
             filter,
             when_input,
-            capture,
+            focus: HashMap::new(),
             catalog: None,
             drafts: HashMap::new(),
             adding: false,
@@ -140,12 +143,31 @@ impl KeybindingsState {
         let rows = model::binding_rows(keybindings, MAC);
         let live = |id: &String| id == NEW_ROW || rows.iter().any(|row| row.id == *id);
         self.drafts.retain(|id, _| live(id));
+        self.focus.retain(|id, _| live(id));
         for target in [&mut self.recording, &mut self.when_open, &mut self.menu] {
             if target.as_ref().is_some_and(|id| !live(id)) {
                 *target = None;
             }
         }
         self.catalog = Some(Catalog { source: keybindings.clone(), commands: Rc::new(model::command_options(keybindings)), rows: Rc::new(rows) });
+    }
+
+    fn ensure_focus(&mut self, id: &str, cx: &mut App) {
+        if !self.focus.contains_key(id) {
+            let handle = || cx.focus_handle().tab_stop(true);
+            let focus = RowFocus { pill: handle(), field: handle(), when: handle() };
+            self.focus.insert(id.to_owned(), focus);
+        }
+    }
+
+    fn row_focus(&self, id: &str) -> Option<&RowFocus> {
+        self.focus.get(id)
+    }
+
+    /// Whether `id` shows its pill: a saved, unedited shortcut whose field is not recording.
+    fn shows_pill(&self, id: &str, recording: bool) -> bool {
+        let rows = self.rows();
+        !recording && rows.iter().find(|row| row.id == id).is_some_and(|row| !row.key.is_empty() && !self.draft_for(row).dirty(row))
     }
 
     fn draft_for(&self, row: &BindingRow) -> Draft {
@@ -177,13 +199,13 @@ impl KeybindingsState {
 
 impl SettingsView {
     /// Closes the when builder or a row menu; true when one was open, so Escape stops there.
-    pub(super) fn dismiss_keybinding_overlay(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(super) fn dismiss_keybinding_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.keybindings.menu.take().is_some() {
             cx.notify();
             return true;
         }
         if self.keybindings.when_open.is_some() {
-            self.close_when(cx);
+            self.close_when(window, cx);
             return true;
         }
         false
@@ -193,30 +215,39 @@ impl SettingsView {
         matches!(self.state.read(cx).phase, Phase::Online(ConnectionStatus::Connected))
     }
 
-    /// `captureKeybinding`: the focused shortcut field takes every chord; Escape restores the saved
-    /// one, and Tab passes once a chord is recorded.
+    /// `captureKeybinding`: a focused shortcut field takes every chord; Escape restores the saved
+    /// one, and Tab passes once a chord is recorded. Focusing the field arms it (`onFocus`).
     fn capture_keystroke(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.keybindings.recording.clone() else { return };
-        if !self.keybindings.capture.is_focused(window) || (keystroke.key == "tab" && !self.keybindings.armed) {
+        let Some(target) = self.keybindings.focus.iter().find(|(_, focus)| focus.field.is_focused(window)).map(|(id, _)| id.clone()) else {
+            return;
+        };
+        if self.keybindings.recording.as_deref() != Some(target.as_str()) {
+            self.keybindings.recording = Some(target.clone());
+            self.keybindings.armed = true;
+        }
+        if keystroke.key == "tab" && !self.keybindings.armed {
             return;
         }
         cx.stop_propagation();
         if keystroke.key == "escape" {
             let saved = self.keybindings.saved_key(&target);
             self.keybindings.draft_mut(&target).key = saved;
-            self.stop_recording(window, cx);
+            self.stop_recording(&target, window, cx);
             return;
         }
         let modifiers = keystroke.modifiers;
-        let Some(next) = model::keybinding_from_keystroke(&keystroke.key, modifiers.platform, modifiers.control, modifiers.alt, modifiers.shift, MAC)
+        let mapper = cx.keyboard_mapper().clone();
+        let equivalents = mapper.get_key_equivalents();
+        let Some(next) =
+            model::keybinding_from_keystroke(&keystroke.key, modifiers.platform, modifiers.control, modifiers.alt, modifiers.shift, MAC, equivalents)
         else {
             return;
         };
         self.keybindings.draft_mut(&target).key = next;
         self.keybindings.armed = false;
-        // An unchanged row swaps its field back for the pill, which would drop focus.
+        // An unchanged row swaps its field back for the pill, which takes focus.
         if !self.keybindings.is_dirty(&target) {
-            self.stop_recording(window, cx);
+            self.stop_recording(&target, window, cx);
         }
         cx.notify();
     }
@@ -225,14 +256,20 @@ impl SettingsView {
         self.keybindings.recording = Some(id.to_owned());
         self.keybindings.armed = true;
         self.keybindings.menu = None;
-        self.keybindings.capture.focus(window, cx);
+        if let Some(focus) = self.keybindings.row_focus(id) {
+            focus.field.focus(window, cx);
+        }
         cx.notify();
     }
 
-    fn stop_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Leaves the field for the row's pill when it shows one, else for the page.
+    fn stop_recording(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.keybindings.recording = None;
         self.keybindings.armed = false;
-        self.focus.focus(window, cx);
+        match self.keybindings.row_focus(id).filter(|_| self.keybindings.shows_pill(id, false)) {
+            Some(focus) => focus.pill.focus(window, cx),
+            None => self.focus.focus(window, cx),
+        }
         cx.notify();
     }
 
@@ -240,16 +277,23 @@ impl SettingsView {
         let expression = self.keybindings.draft(id).when_expression();
         self.keybindings.when_open = Some(id.to_owned());
         self.keybindings.menu = None;
-        self.keybindings.when_input.update(cx, |input, cx| input.set_value(expression, window, cx));
+        self.keybindings.when_input.update(cx, |input, cx| {
+            input.set_value(expression, window, cx);
+            input.focus(window, cx);
+        });
         cx.notify();
     }
 
-    /// Closing keeps the last valid clause and drops an unparsed expression (`WhenClauseControl`).
-    fn close_when(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.keybindings.when_open.take()
-            && let Some(draft) = self.keybindings.drafts.get_mut(&id)
-        {
-            draft.when_valid = true;
+    /// Closing keeps the last valid clause and drops an unparsed expression (`WhenClauseControl`),
+    /// and returns focus to the trigger.
+    fn close_when(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.keybindings.when_open.take() {
+            if let Some(draft) = self.keybindings.drafts.get_mut(&id) {
+                draft.when_valid = true;
+            }
+            if let Some(focus) = self.keybindings.row_focus(&id) {
+                focus.when.focus(window, cx);
+            }
         }
         cx.notify();
     }
@@ -314,7 +358,10 @@ impl SettingsView {
     fn send_keybinding(&mut self, method: &'static str, payload: Value, command: String, done: Option<String>, failure: &'static str, cx: &mut Context<Self>) {
         store::clear_error(cx);
         self.keybindings.saving = Some(command);
-        let task = self.state.read(cx).rpc(method, payload);
+        let (sent_at, task) = {
+            let state = self.state.read(cx);
+            (state.server_config.keybindings_revision(), state.rpc(method, payload))
+        };
         let state = self.state.clone();
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -323,7 +370,7 @@ impl SettingsView {
                 match result {
                     Ok(reply) => {
                         state.update(cx, |state, cx| {
-                            if state.server_config.apply_keybindings_reply(&reply) {
+                            if state.server_config.apply_keybindings_reply(&reply, sent_at) {
                                 state.sync_server_config(cx);
                                 cx.emit(AppEvent::ServerConfig);
                             }
@@ -366,6 +413,13 @@ impl SettingsView {
         static NONE: Value = Value::Null;
         let keybindings = self.state.read(cx).server_config.config.as_ref().map_or(&NONE, |config| &config.keybindings);
         self.keybindings.refresh(keybindings);
+        // A field left by Tab or a click re-arms when focused again.
+        if let Some(id) = self.keybindings.recording.clone()
+            && !self.keybindings.row_focus(&id).is_some_and(|focus| focus.field.is_focused(window))
+        {
+            self.keybindings.recording = None;
+            self.keybindings.armed = false;
+        }
         let connected = self.connected(cx);
         let rows = self.keybindings.rows();
         // A settings-search jump to a binding clears the table filter so its row shows.
@@ -378,9 +432,13 @@ impl SettingsView {
             blocks.push(Block::new(&[], div().px(r(16.)).text_xs().text_color(hsla(palette(cx).muted_foreground)).child("Connect an environment to change keybindings.")));
         }
         if self.keybindings.adding {
+            self.keybindings.ensure_focus(NEW_ROW, cx);
             blocks.push(Block::new(&[], group(vec![self.new_binding_row(&rows, window, cx)], cx)));
         }
         let filtered = model::filter_binding_rows(&rows, &query);
+        for row in &filtered {
+            self.keybindings.ensure_focus(&row.id, cx);
+        }
         if filtered.is_empty() {
             let empty = div().px(r(16.)).py(r(48.)).flex().justify_center().child(muted_text("No keybindings match your search.", cx));
             blocks.push(Block::new(&[], group(vec![empty.into_any_element()], cx)));
@@ -465,8 +523,7 @@ impl SettingsView {
         let saving = self.keybindings.saving.as_deref() == Some(row.command.as_str());
         let highlighted = anchor.as_deref().is_some_and(|anchor| self.is_target(anchor));
         let id = element_id("kb-row", &row.id);
-        let recording = self.recording_in(&row.id, window);
-        let show_pill = !recording && !dirty && !row.key.is_empty();
+        let show_pill = !self.recording_in(&row.id, window) && !dirty && !row.key.is_empty();
 
         let title = h_flex()
             .id(element_id("kb-title", &row.id))
@@ -498,7 +555,7 @@ impl SettingsView {
                         .on_click(move |_, _, cx| save_view.update(cx, |this, cx| this.save_binding(&save_id, cx))),
                 )
             })
-            .child(if show_pill { self.key_pill(row, cx) } else { self.capture_field(&row.id, &draft.key, 176., window, cx) });
+            .child(if show_pill { self.key_pill(row, window, cx) } else { self.capture_field(&row.id, &draft.key, 176., window, cx) });
 
         let fill = highlighted.then(|| hsla(p.accent).opacity(0.6));
         row_layout(id, fill, title.into_any_element(), description.into_any_element(), control.into_any_element(), window)
@@ -567,23 +624,29 @@ impl SettingsView {
         row_layout("kb-new".into(), Some(hsla(p.muted).opacity(0.15)), title.into_any_element(), description.into_any_element(), control.into_any_element(), window)
     }
 
+    /// The field shows "Press shortcut": focused, and no chord recorded since (`isRecording`).
     fn recording_in(&self, id: &str, window: &Window) -> bool {
-        self.keybindings.recording.as_deref() == Some(id) && self.keybindings.armed && self.keybindings.capture.is_focused(window)
+        let focused = self.keybindings.row_focus(id).is_some_and(|focus| focus.field.is_focused(window));
+        focused && (self.keybindings.recording.as_deref() != Some(id) || self.keybindings.armed)
     }
 
     /// The saved shortcut as key caps; clicking starts recording (`KeybindingKeyControl`).
-    fn key_pill(&self, row: &BindingRow, cx: &mut Context<Self>) -> AnyElement {
+    fn key_pill(&self, row: &BindingRow, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let id = row.id.clone();
+        let focus = self.keybindings.row_focus(&row.id).map(|focus| focus.pill.clone());
+        let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         h_flex()
             .id(element_id("kb-pill", &row.id))
+            .when_some(focus, |this, focus| this.track_focus(&focus))
+            .when(ring, |this| this.border_color(hsla(p.ring)).shadow(focus_ring(hsla(p.ring).opacity(0.24))))
             .h(r(28.))
             .px(r(6.))
             .mr(r(-6.))
             .gap(r(4.))
             .rounded(r(6.))
             .border_1()
-            .border_color(gpui::transparent_black())
+            .when(!ring, |this| this.border_color(gpui::transparent_black()))
             .cursor_pointer()
             .hover(|this| this.border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.accent)))
             .children(model::key_pill_parts(&row.key, MAC).into_iter().map(|part| kbd(part, cx)))
@@ -595,8 +658,8 @@ impl SettingsView {
     fn capture_field(&self, id: &str, key: &str, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
-        let holder = self.keybindings.recording.as_deref() == Some(id);
-        let focused = holder && self.keybindings.capture.is_focused(window);
+        let focus = self.keybindings.row_focus(id).map(|focus| focus.field.clone());
+        let focused = focus.as_ref().is_some_and(|focus| focus.is_focused(window));
         let recording = self.recording_in(id, window);
         let (text, placeholder) = match (recording, key.is_empty()) {
             (true, _) => ("Press shortcut".to_owned(), true),
@@ -606,7 +669,7 @@ impl SettingsView {
         let target = id.to_owned();
         h_flex()
             .id(element_id("kb-capture", id))
-            .when(holder, |this| this.track_focus(&self.keybindings.capture))
+            .when_some(focus, |this, focus| this.track_focus(&focus))
             .w(r(width))
             .h(r(28.))
             .px(r(9.))
@@ -623,6 +686,7 @@ impl SettingsView {
             // GPUI keeps focus on a click elsewhere; the web field blurs and stops recording.
             .when(focused, |this| {
                 this.on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    this.keybindings.recording = None;
                     this.keybindings.armed = false;
                     this.focus.focus(window, cx);
                     cx.notify();
@@ -707,8 +771,12 @@ impl SettingsView {
         let p = palette(cx);
         let open = self.keybindings.when_open.as_deref() == Some(id);
         let target = id.to_owned();
+        let focus = self.keybindings.row_focus(id).map(|focus| focus.when.clone());
+        let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         let trigger = h_flex()
             .id(element_id("kb-when", id))
+            .when_some(focus, |this, focus| this.track_focus(&focus))
+            .when(ring, |this| this.shadow(focus_ring(hsla(p.ring))))
             .min_w_0()
             .h(r(20.))
             .px(r(5.))
@@ -724,7 +792,7 @@ impl SettingsView {
             .child(icon(Icon::ChevronDown, 14., hsla(p.muted_foreground).opacity(0.6)).flex_none())
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if this.keybindings.when_open.as_deref() == Some(target.as_str()) {
-                    this.close_when(cx);
+                    this.close_when(window, cx);
                 } else {
                     this.open_when(&target, window, cx);
                 }
@@ -736,7 +804,7 @@ impl SettingsView {
                 .w(viewport.width)
                 .h(viewport.height)
                 .occlude()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_when(cx)));
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_when(window, cx)));
             div()
                 .absolute()
                 .bottom_0()

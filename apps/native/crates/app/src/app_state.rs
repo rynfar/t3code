@@ -14,6 +14,7 @@ use t3_core::composer::ClientSettings;
 use t3_core::history::{HistoryStep, PageOutcome};
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::{ShellState, ShellStreamItem};
+use t3_core::sidebar::history::NavEntry;
 use t3_core::thread::ThreadState;
 use t3_core::workflows::{self, StopTarget};
 
@@ -238,6 +239,7 @@ impl AppState {
             cx.emit(AppEvent::Shell);
             let (shell, mounts) = (&self.shell, &self.omitted.mounts);
             if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
+                self.sidebar.history.replace_draft();
                 self.select_thread(&id, cx);
             } else if self.selected_thread.is_none()
                 && self.draft_project.is_none()
@@ -320,7 +322,7 @@ impl AppState {
         self.adopt_side_thread(thread_id);
         self.restore_thread = None;
         store::save_last_thread(thread_id);
-        self.sidebar.history.visit(thread_id);
+        self.sidebar.history.visit(NavEntry::Thread(thread_id.to_owned()));
         if let Some(client) = &self.client {
             client.open_thread(thread_id);
         }
@@ -405,6 +407,7 @@ impl AppState {
         self.thread = ThreadState::default();
         self.restore_thread = None;
         self.draft_project = Some(project_id.to_owned());
+        self.sidebar.history.visit(NavEntry::Draft(project_id.to_owned()));
         self.sync_side_threads(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
@@ -426,6 +429,7 @@ impl AppState {
     /// Selects a thread the draft launched as soon as the shell lists it.
     pub fn select_when_listed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.thread_shell(thread_id).is_some() {
+            self.sidebar.history.replace_draft();
             self.select_thread(thread_id, cx);
         } else {
             self.select_when_listed = Some(thread_id.to_owned());

@@ -4,7 +4,8 @@
 //! conflicts. The when builder edits a tree addressed by child paths (`apply_when_edit`), and
 //! edits go out as `server.upsertKeybinding` / `server.removeKeybinding` payloads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::BuildHasher;
 
 use serde_json::{Map, Value, json};
 
@@ -429,13 +430,37 @@ pub fn conflict_description(labels: &[String]) -> Option<String> {
 }
 
 /// `keybindingFromKeyboardEvent` with `layoutCharacter` for a GPUI keystroke: `mod` is Cmd on
-/// macOS and Ctrl elsewhere. GPUI on macOS reports Shift+symbol as the shifted glyph without
-/// Shift, which records as Shift and the US key under it. Modifier-only or unnamed keys give `None`.
-pub fn keybinding_from_keystroke(key: &str, platform: bool, control: bool, alt: bool, shift: bool, mac: bool) -> Option<String> {
+/// macOS and Ctrl elsewhere. GPUI on macOS reports a shifted symbol as its glyph without Shift,
+/// and a shifted non-ASCII letter upper-cased without Shift. `equivalents` is GPUI's key
+/// equivalents table (US character to this layout's at the same position; `None` for US-like
+/// layouts): a US shifted glyph at its US position records as Shift and the key under it, like
+/// the web, and other glyphs record as typed. Modifier-only or unnamed keys give `None`.
+pub fn keybinding_from_keystroke<S: BuildHasher>(
+    key: &str,
+    platform: bool,
+    control: bool,
+    alt: bool,
+    shift: bool,
+    mac: bool,
+    equivalents: Option<&HashMap<char, char, S>>,
+) -> Option<String> {
     let lowered = key.to_lowercase();
-    let (token, shift) = match US_SHIFTED_TO_UNSHIFTED_KEYS.iter().find(|(shifted, _)| *shifted == lowered) {
-        Some((_, unshifted)) if !alt => ((*unshifted).to_owned(), true),
-        _ => (lowered, shift),
+    let mut chars = lowered.chars();
+    let glyph = chars.next().filter(|_| chars.next().is_none());
+    let us_unshifted = |glyph: char| US_SHIFTED_TO_UNSHIFTED_KEYS.iter().find(|(shifted, _)| shifted.chars().eq([glyph])).map(|(_, unshifted)| *unshifted);
+    let shift = shift || (glyph.is_some() && lowered != key);
+    let (token, shift) = match glyph.filter(|_| !alt) {
+        None => (lowered, shift),
+        Some(glyph) => {
+            let us_position = equivalents.and_then(|table| table.iter().find(|(_, layout)| **layout == glyph).map(|(us, _)| *us));
+            let moved = equivalents.is_some_and(|table| table.contains_key(&glyph));
+            match (us_position, us_unshifted(glyph)) {
+                // This layout's glyph sits where US has a shifted one, so Shift was held.
+                (Some(us), _) => (lowered, shift || us_unshifted(us).is_some()),
+                (None, Some(unshifted)) if !moved => (unshifted.to_owned(), true),
+                _ => (lowered, shift),
+            }
+        }
     };
     let token = match token.as_str() {
         "up" | "arrowup" => "arrowup".to_owned(),

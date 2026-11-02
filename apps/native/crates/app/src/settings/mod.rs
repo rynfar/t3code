@@ -309,7 +309,7 @@ impl SettingsView {
     }
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dismiss_keybinding_overlay(cx) {
+        if self.dismiss_keybinding_overlay(window, cx) {
             return;
         }
         if !self.query(cx).trim().is_empty() {
