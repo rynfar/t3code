@@ -194,7 +194,6 @@ pub struct SettingsView {
     focused_section: Option<(Section, Section)>,
     /// The compact (icon rail) nav shows the search field over the page while this is set.
     compact_search_open: bool,
-    server_address: String,
     pub(crate) threads: threads::ThreadsState,
     pub(crate) keybindings: keybindings::KeybindingsState,
     pub(crate) archive: archive::ArchiveState,
@@ -253,7 +252,6 @@ impl SettingsView {
                 .collect(),
             focused_section: None,
             compact_search_open: false,
-            server_address: t3_client::store::load().map(|credentials| credentials.http_base).unwrap_or_default(),
             _subscriptions: subscriptions,
         };
         view.navigate(section, anchor, cx);

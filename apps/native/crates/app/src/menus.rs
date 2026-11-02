@@ -8,7 +8,7 @@ use crate::app_state::AppState;
 use crate::keymap::{ToggleCommandPalette, ToggleSidebar};
 use crate::settings::OpenSettings;
 
-actions!(t3, [Quit, Disconnect, Hide, HideOthers, ShowAll, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
+actions!(t3, [Quit, SwitchEnvironment, Disconnect, Hide, HideOthers, ShowAll, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut gpui::Window)) {
     if let Some(window) = cx.active_window() {
@@ -25,7 +25,11 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
     cx.on_action(|_: &ToggleFullScreen, cx| with_active_window(cx, |window| window.toggle_fullscreen()));
-    cx.on_action(move |_: &Disconnect, cx| state.update(cx, |state, cx| state.forget_connection(cx)));
+    cx.on_action({
+        let state = state.clone();
+        move |_: &SwitchEnvironment, cx| state.update(cx, |state, cx| state.open_switcher(cx))
+    });
+    cx.on_action(move |_: &Disconnect, cx| state.update(cx, |state, cx| state.disconnect(cx)));
     cx.bind_keys([
         // Labels the menu item only: `quit_hold` handles the key so it can see auto-repeat.
         KeyBinding::new("cmd-q", Quit, Some("QuitMenuLabel")),
@@ -38,7 +42,8 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
         Menu::new("T3 Code").items([
             MenuItem::action("Settings...", OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Disconnect from Server", Disconnect),
+            MenuItem::action("Switch Environment...", SwitchEnvironment),
+            MenuItem::action("Disconnect", Disconnect),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),

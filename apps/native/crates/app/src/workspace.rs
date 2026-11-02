@@ -1,6 +1,6 @@
 //! Window root: titlebar strip, sidebar, and the thread area, or the connect screen.
 
-use gpui::{App, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window, WindowControlArea, div, prelude::*, px};
+use gpui::{ClipboardItem, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
 
@@ -108,15 +108,46 @@ impl Workspace {
         }
     }
 
-    fn render_titlebar(&self, window: &Window, cx: &App) -> impl IntoElement {
+    /// CN-STATUS: while not connected, a status dot and title with the diagnosis as a tooltip,
+    /// and Retry where it can do something.
+    fn render_connection_status(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let state = self.state.read(cx);
-        let status = match &state.phase {
-            Phase::Online(ConnectionStatus::Connected) => None,
-            Phase::Online(ConnectionStatus::Connecting) => Some("Connecting…".to_owned()),
-            Phase::Online(ConnectionStatus::Reconnecting { reason, .. }) => Some(reason.clone()),
-            Phase::Online(ConnectionStatus::NeedsPairing { reason }) => Some(reason.clone()),
-            Phase::Pairing | Phase::Unpaired { .. } => None,
-        };
+        let Phase::Online(status) = &state.phase else { return None };
+        if *status == ConnectionStatus::Connected {
+            return None;
+        }
+        let host = state.active_environment().map(|environment| environment.label.clone()).unwrap_or_default();
+        let details: gpui::SharedString = status.details(&host).into();
+        let error_tone = status.summary().1;
+        let p = palette(cx);
+        Some(
+            h_flex()
+                .flex_none()
+                .gap(px(6.))
+                .child(
+                    h_flex()
+                        .id("connection-status")
+                        .gap(px(4.))
+                        .child(crate::connect::status_dot(Some(status.dot()), cx))
+                        .child(div().text_xs().text_color(if error_tone { hsla(p.destructive_foreground) } else { hsla(p.muted_foreground) }).child(status.title()))
+                        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(details.clone()).build(window, cx)),
+                )
+                .when(status.can_retry(), |this| {
+                    this.child(
+                        crate::right_panel::Button::new("connection-retry")
+                            .variant(crate::right_panel::Variant::GhostMuted)
+                            .size(crate::right_panel::Size::Xs)
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| this.state.read(cx).retry_connection())),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+        let status = self.render_connection_status(cx);
+        let state = self.state.read(cx);
         let terminal_toggle = state.selected_thread.is_some().then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
         let theme = cx.theme();
         let collapsed = state.sidebar.collapsed;
@@ -130,7 +161,7 @@ impl Workspace {
             .border_b_1()
             .border_color(theme.border)
             .child(self.header.clone())
-            .children(status.map(|status| div().text_xs().text_color(theme.muted_foreground).child(status)))
+            .children(status)
             .child(new_thread::new_thread_button(cx))
             .child(chat_header::controls(&self.state, terminal_toggle, window, cx))
     }
@@ -140,7 +171,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let paired = matches!(self.state.read(cx).phase, Phase::Online(_));
         let theme = cx.theme();
-        if !paired {
+        if !paired || self.state.read(cx).connect.switching {
             return div().size_full().bg(theme.background).map(crate::quit_hold::listen).child(self.connect.clone()).children(crate::quit_hold::hint(cx)).into_any_element();
         }
         let state = self.state.read(cx);
