@@ -2,6 +2,7 @@ use serde_json::json;
 
 use super::*;
 use crate::server_config::ServerConfig;
+use crate::settings::project_actions::Member;
 
 fn group(key: &str, label: &str, members: &[&str], archived: bool) -> ProjectGroup {
     ProjectGroup {
@@ -23,8 +24,10 @@ fn groups_sort_by_name_and_name_twins_show_their_machine() {
     let mut groups = vec![group("b", "beta", &["p2"], false), group("a", "Alpha", &["p1"], true), group("c", "beta", &["p3"], false)];
     sort_groups(&mut groups);
     assert_eq!(groups.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
-    assert_eq!(choice_secondary(&groups[0], &groups, "/w/alpha", "This Mac"), "Archived \u{b7} /w/alpha");
-    assert_eq!(choice_secondary(&groups[1], &groups, "/w/beta", "This Mac"), "This Mac \u{b7} /w/beta");
+    let shared = shared_labels(&groups);
+    assert_eq!(shared, HashSet::from(["beta"]));
+    assert_eq!(choice_secondary(&groups[0], shared.contains(groups[0].label.as_str()), "/w/alpha", "This Mac"), "Archived \u{b7} /w/alpha");
+    assert_eq!(choice_secondary(&groups[1], shared.contains(groups[1].label.as_str()), "/w/beta", "This Mac"), "This Mac \u{b7} /w/beta");
 }
 
 #[test]
@@ -114,6 +117,14 @@ fn removal_confirmations_follow_plan_project_removal() {
     assert_eq!(danger_copy(true, 3).title, "Remove checkout");
 }
 
+fn members(ids: &[&str]) -> Vec<Member> {
+    ids.iter().map(|id| Member { id: (*id).to_owned(), scripts: Vec::new() }).collect()
+}
+
+fn set(key: &str, value: Value) -> OverrideEdit {
+    OverrideEdit::Set { key: key.into(), value }
+}
+
 #[test]
 fn override_writes_keep_unknown_keys_and_clear_to_null() {
     let settings = settings(json!({
@@ -122,27 +133,47 @@ fn override_writes_keep_unknown_keys_and_clear_to_null() {
             "p2": {"defaultModelSelection": null}
         }
     }));
-    let set = override_set_patch(&settings, &["p1", "p3"], "defaultThreadEnvMode", json!("local"));
+    let local = override_patch(&settings, &members(&["p1", "p3"]), &set("defaultThreadEnvMode", json!("local")));
     assert_eq!(
-        set,
+        local,
         json!({"patch": {"projectSettingsOverrides": {
             "p1": {"defaultThreadEnvMode": "local", "branchNamePrefix": "x/", "futureKey": {"a": 1}},
             "p3": {"defaultThreadEnvMode": "local"}
         }}})
     );
-    let model = override_set_patch(&settings, &["p1"], "defaultModelSelection", Value::Null);
+    let model = override_patch(&settings, &members(&["p1"]), &set("defaultModelSelection", Value::Null));
     assert_eq!(model["patch"]["projectSettingsOverrides"]["p1"]["defaultModelSelection"], Value::Null, "null is a stored model override");
-    let unset = override_set_patch(&settings, &["p1"], "defaultThreadEnvMode", Value::Null);
+    let unset = override_patch(&settings, &members(&["p1"]), &set("defaultThreadEnvMode", Value::Null));
     assert!(unset["patch"]["projectSettingsOverrides"]["p1"].get("defaultThreadEnvMode").is_none());
-    let cleared = override_clear_patch(&settings, &["p1", "p2", "p4"], &["defaultThreadEnvMode", "defaultModelSelection"]);
+    let clear = OverrideEdit::Clear { keys: vec!["defaultThreadEnvMode".into(), "defaultModelSelection".into()] };
     assert_eq!(
-        cleared,
+        override_patch(&settings, &members(&["p1", "p2", "p4"]), &clear),
         json!({"patch": {"projectSettingsOverrides": {
             "p1": {"branchNamePrefix": "x/", "futureKey": {"a": 1}},
             "p2": null,
             "p4": null
         }}})
     );
+}
+
+#[test]
+fn a_queued_override_keeps_the_change_saved_ahead_of_it() {
+    use crate::settings::ServerSettingChange;
+    use crate::settings::project_actions::ScriptsEdit;
+    // Model, then Workspace, picked before the first save lands: the second is built when it sends.
+    let before = settings(json!({"projectSettingsOverrides": {"p1": {"branchNamePrefix": "x/"}}}));
+    let model = ServerSettingChange::ProjectOverride { members: members(&["p1"]), edit: set("defaultModelSelection", json!({"instanceId": "codex", "model": "gpt-5"})) };
+    let workspace = ServerSettingChange::ProjectOverride { members: members(&["p1"]), edit: set("defaultThreadEnvMode", json!("worktree")) };
+    let first = model.payload_for(Some(&before)).expect("payload");
+    let after = settings(json!({"projectSettingsOverrides": first["patch"]["projectSettingsOverrides"].clone()}));
+    let second = workspace.payload_for(Some(&after)).expect("payload");
+    assert_eq!(
+        second["patch"]["projectSettingsOverrides"]["p1"],
+        json!({"branchNamePrefix": "x/", "defaultModelSelection": {"instanceId": "codex", "model": "gpt-5"}, "defaultThreadEnvMode": "worktree"})
+    );
+    let actions = ServerSettingChange::ProjectOverride { members: members(&["p1"]), edit: OverrideEdit::Scripts(ScriptsEdit::Reset) };
+    assert_eq!(actions.payload_for(Some(&after)).expect("payload")["patch"]["projectSettingsOverrides"]["p1"]["defaultModelSelection"]["model"], "gpt-5");
+    assert_eq!(workspace.payload_for(None), None, "nothing to build without settings");
 }
 
 fn config(value: Value) -> ServerConfig {
@@ -182,3 +213,19 @@ fn the_project_workspace_falls_back_to_t3_json_then_the_checkout() {
     assert_eq!(project_env_mode(&settings, "p2", Some(ThreadEnvMode::Worktree)), (ThreadEnvMode::Worktree, Source::ProjectFile));
     assert_eq!(project_env_mode(&settings, "p2", None), (ThreadEnvMode::Local, Source::Environment));
 }
+
+#[test]
+fn a_model_one_member_turned_off_is_unavailable_to_the_group() {
+    let config = config(json!({"providers": [
+        {"instanceId": "codex", "driver": "codex", "status": "ready", "enabled": true, "installed": true, "models": [{"slug": "gpt-5", "name": "GPT-5", "isCustom": false}]}
+    ], "settings": {"projectSettingsOverrides": {"p2": {"providerInstances": {"codex": {"enabled": false}}}}}}));
+    let gpt = ModelSelection { instance_id: "codex".into(), model: "gpt-5".into(), options: None };
+    assert_eq!(model_unavailable_reason(&config, &["p1"], &gpt, "This Mac"), None);
+    assert_eq!(
+        model_unavailable_reason(&config, &["p1", "p2"], &gpt, "This Mac").as_deref(),
+        Some("This model is unavailable on This Mac. Select that environment to choose its model separately.")
+    );
+    let missing = ModelSelection { model: "gpt-9".into(), ..gpt };
+    assert!(model_unavailable_reason(&config, &["p1"], &missing, "This Mac").is_some());
+}
+

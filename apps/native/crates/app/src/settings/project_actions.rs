@@ -14,10 +14,12 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::keybindings::{ResolvedKeybindingRule, ShortcutMatchContext, decode_resolved_keybindings, shortcut_label_for_command};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script};
 use t3_core::settings::keybindings::keybinding_from_keystroke;
+use t3_core::settings::ServerSettingChange;
 use t3_core::settings::project_actions::{
-    ACTIONS_DESCRIPTION, ActionWrite, EditorRequest, FileScript, FormValues, Member, NO_ACTIONS, ProjectFile, SCRIPT_ICONS, ScriptInput, importable,
-    plan_writes, scripts_mixed, scripts_overridden, shown_scripts, submit_id, submitted_scripts, validate_form,
+    ACTIONS_DESCRIPTION, ActionWrite, EditorRequest, FileScript, FormValues, Member, NO_ACTIONS, ProjectFile, SCRIPT_ICONS, ScriptInput, ScriptsEdit,
+    importable, keybinding_writes, scripts_mixed, scripts_overridden, shown_scripts, submit_id, validate_form,
 };
+use t3_core::settings::projects::OverrideEdit;
 use t3_core::shell::ProjectShell;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Switch, focus_ring, group, icon, r, section_title};
@@ -132,7 +134,7 @@ impl ActionsState {
     }
 }
 
-fn members_of(projects: &[ProjectShell]) -> Vec<Member> {
+pub(super) fn members_of(projects: &[ProjectShell]) -> Vec<Member> {
     projects
         .iter()
         .map(|project| Member { id: project.id.clone(), scripts: project.scripts.iter().filter_map(|script| serde_json::from_value(script.clone()).ok()).collect() })
@@ -238,22 +240,13 @@ impl SettingsView {
         let projects = members_of(&self.state.read(cx).shell.snapshot.as_ref().map(|snapshot| snapshot.projects.clone()).unwrap_or_default());
         let Some(config) = self.thread_settings(cx) else { return };
         let id = submit_id(&config.settings, &projects, &members, script_id.as_deref(), &input.name, now_ms().max(0) as u64);
-        let is_new = script_id.is_none();
-        let keybinding = input.keybinding.clone();
-        let target = id.clone();
-        self.persist_actions(move |current| Some(submitted_scripts(current, &target, &input, is_new)), Some(id), keybinding, after, cx);
+        self.persist_actions(ScriptsEdit::Save { id, input, is_new: script_id.is_none() }, after, cx);
     }
 
-    /// `persist`: refuses while another save runs or without settings access, then sends
-    /// `plan_writes`' RPCs in order.
-    fn persist_actions(
-        &mut self,
-        next: impl Fn(&[ProjectScript]) -> Option<Vec<ProjectScript>>,
-        script_id: Option<String>,
-        keybinding: Option<Option<String>>,
-        after: AfterSave,
-        cx: &mut Context<Self>,
-    ) {
+    /// `persist`: refuses while another save runs or without settings access. The list joins the
+    /// settings queue and is built when it sends, so it keeps a model or workspace change queued
+    /// ahead of it; the shortcuts follow once it saved.
+    fn persist_actions(&mut self, edit: ScriptsEdit, after: AfterSave, cx: &mut Context<Self>) {
         let shown = self.shown_members(cx);
         if self.projects.actions.saving || shown.is_empty() {
             let message = "No available machine, or another action change is saving.";
@@ -265,30 +258,47 @@ impl SettingsView {
             store::show_error(format!("Failed to save project actions: {message}"), cx);
             return self.finish_actions_save(after, Some(message.to_owned()), cx);
         }
+        let members = members_of(&shown);
         let projects = members_of(&self.state.read(cx).shell.snapshot.as_ref().map(|snapshot| snapshot.projects.clone()).unwrap_or_default());
         let keybindings = self.actions_keybindings(cx);
         let Some(config) = self.thread_settings(cx) else { return };
-        let writes = plan_writes(&config.settings, &keybindings, &projects, &members_of(&shown), next, script_id.as_deref(), keybinding.as_ref().map(|key| key.as_deref()));
-        let requests: Vec<_> = writes.iter().map(|write: &ActionWrite| self.state.read(cx).rpc(write.method(), write.payload().clone())).collect();
+        let shortcuts = keybinding_writes(&config.settings, &keybindings, &projects, &members, &edit);
         self.projects.actions.saving = true;
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let mut failure = None;
-            for request in requests {
-                if let Err(error) = request.await {
-                    failure = Some(error.to_string());
-                    break;
+        let (view, state) = (cx.entity().downgrade(), self.state.clone());
+        let change = ServerSettingChange::ProjectOverride { members, edit: OverrideEdit::Scripts(edit) };
+        store::update_server_then(
+            &self.state,
+            change,
+            move |error, cx| {
+                if let Some(message) = error {
+                    let _ = view.update(cx, |this, cx| {
+                        this.projects.actions.saving = false;
+                        this.finish_actions_save(after, Some(message), cx);
+                    });
+                    return;
                 }
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.projects.actions.saving = false;
-                if let Some(message) = &failure {
-                    store::show_error(format!("Failed to save project actions: {message}"), cx);
-                }
-                this.finish_actions_save(after, failure, cx);
-            });
-        })
-        .detach();
+                let requests: Vec<_> = shortcuts.iter().map(|write: &ActionWrite| state.read(cx).rpc(write.method(), write.payload().clone())).collect();
+                cx.spawn(async move |cx| {
+                    let mut failure = None;
+                    for request in requests {
+                        if let Err(error) = request.await {
+                            failure = Some(error.to_string());
+                            break;
+                        }
+                    }
+                    let _ = view.update(cx, |this, cx| {
+                        this.projects.actions.saving = false;
+                        if let Some(message) = &failure {
+                            store::show_error(format!("Failed to save project actions: {message}"), cx);
+                        }
+                        this.finish_actions_save(after, failure, cx);
+                    });
+                })
+                .detach();
+            },
+            cx,
+        );
     }
 
     fn finish_actions_save(&mut self, after: AfterSave, failure: Option<String>, cx: &mut Context<Self>) {
@@ -335,13 +345,12 @@ impl SettingsView {
         self.submit_action(None, input.clone(), AfterSave::Import(input), cx);
     }
 
-    fn delete_action(&mut self, script_id: String, cx: &mut Context<Self>) {
-        let id = script_id.clone();
-        self.persist_actions(move |current| Some(current.iter().filter(|script| script.id != id).cloned().collect()), Some(script_id), Some(None), AfterSave::Nothing, cx);
+    fn delete_action(&mut self, id: String, cx: &mut Context<Self>) {
+        self.persist_actions(ScriptsEdit::Delete { id }, AfterSave::Nothing, cx);
     }
 
     fn reset_actions(&mut self, cx: &mut Context<Self>) {
-        self.persist_actions(|_| None, None, None, AfterSave::Nothing, cx);
+        self.persist_actions(ScriptsEdit::Reset, AfterSave::Nothing, cx);
     }
 
     /// The editor's Delete: confirm first (`AlertDialog`), then close and delete.

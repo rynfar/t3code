@@ -124,6 +124,8 @@ pub enum ServerSettingChange {
     Prepared(Value),
     /// Built from the settings as they stand when the queue sends it (`providers::edit_payload`).
     ProviderInstance { instance_id: String, edit: providers::InstanceEdit },
+    /// Project override entries, built when the queue sends them (`projects::override_patch`).
+    ProjectOverride { members: Vec<project_actions::Member>, edit: projects::OverrideEdit },
 }
 
 impl ServerSettingChange {
@@ -141,7 +143,7 @@ impl ServerSettingChange {
             ServerSettingChange::SnoozePresets(_) => "snoozePresets",
             ServerSettingChange::AddProjectBaseDirectory(_) => "addProjectBaseDirectory",
             ServerSettingChange::ResponseStreamingMode(_) => "responseStreamingMode",
-            ServerSettingChange::Prepared(_) | ServerSettingChange::ProviderInstance { .. } => "",
+            ServerSettingChange::Prepared(_) | ServerSettingChange::ProviderInstance { .. } | ServerSettingChange::ProjectOverride { .. } => "",
         }
     }
 
@@ -163,7 +165,7 @@ impl ServerSettingChange {
             ServerSettingChange::AddProjectBaseDirectory(path) => json!(path.trim()),
             ServerSettingChange::ResponseStreamingMode(mode) => json!(mode),
             ServerSettingChange::Prepared(payload) => payload.get("patch").cloned().unwrap_or_default(),
-            ServerSettingChange::ProviderInstance { .. } => Value::Null,
+            ServerSettingChange::ProviderInstance { .. } | ServerSettingChange::ProjectOverride { .. } => Value::Null,
         }
     }
 
@@ -172,6 +174,7 @@ impl ServerSettingChange {
     pub fn payload_for(&self, settings: Option<&ServerSettings>) -> Option<Value> {
         match self {
             ServerSettingChange::ProviderInstance { instance_id, edit } => providers::edit_payload(settings?, instance_id, edit),
+            ServerSettingChange::ProjectOverride { members, edit } => Some(projects::override_patch(settings?, members, edit)),
             _ => Some(self.payload()),
         }
     }

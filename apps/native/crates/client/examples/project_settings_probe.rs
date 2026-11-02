@@ -16,11 +16,11 @@ use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ClientHandle, start};
 use t3_core::commands::method;
 use t3_core::keybindings::decode_resolved_keybindings;
-use t3_core::project_scripts::{ProjectScript, command_for_project_script};
+use t3_core::project_scripts::command_for_project_script;
 use t3_core::projects::{PROJECTS_MUTATE, create_project};
 use t3_core::server_config::{ServerConfig, ServerConfigState};
-use t3_core::settings::project_actions::{Member, ScriptInput, importable, keybinding_value_for_command, plan_writes, project_file_from_read, shown_scripts, submit_id, submitted_scripts};
-use t3_core::settings::projects::{ProjectIcon, ProjectUpdate, RemovalMember, confirm_copy, delete_project, icon_description, override_clear_patch, override_set_patch, plan_removal};
+use t3_core::settings::project_actions::{Member, ScriptInput, ScriptsEdit, importable, keybinding_value_for_command, plan_writes, project_file_from_read, shown_scripts, submit_id};
+use t3_core::settings::projects::{OverrideEdit, ProjectIcon, ProjectUpdate, RemovalMember, confirm_copy, delete_project, icon_description, override_patch, plan_removal};
 use t3_core::shell::{ProjectShell, ShellState};
 use t3_core::workspace;
 use tokio::sync::mpsc::Receiver;
@@ -70,11 +70,11 @@ fn member(project: &ProjectShell) -> Member {
 }
 
 /// Sends an actions save as the page does, every write in order.
-async fn save_actions(client: &ClientHandle, live: &Live, project_id: &str, next: impl Fn(&[ProjectScript]) -> Option<Vec<ProjectScript>>, script_id: Option<&str>, keybinding: Option<Option<&str>>) -> anyhow::Result<()> {
+async fn save_actions(client: &ClientHandle, live: &Live, project_id: &str, edit: ScriptsEdit) -> anyhow::Result<()> {
     let config = live.config();
     let projects: Vec<Member> = live.shell.snapshot.as_ref().map(|snapshot| snapshot.projects.iter().map(member).collect()).unwrap_or_default();
     let members = vec![member(live.project(project_id).expect("project listed"))];
-    let writes = plan_writes(&config.settings, &decode_resolved_keybindings(&config.keybindings), &projects, &members, next, script_id, keybinding);
+    let writes = plan_writes(&config.settings, &decode_resolved_keybindings(&config.keybindings), &projects, &members, &edit);
     for write in writes {
         println!("  send {} {}", write.method(), write.payload());
         client.request(write.method(), write.payload().clone()).await?;
@@ -86,8 +86,7 @@ async fn add_action(client: &ClientHandle, live: &Live, project_id: &str, input:
     let projects: Vec<Member> = live.shell.snapshot.as_ref().map(|snapshot| snapshot.projects.iter().map(member).collect()).unwrap_or_default();
     let members = vec![member(live.project(project_id).expect("project listed"))];
     let script_id = submit_id(&live.config().settings, &projects, &members, None, &input.name, 0);
-    let keybinding = input.keybinding.clone();
-    save_actions(client, live, project_id, |current| Some(submitted_scripts(current, &script_id, &input, true)), Some(&script_id), keybinding.as_ref().map(|key| key.as_deref())).await?;
+    save_actions(client, live, project_id, ScriptsEdit::Save { id: script_id.clone(), input, is_new: true }).await?;
     Ok(script_id)
 }
 
@@ -112,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     live.until("shell and config loaded", |shell, config| shell.synchronized && config.is_some()).await?;
     if let Some(project_id) = args.iter().position(|arg| arg == "--remove").and_then(|index| args.get(index + 1)) {
         let removed = shown_ids(live.config.config.as_ref(), project_id);
-        save_actions(&client, &live, project_id, |_| None, None, None).await?;
+        save_actions(&client, &live, project_id, ScriptsEdit::Reset).await?;
         live.until("reset the override", |_, config| config.is_some_and(|config| !config.settings.project_settings_overrides.contains_key(project_id))).await?;
         live.until("shortcuts released", |_, config| removed.iter().all(|script_id| binding(config, script_id).is_none())).await?;
         client.request(PROJECTS_MUTATE, delete_project(&id(), project_id)).await?;
@@ -157,14 +156,15 @@ async fn main() -> anyhow::Result<()> {
     live.until("icon reset to Automatic", |shell, _| shell.project(&project_id).is_some_and(|p| p.favicon_path.is_none() && p.project_icon.is_none())).await?;
 
     println!("New threads overrides");
-    let set = override_set_patch(&live.config().settings, &[&project_id], "defaultThreadEnvMode", json!("worktree"));
+    let only = [Member { id: project_id.clone(), scripts: Vec::new() }];
+    let set = override_patch(&live.config().settings, &only, &OverrideEdit::Set { key: "defaultThreadEnvMode".into(), value: json!("worktree") });
     println!("  send {} {set}", method::SERVER_UPDATE_SETTINGS);
     client.request(method::SERVER_UPDATE_SETTINGS, set).await?;
     live.until("workspace override = worktree", |_, config| {
         config.is_some_and(|config| workspace::configured_env_mode(&config.settings, &project_id).is_some_and(|(_, source)| source == workspace::Source::Project))
     })
     .await?;
-    let clear = override_clear_patch(&live.config().settings, &[&project_id], &["defaultThreadEnvMode"]);
+    let clear = override_patch(&live.config().settings, &only, &OverrideEdit::Clear { keys: vec!["defaultThreadEnvMode".into()] });
     println!("  send {} {clear}", method::SERVER_UPDATE_SETTINGS);
     client.request(method::SERVER_UPDATE_SETTINGS, clear).await?;
     live.until("workspace override cleared", |_, config| config.is_some_and(|config| !config.settings.project_settings_overrides.contains_key(&project_id))).await?;
@@ -176,18 +176,18 @@ async fn main() -> anyhow::Result<()> {
     let lint = add_action(&client, &live, &project_id, import).await?;
     live.until("imported Lint from t3.json", |_, config| shown_ids(config, &project_id).contains(&lint)).await?;
     let dev_input = ScriptInput { name: "Dev".into(), command: "echo dev".into(), keybinding: Some(Some("mod+shift+9".into())), ..Default::default() };
-    let dev = add_action(&client, &live, &project_id, dev_input).await?;
+    let dev = add_action(&client, &live, &project_id, dev_input.clone()).await?;
     live.until("added Dev with mod+shift+9", |_, config| shown_ids(config, &project_id).contains(&dev) && binding(config, &dev).as_deref() == Some("mod+shift+9")).await?;
     if args.iter().any(|arg| arg == "--keep") {
         println!("kept project {project_id}");
         return Ok(());
     }
-    save_actions(&client, &live, &project_id, |current| Some(current.to_vec()), Some(&dev), Some(Some("mod+shift+8"))).await?;
+    let rebind = ScriptInput { keybinding: Some(Some("mod+shift+8".into())), ..dev_input };
+    save_actions(&client, &live, &project_id, ScriptsEdit::Save { id: dev.clone(), input: rebind, is_new: false }).await?;
     live.until("rebound Dev to mod+shift+8", |_, config| binding(config, &dev).as_deref() == Some("mod+shift+8")).await?;
-    let gone = dev.clone();
-    save_actions(&client, &live, &project_id, move |current| Some(current.iter().filter(|script| script.id != gone).cloned().collect()), Some(&dev), Some(None)).await?;
+    save_actions(&client, &live, &project_id, ScriptsEdit::Delete { id: dev.clone() }).await?;
     live.until("deleted Dev and its shortcut", |_, config| !shown_ids(config, &project_id).contains(&dev) && binding(config, &dev).is_none()).await?;
-    save_actions(&client, &live, &project_id, |_| None, None, None).await?;
+    save_actions(&client, &live, &project_id, ScriptsEdit::Reset).await?;
     live.until("reset the override", |_, config| config.is_some_and(|config| !config.settings.project_settings_overrides.contains_key(&project_id))).await?;
     live.until("keybindings back as they were", |_, config| config.is_some_and(|config| config.keybindings == keybindings_before)).await?;
 

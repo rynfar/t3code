@@ -736,7 +736,11 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = ModalLayout::of(window);
         let blocks = self.render_page(window, cx);
-        let archive_list = if self.section == Section::Archived { self.archive_list(self.scroll_to_target, cx) } else { None };
+        let archive_list = match self.section {
+            Section::Archived => self.archive_list(self.scroll_to_target, cx),
+            Section::Projects => self.project_list_view(cx),
+            _ => None,
+        };
         if self.scroll_to_target {
             self.scroll_to_target = false;
             if let Some(index) = self.target.as_deref().and_then(|target| blocks.iter().position(|block| block.anchors.iter().any(|anchor| anchor.as_ref() == target))) {

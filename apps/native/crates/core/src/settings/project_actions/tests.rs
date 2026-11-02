@@ -130,7 +130,7 @@ fn saving_writes_the_override_then_the_shortcut() {
     let input = ScriptInput { name: "Dev".into(), command: "bun dev".into(), keybinding: Some(Some("mod+d".into())), ..Default::default() };
     let id = submit_id(&settings, &[], &[member("p1")], None, &input.name, 0);
     assert_eq!(id, "dev");
-    let writes = plan_writes(&settings, &[], &[member("p1")], &[member("p1")], |current| Some(submitted_scripts(current, &id, &input, true)), Some(&id), Some(Some("mod+d")));
+    let writes = plan_writes(&settings, &[], &[member("p1")], &[member("p1")], &ScriptsEdit::Save { id: id.clone(), input, is_new: true });
     assert_eq!(
         writes,
         vec![
@@ -148,9 +148,12 @@ fn saving_writes_the_override_then_the_shortcut() {
 fn a_changed_shortcut_replaces_the_old_one() {
     let settings = settings(json!({"projectSettingsFolded": true, "projectSettingsOverrides": {"p1": {"defaultProjectScripts": [{"id": "dev", "name": "Dev", "command": "bun dev", "icon": "play", "runOnWorktreeCreate": false}]}}}));
     let bindings = keybindings(json!([binding("script.dev.run", "d", &["mod"])]));
-    let writes = plan_writes(&settings, &bindings, &[member("p1")], &[member("p1")], |current| Some(current.to_vec()), Some("dev"), Some(Some("mod+shift+d")));
+    let dev = shown_scripts(&settings, "p1")[0].clone();
+    let rebind = ScriptInput { name: dev.name.clone(), command: dev.command.clone(), keybinding: Some(Some("mod+shift+d".into())), ..Default::default() };
+    let writes = plan_writes(&settings, &bindings, &[member("p1")], &[member("p1")], &ScriptsEdit::Save { id: "dev".into(), input: rebind.clone(), is_new: false });
     assert_eq!(writes[1], ActionWrite::UpsertKeybinding(json!({"key": "mod+shift+d", "command": "script.dev.run", "replace": {"key": "mod+d", "command": "script.dev.run"}})));
-    let kept = plan_writes(&settings, &bindings, &[member("p1")], &[member("p1")], |current| Some(current.to_vec()), Some("dev"), None);
+    let unchanged = ScriptInput { keybinding: None, ..rebind };
+    let kept = plan_writes(&settings, &bindings, &[member("p1")], &[member("p1")], &ScriptsEdit::Save { id: "dev".into(), input: unchanged, is_new: false });
     assert_eq!(kept.len(), 1, "a save that leaves the shortcut alone sends only the list");
 }
 
@@ -159,12 +162,12 @@ fn deleting_an_action_keeps_a_shortcut_another_project_still_uses() {
     let dev = json!([{"id": "dev", "name": "Dev", "command": "bun dev", "icon": "play", "runOnWorktreeCreate": false}]);
     let shared = settings(json!({"projectSettingsFolded": true, "projectSettingsOverrides": {"p1": {"defaultProjectScripts": dev}, "p2": {"defaultProjectScripts": dev}}}));
     let bindings = keybindings(json!([binding("script.dev.run", "d", &["mod"])]));
-    let remove = |current: &[ProjectScript]| Some(current.iter().filter(|script| script.id != "dev").cloned().collect());
+    let remove = ScriptsEdit::Delete { id: "dev".into() };
     let projects = [member("p1"), member("p2")];
-    let writes = plan_writes(&shared, &bindings, &projects, &[member("p1")], remove, Some("dev"), Some(None));
+    let writes = plan_writes(&shared, &bindings, &projects, &[member("p1")], &remove);
     assert_eq!(writes.len(), 1, "p2 still runs dev, so its shortcut stays");
     let alone = settings(json!({"projectSettingsFolded": true, "projectSettingsOverrides": {"p1": {"defaultProjectScripts": dev}}}));
-    let writes = plan_writes(&alone, &bindings, &projects, &[member("p1")], remove, Some("dev"), Some(None));
+    let writes = plan_writes(&alone, &bindings, &projects, &[member("p1")], &remove);
     assert_eq!(writes[0], ActionWrite::Settings(json!({"patch": {"projectSettingsOverrides": {"p1": {"defaultProjectScripts": []}}}})));
     assert_eq!(writes[1], ActionWrite::RemoveKeybinding(json!({"key": "mod+d", "command": "script.dev.run"})));
 }
@@ -177,7 +180,7 @@ fn resetting_the_override_clears_it_and_drops_orphaned_shortcuts() {
         "projectSettingsOverrides": {"p1": {"defaultProjectScripts": [{"id": "dev", "name": "Dev", "command": "bun dev", "icon": "play", "runOnWorktreeCreate": false}]}}
     }));
     let bindings = keybindings(json!([binding("script.dev.run", "d", &["mod"])]));
-    let writes = plan_writes(&settings, &bindings, &[member("p1")], &[member("p1")], |_| None, None, None);
+    let writes = plan_writes(&settings, &bindings, &[member("p1")], &[member("p1")], &ScriptsEdit::Reset);
     assert_eq!(
         writes,
         vec![
@@ -225,4 +228,13 @@ fn t3_json_parses_leniently_and_rejects_invalid_files() {
     other.name = "install".into();
     assert!(importable(scripts, &[taken, other]).is_empty(), "same command or same name (any case) is already imported");
     assert_eq!(importable(scripts, &[]).len(), 2);
+}
+
+#[test]
+fn grouped_members_send_each_shortcut_once() {
+    let settings = settings(json!({"projectSettingsFolded": true}));
+    let input = ScriptInput { name: "Dev".into(), command: "bun dev".into(), keybinding: Some(Some("mod+d".into())), ..Default::default() };
+    let writes = plan_writes(&settings, &[], &[member("p1"), member("p2")], &[member("p1"), member("p2")], &ScriptsEdit::Save { id: "dev".into(), input, is_new: true });
+    assert_eq!(writes.len(), 2, "one list write for both members, then one shortcut: {writes:?}");
+    assert_eq!(writes[0].payload()["patch"]["projectSettingsOverrides"].as_object().map(|entries| entries.len()), Some(2));
 }

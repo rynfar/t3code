@@ -18,11 +18,13 @@ use crate::terminal;
 use crate::theme::{self, Preferences};
 
 type OnFailed = Box<dyn FnOnce(&mut App)>;
+/// Told when a save settles: `None` once saved, else why it was not.
+type OnDone = Box<dyn FnOnce(Option<String>, &mut App)>;
 
 struct PendingSave {
     state: Entity<AppState>,
     change: ServerSettingChange,
-    on_failed: Option<OnFailed>,
+    on_done: Option<OnDone>,
 }
 
 struct ClientPrefs {
@@ -93,9 +95,26 @@ pub fn update_server(state: &Entity<AppState>, change: ServerSettingChange, cx: 
 
 /// `update_server`, telling the caller when the save failed so it can drop a local draft.
 pub fn update_server_with(state: &Entity<AppState>, change: ServerSettingChange, on_failed: Option<OnFailed>, cx: &mut App) {
+    let on_done = on_failed.map(|on_failed| -> OnDone {
+        Box::new(move |error, cx| {
+            if error.is_some() {
+                on_failed(cx);
+            }
+        })
+    });
+    enqueue(state, change, on_done, cx);
+}
+
+/// `update_server`, then `on_done` once the save settles, so a caller can follow it with writes
+/// that depend on it.
+pub fn update_server_then(state: &Entity<AppState>, change: ServerSettingChange, on_done: impl FnOnce(Option<String>, &mut App) + 'static, cx: &mut App) {
+    enqueue(state, change, Some(Box::new(on_done)), cx);
+}
+
+fn enqueue(state: &Entity<AppState>, change: ServerSettingChange, on_done: Option<OnDone>, cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
     prefs.error = None;
-    prefs.queue.push_back(PendingSave { state: state.clone(), change, on_failed });
+    prefs.queue.push_back(PendingSave { state: state.clone(), change, on_done });
     if !prefs.saving {
         send_next(cx);
     }
@@ -103,12 +122,15 @@ pub fn update_server_with(state: &Entity<AppState>, change: ServerSettingChange,
 
 fn send_next(cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
-    let Some(PendingSave { state, change, on_failed }) = prefs.queue.pop_front() else {
+    let Some(PendingSave { state, change, on_done }) = prefs.queue.pop_front() else {
         prefs.saving = false;
         return;
     };
     prefs.saving = true;
     let Some(payload) = change.payload_for(state.read(cx).server_config.config.as_ref().map(|config| &config.settings)) else {
+        if let Some(on_done) = on_done {
+            on_done(Some("Reconnect to save this setting.".to_owned()), cx);
+        }
         return send_next(cx);
     };
     let (label, sent_at, task) = {
@@ -134,11 +156,14 @@ fn send_next(cx: &mut App) {
                             }
                         });
                     }
+                    if let Some(on_done) = on_done {
+                        on_done(None, cx);
+                    }
                 }
                 Err(error) => {
                     cx.global_mut::<ClientPrefs>().error = Some(format!("Could not save on {label}: {error}").into());
-                    if let Some(on_failed) = on_failed {
-                        on_failed(cx);
+                    if let Some(on_done) = on_done {
+                        on_done(Some(error.to_string()), cx);
                     }
                     cx.refresh_windows();
                 }

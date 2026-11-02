@@ -8,7 +8,6 @@
 use serde_json::{Map, Value, json};
 
 use super::keybindings::{SERVER_REMOVE_KEYBINDING, SERVER_UPSERT_KEYBINDING};
-use super::projects::cleared_override;
 use crate::keybindings::{ResolvedKeybindingRule, is_keybinding_command};
 use crate::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script, resolve_project_scripts};
 use crate::server_config::ServerSettings;
@@ -323,37 +322,54 @@ fn keybinding_rule(key: &str, command: &str) -> Value {
     json!({ "key": key, "command": command })
 }
 
-/// `useProjectScriptSettings`' `writeTargets`: for each member, the override patch, then the
-/// shortcut writes for the actions it touched. A shortcut leaves only when no other project still
-/// runs the same action. `next` maps the member's current actions to its new ones; `None` resets
-/// the override. `keybinding` is `None` to keep shortcuts as they are.
-pub fn plan_writes(
-    settings: &ServerSettings,
-    keybindings: &[ResolvedKeybindingRule],
-    projects: &[Member],
-    members: &[Member],
-    next: impl Fn(&[ProjectScript]) -> Option<Vec<ProjectScript>>,
-    script_id: Option<&str>,
-    keybinding: Option<Option<&str>>,
-) -> Vec<ActionWrite> {
-    let mut writes = Vec::new();
+/// What an actions save does to each member's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptsEdit {
+    /// `submit`: the saved action, the others giving up the roles it claims.
+    Save { id: String, input: ScriptInput, is_new: bool },
+    Delete { id: String },
+    /// "Reset to inherited value": the override goes.
+    Reset,
+}
+
+impl ScriptsEdit {
+    /// The member's new list; `None` drops its override.
+    pub fn apply(&self, current: &[ProjectScript]) -> Option<Vec<ProjectScript>> {
+        match self {
+            ScriptsEdit::Save { id, input, is_new } => Some(submitted_scripts(current, id, input, *is_new)),
+            ScriptsEdit::Delete { id } => Some(current.iter().filter(|script| script.id != *id).cloned().collect()),
+            ScriptsEdit::Reset => None,
+        }
+    }
+
+    fn script_id(&self) -> Option<&str> {
+        match self {
+            ScriptsEdit::Save { id, .. } | ScriptsEdit::Delete { id } => Some(id),
+            ScriptsEdit::Reset => None,
+        }
+    }
+
+    /// `None` keeps shortcuts as they are; `Some(None)` removes the action's.
+    fn keybinding(&self) -> Option<Option<&str>> {
+        match self {
+            ScriptsEdit::Save { input, .. } => input.keybinding.as_ref().map(|key| key.as_deref()),
+            ScriptsEdit::Delete { .. } => Some(None),
+            ScriptsEdit::Reset => None,
+        }
+    }
+}
+
+/// The shortcut half of `useProjectScriptSettings`' `writeTargets`, sent once the list saved: for
+/// each action an edit touched, bind, rebind or unbind it. A shortcut leaves only when no other
+/// project still runs the same action.
+pub fn keybinding_writes(settings: &ServerSettings, keybindings: &[ResolvedKeybindingRule], projects: &[Member], members: &[Member], edit: &ScriptsEdit) -> Vec<ActionWrite> {
+    let keybinding = edit.keybinding();
+    let mut writes: Vec<ActionWrite> = Vec::new();
     for member in members {
         let current = resolve_project_scripts(settings, &member.id, member.scripts.clone());
-        let next_scripts = next(&current);
+        let next_scripts = edit.apply(&current);
         let effective = next_scripts.as_deref().unwrap_or(&settings.default_project_scripts);
-        let entry = match &next_scripts {
-            None => cleared_override(settings, &member.id, &["defaultProjectScripts"]),
-            Some(scripts) => {
-                let mut entry = settings.project_settings_overrides.get(&member.id).map(|entry| entry.raw.clone()).unwrap_or_default();
-                entry.insert("defaultProjectScripts".to_owned(), json!(scripts));
-                Value::Object(entry)
-            }
-        };
-        let mut overrides = Map::new();
-        overrides.insert(member.id.clone(), entry);
-        writes.push(ActionWrite::Settings(json!({ "patch": { "projectSettingsOverrides": overrides } })));
-
-        let changed: Vec<String> = match script_id {
+        let changed: Vec<String> = match edit.script_id() {
             Some(id) => vec![id.to_owned()],
             None => current.iter().filter(|script| !effective.iter().any(|next| next.id == script.id)).map(|script| script.id.clone()).collect(),
         };
@@ -370,20 +386,31 @@ pub fn plan_writes(
                 && (has(&settings.default_project_scripts)
                     || settings.project_settings_overrides.iter().any(|(project_id, entry)| *project_id != member.id && entry.default_project_scripts.as_deref().is_some_and(has))
                     || projects.iter().any(|other| other.id != member.id && has(&resolve_project_scripts(settings, &other.id, other.scripts.clone()))));
-            match (wanted, previous) {
+            let write = match (wanted, previous) {
                 (Some((key, command)), previous) => {
                     let mut payload = keybinding_rule(&key, &command);
                     if let Some((previous_key, previous_command)) = previous.filter(|(previous_key, _)| *previous_key != key) {
                         payload["replace"] = keybinding_rule(&previous_key, &previous_command);
                     }
-                    writes.push(ActionWrite::UpsertKeybinding(payload));
+                    ActionWrite::UpsertKeybinding(payload)
                 }
-                (None, Some((key, command))) if !retained_elsewhere => writes.push(ActionWrite::RemoveKeybinding(keybinding_rule(&key, &command))),
-                _ => {}
+                (None, Some((key, command))) if !retained_elsewhere => ActionWrite::RemoveKeybinding(keybinding_rule(&key, &command)),
+                _ => continue,
+            };
+            // Members of one environment share its keymap: one write each.
+            if !writes.contains(&write) {
+                writes.push(write);
             }
         }
     }
     writes
+}
+
+/// Every RPC an actions save sends, in order: the members' list, then their shortcuts. The app
+/// queues the list behind other settings saves and builds it when it sends.
+pub fn plan_writes(settings: &ServerSettings, keybindings: &[ResolvedKeybindingRule], projects: &[Member], members: &[Member], edit: &ScriptsEdit) -> Vec<ActionWrite> {
+    let patch = super::projects::override_patch(settings, members, &super::projects::OverrideEdit::Scripts(edit.clone()));
+    std::iter::once(ActionWrite::Settings(patch)).chain(keybinding_writes(settings, keybindings, projects, members, edit)).collect()
 }
 
 /// `submit`: the id a new action takes (past every id in use), and the list each member saves

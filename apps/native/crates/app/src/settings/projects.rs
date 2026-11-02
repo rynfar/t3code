@@ -7,9 +7,11 @@
 //! Not ported: the icon and image pickers ("Choose icon", "Choose file"), and the info alert about
 //! keeping the project picked on other pages, which other native pages do not scope by project.
 
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, img, prelude::FluentBuilder,
+    AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, img, list, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
@@ -21,8 +23,9 @@ use t3_core::server_config::{ServerConfig, ThreadEnvMode};
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::project_actions::{ProjectFile, project_file_from_read};
 use t3_core::settings::projects::{
-    self as model, NO_PROJECT_NOTICE, NO_PROJECTS, ProjectIcon, ProjectUpdate, RemovalMember, Rename, archive_description, choice_secondary,
-    danger_copy, edit_denied_notice, plan_removal, project_env_mode, project_model, resolve_selection,
+    self as model, NO_PROJECT_NOTICE, NO_PROJECTS, OverrideEdit, ProjectIcon, ProjectUpdate, RemovalMember, Rename, archive_description,
+    choice_secondary, danger_copy, edit_denied_notice, model_unavailable_reason, plan_removal, project_env_mode, project_model, resolve_selection,
+    shared_labels,
 };
 use t3_core::settings::ENV_MODES;
 use t3_core::shell::ProjectShell;
@@ -31,7 +34,7 @@ use t3_core::sidebar::grouping::{ProjectGroup, build_project_groups};
 use t3_core::workspace::{self, Source};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, icon, muted_text, r, section, tooltip};
-use super::project_actions::ActionsState;
+use super::project_actions::{ActionsState, members_of};
 use super::threads::{env_mode_value, model_options, parse_selection, selection_label, selection_value};
 use super::{Block, SettingsView, store};
 use crate::icons::Icon;
@@ -50,6 +53,9 @@ pub(crate) struct ProjectsState {
     last_members: Vec<String>,
     /// A project an entry point asked for before the shell listed it.
     pending_project: Option<String>,
+    /// The project list, virtualized: a header entry, then one per project.
+    list: ListState,
+    choices: Rc<Vec<Choice>>,
     pub(super) name: Entity<InputState>,
     /// The Name field was typed in since it last committed.
     name_edited: bool,
@@ -78,6 +84,8 @@ impl ProjectsState {
             selected: None,
             last_members: Vec::new(),
             pending_project: None,
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
+            choices: Rc::default(),
             name,
             name_edited: false,
             organizing: false,
@@ -87,6 +95,14 @@ impl ProjectsState {
             _subscriptions: subscriptions,
         }
     }
+}
+
+/// A project-list row.
+pub(super) struct Choice {
+    key: String,
+    label: SharedString,
+    secondary: SharedString,
+    representative_id: String,
 }
 
 /// One project group with its members, as the page reads it.
@@ -284,11 +300,11 @@ impl SettingsView {
         if let Some(project_id) = self.projects.pending_project.clone() {
             self.select_project_id(&project_id, cx);
         }
+        if self.projects.selected.is_none() {
+            return Vec::new();
+        }
         let groups = self.project_groups(cx);
         let picker = self.project_picker(&groups, cx);
-        if self.projects.selected.is_none() {
-            return vec![Block::new(&[], picker), Block::new(&[], self.project_list(&groups, cx))];
-        }
         let Some(shown) = self.shown_project(cx) else {
             let message = if groups.is_empty() { NO_PROJECTS } else { "This project is no longer available." };
             return vec![Block::new(&[], picker), Block::new(&[], muted_text(message, cx))];
@@ -343,9 +359,10 @@ impl SettingsView {
         let state = self.state.read(cx);
         let label = self.environment_label(cx);
         let root = |group: &ProjectGroup| state.shell.project(&group.representative_id).map(|project| project.workspace_root.clone()).unwrap_or_default();
+        let shared = shared_labels(groups);
         let options = std::iter::once(SelectOption::new(ALL_PROJECTS, "All projects"))
             .chain(groups.iter().map(|group| {
-                let secondary = choice_secondary(group, groups, &root(group), &label);
+                let secondary = choice_secondary(group, shared.contains(group.label.as_str()), &root(group), &label);
                 SelectOption::new(group.key.clone(), group.label.clone()).description(secondary)
             }))
             .collect();
@@ -370,41 +387,99 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// `SettingsScopeNotice` for a project: the status line and one row per project.
-    fn project_list(&self, groups: &[ProjectGroup], cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
+    /// `SettingsScopeNotice` for a project, while none is chosen: the picker and status line,
+    /// then one row per project, as a virtualized list over the page.
+    pub(super) fn project_list_view(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.projects.selected.is_some() || self.thread_settings(cx).is_none() {
+            return None;
+        }
+        let groups = self.project_groups(cx);
         let label = self.environment_label(cx);
-        let rows: Vec<AnyElement> = groups
+        let shared = shared_labels(&groups);
+        let state = self.state.read(cx);
+        let choices: Vec<Choice> = groups
             .iter()
             .map(|group| {
-                let state = self.state.read(cx);
-                let root = state.shell.project(&group.representative_id).map(|project| project.workspace_root.clone()).unwrap_or_default();
-                let secondary = choice_secondary(group, groups, &root, &label);
-                let key = group.key.clone();
-                h_flex()
-                    .id(SharedString::from(format!("project-choice-{}", group.key)))
-                    .w_full()
-                    .px(r(16.))
-                    .py(r(12.))
-                    .gap(r(12.))
-                    .rounded(r(12.))
-                    .cursor_pointer()
-                    .hover(|this| this.bg(hsla(p.accent).opacity(0.5)))
-                    .child(self.project_favicon(&group.representative_id, 16., cx))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(group.label.clone()))
-                            .child(div().id(SharedString::from(format!("project-choice-path-{}", group.key))).truncate().text_xs().text_color(hsla(p.muted_foreground)).child(secondary.clone()).tooltip(tooltip(secondary.into()))),
-                    )
-                    .child(icon(Icon::ChevronRight, 16., hsla(p.muted_foreground)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_project(Some(key.clone()), cx)))
-                    .into_any_element()
+                let root = state.shell.project(&group.representative_id).map(|project| project.workspace_root.as_str()).unwrap_or_default();
+                Choice {
+                    key: group.key.clone(),
+                    label: group.label.clone().into(),
+                    secondary: choice_secondary(group, shared.contains(group.label.as_str()), root, &label).into(),
+                    representative_id: group.representative_id.clone(),
+                }
             })
             .collect();
-        let status = div().px(r(16.)).text_sm().text_color(hsla(p.muted_foreground)).child(if groups.is_empty() { NO_PROJECTS } else { NO_PROJECT_NOTICE });
-        v_flex().gap(r(12.)).child(status).when(!rows.is_empty(), |this| this.child(group(rows, cx))).into_any_element()
+        if self.projects.list.item_count() != choices.len() + 1 {
+            self.projects.list.reset(choices.len() + 1);
+        }
+        self.projects.choices = Rc::new(choices);
+        Some(list(self.projects.list.clone(), cx.processor(|this, index: usize, _, cx| this.render_project_choice(index, cx))).w_full().flex_1().into_any_element())
+    }
+
+    fn render_project_choice(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let choices = self.projects.choices.clone();
+        let content = match index.checked_sub(1).and_then(|index| choices.get(index).map(|choice| (index, choice))) {
+            None => {
+                let groups = self.project_groups(cx);
+                let status = if choices.is_empty() { NO_PROJECTS } else { NO_PROJECT_NOTICE };
+                v_flex()
+                    .gap(r(24.))
+                    .pb(r(12.))
+                    .child(self.project_picker(&groups, cx))
+                    .child(div().px(r(16.)).text_sm().text_color(hsla(p.muted_foreground)).child(status))
+                    .into_any_element()
+            }
+            Some((position, choice)) => {
+                let key = choice.key.clone();
+                // One segment of `SettingsGroup`: the card's sides on every row, its ends on the first and last.
+                div()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(hsla(p.border).opacity(0.6))
+                    .bg(hsla(p.card).opacity(0.4))
+                    .when(position == 0, |this| this.border_t_1().rounded_t(r(12.)))
+                    .when(position + 1 == choices.len(), |this| this.border_b_1().rounded_b(r(12.)))
+                    .child(
+                        h_flex()
+                            .id(SharedString::from(format!("project-choice-{}", choice.key)))
+                            .w_full()
+                            .px(r(16.))
+                            .py(r(12.))
+                            .gap(r(12.))
+                            .when(position > 0, |this| this.border_t_1().border_color(hsla(p.border).opacity(0.5)))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(hsla(p.accent).opacity(0.5)))
+                            .child(self.project_favicon(&choice.representative_id, 16., cx))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(choice.label.clone()))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("project-choice-path-{}", choice.key)))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(hsla(p.muted_foreground))
+                                            .child(choice.secondary.clone())
+                                            .tooltip(tooltip(choice.secondary.clone())),
+                                    ),
+                            )
+                            .child(icon(Icon::ChevronRight, 16., hsla(p.muted_foreground)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.select_project(Some(key.clone()), cx))),
+                    )
+                    .into_any_element()
+            }
+        };
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .when(index == 0, |this| this.pt(r(24.)))
+            .when(index == choices.len(), |this| this.pb(r(48.)))
+            .child(div().w_full().max_w(r(896.)).px(r(24.)).child(content))
+            .into_any_element()
     }
 
     /// `ProjectFavicon`: the project's image once fetched, else the folder glyph.
@@ -494,19 +569,29 @@ impl SettingsView {
         div().rounded(r(12.)).when(highlighted, |this| this.bg(hsla(p.accent).opacity(0.3))).child(group(rows, cx)).into_any_element()
     }
 
-    /// Saves one project-scoped setting on every member's override.
-    fn save_project_override(&self, members: &[String], key: &'static str, value: Value, cx: &mut App) {
-        let Some(config) = self.thread_settings(cx) else { return };
-        let ids: Vec<&str> = members.iter().map(String::as_str).collect();
-        let patch = model::override_set_patch(&config.settings, &ids, key, value);
-        store::update_server(&self.state, ServerSettingChange::Prepared(patch), cx);
+    /// Saves one project-scoped setting on every member's override, built when the queue sends
+    /// it so an earlier queued change to the same entries is kept.
+    fn save_project_override(&self, key: &'static str, value: Value, cx: &mut App) {
+        let members = members_of(&self.shown_members(cx));
+        let edit = OverrideEdit::Set { key: key.to_owned(), value };
+        store::update_server(&self.state, ServerSettingChange::ProjectOverride { members, edit }, cx);
     }
 
-    fn clear_project_override(&self, members: &[String], key: &'static str, cx: &mut App) {
+    /// `setModel`: refuses a model some member cannot run.
+    fn set_project_model(&self, selection: t3_core::model::ModelSelection, cx: &mut App) {
         let Some(config) = self.thread_settings(cx) else { return };
-        let ids: Vec<&str> = members.iter().map(String::as_str).collect();
-        let patch = model::override_clear_patch(&config.settings, &ids, &[key]);
-        store::update_server(&self.state, ServerSettingChange::Prepared(patch), cx);
+        let members = self.shown_members(cx);
+        let ids: Vec<&str> = members.iter().map(|member| member.id.as_str()).collect();
+        if let Some(reason) = model_unavailable_reason(config, &ids, &selection, &self.environment_label(cx)) {
+            return store::show_error(format!("Default model not saved: {reason}"), cx);
+        }
+        self.save_project_override("defaultModelSelection", json!(selection), cx);
+    }
+
+    fn clear_project_override(&self, key: &'static str, cx: &mut App) {
+        let members = members_of(&self.shown_members(cx));
+        let edit = OverrideEdit::Clear { keys: vec![key.to_owned()] };
+        store::update_server(&self.state, ServerSettingChange::ProjectOverride { members, edit }, cx);
     }
 
     /// A control this connection cannot use: dimmed, inert, and saying why (`SettingsRow`).
@@ -527,31 +612,37 @@ impl SettingsView {
     /// `ProjectDefaultsSettings` with the "project" category: Model and Workspace overrides.
     fn project_new_threads(&self, shown: &Shown, config: &ServerConfig, cx: &mut Context<Self>) -> AnyElement {
         let ids: Vec<String> = shown.members.iter().map(|member| member.id.clone()).collect();
-        let first = ids[0].clone();
+        let member_ids = shown.member_ids();
+        let label = self.environment_label(cx);
         let can_write = self.may(SETTINGS_WRITE_SCOPE, cx);
         let models: Vec<_> = ids.iter().map(|id| project_model(config, id)).collect();
         let model = &models[0];
         let mixed_model = models.iter().any(|other| other.shown != model.shown);
-        let options = model_options(config, Some(&first));
+        // Only models every member can run, as `useScopedModelDisabledReason` disables the rest.
+        let options: Vec<SelectOption> = model_options(config, Some(member_ids[0]))
+            .into_iter()
+            .filter(|option| parse_selection(&option.value).is_some_and(|selection| model_unavailable_reason(config, &member_ids, &selection, &label).is_none()))
+            .collect();
         let model_reset = can_write && models.iter().any(|model| model.source == Source::Project);
+        let unavailable = model.shown.as_ref().filter(|_| !mixed_model).and_then(|selection| model_unavailable_reason(config, &member_ids, selection, &label));
         let model_row = Row::new("project-default-model", "Model")
             .description("Model for new threads in this project.")
+            .when_some(unavailable, |row, reason| row.status(reason))
             .reset_tooltip("Reset to inherited value")
             .reset(model_reset, {
-                let (view, ids) = (cx.entity().downgrade(), ids.clone());
+                let view = cx.entity().downgrade();
                 move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.clear_project_override(&ids, "defaultModelSelection", cx));
+                    let _ = view.update(cx, |this, cx| this.clear_project_override("defaultModelSelection", cx));
                 }
             });
         let model_row = match &model.shown {
             Some(selection) if !options.is_empty() => {
-                let (view, ids) = (cx.entity().downgrade(), ids.clone());
-                let label = if mixed_model { if model.automatic { "Automatic (mixed)".to_owned() } else { "Mixed".to_owned() } } else { selection_label(config, selection) };
-                let select = Select::new("project-default-model-select", options).selected(selection_value(selection)).label(label).width(220.).popup_width(260.).show_check().on_change(
+                let view = cx.entity().downgrade();
+                let trigger = if mixed_model { if model.automatic { "Automatic (mixed)".to_owned() } else { "Mixed".to_owned() } } else { selection_label(config, selection) };
+                let select = Select::new("project-default-model-select", options).selected(selection_value(selection)).label(trigger).width(220.).popup_width(260.).show_check().on_change(
                     move |value, _, cx| {
-                        if let Some(selection) = parse_selection(&value) {
-                            let _ = view.update(cx, |this, cx| this.save_project_override(&ids, "defaultModelSelection", json!(selection), cx));
-                        }
+                        let Some(selection) = parse_selection(&value) else { return };
+                        let _ = view.update(cx, |this, cx| this.set_project_model(selection, cx));
                     },
                 );
                 model_row.control(self.inert_unless(can_write, "project-default-model-inert", select, cx))
@@ -566,7 +657,7 @@ impl SettingsView {
         let modes: Vec<(ThreadEnvMode, Source)> = ids.iter().map(|id| project_env_mode(&config.settings, id, file_mode)).collect();
         let mixed_mode = modes.iter().any(|(mode, _)| *mode != modes[0].0);
         let mode_reset = can_write && modes.iter().any(|(_, source)| *source == Source::Project);
-        let (view, mode_ids) = (cx.entity().downgrade(), ids.clone());
+        let view = cx.entity().downgrade();
         let mut workspace_select = Select::new("project-default-workspace-select", ENV_MODES.iter().map(|(mode, label)| SelectOption::new(env_mode_value(*mode), *label)).collect())
             .show_check()
             .on_change(move |value, _, cx| {
@@ -574,16 +665,16 @@ impl SettingsView {
                     "local" | "worktree" => value.to_string(),
                     _ => return,
                 };
-                let _ = view.update(cx, |this, cx| this.save_project_override(&mode_ids, "defaultThreadEnvMode", json!(mode), cx));
+                let _ = view.update(cx, |this, cx| this.save_project_override("defaultThreadEnvMode", json!(mode), cx));
             });
         workspace_select = if mixed_mode { workspace_select.label("Mixed") } else { workspace_select.selected(env_mode_value(modes[0].0)) };
         let workspace_row = Row::new("project-default-workspace", "Workspace")
             .description("Where new threads in this project start.")
             .reset_tooltip("Reset to inherited value")
             .reset(mode_reset, {
-                let (view, ids) = (cx.entity().downgrade(), ids.clone());
+                let view = cx.entity().downgrade();
                 move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.clear_project_override(&ids, "defaultThreadEnvMode", cx));
+                    let _ = view.update(cx, |this, cx| this.clear_project_override("defaultThreadEnvMode", cx));
                 }
             })
             .control(self.inert_unless(can_write, "project-default-workspace-inert", workspace_select, cx));

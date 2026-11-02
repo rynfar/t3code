@@ -7,9 +7,13 @@
 //! native client holds one environment, so the web scope's environment and checkout axes have no
 //! counterpart here: a project's members are every checkout in the group.
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value, json};
 
+use super::project_actions::{Member, ScriptsEdit};
 use crate::model::ModelSelection;
+use crate::project_scripts::resolve_project_scripts;
 use crate::providers;
 use crate::server_config::{ServerConfig, ServerSettings, ThreadEnvMode};
 use crate::sidebar::grouping::{ProjectGroup, normalize_project_path};
@@ -28,14 +32,20 @@ pub fn sort_groups(groups: &mut [ProjectGroup]) {
     groups.sort_by(|left, right| locale_compare(&left.label, &right.label));
 }
 
+/// Labels more than one group carries, so their rows also name the machine.
+pub fn shared_labels(groups: &[ProjectGroup]) -> HashSet<&str> {
+    let mut seen = HashSet::new();
+    groups.iter().filter(|group| !seen.insert(group.label.as_str())).map(|group| group.label.as_str()).collect()
+}
+
 /// A project-list row's second line (`SettingsScopeNotice`, target "project"): archived, the
 /// machine when another project shares the name, then the folder.
-pub fn choice_secondary(group: &ProjectGroup, groups: &[ProjectGroup], workspace_root: &str, environment_label: &str) -> String {
+pub fn choice_secondary(group: &ProjectGroup, shares_label: bool, workspace_root: &str, environment_label: &str) -> String {
     let mut parts = Vec::new();
     if group.archived {
         parts.push("Archived");
     }
-    if groups.iter().any(|other| other.key != group.key && other.label == group.label) {
+    if shares_label {
         parts.push(environment_label);
     }
     parts.push(workspace_root);
@@ -323,24 +333,6 @@ fn override_entry(settings: &ServerSettings, project_id: &str) -> Option<Map<Str
     settings.project_settings_overrides.get(project_id).map(|entry| entry.raw.clone())
 }
 
-/// `projectOverrideWrites` for one key on each member, completed as `planScopedSettingsPatch`
-/// completes it: the entry keeps its other keys, and null removes a key that cannot hold null.
-pub fn override_set_patch(settings: &ServerSettings, project_ids: &[&str], key: &str, value: Value) -> Value {
-    let entries: Map<String, Value> = project_ids
-        .iter()
-        .map(|project_id| {
-            let mut entry = override_entry(settings, project_id).unwrap_or_default();
-            if value.is_null() && !nullable_override(key) {
-                entry.remove(key);
-            } else {
-                entry.insert(key.to_owned(), value.clone());
-            }
-            ((*project_id).to_owned(), Value::Object(entry))
-        })
-        .collect();
-    json!({ "patch": { "projectSettingsOverrides": entries } })
-}
-
 /// `clearProjectSettingsOverrides`: the entry without `keys`; null when nothing is left.
 pub fn cleared_override(settings: &ServerSettings, project_id: &str, keys: &[&str]) -> Value {
     let Some(mut entry) = override_entry(settings, project_id) else { return Value::Null };
@@ -350,10 +342,68 @@ pub fn cleared_override(settings: &ServerSettings, project_id: &str, keys: &[&st
     if entry.is_empty() { Value::Null } else { Value::Object(entry) }
 }
 
-/// `planScopedSettingsClear`: "Reset to inherited value" on each member.
-pub fn override_clear_patch(settings: &ServerSettings, project_ids: &[&str], keys: &[&str]) -> Value {
-    let entries: Map<String, Value> = project_ids.iter().map(|project_id| ((*project_id).to_owned(), cleared_override(settings, project_id, keys))).collect();
+/// One change to the members' override entries. The server replaces a whole entry, so the patch
+/// is built from the settings current when it is sent (`ServerSettingChange::ProjectOverride`);
+/// a save queued behind another keeps what that one wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverrideEdit {
+    /// `planScopedSettingsPatch` for one key: null removes a key that cannot hold null.
+    Set { key: String, value: Value },
+    /// `planScopedSettingsClear`: "Reset to inherited value".
+    Clear { keys: Vec<String> },
+    /// The members' actions (`useProjectScriptSettings`).
+    Scripts(ScriptsEdit),
+}
+
+/// `projectOverrideWrites`: each member's entry with `edit` applied, its other keys kept.
+pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &OverrideEdit) -> Value {
+    let entries: Map<String, Value> = members
+        .iter()
+        .map(|member| {
+            let id = member.id.as_str();
+            let entry = match edit {
+                OverrideEdit::Set { key, value } => {
+                    let mut entry = override_entry(settings, id).unwrap_or_default();
+                    if value.is_null() && !nullable_override(key) {
+                        entry.remove(key);
+                    } else {
+                        entry.insert(key.clone(), value.clone());
+                    }
+                    Value::Object(entry)
+                }
+                OverrideEdit::Clear { keys } => cleared_override(settings, id, &keys.iter().map(String::as_str).collect::<Vec<_>>()),
+                OverrideEdit::Scripts(edit) => {
+                    let current = resolve_project_scripts(settings, id, member.scripts.clone());
+                    match edit.apply(&current) {
+                        None => cleared_override(settings, id, &["defaultProjectScripts"]),
+                        Some(scripts) => {
+                            let mut entry = override_entry(settings, id).unwrap_or_default();
+                            entry.insert("defaultProjectScripts".to_owned(), json!(scripts));
+                            Value::Object(entry)
+                        }
+                    }
+                }
+            };
+            (member.id.clone(), entry)
+        })
+        .collect();
     json!({ "patch": { "projectSettingsOverrides": entries } })
+}
+
+/// `useScopedModelDisabledReason`: a model every member can run, else why not.
+pub fn model_unavailable_reason(config: &ServerConfig, project_ids: &[&str], selection: &ModelSelection, environment_label: &str) -> Option<String> {
+    let driver = config.provider(&selection.instance_id).map(|provider| provider.driver.as_str());
+    let usable = |project_id: &str| {
+        providers::entries(config, Some(project_id)).iter().any(|entry| {
+            entry.instance_id() == selection.instance_id
+                && entry.enabled
+                && entry.provider.is_available()
+                && Some(entry.driver()) == driver
+                && providers::model_options(&config.settings, entry.provider).iter().any(|model| model.slug == selection.model)
+        })
+    };
+    (!project_ids.iter().all(|id| usable(id)))
+        .then(|| format!("This model is unavailable on {environment_label}. Select that environment to choose its model separately."))
 }
 
 #[cfg(test)]
