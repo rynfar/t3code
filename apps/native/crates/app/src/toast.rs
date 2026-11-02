@@ -107,6 +107,10 @@ impl AppState {
     pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         let before = self.toasts.entries.len();
         self.toasts.entries.retain(|entry| entry.id != id);
+        // The stack unmounts with its last toast, so no hover-out will arrive.
+        if self.toasts.entries.is_empty() {
+            self.toasts.hovered = false;
+        }
         if self.toasts.entries.len() != before {
             cx.emit(AppEvent::Notice);
         }
