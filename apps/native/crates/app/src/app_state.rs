@@ -103,7 +103,7 @@ impl AppState {
             server_config: ServerConfigState::default(),
             client_settings: ClientSettings::from_json(&store::load_client_settings().unwrap_or_default()),
             draft_project: None,
-            panels: crate::right_panel::PanelState::load(),
+            panels: Default::default(),
             pull_requests_open: false,
             restore_thread: store::load_last_thread(),
             omitted: Default::default(),
@@ -141,6 +141,8 @@ impl AppState {
         self.select_when_listed = None;
         self.restore_thread = None;
         self.thread = ThreadState::default();
+        // Side subscriptions and a side chat start (with its timeout) belong to this environment.
+        self.side_threads = Default::default();
         self.server_config = ServerConfigState::default();
         self.draft_project = None;
         self.pull_requests_open = false;
@@ -154,6 +156,8 @@ impl AppState {
     pub(crate) fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
         let (client, mut events) = t3_client::supervisor::start(&self.runtime, credentials);
         self.client = Some(client);
+        self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
+        cx.emit(AppEvent::RightPanel);
         self.set_phase(Phase::Online(ConnectionStatus::Connecting), cx);
         self._pump = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = events.recv().await {

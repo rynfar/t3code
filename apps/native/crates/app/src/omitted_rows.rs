@@ -135,6 +135,7 @@ impl AppState {
         }
         self.omitted.mounts.mount(PAGES_KEY, generation, self.omitted.pages.reads.clone());
         self.rebuild_sidebar(cx);
+        self.sync_side_threads(cx);
         self.request_settled_page(cx);
         cx.emit(AppEvent::Shell);
     }
@@ -184,6 +185,7 @@ impl AppState {
                     state.select_thread(&thread_id, cx);
                 }
                 state.rebuild_sidebar(cx);
+                state.sync_side_threads(cx);
                 cx.emit(AppEvent::Shell);
             });
         })
