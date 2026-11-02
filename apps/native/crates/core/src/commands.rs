@@ -26,11 +26,36 @@ pub fn subscribe_server_config() -> Value {
     json!({ "workspaceSnapshotsOnDemand": true })
 }
 
+/// Which rows the shell may leave to on-demand reads, as `shell.ts` decides from the config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellOptions {
+    /// Idle subagent children come from `getThreadFamily`.
+    pub omit_idle_subagents: bool,
+    /// Older settled threads are counted in `olderSettled` and come from `getOlderSettledThreads`.
+    pub omit_older_settled: bool,
+}
+
+impl ShellOptions {
+    /// Older settled rows need families too, so a server must advertise both.
+    pub fn for_server(shell_thread_families: bool, shell_older_settled: bool) -> ShellOptions {
+        ShellOptions {
+            omit_idle_subagents: shell_thread_families,
+            omit_older_settled: shell_older_settled && shell_thread_families,
+        }
+    }
+}
+
 /// Asks for the `synchronized` marker so "no rows" can mean empty rather than still loading.
-pub fn subscribe_shell(after_sequence: Option<u64>) -> Value {
+pub fn subscribe_shell(after_sequence: Option<u64>, options: ShellOptions) -> Value {
     let mut payload = json!({ "requestCompletionMarker": true });
     if let Some(sequence) = after_sequence {
         payload["afterSequence"] = json!(sequence);
+    }
+    if options.omit_idle_subagents {
+        payload["omitIdleSubagents"] = json!(true);
+    }
+    if options.omit_older_settled {
+        payload["omitOlderSettled"] = json!(true);
     }
     payload
 }

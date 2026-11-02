@@ -314,6 +314,12 @@ pub struct ServerConfig {
     pub settings: ServerSettings,
     #[serde(default)]
     pub new_projects_root: Option<String>,
+    /// The shell can omit idle subagent children; `getThreadFamily` serves them.
+    #[serde(default)]
+    pub shell_thread_families: bool,
+    /// The shell can omit older settled threads; `getOlderSettledThreads` serves them.
+    #[serde(default)]
+    pub shell_older_settled: bool,
 }
 
 impl ServerConfig {

@@ -32,6 +32,18 @@ async fn next_thread_sequence(events: &mut mpsc::Receiver<ClientEvent>) -> Optio
     }
 }
 
+/// The shell waits for the first config snapshot, whose capabilities decide its options.
+async fn answer_config(connection: &mut crate::test_server::Connection, config: Option<Value>) {
+    let request = connection.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+    match config {
+        Some(config) => connection.chunk(&request, json!([{"type": "snapshot", "config": config}])).await,
+        None => {
+            let failure = json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": {"message": "no config"}}]});
+            connection.send(json!({"_tag": "Exit", "requestId": request["id"], "exit": failure})).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     let mut server = FakeServer::start().await;
@@ -40,8 +52,10 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
 
     let mut first = server.connection().await;
     assert!(first.path.contains("wsTicket=ticket"), "{}", first.path);
+    answer_config(&mut first, None).await;
     let shell = first.request(method::SUBSCRIBE_SHELL).await;
     assert_eq!(shell["payload"].get("afterSequence"), None);
+    assert_eq!(shell["payload"].get("omitIdleSubagents"), None, "a failed config asks for every row");
     let thread = first.request(method::SUBSCRIBE_THREAD).await;
     assert_eq!(thread["payload"].get("afterSequence"), None);
     assert_eq!(thread["payload"]["acceptBoundedSnapshot"], true);
@@ -63,8 +77,11 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     drop(first);
 
     let mut second = server.connection().await;
+    answer_config(&mut second, Some(json!({"shellThreadFamilies": true, "shellOlderSettled": true}))).await;
     let shell = second.request(method::SUBSCRIBE_SHELL).await;
     assert_eq!(shell["payload"]["afterSequence"], 40);
+    assert_eq!(shell["payload"]["omitIdleSubagents"], true);
+    assert_eq!(shell["payload"]["omitOlderSettled"], true);
     let thread = second.request(method::SUBSCRIBE_THREAD).await;
     assert_eq!(thread["payload"]["afterSequence"], 6);
     assert_eq!(thread["payload"]["threadId"], "t1");
