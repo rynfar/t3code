@@ -104,7 +104,12 @@ impl SettingsView {
         };
         dialog.submitted = true;
         let target = dialog.target.clone();
-        let existing = self.thread_settings(cx).map(|config| config.settings.secret_providers.ids()).unwrap_or_default();
+        let providers = self.thread_settings(cx).map(|config| config.settings.secret_providers.clone()).unwrap_or_default();
+        if !target.is_open_in(&providers) {
+            self.secrets.dialog = None;
+            return cx.notify();
+        }
+        let existing = providers.ids();
         let draft = self.secret_draft(cx);
         if let Ok((id, config)) = secrets::provider_from_draft(&draft, &existing, &target) {
             store::update_server(&self.state, ServerSettingChange::Prepared(secrets::save_payload(&id, config)), cx);
@@ -129,6 +134,11 @@ impl SettingsView {
     }
 
     pub(super) fn secrets_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+        // The web stops rendering an edit whose provider another client removed.
+        let providers = self.thread_settings(cx).map(|config| config.settings.secret_providers.clone()).unwrap_or_default();
+        if self.secrets.dialog.as_ref().is_some_and(|dialog| !dialog.target.is_open_in(&providers)) {
+            self.secrets.dialog = None;
+        }
         let p = palette(cx);
         let environment = self.environment_label(cx);
         let notice = |text: String| {
@@ -230,6 +240,9 @@ impl SettingsView {
         let dialog = self.secrets.dialog.as_ref()?;
         let p = palette(cx);
         let config = self.thread_settings(cx);
+        if !dialog.target.is_open_in(&config.map(|config| config.settings.secret_providers.clone()).unwrap_or_default()) {
+            return None;
+        }
         let existing = config.map(|config| config.settings.secret_providers.ids()).unwrap_or_default();
         let editing = match &dialog.target {
             Target::Edit(id) => config.and_then(|config| config.settings.secret_providers.get(id)).map(|provider| provider.label.clone()),

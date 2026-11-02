@@ -156,7 +156,7 @@ fn telemetry_saves_changed_endpoints_and_shows_what_runs() {
     let saved = ObservabilitySettings { otlp_traces_url: "http://a".into(), ..Default::default() };
     let values = vec![(OtlpSignal::Traces, " http://a ".to_owned()), (OtlpSignal::Metrics, "http://m".to_owned()), (OtlpSignal::Logs, String::new())];
     assert_eq!(changed_signals(&values, &saved), vec![OtlpSignal::Metrics]);
-    assert_eq!(telemetry_save_payload(&values, &saved), json!({ "patch": { "observability": { "otlpMetricsUrl": "http://m" } } }));
+    assert_eq!(telemetry_save_payload(&values, &saved), Ok(json!({ "patch": { "observability": { "otlpMetricsUrl": "http://m" } } })));
 
     let running = observability(json!({ "otlpTracesUrl": "http://b", "otlpTracesSource": "settings" }));
     assert_eq!(running_line(OtlpSignal::Traces, &saved, Some(&running)), Some(("http://b".into(), None)));
@@ -166,4 +166,34 @@ fn telemetry_saves_changed_endpoints_and_shows_what_runs() {
     assert!(is_http_url("HTTPS://x"));
     assert!(!is_http_url("http://"));
     assert!(!is_http_url("ftp://x"));
+}
+
+/// The form refuses endpoints that are not HTTP or HTTPS URLs, as the web's field validation does.
+#[test]
+fn telemetry_save_refuses_endpoints_that_are_not_http_urls() {
+    let saved = ObservabilitySettings::default();
+    let with = |traces: &str| vec![(OtlpSignal::Traces, traces.to_owned()), (OtlpSignal::Metrics, String::new()), (OtlpSignal::Logs, String::new())];
+    for bad in ["ftp://collector", "collector:4318", "http://", "https:// spaced host"] {
+        assert_eq!(telemetry_save_payload(&with(bad), &saved), Err(vec![OtlpSignal::Traces]), "{bad}");
+    }
+    assert_eq!(
+        telemetry_save_payload(&with("  HTTPS://collector:4318/v1/traces "), &saved),
+        Ok(json!({ "patch": { "observability": { "otlpTracesUrl": "HTTPS://collector:4318/v1/traces" } } })),
+        "sent trimmed, as a URL field trims"
+    );
+    assert!(is_valid_endpoint(""), "empty turns export off");
+}
+
+/// Leaving Diagnostics while it loads and coming back: the first visit's reply is dropped.
+#[test]
+fn a_reset_query_drops_replies_from_before_it() {
+    let mut query: Query<u32> = Query::default();
+    let earlier = query.begin();
+    query.reset();
+    let current = query.begin();
+    assert_ne!(earlier, current);
+    assert!(!query.finish(earlier, Ok(1)), "the earlier visit's reply is stale");
+    assert!(query.initial_loading(), "the new visit is still loading");
+    assert!(query.finish(current, Ok(2)));
+    assert_eq!((query.data, query.pending), (Some(2), false));
 }

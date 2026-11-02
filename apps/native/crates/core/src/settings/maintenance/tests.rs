@@ -173,3 +173,24 @@ fn compaction_is_suggested_only_for_large_unvacuumed_databases() {
     assert!(compaction_recommendation(&json!({ "reclaimableBytes": 2e9, "incrementalVacuumEnabled": true, "compactCommand": "x" })).is_none());
     assert!(compaction_recommendation(&json!({ "reclaimableBytes": 1e6, "incrementalVacuumEnabled": false, "compactCommand": "x" })).is_none());
 }
+
+/// Two switches flipped before the first save answers: the second is built from the settings the
+/// first left, so it keeps the first's value instead of pinning the old one.
+#[test]
+fn queued_background_edits_build_on_the_previous_save() {
+    use crate::settings::ServerSettingChange;
+    let background = |payload: &Value| settings(json!({ "backgroundActivity": payload["patch"]["backgroundActivity"] }));
+    let battery = ServerSettingChange::BackgroundActivity(BackgroundEdit::Override(Override::Pause(PauseKey::OnBattery, true)));
+    let locked = ServerSettingChange::BackgroundActivity(BackgroundEdit::Override(Override::Pause(PauseKey::HostLocked, false)));
+    let first = battery.payload_for(Some(&settings(json!({})))).unwrap();
+    let after_first = background(&first);
+    let second = locked.payload_for(Some(&after_first)).unwrap();
+    let overrides = &second["patch"]["backgroundActivity"]["overrides"];
+    assert_eq!(overrides["pauseWhenOnBattery"], true, "the first edit survives the second");
+    assert_eq!(overrides["pauseWhenHostLocked"], false);
+    let policy = ServerSettingChange::BackgroundActivity(BackgroundEdit::SharedPolicy(Profile::Performance));
+    let third = policy.payload_for(Some(&background(&second))).unwrap();
+    assert_eq!(third["patch"]["backgroundActivity"]["baseProfile"], "performance");
+    assert_eq!(third["patch"]["backgroundActivity"]["overrides"]["pauseWhenOnBattery"], true);
+    assert!(policy.payload_for(None).is_none(), "nothing to build from without settings");
+}

@@ -166,10 +166,14 @@ async fn telemetry_cycle(client: &ClientHandle) -> anyhow::Result<()> {
         (OtlpSignal::Metrics, original.otlp_metrics_url.clone()),
         (OtlpSignal::Logs, original.otlp_logs_url.clone()),
     ];
-    let saved = save(client, diagnostics::telemetry_save_payload(&values, &original)).await?;
+    let refused = diagnostics::telemetry_save_payload(&[(OtlpSignal::Traces, "ftp://collector".to_owned())], &original);
+    println!("refuse  ftp://collector -> {refused:?}");
+    let payload = diagnostics::telemetry_save_payload(&values, &original).map_err(|invalid| anyhow::anyhow!("invalid endpoints {invalid:?}"))?;
+    let saved = save(client, payload).await?;
     println!("saved   {:?}", saved.observability);
     let back = vec![(OtlpSignal::Traces, original.otlp_traces_url.clone())];
-    let restored = save(client, diagnostics::telemetry_save_payload(&back, &saved.observability)).await?;
+    let payload = diagnostics::telemetry_save_payload(&back, &saved.observability).map_err(|invalid| anyhow::anyhow!("invalid endpoints {invalid:?}"))?;
+    let restored = save(client, payload).await?;
     println!("restore {:?}", restored.observability);
     anyhow::ensure!(restored.observability == original, "telemetry endpoints not restored");
     Ok(())

@@ -20,7 +20,7 @@ use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::diagnostics::{
-    self as model, Dot, EndpointCheck, HISTORY_WINDOWS, OtlpSignal, ProcessDiagnostics, ResourceHistory, Signal, SignalOutcome, TraceDiagnostics,
+    self as model, Dot, EndpointCheck, HISTORY_WINDOWS, OtlpSignal, ProcessDiagnostics, Query, ResourceHistory, Signal, SignalOutcome, TraceDiagnostics,
 };
 use t3_core::settings::maintenance::{format_bytes, format_count};
 use t3_core::usage::{ConnectionPhase, resolve_usage_access};
@@ -37,27 +37,6 @@ const PROCESS_ROW: f32 = 36.;
 /// `max-h-[min(64vh,44rem)]`.
 const TABLE_MAX: f32 = 704.;
 
-/// One RPC the page reads, refreshed on demand.
-struct Query<T> {
-    data: Option<T>,
-    error: Option<String>,
-    pending: bool,
-    /// Replies to an older request are dropped.
-    request: u64,
-}
-
-impl<T> Default for Query<T> {
-    fn default() -> Self {
-        Query { data: None, error: None, pending: false, request: 0 }
-    }
-}
-
-impl<T> Query<T> {
-    fn initial_loading(&self) -> bool {
-        self.pending && self.data.is_none()
-    }
-}
-
 struct Telemetry {
     inputs: [Entity<InputState>; 3],
     /// Fields that differ from what is saved; the rest follow the server.
@@ -68,6 +47,8 @@ struct Telemetry {
     /// Seeded once per visit from what runs or is saved, then sent once checks are allowed.
     seeded: bool,
     sent: bool,
+    /// Fields a save refused (`ENDPOINT_HINT`), until edited.
+    invalid: Vec<OtlpSignal>,
 }
 
 pub(crate) struct DiagnosticsState {
@@ -121,7 +102,7 @@ impl DiagnosticsState {
             copied: None,
             form_ready: false,
             pending_scroll: false,
-            telemetry: Telemetry { inputs, drafts: HashMap::new(), saving: false, message: None, checks: HashMap::new(), seeded: false, sent: false },
+            telemetry: Telemetry { inputs, drafts: HashMap::new(), saving: false, message: None, checks: HashMap::new(), seeded: false, sent: false, invalid: Vec::new() },
             ticker: None,
             grants: None,
             _subscriptions: subscriptions,
@@ -135,9 +116,9 @@ impl DiagnosticsState {
     /// A fresh visit: signals and pending state belong to one visit (`key={environmentId}`).
     pub(super) fn reset(&mut self) {
         self.leave();
-        self.processes = Query::default();
-        self.history = Query::default();
-        self.trace = Query::default();
+        self.processes.reset();
+        self.history.reset();
+        self.trace.reset();
         self.window = model::DEFAULT_HISTORY_WINDOW;
         self.collapsed.clear();
         self.signaling = None;
@@ -150,6 +131,7 @@ impl DiagnosticsState {
         self.telemetry.checks.clear();
         self.telemetry.seeded = false;
         self.telemetry.sent = false;
+        self.telemetry.invalid.clear();
     }
 
     /// Off the page: clocks and watchers stop, and nothing reloads until it shows again.
@@ -207,10 +189,7 @@ impl SettingsView {
     }
 
     fn load_processes(&mut self, cx: &mut Context<Self>) {
-        let query = &mut self.diagnostics.processes;
-        query.pending = true;
-        query.request += 1;
-        let request = query.request;
+        let request = self.diagnostics.processes.begin();
         let task = self
             .state
             .read(cx)
@@ -219,10 +198,7 @@ impl SettingsView {
     }
 
     fn load_history(&mut self, cx: &mut Context<Self>) {
-        let query = &mut self.diagnostics.history;
-        query.pending = true;
-        query.request += 1;
-        let request = query.request;
+        let request = self.diagnostics.history.begin();
         let payload = HISTORY_WINDOWS[self.diagnostics.window].payload();
         let task = self
             .state
@@ -232,10 +208,7 @@ impl SettingsView {
     }
 
     fn load_trace(&mut self, cx: &mut Context<Self>) {
-        let query = &mut self.diagnostics.trace;
-        query.pending = true;
-        query.request += 1;
-        let request = query.request;
+        let request = self.diagnostics.trace.begin();
         let task = self
             .state
             .read(cx)
@@ -251,27 +224,15 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         let Some(task) = task else {
-            let query = slot(self);
-            query.pending = false;
-            query.error = Some("The connection closed. Try again once it reconnects.".to_owned());
+            slot(self).finish(request, Err("The connection closed. Try again once it reconnects.".to_owned()));
             return;
         };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
             let _ = this.update(cx, |this, cx| {
-                let query = slot(this);
-                if query.request != request {
-                    return;
+                if slot(this).finish(request, result) {
+                    cx.notify();
                 }
-                query.pending = false;
-                match result {
-                    Ok(data) => {
-                        query.data = Some(data);
-                        query.error = None;
-                    }
-                    Err(error) => query.error = Some(error),
-                }
-                cx.notify();
             });
         })
         .detach();
@@ -1183,6 +1144,7 @@ impl SettingsView {
             self.diagnostics.telemetry.drafts.insert(signal, value);
         }
         self.diagnostics.telemetry.message = None;
+        self.diagnostics.telemetry.invalid.retain(|invalid| *invalid != signal);
         cx.notify();
     }
 
@@ -1199,12 +1161,20 @@ impl SettingsView {
         if self.diagnostics.telemetry.saving || model::changed_signals(&values, &saved).is_empty() || !self.may(SETTINGS_WRITE_SCOPE, cx) {
             return;
         }
+        let payload = match model::telemetry_save_payload(&values, &saved) {
+            Ok(payload) => payload,
+            Err(invalid) => {
+                self.diagnostics.telemetry.invalid = invalid;
+                return cx.notify();
+            }
+        };
         self.diagnostics.telemetry.saving = true;
         self.diagnostics.telemetry.message = None;
+        self.diagnostics.telemetry.invalid.clear();
         let view = cx.entity().downgrade();
         store::update_server_then(
             &self.state,
-            ServerSettingChange::Prepared(model::telemetry_save_payload(&values, &saved)),
+            ServerSettingChange::Prepared(payload),
             move |error, cx| {
                 let _ = view.update(cx, |this, cx| {
                     this.diagnostics.telemetry.saving = false;
@@ -1221,6 +1191,7 @@ impl SettingsView {
     }
 
     fn discard_telemetry(&mut self, can_check: bool, cx: &mut Context<Self>) {
+        self.diagnostics.telemetry.invalid.clear();
         self.diagnostics.telemetry.drafts.clear();
         self.diagnostics.telemetry.message = None;
         if can_check {
@@ -1328,6 +1299,7 @@ impl SettingsView {
             let status = model::signal_status(found.as_ref(), can_check.then(|| model::endpoint_status(&url, check)));
             let checking = check.is_some_and(|check| check.result.is_none());
             let running_line = model::running_line(signal, &saved, running.as_ref());
+            let refused = self.diagnostics.telemetry.invalid.contains(&signal);
             let test_url = url.clone();
             form = form.child(
                 v_flex()
@@ -1357,6 +1329,7 @@ impl SettingsView {
                                 )
                             }),
                     )
+                    .when(refused, |this| this.child(div().text_xs().text_color(hsla(p.destructive_foreground)).child(model::ENDPOINT_HINT)))
                     .children(running_line.map(|(running, variable)| {
                         h_flex()
                             .flex_wrap()

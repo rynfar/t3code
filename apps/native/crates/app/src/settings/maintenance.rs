@@ -18,8 +18,8 @@ use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::maintenance::{
-    self as model, CleanupReport, DatabaseStorage, INTERVAL_FIELDS, IntervalField, LastRun, MaintenanceChange, Outcome, Override, PROFILES, PauseKey, ProfileOption, ReportEntry,
-    Retention,
+    self as model, BackgroundEdit, CleanupReport, DatabaseStorage, INTERVAL_FIELDS, IntervalField, LastRun, MaintenanceChange, Outcome, Override, PROFILES, PauseKey,
+    ProfileOption, ReportEntry, Retention,
 };
 use t3_core::settings::search::Section;
 use t3_core::settings::worktrees::{DEFAULT_RETENTION_DAYS, clamp_retention};
@@ -167,6 +167,11 @@ impl SettingsView {
         store::update_server(&self.state, ServerSettingChange::Prepared(change.payload()), cx);
     }
 
+    /// Built when the save queue sends it, from the settings every earlier save left.
+    fn save_background(state: &Entity<crate::app_state::AppState>, edit: BackgroundEdit, cx: &mut App) {
+        store::update_server(state, ServerSettingChange::BackgroundActivity(edit), cx);
+    }
+
     fn save_prepared(state: &Entity<crate::app_state::AppState>, payload: serde_json::Value, cx: &mut App) {
         store::update_server(state, ServerSettingChange::Prepared(payload), cx);
     }
@@ -244,7 +249,7 @@ impl SettingsView {
         let seconds = field.normalize(&input.read(cx).value()).unwrap_or(saved);
         input.update(cx, |input, cx| input.set_value(seconds.to_string(), window, cx));
         if seconds != saved && self.may(SETTINGS_WRITE_SCOPE, cx) {
-            Self::save_prepared(&self.state, model::override_payload(&settings, field.change(seconds)), cx);
+            Self::save_background(&self.state, BackgroundEdit::Override(field.change(seconds)), cx);
         }
     }
 
@@ -406,14 +411,13 @@ impl SettingsView {
         };
         let row = |content: gpui::Div| content.px(r(16.)).py(r(12.)).gap(r(12.)).items_center();
         let state = self.state.clone();
-        let policy_settings = settings.clone();
         let policy = row(h_flex()).child(text_block("Shared policy", "Controls whether background work may run after a subscribed interval fires.")).child(
             Select::new("background-shared-policy", PROFILES.iter().map(|profile| SelectOption::new(profile.as_str(), model::profile_label(*profile))).collect())
                 .selected(resolved.profile.as_str())
                 .width(160.)
                 .on_change(move |value, _, cx| {
                     if let Some(profile) = model::parse_profile(&value) {
-                        Self::save_prepared(&state, model::shared_policy_payload(&policy_settings, profile), cx);
+                        Self::save_background(&state, BackgroundEdit::SharedPolicy(profile), cx);
                     }
                 }),
         );
@@ -431,7 +435,6 @@ impl SettingsView {
         }
         let switches = PauseKey::ALL.map(|key| {
             let state = self.state.clone();
-            let settings = settings.clone();
             h_flex()
                 .flex_1()
                 .justify_between()
@@ -440,7 +443,7 @@ impl SettingsView {
                 .py(r(12.))
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(key.label()))
                 .child(Switch::new(SharedString::from(format!("background-{}", key.label())), key.value(&resolved)).disabled(!can_write).on_change(move |on, _, cx| {
-                    Self::save_prepared(&state, model::override_payload(&settings, Override::Pause(key, on)), cx);
+                    Self::save_background(&state, BackgroundEdit::Override(Override::Pause(key, on)), cx);
                 }))
                 .into_any_element()
         });

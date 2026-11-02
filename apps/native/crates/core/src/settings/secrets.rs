@@ -152,6 +152,17 @@ pub enum Target {
     Edit(String),
 }
 
+impl Target {
+    /// Whether the dialog may stay open: an edit closes once its provider is gone (another client
+    /// removed it), so Save never writes it back.
+    pub fn is_open_in(&self, providers: &SecretProviders) -> bool {
+        match self {
+            Target::Add => true,
+            Target::Edit(id) => providers.get(id).is_some(),
+        }
+    }
+}
+
 /// `SecretProviderDraftIssues`: one message per field that blocks saving.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Issues {

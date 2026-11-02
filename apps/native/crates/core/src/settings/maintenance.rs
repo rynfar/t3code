@@ -249,6 +249,23 @@ pub fn override_payload(settings: &ProviderPanelSettings, change: Override) -> V
     } } })
 }
 
+/// An advanced dialog edit. Both pin the values they keep from the settings as they stand, so
+/// `ServerSettingChange::BackgroundActivity` builds them when the save queue sends them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundEdit {
+    Override(Override),
+    SharedPolicy(Profile),
+}
+
+impl BackgroundEdit {
+    pub fn payload(self, settings: &ProviderPanelSettings) -> Value {
+        match self {
+            BackgroundEdit::Override(change) => override_payload(settings, change),
+            BackgroundEdit::SharedPolicy(profile) => shared_policy_payload(settings, profile),
+        }
+    }
+}
+
 /// One interval field in the advanced dialog: its bounds and what it sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntervalField {

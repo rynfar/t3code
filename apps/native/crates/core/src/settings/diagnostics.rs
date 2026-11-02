@@ -677,11 +677,77 @@ pub fn changed_signals(values: &[(OtlpSignal, String)], saved: &ObservabilitySet
     values.iter().filter(|(signal, value)| value.trim() != signal.saved(saved)).map(|(signal, _)| *signal).collect()
 }
 
-/// Save: the changed endpoints only, as typed.
-pub fn telemetry_save_payload(values: &[(OtlpSignal, String)], saved: &ObservabilitySettings) -> Value {
+/// The field's `type="url"` and `pattern="[Hh][Tt][Tt][Pp][Ss]?://.*"`: empty, or an absolute
+/// HTTP or HTTPS URL.
+pub fn is_valid_endpoint(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || (is_http_url(value) && url::Url::parse(value).is_ok_and(|url| url.has_host()))
+}
+
+/// The field's `title`, which the browser shows when the form refuses an endpoint.
+pub const ENDPOINT_HINT: &str = "Enter an HTTP or HTTPS endpoint, or leave empty to disable export.";
+
+/// Save: the changed endpoints only, trimmed as a URL field trims them. Any field that is not a
+/// valid endpoint blocks the save, as the form's validation does; those fields come back.
+pub fn telemetry_save_payload(values: &[(OtlpSignal, String)], saved: &ObservabilitySettings) -> Result<Value, Vec<OtlpSignal>> {
+    let invalid: Vec<OtlpSignal> = values.iter().filter(|(_, value)| !is_valid_endpoint(value)).map(|(signal, _)| *signal).collect();
+    if !invalid.is_empty() {
+        return Err(invalid);
+    }
     let changed = changed_signals(values, saved);
-    let observability: Map<String, Value> = values.iter().filter(|(signal, _)| changed.contains(signal)).map(|(signal, value)| (signal.key().to_owned(), json!(value))).collect();
-    json!({ "patch": { "observability": observability } })
+    let observability: Map<String, Value> =
+        values.iter().filter(|(signal, _)| changed.contains(signal)).map(|(signal, value)| (signal.key().to_owned(), json!(value.trim()))).collect();
+    Ok(json!({ "patch": { "observability": observability } }))
+}
+
+/// One query the page reads and refreshes. Each request gets a number that only grows, even
+/// across a reset, so a reply to a request from an earlier visit is never taken for a newer one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Query<T> {
+    pub data: Option<T>,
+    pub error: Option<String>,
+    pub pending: bool,
+    request: u64,
+}
+
+impl<T> Default for Query<T> {
+    fn default() -> Self {
+        Query { data: None, error: None, pending: false, request: 0 }
+    }
+}
+
+impl<T> Query<T> {
+    /// Starts a request; its reply is taken only while it is the latest.
+    pub fn begin(&mut self) -> u64 {
+        self.pending = true;
+        self.request += 1;
+        self.request
+    }
+
+    /// Takes a reply; false when a newer request or a reset superseded it.
+    pub fn finish(&mut self, request: u64, result: Result<T, String>) -> bool {
+        if request != self.request {
+            return false;
+        }
+        self.pending = false;
+        match result {
+            Ok(data) => {
+                self.data = Some(data);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+        true
+    }
+
+    /// A fresh visit: no data, nothing loading, and every request still in flight discarded.
+    pub fn reset(&mut self) {
+        *self = Query { request: self.request + 1, ..Query::default() };
+    }
+
+    pub fn initial_loading(&self) -> bool {
+        self.pending && self.data.is_none()
+    }
 }
 
 pub const TELEMETRY_SAVED: &str = "Saved. Restart the server to apply.";

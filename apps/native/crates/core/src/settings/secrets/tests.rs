@@ -122,3 +122,13 @@ fn redacted_placeholder_matches_the_web() {
         assert_eq!(redacted_placeholder(value), redacted, "{value}");
     }
 }
+
+#[test]
+fn an_edit_closes_once_its_provider_is_removed_elsewhere() {
+    let present = providers(json!({ "personal": { "kind": "one_password", "label": "Personal", "config": { "account": "a" } } }));
+    let removed = providers(json!({}));
+    let edit = Target::Edit("personal".into());
+    assert!(edit.is_open_in(&present));
+    assert!(!edit.is_open_in(&removed), "Save would write the removed provider back");
+    assert!(Target::Add.is_open_in(&removed));
+}
