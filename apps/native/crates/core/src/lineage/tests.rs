@@ -270,18 +270,15 @@ fn workflow_members_follow_an_ended_coordinator_and_phases_merge_declared_titles
     )])
     .remove(0);
     let group = workflow_group(&coordinator).expect("group");
-    let phases: Vec<(u32, &str, PhaseState, Vec<(&str, &str)>)> = group
+    let phases: Vec<String> = group
         .phases
         .iter()
-        .map(|phase| (phase.index, phase.title.as_str(), phase.state, phase.members.iter().map(|m| (m.label.as_str(), m.status.as_str())).collect()))
+        .map(|phase| {
+            let members: Vec<String> = phase.members.iter().map(|m| format!("{}={}", m.label, m.status)).collect();
+            format!("{} {} {:?} [{}]", phase.index, phase.title, phase.state, members.join(" "))
+        })
         .collect();
-    assert_eq!(
-        phases,
-        [
-            (0, "Plan", PhaseState::Done, vec![("A", "completed"), ("B", "cancelled")]),
-            (1, "Build", PhaseState::Done, vec![("C", "cancelled")]),
-        ]
-    );
+    assert_eq!(phases, ["0 Plan Done [A=completed B=cancelled]", "1 Build Done [C=cancelled]"]);
     assert_eq!(group.unphased.iter().map(|m| m.status.as_str()).collect::<Vec<_>>(), ["cancelled"]);
 }
 
@@ -338,4 +335,23 @@ fn commands_carry_the_fields_the_server_reads() {
     assert_eq!(merge_back_command("c", "s", "t", "r")["sourcePoint"], json!({"type": "run", "runId": "r"}));
     assert_eq!(stop_subagent_command("c", "t", "r", "a"), json!({"type": "subagent.stop", "commandId": "c", "threadId": "t", "runId": "r", "subagentId": "a"}));
     assert_eq!(stop_workflow_request("t", "a"), json!({"threadId": "t", "subagentId": "a"}));
+}
+
+#[test]
+fn effort_reads_the_reported_selection_first_and_variant_falls_back_to_its_default() {
+    let model: crate::server_config::ProviderModel = serde_json::from_value(json!({
+        "slug": "gpt", "name": "GPT", "isCustom": false,
+        "capabilities": {"optionDescriptors": [
+            {"id": "fastMode", "label": "Fast", "type": "boolean"},
+            {"id": "reasoningEffort", "label": "Reasoning", "type": "select", "options": [{"id": "low", "label": "Low"}, {"id": "high", "label": "High", "isDefault": true}]}
+        ]}
+    }))
+    .expect("model");
+    let selection = |options: Value| -> crate::model::ModelSelection { serde_json::from_value(json!({"instanceId": "codex", "model": "gpt", "options": options})).expect("selection") };
+    let chosen = selection(json!([{"id": "reasoningEffort", "value": "low"}]));
+    assert_eq!(effort_label(&chosen, Some(&model), None).as_deref(), Some("Low"));
+    let reported = selection(json!([{"id": "reasoningEffort", "value": "high"}]));
+    assert_eq!(effort_label(&chosen, Some(&model), Some(&reported)).as_deref(), Some("High"));
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), None), None, "an unstated effort is not shown");
+    assert_eq!(effort_label(&chosen, None, None), None);
 }

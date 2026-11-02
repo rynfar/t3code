@@ -35,6 +35,8 @@ pub struct Workspace {
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
+    lineage: Entity<crate::lineage::ComposerLineage>,
+    composer_replaced: bool,
     draft: Entity<DraftHero>,
     connect: Entity<ConnectView>,
     menu: Entity<ContextMenu>,
@@ -60,6 +62,7 @@ impl Workspace {
         let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+        let lineage = cx.new(|cx| crate::lineage::ComposerLineage::new(state.clone(), cx));
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(state.clone(), window, cx));
@@ -79,6 +82,13 @@ impl Workspace {
             }),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
             cx.subscribe(&details_model, |_, _, _: &DetailsEvent, cx| cx.notify()),
+            // The bar ticks while a subagent works; only swapping it for the composer re-lays out.
+            cx.observe(&lineage, |this, lineage, cx| {
+                let replaced = lineage.read(cx).replaces_composer();
+                if replaced != std::mem::replace(&mut this.composer_replaced, replaced) {
+                    cx.notify();
+                }
+            }),
             // Coming back to the app retires its delivered notifications, as the web's focus does.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -91,6 +101,8 @@ impl Workspace {
             sidebar,
             thread,
             composer,
+            lineage,
+            composer_replaced: false,
             draft,
             connect,
             menu,
@@ -154,6 +166,7 @@ impl Render for Workspace {
         let drawer = self.terminal.clone();
         let details_layout = thread_details::layout(&self.state, window, cx);
         let on_pull_requests = state.pull_requests_open;
+        let composer_replaced = self.composer_replaced;
         h_flex()
             .relative()
             .size_full()
@@ -246,7 +259,8 @@ impl Render for Workspace {
                                 .pr(px(details_layout.lane_inset))
                                 // Cached so terminal output repaints do not re-render the transcript.
                                 .child(div().flex_1().min_h_0().child(self.thread.clone().cached(gpui::StyleRefinement::default().size_full())))
-                                .child(self.composer.clone())
+                                .child(self.lineage.clone())
+                                .when(!composer_replaced, |this| this.child(self.composer.clone()))
                                 .child(self.details.clone()),
                         )
                         .child(self.terminal.clone())

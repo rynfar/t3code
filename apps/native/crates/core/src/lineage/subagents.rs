@@ -400,3 +400,51 @@ impl NativeChildStep {
         }
     }
 }
+
+const EFFORT_OPTION_IDS: [&str; 6] = ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level"];
+
+/// `formatModelSelectionEffort`: the effort a subagent runs at, from what the provider reported
+/// first, else the selection. `variant` falls back to its default choice.
+pub fn effort_label(
+    selection: &crate::model::ModelSelection,
+    model: Option<&crate::server_config::ProviderModel>,
+    reported: Option<&crate::model::ModelSelection>,
+) -> Option<String> {
+    use crate::server_config::OptionDescriptor;
+    use crate::traits::{OptionValue, current_label, resolve_descriptors, selections};
+    let descriptors = &model?.capabilities.as_ref()?.option_descriptors;
+    let stated = |id: &str| {
+        let pick = |selection: Option<&crate::model::ModelSelection>| selections(selection?.options.as_ref()).into_iter().find(|option| option.id == id);
+        pick(reported).or_else(|| pick(Some(selection)))
+    };
+    for id in EFFORT_OPTION_IDS {
+        let Some(descriptor @ OptionDescriptor::Select(_)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
+        let value = stated(id);
+        if value.is_none() && id != "variant" {
+            continue;
+        }
+        if value.as_ref().is_some_and(|value| matches!(value.value, OptionValue::Bool(_))) {
+            continue;
+        }
+        let resolved = resolve_descriptors(std::slice::from_ref(descriptor), &value.into_iter().collect::<Vec<_>>());
+        if let Some(label) = resolved.first().and_then(current_label) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// `deriveReportedModelSelection`: what the provider says the thread runs on.
+pub fn reported_model_selection(projection: &ThreadProjection) -> Option<crate::model::ModelSelection> {
+    let thread = &projection.thread;
+    projection
+        .provider_threads
+        .iter()
+        .map(|entity| &entity.value)
+        .find(|provider_thread| {
+            provider_thread.get("id").and_then(Value::as_str) == thread.active_provider_thread_id.as_deref()
+                && provider_thread.get("providerInstanceId").and_then(Value::as_str) == Some(thread.model_selection.instance_id.as_str())
+        })
+        .and_then(|provider_thread| provider_thread.pointer("/nativeMetadata/modelSelection"))
+        .and_then(|selection| serde_json::from_value(selection.clone()).ok())
+}

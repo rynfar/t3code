@@ -71,7 +71,7 @@ impl SideChatPane {
         let state = self.state.read(cx);
         let shell = state.thread_shell(&self.thread_id);
         let title = shell.map_or_else(|| "Side chat".to_owned(), |thread| thread.title.clone());
-        let busy = state.side_threads.busy.iter().any(|id| *id == self.thread_id);
+        let busy = state.side_threads.busy.contains(&self.thread_id);
         let parent_active = state.selected_thread.as_deref().is_some_and(|parent| state.is_thread_running(parent));
         let merge_run = state.thread_state(&self.thread_id).projection.as_ref().and_then(|projection| latest_merge_back_run(&projection.runs));
         let blocked = bring_back_blocked_reason(parent_active, merge_run);

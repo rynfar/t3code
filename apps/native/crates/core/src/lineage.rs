@@ -85,6 +85,14 @@ fn is_work_active(status: &str) -> bool {
     matches!(status, "pending" | "running" | "waiting")
 }
 
+/// A thread's edge to its parent, as its lineage records it.
+struct Link {
+    thread_id: String,
+    parent: Option<String>,
+    subagent: bool,
+    status: Option<String>,
+}
+
 struct GraphBuilder<'a> {
     nodes: HashMap<String, RelationshipNode<'a>>,
     edges: Vec<RelationshipEdge>,
@@ -127,24 +135,29 @@ pub fn relationship_graph<'a>(threads: impl IntoIterator<Item = &'a ThreadShell>
             ordered.push(thread);
         }
     }
-    let mut lineage: Vec<(String, Option<&str>, Option<&Value>, bool, Option<String>)> = ordered
+    let mut links: Vec<Link> = ordered
         .iter()
-        .map(|thread| {
-            let subagent = thread.lineage.relationship_to_parent.as_deref() == Some("subagent");
-            let status = thread.activity_run_status.clone().or_else(|| Some(thread.status.clone()));
-            (thread.id.clone(), thread.lineage.parent_thread_id.as_deref(), thread.forked_from.as_ref(), subagent, status)
+        .map(|thread| Link {
+            thread_id: thread.id.clone(),
+            parent: parent_of(thread.forked_from.as_ref(), thread.lineage.parent_thread_id.as_deref()).map(str::to_owned),
+            subagent: thread.lineage.relationship_to_parent.as_deref() == Some("subagent"),
+            status: thread.activity_run_status.clone().or_else(|| Some(thread.status.clone())),
         })
         .collect();
     if let Some(selected) = projection.map(|projection| &projection.thread)
         && !ordered.iter().any(|thread| thread.id == selected.id)
     {
-        let subagent = selected.lineage.relationship_to_parent.as_deref() == Some("subagent");
-        lineage.push((selected.id.clone(), selected.lineage.parent_thread_id.as_deref(), selected.forked_from.as_ref(), subagent, None));
+        links.push(Link {
+            thread_id: selected.id.clone(),
+            parent: parent_of(selected.forked_from.as_ref(), selected.lineage.parent_thread_id.as_deref()).map(str::to_owned),
+            subagent: selected.lineage.relationship_to_parent.as_deref() == Some("subagent"),
+            status: None,
+        });
     }
-    for (thread_id, parent_thread_id, forked_from, subagent, status) in lineage {
-        let Some(parent) = parent_of(forked_from, parent_thread_id) else { continue };
-        let kind = if subagent { RelationshipKind::Subagent } else { RelationshipKind::Fork };
-        builder.add(RelationshipEdge { source: parent.to_owned(), target: thread_id, kind, status });
+    for link in links {
+        let Some(parent) = link.parent else { continue };
+        let kind = if link.subagent { RelationshipKind::Subagent } else { RelationshipKind::Fork };
+        builder.add(RelationshipEdge { source: parent, target: link.thread_id, kind, status: link.status });
     }
     if let Some(projection) = projection {
         let owner = projection.thread.id.clone();
