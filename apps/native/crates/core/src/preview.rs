@@ -15,6 +15,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::right_panel::RightPanels;
+
 pub mod method {
     pub const OPEN: &str = "preview.open";
     pub const ADJUST: &str = "preview.adjust";
@@ -535,6 +537,143 @@ impl ThreadPreviews {
                 }
             })
             .collect()
+    }
+}
+
+/// What the shown thread's browser tabs need: follow its sessions (once listed), and bring
+/// `fronted` tabs (forced reveals, popups) to the front.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TabsEdit {
+    pub tabs: Option<(Vec<String>, HashSet<String>)>,
+    pub fronted: Vec<String>,
+}
+
+impl TabsEdit {
+    pub fn apply(&self, panels: &mut RightPanels, thread_id: &str) -> bool {
+        let mut changed = false;
+        if let Some((tabs, hidden)) = &self.tabs {
+            changed |= panels.reconcile_browser_surfaces(thread_id, tabs, hidden);
+        }
+        for tab in &self.fronted {
+            changed |= panels.open_browser(thread_id, Some(tab));
+        }
+        changed
+    }
+}
+
+/// What a batch of events did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Applied {
+    /// Threads whose sessions changed.
+    pub changed: Vec<String>,
+    /// An event came from another server epoch, so the shown thread lists again.
+    pub relist: bool,
+    pub edit: Option<TabsEdit>,
+}
+
+/// The sessions of every thread this client follows, and which thread the panel shows: one
+/// `usePreviewSession` per thread with `followPreviewSessions` for the shown one. A thread's
+/// sessions keep changing while it is hidden, so showing it again catches its tabs up.
+#[derive(Debug, Clone, Default)]
+pub struct PreviewThreads {
+    threads: std::collections::HashMap<String, ThreadPreviews>,
+    shown: Option<String>,
+    /// A page's popup, fronted once its session is known (`whenPreviewTabKnown`).
+    pending_popup: Option<(String, String)>,
+}
+
+impl PreviewThreads {
+    pub fn thread(&self, thread_id: &str) -> Option<&ThreadPreviews> {
+        self.threads.get(thread_id)
+    }
+
+    /// Follows `thread_id` from now on.
+    pub fn thread_mut(&mut self, thread_id: &str) -> &mut ThreadPreviews {
+        self.threads.entry(thread_id.to_owned()).or_default()
+    }
+
+    /// A new connection: nothing is known about any thread.
+    pub fn clear(&mut self) {
+        self.threads.clear();
+        self.pending_popup = None;
+    }
+
+    /// A thread comes into view, or none does.
+    pub fn show(&mut self, thread_id: Option<&str>) -> Option<TabsEdit> {
+        self.shown = thread_id.map(str::to_owned);
+        self.edit(thread_id?, None)
+    }
+
+    /// Events for followed threads; others are ignored.
+    pub fn apply(&mut self, events: impl IntoIterator<Item = PreviewEvent>) -> Applied {
+        let mut applied = Applied::default();
+        let mut previous: Vec<(String, ThreadPreviews)> = Vec::new();
+        for event in events {
+            let Some(thread) = self.threads.get_mut(&event.thread_id) else { continue };
+            if thread.needs_relist(&event) {
+                applied.relist = true;
+                continue;
+            }
+            let before = thread.clone();
+            if thread.apply_event(&event) && !previous.iter().any(|(id, _)| *id == event.thread_id) {
+                previous.push((event.thread_id.clone(), before));
+            }
+        }
+        for (thread_id, before) in previous {
+            if self.shown.as_deref() == Some(thread_id.as_str()) {
+                applied.edit = self.edit(&thread_id, Some(&before));
+            }
+            applied.changed.push(thread_id);
+        }
+        applied
+    }
+
+    /// A list answered for `thread_id`: whether its sessions changed, whether to list again
+    /// (an event overtook it), and the shown thread's edit, which follows the list even when
+    /// the sessions did not change, because its tabs may lag them.
+    pub fn listed(&mut self, thread_id: &str, list: &ListResult) -> (bool, bool, Option<TabsEdit>) {
+        let thread = self.thread_mut(thread_id);
+        let before = thread.clone();
+        let changed = thread.reconcile(list);
+        if !thread.list_loaded {
+            return (changed, true, None);
+        }
+        (changed, false, self.edit(thread_id, changed.then_some(&before)))
+    }
+
+    /// The shown thread's edit after a change made here (open, close, cancel) from `before`.
+    pub fn changed(&mut self, thread_id: &str, before: &ThreadPreviews) -> Option<TabsEdit> {
+        self.edit(thread_id, Some(before))
+    }
+
+    /// The page opened a popup: fronted now if its session is known, else once it is.
+    pub fn popup(&mut self, thread_id: &str, tab_id: &str) -> Option<TabsEdit> {
+        if self.threads.get(thread_id).and_then(|thread| thread.session(tab_id)).is_some() {
+            return (self.shown.as_deref() == Some(thread_id)).then(|| TabsEdit { tabs: None, fronted: vec![tab_id.to_owned()] });
+        }
+        self.pending_popup = Some((thread_id.to_owned(), tab_id.to_owned()));
+        None
+    }
+
+    fn edit(&mut self, thread_id: &str, before: Option<&ThreadPreviews>) -> Option<TabsEdit> {
+        if self.shown.as_deref() != Some(thread_id) {
+            return None;
+        }
+        let next = self.threads.get(thread_id)?;
+        let mut fronted: Vec<String> = before
+            .map(|before| {
+                next.freshly_revealed(before)
+                    .into_iter()
+                    .filter(|session| session.reveal_request.as_ref().is_some_and(|request| request.force))
+                    .map(|session| session.tab_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some((_, tab)) = self.pending_popup.take_if(|(thread, tab)| thread == thread_id && next.session(tab).is_some()) {
+            fronted.push(tab);
+        }
+        let tabs = next.panel_tabs();
+        (tabs.is_some() || !fronted.is_empty()).then_some(TabsEdit { tabs, fronted })
     }
 }
 

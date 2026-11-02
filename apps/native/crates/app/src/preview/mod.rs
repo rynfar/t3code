@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::preview::address::{BrowserHistory, HistoryEntry};
-use t3_core::preview::{ListResult, NavStatus, PREVIEW_OPERATE_SCOPE, PreviewEvent, SessionSnapshot, ThreadPreviews, method};
+use t3_core::preview::{ListResult, NavStatus, PREVIEW_OPERATE_SCOPE, PreviewEvent, PreviewThreads, SessionSnapshot, TabsEdit, method};
 
 pub use pane::PreviewPane;
 
@@ -82,11 +82,9 @@ enum Feed {
 
 pub struct Previews {
     state: Entity<AppState>,
-    threads: HashMap<String, ThreadPreviews>,
+    threads: PreviewThreads,
     /// Browser tabs each thread's panel last showed, to tell a user's close from the server's.
     panel_tabs: HashMap<String, Vec<String>>,
-    /// A page's popup, focused once its session is known (`whenPreviewTabKnown`).
-    pending_popup: Option<(String, String)>,
     history: BrowserHistory,
     history_store: Option<String>,
     /// `None` until the session state answers; unknown counts as granted.
@@ -145,7 +143,7 @@ pub fn toggle_preview(state: &mut AppState, cx: &mut Context<AppState>) {
             if previews.availability() != Availability::Available {
                 return;
             }
-            match previews.threads.get(&thread_id).and_then(|thread| thread.active_tab_id.clone()) {
+            match previews.threads.thread(&thread_id).and_then(|thread| thread.active_tab_id.clone()) {
                 Some(tab) => previews.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some(&tab)))),
                 None => previews.open_session(thread_id, None, cx),
             }
@@ -164,9 +162,9 @@ impl Previews {
             AppEvent::ServerConfig => this.sync_server_browser(cx),
             AppEvent::Selection => {
                 this.panel_changed(cx);
-                if let Some(thread) = this.state.read(cx).selected_thread.clone() {
-                    this.sync_panel(&thread, &[], cx);
-                }
+                let selected = this.state.read(cx).selected_thread.clone();
+                let edit = this.threads.show(selected.as_deref());
+                this.apply_edit(selected.as_deref(), edit, cx);
                 this.list_selected(cx);
             }
             AppEvent::RightPanel => this.panel_changed(cx),
@@ -174,9 +172,8 @@ impl Previews {
         });
         let mut previews = Previews {
             state,
-            threads: HashMap::new(),
+            threads: PreviewThreads::default(),
             panel_tabs: HashMap::new(),
-            pending_popup: None,
             history: BrowserHistory::default(),
             history_store: None,
             can_operate: None,
@@ -202,7 +199,7 @@ impl Previews {
     }
 
     pub fn session(&self, thread_id: &str, tab_id: &str) -> Option<&SessionSnapshot> {
-        self.threads.get(thread_id)?.session(tab_id)
+        self.threads.thread(thread_id)?.session(tab_id)
     }
 
     /// A new connection starts over: its sessions, grants and history are its own.
@@ -214,8 +211,8 @@ impl Previews {
         }
         self.connection = current;
         self.threads.clear();
+        self.threads.show(state.selected_thread.as_deref());
         self.panel_tabs.clear();
-        self.pending_popup = None;
         self.events = None;
         self.grants = None;
         self.listing = None;
@@ -331,31 +328,24 @@ impl Previews {
     }
 
     fn apply_feed(&mut self, batch: Vec<Feed>, cx: &mut Context<Self>) {
-        let mut changed: HashMap<String, ThreadPreviews> = HashMap::new();
-        let mut relist = false;
-        for item in batch {
-            let event = match item {
-                Feed::Event(event) => *event,
+        let mut resubscribed = false;
+        let events: Vec<PreviewEvent> = batch
+            .into_iter()
+            .filter_map(|item| match item {
+                Feed::Event(event) => Some(*event),
                 Feed::Resubscribed => {
-                    relist = true;
-                    continue;
+                    resubscribed = true;
+                    None
                 }
-            };
-            // Only threads this client follows: the selected one and those it opened tabs in.
-            let Some(thread) = self.threads.get_mut(&event.thread_id) else { continue };
-            if thread.needs_relist(&event) {
-                relist = true;
-                continue;
-            }
-            let previous = thread.clone();
-            if thread.apply_event(&event) {
-                changed.entry(event.thread_id.clone()).or_insert(previous);
-            }
+            })
+            .collect();
+        let applied = self.threads.apply(events);
+        for thread in &applied.changed {
+            self.changed(thread, cx);
         }
-        for (thread, previous) in changed {
-            self.follow(&thread, &previous, cx);
-        }
-        if relist {
+        let shown = self.state.read(cx).selected_thread.clone();
+        self.apply_edit(shown.as_deref(), applied.edit, cx);
+        if resubscribed || applied.relist {
             self.list_selected(cx);
         }
     }
@@ -365,20 +355,18 @@ impl Previews {
             return;
         }
         let Some(thread_id) = self.state.read(cx).selected_thread.clone() else { return };
-        self.threads.entry(thread_id.clone()).or_default();
+        self.threads.thread_mut(&thread_id);
         let Some(task) = self.state.read(cx).request(method::LIST, json!({ "threadId": thread_id }), ListResult::decode) else { return };
         self.listing = Some(cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
             let _ = this.update(cx, |this, cx| match result {
                 Ok(list) => {
-                    let thread = this.threads.entry(thread_id.clone()).or_default();
-                    let previous = thread.clone();
-                    if thread.reconcile(&list) {
-                        this.follow(&thread_id, &previous, cx);
-                    } else if thread.list_loaded {
-                        // Unchanged since the events this client applied, but its panel may not be.
-                        this.sync_panel(&thread_id, &[], cx);
-                    } else {
+                    let (changed, relist, edit) = this.threads.listed(&thread_id, &list);
+                    if changed {
+                        this.changed(&thread_id, cx);
+                    }
+                    this.apply_edit(Some(&thread_id), edit, cx);
+                    if relist {
                         // An event overtook the list; ask again before trusting it for tab cleanup.
                         cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.list_selected(cx))).detach();
                     }
@@ -388,61 +376,29 @@ impl Previews {
         }));
     }
 
-    /// A thread's sessions changed: its browser tabs follow, forced reveals and popups come to
-    /// the front, and loaded pages name their history entries.
-    fn follow(&mut self, thread_id: &str, previous: &ThreadPreviews, cx: &mut Context<Self>) {
+    /// A thread's sessions changed: views follow, and loaded pages name their history entries.
+    fn changed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         cx.emit(PreviewsEvent::Thread(thread_id.to_owned()));
-        let Some(next) = self.threads.get(thread_id) else { return };
-        let project = self.state.read(cx).thread_shell(thread_id).map(|thread| thread.project_id.clone());
-        if let Some(project) = project {
-            let mut titled = false;
-            for session in &next.sessions {
-                if let NavStatus::Success { url, title } = &session.nav_status {
-                    titled |= self.history.set_title(&project, url, title);
-                }
-            }
-            if titled {
-                self.save_history();
+        let project = self.project_of(thread_id, cx);
+        let (Some(project), Some(thread)) = (project, self.threads.thread(thread_id)) else { return };
+        let mut titled = false;
+        for session in &thread.sessions {
+            if let NavStatus::Success { url, title } = &session.nav_status {
+                titled |= self.history.set_title(&project, url, title);
             }
         }
-        if self.state.read(cx).selected_thread.as_deref() != Some(thread_id) {
-            return;
+        if titled {
+            self.save_history();
         }
-        let mut fronted: Vec<String> = next
-            .freshly_revealed(previous)
-            .into_iter()
-            .filter(|session| session.reveal_request.as_ref().is_some_and(|request| request.force))
-            .map(|session| session.tab_id.clone())
-            .collect();
-        if let Some((_, tab)) = self.pending_popup.take_if(|(thread, tab)| thread == thread_id && next.session(tab).is_some()) {
-            fronted.push(tab);
-        }
-        self.sync_panel(thread_id, &fronted, cx);
     }
 
-    /// The selected thread's browser tabs follow its sessions; `fronted` tabs come to the front.
-    /// Also run when a thread comes back into view, since a background thread's sessions change
-    /// without touching its panel.
-    fn sync_panel(&mut self, thread_id: &str, fronted: &[String], cx: &mut Context<Self>) {
+    /// Applies the shown thread's tab edit to its panel.
+    fn apply_edit(&mut self, thread_id: Option<&str>, edit: Option<TabsEdit>, cx: &mut Context<Self>) {
+        let (Some(thread_id), Some(edit)) = (thread_id, edit) else { return };
         if self.state.read(cx).selected_thread.as_deref() != Some(thread_id) {
             return;
         }
-        let tabs = self.threads.get(thread_id).and_then(ThreadPreviews::panel_tabs);
-        if tabs.is_none() && fronted.is_empty() {
-            return;
-        }
-        self.state.update(cx, |state, cx| {
-            state.mutate_panels(cx, |panels, thread| {
-                let mut changed = false;
-                if let Some((tabs, hidden)) = &tabs {
-                    changed |= panels.panels.reconcile_browser_surfaces(thread, tabs, hidden);
-                }
-                for tab in fronted {
-                    changed |= panels.panels.open_browser(thread, Some(tab));
-                }
-                changed
-            });
-        });
+        self.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| edit.apply(&mut panels.panels, thread)));
     }
 
     /// A browser tab the user closed (a tab whose session still lives) closes its session.
@@ -455,7 +411,7 @@ impl Previews {
             return;
         }
         for tab in before.into_iter().filter(|tab| !now.contains(tab)) {
-            let live = self.threads.get(&thread_id).is_none_or(|thread| !thread.list_loaded || thread.session(&tab).is_some());
+            let live = self.threads.thread(&thread_id).is_none_or(|thread| !thread.list_loaded || thread.session(&tab).is_some());
             if live {
                 self.close_session(&thread_id, &tab, cx);
             }
@@ -477,15 +433,13 @@ impl Previews {
             let _ = this.update(cx, |this, cx| match result {
                 Ok(snapshot) => {
                     let tab = snapshot.tab_id.clone();
-                    let thread = this.threads.entry(thread_id.clone()).or_default();
+                    let thread = this.threads.thread_mut(&thread_id);
                     if let Some(url) = &url {
                         thread.remember_url(snapshot.nav_status.url().unwrap_or(url));
                     }
                     thread.apply_snapshot(snapshot);
                     cx.emit(PreviewsEvent::Thread(thread_id.clone()));
-                    if this.state.read(cx).selected_thread.as_deref() == Some(thread_id.as_str()) {
-                        this.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some(&tab))));
-                    }
+                    this.apply_edit(Some(&thread_id), Some(TabsEdit { tabs: None, fronted: vec![tab] }), cx);
                 }
                 Err(error) => this.toast("Unable to open browser", error, cx),
             });
@@ -496,19 +450,19 @@ impl Previews {
     /// `closePreviewSession`: hidden at once, back if the server refuses.
     pub fn close_session(&mut self, thread_id: &str, tab_id: &str, cx: &mut Context<Self>) {
         let snapshot = self.session(thread_id, tab_id).cloned();
-        if let Some(thread) = self.threads.get_mut(thread_id) {
-            thread.begin_close(tab_id);
-        }
+        self.threads.thread_mut(thread_id).begin_close(tab_id);
         cx.emit(PreviewsEvent::Thread(thread_id.to_owned()));
         let task = self.state.read(cx).rpc(method::CLOSE, json!({ "threadId": thread_id, "tabId": tab_id }));
         let (thread_id, tab_id) = (thread_id.to_owned(), tab_id.to_owned());
         cx.spawn(async move |this, cx| {
             let Err(error) = task.await else { return };
             let _ = this.update(cx, |this, cx| {
-                let Some(thread) = this.threads.get_mut(&thread_id) else { return };
-                let previous = thread.clone();
+                let thread = this.threads.thread_mut(&thread_id);
+                let before = thread.clone();
                 if thread.cancel_close(snapshot, &tab_id) {
-                    this.follow(&thread_id, &previous, cx);
+                    this.changed(&thread_id, cx);
+                    let edit = this.threads.changed(&thread_id, &before);
+                    this.apply_edit(Some(&thread_id), edit, cx);
                 }
                 this.toast("Unable to close the browser tab", error.to_string(), cx);
             });
@@ -528,7 +482,7 @@ impl Previews {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
             let _ = this.update(cx, |this, cx| match result {
                 Ok(snapshot) => {
-                    if this.threads.entry(thread_id.clone()).or_default().update_snapshot(snapshot) {
+                    if this.threads.thread_mut(&thread_id).update_snapshot(snapshot) {
                         cx.emit(PreviewsEvent::Thread(thread_id));
                     }
                 }
@@ -540,18 +494,13 @@ impl Previews {
 
     /// The page opened a popup; it gets a tab once its session is known.
     pub fn popup(&mut self, thread_id: &str, tab_id: &str, cx: &mut Context<Self>) {
-        if self.session(thread_id, tab_id).is_some() {
-            self.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some(tab_id))));
-        } else {
-            self.pending_popup = Some((thread_id.to_owned(), tab_id.to_owned()));
-        }
+        let edit = self.threads.popup(thread_id, tab_id);
+        self.apply_edit(Some(thread_id), edit, cx);
     }
 
     /// `setActivePreviewTab`: the tab `preview.toggle` brings back.
     pub fn set_active(&mut self, thread_id: &str, tab_id: &str) {
-        if let Some(thread) = self.threads.get_mut(thread_id) {
-            thread.set_active(tab_id);
-        }
+        self.threads.thread_mut(thread_id).set_active(tab_id);
     }
 
     fn project_of(&self, thread_id: &str, cx: &App) -> Option<String> {
@@ -565,7 +514,7 @@ impl Previews {
 
     /// `rememberPreviewUrl` and `recordVisitForThread`.
     pub fn record_visit(&mut self, thread_id: &str, url: &str, cx: &mut Context<Self>) {
-        self.threads.entry(thread_id.to_owned()).or_default().remember_url(url);
+        self.threads.thread_mut(thread_id).remember_url(url);
         if let Some(project) = self.project_of(thread_id, cx)
             && self.history.record(&project, url, now_ms())
         {

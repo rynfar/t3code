@@ -186,3 +186,36 @@ impl SessionSnapshot {
         })
     }
 }
+
+#[test]
+fn a_thread_shown_again_catches_its_tabs_up_with_changes_made_while_hidden() {
+    let mut panels = crate::right_panel::RightPanels::default();
+    let mut threads = PreviewThreads::default();
+    let follow = |panels: &mut crate::right_panel::RightPanels, edit: Option<TabsEdit>| {
+        if let Some(edit) = edit {
+            edit.apply(panels, "thread-1");
+        }
+    };
+    let browser_tabs = |panels: &crate::right_panel::RightPanels| -> Vec<String> {
+        panels.panel("thread-1").surfaces.iter().filter_map(|surface| surface.preview_tab().map(str::to_owned)).collect()
+    };
+    follow(&mut panels, threads.show(Some("thread-1")));
+    let (_, relist, edit) = threads.listed("thread-1", &list(1, vec![snapshot("a", Some("https://example.com/"), "1")]));
+    assert!(!relist);
+    follow(&mut panels, edit);
+    assert_eq!(browser_tabs(&panels), ["a"]);
+    // Another thread comes into view; another client closes `a` meanwhile.
+    assert_eq!(threads.show(Some("thread-2")), None);
+    let applied = threads.apply([event("closed", "a", 2, json!({}))]);
+    assert_eq!((applied.changed, applied.edit), (vec!["thread-1".to_owned()], None));
+    assert_eq!(browser_tabs(&panels), ["a"]);
+    // Back on thread-1 the dead tab goes, before any list answers.
+    follow(&mut panels, threads.show(Some("thread-1")));
+    assert!(browser_tabs(&panels).is_empty());
+    // A list that changes nothing still brings lagging tabs in line.
+    panels.open_browser("thread-1", Some("a"));
+    let (changed, _, edit) = threads.listed("thread-1", &list(2, vec![]));
+    assert!(!changed);
+    follow(&mut panels, edit);
+    assert!(browser_tabs(&panels).is_empty());
+}
