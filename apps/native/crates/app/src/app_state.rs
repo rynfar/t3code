@@ -61,6 +61,8 @@ pub struct AppState {
     /// The project of the new-thread draft, while the user composes a thread that does not exist.
     pub draft_project: Option<String>,
     pub panels: crate::right_panel::PanelState,
+    /// The pull requests page replaces the thread area while open (`/pull-requests`).
+    pub pull_requests_open: bool,
     restore_thread: Option<String>,
     /// Rows the shell leaves to on-demand reads: older settled pages and thread families.
     pub(crate) omitted: crate::omitted_rows::OmittedRows,
@@ -91,6 +93,7 @@ impl AppState {
             client_settings: ClientSettings::from_json(&store::load_client_settings().unwrap_or_default()),
             draft_project: None,
             panels: crate::right_panel::PanelState::load(),
+            pull_requests_open: false,
             restore_thread: store::load_last_thread(),
             omitted: Default::default(),
             notifications: Default::default(),
@@ -260,8 +263,9 @@ impl AppState {
 
     pub fn select_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.selected_thread.as_deref() == Some(thread_id) {
-            return;
+            return self.set_pull_requests_open(false, cx);
         }
+        self.pull_requests_open = false;
         self.draft_project = None;
         if let (Some(client), Some(previous)) = (&self.client, &self.selected_thread) {
             client.close_thread(previous);
@@ -345,8 +349,9 @@ impl AppState {
     /// Opens the new-thread draft for `project_id`, leaving the open thread.
     pub fn start_draft(&mut self, project_id: &str, cx: &mut Context<Self>) {
         if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
-            return;
+            return self.set_pull_requests_open(false, cx);
         }
+        self.pull_requests_open = false;
         if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&previous);
         }

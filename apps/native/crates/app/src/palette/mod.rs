@@ -102,6 +102,12 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
         items.push(action("action:pin", pin, &["pin"], Some("thread.pin")));
         items.push(action("action:settle", settle, &["archive", "done"], Some("thread.settle")));
         items.push(action("action:copy-thread", "Copy thread reference", &["link", "copy"], Some("thread.copyReference")));
+        items.push(action("action:link-pull-request", "Link pull request to thread", &["link", "pull request", "pr", "attach", "stack"], None));
+        let linked = state.thread_shell(&thread.id).is_some_and(|shell| !t3_core::pull_requests::link::visible_links(&shell.pull_requests).is_empty());
+        items.push(CommandPaletteItem { disabled: !linked, ..action("action:open-thread-pull-requests", "Show linked pull requests", &["pull requests", "linked", "stack", "prs"], None) });
+    }
+    if state.server_config.config.is_some() {
+        items.push(action("action:pull-requests", "Open pull requests", &["pull requests", "prs", "pr", "github", "review", "merge", "branch"], None));
     }
     items.push(action("action:previous-thread", "Previous thread", &["navigate"], Some("thread.previous")));
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
@@ -394,6 +400,9 @@ impl CommandPalette {
                 "copy-thread" => keymap::action_for("thread.copyReference"),
                 "previous-thread" => keymap::action_for("thread.previous"),
                 "next-thread" => keymap::action_for("thread.next"),
+                "link-pull-request" => Box::new(crate::pull_requests::LinkPullRequest),
+                "open-thread-pull-requests" => Box::new(crate::pull_requests::ShowLinkedPullRequests),
+                "pull-requests" => Box::new(crate::pull_requests::OpenPullRequests),
                 "settings" => {
                     crate::settings::open(t3_core::settings::search::Section::General, cx);
                     return;

@@ -108,6 +108,14 @@ impl AppState {
         self.mutate_panels(cx, |state, thread| state.panels.toggle(thread, Surface::diff()));
     }
 
+    /// The "Linked pull requests" launcher entry and "Show linked pull requests".
+    pub fn add_pull_requests_surface(&mut self, cx: &mut Context<Self>) {
+        self.mutate_panels(cx, |state, thread| {
+            state.panels.open(thread, Surface::pull_requests());
+            true
+        });
+    }
+
     /// The "Diff" launcher entry: always opens on the branch scope (`addDiffSurface`).
     pub fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.panel_thread() else { return };

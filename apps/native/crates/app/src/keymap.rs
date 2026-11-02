@@ -72,6 +72,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "rightPanel.close" => Box::new(crate::right_panel::CloseActiveSurface),
         "view.reopenClosed" => Box::new(crate::right_panel::ReopenClosedView),
         "diff.toggle" => Box::new(crate::right_panel::ToggleDiff),
+        "pullRequest.copyNumber" => Box::new(crate::pull_requests::CopyPullRequestNumber),
         "terminal.toggle" => Box::new(crate::terminal::ToggleTerminal),
         "terminal.split" => Box::new(crate::terminal::SplitTerminal),
         "terminal.splitVertical" => Box::new(crate::terminal::SplitTerminalVertical),
