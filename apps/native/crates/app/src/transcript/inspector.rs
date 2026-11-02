@@ -59,6 +59,8 @@ const INLINE_BUDGET: usize = 16 * 1024;
 const HIGHLIGHT_BUDGET: usize = 64 * 1024;
 /// Derived items kept, most recently drawn first.
 const CACHE_LIMIT: usize = 32;
+/// Background derives at once; more wait their turn, most recently asked-for first.
+const RUNNING_LIMIT: usize = 4;
 
 #[derive(IntoElement)]
 pub struct ItemInspector {
@@ -238,39 +240,77 @@ impl Key {
 
     /// Whether the item is small enough to derive during render.
     fn inline(&self) -> bool {
-        let fetched = match &self.fetch {
-            Fetch::Loaded(item) => item_bytes(item),
-            _ => 0,
-        };
-        item_bytes(&self.item) + fetched <= INLINE_BUDGET
+        let mut budget = Budget(INLINE_BUDGET);
+        budget.item(&self.item)
+            && match &self.fetch {
+                Fetch::Loaded(item) => budget.item(item),
+                _ => true,
+            }
     }
 }
 
-/// About how much text an item carries, without formatting any of it.
-fn item_bytes(item: &TurnItem) -> usize {
-    let text = |text: &Option<String>| text.as_deref().map_or(0, str::len);
-    let values = |values: &Option<Vec<Value>>| values.iter().flatten().map(value_bytes).sum::<usize>();
-    match &item.kind {
-        TurnItemKind::CommandExecution { input, output, .. } => input.len() + text(output),
-        TurnItemKind::DynamicTool { input, output, .. } => value_bytes(input) + output.as_ref().map_or(0, value_bytes),
-        TurnItemKind::FileChange { diff_str, changes, .. } => text(diff_str) + changes.as_ref().map_or(0, |changes| changes.len() * 64),
-        TurnItemKind::FileSearch { results, .. } | TurnItemKind::WebSearch { results, .. } => values(results),
-        TurnItemKind::ApprovalRequest { prompt, .. } => text(prompt),
-        TurnItemKind::UserInputRequest { questions, .. } => questions.iter().map(value_bytes).sum(),
-        TurnItemKind::Notification { detail, .. } => text(detail),
-        TurnItemKind::SystemNotice { message } => message.len(),
-        TurnItemKind::Error { failure, .. } => failure.message.len(),
-        TurnItemKind::TodoList { steps, .. } => steps.iter().map(|step| step.text.len()).sum(),
-        _ => 0,
-    }
-}
+/// Bytes left before an item is too large to derive during render. Every string the inspector
+/// draws spends it, and a walk stops as soon as it runs out.
+struct Budget(usize);
 
-fn value_bytes(value: &Value) -> usize {
-    match value {
-        Value::String(text) => text.len(),
-        Value::Array(items) => items.iter().map(|item| value_bytes(item) + 1).sum(),
-        Value::Object(object) => object.iter().map(|(key, item)| key.len() + value_bytes(item)).sum(),
-        _ => 8,
+impl Budget {
+    fn spend(&mut self, bytes: usize) -> bool {
+        match self.0.checked_sub(bytes) {
+            Some(left) => {
+                self.0 = left;
+                true
+            }
+            None => {
+                self.0 = 0;
+                false
+            }
+        }
+    }
+
+    fn text(&mut self, text: Option<&str>) -> bool {
+        self.spend(text.map_or(0, str::len))
+    }
+
+    fn value(&mut self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => self.spend(text.len()),
+            Value::Array(items) => items.iter().all(|item| self.spend(1) && self.value(item)),
+            Value::Object(object) => object.iter().all(|(key, item)| self.spend(key.len()) && self.value(item)),
+            _ => self.spend(8),
+        }
+    }
+
+    fn values(&mut self, values: Option<&Vec<Value>>) -> bool {
+        values.into_iter().flatten().all(|value| self.value(value))
+    }
+
+    /// Spends the item's text; `false` once the budget runs out.
+    fn item(&mut self, item: &TurnItem) -> bool {
+        match &item.kind {
+            TurnItemKind::CommandExecution { input, output, .. } => self.spend(input.len()) && self.text(output.as_deref()),
+            TurnItemKind::DynamicTool { tool_name, input, output, .. } => {
+                self.text(tool_name.as_deref()) && self.value(input) && output.as_ref().is_none_or(|output| self.value(output))
+            }
+            TurnItemKind::FileChange { file_name, diff_str, changes, .. } => {
+                self.spend(file_name.len())
+                    && self.text(diff_str.as_deref())
+                    && changes.iter().flatten().all(|change| {
+                        let parts = [Some(change.operation.as_str()), Some(change.path.as_str()), change.old_path.as_deref(), change.file_type.as_deref(), change.mime_type.as_deref()];
+                        parts.into_iter().all(|part| self.text(part))
+                    })
+            }
+            TurnItemKind::FileSearch { pattern, results } => self.text(pattern.as_deref()) && self.values(results.as_ref()),
+            TurnItemKind::WebSearch { patterns, results } => {
+                patterns.iter().flatten().all(|pattern| self.spend(pattern.len() + 1)) && self.values(results.as_ref())
+            }
+            TurnItemKind::ApprovalRequest { prompt, .. } => self.text(prompt.as_deref()),
+            TurnItemKind::UserInputRequest { questions, .. } => questions.iter().all(|question| self.value(question)),
+            TurnItemKind::Notification { detail, .. } => self.text(detail.as_deref()),
+            TurnItemKind::SystemNotice { message } => self.spend(message.len()),
+            TurnItemKind::Error { failure, .. } => self.spend(failure.message.len()),
+            TurnItemKind::TodoList { steps, .. } => steps.iter().all(|step| self.spend(step.text.len() + 2)),
+            _ => true,
+        }
     }
 }
 
@@ -279,7 +319,9 @@ struct Prepared {
 }
 
 enum Slot {
-    Pending { waiters: Vec<EntityId>, _task: Task<()> },
+    /// Waiting for a background derive to free up.
+    Queued { waiters: Vec<EntityId> },
+    Running { waiters: Vec<EntityId>, _task: Task<()> },
     Ready(Rc<Prepared>),
 }
 
@@ -289,7 +331,8 @@ struct Entry {
     slot: Slot,
 }
 
-/// Derived inspectors, kept while rows scroll in and out, at most `CACHE_LIMIT` of them.
+/// Derived inspectors, kept while rows scroll in and out: at most `CACHE_LIMIT` entries, of
+/// which at most `RUNNING_LIMIT` derive at once.
 #[derive(Default)]
 pub struct PreparedCache {
     entries: Vec<Entry>,
@@ -310,8 +353,8 @@ fn cache(cx: &mut App) -> Entity<PreparedCache> {
 }
 
 impl PreparedCache {
-    /// The derived blocks for `key`; `None` while a background derive runs, after which `owner`
-    /// is notified.
+    /// The derived blocks for `key`; `None` while a background derive is due, after which
+    /// `owner` is notified.
     fn get(&mut self, key: Key, owner: EntityId, cx: &mut Context<Self>) -> Option<Rc<Prepared>> {
         self.tick += 1;
         let tick = self.tick;
@@ -319,7 +362,7 @@ impl PreparedCache {
             entry.used = tick;
             return match &mut entry.slot {
                 Slot::Ready(prepared) => Some(prepared.clone()),
-                Slot::Pending { waiters, .. } => {
+                Slot::Queued { waiters } | Slot::Running { waiters, .. } => {
                     if !waiters.contains(&owner) {
                         waiters.push(owner);
                     }
@@ -329,41 +372,76 @@ impl PreparedCache {
         }
         if key.inline() {
             let prepared = Rc::new(Prepared { blocks: key.derive() });
-            self.insert(key, Slot::Ready(prepared.clone()));
+            self.entries.push(Entry { key, used: tick, slot: Slot::Ready(prepared.clone()) });
+            self.trim();
             return Some(prepared);
         }
-        let input = key.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let derived = cx.background_executor().spawn(async move {
-                let blocks = input.derive();
-                (input, blocks)
-            });
-            let derived = derived.await;
-            let _ = this.update(cx, |cache, cx| cache.finish(derived, cx));
-        });
-        self.insert(key, Slot::Pending { waiters: vec![owner], _task: task });
+        self.entries.push(Entry { key, used: tick, slot: Slot::Queued { waiters: vec![owner] } });
+        self.trim();
+        self.start_queued(cx);
         None
     }
 
-    /// Lands a background derive and wakes the views waiting for it.
-    fn finish(&mut self, (key, blocks): (Key, Vec<Block>), cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key)) else { return };
-        let waiters = match std::mem::replace(&mut entry.slot, Slot::Ready(Rc::new(Prepared { blocks }))) {
-            Slot::Pending { waiters, .. } => waiters,
-            Slot::Ready(_) => Vec::new(),
-        };
-        let app: &mut App = cx;
-        for owner in waiters {
-            app.notify(owner);
+    /// Starts queued derives while fewer than `RUNNING_LIMIT` run.
+    fn start_queued(&mut self, cx: &mut Context<Self>) {
+        while let Some(index) = self.next_to_start() {
+            let entry = &mut self.entries[index];
+            let input = entry.key.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let derived = cx.background_executor().spawn(async move {
+                    let blocks = input.derive();
+                    (input, blocks)
+                });
+                let derived = derived.await;
+                let _ = this.update(cx, |cache, cx| cache.finish(derived, cx));
+            });
+            let waiters = match &mut entry.slot {
+                Slot::Queued { waiters } => std::mem::take(waiters),
+                _ => Vec::new(),
+            };
+            entry.slot = Slot::Running { waiters, _task: task };
         }
     }
 
-    fn insert(&mut self, key: Key, slot: Slot) {
-        self.entries.push(Entry { key, used: self.tick, slot });
+    /// The most recently asked-for queued entry, when a derive is free.
+    fn next_to_start(&self) -> Option<usize> {
+        let running = self.entries.iter().filter(|entry| matches!(entry.slot, Slot::Running { .. })).count();
+        if running >= RUNNING_LIMIT {
+            return None;
+        }
+        self.entries.iter().enumerate().filter(|(_, entry)| matches!(entry.slot, Slot::Queued { .. })).max_by_key(|(_, entry)| entry.used).map(|(index, _)| index)
+    }
+
+    /// Lands a background derive, wakes the views waiting for it, and starts the next one.
+    fn finish(&mut self, (key, blocks): (Key, Vec<Block>), cx: &mut Context<Self>) {
+        let mut waiters = Vec::new();
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key.same(&key))
+            && let Slot::Running { waiters: waiting, .. } = std::mem::replace(&mut entry.slot, Slot::Ready(Rc::new(Prepared { blocks })))
+        {
+            waiters = waiting;
+        }
+        self.trim();
+        self.start_queued(cx);
+        let app: &mut App = cx;
+        for view in waiters {
+            app.notify(view);
+        }
+    }
+
+    /// Drops the least recently asked-for entries past `CACHE_LIMIT`: ready ones first, then
+    /// queued ones. Running ones stay, and there are never more than `RUNNING_LIMIT`.
+    fn trim(&mut self) {
         while self.entries.len() > CACHE_LIMIT {
-            let oldest = self.entries.iter().enumerate().filter(|(_, entry)| matches!(entry.slot, Slot::Ready(_))).min_by_key(|(_, entry)| entry.used).map(|(index, _)| index);
-            let Some(oldest) = oldest else { break };
-            self.entries.swap_remove(oldest);
+            let oldest = |queued: bool| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| if queued { matches!(entry.slot, Slot::Queued { .. }) } else { matches!(entry.slot, Slot::Ready(_)) })
+                    .min_by_key(|(_, entry)| entry.used)
+                    .map(|(index, _)| index)
+            };
+            let Some(index) = oldest(false).or_else(|| oldest(true)) else { return };
+            self.entries.swap_remove(index);
         }
     }
 }
@@ -741,6 +819,66 @@ mod tests {
         assert!(!key(tool(&"x".repeat(INLINE_BUDGET)), Fetch::None).inline());
         let fetched = Fetch::Loaded(tool(&"x".repeat(INLINE_BUDGET)));
         assert!(!key(tool(""), fetched).inline(), "the fetched output counts too");
+    }
+
+    fn search(body: serde_json::Value) -> Arc<TurnItem> {
+        let mut item = serde_json::json!({
+            "id": "search", "threadId": "thread", "runId": null, "nodeId": null, "parentItemId": null, "ordinal": 1, "status": "completed",
+            "title": null, "startedAt": null, "completedAt": null, "updatedAt": "2026-10-01T00:00:00Z",
+        });
+        item.as_object_mut().expect("object").extend(body.as_object().expect("object").clone());
+        Arc::new(serde_json::from_value(item).expect("item decodes"))
+    }
+
+    #[test]
+    fn every_drawn_string_counts_toward_the_inline_budget() {
+        let big = "x".repeat(INLINE_BUDGET + 1);
+        assert!(!key(search(serde_json::json!({ "type": "file_search", "pattern": big })), Fetch::None).inline(), "a file search's pattern");
+        assert!(!key(search(serde_json::json!({ "type": "web_search", "patterns": [big] })), Fetch::None).inline(), "a web search's queries");
+        let halves = ["y".repeat(INLINE_BUDGET / 2), "z".repeat(INLINE_BUDGET / 2)];
+        assert!(!key(search(serde_json::json!({ "type": "web_search", "patterns": halves })), Fetch::None).inline(), "queries add up");
+        assert!(key(search(serde_json::json!({ "type": "file_search", "pattern": "fn main" })), Fetch::None).inline());
+    }
+
+    fn entry(slot: Slot, used: u64) -> Entry {
+        Entry { key: key(tool("x"), Fetch::None), used, slot }
+    }
+
+    fn running() -> Slot {
+        Slot::Running { waiters: Vec::new(), _task: Task::ready(()) }
+    }
+
+    fn queued() -> Slot {
+        Slot::Queued { waiters: Vec::new() }
+    }
+
+    #[test]
+    fn the_cache_stays_bounded_while_derives_wait() {
+        let mut cache = PreparedCache::default();
+        cache.entries.extend((0..RUNNING_LIMIT as u64).map(|used| entry(running(), used)));
+        cache.entries.extend((0..CACHE_LIMIT as u64 * 2).map(|used| entry(queued(), 100 + used)));
+        cache.trim();
+        assert_eq!(cache.entries.len(), CACHE_LIMIT);
+        assert_eq!(cache.entries.iter().filter(|entry| matches!(entry.slot, Slot::Running { .. })).count(), RUNNING_LIMIT, "running derives stay");
+        assert!(cache.entries.iter().all(|entry| matches!(entry.slot, Slot::Running { .. }) || entry.used >= 100 + CACHE_LIMIT as u64 + RUNNING_LIMIT as u64), "the oldest queued ones go");
+
+        let mut cache = PreparedCache::default();
+        cache.entries.push(entry(queued(), 50));
+        cache.entries.extend((0..CACHE_LIMIT as u64).map(|used| entry(Slot::Ready(Rc::new(Prepared { blocks: Vec::new() })), used)));
+        cache.trim();
+        assert_eq!(cache.entries.len(), CACHE_LIMIT);
+        assert!(cache.entries.iter().any(|entry| matches!(entry.slot, Slot::Queued { .. })), "ready entries go before waiting ones");
+    }
+
+    #[test]
+    fn only_a_few_derives_run_at_once_newest_first() {
+        let mut cache = PreparedCache::default();
+        cache.entries.extend((0..RUNNING_LIMIT as u64).map(|used| entry(running(), used)));
+        cache.entries.push(entry(queued(), 10));
+        cache.entries.push(entry(queued(), 20));
+        assert_eq!(cache.next_to_start(), None, "every derive is busy");
+        cache.entries.remove(0);
+        assert_eq!(cache.next_to_start().map(|index| cache.entries[index].used), Some(20), "the most recently asked-for one starts next");
     }
 
     #[test]
