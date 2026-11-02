@@ -29,7 +29,7 @@ struct Inputs {
     project_root: String,
     scripts: Vec<Value>,
     no_runs_yet: bool,
-    lineage: Vec<sections::LineageRow>,
+    lineage: crate::lineage::Relationships,
 }
 
 fn inputs(state: &AppState) -> Option<Inputs> {
@@ -42,7 +42,7 @@ fn inputs(state: &AppState) -> Option<Inputs> {
         project_root: project.workspace_root.clone(),
         scripts: project.scripts.clone(),
         no_runs_yet: thread.latest_run_id.is_none(),
-        lineage: sections::lineage_rows(state, thread),
+        lineage: crate::lineage::relationships(state, thread),
     })
 }
 
@@ -72,7 +72,8 @@ impl DetailsView {
                     this.inputs = inputs(state.read(cx));
                     cx.notify();
                 }
-                AppEvent::Shell => {
+                // Lineage reads the open thread's subagents and runs as well as the shell.
+                AppEvent::Shell | AppEvent::Thread => {
                     let next = inputs(state.read(cx));
                     if next != this.inputs {
                         this.inputs = next;
@@ -144,10 +145,12 @@ impl Render for DetailsView {
             this.lineage_shown += sections::LINEAGE_PAGE;
             cx.notify();
         });
-        let lineage = sections::lineage(&ctx, lineage_shown, workspace.is_some() || version_control.is_some(), more, cx);
-        let empty = workspace.is_none() && version_control.is_none() && lineage.is_none();
+        let relationships = self.inputs.as_ref().map(|inputs| inputs.lineage.clone()).unwrap_or_default();
+        let lineage = sections::lineage(&ctx, &relationships, lineage_shown, workspace.is_some() || version_control.is_some(), more, cx);
+        let side_chats = sections::side_chats(&ctx, &relationships, workspace.is_some() || version_control.is_some() || lineage.is_some(), cx);
+        let empty = workspace.is_none() && version_control.is_none() && lineage.is_none() && side_chats.is_none();
         let details = self.details.clone();
-        let content = v_flex().w_full().children(workspace).children(version_control).children(lineage).when(empty, |this| {
+        let content = v_flex().w_full().children(workspace).children(version_control).children(lineage).children(side_chats).when(empty, |this| {
             // Only when no section has content, so an emptied card can be refilled.
             this.child(div().p(px(8.)).child(Row::new("details-choose", "Choose what to show").icon(Icon::SlidersHorizontal).opens_menu().dropdown_menu(move |menu, _, cx| items_menu(menu, &details, cx))))
         });

@@ -355,3 +355,25 @@ fn effort_reads_the_reported_selection_first_and_variant_falls_back_to_its_defau
     assert_eq!(effort_label(&selection(json!([])), Some(&model), None), None, "an unstated effort is not shown");
     assert_eq!(effort_label(&chosen, None, None), None);
 }
+
+#[test]
+fn labels_and_stop_rules_follow_the_relationships_panel() {
+    let edge = |source: &str, target: &str, kind| RelationshipEdge { source: source.into(), target: target.into(), kind, status: None };
+    assert_eq!(relationship_label(&edge("me", "kid", RelationshipKind::Subagent), "me", false), "Subagent");
+    assert_eq!(relationship_label(&edge("dad", "me", RelationshipKind::Subagent), "me", false), "Parent agent");
+    assert_eq!(relationship_label(&edge("me", "f", RelationshipKind::Fork), "me", true), "Side chat");
+    assert_eq!(relationship_label(&edge("src", "me", RelationshipKind::Fork), "me", false), "Parent thread");
+    assert_eq!(relationship_label(&edge("me", "t", RelationshipKind::Transfer), "me", false), "Context transfer");
+    assert_eq!(relationship_status_label(Some("interrupted")), "Stopped");
+    assert_eq!(relationship_status_label(None), "Unknown");
+
+    let agent = |extra: Value| decode_agents(vec![subagent("a", Some("r1"), "running", T, extra)]).remove(0);
+    assert!(agent(json!({"origin": "app_owned"})).can_stop());
+    assert!(!agent(json!({"origin": "app_owned", "startedAt": null})).can_stop(), "not started yet");
+    let strong = json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}});
+    assert!(agent(strong.clone()).can_stop());
+    assert!(!agent(json!({"origin": "provider_native", "driver": "codex", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}})).can_stop());
+    assert!(!agent(json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "weak", "nativeId": "x"}})).can_stop());
+    assert!(agent(merge(strong.clone(), json!({"workflow": {"phases": [], "agents": []}}))).can_stop_workflow());
+    assert!(!agent(strong).can_stop_workflow());
+}

@@ -3,6 +3,7 @@
 //! which cannot take messages, `ProviderSubagentBar.tsx` with `NativeChildWorkDialog.tsx`.
 
 mod child_work;
+mod relationships;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -23,6 +24,8 @@ use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
+
+pub use relationships::{LineageRow, MergeBack, Relationships, StopAction, relationships};
 
 /// One child approval: the child thread, its title, and what it asks.
 #[derive(Debug, Clone, PartialEq)]
@@ -320,12 +323,12 @@ impl Render for ComposerLineage {
             .w_full()
             .flex()
             .justify_center()
-            .px(px(48.))
+            .px(crate::theme::rem(48.))
             .when(has_bar, |this| this.pb(px(16.)).pt(px(8.)))
             .child(
                 v_flex()
                     .w_full()
-                    .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(px(width)))
+                    .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
                     .when(has_approvals, |this| {
                         this.child(v_flex().id("child-thread-approvals").max_h(px(320.)).overflow_y_scroll().gap(px(8.)).mb(px(8.)).children(approvals))
                     })

@@ -25,6 +25,8 @@ pub struct Subagent {
     #[serde(default)]
     pub remote_child: Option<Value>,
     #[serde(default)]
+    pub native_task_ref: Option<Value>,
+    #[serde(default)]
     pub prompt: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -447,4 +449,23 @@ pub fn reported_model_selection(projection: &ThreadProjection) -> Option<crate::
         })
         .and_then(|provider_thread| provider_thread.pointer("/nativeMetadata/modelSelection"))
         .and_then(|selection| serde_json::from_value(selection.clone()).ok())
+}
+
+impl Subagent {
+    /// `canStop` in `ThreadRelationshipsControl.tsx`: app-owned tasks, and Claude's native tasks
+    /// with a strong reference, once started and while they work.
+    pub fn can_stop(&self) -> bool {
+        let live = is_active_status(&self.status);
+        let strong = self.native_task_ref.as_ref().is_some_and(|reference| {
+            reference.get("strength").and_then(Value::as_str) == Some("strong") && reference.get("nativeId").is_some_and(|id| !id.is_null())
+        });
+        let stoppable = self.origin.as_deref() == Some("app_owned")
+            || (self.origin.as_deref() == Some("provider_native") && self.driver.as_deref() == Some("claudeAgent") && self.run_id.is_some() && strong && live);
+        stoppable && self.started_at.is_some() && live
+    }
+
+    /// `canStopWorkflow`: a running Claude workflow coordinator.
+    pub fn can_stop_workflow(&self) -> bool {
+        self.workflow.is_some() && self.status == "running" && self.origin.as_deref() == Some("provider_native") && self.driver.as_deref() == Some("claudeAgent")
+    }
 }

@@ -239,6 +239,39 @@ pub fn order_rows(graph: &RelationshipGraph, mut rows: Vec<RelationshipRow>, cur
     rows
 }
 
+/// `relationshipLabel`, with side chats named as such.
+pub fn relationship_label(edge: &RelationshipEdge, current: &str, side_chat: bool) -> &'static str {
+    let outgoing = edge.source == current;
+    match edge.kind {
+        _ if side_chat && outgoing => "Side chat",
+        RelationshipKind::Transfer => "Context transfer",
+        RelationshipKind::Subagent if outgoing => "Subagent",
+        RelationshipKind::Subagent => "Parent agent",
+        _ if outgoing => "Fork",
+        _ => "Parent thread",
+    }
+}
+
+/// `threadRelationshipStatusLabel`.
+pub fn relationship_status_label(status: Option<&str>) -> &'static str {
+    match status.unwrap_or("") {
+        "preparing" | "starting" => "Starting",
+        "running" | "in_progress" => "Running",
+        "pending" | "queued" => "Queued",
+        "waiting" | "blocked" => "Waiting",
+        "completed" => "Done",
+        "failed" | "error" => "Failed",
+        "cancelled" | "interrupted" => "Stopped",
+        "rolled_back" => "Reverted",
+        "resolved_native" => "Resolved (native)",
+        "resolved_portable" => "Resolved (portable)",
+        "consumed" => "Consumed",
+        "superseded" => "Superseded",
+        "idle" => "Idle",
+        _ => "Unknown",
+    }
+}
+
 const SETTLED_AGENT_STATUSES: [&str; 6] = ["completed", "failed", "error", "cancelled", "interrupted", "idle"];
 
 /// The relationship panel's rows, grouped as `ThreadRelationshipsPanel` groups them.
