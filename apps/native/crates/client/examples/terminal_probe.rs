@@ -2,10 +2,12 @@
 //! fresh terminal for a thread, attaches, runs `echo hello && pwd` and prints a combining mark,
 //! shows what comes back and how the emulator lays it out, resizes, and closes it (deleting its
 //! history). With `--observe` it follows an existing terminal read-only instead (optionally
-//! typing `--run` into it) and leaves it open. Uses the saved connection, like `probe`.
+//! typing `--run` into it) and leaves it open; with `--close` it closes one, deleting its history.
+//! Uses the saved connection, like `probe`.
 //!
 //!   cargo run -p t3-client --example terminal_probe -- [--thread <thread-id>] [--seconds 3]
 //!   cargo run -p t3-client --example terminal_probe -- --thread <id> --observe term-1 [--run 'ls']
+//!   cargo run -p t3-client --example terminal_probe -- --thread <id> --close term-1
 
 use std::time::Duration;
 
@@ -57,6 +59,11 @@ async fn main() -> anyhow::Result<()> {
     let thread_id = thread.id.clone();
     if let Some(terminal_id) = flag("--observe") {
         return observe(&client, &thread_id, &terminal_id, flag("--run"), seconds).await;
+    }
+    if let Some(terminal_id) = flag("--close") {
+        let closed = client.request(method::CLOSE, terminal::close_input(&thread_id, &terminal_id, true)).await;
+        println!("close {terminal_id}: {}", if closed.is_ok() { "ok".to_owned() } else { format!("{closed:?}") });
+        return Ok(());
     }
     println!("thread {thread_id}\nterminal {terminal_id} ({})\ncwd {}", terminal::terminal_label(&terminal_id), location.cwd);
 

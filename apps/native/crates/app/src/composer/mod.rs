@@ -6,6 +6,7 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+mod context;
 pub(crate) mod controls;
 mod drafts;
 mod menu;
@@ -158,6 +159,8 @@ pub struct Composer {
     menu: Menu,
     /// Staged images and files per target.
     attachments: attachments::Attachments,
+    /// Terminal excerpts per target and the chip row's popover.
+    context: context::ContextChips,
     drafts: drafts::Drafts,
     queue: queue::Queue,
     stash_state: stash::Stashed,
@@ -203,6 +206,12 @@ impl Composer {
                 if *event == AppEvent::ComposerRestore {
                     this.restore_prompt(window, cx);
                 }
+                if *event == AppEvent::ComposerTerminalContext
+                    && let Some(thread_id) = this.thread_id()
+                    && let Some(selection) = this.state.update(cx, |state, _| state.take_terminal_context(&thread_id))
+                {
+                    this.add_terminal_context(selection, window, cx);
+                }
             }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| this.on_picker(event, window, cx)),
             // Caret moves change the token under it; blinks find the caret unchanged and stop.
@@ -236,6 +245,7 @@ impl Composer {
             fixed,
             menu: Menu::default(),
             attachments: Default::default(),
+            context: Default::default(),
             drafts: Default::default(),
             queue: Default::default(),
             stash_state: Default::default(),
@@ -574,6 +584,7 @@ impl Composer {
             self.draft_changed(cx);
         }
         let text = self.prompt(cx);
+        self.sync_context_chips(&text, cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();
         if let Some((request_id, question)) = &answering {

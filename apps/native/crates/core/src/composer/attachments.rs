@@ -3,12 +3,13 @@
 //! `contracts/src/chatAttachment.ts`, the `attachments.createUploadUrl` request and upload URL
 //! (`client-runtime/src/state/attachments.ts`, `web/src/lib/attachmentUploadQueue.ts`), the
 //! `ChatAttachment` a turn carries (`getUploadedAttachments`) with its context record
-//! (`attachmentContextRecord` in `web/src/lib/composerContextRecords.ts`), large pastes folded
+//! (`attachmentContextRecord` and `buildMessageContext` in `web/src/lib/composerContextRecords.ts`), large pastes folded
 //! into a file (`client-runtime/src/textPaste.ts`), and the attachment-only prompt
 //! (`shared/src/composerContextReferences.ts`).
 
 use serde_json::{Value, json};
 
+use super::context::TerminalContext;
 use super::menu::{ThreadContext, kind_scoped_context_id, referenced_context_ids, sanitize_context_label};
 
 pub const CREATE_UPLOAD_URL: &str = "attachments.createUploadUrl";
@@ -346,14 +347,14 @@ pub fn text_for_send(text: &str, has_attachments: bool) -> String {
     text.to_owned()
 }
 
-/// `buildMessageContext`: the thread references the text still links, then every uploaded
-/// attachment, or `None` when there is nothing to carry.
-pub fn message_context(text: &str, threads: &[ThreadContext], attachments: &[Attachment]) -> Option<Value> {
+/// `buildMessageContext`: the terminal excerpts and threads the text still links, then every
+/// uploaded attachment, or `None` when there is nothing to carry.
+pub fn message_context(text: &str, threads: &[ThreadContext], terminals: &[TerminalContext], attachments: &[Attachment]) -> Option<Value> {
     let referenced = referenced_context_ids(text);
-    let records: Vec<Value> = threads
-        .iter()
-        .filter(|thread| referenced.contains(&thread.context_id.as_str()))
-        .map(ThreadContext::to_record)
+    let records: Vec<Value> = super::context::referenced(text, terminals)
+        .into_iter()
+        .map(TerminalContext::record)
+        .chain(threads.iter().filter(|thread| referenced.contains(&thread.context_id.as_str())).map(ThreadContext::to_record))
         .chain(attachments.iter().filter_map(Attachment::context_record))
         .collect();
     (!records.is_empty()).then(|| json!({ "version": 1, "records": records }))

@@ -1,8 +1,9 @@
 //! A terminal pane: one session painted by `TerminalElement`, with keyboard and IME input,
 //! selection, scrollback, the clipboard, and mouse reports for programs that track the mouse.
 //! Ports `TerminalSessionViewport` in `apps/web/src/components/ThreadTerminalDrawer.tsx` (its
-//! context menu, editing shortcuts and exit handling) and the pointer handling of
-//! `apps/web/src/terminal/ghostty/surface.ts`.
+//! context menu, the selection action menu, "Add to chat", editing shortcuts and exit handling),
+//! `observeSelectionActions` from `apps/web/src/lib/selectionActions.ts`, and the pointer
+//! handling of `apps/web/src/terminal/ghostty/surface.ts`.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -17,17 +18,22 @@ use gpui::{
 use gpui_component::menu::ContextMenuExt;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
+use t3_core::composer::context::{normalize_text, selection_line_range};
 use t3_core::terminal::emulator::{self, GridPoint, MouseAction, SelectionType, Side, TermMode, ThemeColors, hit_cell};
 use t3_core::terminal::{self, Grid, KeyInput, encode_key, encode_paste, shortcut_data};
 
 use super::colors;
 use super::element::{RowCache, TerminalElement, TerminalFont};
 use super::session::{Frame, Session, Signal, Target};
-use super::{Clear, Copy, JumpToLatest, Paste, SelectAll};
+use super::{AddToChat, Clear, Copy, JumpToLatest, Paste, SelectAll};
+use crate::composer::controls::{MenuItem, menu_surface};
 
 /// The PTY hears a new grid only after the size settles, so a drag does not reflow the prompt.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const DRAG_THRESHOLD: f32 = 2.;
+/// `SELECTION_MULTI_CLICK_INTERVAL_MS`: after a double or triple click the selection menu waits
+/// out the next click.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
@@ -38,12 +44,27 @@ pub struct Geometry {
     pub rows: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneEvent {
     /// The shell ended while attached.
     Exited,
     /// The user clicked into this pane.
     Activated,
+    /// "Add to chat" on a selection; the drawer names the terminal.
+    AddToChat(Excerpt),
+}
+
+/// A selection's text and 1-based lines, counted from the top of the scrollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Excerpt {
+    pub line_start: u32,
+    pub line_end: u32,
+    pub text: String,
+}
+
+/// The selection action menu, open at the pointer that ended a selection.
+struct SelectionMenu {
+    at: Point<Pixels>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +104,9 @@ pub struct TerminalPane {
     theme: Option<ThemeColors>,
     resize_pending: bool,
     resize_settle: Option<Task<()>>,
+    selection_menu: Option<SelectionMenu>,
+    /// A selection menu waiting out a possible next click.
+    selection_menu_delay: Option<Task<()>>,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -139,6 +163,8 @@ impl TerminalPane {
             theme: Some(theme),
             resize_pending: false,
             resize_settle: None,
+            selection_menu: None,
+            selection_menu_delay: None,
             _pump: pump,
             _subscriptions: subscriptions,
         }
@@ -179,6 +205,9 @@ impl TerminalPane {
     }
 
     fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if !focused {
+            self.dismiss_selection_menu(cx);
+        }
         let report = self.session.shared.lock().emulator.focus_input(focused);
         if let Some(report) = report {
             self.session.write(report);
@@ -221,6 +250,79 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// The selection as an excerpt, when it holds more than blank lines (`readSelectionAction`).
+    fn selected_excerpt(&self) -> Option<Excerpt> {
+        let core = self.session.shared.lock();
+        let text = normalize_text(&core.emulator.selection_text()?);
+        let (start, end) = core.emulator.selection_rows()?;
+        if text.is_empty() {
+            return None;
+        }
+        let (line_start, line_end) = selection_line_range(start, end);
+        Some(Excerpt { line_start, line_end, text })
+    }
+
+    /// `addSelectionToChat`: the selection goes to the composer and leaves the terminal.
+    fn add_to_chat(&mut self, _: &AddToChat, _: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_selection_menu(cx);
+        let Some(excerpt) = self.selected_excerpt() else { return };
+        self.session.update(|core| core.emulator.clear_selection());
+        cx.emit(PaneEvent::AddToChat(excerpt));
+        cx.notify();
+    }
+
+    /// `showSelectionAction`: after a selecting gesture, its menu opens at the pointer, at once
+    /// for a drag and once a multi-click settles.
+    fn schedule_selection_menu(&mut self, at: Point<Pixels>, multi_click: bool, cx: &mut Context<Self>) {
+        self.dismiss_selection_menu(cx);
+        if self.selected_excerpt().is_none() {
+            return;
+        }
+        if !multi_click {
+            self.selection_menu = Some(SelectionMenu { at });
+            cx.notify();
+            return;
+        }
+        self.selection_menu_delay = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MULTI_CLICK_INTERVAL).await;
+            let _ = this.update(cx, |pane, cx| {
+                pane.selection_menu_delay = None;
+                if pane.selected_excerpt().is_some() {
+                    pane.selection_menu = Some(SelectionMenu { at });
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn dismiss_selection_menu(&mut self, cx: &mut Context<Self>) {
+        self.selection_menu_delay = None;
+        if self.selection_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn render_selection_menu(&self, menu: &SelectionMenu, cx: &mut Context<Self>) -> gpui::AnyElement {
+        gpui::deferred(
+            gpui::anchored().position(menu.at).snap_to_window_with_margin(px(8.)).child(
+                menu_surface(cx)
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|pane, _, _, cx| pane.dismiss_selection_menu(cx)))
+                    .child(
+                        MenuItem::new("terminal-selection-add-to-chat", "Add to chat")
+                            .on_click(cx.listener(|pane, _, window, cx| pane.add_to_chat(&AddToChat, window, cx))),
+                    )
+                    .child(MenuItem::new("terminal-selection-copy", "Copy").on_click(cx.listener(|pane, _, window, cx| {
+                        pane.dismiss_selection_menu(cx);
+                        pane.copy(&Copy, window, cx);
+                        window.focus(&pane.focus, cx);
+                    }))),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         let text = self.session.shared.lock().emulator.selection_text();
         if let Some(text) = text {
@@ -252,6 +354,7 @@ impl TerminalPane {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_selection_menu(cx);
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
         let key = KeyInput {
@@ -396,11 +499,15 @@ impl TerminalPane {
             return;
         }
         if event.button == MouseButton::Left {
-            self.drag = None;
+            let selecting = self.drag.take().is_some_and(|drag| drag.armed);
+            if selecting {
+                self.schedule_selection_menu(event.position, event.click_count >= 2, cx);
+            }
         }
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_selection_menu(cx);
         let Some(geometry) = self.geometry else { return };
         let delta = event.delta.pixel_delta(px(geometry.line_height)).y;
         self.scroll_remainder += f32::from(delta) / geometry.line_height;
@@ -470,6 +577,7 @@ impl Render for TerminalPane {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear))
             .on_action(cx.listener(Self::jump_to_latest))
+            .on_action(cx.listener(Self::add_to_chat))
             .on_key_down(cx.listener(Self::key_down))
             .capture_any_mouse_down(cx.listener(Self::report_mouse_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
@@ -482,11 +590,14 @@ impl Render for TerminalPane {
             .on_mouse_up_out(MouseButton::Right, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(element)
+            .children(self.selection_menu.as_ref().map(|menu| self.render_selection_menu(menu, cx)))
             .context_menu(move |menu, _, _| {
                 let core = shared.lock();
-                let (selected, read_only) = (core.emulator.has_selection(), core.read_only);
+                let selected = core.emulator.selection_text().is_some_and(|text| !normalize_text(&text).is_empty());
+                let read_only = core.read_only;
                 drop(core);
                 menu.action_context(menu_focus.clone())
+                    .menu_with_disabled("Add to chat", Box::new(AddToChat), !selected)
                     .menu_with_disabled("Copy", Box::new(Copy), !selected)
                     .menu_with_disabled("Paste", Box::new(Paste), read_only)
                     .menu("Select all", Box::new(SelectAll))

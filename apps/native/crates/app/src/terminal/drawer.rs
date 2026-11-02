@@ -12,6 +12,7 @@ use gpui::{App, AppContext, Context, Entity, Focusable, PromptLevel, Subscriptio
 use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::store;
+use t3_core::composer::context::TerminalSelection;
 use t3_core::terminal::{
     self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalLayouts, TerminalSummary, ThreadTerminalLayout,
     method,
@@ -276,10 +277,24 @@ impl TerminalDrawer {
         cx.subscribe_in(&pane, window, move |drawer, _, event: &PaneEvent, window, cx| match event {
             PaneEvent::Exited => drawer.close_terminal(&thread, &terminal, window, cx),
             PaneEvent::Activated => drawer.activate(&terminal, window, cx),
+            PaneEvent::AddToChat(excerpt) => drawer.add_to_chat(&thread, &terminal, excerpt.clone(), cx),
         })
         .detach();
         self.panes.insert(terminal_id.to_owned(), pane.clone());
         Some(pane)
+    }
+
+    /// `handleAddTerminalContext`: names the excerpt after its terminal and hands it to the
+    /// thread's composer.
+    fn add_to_chat(&mut self, thread_id: &str, terminal_id: &str, excerpt: super::pane::Excerpt, cx: &mut Context<Self>) {
+        let selection = TerminalSelection {
+            terminal_id: terminal_id.to_owned(),
+            terminal_label: self.label(thread_id, terminal_id),
+            line_start: excerpt.line_start,
+            line_end: excerpt.line_end,
+            text: excerpt.text,
+        };
+        self.app.update(cx, |state, cx| state.add_terminal_context(thread_id, selection, cx));
     }
 
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {

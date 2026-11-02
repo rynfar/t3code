@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use gpui::{AnyElement, App, Context, Focusable, FontWeight, IntoElement, ParentElement, ScrollHandle, SharedString, Styled, Task, Window, div, prelude::*, px, relative};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::composer::context as context_rules;
 use t3_core::composer::menu::{
     self as rules, MenuAction, MenuItem, PathEntry, PathKind, SkillSource, SlashCommand, SlashMenuOptions, ThreadContext, Trigger, TriggerKind,
     TriggerState,
@@ -101,7 +102,7 @@ impl Composer {
         worktree.or_else(|| Some(state.shell.project(self.snapshot.project_id.as_deref()?)?.workspace_root.clone()))
     }
 
-    fn environment_id(&self, cx: &App) -> String {
+    pub(super) fn environment_id(&self, cx: &App) -> String {
         let config = self.state.read(cx).server_config.config.as_ref();
         config.map(|config| config.environment.environment_id.clone()).unwrap_or_else(|| t3_core::sidebar::ENVIRONMENT_ID.to_owned())
     }
@@ -429,11 +430,18 @@ impl Composer {
         self.focus(window, cx);
     }
 
-    /// The `context` a send to the current target carries: the threads its text still links,
-    /// then its attachments.
+    /// The `context` a send to the current target carries: the terminal excerpts and threads
+    /// its text still links, then its attachments.
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
-        t3_core::composer::attachments::message_context(text, threads, attachments)
+        t3_core::composer::attachments::message_context(text, threads, self.current_terminals(), attachments)
+    }
+
+    /// How many mentioned threads `text` links, which make a message sendable on their own.
+    pub(super) fn linked_threads(&self, text: &str) -> usize {
+        let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
+        let linked = rules::referenced_context_ids(text);
+        threads.iter().filter(|thread| linked.contains(&thread.context_id.as_str())).count()
     }
 
     pub(super) fn mentions(&self, target: &Target) -> &[ThreadContext] {
@@ -446,9 +454,26 @@ impl Composer {
         }
     }
 
-    /// Forgets a target's mentioned threads once its message went out.
+    /// Forgets a target's mentioned threads and terminal excerpts once a stash took them.
     pub(super) fn clear_mentions(&mut self, target: &Target) {
         self.menu.threads.remove(target);
+        self.clear_terminals(target);
+    }
+
+    /// The threads a send's `prompt` links; the rest go with the prompt's history.
+    pub(super) fn take_threads(&mut self, target: &Target, prompt: &str) -> Vec<ThreadContext> {
+        self.menu.threads.get_mut(target).map(|held| context_rules::take_for_send(held, prompt)).unwrap_or_default()
+    }
+
+    pub(super) fn restore_threads(&mut self, target: &Target, sent: Vec<ThreadContext>) {
+        context_rules::restore_unsent(self.menu.threads.entry(target.clone()).or_default(), sent);
+    }
+
+    /// Threads `prompt` no longer links go once its undo history does.
+    pub(super) fn reset_thread_history(&mut self, target: &Target, prompt: &str) {
+        if let Some(held) = self.menu.threads.get_mut(target) {
+            context_rules::reset_history(held, prompt);
+        }
     }
 
     pub(super) fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

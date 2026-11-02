@@ -314,6 +314,14 @@ impl Emulator {
         self.term.selection_to_string().filter(|text| !text.is_empty())
     }
 
+    /// The selection's first and last rows counted from the top of the scrollback, the screen
+    /// coordinates `getSelectionPosition` reports.
+    pub fn selection_rows(&self) -> Option<(u32, u32)> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let top = self.term.topmost_line().0;
+        Some(((range.start.line.0 - top) as u32, (range.end.line.0 - top) as u32))
+    }
+
     /// What a wheel step means: wheel reports for a program that tracks the mouse (when the
     /// modifiers let it, see `shouldReportTerminalMouse`), arrow keys for one that owns the
     /// alternate screen (as xterm sends), or `None` to scroll the scrollback. Positive `lines`
@@ -597,7 +605,13 @@ mod tests {
         emulator.start_selection(SelectionType::Simple, start, Side::Left);
         emulator.update_selection(emulator.point_at(0, 4), Side::Right);
         assert_eq!(emulator.selection_text().as_deref(), Some("line3"));
+        // Rows count from the top of the scrollback, whatever is scrolled into view.
+        assert_eq!(emulator.selection_rows(), Some((2, 2)));
+        emulator.update_selection(emulator.point_at(2, 4), Side::Right);
         emulator.scroll_to_bottom();
+        assert_eq!(emulator.selection_rows(), Some((2, 4)));
+        emulator.clear_selection();
+        assert_eq!(emulator.selection_rows(), None);
         assert_eq!(emulator.display_offset(), 0);
         emulator.select_all();
         assert!(emulator.selection_text().is_some_and(|all| all.starts_with("line1")));
