@@ -295,11 +295,39 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        // `--settled N`: read N older settled pages below the shell's cut, as the shelf does.
+        let mut mounts = t3_core::families::MountedReads::default();
+        let mut pages = t3_core::sidebar::older_settled::SettledPages::default();
+        let mut shelves = t3_core::sidebar::ShelfState::default();
+        let older = snapshot.older_settled.as_ref().and_then(t3_core::sidebar::older_settled::OlderSettled::from_cut);
+        if let (Some(wanted), Some(older)) = (flag("--settled").and_then(|n| n.parse::<usize>().ok()), older.as_ref()) {
+            println!("older settled: before {} counts {:?}", older.before, older.counts);
+            pages.sync(&shell, Some(older));
+            shelves.settled_expanded = true;
+            while pages.reads.len() < wanted && pages.grow(Some(older), 0, usize::MAX) {
+                let Some((generation, before)) = pages.next_request() else { break };
+                let payload = t3_core::sidebar::older_settled::page_request(&before, None);
+                let started = std::time::Instant::now();
+                let page = client
+                    .request(t3_core::sidebar::older_settled::GET_OLDER_SETTLED_THREADS, payload)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
+                let rows: Result<usize, String> = page.as_ref().map(|p: &t3_core::families::FamilyRead| p.threads.len()).map_err(Clone::clone);
+                pages.apply_page(generation, &before, page);
+                println!("older page: {rows:?} rows in {:?}, frontier {:?}", started.elapsed(), pages.frontier);
+            }
+            mounts.mount("older-settled", shell.generation, pages.reads.clone());
+            shelves.settled_visible = usize::MAX;
+        }
+        let extras = mounts.extras(&shell);
         let model = t3_core::sidebar::SidebarModel::build(
             &t3_core::sidebar::ModelInput {
                 snapshot,
+                extra_threads: &extras,
+                older_settled: older.as_ref().map(|older| t3_core::sidebar::OlderSettledShelf { older, frontier: pages.listing_frontier(Some(older)) }),
                 settings: &Default::default(),
-                shelves: &Default::default(),
+                shelves: &shelves,
                 selected_thread_id: None,
                 project_scope: None,
                 connected: true,
@@ -307,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
             },
             &mut Default::default(),
         );
+        println!("settled: count={} listed={} hidden={}", model.settled_count, model.listed_settled_count, model.hidden_settled_count);
         for row in model.rows.iter().take(12) {
             match row {
                 t3_core::sidebar::SidebarRow::Thread { index, section } => println!("  {section:?}: {}", model.threads[*index].title),

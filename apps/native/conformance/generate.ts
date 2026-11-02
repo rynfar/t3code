@@ -8,6 +8,7 @@ import { ROOT, toJson } from "./runtime.ts";
 import { collationCase, fuzzReducerCases, portedReducerCases } from "./reducerCases.ts";
 import { threadCases } from "./threadCases.ts";
 import { shellCases } from "./shellCases.ts";
+import { shelfCases } from "./shelfCases.ts";
 
 const OUTPUT_DIR = "apps/native/crates/core/tests/conformance";
 
@@ -17,6 +18,7 @@ function fixtures(): Record<string, ReadonlyArray<unknown>> {
     "reducer.jsonl": [...portedReducerCases(), collationCase(), ...fuzzReducerCases(20)],
     "thread.jsonl": threadCases(),
     "shell.jsonl": shellCases(),
+    "shelf.jsonl": shelfCases(),
   };
 }
 

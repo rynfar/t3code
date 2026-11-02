@@ -15,7 +15,7 @@ use t3_core::sidebar::time::{LocalTime, Ms, Zone};
 use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::sidebar::thread::same_apart_from_streaming;
 use t3_core::sidebar::visits::{VisitDecision, VisitTracker, VisitedShell};
-use t3_core::sidebar::{ModelInput, Shelf, ShelfState, SidebarModel, SidebarSettings};
+use t3_core::sidebar::{ModelInput, OlderSettledShelf, Shelf, ShelfState, SidebarModel, SidebarSettings};
 use t3_core::thread_actions::{
     self as actions, PlanFor, RenameOutcome, ThreadAction, ThreadUndoStore, UndoAction, UndoKind, UndoStep,
 };
@@ -101,10 +101,16 @@ impl AppState {
     /// Re-derives the sidebar from the shell. Cheap enough per batch; rows notify only the sidebar.
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
         let now = now_ms();
+        let extras = self.omitted.mounts.extras(&self.shell);
+        let older = self.omitted.older();
+        let frontier = self.omitted.pages.listing_frontier(older.as_ref());
+        let older_settled = older.as_ref().map(|older| OlderSettledShelf { older, frontier });
         let model = match &self.shell.snapshot {
             Some(snapshot) => SidebarModel::build(
                 &ModelInput {
                     snapshot,
+                    extra_threads: &extras,
+                    older_settled,
                     settings: &self.sidebar.settings,
                     shelves: &self.sidebar.shelves,
                     selected_thread_id: self.selected_thread.as_deref(),
@@ -117,7 +123,9 @@ impl AppState {
             None => SidebarModel::default(),
         };
         let next = model.next_change_at;
+        let listed_settled = model.listed_settled_count;
         self.sidebar.model = Arc::new(model);
+        self.grow_settled_shelf(listed_settled, cx);
         self.sidebar.wake_timer = next.map(|at| {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(Duration::from_millis((at - now).max(0) as u64 + 1)).await;
@@ -145,6 +153,7 @@ impl AppState {
     }
 
     pub fn show_more_settled(&mut self, cx: &mut Context<Self>) {
+        self.retry_settled_pages(cx);
         self.sidebar.shelves.show_more_settled();
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Shell);

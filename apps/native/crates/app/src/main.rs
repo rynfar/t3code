@@ -9,6 +9,7 @@ mod icons;
 mod keymap;
 mod menus;
 mod new_thread;
+mod omitted_rows;
 mod palette;
 mod right_panel;
 mod sidebar;

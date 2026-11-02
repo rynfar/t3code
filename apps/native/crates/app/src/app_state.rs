@@ -58,6 +58,8 @@ pub struct AppState {
     pub draft_project: Option<String>,
     pub panels: crate::right_panel::PanelState,
     restore_thread: Option<String>,
+    /// Rows the shell leaves to on-demand reads: older settled pages and thread families.
+    pub(crate) omitted: crate::omitted_rows::OmittedRows,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
     client: Option<ClientHandle>,
@@ -85,6 +87,7 @@ impl AppState {
             draft_project: None,
             panels: crate::right_panel::PanelState::load(),
             restore_thread: store::load_last_thread(),
+            omitted: Default::default(),
             select_when_listed: None,
             client: None,
             runtime,
@@ -127,6 +130,7 @@ impl AppState {
         self._pump = None;
         self.shell = ShellState::default();
         self.sidebar = SidebarController::default();
+        self.omitted = Default::default();
         self.selected_thread = None;
         self.thread = ThreadState::default();
         self.server_config = ServerConfigState::default();
@@ -185,6 +189,7 @@ impl AppState {
             }
         }
         if shell_changed {
+            self.sync_omitted_rows(cx);
             if sidebar_changed {
                 self.rebuild_sidebar(cx);
             }
@@ -196,6 +201,13 @@ impl AppState {
                 && let Some(id) = self.restore_thread.take_if(|id| self.shell.thread(id).is_some())
             {
                 self.select_thread(&id, cx);
+            } else if self.selected_thread.is_none()
+                && self.draft_project.is_none()
+                && self.shell.synchronized
+                && let Some(id) = self.restore_thread.take()
+            {
+                // A shell that omits older settled or idle threads can still hold it: ask its family.
+                self.read_family(&id, true, cx);
             }
         }
         if thread_changed && self.thread.deleted {
@@ -214,6 +226,7 @@ impl AppState {
         if let (Some(client), Some(thread_id)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&thread_id);
         }
+        self.release_families(None);
         self.thread = ThreadState::default();
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
@@ -245,6 +258,11 @@ impl AppState {
         store::save_last_thread(thread_id);
         if let Some(client) = &self.client {
             client.open_thread(thread_id);
+        }
+        // An idle subagent or older settled thread opens from its family when the shell omits it.
+        self.release_families(Some(thread_id));
+        if self.thread_shell(thread_id).is_none() {
+            self.read_family(thread_id, false, cx);
         }
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
@@ -368,7 +386,7 @@ impl AppState {
     pub fn is_selected_thread_running(&self) -> bool {
         self.selected_thread
             .as_deref()
-            .and_then(|id| self.shell.thread(id))
+            .and_then(|id| self.thread_shell(id))
             .is_some_and(|thread| thread.is_live())
     }
 
@@ -376,7 +394,7 @@ impl AppState {
     pub fn stop_selected_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread.clone() else { return };
         let thread_stop = self.server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.thread_stop == Some(true));
-        let command = match self.shell.thread(&thread_id).and_then(|t| t.active_run_id.clone()) {
+        let command = match self.thread_shell(&thread_id).and_then(|t| t.active_run_id.clone()) {
             Some(run_id) if !thread_stop => commands::interrupt_run(&uuid_v4(), &thread_id, &run_id),
             _ => commands::stop_thread(&uuid_v4(), &thread_id),
         };

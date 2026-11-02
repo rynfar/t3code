@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use t3_core::commands::{self, method};
+use t3_core::commands::{self, ShellOptions, method};
 use t3_core::server_config::ServerConfigStreamEvent;
 use t3_core::shell::ShellStreamItem;
 use t3_core::history::HistoryPage;
@@ -214,10 +214,11 @@ async fn run_session(
     commands: &mut mpsc::UnboundedReceiver<Command>,
     events: &Events,
 ) -> SessionEnd {
-    let Ok(mut shell) = session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell)) else {
+    let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, commands::subscribe_server_config()).ok();
+    let options = initial_shell_options(&mut server_config, events).await;
+    let Ok(mut shell) = session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell, options)) else {
         return SessionEnd::Closed("Could not subscribe to the shell.".into());
     };
-    let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, commands::subscribe_server_config()).ok();
     let (thread_tx, mut thread_rx) = mpsc::channel::<ThreadFrame>(256);
     let mut forwarders: HashMap<String, JoinHandle<()>> = HashMap::new();
     for (thread_id, sequence) in resume.threads.clone() {
@@ -300,6 +301,41 @@ async fn run_session(
         task.abort();
     }
     end
+}
+
+/// How long the shell waits for the config that decides its options before asking for every row.
+const CONFIG_WAIT: Duration = Duration::from_secs(10);
+
+/// `shell.ts` builds the shell input from `session.initialConfig`: the first config snapshot,
+/// forwarded like any other. Without one the shell asks for every row, as a config failure does.
+async fn initial_shell_options(stream: &mut Option<StreamHandle>, events: &Events) -> ShellOptions {
+    let wait = async {
+        loop {
+            match next_config(stream).await {
+                Some(Ok(value)) => match serde_json::from_value::<ServerConfigStreamEvent>(value) {
+                    Ok(event) => {
+                        let options = match &event {
+                            ServerConfigStreamEvent::Snapshot { config } => {
+                                Some(ShellOptions::for_server(config.shell_thread_families, config.shell_older_settled))
+                            }
+                            _ => None,
+                        };
+                        let _ = events.send(ClientEvent::ServerConfig(Box::new(event))).await;
+                        if let Some(options) = options {
+                            return options;
+                        }
+                    }
+                    Err(error) => report(events, "server config", error.to_string()).await,
+                },
+                Some(Err(error)) => {
+                    report(events, "server config", error.to_string()).await;
+                    return ShellOptions::default();
+                }
+                None => return ShellOptions::default(),
+            }
+        }
+    };
+    tokio::time::timeout(CONFIG_WAIT, wait).await.unwrap_or_default()
 }
 
 async fn next_config(stream: &mut Option<StreamHandle>) -> Option<Result<Value, RpcError>> {
