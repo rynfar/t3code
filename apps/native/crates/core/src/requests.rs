@@ -182,15 +182,32 @@ fn approval_options(raw: &[Value]) -> Vec<ApprovalOption> {
         .collect()
 }
 
+fn is_pending(entity: &&crate::thread::Entity) -> bool {
+    entity.value.get("status").and_then(Value::as_str) == Some("pending")
+}
+
+/// What `pending_requests` reads, cheap to compare on every streamed event: the pending requests
+/// and, while any wait, how many turn items there are to join them with. Re-derive only when it
+/// changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PendingKey {
+    requests: Vec<Value>,
+    turn_items: usize,
+}
+
+impl PendingKey {
+    pub fn of(projection: &ThreadProjection) -> Self {
+        let requests: Vec<Value> = projection.runtime_requests.iter().filter(is_pending).map(|entity| entity.value.clone()).collect();
+        let turn_items = if requests.is_empty() { 0 } else { projection.turn_items.len() };
+        PendingKey { requests, turn_items }
+    }
+}
+
 /// `derivePendingThreadRequests`, then sorted oldest first as `derivePendingApprovals` and
-/// `derivePendingUserInputs` sort them. Runs on every streamed event, so settled requests are
-/// skipped before anything is decoded.
+/// `derivePendingUserInputs` sort them. Settled requests are skipped before anything is decoded.
 pub fn pending_requests(projection: &ThreadProjection) -> PendingRequests {
     let mut pending = PendingRequests::default();
-    for entity in &projection.runtime_requests {
-        if entity.value.get("status").and_then(Value::as_str) != Some("pending") {
-            continue;
-        }
+    for entity in projection.runtime_requests.iter().filter(is_pending) {
         let Ok(request) = RuntimeRequest::deserialize(&entity.value) else { continue };
         let capability = request.response_capability.kind.clone();
         if request.kind == "user_input" {

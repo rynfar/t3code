@@ -6,7 +6,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::model::ModelSelection;
-use crate::server_config::{BooleanDescriptor, OptionChoice, OptionDescriptor, SelectDescriptor};
+use crate::server_config::{BooleanDescriptor, OptionChoice, OptionDescriptor, ProviderModel, SelectDescriptor};
 
 /// `REASONING_EFFORT_OPTION_IDS` plus `thinking`.
 const REASONING_IDS: [&str; 7] =
@@ -161,6 +161,67 @@ pub fn explicit_selections(resolved: &[OptionDescriptor], explicit: &[OptionSele
         .into_iter()
         .filter(|selection| explicit.iter().any(|chosen| chosen.id == selection.id))
         .collect()
+}
+
+/// `withoutPlanAgentOption`: with plan mode off, an agent picker cannot choose `plan`.
+fn without_plan_agent(descriptors: &[OptionDescriptor]) -> Vec<OptionDescriptor> {
+    descriptors
+        .iter()
+        .filter_map(|descriptor| match descriptor {
+            OptionDescriptor::Select(select) if select.id == "agent" => {
+                let options: Vec<OptionChoice> = select.options.iter().filter(|option| option.id != "plan").cloned().collect();
+                if options.is_empty() {
+                    return None;
+                }
+                let current_value = select
+                    .current_value
+                    .clone()
+                    .filter(|value| options.iter().any(|option| option.id == *value))
+                    .or_else(|| options.iter().find(|option| option.is_default).or(options.first()).map(|option| option.id.clone()));
+                Some(OptionDescriptor::Select(SelectDescriptor { options, current_value, ..select.clone() }))
+            }
+            other => Some(other.clone()),
+        })
+        .collect()
+}
+
+/// `withImplicitFastModeDefault`: a model with a Fast mode switch dispatches it off unless the
+/// user turned it on (Cursor's agent can otherwise default it on).
+fn with_implicit_fast_mode(descriptors: &[OptionDescriptor], explicit: &[OptionSelection]) -> Vec<OptionSelection> {
+    let has_switch = descriptors.iter().any(|d| matches!(d, OptionDescriptor::Boolean(b) if b.id == "fastMode"));
+    let mut selections = explicit.to_vec();
+    if has_switch && !explicit.iter().any(|selection| selection.id == "fastMode") {
+        selections.push(OptionSelection { id: "fastMode".into(), value: OptionValue::Bool(false) });
+    }
+    selections
+}
+
+/// What the composer shows and sends for a model (`getComposerProviderState`): its descriptors
+/// with current values, and the options a turn carries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ComposerOptions {
+    pub descriptors: Vec<OptionDescriptor>,
+    pub dispatch: Vec<OptionSelection>,
+}
+
+/// `model` is the catalog entry for the chosen slug, if the provider lists it.
+pub fn composer_options(driver: &str, model: Option<&ProviderModel>, plan_mode_enabled: bool, explicit: &[OptionSelection]) -> ComposerOptions {
+    if driver == "opencode" && model.is_none() {
+        // A model outside OpenCode's catalog has no descriptors to normalize against, so the
+        // options it was given go out as they are.
+        let dispatch = explicit
+            .iter()
+            .filter(|selection| plan_mode_enabled || !(selection.id == "agent" && selection.value == OptionValue::Str("plan".into())))
+            .cloned()
+            .collect();
+        return ComposerOptions { descriptors: Vec::new(), dispatch };
+    }
+    let caps = model.and_then(|model| model.capabilities.as_ref()).map(|caps| caps.option_descriptors.as_slice()).unwrap_or_default();
+    let caps = if plan_mode_enabled { caps.to_vec() } else { without_plan_agent(caps) };
+    let selections = with_implicit_fast_mode(&caps, explicit);
+    let descriptors = resolve_descriptors(&caps, &selections);
+    let dispatch = explicit_selections(&descriptors, &selections);
+    ComposerOptions { descriptors, dispatch }
 }
 
 /// The selections after picking `value` for one descriptor, as `getTraitSelectChange` builds them.

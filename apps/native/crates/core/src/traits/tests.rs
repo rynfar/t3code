@@ -1,4 +1,5 @@
 use super::*;
+use crate::server_config::ProviderModel;
 
 fn descriptors() -> Vec<OptionDescriptor> {
     serde_json::from_value(json!([
@@ -86,4 +87,38 @@ fn explicit_selections_keep_only_what_the_user_chose() {
         vec![OptionSelection { id: "reasoningEffort".into(), value: OptionValue::Str("high".into()) }]
     );
     assert!(explicit_selections(&resolved, &[]).is_empty());
+}
+
+fn model(descriptors: Value) -> ProviderModel {
+    serde_json::from_value(json!({"slug": "m", "name": "M", "isCustom": false, "capabilities": {"optionDescriptors": descriptors}})).unwrap()
+}
+
+#[test]
+fn composer_options_send_fast_mode_off_unless_chosen() {
+    let cursor = model(json!([{"id": "fastMode", "label": "Fast", "type": "boolean", "currentValue": true}]));
+    let options = composer_options("cursor", Some(&cursor), false, &[]);
+    assert_eq!(options.dispatch, vec![OptionSelection { id: "fastMode".into(), value: OptionValue::Bool(false) }]);
+    let chosen = [OptionSelection { id: "fastMode".into(), value: OptionValue::Bool(true) }];
+    assert_eq!(composer_options("cursor", Some(&cursor), false, &chosen).dispatch, chosen.to_vec());
+    let plain = model(json!([{"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "low", "label": "Low", "isDefault": true}]}]));
+    assert!(composer_options("codex", Some(&plain), false, &[]).dispatch.is_empty());
+}
+
+#[test]
+fn composer_options_hide_the_plan_agent_while_plan_mode_is_off() {
+    let opencode = model(json!([{"id": "agent", "label": "Agent", "type": "select", "currentValue": "plan",
+        "options": [{"id": "build", "label": "Build", "isDefault": true}, {"id": "plan", "label": "Plan"}]}]));
+    let off = composer_options("opencode", Some(&opencode), false, &[]);
+    assert!(matches!(&off.descriptors[0], OptionDescriptor::Select(select) if select.options.len() == 1 && select.current_value.as_deref() == Some("build")));
+    let on = composer_options("opencode", Some(&opencode), true, &[]);
+    assert!(matches!(&on.descriptors[0], OptionDescriptor::Select(select) if select.options.len() == 2));
+}
+
+#[test]
+fn uncatalogued_opencode_models_keep_their_options() {
+    let kept = selections(Some(&json!([{"id": "variant", "value": "high"}, {"id": "agent", "value": "plan"}])));
+    let off = composer_options("opencode", None, false, &kept);
+    assert_eq!(off.dispatch, vec![OptionSelection { id: "variant".into(), value: OptionValue::Str("high".into()) }]);
+    assert!(off.descriptors.is_empty());
+    assert_eq!(composer_options("opencode", None, true, &kept).dispatch.len(), 2);
 }

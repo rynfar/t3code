@@ -182,3 +182,23 @@ fn displaced_answers_join_the_draft_after_a_blank_line() {
     assert_eq!(carry_displaced_answer("  ", "typed"), "typed");
     assert_eq!(carry_displaced_answer("draft", "   "), "draft");
 }
+
+#[test]
+fn the_pending_key_changes_only_with_what_pending_requests_read() {
+    let streamed = || item("i9", json!({"type": "reasoning", "text": "…", "streaming": true}));
+    let settled = projection(vec![request("a2", "command", "resolved", live(false), T)], vec![]);
+    let key = PendingKey::of(&settled);
+    assert_eq!(PendingKey::of(&projection(vec![request("a2", "command", "resolved", live(false), T)], vec![streamed()])), key);
+
+    let requests = || vec![request("a1", "command", "pending", live(false), T), request("a2", "command", "resolved", live(false), T)];
+    let pending = projection(requests(), vec![]);
+    let key = PendingKey::of(&pending);
+    let mut settled_changed = pending.clone();
+    settled_changed.runtime_requests[1].value["resolvedAt"] = json!(T);
+    assert_eq!(PendingKey::of(&settled_changed), key);
+    let mut capability_changed = pending.clone();
+    capability_changed.runtime_requests[0].value["responseCapability"] = json!({"type": "not_resumable"});
+    assert_ne!(PendingKey::of(&capability_changed), key);
+    let prompt = item("i1", json!({"type": "approval_request", "requestId": "a1", "requestKind": "command", "prompt": "rm -rf"}));
+    assert_ne!(PendingKey::of(&projection(requests(), vec![prompt])), key);
+}

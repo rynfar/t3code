@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::json;
 
+/// 2026-11-02T10:00:00Z.
+const NOW: i64 = 1_793_613_600_000;
+
 #[test]
 fn dispatch_follows_the_follow_up_setting_and_its_alternate() {
     assert_eq!(dispatch_mode(false, true, FollowUpBehavior::Steer, true), ComposerDispatch::Auto);
@@ -14,14 +17,23 @@ fn dispatch_follows_the_follow_up_setting_and_its_alternate() {
 #[test]
 fn enter_sends_unless_the_shortcut_needs_a_modifier() {
     use SendShortcut::*;
-    assert_eq!(submit_intent(false, false, false, Enter, "hi"), Some(SubmitIntent::Foreground));
-    assert_eq!(submit_intent(true, false, false, Enter, "hi"), Some(SubmitIntent::Foreground));
-    assert_eq!(submit_intent(true, true, false, Enter, "hi"), Some(SubmitIntent::Alternate));
-    assert_eq!(submit_intent(true, false, true, Enter, "hi"), Some(SubmitIntent::Background));
-    assert_eq!(submit_intent(false, false, false, ModEnter, "hi"), None);
-    assert_eq!(submit_intent(true, false, false, ModEnter, "hi"), Some(SubmitIntent::Foreground));
-    assert_eq!(submit_intent(false, false, false, ModEnterMultiline, "one line"), Some(SubmitIntent::Foreground));
-    assert_eq!(submit_intent(false, false, false, ModEnterMultiline, "two\nlines"), None);
+    let (plain, modified) = (EnterKey::default(), EnterKey { modifier: true, ..EnterKey::default() });
+    assert_eq!(submit_intent(plain, false, false, Enter, "hi"), Some(SubmitIntent::Foreground));
+    assert_eq!(submit_intent(modified, false, false, Enter, "hi"), Some(SubmitIntent::Foreground));
+    assert_eq!(submit_intent(modified, true, false, Enter, "hi"), Some(SubmitIntent::Alternate));
+    assert_eq!(submit_intent(modified, false, true, Enter, "hi"), Some(SubmitIntent::Background));
+    assert_eq!(submit_intent(plain, false, false, ModEnter, "hi"), None);
+    assert_eq!(submit_intent(modified, false, false, ModEnter, "hi"), Some(SubmitIntent::Foreground));
+    assert_eq!(submit_intent(plain, false, false, ModEnterMultiline, "one line"), Some(SubmitIntent::Foreground));
+    assert_eq!(submit_intent(plain, false, false, ModEnterMultiline, "two\nlines"), None);
+}
+
+#[test]
+fn a_held_or_composing_enter_never_sends() {
+    let repeat = EnterKey { repeat: true, ..EnterKey::default() };
+    let composing = EnterKey { modifier: true, composing: true, ..EnterKey::default() };
+    assert_eq!(submit_intent(repeat, false, false, SendShortcut::Enter, "hi"), None);
+    assert_eq!(submit_intent(composing, true, false, SendShortcut::Enter, "hi"), None);
 }
 
 #[test]
@@ -105,24 +117,24 @@ fn draft_defaults_prefer_project_then_environment_then_carry_then_first_provider
         "projectSettingsOverrides": {"p1": {"defaultModelSelection": {"instanceId": "devReplay", "model": "showcase"},
                                             "defaultRuntimeMode": "approval-required"}}
     }));
-    let defaults = draft_defaults(Some(&project), "p1", Some(&carry), Some(InteractionMode::Plan));
+    let defaults = draft_defaults(Some(&project), "p1", Some(&carry), Some(InteractionMode::Plan), NOW);
     assert_eq!(defaults.model_selection.map(|s| s.model), Some("showcase".into()));
     assert_eq!(defaults.runtime_mode, RuntimeMode::ApprovalRequired);
     assert_eq!(defaults.interaction_mode, InteractionMode::Plan);
 
-    let environment = draft_defaults(Some(&project), "p2", Some(&carry), None);
+    let environment = draft_defaults(Some(&project), "p2", Some(&carry), None, NOW);
     assert_eq!(environment.model_selection.map(|s| s.model), Some("luna".into()));
     assert_eq!(environment.runtime_mode, RuntimeMode::Auto);
 
     let cleared = config(json!({"projectSettingsOverrides": {"p1": {"defaultModelSelection": null}},
                                 "defaultModelSelection": {"instanceId": "codex", "model": "luna"}}));
-    assert_eq!(draft_defaults(Some(&cleared), "p1", Some(&carry), None).model_selection, Some(carry.clone()));
+    assert_eq!(draft_defaults(Some(&cleared), "p1", Some(&carry), None, NOW).model_selection, Some(carry.clone()));
 
     let bare = config(json!({"providerInstances": {"devReplay": devreplay}}));
-    let first = draft_defaults(Some(&bare), "p1", None, None);
+    let first = draft_defaults(Some(&bare), "p1", None, None, NOW);
     assert_eq!(first.model_selection.map(|s| s.instance_id), Some("devReplay".into()));
     assert_eq!(first.runtime_mode, RuntimeMode::FullAccess);
-    assert_eq!(draft_defaults(None, "p1", None, None).model_selection, None);
+    assert_eq!(draft_defaults(None, "p1", None, None, NOW).model_selection, None);
 }
 
 #[test]
@@ -134,4 +146,28 @@ fn effective_selection_keeps_a_usable_choice_and_replaces_an_unusable_one() {
     let missing = ModelSelection { instance_id: "gone".into(), model: "x".into(), options: None };
     let replaced = effective_selection(&entries, Some(&missing)).unwrap();
     assert_eq!((replaced.instance_id.as_str(), replaced.model.as_str()), ("codex", "luna"));
+}
+
+#[test]
+fn a_spent_default_falls_back_when_the_fallback_can_take_work() {
+    let limits = |used: f64, resets: &str| json!({"checkedAt": "2026-11-02T09:00:00Z", "windows": [{"id": "weekly", "kind": "weekly", "label": "Weekly", "usedPercent": used, "resetsAt": resets}]});
+    let config = |codex_limits: serde_json::Value, claude_enabled: bool| -> ServerConfig {
+        serde_json::from_value(json!({
+            "providers": [
+                {"instanceId": "codex", "driver": "codex", "enabled": true, "installed": true, "status": "ready",
+                 "auth": {"status": "authenticated"}, "usageLimits": codex_limits,
+                 "models": [{"slug": "luna", "name": "Luna", "isCustom": false}]},
+                {"instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": claude_enabled, "installed": true, "status": "ready",
+                 "auth": {"status": "authenticated"}, "models": [{"slug": "opus", "name": "Opus", "isCustom": false}]}
+            ],
+            "settings": {"defaultModelSelection": {"instanceId": "codex", "model": "luna"},
+                         "fallbackModelSelection": {"instanceId": "claudeAgent", "model": "opus"}}
+        }))
+        .unwrap()
+    };
+    let model = |config: &ServerConfig| draft_defaults(Some(config), "p1", None, None, NOW).model_selection.map(|s| s.model);
+    assert_eq!(model(&config(limits(100.0, "2026-11-03T00:00:00Z"), true)), Some("opus".into()));
+    assert_eq!(model(&config(limits(100.0, "2026-11-01T00:00:00Z"), true)), Some("luna".into()));
+    assert_eq!(model(&config(limits(80.0, "2026-11-03T00:00:00Z"), true)), Some("luna".into()));
+    assert_eq!(model(&config(limits(100.0, "2026-11-03T00:00:00Z"), false)), Some("luna".into()));
 }

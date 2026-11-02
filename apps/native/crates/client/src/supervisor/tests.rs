@@ -86,3 +86,34 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     assert_eq!(thread["payload"]["afterSequence"], 6);
     assert_eq!(thread["payload"]["threadId"], "t1");
 }
+
+
+async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, oneshot::Sender<Result<Value, RpcError>>) {
+    match rx.recv().await {
+        Some(Command::Dispatch { command, reply }) => (command, reply),
+        _ => panic!("expected a dispatch"),
+    }
+}
+
+#[tokio::test]
+async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
+    let (commands, mut rx) = mpsc::unbounded_channel();
+    let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() });
+    let handle = ClientHandle { commands, credentials };
+    let sends = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
+    let run = tokio::spawn(async move { handle.dispatch_in_order(sends).await });
+
+    let (first, reply) = next_dispatch(&mut rx).await;
+    assert_eq!(first["n"], 1);
+    tokio::task::yield_now().await;
+    assert!(rx.try_recv().is_err(), "the second command went out before the first committed");
+    let _ = reply.send(Ok(json!({"sequence": 1})));
+
+    let (second, reply) = next_dispatch(&mut rx).await;
+    assert_eq!(second["n"], 2);
+    let _ = reply.send(Err(RpcError::Closed));
+
+    let result = run.await.unwrap();
+    assert!(matches!(result, Err((1, RpcError::Closed))));
+    assert!(rx.try_recv().is_err(), "a command after the failure still went out");
+}

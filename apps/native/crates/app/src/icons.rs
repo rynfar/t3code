@@ -1,7 +1,8 @@
 //! Lucide icons vendored at the web's version (`lucide-react` 0.564.0) with the web's stroke
 //! baked in (design system §8): 1.75 by default, 2 under `stroke-2/` for work-row icons. The
-//! composer's own glyphs (send arrow, stop square, filled star and bolt) live under `composer/`.
-//! The asset source also serves gpui-component's own icons, which its `IconName` widgets load.
+//! composer's own glyphs (send arrow, stop square, filled star and bolt) live under `composer/`,
+//! and provider brand marks under `providers/`. The asset source also serves gpui-component's own
+//! icons, which its `IconName` widgets load.
 
 use std::borrow::Cow;
 
@@ -154,12 +155,59 @@ impl Icon {
     }
 }
 
+/// How a provider's brand mark draws (`ProviderInstanceIcon`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderLogo {
+    /// One color taken from the surrounding text, like a Lucide icon (Codex).
+    Mono(&'static str),
+    /// Fixed fills drawn with `img()`, one file per theme.
+    Image { light: &'static str, dark: &'static str },
+}
+
+macro_rules! provider_logos {
+    (mono: [$($mono:literal),*], image: [$($image:literal => $file:literal),*], themed: [$($themed:literal),*] $(,)?) => {
+        const PROVIDER_FILES: &[(&str, &[u8])] = &[
+            $((concat!("icons/providers/", $mono, ".svg"), include_bytes!(concat!("../assets/icons/providers/", $mono, ".svg"))),)*
+            $((concat!("icons/providers/", $file), include_bytes!(concat!("../assets/icons/providers/", $file))),)*
+            $(
+                (concat!("icons/providers/", $themed, "-light.svg"), include_bytes!(concat!("../assets/icons/providers/", $themed, "-light.svg"))),
+                (concat!("icons/providers/", $themed, "-dark.svg"), include_bytes!(concat!("../assets/icons/providers/", $themed, "-dark.svg"))),
+            )*
+        ];
+
+        /// The brand mark vendored for a driver (`scripts/vendor-icons.ts --providers`), if any.
+        pub fn provider_logo(driver: &str) -> Option<ProviderLogo> {
+            match driver {
+                $($mono => Some(ProviderLogo::Mono(concat!("icons/providers/", $mono, ".svg"))),)*
+                $($image => Some(ProviderLogo::Image { light: concat!("icons/providers/", $file), dark: concat!("icons/providers/", $file) }),)*
+                $($themed => Some(ProviderLogo::Image {
+                    light: concat!("icons/providers/", $themed, "-light.svg"),
+                    dark: concat!("icons/providers/", $themed, "-dark.svg"),
+                }),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+provider_logos! {
+    mono: ["codex"],
+    image: ["claudeAgent" => "claudeAgent.svg", "antigravity" => "antigravity.png"],
+    themed: ["cursor", "grok", "fx", "opencode", "muse", "pi"],
+}
+
 /// Serves the vendored icons to GPUI.
 pub struct Assets;
 
+impl Assets {
+    fn files() -> impl Iterator<Item = &'static (&'static str, &'static [u8])> {
+        FILES.iter().chain(PROVIDER_FILES)
+    }
+}
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        match FILES.iter().find(|(candidate, _)| *candidate == path) {
+        match Self::files().find(|(candidate, _)| *candidate == path) {
             Some((_, bytes)) => Ok(Some(Cow::Borrowed(*bytes))),
             None => gpui_component_assets::Assets.load(path),
         }
@@ -167,7 +215,7 @@ impl AssetSource for Assets {
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
         let mut paths = gpui_component_assets::Assets.list(path)?;
-        paths.extend(FILES.iter().filter(|(candidate, _)| candidate.starts_with(path)).map(|(candidate, _)| SharedString::from(*candidate)));
+        paths.extend(Self::files().filter(|(candidate, _)| candidate.starts_with(path)).map(|(candidate, _)| SharedString::from(*candidate)));
         Ok(paths)
     }
 }

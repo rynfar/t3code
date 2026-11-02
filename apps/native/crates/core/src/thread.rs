@@ -59,6 +59,11 @@ pub struct AppThread {
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub lineage: Lineage,
+    #[serde(default)]
+    pub active_provider_thread_id: Option<String>,
+    /// `native`, or `v1_import` for threads migrated from the first orchestration engine.
+    #[serde(default)]
+    pub history_origin: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
@@ -73,6 +78,8 @@ pub struct Run {
     pub ordinal: u64,
     pub provider_instance_id: String,
     pub model_selection: ModelSelection,
+    #[serde(default)]
+    pub provider_thread_id: Option<String>,
     pub user_message_id: String,
     pub root_node_id: Option<String>,
     pub status: String,

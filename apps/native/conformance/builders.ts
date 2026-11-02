@@ -253,6 +253,7 @@ function recordsFor(items: ReadonlyArray<Item>) {
 const baseThread = {
   ...Fixtures.v2Projection.thread,
   lineage: { ...Fixtures.v2Projection.thread.lineage, sideChat: false },
+  historyOrigin: "native" as const,
 };
 
 export function projectionOf(

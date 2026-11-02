@@ -6,7 +6,8 @@
 //! `web/src/components/chat/modelPickerSearch.ts`.
 
 use crate::model::ModelSelection;
-use crate::server_config::{ProviderModel, ServerConfig, ServerProvider, ServerSettings};
+use crate::server_config::{ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow};
+use crate::sidebar::time::parse_iso;
 
 /// Drivers whose instances are off until configured (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
 const DEFAULT_DISABLED_DRIVERS: [&str; 7] = ["cursor", "grok", "fx", "muse", "pi", "opencode", "antigravity"];
@@ -77,6 +78,38 @@ pub fn initials(label: &str) -> String {
         [word] => word.chars().take(2).collect::<String>().to_uppercase(),
         [first, second, ..] => [first, second].iter().filter_map(|word| word.chars().next()).collect::<String>().to_uppercase(),
     }
+}
+
+/// `normalizeProviderAccentColor`: a configured `#rrggbb`, as `0xrrggbbff`.
+pub fn accent_color(provider: &ServerProvider) -> Option<u32> {
+    let hex = provider.accent_color.as_deref()?.trim().strip_prefix('#')?;
+    (hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| u32::from_str_radix(hex, 16).ok().map(|rgb| (rgb << 8) | 0xff))
+        .flatten()
+}
+
+/// `providerAccentForegroundColor`: whether black reads better than white on the accent.
+pub fn accent_wants_black(rgba: u32) -> bool {
+    let channel = |shift: u32| {
+        let value = ((rgba >> shift) & 0xff) as f64 / 255.0;
+        if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    };
+    let luminance = 0.2126 * channel(24) + 0.7152 * channel(16) + 0.0722 * channel(8);
+    (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05)
+}
+
+/// `shouldShowInstanceBadge`: an accent, or another enabled instance of the same driver, earns the
+/// instance a badge so the two can be told apart.
+pub fn shows_instance_badge(entry: &ProviderEntry, entries: &[ProviderEntry]) -> bool {
+    if accent_color(entry.provider).is_some() {
+        return true;
+    }
+    entries
+        .iter()
+        .filter(|candidate| candidate.driver() == entry.driver())
+        .filter(|candidate| !entry.enabled || candidate.enabled)
+        .count()
+        > 1
 }
 
 /// `resolveProjectProviderInstanceEnabled`.
@@ -203,6 +236,66 @@ pub fn favorites(settings: &ServerSettings) -> &[crate::server_config::ModelFavo
 
 pub fn is_favorite(settings: &ServerSettings, instance_id: &str, slug: &str) -> bool {
     favorites(settings).iter().any(|favorite| favorite.provider == instance_id && favorite.model == slug)
+}
+
+fn family<'a>(id: &'a str, families: &[&'a str]) -> Option<&'a str> {
+    families.iter().copied().find(|family| id.strip_prefix(family).is_some_and(|rest| rest.starts_with('-')))
+}
+
+/// `exhaustedUsageWindow`: a spent quota that has not reset, matched to the model's pool for
+/// providers that bill models from separate pools.
+pub fn exhausted_window<'a>(provider: &'a ServerProvider, now_ms: i64, model: &str) -> Option<&'a UsageWindow> {
+    let windows = provider.usage_limits.as_ref().map(|limits| limits.windows.as_slice()).unwrap_or_default();
+    let mut exhausted = windows.iter().filter(|window| {
+        window.used_percent >= 100.0
+            && window.resets_at.as_deref().and_then(parse_iso).is_none_or(|resets| resets > now_ms)
+    });
+    match provider.driver.as_str() {
+        "cursor" => {
+            let windows: Vec<&UsageWindow> = exhausted.collect();
+            let api = windows.iter().copied().find(|window| window.id == "apiPercentUsed");
+            let auto = windows.iter().copied().find(|window| window.id == "autoPercentUsed");
+            let cursor_pool = ["auto", "default", "grok", "composer"].iter().any(|prefix| model.starts_with(prefix));
+            if cursor_pool { auto.and(api) } else { api }
+        }
+        "antigravity" => {
+            let model_family = family(model, &["gemini", "claude", "gpt"]);
+            exhausted.find(|window| {
+                let pool = family(&window.id, &["gemini", "claude", "gpt", "3p"]);
+                match (pool, model_family) {
+                    (None, _) | (_, None) => true,
+                    (Some(pool), Some(model_family)) => {
+                        pool == model_family || (pool == "3p" && matches!(model_family, "claude" | "gpt"))
+                    }
+                }
+            })
+        }
+        "opencode" => exhausted.find(|window| !window.id.starts_with("go_") || model.starts_with("opencode-go/")),
+        _ => exhausted.next(),
+    }
+}
+
+/// `resolveNewThreadModelSelection`: a default whose quota is spent gives way to the configured
+/// fallback, when the fallback can take work. Returns the selection and whether it fell back.
+pub fn with_usage_fallback(
+    config: &ServerConfig,
+    project_id: Option<&str>,
+    default: Option<ModelSelection>,
+    now_ms: i64,
+) -> (Option<ModelSelection>, bool) {
+    let (Some(selection), Some(fallback)) = (default.as_ref(), config.settings.fallback_model_selection.as_ref()) else {
+        return (default, false);
+    };
+    let exhausted = config.provider(&selection.instance_id).and_then(|provider| exhausted_window(provider, now_ms, &selection.model));
+    let usable = config.provider(&fallback.instance_id).is_some_and(|provider| {
+        provider.enabled
+            && provider.installed
+            && provider.auth.status != "unauthenticated"
+            && provider.is_available()
+            && exhausted_window(provider, now_ms, &fallback.model).is_none()
+            && instance_enabled(&config.settings, project_id, &provider.instance_id)
+    });
+    if exhausted.is_some() && usable { (Some(fallback.clone()), true) } else { (default, false) }
 }
 
 fn strip_leading_qualifier<'a>(value: &'a str, qualifier: Option<&str>) -> &'a str {
