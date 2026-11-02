@@ -3,6 +3,7 @@ pub mod client_settings;
 pub mod commands;
 pub mod compatibility;
 pub mod composer;
+pub mod device;
 pub mod diff;
 pub mod families;
 pub mod files;

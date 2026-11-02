@@ -36,6 +36,7 @@ const SURFACE_ACTIONS: &[SurfaceAction] = &[
     SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface, unavailable: always },
     SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: always },
     SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: always },
+    SurfaceAction { label: "Device", icon: Icon::Smartphone, shortcut: "M", open: crate::device::add_device_surface, unavailable: always },
 ];
 
 /// Opens the launcher entry named `label` (case-insensitive), as clicking it would.
@@ -56,6 +57,22 @@ pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<Ap
         state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, tab));
         return true;
     }
+    // `launcher`: the panel open with no tab; `device:list`: the device tab without the
+    // launcher's setup gate, so setup shows over it while devices are off.
+    match label {
+        "launcher" => {
+            state.mutate_panels(cx, |panels, thread| {
+                panels.panels.close_all_surfaces(thread);
+                panels.panels.toggle_visibility(thread)
+            });
+            return true;
+        }
+        "device:list" => {
+            state.mutate_panels(cx, |panels, thread| panels.panels.open(thread, Surface::device(None)));
+            return true;
+        }
+        _ => {}
+    }
     let Some(action) = SURFACE_ACTIONS.iter().find(|action| action.label.eq_ignore_ascii_case(label)) else { return false };
     (action.open)(state, cx);
     true
@@ -69,6 +86,7 @@ fn surface_icon(surface: &Surface) -> Icon {
         SurfaceKind::File { .. } => Icon::File,
         SurfaceKind::SideChat { .. } => Icon::MessagesSquare,
         SurfaceKind::Preview { .. } => Icon::Earth,
+        SurfaceKind::Device { .. } => Icon::Smartphone,
     }
 }
 

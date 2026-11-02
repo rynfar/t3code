@@ -60,6 +60,8 @@ pub struct RightPanelView {
     side_chats: Vec<Entity<crate::side_chat::SideChatPane>>,
     /// One pane per open browser tab of the showing thread; only the active one streams.
     previews: Vec<Entity<crate::preview::PreviewPane>>,
+    /// One pane per open device tab of the showing thread; only the active one streams.
+    devices: Vec<Entity<crate::device::DevicePane>>,
     _save_width: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -88,7 +90,7 @@ impl RightPanelView {
             }
             _ => {}
         });
-        RightPanelView { state, diff, pull_requests, files, side_chats: Vec::new(), previews: Vec::new(), _save_width: None, _subscription: subscription }
+        RightPanelView { state, diff, pull_requests, files, side_chats: Vec::new(), previews: Vec::new(), devices: Vec::new(), _save_width: None, _subscription: subscription }
     }
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
@@ -138,6 +140,31 @@ impl RightPanelView {
         }
     }
 
+    /// Keeps a pane per device tab of the showing thread, and lets only the one in front stream.
+    fn sync_devices(&mut self, thread_id: Option<&str>, panel: Option<&ThreadPanel>, cx: &mut Context<Self>) {
+        let front = panel.filter(|panel| panel.is_open).and_then(|panel| panel.active_surface_id.as_deref());
+        self.devices.retain(|pane| {
+            let pane = pane.read(cx);
+            thread_id == Some(pane.thread_id()) && panel.is_some_and(|panel| panel.surfaces.iter().any(|surface| surface.id == pane.surface_id()))
+        });
+        for pane in &self.devices {
+            let visible = front == Some(pane.read(cx).surface_id());
+            pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
+        }
+    }
+
+    fn device_pane(&mut self, thread_id: &str, surface: &Surface, cx: &mut Context<Self>) -> Option<Entity<crate::device::DevicePane>> {
+        if let Some(pane) = self.devices.iter().find(|pane| pane.read(cx).surface_id() == surface.id) {
+            return Some(pane.clone());
+        }
+        let devices = crate::device::devices(cx)?;
+        let (state, thread_id, surface_id) = (self.state.clone(), thread_id.to_owned(), surface.id.clone());
+        let pane = cx.new(|cx| crate::device::DevicePane::new(state, devices, thread_id, surface_id, cx));
+        pane.update(cx, |pane, cx| pane.set_visible(true, cx));
+        self.devices.push(pane.clone());
+        Some(pane)
+    }
+
     fn preview_pane(&mut self, thread_id: &str, surface: &Surface, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<crate::preview::PreviewPane>> {
         if let Some(pane) = self.previews.iter().find(|pane| pane.read(cx).surface_id() == surface.id) {
             return Some(pane.clone());
@@ -182,6 +209,7 @@ impl Render for RightPanelView {
         let thread_id = state.selected_thread.clone();
         let panel = thread_id.as_deref().map(|thread_id| state.panels.panels.panel(thread_id).clone());
         self.sync_previews(thread_id.as_deref(), panel.as_ref(), window, cx);
+        self.sync_devices(thread_id.as_deref(), panel.as_ref(), cx);
         let state = self.state.read(cx);
         let (Some(thread_id), Some(panel)) = (thread_id, panel) else { return div().into_any_element() };
         if !panel.is_open {
@@ -204,6 +232,11 @@ impl Render for RightPanelView {
             Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, window, cx).into_any_element(),
             // Cached: frames repaint the page view inside, not the panel around it.
             Some(SurfaceKind::Preview { .. }) => match panel.active().and_then(|surface| self.preview_pane(&thread_id, surface, window, cx)) {
+                Some(pane) => pane.cached(StyleRefinement::default().size_full()).into_any_element(),
+                None => div().into_any_element(),
+            },
+            // Cached: frames repaint the device screen inside, not the panel around it.
+            Some(SurfaceKind::Device { .. }) => match panel.active().and_then(|surface| self.device_pane(&thread_id, surface, cx)) {
                 Some(pane) => pane.cached(StyleRefinement::default().size_full()).into_any_element(),
                 None => div().into_any_element(),
             },

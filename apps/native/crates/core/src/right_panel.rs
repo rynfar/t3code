@@ -3,8 +3,8 @@
 //! (`upsertSurface`, `toggle`, `closeSurface`, `closeOtherSurfaces`, `closeSurfacesToRight`,
 //! `closeAllSurfaces`, `moveSurface`, `setMaximized`), `apps/web/src/closedViewStore.ts` and
 //! `planNextReopen` from `apps/web/src/reopenClosedView.ts`, with the file surfaces' `openFile` and
-//! `navigateFolder`, and the browser tabs' `openBrowser` and `reconcileBrowserSurfaces`. Other
-//! surfaces plug in as new `Surface` variants.
+//! `navigateFolder`, the browser tabs' `openBrowser` and `reconcileBrowserSurfaces`, and the device
+//! tabs' `openDevice`. Other surfaces plug in as new `Surface` variants.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,6 +42,23 @@ pub enum SurfaceKind {
     /// A browser tab: `browser:<tab>` for a preview session, `browser:new` before one opens.
     #[serde(rename_all = "camelCase")]
     Preview { resource_id: Option<String> },
+    /// A device tab: `device` while it lists devices, `device:<host>:<device>` once one opened.
+    Device {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<DeviceTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+}
+
+/// `DeviceTabTarget`: the device a tab shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceTarget {
+    pub host_id: String,
+    pub device_id: String,
+    pub platform: crate::device::Platform,
+    pub name: String,
 }
 
 /// `normalizeRevealLine`: a positive whole line, anything else none.
@@ -83,6 +100,15 @@ impl Surface {
         }
     }
 
+    /// The device tab: the `device` placeholder, or the one keyed by its device.
+    pub fn device(target: Option<DeviceTarget>) -> Surface {
+        let id = match &target {
+            Some(target) => format!("device:{}:{}", crate::device::encode_component(&target.host_id), crate::device::encode_component(&target.device_id)),
+            None => DEVICE_PLACEHOLDER_ID.to_owned(),
+        };
+        Surface { id, kind: SurfaceKind::Device { target, title: None } }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -107,6 +133,7 @@ impl Surface {
             }
             SurfaceKind::SideChat { .. } => "Side chat".to_owned(),
             SurfaceKind::Preview { .. } => "Browser".to_owned(),
+            SurfaceKind::Device { target, title } => title.clone().or_else(|| target.as_ref().map(|target| target.name.clone())).unwrap_or_else(|| "Device".to_owned()),
         }
     }
 
@@ -194,6 +221,7 @@ pub struct ClosedView {
 
 const CLOSED_VIEW_LIMIT: usize = 20;
 const BROWSER_PLACEHOLDER_ID: &str = "browser:new";
+const DEVICE_PLACEHOLDER_ID: &str = "device";
 
 /// `usePreviewPanelInlineSize`: the inline panel's default and minimum width.
 pub const DEFAULT_WIDTH: f32 = 540.;
@@ -346,6 +374,11 @@ impl RightPanels {
         self.update(thread_id, |panel| panel.is_open = !panel.is_open)
     }
 
+    /// `show`: the panel opens, on the launcher when it has no tab.
+    pub fn show(&mut self, thread_id: &str) -> bool {
+        self.update(thread_id, |panel| panel.is_open = true)
+    }
+
     pub fn hide(&mut self, thread_id: &str) -> bool {
         self.update(thread_id, |panel| panel.is_open = false)
     }
@@ -485,6 +518,21 @@ impl RightPanels {
                 panel.surfaces.retain(|surface| surface.id != BROWSER_PLACEHOLDER_ID);
             }
             panel.upsert(Surface::browser(tab_id));
+        })
+    }
+
+    /// `openDevice`: an opened device's tab takes the `device` placeholder's place, or, when the
+    /// device already has a tab, the placeholder goes and that tab comes to the front.
+    pub fn open_device(&mut self, thread_id: &str, target: DeviceTarget) -> bool {
+        let surface = Surface::device(Some(target));
+        self.update(thread_id, |panel| {
+            let existing = panel.surfaces.iter().any(|entry| entry.id == surface.id);
+            if existing {
+                panel.surfaces.retain(|entry| entry.id != DEVICE_PLACEHOLDER_ID);
+            } else if let Some(placeholder) = panel.surfaces.iter_mut().find(|entry| entry.id == DEVICE_PLACEHOLDER_ID) {
+                *placeholder = surface.clone();
+            }
+            panel.upsert(surface);
         })
     }
 

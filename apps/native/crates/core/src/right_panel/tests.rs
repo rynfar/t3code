@@ -170,7 +170,7 @@ fn persisted_state_drops_unknown_surfaces() {
         "threads": { "t": { "isOpen": true, "activeSurfaceId": "diff",
             "surfaces": [{ "id": "terminal:1", "kind": "terminal", "terminalIds": ["1"] }, { "id": "diff", "kind": "diff" }] } },
         "widths": { "t": 480.0 },
-        "closed": [{ "threadId": "t", "surface": { "id": "device", "kind": "device" } },
+        "closed": [{ "threadId": "t", "surface": { "id": "terminal:2", "kind": "terminal" } },
                    { "threadId": "t", "surface": { "id": "diff", "kind": "diff" } }]
     }"#;
     let panels: RightPanels = serde_json::from_str(json).expect("decode");
@@ -200,7 +200,7 @@ fn persisted_state_survives_bad_entries_and_repairs_the_active_tab() {
                 "surfaces": [{ "id": "terminal:1", "kind": "terminal" }, { "id": "diff", "kind": "diff" }] },
             "hidden": { "isOpen": false, "activeSurfaceId": "gone", "surfaces": [{ "id": "diff", "kind": "diff" }] },
             "broken": "not a panel",
-            "emptied": { "isOpen": true, "activeSurfaceId": "device", "surfaces": [{ "id": "device", "kind": "device" }] }
+            "emptied": { "isOpen": true, "activeSurfaceId": "terminal:2", "surfaces": [{ "id": "terminal:2", "kind": "terminal" }] }
         },
         "widths": { "kept": 480, "bad": "wide" },
         "closed": "nope"
@@ -313,4 +313,38 @@ fn browser_tabs_persist_in_the_web_shape() {
     assert_eq!(value, serde_json::json!({ "id": "browser:a", "kind": "preview", "resourceId": "a" }));
     let placeholder: Surface = serde_json::from_value(serde_json::json!({ "id": "browser:new", "kind": "preview", "resourceId": null })).unwrap();
     assert_eq!(placeholder, Surface::browser(None));
+}
+
+#[test]
+fn an_opened_device_takes_the_placeholder_tab_or_fronts_its_own() {
+    use crate::device::Platform;
+    let target = |device: &str| DeviceTarget { host_id: "local".into(), device_id: device.into(), platform: Platform::Ios, name: format!("iPhone {device}") };
+    let mut panels = RightPanels::default();
+    panels.open("t", Surface::diff());
+    panels.open("t", Surface::device(None));
+    panels.open("t", Surface::files());
+    // The placeholder becomes the device's tab in place.
+    assert!(panels.open_device("t", target("A 1")));
+    assert_eq!(ids(&panels, "t"), ["diff", "device:local:A%201", "files"]);
+    assert_eq!(panels.panel("t").active_surface_id.as_deref(), Some("device:local:A%201"));
+    assert_eq!(panels.panel("t").active().map(Surface::title).as_deref(), Some("iPhone A 1"));
+    // A second list opening the same device drops the list and fronts the existing tab.
+    panels.open("t", Surface::device(None));
+    panels.activate("t", "diff");
+    panels.activate("t", "device");
+    assert!(panels.open_device("t", target("A 1")));
+    assert_eq!(ids(&panels, "t"), ["diff", "device:local:A%201", "files"]);
+    assert_eq!(panels.panel("t").active_surface_id.as_deref(), Some("device:local:A%201"));
+    // Without a placeholder the device gets a new tab.
+    assert!(panels.open_device("t", target("B")));
+    assert_eq!(ids(&panels, "t"), ["diff", "device:local:A%201", "files", "device:local:B"]);
+    // Tabs persist and restore with their target.
+    let restored = RightPanels::from_value(&serde_json::to_value(&panels).unwrap());
+    assert_eq!(restored.panel("t").surfaces, panels.panel("t").surfaces);
+    assert_eq!(Surface::device(None).title(), "Device");
+    // Dismissing setup over the last tab keeps the panel open on the launcher.
+    let mut panels = RightPanels::default();
+    panels.open("t", Surface::device(None));
+    assert!(panels.close_surface("t", "device") | panels.show("t"));
+    assert!(panels.is_open("t") && panels.panel("t").surfaces.is_empty());
 }
