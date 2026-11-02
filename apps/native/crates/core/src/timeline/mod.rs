@@ -7,6 +7,7 @@ mod activity;
 mod compaction;
 mod detail;
 mod entries;
+mod changed_files;
 mod find;
 mod folds;
 mod presentation;
@@ -36,6 +37,10 @@ pub use presentation::{
     SummaryKind, ToolGroupAction, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args,
     summary_icon, summarize_tool_group, tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label,
     work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_log_entry_is_tool_like,
+};
+pub use changed_files::{
+    ChangedFileRow, DiffStat, TreeNode, changed_file_rows, changed_file_tree, changed_files_label, directory_paths, has_directories, hidden_files_label,
+    turn_diffs_by_message,
 };
 pub use find::{FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, SEARCH_THREAD, bar_label, decode_result, format_count, search_request, step_index, step_locally};
 pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};

@@ -237,6 +237,7 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         .px(px(4.))
         .py(px(2.))
         .child(prose(&state, cx))
+        .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
         .when(show_meta || show_timestamp, |this| {
             this.child(div().mt(px(6.)).child(assistant_meta(message, show_meta && show_copy, copy_streaming, false, &env.clock, cx)))
         })

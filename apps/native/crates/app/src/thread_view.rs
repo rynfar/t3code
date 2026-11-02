@@ -17,8 +17,9 @@ use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement
 use t3_core::history::HistoryControl;
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
-    derive_rows, detail_request, detail_revision, needs_detail_fetch, rows_equal, update_entries,
+    derive_rows, detail_request, detail_revision, needs_detail_fetch, rows_equal, turn_diffs_by_message, update_entries,
 };
+use t3_core::diff::TurnDiffSummary;
 
 use crate::app_state::{AppEvent, AppState};
 use crate::theme::{hsla, palette};
@@ -46,6 +47,9 @@ pub struct ThreadView {
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
     footer: status::ThreadFooter,
+    turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
+    /// What `turn_diffs` was derived from: the message count and the checkpoints.
+    turn_diff_source: Option<(usize, Vec<t3_core::thread::Entity>)>,
     banners: status::Banners,
     /// A failure from an action taken here, shown in the error banner like the web's local error.
     local_error: Option<String>,
@@ -79,6 +83,8 @@ impl ThreadView {
             working_timer: None,
             find: None,
             footer: status::ThreadFooter::default(),
+            turn_diffs: HashMap::new(),
+            turn_diff_source: None,
             banners: status::Banners::default(),
             local_error: None,
             clock: Clock::now(),
@@ -109,6 +115,8 @@ impl ThreadView {
             self.history = None;
             self.find = None;
             self.reset_status();
+            self.turn_diffs.clear();
+            self.turn_diff_source = None;
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -127,6 +135,7 @@ impl ThreadView {
         }
         self.sync_history(cx);
         self.rederive(cx);
+        self.sync_turn_diffs(cx);
         self.sync_status(cx);
         self.refresh_open_details(cx);
         self.refresh_find_after_change(cx);
@@ -294,6 +303,49 @@ impl ThreadView {
         self.state.update(cx, |state, cx| state.select_thread(thread_id, cx));
     }
 
+    /// Re-derives the changed-files cards when the checkpoints or messages change, remeasuring
+    /// only the assistant rows whose card appeared, changed or went.
+    fn sync_turn_diffs(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(projection) = state.thread.projection.as_ref() else { return };
+        if self.turn_diff_source.as_ref().is_some_and(|(messages, checkpoints)| *messages == projection.messages.len() && *checkpoints == projection.checkpoints) {
+            return;
+        }
+        let next = turn_diffs_by_message(projection);
+        self.turn_diff_source = Some((projection.messages.len(), projection.checkpoints.clone()));
+        let changed: std::collections::HashSet<String> = next
+            .iter()
+            .filter(|(id, summary)| self.turn_diffs.get(*id).is_none_or(|old| old != *summary))
+            .map(|(id, _)| id.clone())
+            .chain(self.turn_diffs.keys().filter(|id| !next.contains_key(*id)).cloned())
+            .collect();
+        self.turn_diffs = next;
+        if !changed.is_empty() {
+            self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if changed.contains(&message.id)));
+            cx.notify();
+        }
+    }
+
+    pub fn open_turn_diff(&mut self, run_id: &str, file_path: Option<&str>, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| state.open_turn_diff(run_id, file_path, cx));
+    }
+
+    /// Expand or Collapse all folders; a folder's own toggle resets with it, as on the web.
+    pub fn toggle_changed_files_all(&mut self, run_id: &str, message_id: &str, cx: &mut Context<Self>) {
+        toggle(&mut self.ui.changed_files_open, run_id);
+        self.ui.changed_file_dirs.remove(run_id);
+        self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if message.id == message_id));
+        cx.notify();
+    }
+
+    pub fn toggle_changed_dir(&mut self, run_id: &str, path: &str, all_expanded: bool, message_id: &str, cx: &mut Context<Self>) {
+        let dirs = self.ui.changed_file_dirs.entry(run_id.to_owned()).or_default();
+        let open = dirs.get(path).copied().unwrap_or(all_expanded);
+        dirs.insert(path.to_owned(), !open);
+        self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if message.id == message_id));
+        cx.notify();
+    }
+
     fn remeasure_where(&self, matches: impl Fn(&TimelineRow) -> bool) {
         let offset = self.header_count();
         for (index, row) in self.rows.iter().enumerate() {
@@ -315,6 +367,7 @@ impl ThreadView {
             group_lists: &self.group_lists,
             working_timer: self.working_timer.as_ref(),
             find_target: self.find.as_ref().and_then(|find| find.active_entry()),
+            turn_diffs: &self.turn_diffs,
         };
         render(&env, &mut self.markdown)
     }

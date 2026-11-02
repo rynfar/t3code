@@ -1032,3 +1032,61 @@ fn relative_labels_match_the_web() {
     assert_eq!(relative_time_label(3 * 3_600_000), "3h ago");
     assert_eq!(relative_time_label(49 * 3_600_000), "2d ago");
 }
+
+fn checkpoint_file(path: &str, additions: u64, deletions: u64) -> crate::diff::CheckpointFile {
+    serde_json::from_value(serde_json::json!({ "path": path, "kind": "modified", "additions": additions, "deletions": deletions })).expect("file")
+}
+
+/// `buildTurnDiffTree`: directories before files, numeric name order, merged single-child chains.
+#[test]
+fn the_changed_files_tree_matches_the_web() {
+    let files = [
+        checkpoint_file("src/b10.ts", 1, 0),
+        checkpoint_file("README.md", 2, 2),
+        checkpoint_file("src/B2.ts", 3, 1),
+        checkpoint_file("apps/web/src/index.ts", 4, 0),
+        checkpoint_file("apps/web/src/lib/x.ts", 1, 1),
+    ];
+    let tree = changed_file_tree(&files);
+    let names: Vec<(&str, &str, DiffStat)> = tree
+        .iter()
+        .map(|node| match node {
+            TreeNode::Directory { name, path, stat, .. } | TreeNode::File { name, path, stat } => (name.as_str(), path.as_str(), *stat),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("apps/web/src", "apps/web/src", DiffStat { additions: 5, deletions: 1 }),
+            ("src", "src", DiffStat { additions: 4, deletions: 1 }),
+            ("README.md", "README.md", DiffStat { additions: 2, deletions: 2 }),
+        ]
+    );
+    let TreeNode::Directory { children, .. } = &tree[1] else { panic!("src is a directory") };
+    assert_eq!(children.iter().cloned().filter_map(|child| match child { TreeNode::File { name, .. } => Some(name), _ => None }).collect::<Vec<_>>(), ["B2.ts", "b10.ts"]);
+
+    let collapsed = changed_file_rows(&tree, &std::collections::HashMap::new(), false);
+    assert_eq!(collapsed.len(), 3);
+    let open = changed_file_rows(&tree, &std::collections::HashMap::new(), true);
+    assert_eq!(open.iter().map(|row| row.depth).collect::<Vec<_>>(), [0, 1, 2, 1, 0, 1, 1, 0]);
+    let overrides = std::collections::HashMap::from([("src".to_owned(), true)]);
+    assert_eq!(changed_file_rows(&tree, &overrides, false).len(), 5);
+    assert_eq!(directory_paths(&tree).len(), 3);
+    assert_eq!((changed_files_label(1), changed_files_label(1_234), hidden_files_label(2)), ("1 changed file".into(), "1,234 changed files".into(), "2 more files in the full diff".into()));
+}
+
+/// `deriveThreadCheckpointSummaries`: a turn's summary rides on its run's last assistant message.
+#[test]
+fn a_turns_changed_files_ride_on_its_last_assistant_message() {
+    let mut projection = projection_json(serde_json::json!({}), serde_json::json!([]), serde_json::json!([]), serde_json::json!([]));
+    let message = |id: &str, role: &str, run: &str| crate::thread::Entity { id: id.into(), value: serde_json::json!({ "id": id, "role": role, "runId": run }) };
+    projection.messages = vec![message("u1", "user", "run-1"), message("a1", "assistant", "run-1"), message("a2", "assistant", "run-1"), message("a3", "assistant", "run-2")];
+    let checkpoint = |id: &str, run: &str, ordinal: u64, at: &str| crate::thread::Entity {
+        id: id.into(),
+        value: serde_json::json!({ "id": id, "runId": run, "appRunOrdinal": ordinal, "status": "ready", "capturedAt": at, "files": [{ "path": "a.ts", "kind": "modified", "additions": ordinal, "deletions": 0 }] }),
+    };
+    projection.checkpoints = vec![checkpoint("c1", "run-1", 1, "2026-01-01T00:00:01Z"), checkpoint("c3", "run-3", 3, "2026-01-01T00:00:03Z")];
+    let diffs = turn_diffs_by_message(&projection);
+    assert_eq!(diffs.keys().collect::<Vec<_>>(), ["a2"]);
+    assert_eq!(diffs["a2"].run_id, "run-1");
+}

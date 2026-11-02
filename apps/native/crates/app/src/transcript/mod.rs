@@ -1,6 +1,7 @@
 //! Transcript rows. Each `TimelineRow` from `t3_core::timeline` renders here, wrapped with the
 //! row spacing of `TimelineRowContent` and `WorkLogBlock` (`MessagesTimeline.tsx`, `WorkLog.tsx`).
 
+mod changed_files;
 pub mod markdown;
 mod messages;
 mod notices;
@@ -32,6 +33,10 @@ pub struct TranscriptUi {
     pub expanded_entries: HashSet<String>,
     pub expanded_messages: HashSet<String>,
     pub expanded_plans: HashSet<String>,
+    /// Changed-files cards with every folder open, by run.
+    pub changed_files_open: HashSet<String>,
+    /// Folders opened or closed against that, by run, then folder path.
+    pub changed_file_dirs: HashMap<String, HashMap<String, bool>>,
 }
 
 /// Withheld output fetched with `orchestration.getTurnItem`, keyed by item id.
@@ -62,6 +67,8 @@ pub struct RowEnv<'a> {
     pub working_timer: Option<&'a Entity<WorkingTimer>>,
     /// The entry holding find's active match, tinted where it draws.
     pub find_target: Option<&'a str>,
+    /// Each turn's changed files, by the assistant message that ends it.
+    pub turn_diffs: &'a HashMap<String, Arc<t3_core::diff::TurnDiffSummary>>,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.
