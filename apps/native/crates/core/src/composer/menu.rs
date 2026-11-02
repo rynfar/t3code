@@ -211,32 +211,9 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// `encodeURI`, then the characters a markdown destination cannot hold.
-fn encode_link_destination(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | ';' | ',' | '/' | ':' | '@' | '&' | '=' | '+' | '$' | '-' | '_' | '.'
-            | '!' | '~' | '*' | '\'' => out.push(c),
-            '(' => out.push_str("%28"),
-            ')' => out.push_str("%29"),
-            '#' => out.push_str("%23"),
-            '?' => out.push_str("%3F"),
-            _ => {
-                let mut buffer = [0u8; 4];
-                for byte in c.encode_utf8(&mut buffer).bytes() {
-                    out.push_str(&format!("%{byte:02X}"));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// `serializeComposerFileLink`: how a file mention reads in the message, `[name](path)`.
 pub fn serialize_file_link(path: &str) -> String {
-    let label = basename(path).replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
-    format!("[{label}]({})", encode_link_destination(path))
+    crate::files::composer_file_link(path)
 }
 
 /// What a file mention inserts: the link and a space.

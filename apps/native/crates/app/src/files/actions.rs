@@ -51,8 +51,7 @@ impl AppState {
         self.show_toast(Toast::new(ToastKind::Success, "Mention copied").description(path.to_owned()), cx);
     }
 
-    /// "Add to chat": queued for the composer like the file picker's mentions (which also copy
-    /// it while no composer drains the queue).
+    /// "Add to chat": queued for the composer like the file picker's mentions.
     pub fn add_file_to_chat(&mut self, path: &str, cx: &mut Context<Self>) {
         self.request_composer_mention(crate::project_files::ComposerMention { path: path.to_owned(), line: None }, cx);
     }
