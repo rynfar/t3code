@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{App, AppContext, ClipboardItem, Entity, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, div, px, rems};
+use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, div, px, rems};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
 
@@ -22,16 +22,23 @@ struct Cached {
     text: Arc<str>,
     state: Entity<TextViewState>,
     drawn: u64,
+    _repaint: Subscription,
 }
 
 /// Markdown states keyed by the row that shows them, created lazily when a row renders.
-#[derive(Default)]
 pub struct MarkdownStore {
     states: HashMap<String, Cached>,
     frame: u64,
+    owner: EntityId,
 }
 
 impl MarkdownStore {
+    /// `owner` is the view rendering these states. It is drawn `.cached()`, and a state's
+    /// background reparse notifies only the state, so each state re-notifies the owner.
+    pub fn new(owner: EntityId) -> Self {
+        Self { states: HashMap::new(), frame: 0, owner }
+    }
+
     /// Called once per transcript render, before rows draw.
     pub fn begin_frame(&mut self) {
         self.frame += 1;
@@ -56,7 +63,9 @@ impl MarkdownStore {
             return cached.state.clone();
         }
         let state = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
-        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame });
+        let owner = self.owner;
+        let repaint = cx.observe(&state, move |_, cx| cx.notify(owner));
+        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, _repaint: repaint });
         state
     }
 

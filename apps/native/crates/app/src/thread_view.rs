@@ -62,7 +62,7 @@ impl ThreadView {
             rows_cache: RowsCache::default(),
             activity: ThreadActivity::default(),
             ui: TranscriptUi::default(),
-            markdown: MarkdownStore::default(),
+            markdown: MarkdownStore::new(cx.entity_id()),
             thread_id: None,
             workspace_root: None,
             history: None,
