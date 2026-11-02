@@ -405,32 +405,44 @@ impl NativeChildStep {
 
 const EFFORT_OPTION_IDS: [&str; 6] = ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level"];
 
-/// `formatModelSelectionEffort`: the effort a subagent runs at, from what the provider reported
-/// first, else the selection. `variant` falls back to its default choice.
+/// `formatModelSelectionEffort`: the effort a subagent runs at, from the selection's explicit
+/// choice, else what the provider reported for the same model. A value the catalog lacks is
+/// not shown as its default (`getProviderOptionCurrentLabel`).
 pub fn effort_label(
     selection: &crate::model::ModelSelection,
     model: Option<&crate::server_config::ProviderModel>,
     reported: Option<&crate::model::ModelSelection>,
 ) -> Option<String> {
     use crate::server_config::OptionDescriptor;
-    use crate::traits::{OptionValue, current_label, resolve_descriptors, selections};
+    use crate::traits::{OptionValue, selections};
     let descriptors = &model?.capabilities.as_ref()?.option_descriptors;
-    let stated = |id: &str| {
-        let pick = |selection: Option<&crate::model::ModelSelection>| selections(selection?.options.as_ref()).into_iter().find(|option| option.id == id);
-        pick(reported).or_else(|| pick(Some(selection)))
-    };
+    let explicit = selections(selection.options.as_ref());
+    let reported = reported.filter(|reported| reported.instance_id == selection.instance_id && reported.model == selection.model).map(|reported| selections(reported.options.as_ref()));
     for id in EFFORT_OPTION_IDS {
-        let Some(descriptor @ OptionDescriptor::Select(_)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
-        let value = stated(id);
-        if value.is_none() && id != "variant" {
-            continue;
-        }
-        if value.as_ref().is_some_and(|value| matches!(value.value, OptionValue::Bool(_))) {
-            continue;
-        }
-        let resolved = resolve_descriptors(std::slice::from_ref(descriptor), &value.into_iter().collect::<Vec<_>>());
-        if let Some(label) = resolved.first().and_then(current_label) {
-            return Some(label);
+        let Some(OptionDescriptor::Select(descriptor)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
+        let chosen = explicit.iter().find(|option| option.id == id).map(|option| &option.value);
+        // `getReportedOptionValue`: only for options the selection leaves unstated.
+        let reported = reported.as_ref().filter(|_| chosen.is_none()).and_then(|options| options.iter().find(|option| option.id == id)).map(|option| &option.value);
+        let value = match chosen.or(reported) {
+            Some(OptionValue::Bool(_)) => continue,
+            Some(OptionValue::Str(value)) => Some(value.as_str()),
+            None if id == "variant" => None,
+            None => continue,
+        };
+        let current = match reported {
+            Some(OptionValue::Str(value)) => Some(value.as_str()),
+            _ if id == "variant" && chosen.is_none() => None,
+            _ => value.filter(|value| !value.is_empty()).or_else(|| descriptor.options.iter().find(|option| option.is_default).map(|option| option.id.as_str())),
+        };
+        let label = descriptor.options.iter().find(|option| Some(option.id.as_str()) == current).map(|option| option.label.clone()).or_else(|| {
+            if matches!(reported, Some(OptionValue::Str(value)) if value == "default") {
+                Some("Default".to_owned())
+            } else {
+                (id == "variant").then(|| "Unknown".to_owned())
+            }
+        });
+        if label.is_some() {
+            return label;
         }
     }
     None

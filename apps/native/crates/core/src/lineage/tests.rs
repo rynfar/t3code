@@ -312,7 +312,7 @@ fn commands_carry_the_fields_the_server_reads() {
 }
 
 #[test]
-fn effort_reads_the_reported_selection_first_and_variant_falls_back_to_its_default() {
+fn effort_prefers_the_explicit_choice_and_never_shows_an_unstated_default() {
     let model: crate::server_config::ProviderModel = serde_json::from_value(json!({
         "slug": "gpt", "name": "GPT", "isCustom": false,
         "capabilities": {"optionDescriptors": [
@@ -325,9 +325,26 @@ fn effort_reads_the_reported_selection_first_and_variant_falls_back_to_its_defau
     let chosen = selection(json!([{"id": "reasoningEffort", "value": "low"}]));
     assert_eq!(effort_label(&chosen, Some(&model), None).as_deref(), Some("Low"));
     let reported = selection(json!([{"id": "reasoningEffort", "value": "high"}]));
-    assert_eq!(effort_label(&chosen, Some(&model), Some(&reported)).as_deref(), Some("High"));
+    assert_eq!(effort_label(&chosen, Some(&model), Some(&reported)).as_deref(), Some("Low"), "an explicit choice outranks the report");
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), Some(&reported)).as_deref(), Some("High"));
+    let other: crate::model::ModelSelection = serde_json::from_value(json!({"instanceId": "codex", "model": "other", "options": [{"id": "reasoningEffort", "value": "high"}]})).expect("selection");
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), Some(&other)), None, "a report for another model is ignored");
+    let default = selection(json!([{"id": "reasoningEffort", "value": "default"}]));
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), Some(&default)).as_deref(), Some("Default"));
+    assert_eq!(effort_label(&selection(json!([{"id": "reasoningEffort", "value": "max"}])), Some(&model), None), None, "an unknown choice is not shown as the default");
     assert_eq!(effort_label(&selection(json!([])), Some(&model), None), None, "an unstated effort is not shown");
     assert_eq!(effort_label(&chosen, None, None), None);
+
+    let variant: crate::server_config::ProviderModel = serde_json::from_value(json!({
+        "slug": "gpt", "name": "GPT", "isCustom": false,
+        "capabilities": {"optionDescriptors": [
+            {"id": "variant", "label": "Reasoning", "type": "select", "options": [{"id": "none", "label": "None"}, {"id": "thinking", "label": "Thinking", "isDefault": true}]}
+        ]}
+    }))
+    .expect("model");
+    assert_eq!(effort_label(&selection(json!([])), Some(&variant), None).as_deref(), Some("Unknown"), "an unstated variant is not its default");
+    assert_eq!(effort_label(&selection(json!([{"id": "variant", "value": "none"}])), Some(&variant), None).as_deref(), Some("None"));
+    assert_eq!(effort_label(&selection(json!([{"id": "variant", "value": "gone"}])), Some(&variant), None).as_deref(), Some("Unknown"));
 }
 
 #[test]
