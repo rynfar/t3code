@@ -79,6 +79,17 @@ pub struct PendingBackgroundTask {
     pub awaited: Option<bool>,
 }
 
+/// `OrchestrationV2LimitRecovery`: what to do when a usage limit resets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitRecovery {
+    pub run_id: String,
+    pub reset_at: String,
+    pub auto_resume: bool,
+    #[serde(default)]
+    pub snooze: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadShell {
@@ -132,6 +143,8 @@ pub struct ThreadShell {
     pub pending_background_tasks: Vec<PendingBackgroundTask>,
     #[serde(default)]
     pub goal: Option<serde_json::Value>,
+    #[serde(default)]
+    pub limit_recovery: Option<LimitRecovery>,
     pub item_count: u64,
     pub visible_item_count: u64,
     pub created_at: String,

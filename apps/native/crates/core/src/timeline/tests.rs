@@ -863,3 +863,256 @@ fn fold_membership_names_the_fold_hiding_each_entry() {
     assert!(!runs.contains_key("assistant-final-entry"));
     assert!(attempts.is_empty());
 }
+
+fn projection_with(runs: serde_json::Value, items: serde_json::Value, sessions: serde_json::Value) -> crate::thread::ThreadProjection {
+    let mut projection = projection_json(serde_json::json!({}), runs, serde_json::json!([]), serde_json::json!([]));
+    projection.turn_items = serde_json::from_value::<Vec<crate::turn_item::TurnItem>>(items).expect("items").into_iter().map(Arc::new).collect();
+    projection.provider_sessions = serde_json::from_value(sessions).expect("sessions");
+    projection
+}
+
+fn status_run(id: &str, ordinal: u64, status: &str, started: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "ordinal": ordinal, "providerInstanceId": "codex", "modelSelection": { "instanceId": "codex", "model": "m" },
+        "userMessageId": "u", "rootNodeId": "root", "status": status, "requestedAt": "2026-01-01T00:00:00Z",
+        "startedAt": if started { serde_json::json!("2026-01-01T00:00:00Z") } else { serde_json::Value::Null },
+        "completedAt": if started && status != "running" { serde_json::json!("2026-01-01T00:00:05Z") } else { serde_json::Value::Null },
+    })
+}
+
+fn run_json(status: &str) -> serde_json::Value {
+    serde_json::json!([status_run("run-1", 1, status, true)])
+}
+
+fn item_json(id: &str, kind: serde_json::Value) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "id": id, "threadId": "t", "runId": "run-1", "nodeId": "root", "parentItemId": null, "ordinal": 1, "status": "failed",
+        "title": null, "startedAt": "2026-01-01T00:00:03Z", "completedAt": null, "updatedAt": "2026-01-01T00:00:04Z",
+    });
+    if let (Some(object), Some(extra)) = (item.as_object_mut(), kind.as_object()) {
+        object.extend(extra.clone());
+    }
+    item
+}
+
+fn limit_failure(reset_at: &str) -> serde_json::Value {
+    item_json("e1", serde_json::json!({
+        "type": "error",
+        "failure": { "class": "usage_limit", "message": "{\"error\":{\"message\":\"Limit hit\"}}", "code": "subscription_sharing_usage_limit_exceeded", "resetAt": reset_at, "retryable": null },
+    }))
+}
+
+fn status_shell(extra: serde_json::Value) -> crate::shell::ThreadShell {
+    let mut value = serde_json::json!({
+        "id": "t", "projectId": "p", "title": "T", "providerInstanceId": "codex",
+        "modelSelection": { "instanceId": "codex", "model": "m" }, "runtimeMode": "auto", "interactionMode": "default",
+        "branch": null, "worktreePath": null, "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t" },
+        "latestRunId": "run-1", "latestRunCompletedAt": "2026-01-01T00:00:05Z", "activeRunId": null, "status": "failed",
+        "pendingRuntimeRequest": null, "latestVisibleMessage": null, "latestUserMessageAt": null, "hasActionableProposedPlan": false,
+        "itemCount": 0, "visibleItemCount": 0, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:06Z",
+        "archivedAt": null, "settledOverride": null, "settledAt": null, "deletedAt": null,
+    });
+    if let (Some(object), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+        object.extend(extra.clone());
+    }
+    serde_json::from_value(value).expect("shell")
+}
+
+/// `threadErrorSummary`: the failed run's root failure, unless the session reports another error.
+#[test]
+fn the_error_banner_reads_the_failed_runs_root_failure() {
+    let failure = limit_failure("2026-01-01T05:00:00Z");
+    let error = thread_error(&projection_with(run_json("failed"), serde_json::json!([failure]), serde_json::json!([]))).expect("an error");
+    assert!(error.is_usage_limit() && error.chatgpt_limit() && !error.workspace_limit() && error.limit_blocked());
+    assert_eq!(error.reset_at.as_deref(), Some("2026-01-01T05:00:00Z"));
+    assert_eq!(error_banner_message(&error.message), "Limit hit");
+    assert!(error_can_expand(&error.message, &error_banner_message(&error.message)));
+    assert!(!error_can_expand("Short", "Short"));
+    let session = serde_json::json!([{ "id": "s", "providerInstanceId": "codex", "lastError": "Session crashed" }]);
+    let other = thread_error(&projection_with(run_json("failed"), serde_json::json!([failure]), session)).expect("an error");
+    assert_eq!((other.message.as_str(), other.class, other.reset_at), ("Session crashed", None, None));
+    assert!(thread_error(&projection_with(run_json("completed"), serde_json::json!([failure]), serde_json::json!([]))).is_none());
+}
+
+/// `usageLimitRunPresentedAsLatest`: queued runs that never started leave the limited run latest,
+/// and the recovery banner takes over from the error banner.
+#[test]
+fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
+    let runs = serde_json::json!([status_run("run-1", 1, "failed", true), status_run("run-2", 2, "queued", false)]);
+    let projection = projection_with(runs, serde_json::json!([limit_failure("2026-01-01T05:00:00Z")]), serde_json::json!([]));
+    assert_eq!(presented_latest_run(&projection).map(|run| run.id.as_str()), Some("run-1"));
+    let error = thread_error(&projection).expect("an error");
+    assert!(error.limit_blocked());
+    let shell = status_shell(serde_json::json!({}));
+    assert!(timeline_thread_error(Some(error.clone()), Some(&shell)).is_none());
+    assert!(timeline_thread_error(Some(error.clone()), Some(&status_shell(serde_json::json!({ "latestRunId": null })))).is_some());
+
+    let now = parse_iso_ms("2026-01-01T01:00:00Z").expect("now");
+    let recovery = limit_recovery(Some(&error), &shell, now).expect("recovery");
+    assert_eq!(recovery.id(), "usage-limit-recovery:run-1");
+    assert!(recovery.can_schedule && !recovery.scheduled && !recovery.snoozed && !recovery.reset_passed);
+    assert_eq!(recovery.description(now, 0), "Resets 5:00 AM");
+    let resume = recovery.toggle_resume("c", "t").expect("resume");
+    assert_eq!(resume["limitRecovery"], serde_json::json!({ "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true }));
+    assert_eq!(recovery.toggle_snooze("c", "t", now).expect("snooze")["limitRecovery"]["snooze"], true);
+    assert_eq!(recovery.toggle_snooze("c", "t", parse_iso_ms("2026-01-01T06:00:00Z").expect("later")), Err(SnoozeRefused));
+
+    let scheduled = status_shell(serde_json::json!({
+        "snoozedUntil": "2026-01-01T05:00:00.000Z",
+        "limitRecovery": { "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true, "snooze": true },
+    }));
+    let recovery = limit_recovery(Some(&error), &scheduled, now).expect("recovery");
+    assert!(recovery.scheduled && recovery.snoozed);
+    assert_eq!(recovery.toggle_snooze("c", "t", now).expect("wake")["limitRecovery"]["snooze"], false);
+    let after = limit_recovery(Some(&error), &scheduled, parse_iso_ms("2026-01-01T05:00:00Z").expect("reset")).expect("recovery");
+    assert!(!after.snoozed && after.reset_passed && after.deadline().is_none());
+
+    let no_reset = thread_error(&projection_with(run_json("failed"), serde_json::json!([item_json("e1", serde_json::json!({
+        "type": "error", "failure": { "class": "usage_limit", "message": "Limit", "code": null, "retryable": null },
+    }))]), serde_json::json!([]))).expect("an error");
+    let recovery = limit_recovery(Some(&no_reset), &shell, now).expect("recovery");
+    assert!(!recovery.can_schedule);
+    assert_eq!(recovery.description(now, 0), "Reset time unavailable; retry manually");
+}
+
+/// `presentRunStop`: Stopping shows from the request until its result; an ended run's Stop only
+/// once the provider stops answering, and only while its background work is pending.
+#[test]
+fn a_stop_shows_until_the_provider_confirms_it() {
+    let request = item_json("stop", serde_json::json!({ "type": "run_interrupt_request", "message": "Stop", "status": "completed" }));
+    let result = item_json("done", serde_json::json!({ "type": "run_interrupt_result", "message": "Stopped", "status": "completed" }));
+    let stop = run_stop(&projection_with(run_json("running"), serde_json::json!([request]), serde_json::json!([])), false).expect("stopping");
+    assert_eq!((stop.run_id.as_str(), stop.requested_at.as_str(), stop.title()), ("run-1", "2026-01-01T00:00:03Z", "Stopping"));
+    assert!(!stop.unresponsive && !stop.background && stop.description().is_none());
+    assert!(run_stop(&projection_with(run_json("running"), serde_json::json!([request, result]), serde_json::json!([])), false).is_none());
+    assert!(run_stop(&projection_with(run_json("completed"), serde_json::json!([request]), serde_json::json!([])), true).is_none());
+
+    let unanswered = item_json("stop", serde_json::json!({
+        "type": "run_interrupt_request", "message": "Stop", "status": "completed", "unresponsiveAt": "2026-01-01T00:00:13Z",
+    }));
+    let stop = run_stop(&projection_with(run_json("running"), serde_json::json!([unanswered]), serde_json::json!([])), false).expect("unresponsive");
+    assert_eq!(stop.title(), "Agent not responding to Stop");
+    let ended = projection_with(run_json("completed"), serde_json::json!([unanswered]), serde_json::json!([]));
+    assert!(run_stop(&ended, true).is_some_and(|stop| stop.background));
+    assert!(run_stop(&ended, false).is_none());
+    assert_eq!(elapsed_since("2026-01-01T00:00:03Z", parse_iso_ms("2026-01-01T00:00:03Z").expect("now")).as_deref(), Some("1s"));
+}
+
+/// `presentProviderGoal` as `goalNowItem` titles it.
+#[test]
+fn goal_lines_match_the_web() {
+    let goal = |value: serde_json::Value, working: bool| goal_line(&value, working).expect("a goal");
+    let set = goal(serde_json::json!({ "objective": "Ship it", "status": "active" }), false);
+    assert_eq!((set.title.as_str(), set.objective.as_str(), set.can_resume), ("Goal set", "Ship it", false));
+    assert_eq!(goal(serde_json::json!({ "objective": "Ship it", "status": "active" }), true).title, "Pursuing goal");
+    let paused = goal(
+        serde_json::json!({ "objective": "Ship it", "status": "paused", "tokensUsed": 12_400, "tokenBudget": 2_500_000, "timeUsedSeconds": 90, "checks": 1 }),
+        false,
+    );
+    assert_eq!(paused.title, "Goal paused · 12k / 2.5m tokens · 1m 30s · 1 check");
+    assert!(paused.can_resume);
+    assert_eq!(goal(serde_json::json!({ "objective": "x", "status": "budget_limited", "tokensUsed": 999 }), false).title, "Goal reached its token budget · 999 tokens");
+    assert!(!goal(serde_json::json!({ "objective": "x", "status": "complete" }), false).can_resume);
+}
+
+#[test]
+fn upcoming_times_name_the_day() {
+    let now = parse_iso_ms("2026-03-10T12:00:00Z").expect("now");
+    assert_eq!(format_upcoming("2026-03-10T18:30:00Z", now, 0).as_deref(), Some("6:30 PM"));
+    assert_eq!(format_upcoming("2026-03-11T09:05:00Z", now, 0).as_deref(), Some("tomorrow at 9:05 AM"));
+    assert_eq!(format_upcoming("2026-03-14T09:05:00Z", now, 0).as_deref(), Some("3/14 9:05 AM"));
+    assert_eq!(format_upcoming("2027-01-02T09:05:00Z", now, 0).as_deref(), Some("1/2/2027 9:05 AM"));
+    assert_eq!(format_upcoming("2026-03-09T09:05:00Z", now, 0).as_deref(), Some("yesterday at 9:05 AM"));
+}
+
+#[test]
+fn relative_labels_match_the_web() {
+    assert_eq!(relative_time_label(30_000), "just now");
+    assert_eq!(relative_time_label(5 * 60_000), "5m ago");
+    assert_eq!(relative_time_label(3 * 3_600_000), "3h ago");
+    assert_eq!(relative_time_label(49 * 3_600_000), "2d ago");
+}
+
+fn checkpoint_file(path: &str, additions: u64, deletions: u64) -> crate::diff::CheckpointFile {
+    serde_json::from_value(serde_json::json!({ "path": path, "kind": "modified", "additions": additions, "deletions": deletions })).expect("file")
+}
+
+/// `buildTurnDiffTree`: directories before files, numeric name order, merged single-child chains.
+#[test]
+fn the_changed_files_tree_matches_the_web() {
+    let files = [
+        checkpoint_file("src/b10.ts", 1, 0),
+        checkpoint_file("README.md", 2, 2),
+        checkpoint_file("src/B2.ts", 3, 1),
+        checkpoint_file("apps/web/src/index.ts", 4, 0),
+        checkpoint_file("apps/web/src/lib/x.ts", 1, 1),
+    ];
+    let tree = changed_file_tree(&files);
+    let names: Vec<(&str, &str, DiffStat)> = tree
+        .iter()
+        .map(|node| match node {
+            TreeNode::Directory { name, path, stat, .. } | TreeNode::File { name, path, stat } => (name.as_str(), path.as_str(), *stat),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("apps/web/src", "apps/web/src", DiffStat { additions: 5, deletions: 1 }),
+            ("src", "src", DiffStat { additions: 4, deletions: 1 }),
+            ("README.md", "README.md", DiffStat { additions: 2, deletions: 2 }),
+        ]
+    );
+    let TreeNode::Directory { children, .. } = &tree[1] else { panic!("src is a directory") };
+    assert_eq!(children.iter().cloned().filter_map(|child| match child { TreeNode::File { name, .. } => Some(name), _ => None }).collect::<Vec<_>>(), ["B2.ts", "b10.ts"]);
+
+    let collapsed = changed_file_rows(&tree, &std::collections::HashMap::new(), false);
+    assert_eq!(collapsed.len(), 3);
+    let open = changed_file_rows(&tree, &std::collections::HashMap::new(), true);
+    assert_eq!(open.iter().map(|row| row.depth).collect::<Vec<_>>(), [0, 1, 2, 1, 0, 1, 1, 0]);
+    let overrides = std::collections::HashMap::from([("src".to_owned(), true)]);
+    assert_eq!(changed_file_rows(&tree, &overrides, false).len(), 5);
+    assert_eq!(directory_paths(&tree).len(), 3);
+    assert_eq!((changed_files_label(1), changed_files_label(1_234), hidden_files_label(2)), ("1 changed file".into(), "1,234 changed files".into(), "2 more files in the full diff".into()));
+}
+
+/// `deriveThreadCheckpointSummaries`: a turn's summary rides on its run's last assistant message.
+#[test]
+fn a_turns_changed_files_ride_on_its_last_assistant_message() {
+    let mut projection = projection_json(serde_json::json!({}), serde_json::json!([]), serde_json::json!([]), serde_json::json!([]));
+    let message = |id: &str, role: &str, run: &str| crate::thread::Entity { id: id.into(), value: serde_json::json!({ "id": id, "role": role, "runId": run }) };
+    projection.messages = vec![message("u1", "user", "run-1"), message("a1", "assistant", "run-1"), message("a2", "assistant", "run-1"), message("a3", "assistant", "run-2")];
+    let checkpoint = |id: &str, run: &str, ordinal: u64, at: &str| crate::thread::Entity {
+        id: id.into(),
+        value: serde_json::json!({ "id": id, "runId": run, "appRunOrdinal": ordinal, "status": "ready", "capturedAt": at, "files": [{ "path": "a.ts", "kind": "modified", "additions": ordinal, "deletions": 0 }] }),
+    };
+    projection.checkpoints = vec![checkpoint("c1", "run-1", 1, "2026-01-01T00:00:01Z"), checkpoint("c3", "run-3", 3, "2026-01-01T00:00:03Z")];
+    let diffs = turn_diffs_by_message(&projection);
+    assert_eq!(diffs.keys().collect::<Vec<_>>(), ["a2"]);
+    assert_eq!(diffs["a2"].run_id, "run-1");
+}
+
+/// `canForkProjectedAssistantItem`: completed assistant messages fork unless the provider can't.
+#[test]
+fn forking_needs_a_completed_assistant_message_and_a_capable_provider() {
+    let mut projection = projection_json(serde_json::json!({}), serde_json::json!([]), serde_json::json!([]), serde_json::json!([]));
+    let item = |status: &str, provider_thread: Option<&str>| -> crate::turn_item::TurnItem {
+        serde_json::from_value(item_json("a1", serde_json::json!({
+            "type": "assistant_message", "messageId": "m1", "text": "Done", "streaming": false, "status": status, "providerThreadId": provider_thread,
+        })))
+        .expect("item")
+    };
+    assert!(can_fork(&item("completed", None), &fork_support(&projection)));
+    assert!(!can_fork(&item("running", None), &fork_support(&projection)));
+    projection.provider_threads = vec![crate::thread::Entity { id: "pt".into(), value: serde_json::json!({ "id": "pt", "providerSessionId": "ps" }) }];
+    let session = |capabilities: serde_json::Value| vec![crate::thread::Entity { id: "ps".into(), value: serde_json::json!({ "id": "ps", "capabilities": capabilities }) }];
+    projection.provider_sessions = session(serde_json::json!({
+        "threads": { "canForkThread": true, "canForkFromTurn": true }, "identity": { "nativeThreadIds": "weak" }, "context": { "supportsFullThreadHandoff": false },
+    }));
+    assert!(!can_fork(&item("completed", Some("pt")), &fork_support(&projection)));
+    projection.provider_sessions = session(serde_json::json!({
+        "threads": { "canForkThread": true, "canForkFromTurn": true }, "identity": { "nativeThreadIds": "strong" }, "context": { "supportsFullThreadHandoff": false },
+    }));
+    assert!(can_fork(&item("completed", Some("pt")), &fork_support(&projection)));
+    let command = fork_from_run("c", "t", "t2", "run-1", "Refactor");
+    assert_eq!((command["type"].as_str(), command["sourcePoint"]["runId"].as_str(), command["title"].as_str()), (Some("thread.fork"), Some("run-1"), Some("Refactor fork")));
+}

@@ -108,7 +108,12 @@ export function turnItem(
     case "reasoning":
       return { ...base, type: "reasoning", text, streaming: false } as Item;
     case "interrupt_request":
-      return { ...base, type: "run_interrupt_request", message: "Stop" } as Item;
+      return {
+        ...base,
+        type: "run_interrupt_request",
+        message: "Stop",
+        ...(options.rich ? { unresponsiveAt: NOW } : {}),
+      } as Item;
     case "interrupt_result":
       return { ...base, type: "run_interrupt_result", message: "Stopped" } as Item;
     case "checkpoint":
@@ -155,6 +160,7 @@ export function run(
     userMessageId: `message-${id}`,
     rootNodeId: null,
     activeAttemptId: null,
+    queueHeld: status === "queued",
     status,
     requestedAt: NOW,
     startedAt: NOW,

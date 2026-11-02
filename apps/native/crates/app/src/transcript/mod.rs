@@ -1,6 +1,7 @@
 //! Transcript rows. Each `TimelineRow` from `t3_core::timeline` renders here, wrapped with the
 //! row spacing of `TimelineRowContent` and `WorkLogBlock` (`MessagesTimeline.tsx`, `WorkLog.tsx`).
 
+mod changed_files;
 pub mod markdown;
 mod messages;
 mod notices;
@@ -19,8 +20,8 @@ use t3_core::turn_item::TurnItem;
 use crate::thread_view::ThreadView;
 use markdown::MarkdownStore;
 pub use notices::history_control;
-pub use parts::{Clock, ghost_icon_button, ghost_text_button};
-pub use timer::WorkingTimer;
+pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_button, inline_button};
+pub use timer::{TimerKind, WorkingTimer};
 
 /// Disclosure state the user controls. Folds and groups feed row derivation; the rest only
 /// change how a row draws.
@@ -32,6 +33,10 @@ pub struct TranscriptUi {
     pub expanded_entries: HashSet<String>,
     pub expanded_messages: HashSet<String>,
     pub expanded_plans: HashSet<String>,
+    /// Changed-files cards with every folder open, by run.
+    pub changed_files_open: HashSet<String>,
+    /// Folders opened or closed against that, by run, then folder path.
+    pub changed_file_dirs: HashMap<String, HashMap<String, bool>>,
 }
 
 /// Withheld output fetched with `orchestration.getTurnItem`, keyed by item id.
@@ -62,6 +67,11 @@ pub struct RowEnv<'a> {
     pub working_timer: Option<&'a Entity<WorkingTimer>>,
     /// The entry holding find's active match, tinted where it draws.
     pub find_target: Option<&'a str>,
+    /// Each turn's changed files, by the assistant message that ends it.
+    pub turn_diffs: &'a HashMap<String, Arc<t3_core::diff::TurnDiffSummary>>,
+    /// Fork capability by provider thread, and the runs a fork is being created from.
+    pub fork_support: &'a HashMap<String, bool>,
+    pub forking: &'a HashSet<String>,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.

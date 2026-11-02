@@ -136,6 +136,24 @@ pub fn format_day_aware(iso: &str, now_ms: i64, offset_minutes: i64) -> Option<S
     Some(if year == now_year { format!("{month}/{day} {time}") } else { format!("{month}/{day}/{year} {time}") })
 }
 
+/// `formatUpcomingTimestamp` (`apps/web/src/timestampFormat.ts`): the time today,
+/// `tomorrow at …`, `M/D …` (with the year when it differs) after that, day-aware before today.
+pub fn format_upcoming(iso: &str, now_ms: i64, offset_minutes: i64) -> Option<String> {
+    let ms = parse_iso_ms(iso)?;
+    let time = format_short_time(iso, offset_minutes)?;
+    let local_day = |ms: i64| (ms + offset_minutes * 60_000).div_euclid(86_400_000);
+    match local_day(ms) - local_day(now_ms) {
+        ..0 => format_day_aware(iso, now_ms, offset_minutes),
+        0 => Some(time),
+        1 => Some(format!("tomorrow at {time}")),
+        _ => {
+            let (year, month, day) = civil_from_days(local_day(ms));
+            let (now_year, _, _) = civil_from_days(local_day(now_ms));
+            Some(if year == now_year { format!("{month}/{day} {time}") } else { format!("{month}/{day}/{year} {time}") })
+        }
+    }
+}
+
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

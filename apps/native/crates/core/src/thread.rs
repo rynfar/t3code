@@ -90,6 +90,8 @@ pub struct Run {
     pub restart_cancelled_background_work: Option<Value>,
     #[serde(default)]
     pub active_attempt_id: Option<String>,
+    #[serde(default)]
+    pub queue_held: Option<bool>,
 }
 
 impl Run {

@@ -7,10 +7,13 @@ mod activity;
 mod compaction;
 mod detail;
 mod entries;
+mod changed_files;
 mod find;
 mod folds;
+mod fork;
 mod presentation;
 mod rows;
+mod status;
 mod time;
 mod tool_activity;
 mod user_input;
@@ -36,9 +39,19 @@ pub use presentation::{
     summary_icon, summarize_tool_group, tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label,
     work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_log_entry_is_tool_like,
 };
+pub use changed_files::{
+    ChangedFileRow, DiffStat, TreeNode, changed_file_rows, changed_file_tree, changed_files_label, directory_paths, has_directories, hidden_files_label,
+    turn_diffs_by_message,
+};
+pub use fork::{FORK_FAILED, FORK_LABEL, can_fork, fork_from_run, fork_support};
 pub use find::{FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, SEARCH_THREAD, bar_label, decode_result, format_count, search_request, step_index, step_locally};
 pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};
-pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, parse_iso_ms};
+pub use status::{
+    CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, LimitRecovery, ProviderBanner, RunStop, SnoozeRefused, StatusLine, ThreadError, elapsed_since,
+    error_banner_message, error_can_expand, goal_line, limit_recovery, presented_latest_run, provider_banner, relative_time_label, run_stop, status_line,
+    thread_error, timeline_thread_error,
+};
+pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, format_upcoming, parse_iso_ms};
 pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name};
 pub use user_input::{has_question_answer, question_answer_preview, question_answer_text, question_text_preview};
 

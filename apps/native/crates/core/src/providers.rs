@@ -15,7 +15,7 @@ const DEFAULT_DISABLED_DRIVERS: [&str; 7] = ["cursor", "grok", "fx", "muse", "pi
 const DEFAULT_ENABLED_INSTANCES: [&str; 2] = ["codex", "claudeAgent"];
 
 /// `PROVIDER_DISPLAY_NAMES`.
-fn driver_label(driver: &str) -> String {
+pub fn driver_label(driver: &str) -> String {
     match driver {
         "antigravity" => "Antigravity".into(),
         "codex" => "Codex".into(),

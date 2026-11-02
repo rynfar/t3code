@@ -8,18 +8,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod find;
+mod limit_recovery;
+mod status;
+
+pub use limit_recovery::LimitRecoveryBanner;
 
 use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Window, actions, div, list, prelude::*, px};
 use t3_core::history::HistoryControl;
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
-    derive_rows, detail_request, detail_revision, needs_detail_fetch, rows_equal, update_entries,
+    derive_rows, detail_request, detail_revision, needs_detail_fetch, fork_support, rows_equal, turn_diffs_by_message, update_entries,
 };
+use t3_core::diff::TurnDiffSummary;
 
 use crate::app_state::{AppEvent, AppState};
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::MarkdownStore;
-use crate::transcript::{Clock, Detail, RowEnv, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+use crate::transcript::{Clock, Detail, RowEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
 
 actions!(thread_view, [FindInThread]);
 
@@ -41,6 +46,15 @@ pub struct ThreadView {
     group_lists: RefCell<HashMap<String, ListState>>,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
+    footer: status::ThreadFooter,
+    turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
+    fork_support: HashMap<String, bool>,
+    forking: std::collections::HashSet<String>,
+    /// What `turn_diffs` was derived from: the message count and the checkpoints.
+    turn_diff_source: Option<(usize, Vec<t3_core::thread::Entity>)>,
+    banners: status::Banners,
+    /// A failure from an action taken here, shown in the error banner like the web's local error.
+    local_error: Option<String>,
     clock: Clock,
     window_height: f32,
     _subscription: Subscription,
@@ -51,6 +65,7 @@ impl ThreadView {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
             AppEvent::Thread | AppEvent::Selection => this.sync(cx),
             AppEvent::History => this.sync_history(cx),
+            AppEvent::Shell | AppEvent::ServerConfig => this.sync_status(cx),
             _ => {}
         });
         ThreadView {
@@ -69,6 +84,13 @@ impl ThreadView {
             group_lists: RefCell::new(HashMap::new()),
             working_timer: None,
             find: None,
+            footer: status::ThreadFooter::default(),
+            turn_diffs: HashMap::new(),
+            fork_support: HashMap::new(),
+            forking: std::collections::HashSet::new(),
+            turn_diff_source: None,
+            banners: status::Banners::default(),
+            local_error: None,
             clock: Clock::now(),
             window_height: 0.,
             _subscription: subscription,
@@ -96,6 +118,9 @@ impl ThreadView {
             self.rows.clear();
             self.history = None;
             self.find = None;
+            self.reset_status();
+            self.turn_diffs.clear();
+            self.turn_diff_source = None;
             self.list.reset(0);
         }
         let state = self.state.read(cx);
@@ -103,6 +128,7 @@ impl ThreadView {
             Some(projection) => {
                 update_entries(&mut self.entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
                 self.activity = derive_activity(projection);
+                self.fork_support = fork_support(projection);
                 let thread = &projection.thread;
                 self.workspace_root =
                     thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|p| p.workspace_root.clone()));
@@ -114,6 +140,8 @@ impl ThreadView {
         }
         self.sync_history(cx);
         self.rederive(cx);
+        self.sync_turn_diffs(cx);
+        self.sync_status(cx);
         self.refresh_open_details(cx);
         self.refresh_find_after_change(cx);
     }
@@ -172,9 +200,10 @@ impl ThreadView {
             (RowKind::Working { compacting }, Some(started)) => Some((started.clone(), *compacting)),
             _ => None,
         });
+        let working = working.map(|(started, compacting)| (started, if compacting { TimerKind::Compacting } else { TimerKind::Working }));
         match working {
-            Some((started, compacting)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, compacting)) => {}
-            Some((started, compacting)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, compacting, cx))),
+            Some((started, kind)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, kind)) => {}
+            Some((started, kind)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, kind, cx))),
             None => self.working_timer = None,
         }
     }
@@ -279,6 +308,80 @@ impl ThreadView {
         self.state.update(cx, |state, cx| state.select_thread(thread_id, cx));
     }
 
+    /// Re-derives the changed-files cards when the checkpoints or messages change, remeasuring
+    /// only the assistant rows whose card appeared, changed or went.
+    fn sync_turn_diffs(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(projection) = state.thread.projection.as_ref() else { return };
+        if self.turn_diff_source.as_ref().is_some_and(|(messages, checkpoints)| *messages == projection.messages.len() && *checkpoints == projection.checkpoints) {
+            return;
+        }
+        let next = turn_diffs_by_message(projection);
+        self.turn_diff_source = Some((projection.messages.len(), projection.checkpoints.clone()));
+        let changed: std::collections::HashSet<String> = next
+            .iter()
+            .filter(|(id, summary)| self.turn_diffs.get(*id).is_none_or(|old| old != *summary))
+            .map(|(id, _)| id.clone())
+            .chain(self.turn_diffs.keys().filter(|id| !next.contains_key(*id)).cloned())
+            .collect();
+        self.turn_diffs = next;
+        if !changed.is_empty() {
+            self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if changed.contains(&message.id)));
+            cx.notify();
+        }
+    }
+
+    /// `onForkFromRun`: forks into `<title> fork`, then opens it once the shell lists it. A failure
+    /// shows in the error banner.
+    pub fn fork_from_run(&mut self, source_thread_id: &str, run_id: &str, cx: &mut Context<Self>) {
+        if self.forking.contains(run_id) {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(title) = self.thread_id.as_deref().and_then(|id| state.shell.thread(id)).map(|thread| thread.title.clone()) else { return };
+        let target = crate::app_state::uuid_v4();
+        let command = t3_core::timeline::fork_from_run(&crate::app_state::uuid_v4(), source_thread_id, &target, run_id, &title);
+        let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
+        let run_id = run_id.to_owned();
+        self.forking.insert(run_id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |view, cx| {
+                view.forking.remove(&run_id);
+                match result {
+                    Ok(_) => view.state.update(cx, |state, cx| state.select_when_listed(&target, cx)),
+                    Err(error) => {
+                        let message = error.to_string();
+                        view.show_local_error(if message.trim().is_empty() { t3_core::timeline::FORK_FAILED.to_owned() } else { message }, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn open_turn_diff(&mut self, run_id: &str, file_path: Option<&str>, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| state.open_turn_diff(run_id, file_path, cx));
+    }
+
+    /// Expand or Collapse all folders; a folder's own toggle resets with it, as on the web.
+    pub fn toggle_changed_files_all(&mut self, run_id: &str, message_id: &str, cx: &mut Context<Self>) {
+        toggle(&mut self.ui.changed_files_open, run_id);
+        self.ui.changed_file_dirs.remove(run_id);
+        self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if message.id == message_id));
+        cx.notify();
+    }
+
+    pub fn toggle_changed_dir(&mut self, run_id: &str, path: &str, all_expanded: bool, message_id: &str, cx: &mut Context<Self>) {
+        let dirs = self.ui.changed_file_dirs.entry(run_id.to_owned()).or_default();
+        let open = dirs.get(path).copied().unwrap_or(all_expanded);
+        dirs.insert(path.to_owned(), !open);
+        self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if message.id == message_id));
+        cx.notify();
+    }
+
     fn remeasure_where(&self, matches: impl Fn(&TimelineRow) -> bool) {
         let offset = self.header_count();
         for (index, row) in self.rows.iter().enumerate() {
@@ -300,6 +403,9 @@ impl ThreadView {
             group_lists: &self.group_lists,
             working_timer: self.working_timer.as_ref(),
             find_target: self.find.as_ref().and_then(|find| find.active_entry()),
+            turn_diffs: &self.turn_diffs,
+            fork_support: &self.fork_support,
+            forking: &self.forking,
         };
         render(&env, &mut self.markdown)
     }
@@ -337,8 +443,10 @@ impl Render for ThreadView {
         if loading {
             return div().size_full().flex().items_center().justify_center().text_sm().text_color(muted).child("Loading thread…").into_any_element();
         }
-        if self.rows.is_empty() && self.history.is_none() {
+        if self.rows.is_empty() && self.history.is_none() && !self.footer_shown() {
+            let banners = self.render_banners(cx);
             return div()
+                .relative()
                 .size_full()
                 .flex()
                 .items_center()
@@ -346,12 +454,14 @@ impl Render for ThreadView {
                 .text_sm()
                 .text_color(muted)
                 .child("Send a message to start the conversation.")
+                .children(banners)
                 .into_any_element();
         }
         self.clock = Clock::now();
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
         let find_bar = self.render_find_bar(cx);
+        let banners = self.render_banners(cx);
         let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, _window, cx| {
@@ -363,12 +473,12 @@ impl Render for ThreadView {
                     };
                     return lane(content, true, crate::theme::chat_max_width(cx));
                 }
-                let Some(row) = this.rows.get(ix - offset).cloned() else { return div().into_any_element() };
+                let Some(row) = this.rows.get(ix - offset).cloned() else { return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx)) };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
                 lane(content, ix == 0, crate::theme::chat_max_width(cx))
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(find_bar).into_any_element()
+        div().relative().size_full().child(transcript).children(banners).children(find_bar).into_any_element()
     }
 }

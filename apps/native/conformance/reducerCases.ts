@@ -265,12 +265,14 @@ export function portedReducerCases() {
   const richUser = turnItem("user", "item-rich-user", 1, { runId, rich: true });
   const richCommand = turnItem("command", "item-rich-command", 2, { runId, rich: true });
   const richTask = turnItem("subagent", "item-rich-task", 3, { runId, rich: true });
+  const richStop = turnItem("interrupt_request", "item-rich-stop", 4, { runId, rich: true });
   cases.push(
     reducerCase(
       "optional fields the native types model",
       projectionOf({ runs: [completed], items: [richUser, richCommand] }),
       [
         { event: itemEvent(richTask) },
+        { event: itemEvent(richStop) },
         { event: itemEvent({ ...richCommand, status: "failed" } as Item) },
       ],
     ),

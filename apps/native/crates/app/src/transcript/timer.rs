@@ -8,17 +8,25 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{Context, IntoElement, ParentElement, Render, Styled, Task, Window, div};
-use t3_core::timeline::{format_duration, parse_iso_ms};
+use t3_core::timeline::{elapsed_since, format_duration, parse_iso_ms};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerKind {
+    Working,
+    Compacting,
+    /// Just the elapsed time, as the Stop line shows it (`runStopNowItem`).
+    Elapsed,
+}
 
 pub struct WorkingTimer {
     started_at: String,
-    compacting: bool,
+    kind: TimerKind,
     painted: Rc<Cell<bool>>,
     _tick: Task<()>,
 }
 
 impl WorkingTimer {
-    pub fn new(started_at: String, compacting: bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(started_at: String, kind: TimerKind, cx: &mut Context<Self>) -> Self {
         let painted = Rc::new(Cell::new(false));
         let seen = painted.clone();
         let tick = cx.spawn(async move |this, cx| {
@@ -30,11 +38,11 @@ impl WorkingTimer {
                 }
             }
         });
-        WorkingTimer { started_at, compacting, painted, _tick: tick }
+        WorkingTimer { started_at, kind, painted, _tick: tick }
     }
 
-    pub fn matches(&self, started_at: &str, compacting: bool) -> bool {
-        self.started_at == started_at && self.compacting == compacting
+    pub fn matches(&self, started_at: &str, kind: TimerKind) -> bool {
+        self.started_at == started_at && self.kind == kind
     }
 }
 
@@ -48,11 +56,12 @@ fn elapsed_label(started_at: &str) -> Option<String> {
 impl Render for WorkingTimer {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         self.painted.set(true);
-        let label = match (self.compacting, elapsed_label(&self.started_at)) {
-            (true, Some(elapsed)) => format!("Compacting for {elapsed}"),
-            (true, None) => "Compacting…".to_owned(),
-            (false, Some(elapsed)) => format!("Working for {elapsed}"),
-            (false, None) => "Working...".to_owned(),
+        let label = match (self.kind, elapsed_label(&self.started_at)) {
+            (TimerKind::Compacting, Some(elapsed)) => format!("Compacting for {elapsed}"),
+            (TimerKind::Compacting, None) => "Compacting…".to_owned(),
+            (TimerKind::Working, Some(elapsed)) => format!("Working for {elapsed}"),
+            (TimerKind::Working, None) => "Working...".to_owned(),
+            (TimerKind::Elapsed, _) => elapsed_since(&self.started_at, chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         };
         div().whitespace_nowrap().child(label)
     }

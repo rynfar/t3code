@@ -7,10 +7,10 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, ClipboardItem, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div, linear_color_stop, linear_gradient, prelude::FluentBuilder, px, relative};
 use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
-use t3_core::timeline::{Attribution, ChatMessage, ProposedPlan, RowKind, TimelineRow, plan_title, should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution};
+use t3_core::timeline::{Attribution, ChatMessage, FORK_LABEL, can_fork, ProposedPlan, RowKind, TimelineRow, plan_title, should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution};
 
 use super::markdown::{MarkdownStore, markdown_view, prose};
-use super::parts::{ROW_GROUP, Clock, DividerTone, ghost_icon_button, ghost_text_button, system_divider};
+use super::parts::{ROW_GROUP, Clock, DividerTone, ghost_icon_button, ghost_text_button, system_divider, tooltip_icon_button};
 use super::RowEnv;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -193,7 +193,16 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .into_any_element()
 }
 
-fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, always: bool, clock: &Clock, cx: &App) -> AnyElement {
+/// `AssistantForkButton`: on a completed assistant message whose provider can fork.
+fn fork_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<AnyElement> {
+    let item = message.item.as_ref().filter(|item| can_fork(item, env.fork_support))?;
+    let (run_id, source) = (item.run_id.clone()?, item.thread_id.clone());
+    let busy = env.forking.contains(&run_id);
+    let id = SharedString::from(format!("fork:{}", message.id));
+    Some(tooltip_icon_button(id, Icon::GitFork, FORK_LABEL, busy, cx.listener(move |view, _, _, cx| view.fork_from_run(&source, &run_id, cx)), cx))
+}
+
+fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, always: bool, fork: Option<AnyElement>, clock: &Clock, cx: &App) -> AnyElement {
     let p = palette(cx);
     let status = message.item.as_ref().map(|item| item.status.clone()).filter(|status| status != "completed");
     let copy = (show_copy && !copy_streaming && !message.text.trim().is_empty()).then(|| {
@@ -218,6 +227,7 @@ fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, 
                 .child(status)
         }))
         .children(copy)
+        .children(fork)
         .when(!message.streaming, |this| this.child(div().text_color(hsla(p.muted_foreground)).child(clock.format(&message.updated_at))))
         .into_any_element()
 }
@@ -237,14 +247,17 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         .px(px(4.))
         .py(px(2.))
         .child(prose(&state, cx))
+        .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
         .when(show_meta || show_timestamp, |this| {
-            this.child(div().mt(px(6.)).child(assistant_meta(message, show_meta && show_copy, copy_streaming, false, &env.clock, cx)))
+            let fork = if show_meta { fork_button(message, env, cx) } else { None };
+            this.child(div().mt(px(6.)).child(assistant_meta(message, show_meta && show_copy, copy_streaming, false, fork, &env.clock, cx)))
         })
         .into_any_element()
 }
 
-pub fn assistant_meta_row(message: &Arc<ChatMessage>, show_copy: bool, copy_streaming: bool, env: &RowEnv, cx: &App) -> AnyElement {
-    div().px(px(4.)).mt(px(2.)).child(assistant_meta(message, show_copy, copy_streaming, true, &env.clock, cx)).into_any_element()
+pub fn assistant_meta_row(message: &Arc<ChatMessage>, show_copy: bool, copy_streaming: bool, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+    let fork = fork_button(message, env, cx);
+    div().px(px(4.)).mt(px(2.)).child(assistant_meta(message, show_copy, copy_streaming, true, fork, &env.clock, cx)).into_any_element()
 }
 
 fn collapsed_plan_preview(markdown: &str) -> String {

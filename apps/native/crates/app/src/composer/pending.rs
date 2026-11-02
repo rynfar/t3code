@@ -17,7 +17,7 @@ use crate::theme::{hsla, palette};
 
 /// `ComposerBanner` surface: the composer's surface (opaque, the no-blur fallback) inset 22px per
 /// side and tucked 17px under the card. Warnings tint it and its outline.
-fn banner_surface(warning: bool, content: impl IntoElement, cx: &App) -> gpui::Div {
+pub(crate) fn banner_surface(warning: bool, content: impl IntoElement, cx: &App) -> gpui::Div {
     let p = palette(cx);
     let dark = cx.theme().is_dark();
     let outline = if warning {
