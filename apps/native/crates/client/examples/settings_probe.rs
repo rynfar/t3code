@@ -93,13 +93,38 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Settings streamed while a save is in flight are at least as new as its reply, so the app
+    // applies a reply only when nothing streamed since it was sent; this shows each decision.
     for value in [!original, original] {
         let change = ServerSettingChange::AutoSettleOnMerge(value);
-        println!("send    {} {}", method::SERVER_UPDATE_SETTINGS, change.payload());
-        let reply = client.request(method::SERVER_UPDATE_SETTINGS, change.payload()).await?;
-        let saved = decode_update_reply(reply).map(|settings| settings.threads.sidebar_auto_settle_on_merge);
-        println!("reply   sidebarAutoSettleOnMerge = {saved:?}");
-        next_settings_value(&mut events, &mut config, Some(value)).await?;
+        let sent_at = config.settings_revision();
+        println!("send    {} {} (settings revision {sent_at})", method::SERVER_UPDATE_SETTINGS, change.payload());
+        let request = client.request(method::SERVER_UPDATE_SETTINGS, change.payload());
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                reply = &mut request => {
+                    let settings = decode_update_reply(reply?);
+                    let saved = settings.as_ref().map(|settings| settings.threads.sidebar_auto_settle_on_merge);
+                    let revision = config.settings_revision();
+                    let applied = settings.is_some_and(|settings| config.apply_settings_reply(settings, sent_at));
+                    let verdict = if revision == sent_at { "applies" } else { "dropped: settings streamed since it was sent" };
+                    println!("reply   sidebarAutoSettleOnMerge = {saved:?} at revision {revision}: {verdict} (changed config: {applied})");
+                    break;
+                }
+                event = events.recv() => {
+                    let Some(ClientEvent::ServerConfig(event)) = event else { continue };
+                    if matches!(&*event, ServerConfigStreamEvent::SettingsUpdated { .. }) {
+                        config.apply(*event);
+                        let value = config.config.as_ref().map(|config| config.settings.threads.sidebar_auto_settle_on_merge);
+                        println!("stream  settingsUpdated  sidebarAutoSettleOnMerge = {value:?} (revision {})", config.settings_revision());
+                    }
+                }
+            }
+        }
+        if config.config.as_ref().map(|config| config.settings.threads.sidebar_auto_settle_on_merge) != Some(value) {
+            next_settings_value(&mut events, &mut config, Some(value)).await?;
+        }
     }
     println!("restored sidebarAutoSettleOnMerge = {original}");
     Ok(())
