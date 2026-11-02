@@ -5,7 +5,9 @@
 
 mod header;
 mod lines;
+mod source;
 mod tree;
+mod view;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,87 +18,18 @@ use gpui::{
     Styled, Subscription, Task, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::v_flex;
-use t3_core::diff::{
-    DiffRow, DiffScope, DiffSelection, FileDiff, Layout, ParsedPatch, PreviewSourceKind, TreeRow, TurnDiffSummary,
-    build_rows, checkpoint_diff_request, decode_diff_preview, decode_turn_diff, diff_preview_request, file_tree_rows,
-    parse_patch, turn_diff_summaries,
-};
+use t3_client::supervisor::ConnectionStatus;
+use t3_core::diff::{DiffScope, DiffSelection, Layout, ParsedPatch, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id};
 use t3_core::right_panel::SurfaceKind;
 
-use crate::app_state::{AppEvent, AppState};
+use crate::app_state::{AppEvent, AppState, Phase};
 use crate::theme::{hsla, palette};
+use source::{Loaded, RequestKey};
+use view::{Parsed, View};
 
 /// `LIVE_REFRESH_MIN_INTERVAL_MS`: showing the panel revalidates a git diff older than this.
 const GIT_REFRESH_FLOOR: Duration = Duration::from_secs(10);
 const CACHE_LIMIT: usize = 6;
-
-/// One fetched patch, parsed off the UI thread.
-pub struct Parsed {
-    pub patch: ParsedPatch,
-    pub truncated: bool,
-    /// Totals over every changed file when the patch holds only some of them.
-    pub totals: Option<(u64, u64)>,
-    pub base_ref: Option<String>,
-    pub head_ref: Option<String>,
-    /// The longest line in bytes, for horizontal scrolling without wrap.
-    pub max_line_len: usize,
-}
-
-impl Parsed {
-    fn new(patch: &str, truncated: bool, totals: Option<(u64, u64)>, base_ref: Option<String>, head_ref: Option<String>) -> Arc<Parsed> {
-        let patch = parse_patch(patch);
-        let max_line_len = match &patch {
-            ParsedPatch::Files(files) => {
-                files.iter().flat_map(|file| &file.hunks).flat_map(|hunk| &hunk.lines).map(|line| line.text.len()).max().unwrap_or(0)
-            }
-            _ => 0,
-        };
-        Arc::new(Parsed { patch, truncated, totals, base_ref, head_ref, max_line_len })
-    }
-
-    pub fn files(&self) -> &[FileDiff] {
-        match &self.patch {
-            ParsedPatch::Files(files) => files,
-            _ => &[],
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RequestKey {
-    /// `review.getDiffPreview` answers both git scopes. `revision` bumps on refresh.
-    Git { cwd: String, base_ref: Option<String>, ignore_whitespace: bool, revision: u64 },
-    Turn { thread_id: String, turn_count: u64, ignore_whitespace: bool },
-}
-
-impl RequestKey {
-    /// A refresh of the same scope keeps showing the old patch until the new one lands.
-    fn same_source(&self, other: &RequestKey) -> bool {
-        match (self, other) {
-            (RequestKey::Git { cwd, base_ref, ignore_whitespace, .. }, RequestKey::Git { cwd: c, base_ref: b, ignore_whitespace: w, .. }) => {
-                cwd == c && base_ref == b && ignore_whitespace == w
-            }
-            _ => self == other,
-        }
-    }
-}
-
-#[derive(Clone)]
-enum Loaded {
-    Git { branch: Option<Arc<Parsed>>, unstaged: Option<Arc<Parsed>> },
-    Turn(Arc<Parsed>),
-}
-
-/// What the list paints: rebuilt when the patch, scope, layout or folds change.
-pub struct View {
-    pub parsed: Arc<Parsed>,
-    pub scope_key: String,
-    pub layout: Layout,
-    pub rows: Vec<DiffRow>,
-    pub tree: Vec<TreeRow>,
-    /// Line-number digits per file: each file sizes its own gutter, as Pierre does.
-    pub digits: Vec<usize>,
-}
 
 pub struct DiffPanel {
     state: Entity<AppState>,
@@ -113,6 +46,11 @@ pub struct DiffPanel {
     _fetch: Option<Task<()>>,
     git_revision: u64,
     git_fetched_at: Option<Instant>,
+    /// `deriveWorkspaceMutationId` as last seen: a change refetches git diffs mid-turn.
+    workspace_mutation: Option<String>,
+    /// Whether each cwd is a repository, learned from git previews (`isGitRepo`).
+    repositories: HashMap<String, bool>,
+    connected: bool,
     visible: bool,
     /// The persisted layout and file tree toggle, as last rendered.
     ui: (Layout, bool),
@@ -140,7 +78,6 @@ impl DiffPanel {
                 this.sync(cx);
             }
         });
-        let list = ListState::new(0, ListAlignment::Top, px(400.));
         let mut panel = DiffPanel {
             state,
             thread_id: None,
@@ -156,12 +93,15 @@ impl DiffPanel {
             _fetch: None,
             git_revision: 0,
             git_fetched_at: None,
+            workspace_mutation: None,
+            repositories: HashMap::new(),
+            connected: false,
             visible: false,
             ui: (Layout::Stacked, false),
             view: None,
             collapsed: HashMap::new(),
             tree_collapsed: HashSet::new(),
-            list,
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
             tree_scroll: UniformListScrollHandle::new(),
             wrap: true,
             ignore_whitespace: true,
@@ -177,7 +117,7 @@ impl DiffPanel {
     }
 
     /// Reconciles with app state. Runs on every thread event, so it does nothing unless the
-    /// scope, the request or the turns actually changed.
+    /// scope, the request, the connection or the workspace actually changed.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let thread_id = state.selected_thread.clone();
@@ -185,6 +125,7 @@ impl DiffPanel {
             self.thread_id = thread_id.clone();
             self.fingerprint = (0, None);
             self.summaries = Arc::new(Vec::new());
+            self.workspace_mutation = None;
             self.selected_file = None;
             self.handled_reveal = None;
             self.tree_collapsed.clear();
@@ -196,6 +137,13 @@ impl DiffPanel {
             }
             return;
         };
+        // A failed request reruns once the connection settles (`runtime.ts` query re-execution).
+        let connected = matches!(state.phase, Phase::Online(ConnectionStatus::Connected));
+        let reconnected = connected && !self.connected;
+        if reconnected {
+            self.error = None;
+        }
+        self.connected = connected;
         let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == thread_id);
         let fingerprint = projection
             .map(|projection| (projection.checkpoints.len(), projection.checkpoints.last().map(|checkpoint| checkpoint.id.clone())))
@@ -205,48 +153,60 @@ impl DiffPanel {
             self.summaries = Arc::new(projection.map(|projection| turn_diff_summaries(&projection.checkpoints)).unwrap_or_default());
             self.fingerprint = fingerprint;
         }
+        let mutation = projection.and_then(|projection| {
+            let latest_checkpoint = self.summaries.first().map(|summary| summary.completed_at.as_str());
+            workspace_mutation_id(projection.visible_turn_items.iter().map(|row| row.item.as_ref()), latest_checkpoint)
+        });
         let selection = state.panels.diff_selection(&thread_id);
         if matches!(selection, DiffSelection::Turn { .. }) && checkpoints_changed && !self.summaries.is_empty() {
             let summaries = self.summaries.clone();
             self.state.update(cx, |state, cx| state.reconcile_diff_selection(&summaries, cx));
         }
         let state = self.state.read(cx);
+        let environment = state.environment().map(str::to_owned);
         let visible = state.panels.panels.active_surface(&thread_id).is_some_and(|surface| surface.kind == SurfaceKind::Diff);
         let scope = DiffScope::resolve(&selection, &self.summaries);
         let cwd = state.shell.thread(&thread_id).and_then(|thread| {
             thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()))
         });
-        // A finished turn changed the workspace; showing the panel revalidates a stale git diff.
+        let repository = cwd.as_ref().and_then(|cwd| self.repositories.get(cwd)).copied();
+        // The agent may have changed files; showing the panel revalidates a stale git diff.
         let git_stale = self.git_fetched_at.is_some_and(|at| at.elapsed() >= GIT_REFRESH_FLOOR);
-        if (checkpoints_changed && self.git_fetched_at.is_some()) || (visible && !self.visible && git_stale) {
+        if (mutation != self.workspace_mutation && self.git_fetched_at.is_some()) || (visible && !self.visible && git_stale) {
             self.git_revision += 1;
         }
+        self.workspace_mutation = mutation;
         self.visible = visible;
-        let request = match &scope {
-            DiffScope::Branch { base_ref } => cwd.map(|cwd| RequestKey::Git {
+        let request = environment.and_then(|environment| match &scope {
+            DiffScope::Branch { base_ref } => cwd.clone().map(|cwd| RequestKey::Git {
+                environment,
                 cwd,
                 base_ref: base_ref.clone(),
                 ignore_whitespace: self.ignore_whitespace,
                 revision: self.git_revision,
             }),
-            DiffScope::Unstaged => cwd.map(|cwd| RequestKey::Git {
+            DiffScope::Unstaged => cwd.clone().map(|cwd| RequestKey::Git {
+                environment,
                 cwd,
                 base_ref: None,
                 ignore_whitespace: self.ignore_whitespace,
                 revision: self.git_revision,
             }),
-            DiffScope::Turn { summary_index, .. } => Some(RequestKey::Turn {
+            // `useCheckpointDiff` is disabled outside a repository.
+            DiffScope::Turn { summary_index, .. } if repository != Some(false) => Some(RequestKey::Turn {
+                environment,
                 thread_id: thread_id.clone(),
                 turn_count: self.summaries[*summary_index].turn_count,
                 ignore_whitespace: self.ignore_whitespace,
             }),
-            DiffScope::NoTurns => None,
-        };
+            DiffScope::Turn { .. } | DiffScope::NoTurns => None,
+        });
         let ui = (state.panels.diff_layout, state.panels.diff_file_tree_open);
         let changed = request != self.request
             || scope != self.scope
             || selection != self.selection
             || checkpoints_changed
+            || reconnected
             || ui != self.ui;
         self.ui = ui;
         self.selection = selection;
@@ -262,14 +222,15 @@ impl DiffPanel {
                         self.loaded = Some(entry);
                         self.pending = false;
                     }
-                    None if visible => self.fetch(key, cx),
+                    None if visible && connected => self.fetch(key, cx),
                     None => self.pending = false,
                 }
             }
         } else if visible
+            && connected
             && !self.pending
             && self.error.is_none()
-            && self.current().is_none()
+            && !self.has_loaded()
             && let Some(key) = self.request.clone()
         {
             self.fetch(key, cx);
@@ -280,27 +241,17 @@ impl DiffPanel {
         }
     }
 
+    /// Whether the current request's source has an answer, even one with nothing to show (a
+    /// cwd that is not a repository), so it is not asked again on every event.
+    fn has_loaded(&self) -> bool {
+        match (&self.request, &self.loaded) {
+            (Some(request), Some((key, _))) => key.same_source(request),
+            _ => false,
+        }
+    }
+
     fn fetch(&mut self, key: RequestKey, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let task = match &key {
-            RequestKey::Git { cwd, base_ref, ignore_whitespace, .. } => {
-                let (method, payload) = diff_preview_request(cwd, base_ref.as_deref(), *ignore_whitespace);
-                state.request(method, payload, |value| {
-                    let source = |kind| {
-                        decode_diff_preview(&value, kind)
-                            .map(|source| Parsed::new(&source.diff, source.truncated, source.totals, source.base_ref, source.head_ref))
-                    };
-                    Ok(Loaded::Git { branch: source(PreviewSourceKind::BranchRange), unstaged: source(PreviewSourceKind::WorkingTree) })
-                })
-            }
-            RequestKey::Turn { thread_id, turn_count, ignore_whitespace } => {
-                let (method, payload) = checkpoint_diff_request(thread_id, *turn_count, *ignore_whitespace);
-                state.request(method, payload, |value| {
-                    decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, false, None, None, None)))
-                })
-            }
-        };
-        let Some(task) = task else {
+        let Some(task) = source::fetch(self.state.read(cx), &key) else {
             self.error = Some("Not connected to the server.".to_owned());
             return;
         };
@@ -314,8 +265,9 @@ impl DiffPanel {
                 this.pending = false;
                 match result {
                     Ok(loaded) => {
-                        if matches!(key, RequestKey::Git { .. }) {
+                        if let (RequestKey::Git { cwd, .. }, Loaded::Git { repository, .. }) = (&key, &loaded) {
                             this.git_fetched_at = Some(Instant::now());
+                            this.repositories.insert(cwd.clone(), *repository);
                         }
                         this.cache.retain(|(cached, _)| !cached.same_source(&key));
                         this.cache.push((key.clone(), loaded.clone()));
@@ -335,12 +287,10 @@ impl DiffPanel {
     /// The patch for the current scope: the loaded one, or the last one of the same source
     /// while a refresh is in flight.
     fn current(&self) -> Option<Arc<Parsed>> {
-        let request = self.request.as_ref()?;
-        let (key, loaded) = self.loaded.as_ref()?;
-        if !key.same_source(request) {
+        if !self.has_loaded() {
             return None;
         }
-        match (loaded, &self.scope) {
+        match (&self.loaded.as_ref()?.1, &self.scope) {
             (Loaded::Git { branch, .. }, DiffScope::Branch { .. }) => branch.clone(),
             (Loaded::Git { unstaged, .. }, DiffScope::Unstaged) => unstaged.clone(),
             (Loaded::Turn(parsed), DiffScope::Turn { .. }) => Some(parsed.clone()),
@@ -357,10 +307,6 @@ impl DiffPanel {
             DiffScope::NoTurns => "none".to_owned(),
         };
         format!("{}:{section}", self.thread_id.as_deref().unwrap_or_default())
-    }
-
-    fn collapsed_for(&self, scope_key: &str, files: &[FileDiff]) -> HashSet<String> {
-        self.collapsed.get(scope_key).cloned().unwrap_or_else(|| files.iter().map(FileDiff::key).collect())
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -385,81 +331,57 @@ impl DiffPanel {
             .as_ref()
             .filter(|view| view.scope_key == scope_key && view.layout == layout)
             .map(|_| self.list.logical_scroll_top());
-        let files = parsed.files();
-        let collapsed = self.collapsed_for(&scope_key, files);
-        let rows = build_rows(files, &collapsed, layout);
-        let tree = file_tree_rows(files, &self.tree_collapsed);
-        let digits = files.iter().map(gutter_digits).collect();
-        self.list.reset_with_uniform_height(rows.len(), px(lines::LINE_HEIGHT));
-        match keep.filter(|top| top.item_ix < rows.len()) {
+        let view = View::new(parsed, scope_key.clone(), layout, self.collapsed.get(&scope_key), &self.tree_collapsed);
+        let count = view.row_count();
+        self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT));
+        match keep.filter(|top| top.item_ix < count) {
             Some(top) => self.list.scroll_to(top),
             None => self.h_offset = px(0.),
         }
-        self.top_file = rows.first().map(DiffRow::file);
-        self.view = Some(View { parsed, scope_key, layout, rows, tree, digits });
+        self.top_file = view.row(0).map(|row| row.file());
+        self.view = Some(view);
         self.reveal_requested(cx);
     }
 
-    /// Re-derives rows after folds change, splicing only the file that changed so the list
-    /// keeps its scroll position and measurements.
-    fn refold(&mut self, file: Option<usize>, cx: &mut Context<Self>) {
+    /// Folds or unfolds one file, splicing only its rows so the list keeps its place.
+    fn set_folded(&mut self, file: usize, folded: bool, cx: &mut Context<Self>) {
         let Some(view) = self.view.as_mut() else { return };
-        let files = view.parsed.files();
-        let collapsed = self.collapsed.get(&view.scope_key).cloned().unwrap_or_default();
-        let rows = build_rows(files, &collapsed, view.layout);
-        match file {
-            Some(file) => {
-                let range = |rows: &[DiffRow]| {
-                    let start = rows.iter().position(|row| row.file() == file).unwrap_or(rows.len());
-                    let end = rows[start..].iter().position(|row| row.file() != file).map_or(rows.len(), |offset| start + offset);
-                    start..end
-                };
-                let old = range(&view.rows);
-                let new = range(&rows);
-                self.list.splice(old, new.len());
+        let Some((range, count)) = view.set_folded(file, folded) else { return };
+        let key = view.key(file).map(str::to_owned);
+        let defaults = || view.folded_keys();
+        let folds = self.collapsed.entry(view.scope_key.clone()).or_insert_with(defaults);
+        if let Some(key) = key {
+            if folded {
+                folds.insert(key);
+            } else {
+                folds.remove(&key);
             }
-            None => self.list.reset_with_uniform_height(rows.len(), px(lines::LINE_HEIGHT)),
         }
-        view.rows = rows;
+        self.list.splice(range, count);
         cx.notify();
     }
 
-    fn fold_set(&mut self) -> Option<&mut HashSet<String>> {
-        let view = self.view.as_ref()?;
-        let defaults: HashSet<String> = view.parsed.files().iter().map(FileDiff::key).collect();
-        Some(self.collapsed.entry(view.scope_key.clone()).or_insert(defaults))
-    }
-
     pub fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
-        let Some(key) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(FileDiff::key) else { return };
-        let Some(folds) = self.fold_set() else { return };
-        if !folds.remove(&key) {
-            folds.insert(key);
-        }
-        self.refold(Some(file), cx);
+        let folded = self.is_collapsed(file);
+        self.set_folded(file, !folded, cx);
     }
 
     /// `toggleAllDiffFiles`: expands every file when all are collapsed, else collapses all.
     pub fn toggle_all_files(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.view.as_ref() else { return };
-        let keys: HashSet<String> = view.parsed.files().iter().map(FileDiff::key).collect();
-        let all_collapsed = self.all_collapsed();
-        let scope_key = view.scope_key.clone();
-        self.collapsed.insert(scope_key, if all_collapsed { HashSet::new() } else { keys });
-        self.refold(None, cx);
+        let Some(view) = self.view.as_mut() else { return };
+        let fold = !view.all_folded();
+        view.set_all_folded(fold);
+        self.collapsed.insert(view.scope_key.clone(), view.folded_keys());
+        self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+        cx.notify();
     }
 
     pub fn all_collapsed(&self) -> bool {
-        let Some(view) = self.view.as_ref() else { return false };
-        let files = view.parsed.files();
-        let folds = self.collapsed.get(&view.scope_key);
-        !files.is_empty() && files.iter().all(|file| folds.is_none_or(|folds| folds.contains(&file.key())))
+        self.view.as_ref().is_some_and(View::all_folded)
     }
 
     pub fn is_collapsed(&self, file: usize) -> bool {
-        let Some(view) = self.view.as_ref() else { return false };
-        let Some(file) = view.parsed.files().get(file) else { return false };
-        self.collapsed.get(&view.scope_key).is_none_or(|folds| folds.contains(&file.key()))
+        self.view.as_ref().is_some_and(|view| view.is_folded(file))
     }
 
     /// Reveals a file: unfolds it and scrolls its header to the top (`revealDiffFile`).
@@ -467,10 +389,8 @@ impl DiffPanel {
         let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) else {
             return;
         };
-        if self.is_collapsed(file) {
-            self.toggle_file(file, cx);
-        }
-        if let Some(index) = self.view.as_ref().and_then(|view| view.rows.iter().position(|row| *row == DiffRow::FileHeader { file })) {
+        self.set_folded(file, false, cx);
+        if let Some(index) = self.view.as_ref().and_then(|view| view.header_row(file)) {
             self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
             self.top_file = Some(file);
         }
@@ -498,6 +418,7 @@ impl DiffPanel {
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.git_revision += 1;
+        self.error = None;
         self.sync(cx);
     }
 
@@ -529,7 +450,7 @@ impl DiffPanel {
             self.tree_collapsed.insert(path.to_owned());
         }
         if let Some(view) = self.view.as_mut() {
-            view.tree = file_tree_rows(view.parsed.files(), &self.tree_collapsed);
+            view.rebuild_tree(&self.tree_collapsed);
         }
         cx.notify();
     }
@@ -542,7 +463,7 @@ impl DiffPanel {
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = palette(cx);
-        let message = |text: String| {
+        let message = |text: &str| {
             div()
                 .flex_1()
                 .flex()
@@ -552,17 +473,20 @@ impl DiffPanel {
                 .text_center()
                 .text_xs()
                 .text_color(hsla(p.muted_foreground).opacity(0.7))
-                .child(text)
+                .child(text.to_owned())
                 .into_any_element()
         };
         if self.thread_id.is_none() {
-            return message("Select a thread to inspect turn diffs.".to_owned());
+            return message("Select a thread to inspect turn diffs.");
+        }
+        if self.is_outside_repository(cx) {
+            return message("Turn diffs are unavailable because this project is not a git repository.");
         }
         if self.scope == DiffScope::NoTurns {
-            return message("No completed turns yet.".to_owned());
+            return message("No completed turns yet.");
         }
         let Some(parsed) = self.view.as_ref().map(|view| view.parsed.clone()) else {
-            if self.pending || (self.request.is_some() && self.error.is_none()) {
+            if self.pending || (self.request.is_some() && self.error.is_none() && !self.has_loaded()) {
                 return lines::loading_state(cx).into_any_element();
             }
             return v_flex()
@@ -570,14 +494,24 @@ impl DiffPanel {
                 .children(self.error.clone().map(|error| {
                     div().px(px(12.)).mb(px(8.)).text_size(px(11.)).text_color(hsla(p.error).opacity(0.8)).child(error)
                 }))
-                .child(message("No patch available for this selection.".to_owned()))
+                .child(message("No patch available for this selection."))
                 .into_any_element();
         };
         match &parsed.patch {
-            ParsedPatch::Empty => message("No net changes in this selection.".to_owned()),
+            ParsedPatch::Empty => message("No net changes in this selection."),
             ParsedPatch::Raw { text, reason } => lines::raw_patch(text, reason, self.wrap, cx).into_any_element(),
             ParsedPatch::Files(_) => self.render_files(&parsed, window, cx),
         }
+    }
+
+    /// `!isGitRepo`: the thread's cwd answered a git preview with no sources.
+    fn is_outside_repository(&self, cx: &gpui::App) -> bool {
+        let Some(thread_id) = self.thread_id.as_deref() else { return false };
+        let state = self.state.read(cx);
+        let cwd = state.shell.thread(thread_id).and_then(|thread| {
+            thread.worktree_path.as_deref().or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.as_str()))
+        });
+        cwd.and_then(|cwd| self.repositories.get(cwd)) == Some(&false)
     }
 
     fn render_files(&mut self, parsed: &Parsed, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -612,17 +546,6 @@ impl DiffPanel {
     }
 }
 
-/// Digits in the largest line number a file shows.
-fn gutter_digits(file: &FileDiff) -> usize {
-    let largest = file
-        .hunks
-        .iter()
-        .map(|hunk| (hunk.old_start + hunk.old_count).max(hunk.new_start + hunk.new_count))
-        .max()
-        .unwrap_or(1);
-    largest.max(1).ilog10() as usize + 1
-}
-
 impl Render for DiffPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
@@ -630,7 +553,7 @@ impl Render for DiffPanel {
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
-            .child(header::render(self, cx))
+            .child(header::render(self, window, cx))
             .child(self.render_body(window, cx))
     }
 }

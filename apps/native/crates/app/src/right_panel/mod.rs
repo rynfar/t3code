@@ -16,7 +16,7 @@ use gpui::{
 use gpui_component::v_flex;
 use t3_core::right_panel::{DEFAULT_WIDTH, SurfaceKind, clamp_width};
 
-pub use controls::{Button, Size, Variant, segment, segmented, tooltip_view};
+pub use controls::{Button, Size, Variant, focusable, segment, segmented, tooltip_view};
 pub use state::PanelState;
 
 use crate::app_state::{AppEvent, AppState};
@@ -133,7 +133,7 @@ impl Render for RightPanelView {
         let content = match panel.active().map(|surface| &surface.kind) {
             // Cached: transcript streaming redraws the window, but only diff changes repaint it.
             Some(SurfaceKind::Diff) => self.diff.clone().cached(StyleRefinement::default().size_full()).into_any_element(),
-            None => tabs::empty_state(self.state.clone(), cx).into_any_element(),
+            None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
         };
         v_flex()
             .id("right-panel")
@@ -147,7 +147,7 @@ impl Render for RightPanelView {
             })
             .on_drag_move(cx.listener(Self::resize))
             .when(!panel.maximized, |this| this.child(self.render_resize_handle(cx)))
-            .child(tabs::tab_bar(self.state.clone(), &panel, cx))
+            .child(tabs::tab_bar(self.state.clone(), &panel, window, cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(content))
             .into_any_element()
     }

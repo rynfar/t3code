@@ -5,30 +5,25 @@
 use std::collections::HashMap;
 
 use gpui::Context;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use t3_client::store;
 use t3_core::diff::{DiffSelection, Layout, TurnDiffSummary};
-use t3_core::right_panel::{RightPanels, Surface, SurfaceKind};
+use t3_core::right_panel::{RightPanels, Surface, SurfaceKind, decode_lenient_map};
 
 use crate::app_state::{AppEvent, AppState};
 
 const STORE: &str = "panels";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelState {
-    #[serde(default)]
     pub panels: RightPanels,
     /// `t3code:diff-panel-state:v1` `byThreadKey`.
-    #[serde(default)]
     pub diff_selections: HashMap<String, DiffSelection>,
     /// `branchBaseRefByThreadKey`.
-    #[serde(default)]
     pub branch_base_refs: HashMap<String, String>,
-    #[serde(default)]
     pub diff_layout: Layout,
     /// `t3code.diffFileTreeOpen`.
-    #[serde(default)]
     pub diff_file_tree_open: bool,
     /// The thread whose diff was opened by an explicit request (a turn's "files changed"), so
     /// opening it keeps that selection instead of resetting to the branch scope.
@@ -37,8 +32,17 @@ pub struct PanelState {
 }
 
 impl PanelState {
+    /// Each key decodes on its own: a corrupt entry falls back to its default and the rest load.
     pub fn load() -> PanelState {
-        store::load_ui_state(STORE).unwrap_or_default()
+        let Some(value) = store::load_ui_state(STORE) else { return PanelState::default() };
+        PanelState {
+            panels: value.get("panels").map(RightPanels::from_value).unwrap_or_default(),
+            diff_selections: decode_lenient_map(value.get("diffSelections")),
+            branch_base_refs: decode_lenient_map(value.get("branchBaseRefs")),
+            diff_layout: value.get("diffLayout").and_then(|layout| serde_json::from_value(layout.clone()).ok()).unwrap_or_default(),
+            diff_file_tree_open: value.get("diffFileTreeOpen").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            explicit_diff_open: None,
+        }
     }
 
     pub fn diff_selection(&self, thread_id: &str) -> DiffSelection {
@@ -74,8 +78,7 @@ impl AppState {
 
     pub(crate) fn save_panels(&mut self, cx: &mut Context<Self>) {
         cx.emit(AppEvent::RightPanel);
-        let snapshot = self.panels.clone();
-        self.runtime().spawn_blocking(move || store::save_ui_state(STORE, &snapshot));
+        store::save_ui_state(STORE, &self.panels);
     }
 
     fn mutate_panels(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PanelState, &str) -> bool) {

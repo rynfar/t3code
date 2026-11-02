@@ -6,9 +6,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyView, App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement,
-    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Stateful, StyleRefinement, Styled, Window,
-    div, prelude::*, px,
+    AnyView, App, BoxShadow, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement, Interactivity,
+    IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Stateful, StyleRefinement,
+    Styled, Window, div, point, prelude::*, px,
 };
 use gpui_component::Selectable;
 use gpui_component::menu::DropdownMenu;
@@ -64,6 +64,7 @@ const CONTROL_GROUP: &str = "panel-control";
 
 #[derive(IntoElement)]
 pub struct Button {
+    id: ElementId,
     base: Stateful<Div>,
     variant: Variant,
     size: Size,
@@ -79,8 +80,10 @@ pub struct Button {
 
 impl Button {
     pub fn new(id: impl Into<ElementId>) -> Self {
+        let id = id.into();
         Button {
-            base: div().id(id),
+            base: div().id(id.clone()),
+            id,
             variant: Variant::Ghost,
             size: Size::IconSm,
             icon: None,
@@ -175,9 +178,11 @@ impl Selectable for Button {
 impl DropdownMenu for Button {}
 
 impl RenderOnce for Button {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let m = self.size.metrics();
+        let disabled = self.disabled;
+        let base = focusable(self.base, self.id.clone(), !disabled, window, cx);
         let (text, icon_color, rest, hover, hover_text): (u32, Hsla, Option<u32>, u32, u32) = match self.variant {
             Variant::Ghost => (p.foreground, hsla(p.muted_foreground), None, p.accent, p.foreground),
             Variant::GhostMuted => (p.muted_foreground, hsla(p.muted_foreground), None, p.accent, p.foreground),
@@ -196,8 +201,7 @@ impl RenderOnce for Button {
         let tooltip = self.tooltip.clone();
         let on_click = self.on_click.clone();
         let follows_hover = self.variant == Variant::GhostMuted;
-        self.base
-            .group(CONTROL_GROUP)
+        base.group(CONTROL_GROUP)
             .flex()
             .flex_none()
             .items_center()
@@ -237,6 +241,23 @@ impl RenderOnce for Button {
     }
 }
 
+/// Makes a control a tab stop: Enter and Space click it (GPUI turns them into a click on the
+/// focused element), and keyboard focus draws the ring from design-system §4.2, 2px of `ring`
+/// inside a 1px `background` gap (`ring-2 ring-inset ring-offset-1`).
+pub fn focusable(element: Stateful<Div>, key: ElementId, enabled: bool, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+    let handle = window.use_keyed_state(key, cx, |_, cx| cx.focus_handle()).read(cx).clone().tab_stop(enabled);
+    let p = palette(cx);
+    let ring = |color: Hsla, spread: f32| BoxShadow {
+        color,
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(spread),
+        inset: true,
+    };
+    let shadows = vec![ring(hsla(p.ring), 3.), ring(hsla(p.background), 1.)];
+    element.track_focus(&handle).focus_visible(move |style| style.shadow(shadows))
+}
+
 pub fn tooltip_view(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
     Tooltip::new(text).build(window, cx)
 }
@@ -248,7 +269,8 @@ pub fn segmented(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
 }
 
 /// One segment of `segmented`: 24 tall, 14px icon.
-pub fn segment(id: impl Into<ElementId>, icon: Icon, pressed: bool, label: &'static str, cx: &App) -> Stateful<Div> {
+pub fn segment(id: impl Into<ElementId>, icon: Icon, pressed: bool, label: &'static str, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+    let id = id.into();
     let p = palette(cx);
     let dark = gpui_component::ActiveTheme::theme(cx).is_dark();
     let (rest_text, pressed_fill, hover_fill) = if dark {
@@ -258,8 +280,7 @@ pub fn segment(id: impl Into<ElementId>, icon: Icon, pressed: bool, label: &'sta
     };
     let icon_color = hsla(if pressed { p.foreground } else { rest_text });
     let hover_icon = hsla(p.foreground);
-    div()
-        .id(id)
+    focusable(div().id(id.clone()), id, true, window, cx)
         .group(CONTROL_GROUP)
         .flex()
         .items_center()

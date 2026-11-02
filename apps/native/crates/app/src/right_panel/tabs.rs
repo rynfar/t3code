@@ -1,12 +1,12 @@
 //! The tab bar (`RightPanelTab`, the add-surface menu, `PanelTabCloseButton`) and the empty
 //! "Open a surface" launcher (`RightPanelEmptyState`) from `components/RightPanelTabs.tsx`.
 
-use gpui::{App, Entity, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, WindowControlArea, div, prelude::*, px};
+use gpui::{AnyElement, App, ElementId, Entity, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::right_panel::{Surface, SurfaceKind, ThreadPanel};
 
-use super::{Button, Size, Variant, header_controls};
+use super::{Button, Size, Variant, focusable, header_controls};
 use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -29,12 +29,17 @@ fn surface_icon(surface: &Surface) -> Icon {
     }
 }
 
-pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, cx: &App) -> impl IntoElement {
+pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, window: &mut Window, cx: &mut App) -> AnyElement {
     let count = panel.surfaces.len();
-    let tabs = panel.surfaces.iter().enumerate().map(|(index, surface)| {
-        let active = panel.active_surface_id.as_deref() == Some(surface.id.as_str());
-        tab(state.clone(), surface, index, count, active, cx)
-    });
+    let tabs: Vec<_> = panel
+        .surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, surface)| {
+            let active = panel.active_surface_id.as_deref() == Some(surface.id.as_str());
+            tab(state.clone(), surface, index, count, active, window, cx)
+        })
+        .collect();
     let add_state = state.clone();
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
@@ -69,9 +74,10 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, cx: &App) -> impl I
                 ),
         )
         .child(header_controls(&state, cx))
+        .into_any_element()
 }
 
-fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, cx: &App) -> impl IntoElement {
+fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     let title: SharedString = surface.title().into();
     let id = surface.id.clone();
@@ -79,8 +85,8 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
     let (activate_id, close_id, middle_id) = (id.clone(), id.clone(), id.clone());
     let group: SharedString = format!("tab-{id}").into();
     let icon_color = hsla(if active { p.foreground } else { p.muted_foreground });
-    div()
-        .id(SharedString::from(format!("right-panel-tab-{id}")))
+    let tab_id = ElementId::from(SharedString::from(format!("right-panel-tab-{id}")));
+    focusable(div().id(tab_id.clone()), tab_id, true, window, cx)
         .group(group.clone())
         .flex()
         .flex_none()
@@ -157,16 +163,17 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
                 .item(item("Close to the right", index + 1 >= count, |state, id, cx| state.close_surfaces_to_right(id, cx)))
                 .item(item("Close all", false, |state, _, cx| state.close_all_surfaces(cx)))
         })
+        .into_any_element()
 }
 
 /// `RightPanelEmptyState`: shown while the panel has no tab.
-pub fn empty_state(state: Entity<AppState>, cx: &App) -> impl IntoElement {
+pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
-    let rows = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
+    let rows: Vec<_> = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
         let state = state.clone();
         let open = action.open;
-        h_flex()
-            .id(("surface-launcher", index))
+        let row_id = ElementId::from(("surface-launcher", index));
+        focusable(h_flex().id(row_id.clone()), row_id, true, window, cx)
             .h(px(32.))
             .w_full()
             .px(px(10.))
@@ -180,7 +187,7 @@ pub fn empty_state(state: Entity<AppState>, cx: &App) -> impl IntoElement {
             .child(action.icon.svg().size(px(16.)).text_color(hsla(p.foreground)))
             .child(div().flex_1().min_w_0().truncate().child(action.label))
             .child(kbd(action.shortcut, cx))
-    });
+    }).collect();
     div()
         .flex_1()
         .flex()
@@ -204,6 +211,7 @@ pub fn empty_state(state: Entity<AppState>, cx: &App) -> impl IntoElement {
                 )
                 .child(v_flex().gap(px(2.)).children(rows)),
         )
+        .into_any_element()
 }
 
 /// `components/ui/kbd.tsx`.

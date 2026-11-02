@@ -45,8 +45,8 @@ fn line_colors(kind: LineKind, p: &Palette) -> LineColors {
             bar: Some(hsla(p.diff_deletion)),
         },
         LineKind::Context => LineColors {
-            row: hsla(p.code_background),
-            gutter: hsla(p.code_background),
+            row: hsla(p.background),
+            gutter: hsla(p.background),
             number: hsla(p.code_foreground).opacity(0.65),
             bar: None,
         },
@@ -68,7 +68,7 @@ impl DiffPanel {
             self.char_width = Some(advance.unwrap_or(px(7.8)));
         }
         let top = self.list.logical_scroll_top().item_ix;
-        self.top_file = self.view.as_ref().and_then(|view| view.rows.get(top)).map(DiffRow::file);
+        self.top_file = self.view.as_ref().and_then(|view| view.row(top)).map(|row| row.file());
         let sticky = self.top_file;
         div()
             .id("diff-list")
@@ -76,7 +76,7 @@ impl DiffPanel {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(hsla(p.code_background))
+            .bg(hsla(p.background))
             .on_scroll_wheel(cx.listener(Self::scroll_horizontally))
             .child(list(self.list.clone(), cx.processor(|this, ix: usize, _, cx| this.render_row(ix, cx))).size_full())
             .children(sticky.map(|file| div().absolute().top_0().left_0().right_0().child(self.render_file_header(file, cx))))
@@ -108,7 +108,7 @@ impl DiffPanel {
     }
 
     fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(row) = self.view.as_ref().and_then(|view| view.rows.get(ix)).copied() else {
+        let Some(row) = self.view.as_ref().and_then(|view| view.row(ix)) else {
             return div().into_any_element();
         };
         match row {
@@ -124,9 +124,24 @@ impl DiffPanel {
                 let right = right.and_then(|line| self.line(file, hunk, line));
                 let digits = left.or(right).map_or(3, |(_, digits)| digits);
                 let p = palette(cx);
-                self.code_row(hsla(p.code_background), cx)
+                self.code_row(hsla(p.background), cx)
                     .child(self.half(left.map(|(line, _)| line), digits, false, cx))
                     .child(self.half(right.map(|(line, _)| line), digits, true, cx))
+                    .into_any_element()
+            }
+            DiffRow::NoNewline { file, hunk, line } => {
+                let Some((line, digits)) = self.line(file, hunk, line) else { return div().into_any_element() };
+                let p = palette(cx);
+                self.code_row(line_colors(line.kind, p).row, cx).child(self.no_newline(Some(line), digits, cx)).into_any_element()
+            }
+            DiffRow::SplitNoNewline { file, hunk, left, right } => {
+                let left = left.and_then(|line| self.line(file, hunk, line));
+                let right = right.and_then(|line| self.line(file, hunk, line));
+                let digits = left.or(right).map_or(3, |(_, digits)| digits);
+                let p = palette(cx);
+                self.code_row(hsla(p.background), cx)
+                    .child(self.no_newline(left.map(|(line, _)| line), digits, cx))
+                    .child(self.no_newline(right.map(|(line, _)| line), digits, cx))
                     .into_any_element()
             }
             DiffRow::Notice { .. } => {
@@ -173,7 +188,7 @@ impl DiffPanel {
             (LineKind::Deletion, _) | (LineKind::Context, false) => line.old_line,
             _ => line.new_line,
         });
-        let text: Option<SharedString> = line.map(|line| line.text.clone().into());
+        let text: Option<SharedString> = line.map(display_text);
         div()
             .flex()
             .flex_1()
@@ -202,6 +217,29 @@ impl DiffPanel {
                         this.overflow_hidden().whitespace_nowrap().child(div().ml(-self.h_offset).children(text.clone()))
                     })
                     .when(self.wrap, |this| this.children(text)),
+            )
+    }
+
+    /// Pierre's `createNoNewlineElement`: the line's fill with an empty gutter and the note at
+    /// 60%, under the line that lacks a newline. An empty side paints nothing.
+    fn no_newline(&self, line: Option<&DiffLine>, digits: usize, cx: &App) -> Div {
+        let p = palette(cx);
+        let char_width = self.char_width.unwrap_or(px(7.8));
+        let colors = line.map_or_else(|| line_colors(LineKind::Context, p), |line| line_colors(line.kind, p));
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .bg(colors.row)
+            .child(div().flex_none().w(gutter_width(digits, char_width)).bg(colors.gutter))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(CODE_PADDING))
+                    .truncate()
+                    .text_color(hsla(p.code_foreground).opacity(0.6))
+                    .children(line.map(|_| "No newline at end of file")),
             )
     }
 
@@ -245,7 +283,7 @@ impl DiffPanel {
             .pl(px(8.))
             .pr(px(12.))
             .gap(px(6.))
-            .bg(hsla(p.code_background))
+            .bg(hsla(p.background))
             .text_size(px(12.))
             .text_color(hsla(p.code_foreground))
             .cursor_pointer()
@@ -283,6 +321,15 @@ impl DiffPanel {
             .child(div().flex_1())
             .child(stat_label(u64::from(file.additions), u64::from(file.deletions), cx))
             .into_any_element()
+    }
+}
+
+/// A line as shown: a trailing `\r` (CRLF content) is invisible on the web too, so it is kept
+/// in the model but not painted.
+fn display_text(line: &DiffLine) -> SharedString {
+    match line.text.strip_suffix('\r') {
+        Some(text) => SharedString::from(text.to_owned()),
+        None => SharedString::from(line.text.clone()),
     }
 }
 

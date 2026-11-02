@@ -1,7 +1,7 @@
 //! The diff toolbar (`headerRow` in `components/DiffPanel.tsx`): the scope menu and comparison
 //! refs on the left; stats, refresh, fold-all, layout, wrap, whitespace and file tree on the right.
 
-use gpui::{Context, IntoElement, ParentElement, Styled, div, prelude::*, px};
+use gpui::{Context, IntoElement, ParentElement, Styled, Window, div, prelude::*, px};
 use gpui_component::h_flex;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use t3_core::diff::{DiffScope, DiffSelection, Layout, line_stat};
@@ -12,7 +12,7 @@ use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant, segment, segmented};
 use crate::theme::{hsla, palette};
 
-pub fn render(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> impl IntoElement {
+pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffPanel>) -> impl IntoElement {
     let p = palette(cx);
     let entity = cx.entity().downgrade();
     let summaries = panel.summaries.clone();
@@ -147,8 +147,8 @@ pub fn render(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> impl IntoEl
                 })
                 .child(
                     segmented("diff-layout", cx)
-                        .child(segment("diff-stacked", Icon::Rows3, layout == Layout::Stacked, "Stacked diff view", cx).on_click(stacked))
-                        .child(segment("diff-split", Icon::Columns2, layout == Layout::Split, "Split diff view", cx).on_click(split)),
+                        .child(segment("diff-stacked", Icon::Rows3, layout == Layout::Stacked, "Stacked diff view", window, cx).on_click(stacked))
+                        .child(segment("diff-split", Icon::Columns2, layout == Layout::Split, "Split diff view", window, cx).on_click(split)),
                 )
                 .child(
                     Button::new("diff-wrap")

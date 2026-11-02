@@ -532,13 +532,14 @@ const statusHue = (name: string, color: string, darkAlpha: number): ColorToken[]
 
 // What a changed diff row paints: Pierre mixes its line color `in lab` over the code surface
 // (lines 88%/80%, gutter 91%/85%) toward the override `diffRendering.ts` sets
-// (`--diffs-bg-{kind}-override` and `--diffs-bg-{kind}-number-override`).
+// (`--diffs-bg-{kind}-override` and `--diffs-bg-{kind}-number-override`). Inside the viewer
+// `StyledDiffCodeView.tsx` sets `--code-background: var(--background)`, so the surface is the canvas.
 const diffRowTokens = (kind: "addition" | "deletion"): ColorToken[] => {
   const row = (line: [number, number], target: [number, number]) =>
     `light-dark(${[0, 1]
       .map(
         (i) =>
-          `color-mix(in lab, var(--code-background) ${line[i]}%, color-mix(in srgb, var(--code-background) ${target[i]}%, var(--diff-${kind})))`,
+          `color-mix(in lab, var(--background) ${line[i]}%, color-mix(in srgb, var(--background) ${target[i]}%, var(--diff-${kind})))`,
       )
       .join(", ")})`;
   return [
@@ -686,7 +687,7 @@ const COLOR_TOKENS: readonly ColorToken[] = [
   {
     name: "diff_hunk_separator",
     web: "StyledDiffCodeView.tsx --diffs-bg-separator",
-    css: "color-mix(in srgb, var(--code-background) 97%, var(--code-foreground))",
+    css: "color-mix(in srgb, var(--background) 97%, var(--code-foreground))",
   },
   { name: "toolbar_background", web: "--toolbar-background", css: v("--toolbar-background") },
   {

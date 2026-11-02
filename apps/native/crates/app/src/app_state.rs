@@ -395,6 +395,11 @@ impl AppState {
         Some(self.runtime.spawn(async move { decode(client.request(method, payload).await.map_err(|error| error.to_string())?) }))
     }
 
+    /// The connected server's address, `None` while unpaired.
+    pub fn environment(&self) -> Option<&str> {
+        self.client.as_ref().map(ClientHandle::environment)
+    }
+
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
         let task = self.rpc(method::DISPATCH_COMMAND, command);
         cx.spawn(async move |this, cx| {
