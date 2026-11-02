@@ -1246,3 +1246,53 @@ fn recalled_prompts_drop_what_the_composer_cannot_restore() {
     assert_eq!(merge_restored_prompt("", "restored"), "restored");
     assert_eq!(merge_restored_prompt("draft", ""), "draft");
 }
+
+
+fn background_task(task_id: &str, kind: &str, description: Option<&str>, awaited: Option<bool>) -> crate::shell::PendingBackgroundTask {
+    crate::shell::PendingBackgroundTask {
+        task_id: task_id.into(),
+        kind: kind.into(),
+        description: description.map(str::to_owned),
+        child_thread_id: (kind == "subagent").then(|| format!("child-{task_id}")),
+        awaited,
+    }
+}
+
+#[test]
+fn background_work_titles_follow_present_pending_background_work() {
+    assert_eq!(background_work(&[]), None);
+    let one = background_work(&[background_task("t1", "command", Some("npm run dev"), None)]).unwrap();
+    assert_eq!((one.title.as_str(), one.waiting, one.description()), ("Running · npm run dev", false, None));
+    assert!(one.items[0].command && one.all_commands());
+    let unnamed = background_work(&[background_task("t1", "monitor", None, Some(true))]).unwrap();
+    assert_eq!(unnamed.title, "Waiting on a monitor");
+    let subagent = background_work(&[background_task("s1", "subagent", Some("Subagent: /root/team/code_reviewer"), None)]).unwrap();
+    assert_eq!(subagent.title, "Waiting · Code Reviewer", "subagents hold the turn");
+    assert_eq!(subagent.only_child_thread(), Some("child-s1"));
+    let many = background_work(&[
+        background_task("c1", "command", Some("a"), None),
+        background_task("s1", "subagent", Some("Explore"), None),
+        background_task("c2", "command", Some("b"), None),
+        background_task("x", "background_task", None, None),
+    ])
+    .unwrap();
+    assert_eq!(many.title, "Waiting on 1 subagent, 2 commands and 1 background task");
+    assert_eq!(many.description().as_deref(), Some("Explore, a, b, background task"));
+    assert_eq!(many.only_child_thread(), None);
+}
+
+#[test]
+fn subagent_titles_drop_prefix_and_path() {
+    assert_eq!(format_subagent_display_title("Subagent: Find the bug"), "Find the bug");
+    assert_eq!(format_subagent_display_title("/root/a/b_c d/"), "B C D");
+    assert_eq!(format_subagent_display_title("plain"), "plain");
+}
+
+#[test]
+fn force_stop_notices_name_what_kept_running() {
+    assert_eq!(force_stop_notice(&serde_json::json!({ "outcome": "stopped", "sharedWithThreadIds": [] })), None);
+    assert_eq!(force_stop_notice(&serde_json::json!({ "outcome": "releasing", "sharedWithThreadIds": [] })).unwrap().0, "Turn stopped; the agent is still shutting down");
+    let shared = force_stop_notice(&serde_json::json!({ "outcome": "shared", "sharedWithThreadIds": ["a"] })).unwrap();
+    assert_eq!(shared.1.as_deref(), Some("It is shared with 1 working thread. Stop those to free it."));
+    assert_eq!(force_stop_request("t", "r"), serde_json::json!({ "threadId": "t", "runId": "r" }));
+}

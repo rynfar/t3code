@@ -25,6 +25,7 @@ pub enum ToastKind {
     Success,
     Error,
     Warning,
+    Info,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl Toast {
             ToastKind::Success => (Icon::CircleCheck, p.success),
             ToastKind::Error => (Icon::CircleAlert, p.destructive),
             ToastKind::Warning => (Icon::CircleAlert, p.warning),
+            ToastKind::Info => (Icon::Info, p.info),
         };
         div()
             .relative()

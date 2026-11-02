@@ -10,8 +10,9 @@ use gpui::{AnyElement, ClipboardItem, Context, Entity, FontWeight, Hsla, IntoEle
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{self, DispatchMode, method};
 use t3_core::timeline::{
-    CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, ProviderBanner, RunStop, StatusLine, ThreadError, error_banner_message, error_can_expand,
-    goal_line, provider_banner, run_stop, status_line, thread_error, timeline_thread_error,
+    BackgroundWork, CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, ChildInputs, FORCE_STOP_THREAD, GoalLine, ProviderBanner, RunStop, StatusLine, ThreadError,
+    background_work, child_inputs, error_banner_message, error_can_expand, force_stop_notice, force_stop_request, goal_line, provider_banner, run_stop, status_line,
+    thread_error, timeline_thread_error,
 };
 
 use super::ThreadView;
@@ -27,15 +28,26 @@ use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct FooterLines {
     stop: Option<RunStop>,
+    /// Subagents and side chats waiting on the user.
+    children: Option<ChildInputs>,
+    /// Background commands and subagents left running after the turn.
+    background: Option<BackgroundWork>,
+    /// The thread is resubscribing ("Syncing messages...").
+    syncing: bool,
     goal: Option<GoalLine>,
     status: Option<StatusLine>,
 }
 
 impl FooterLines {
     fn is_shown(&self) -> bool {
-        self.stop.is_some() || self.goal.is_some() || self.status.is_some()
+        self.stop.is_some() || self.children.is_some() || self.background.is_some() || self.syncing || self.goal.is_some() || self.status.is_some()
     }
 }
+
+/// `useDelayedStatus`: a quick resync does not flash a line at the end of the timeline.
+const SYNC_LINE_DELAY: Duration = Duration::from_millis(500);
+/// `BACKGROUND_WORK_STOP_RETRY_AFTER_MS`: Stop on background work can be retried after this.
+const BACKGROUND_STOP_RETRY: Duration = Duration::from_secs(10);
 
 /// The footer list item: its lines, the timer the Stop line counts with, and the actions in flight.
 #[derive(Default)]
@@ -44,6 +56,11 @@ pub struct ThreadFooter {
     stop_timer: Option<Entity<WorkingTimer>>,
     status_pending: bool,
     goal_pending: bool,
+    force_stopping: bool,
+    /// The background tasks a Stop was sent for, until they change or the retry window passes.
+    background_stop: Option<(Vec<String>, std::time::Instant)>,
+    /// When the thread was first seen unsynchronized, for the sync line's delay.
+    unsynced_since: Option<std::time::Instant>,
     /// Re-reads the relative labels ("Settled 5m ago", "Snoozed, 2h left") once a minute.
     minute: Option<Task<()>>,
 }
@@ -105,11 +122,42 @@ impl ThreadView {
         let background = !working && shell.is_some_and(|shell| !shell.pending_background_tasks.is_empty());
         let now = chrono::Utc::now().timestamp_millis();
         let config_loaded = state.server_config.config.is_some();
+        let parent_awaiting = shell.is_some_and(|shell| shell.pending_runtime_request.is_some()) || !self.activity.pending_approval_ids.is_empty();
+        let children = match (self.thread_id.as_deref(), state.shell.snapshot.as_ref()) {
+            (Some(id), Some(snapshot)) => child_inputs(&snapshot.threads, id, parent_awaiting),
+            _ => None,
+        };
+        let unsynced = state.thread.projection.is_some() && !state.thread.synchronized;
+        let syncing = match (unsynced, self.footer.unsynced_since) {
+            (false, _) => {
+                self.footer.unsynced_since = None;
+                false
+            }
+            (true, Some(since)) => since.elapsed() >= SYNC_LINE_DELAY,
+            (true, None) => {
+                self.footer.unsynced_since = Some(std::time::Instant::now());
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(SYNC_LINE_DELAY).await;
+                    let _ = this.update(cx, |view, cx| view.sync_footer(cx));
+                })
+                .detach();
+                false
+            }
+        };
+        let state = self.state.read(cx);
+        let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
         let next = FooterLines {
             stop: state.thread.projection.as_ref().and_then(|projection| run_stop(projection, background)),
+            children,
+            background: shell.filter(|_| !working).and_then(|shell| background_work(&shell.pending_background_tasks)),
+            syncing,
             goal: shell.and_then(|shell| shell.goal.as_ref()).and_then(|goal| goal_line(goal, working)),
             status: self.thread_id.as_deref().and_then(|id| state.sidebar.model.thread(id)).filter(|_| config_loaded).and_then(|thread| status_line(thread, now)),
         };
+        let task_ids: Vec<String> = next.background.iter().flat_map(|work| work.items.iter().map(|item| item.task_id.clone())).collect();
+        if self.footer.background_stop.as_ref().is_some_and(|(ids, at)| *ids != task_ids || at.elapsed() >= BACKGROUND_STOP_RETRY) {
+            self.footer.background_stop = None;
+        }
         if next == self.footer.lines {
             return;
         }
@@ -243,15 +291,81 @@ impl ThreadView {
         };
         let actions = || h_flex().flex_none().ml(px(6.)).gap(px(10.));
         let mut lines: Vec<AnyElement> = Vec::new();
-        if let Some(stop) = &self.footer.lines.stop {
+        let stop_line = self.footer.lines.stop.as_ref().map(|stop| {
             let icon = if stop.unresponsive { Icon::TriangleAlert.render(px(14.), hsla(p.warning_foreground)) } else { Icon::CircleStop.render(px(14.), muted) };
-            lines.push(
+            let can_force = stop.unresponsive && self.state.read(cx).server_config.config.as_ref().is_some_and(|config| config.environment.capabilities.thread_force_stop == Some(true));
+            let run_id = stop.run_id.clone();
+            let force = can_force.then(|| {
+                let pending = self.footer.force_stopping;
+                inline_button(
+                    "force-stop",
+                    if pending { "Force stopping..." } else { "Force stop" },
+                    InlineTone::Default,
+                    pending,
+                    cx.listener(move |view, _, _, cx| view.force_stop(&run_id, cx)),
+                    cx,
+                )
+            });
+            line()
+                .child(div().flex_none().child(icon))
+                .child(text(stop.title().to_owned(), stop.description().map(str::to_owned)))
+                .child(actions().children(self.footer.stop_timer.clone()).children(force))
+                .into_any_element()
+        });
+        let unresponsive = self.footer.lines.stop.as_ref().is_some_and(|stop| stop.unresponsive);
+        let (attention, work) = if unresponsive { (stop_line, None) } else { (None, stop_line) };
+        // `childInputNowItem`: the only line here that needs you gets the info color.
+        let attention = attention.or_else(|| {
+            let children = self.footer.lines.children.as_ref()?;
+            let info = hsla(p.info_foreground);
+            let icon = if children.approval_icon() { Icon::ShieldQuestion } else { Icon::MessageCircleQuestion };
+            let names: Vec<AnyElement> = children
+                .children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| {
+                    let id = child.thread_id.clone();
+                    let label = if index + 1 < children.children.len() { format!("{},", child.title) } else { child.title.clone() };
+                    inline_button(SharedString::from(format!("child-input:{id}")), label, InlineTone::Muted, false, cx.listener(move |view, _, _, cx| view.open_thread(&id, cx)), cx)
+                })
+                .collect();
+            let first = children.children.first()?.thread_id.clone();
+            Some(
                 line()
-                    .child(div().flex_none().child(icon))
-                    .child(text(stop.title().to_owned(), stop.description().map(str::to_owned)))
-                    .child(actions().children(self.footer.stop_timer.clone()))
+                    .child(div().flex_none().child(icon.render(px(14.), info)))
+                    .child(h_flex().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().gap(px(6.)).child(div().flex_none().child(children.title())).children(names))
+                    .child(actions().child(inline_button("child-input-open", children.action(), InlineTone::Default, false, cx.listener(move |view, _, _, cx| view.open_thread(&first, cx)), cx)))
                     .into_any_element(),
+            )
+        });
+        let work = work.or_else(|| {
+            let background = self.footer.lines.background.as_ref()?;
+            let icon = if background.all_commands() { Icon::Terminal } else { Icon::CircleDashed };
+            let stopping = self.footer.background_stop.is_some();
+            let open = background.only_child_thread().map(|thread_id| {
+                let id = thread_id.to_owned();
+                inline_button("background-open", "Open", InlineTone::Muted, false, cx.listener(move |view, _, _, cx| view.open_thread(&id, cx)), cx)
+            });
+            let stop = inline_button(
+                "background-stop",
+                if stopping { "Stopping..." } else { "Stop" },
+                InlineTone::Default,
+                stopping,
+                cx.listener(|view, _, _, cx| view.stop_background_work(cx)),
+                cx,
             );
+            Some(
+                line()
+                    .child(div().flex_none().child(icon.render(px(14.), muted)))
+                    .child(text(background.title.clone(), background.description()))
+                    .child(actions().children(open).child(stop))
+                    .into_any_element(),
+            )
+        });
+        lines.extend(attention);
+        lines.extend(work);
+        if self.footer.lines.syncing {
+            lines.push(line().child(div().flex_none().child(Icon::RefreshCw.render(px(14.), muted))).child(div().min_w_0().truncate().child("Syncing messages...")).into_any_element());
         }
         if let Some(goal) = &self.footer.lines.goal {
             let pending = self.footer.goal_pending;
@@ -309,6 +423,58 @@ impl ThreadView {
             );
         }
         v_flex().w_full().children(lines).into_any_element()
+    }
+
+    /// `useForceStopThread`: kills the agent that ignored Stop on `run_id`, then says what is left.
+    fn force_stop(&mut self, run_id: &str, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.thread_id.clone() else { return };
+        if self.footer.force_stopping {
+            return;
+        }
+        self.footer.force_stopping = true;
+        cx.notify();
+        let request = self.state.read(cx).rpc(FORCE_STOP_THREAD, force_stop_request(&thread_id, run_id));
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |view, cx| {
+                view.footer.force_stopping = false;
+                let toast = match &result {
+                    Err(error) => Some(Toast::new(ToastKind::Error, "Could not force stop the agent").description(error.to_string())),
+                    Ok(value) => force_stop_notice(value).map(|(title, description)| {
+                        let toast = Toast::new(ToastKind::Info, title);
+                        match description {
+                            Some(description) => toast.description(description),
+                            None => toast,
+                        }
+                    }),
+                };
+                if let Some(toast) = toast {
+                    view.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `handleStopBackgroundWork`: the thread's Stop, which ends its background work; the line
+    /// reads "Stopping..." while those tasks are still listed, for up to ten seconds.
+    fn stop_background_work(&mut self, cx: &mut Context<Self>) {
+        if self.footer.background_stop.is_some() {
+            return;
+        }
+        let ids = self.footer.lines.background.iter().flat_map(|work| work.items.iter().map(|item| item.task_id.clone())).collect();
+        self.footer.background_stop = Some((ids, std::time::Instant::now()));
+        self.state.update(cx, |state, cx| state.stop_selected_thread(cx));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BACKGROUND_STOP_RETRY).await;
+            let _ = this.update(cx, |view, cx| {
+                view.footer.background_stop = None;
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// A failure from an action taken in this view, shown in the error banner.

@@ -11,6 +11,7 @@ mod changed_files;
 mod find;
 mod folds;
 mod fork;
+mod now;
 mod presentation;
 mod rewind;
 mod rows;
@@ -53,6 +54,10 @@ pub use rewind::{
 };
 pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};
 pub use folds::unsettled_run_id;
+pub use now::{
+    BackgroundItem, BackgroundWork, ChildInput, ChildInputs, FORCE_STOP_THREAD, background_work, child_inputs, force_stop_notice, force_stop_request,
+    format_subagent_display_title,
+};
 pub use status::{
     CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, LimitRecovery, ProviderBanner, RunStop, SnoozeRefused, StatusLine, ThreadError, elapsed_since,
     error_banner_message, error_can_expand, goal_line, limit_recovery, presented_latest_run, provider_banner, relative_time_label, run_stop, status_line,
