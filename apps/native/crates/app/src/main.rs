@@ -18,6 +18,7 @@ mod menus;
 mod new_thread;
 mod omitted_rows;
 mod notifications;
+mod onboarding;
 mod palette;
 mod preview;
 mod project_files;
@@ -119,6 +120,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     terminal::init(cx);
     files::init(cx);
     selectable_text::init(cx);
+    onboarding::init(cx);
     state
 }
 

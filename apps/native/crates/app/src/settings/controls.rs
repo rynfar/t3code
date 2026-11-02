@@ -51,11 +51,13 @@ pub(super) fn focus_ring(color: Hsla) -> Vec<BoxShadow> {
     vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: false }]
 }
 
-fn focus_handle(id: &ElementId, window: &mut Window, cx: &mut App) -> FocusHandle {
+/// A control's Tab stop, kept per element id across renders.
+pub(crate) fn focus_handle(id: &ElementId, window: &mut Window, cx: &mut App) -> FocusHandle {
     window.use_keyed_state((id.clone(), "focus"), cx, |_, cx| cx.focus_handle().tab_stop(true)).read(cx).clone()
 }
 
-fn activates(event: &KeyDownEvent) -> bool {
+/// Enter or Space, unmodified: what presses a focused control.
+pub(crate) fn activates(event: &KeyDownEvent) -> bool {
     matches!(event.keystroke.key.as_str(), "enter" | "space")
 }
 

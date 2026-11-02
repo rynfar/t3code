@@ -52,10 +52,14 @@ fn edits_keep_unknown_keys_and_round_trip() {
     assert!(doc.apply(&ClientSettingChange::ChatWidth(ChatWidth::Wide)));
     assert!(!doc.apply(&ClientSettingChange::ChatWidth(ChatWidth::Wide)));
     assert!(doc.apply(&ClientSettingChange::InterfaceFontSize(99)));
+    assert!(!doc.onboarding_completed());
+    assert!(doc.apply(&ClientSettingChange::OnboardingCompletedAt("2026-11-02T00:00:00.000Z".into())));
     let reread = ClientSettingsDoc::from_json(&doc.to_json());
     assert_eq!(reread, doc);
     assert_eq!(reread.chat_width(), ChatWidth::Wide);
     assert_eq!(reread.interface_font_size(), 20);
+    assert!(reread.onboarding_completed());
+    assert!(!ClientSettingsDoc::from_json(r#"{"onboardingCompletedAt": null}"#).onboarding_completed());
     assert!(reread.to_json().contains("futureSetting"));
 }
 

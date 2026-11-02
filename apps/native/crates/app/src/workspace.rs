@@ -40,6 +40,7 @@ pub struct Workspace {
     draft: Entity<DraftHero>,
     home: Entity<crate::home::HomeView>,
     connect: Entity<ConnectView>,
+    welcome: Entity<crate::onboarding::WelcomeWizard>,
     menu: Entity<ContextMenu>,
     dialog: Entity<ConfirmDialog>,
     palette: Entity<CommandPalette>,
@@ -68,6 +69,7 @@ impl Workspace {
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
         let home = cx.new(|cx| crate::home::HomeView::new(state.clone(), cx));
         let connect = cx.new(|cx| ConnectView::new(state.clone(), window, cx));
+        let welcome = cx.new(|cx| crate::onboarding::WelcomeWizard::new(state.clone(), window, cx));
         let right_panel = cx.new(|cx| RightPanelView::new(state.clone(), window, cx));
         let terminal = cx.new(|cx| TerminalDrawer::new(state.clone(), window, cx));
         let header = cx.new(|cx| ChatHeader::new(state.clone(), menu.clone(), window, cx));
@@ -85,6 +87,7 @@ impl Workspace {
                 }
             }),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.subscribe(&welcome, |_, _, _: &crate::onboarding::Visibility, cx| cx.notify()),
             cx.subscribe(&details_model, |_, _, _: &DetailsEvent, cx| cx.notify()),
             // The bar ticks while a subagent works; only swapping it for the composer re-lays out.
             cx.observe(&lineage, |this, lineage, cx| {
@@ -110,6 +113,7 @@ impl Workspace {
             draft,
             home,
             connect,
+            welcome,
             menu,
             dialog,
             palette,
@@ -190,7 +194,9 @@ impl Render for Workspace {
         let paired = matches!(self.state.read(cx).phase, Phase::Online(_));
         let theme = cx.theme();
         if !paired || self.state.read(cx).connect.switching {
-            return div().size_full().bg(theme.background).map(crate::quit_hold::listen).child(self.connect.clone()).children(crate::quit_hold::hint(cx)).into_any_element();
+            // First run shows the welcome wizard where the connect screen would be.
+            let screen = if self.welcome.read(cx).is_open() { self.welcome.clone().into_any_element() } else { self.connect.clone().into_any_element() };
+            return div().size_full().bg(theme.background).map(crate::quit_hold::listen).child(screen).children(crate::quit_hold::hint(cx)).into_any_element();
         }
         let state = self.state.read(cx);
         let has_thread = state.selected_thread.is_some();
@@ -318,6 +324,7 @@ impl Render for Workspace {
             .child(self.palette.clone())
             .child(self.link_dialog.clone())
             .child(self.device_setup.clone())
+            .child(self.welcome.clone())
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))
             .children(crate::usage::overlay(window, cx))

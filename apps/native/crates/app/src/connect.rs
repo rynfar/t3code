@@ -6,11 +6,12 @@
 use gpui::{App, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::*, px};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
+use t3_client::local::LocalServer;
 use t3_client::status::DotTone;
 use t3_client::store::SavedEnvironment;
 
 use crate::app_state::{AppEvent, AppState, Phase};
-use crate::environments::PairingSource;
+use crate::environments::{ConnectScreen, PairingSource};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
@@ -47,6 +48,24 @@ fn muted(text: impl Into<SharedString>, cx: &App) -> Div {
 
 fn error_text(text: impl Into<SharedString>, cx: &App) -> Div {
     div().text_xs().line_height(px(18.)).text_color(hsla(palette(cx).destructive_foreground)).child(text.into())
+}
+
+/// The last pairing failure from `source`, shown beside the control that started it.
+pub(crate) fn pairing_error(connect: &ConnectScreen, source: PairingSource) -> Option<String> {
+    connect.error.as_ref().filter(|(failed, _)| *failed == source).map(|(_, message)| message.clone())
+}
+
+/// Why T3 Code on this Mac isn't offered: still looking, or not running.
+pub(crate) fn discovery_message(discovering: bool) -> &'static str {
+    if discovering { "Looking for T3 Code on this Mac…" } else { "T3 Code isn't running on this Mac. Open it to connect with one click." }
+}
+
+/// The local server's details line (label, version, address), and why it cannot connect, if so.
+pub(crate) fn local_details(server: &LocalServer) -> (String, Option<String>) {
+    let mut details = vec![server.label().to_owned()];
+    details.extend(server.server_version().map(|version| format!("version {version}")));
+    details.push(server.state.origin.clone());
+    (details.join(" · "), server.mismatch().map(|mismatch| mismatch.message(server.label())))
 }
 
 /// `SettingsGroup`: radius 12, `border` at 60%, `card` at 40%.
@@ -150,9 +169,9 @@ impl ConnectView {
     fn render_local(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let connect = &state.connect;
-        let error = connect.error.as_ref().filter(|(source, _)| *source == PairingSource::Local).map(|(_, message)| message.clone());
+        let error = pairing_error(connect, PairingSource::Local);
         let Some(server) = connect.local_server.clone() else {
-            let message = if connect.discovering { "Looking for T3 Code on this Mac…" } else { "T3 Code isn't running on this Mac. Open it to connect with one click." };
+            let message = discovery_message(connect.discovering);
             return card(cx)
                 .px(px(16.))
                 .py(px(12.))
@@ -173,10 +192,7 @@ impl ConnectView {
                 .into_any_element();
         };
         let busy = connect.pairing == Some(PairingSource::Local);
-        let blocked = server.mismatch().map(|mismatch| mismatch.message(server.label()));
-        let mut details = vec![server.label().to_owned()];
-        details.extend(server.server_version().map(|version| format!("version {version}")));
-        details.push(server.state.origin.clone());
+        let (details, blocked) = local_details(&server);
         let p = palette(cx);
         card(cx)
             .px(px(16.))
@@ -191,7 +207,7 @@ impl ConnectView {
                             .flex_1()
                             .min_w_0()
                             .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("T3 Code on this Mac"))
-                            .child(div().truncate().child(muted(details.join(" · "), cx))),
+                            .child(div().truncate().child(muted(details, cx))),
                     ),
             )
             .child(
@@ -292,7 +308,7 @@ impl ConnectView {
         let state = self.state.read(cx);
         let busy = state.connect.pairing == Some(PairingSource::Link);
         let primary = state.connect.local_server.is_none() && state.environments.environments.is_empty();
-        let error = state.connect.error.as_ref().filter(|(source, _)| *source == PairingSource::Link).map(|(_, message)| message.clone());
+        let error = pairing_error(&state.connect, PairingSource::Link);
         v_flex()
             .gap(px(8.))
             .child(label("Add environment", cx))

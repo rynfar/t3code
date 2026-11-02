@@ -25,7 +25,7 @@ use crate::app_state::AppState;
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
-[--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
+[--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
 
@@ -121,6 +121,8 @@ pub struct Options {
     usage_period: Option<String>,
     usage_model: bool,
     context_meter: bool,
+    /// Opens the welcome wizard at a step whatever the first-run gate decides.
+    welcome: Option<crate::onboarding::Step>,
     gestures: Vec<Gesture>,
     width: f32,
     height: f32,
@@ -154,6 +156,10 @@ impl Options {
             usage_period: flag("--usage-period"),
             usage_model: has("--usage-model"),
             context_meter: has("--context-meter"),
+            welcome: has("--welcome").then(|| match flag("--welcome").as_deref() {
+                Some("agents") => crate::onboarding::Step::Agents,
+                _ => crate::onboarding::Step::Connection,
+            }),
             gestures: gestures(&args),
             width: number("--width", 1440.),
             height: number("--height", 900.),
@@ -306,6 +312,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             window.dispatch_action(Box::new(crate::keymap::ToggleCommandPalette), cx);
         })
         .map_err(|error| error.to_string())?;
+    }
+    if let Some(step) = options.welcome {
+        cx.update(|cx| crate::onboarding::open(step, cx));
+        pump(&mut cx, options.wait.min(3.), |_| false);
     }
     if options.new_thread {
         cx.update(|cx| cx.dispatch_action(&crate::new_thread::NewThread));

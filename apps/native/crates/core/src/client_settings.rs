@@ -180,6 +180,8 @@ pub enum ClientSettingChange {
     AppearanceMode(AppearanceMode),
     /// The last repository mode the grouping switch turned off, restored when it turns back on.
     LastEnabledProjectGrouping(ProjectGroupingMode),
+    /// `completeOnboarding`: when the welcome wizard finished, as an ISO timestamp.
+    OnboardingCompletedAt(String),
 }
 
 impl ClientSettingChange {
@@ -225,6 +227,7 @@ impl ClientSettingChange {
             ClientSettingChange::LastEnabledProjectGrouping(mode) => {
                 ("t3code:last-enabled-project-grouping-mode", text(mode.as_str()))
             }
+            ClientSettingChange::OnboardingCompletedAt(at) => ("onboardingCompletedAt", text(at)),
         }
     }
 }
@@ -377,6 +380,11 @@ impl ClientSettingsDoc {
     }
 
     /// `readAppearanceModePreference`: the stored mode, else the default theme's own mode.
+    /// `onboardingCompletedAt !== null`. Installs from before onboarding read as not completed.
+    pub fn onboarding_completed(&self) -> bool {
+        self.text("onboardingCompletedAt").is_some()
+    }
+
     pub fn appearance_mode(&self) -> AppearanceMode {
         if let Some(mode) = self.text(THEME_APPEARANCE_MODE_KEY).and_then(AppearanceMode::parse) {
             return mode;
