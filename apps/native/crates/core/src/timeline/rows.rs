@@ -11,10 +11,11 @@ use super::presentation::{
     single_tool_call_label, summarize_tool_group, tool_group_action, tool_group_summary_kind, work_entry_display_indicates_tool_failure,
     work_entry_indicates_tool_success, work_entry_is_visible_in_group, work_log_entry_is_tool_like, ToolGroupAction,
 };
+use super::compaction::{Compaction, compacting_label, compaction_title};
 use super::folds::{
-    active_visual_response_run_ids, breaks_group, failed_item, is_active_turn_activity, is_compaction, is_compaction_command,
-    is_pending_approval, is_subagent, live_subagent_entry_ids, starts_response, superseded_attempt_folds, terminal_assistant_ids,
-    turn_folds, unsettled_run_id, work_group_id,
+    FoldInput, active_visual_response_run_ids, breaks_group, complete_superseded_reply_ids, failed_item, is_active_turn_activity,
+    is_compaction_command, is_pending_approval, is_subagent, live_subagent_entry_ids, starts_response, superseded_attempt_folds,
+    terminal_assistant_ids, turn_folds, unsettled_run_id, work_group_id,
 };
 use super::presentation::compaction_tokens;
 use super::{ChatMessage, EntryKind, Role, RowKind, SourceActivity, TimelineEntry, TimelineRow, Tone, ToolStatus, WorkLogEntry};
@@ -164,10 +165,22 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
     let itemized: HashSet<String> =
         failed_runs.iter().filter(|run| !usage_limited.contains(*run) || other_failures.contains(*run)).cloned().collect();
     let live_subagents = live_subagent_entry_ids(entries);
-    let superseded = superseded_attempt_folds(entries, &failed_runs, &live_subagents);
+    let complete_replies = complete_superseded_reply_ids(entries);
+    let superseded = superseded_attempt_folds(entries, &failed_runs, &live_subagents, &complete_replies);
     let active_runs = active_visual_response_run_ids(entries, unsettled.as_deref(), is_working);
     let unfolded: HashSet<String> = active_runs.union(&failed_runs).cloned().collect();
-    let folds = turn_folds(entries, &terminal_ids, activity, &unfolded, &live_subagents);
+    let runless = is_working && activity.runless_work_active;
+    let folds = turn_folds(
+        entries,
+        &FoldInput {
+            terminal_ids: &terminal_ids,
+            activity,
+            unfolded: &unfolded,
+            live_subagents: &live_subagents,
+            complete_replies: &complete_replies,
+            runless_active: runless,
+        },
+    );
 
     let mut collapsed: HashSet<String> = HashSet::new();
     let mut collapsed_members: HashSet<String> = HashSet::new();
@@ -185,14 +198,22 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             collapsed_superseded.remove(&entry.id);
         }
     }
-    let run_is_active = |run: Option<&str>| run.is_some_and(|run| active_runs.contains(run));
+    let run_is_active = |run: Option<&str>| match run {
+        Some(run) => active_runs.contains(run),
+        None => runless,
+    };
     let in_active_run = |entry: &WorkLogEntry| {
-        is_working && entry.status == Some(ToolStatus::InProgress) && entry.run_id.is_some() && entry.run_id == unsettled
+        is_working
+            && entry.status == Some(ToolStatus::InProgress)
+            && match &entry.run_id {
+                Some(_) => entry.run_id == unsettled,
+                None => runless,
+            }
     };
     let header_index = if is_working { entries.iter().rposition(|e| starts_response(e)).map_or(0, |i| i + 1) } else { entries.len() };
 
     let mut active_tools: Vec<&Arc<TimelineEntry>> = Vec::new();
-    if is_working && unsettled.is_some() {
+    if is_working && (unsettled.is_some() || runless) {
         let mut tail_attempt: Option<Option<&str>> = None;
         for entry in entries[header_index.min(entries.len())..].iter().rev() {
             let Some(work) = entry.work() else { break };
@@ -258,23 +279,20 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
     let active_entry_ids: HashSet<String> =
         if active_work_row.is_some() || latest_failed { active_tools.iter().map(|e| e.id.clone()).collect() } else { HashSet::new() };
 
-    let compaction_runs: HashSet<&str> = entries
-        .iter()
-        .filter_map(|e| e.message().filter(|m| is_compaction_command(m)).and_then(|m| m.run_id.as_deref()))
-        .collect();
-    let compacted_runs: HashSet<&str> = entries.iter().filter(|e| is_compaction(e)).filter_map(|e| e.work()?.run_id.as_deref()).collect();
-    let active_compaction = entries.iter().find(|e| is_compaction(e) && e.work().is_some_and(|w| in_active_run(w)));
-    let running_compaction = unsettled.as_deref().filter(|run| is_working && compaction_runs.contains(run) && !compacted_runs.contains(run));
-    let has_active_compaction = active_compaction.is_some() || running_compaction.is_some();
+    let compaction = Compaction::derive(entries, is_working, unsettled.as_deref(), &in_active_run);
 
     let mut rows: Vec<TimelineRow> = Vec::new();
     let mut has_activity_row = false;
-    let working_row = || row("working-indicator-row", activity.active_turn_started_at.clone(), RowKind::Working { compacting: false });
+    let working_row = || {
+        compaction
+            .working_row()
+            .map(|compacting| row("working-indicator-row", activity.active_turn_started_at.clone(), RowKind::Working { compacting }))
+    };
     let mut index = 0;
     while index < entries.len() {
         let entry = &entries[index];
-        if is_working && index == header_index && running_compaction.is_none() {
-            rows.push(working_row());
+        if is_working && index == header_index {
+            rows.extend(working_row());
         }
         if Some(&entry.id) == placement.as_ref()
             && let Some(live) = &active_work_row
@@ -290,7 +308,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
         if entry.event().is_some_and(|item| {
             matches!(item.kind, TurnItemKind::RunInterruptRequest { .. })
                 || (matches!(item.kind, TurnItemKind::RunInterruptResult { .. })
-                    && item.run_id.as_deref().is_some_and(|run| compaction_runs.contains(run) && compacted_runs.contains(run)))
+                    && item.run_id.as_ref().is_some_and(|run| compaction.runs.contains_key(run) && compaction.compacted.contains(run)))
         }) {
             index += 1;
             continue;
@@ -324,21 +342,29 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
         match &entry.kind {
             EntryKind::Work(work) if work.source_activity == Some(SourceActivity::Compaction) => {
                 let active = in_active_run(work);
+                if active && compaction.active_run.is_some() && work.run_id == compaction.active_run {
+                    index += 1;
+                    continue;
+                }
                 let (status, before, after, summary) = match work.item.as_ref().map(|i| (&i.status, &i.kind)) {
                     Some((status, TurnItemKind::Compaction { before_token_count, after_token_count, summary })) => {
                         (status.as_str(), *before_token_count, *after_token_count, summary.as_deref())
                     }
                     _ => ("completed", None, None, None),
                 };
+                let reason = compaction.reason(work.run_id.as_deref());
                 let failed = status == "failed";
                 rows.push(row(
                     entry.id.clone(),
                     Some(entry.created_at.clone()),
                     RowKind::ContextCompaction {
-                        label: work.label.clone(),
+                        label: match reason.filter(|_| active) {
+                            Some(reason) => compacting_label(reason).to_owned(),
+                            None => work.label.clone(),
+                        },
                         tokens: compaction_tokens(status, before, after),
                         active,
-                        title: None,
+                        title: reason.map(|reason| compaction_title(reason).to_owned()),
                         failed,
                         failure: if failed { summary.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) } else { None },
                     },
@@ -400,13 +426,18 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             }
             EntryKind::Message(message) => {
                 if let Some(run) = message.run_id.as_deref().filter(|_| is_compaction_command(message)) {
-                    if !compacted_runs.contains(run) {
-                        let pending_compaction = Some(run) == running_compaction;
+                    if !compaction.compacted.contains(run) && compaction.active_run.as_deref() != Some(run) {
+                        let pending_compaction = compaction.running_run.as_deref() == Some(run);
+                        let label = match (pending_compaction, compaction.reason(Some(run))) {
+                            (true, Some(reason)) => compacting_label(reason).to_owned(),
+                            (true, None) => "Compacting context".to_owned(),
+                            (false, _) => "Context compaction".to_owned(),
+                        };
                         rows.push(row(
                             format!("compaction:{run}"),
                             Some(entry.created_at.clone()),
                             RowKind::ContextCompaction {
-                                label: if pending_compaction { "Compacting context".into() } else { "Context compaction".into() },
+                                label,
                                 tokens: None,
                                 active: pending_compaction,
                                 title: None,
@@ -440,10 +471,16 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
         index += 1;
     }
 
-    if is_working && !rows.iter().any(|r| matches!(r.kind, RowKind::Working { .. })) && header_index >= entries.len() && running_compaction.is_none() {
-        rows.push(working_row());
+    if is_working && !rows.iter().any(|r| matches!(r.kind, RowKind::Working { .. })) && header_index >= entries.len() {
+        rows.extend(working_row());
     }
-    if is_working && !has_active_compaction && (latest_failed || (!has_activity_row && pending.is_empty())) {
+    let turn_ended = activity.latest_run.as_ref().is_some_and(|run| run.turn_ended);
+    if is_working
+        && !turn_ended
+        && !compaction.active
+        && !compaction.only_run_finished
+        && (latest_failed || (!has_activity_row && pending.is_empty()))
+    {
         match anchor.filter(|_| latest_failed) {
             Some(anchor) => {
                 let group_id = work_group_id(&anchor.id);

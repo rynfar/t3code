@@ -61,6 +61,8 @@ pub struct AppThread {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub creation_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +80,8 @@ pub struct Run {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub restart_cancelled_background_work: Option<Value>,
+    #[serde(default)]
+    pub active_attempt_id: Option<String>,
 }
 
 impl Run {
@@ -93,6 +97,8 @@ pub struct RunAttempt {
     pub run_id: String,
     pub root_node_id: String,
     pub status: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

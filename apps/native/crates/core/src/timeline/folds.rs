@@ -195,16 +195,53 @@ pub(super) struct SupersededFold {
     pub(super) hidden: HashSet<String>,
 }
 
+/// `completeSupersededReplyEntryIds`: an interrupted stream can still be `completed`, so only an
+/// attempt's last output, finished before the steer superseded it, proves the reply complete.
+pub(super) fn complete_superseded_reply_ids(entries: &[Arc<TimelineEntry>]) -> HashSet<String> {
+    let mut last_by_attempt: HashMap<&str, &TimelineEntry> = HashMap::new();
+    for entry in entries {
+        let Some(attempt) = entry.attempt.as_ref().filter(|a| a.status == "superseded") else { continue };
+        let output = match &entry.kind {
+            EntryKind::Message(message) => message.role == Role::Assistant,
+            EntryKind::Work(work) => !matches!(work.item_type, Some("system_notice" | "notification")),
+            _ => false,
+        };
+        if output {
+            last_by_attempt.insert(attempt.id.as_str(), entry);
+        }
+    }
+    last_by_attempt
+        .into_values()
+        .filter(|entry| {
+            let (Some(message), Some(superseded_at)) = (entry.message(), entry.attempt.as_ref().and_then(|a| a.completed_at.as_deref())) else {
+                return false;
+            };
+            let Some(item) = message.item.as_ref().filter(|item| matches!(item.kind, TurnItemKind::AssistantMessage { .. })) else { return false };
+            !message.streaming
+                && item.status == "completed"
+                && item.completed_at.as_deref().and_then(parse_iso_ms).zip(parse_iso_ms(superseded_at)).is_some_and(|(done, cut)| done < cut)
+        })
+        .map(|entry| entry.id.clone())
+        .collect()
+}
+
 pub(super) fn superseded_attempt_folds(
     entries: &[Arc<TimelineEntry>],
     unfolded: &HashSet<String>,
     live_subagents: &HashSet<String>,
+    complete_replies: &HashSet<String>,
 ) -> HashMap<String, SupersededFold> {
+    let complete_attempts: HashSet<&str> = entries
+        .iter()
+        .filter(|entry| complete_replies.contains(&entry.id))
+        .filter_map(|entry| entry.attempt.as_ref().map(|a| a.id.as_str()))
+        .collect();
     let mut order: Vec<String> = Vec::new();
     let mut by_attempt: HashMap<String, Vec<&TimelineEntry>> = HashMap::new();
     for entry in entries {
         let Some(attempt) = entry.attempt.as_ref().filter(|a| a.status == "superseded") else { continue };
         if unfolded.contains(&attempt.run_id)
+            || complete_attempts.contains(attempt.id.as_str())
             || is_user(entry)
             || entry.event().is_some_and(|item| matches!(item.kind, TurnItemKind::Handoff { .. }))
             || is_persistent_resource(entry)
@@ -260,13 +297,18 @@ pub(super) struct TurnGroup<'a> {
     steers: Vec<(usize, &'a TimelineEntry)>,
 }
 
-pub(super) fn turn_folds(
-    entries: &[Arc<TimelineEntry>],
-    terminal_ids: &HashSet<String>,
-    activity: &ThreadActivity,
-    unfolded: &HashSet<String>,
-    live_subagents: &HashSet<String>,
-) -> HashMap<String, TurnFold> {
+pub(super) struct FoldInput<'a> {
+    pub(super) terminal_ids: &'a HashSet<String>,
+    pub(super) activity: &'a ThreadActivity,
+    pub(super) unfolded: &'a HashSet<String>,
+    pub(super) live_subagents: &'a HashSet<String>,
+    pub(super) complete_replies: &'a HashSet<String>,
+    /// Runless (provider-native subagent) work is live, so the latest runless turn stays open.
+    pub(super) runless_active: bool,
+}
+
+pub(super) fn turn_folds(entries: &[Arc<TimelineEntry>], input: &FoldInput) -> HashMap<String, TurnFold> {
+    let FoldInput { terminal_ids, activity, unfolded, live_subagents, complete_replies, runless_active } = *input;
     let mut interrupted: HashSet<&str> = HashSet::new();
     let mut prompt_index: HashMap<&str, usize> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
@@ -332,7 +374,8 @@ pub(super) fn turn_folds(
     let mut folds = HashMap::new();
     for run_id in order {
         let Some(group) = groups.get(&run_id) else { continue };
-        if unfolded.contains(&run_id) || interrupted.contains(run_id.as_str()) || runless_failed.contains(&run_id) || group.streaming {
+        let live_runless = runless_active && runless.as_ref() == Some(&run_id);
+        if unfolded.contains(&run_id) || interrupted.contains(run_id.as_str()) || runless_failed.contains(&run_id) || live_runless || group.streaming {
             continue;
         }
         let terminal_index = group.terminal.and_then(|t| group.entries.iter().position(|e| e.id == t.id)).unwrap_or(group.entries.len());
@@ -348,7 +391,7 @@ pub(super) fn turn_folds(
             if !compaction && index > terminal_index && !foldable_trailing {
                 continue;
             }
-            if compaction || is_persistent_resource(entry) || live_subagents.contains(&entry.id) {
+            if compaction || is_persistent_resource(entry) || live_subagents.contains(&entry.id) || complete_replies.contains(&entry.id) {
                 continue;
             }
             if entry.work().is_some_and(|w| w.item_type == Some("notification") || w.question_answer.is_some()) {

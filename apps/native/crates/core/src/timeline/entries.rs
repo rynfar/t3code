@@ -325,6 +325,7 @@ fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
 pub struct EntriesCache {
     by_item: HashMap<usize, Arc<TimelineEntry>>,
     attempts: Vec<(String, String, Option<String>)>,
+    nodes: usize,
 }
 
 struct Lookups<'a> {
@@ -360,7 +361,7 @@ impl<'a> Lookups<'a> {
                     id: attempt.id.clone(),
                     run_id: attempt.run_id.clone(),
                     status: attempt.status.clone(),
-                    completed_at: None,
+                    completed_at: attempt.completed_at.clone(),
                 });
             }
             let (_, parent) = self.nodes.get(node_id)?;
@@ -378,11 +379,15 @@ pub fn derive_entries(
     plans: &[Entity],
 ) -> Vec<Arc<TimelineEntry>> {
     let attempt_key: Vec<(String, String, Option<String>)> =
-        attempts.iter().map(|a| (a.id.clone(), a.status.clone(), None)).collect();
+        attempts.iter().map(|a| (a.id.clone(), a.status.clone(), a.completed_at.clone())).collect();
     if attempt_key != cache.attempts {
         cache.by_item.clear();
         cache.attempts = attempt_key;
     }
+    // A node's root and parent never change, so only a new node can resolve an attempt that
+    // was missing; entries that already resolved keep theirs.
+    let new_nodes = nodes.len() != cache.nodes;
+    cache.nodes = nodes.len();
     let folded_answers: HashSet<String> = visible
         .iter()
         .filter_map(|row| match &row.item.kind {
@@ -408,8 +413,15 @@ pub fn derive_entries(
         // Plan rows also read the plan's status, which can change without the item changing.
         let reusable = cache.by_item.get(&key).filter(|entry| !matches!(entry.kind, EntryKind::ProposedPlan(_)));
         if let Some(entry) = reusable {
+            let entry = match (new_nodes, &entry.attempt) {
+                (true, None) => match lookups.get_or_insert_with(|| Lookups::new(attempts, nodes)).attempt(item) {
+                    Some(attempt) => Arc::new(TimelineEntry { attempt: Some(attempt), ..(**entry).clone() }),
+                    None => entry.clone(),
+                },
+                _ => entry.clone(),
+            };
             next.insert(key, entry.clone());
-            entries.push(entry.clone());
+            entries.push(entry);
             continue;
         }
         let lookups = lookups.get_or_insert_with(|| Lookups::new(attempts, nodes));
