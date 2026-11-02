@@ -863,3 +863,172 @@ fn fold_membership_names_the_fold_hiding_each_entry() {
     assert!(!runs.contains_key("assistant-final-entry"));
     assert!(attempts.is_empty());
 }
+
+fn projection_with(runs: serde_json::Value, items: serde_json::Value, sessions: serde_json::Value) -> crate::thread::ThreadProjection {
+    let mut projection = projection_json(serde_json::json!({}), runs, serde_json::json!([]), serde_json::json!([]));
+    projection.turn_items = serde_json::from_value::<Vec<crate::turn_item::TurnItem>>(items).expect("items").into_iter().map(Arc::new).collect();
+    projection.provider_sessions = serde_json::from_value(sessions).expect("sessions");
+    projection
+}
+
+fn status_run(id: &str, ordinal: u64, status: &str, started: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "ordinal": ordinal, "providerInstanceId": "codex", "modelSelection": { "instanceId": "codex", "model": "m" },
+        "userMessageId": "u", "rootNodeId": "root", "status": status, "requestedAt": "2026-01-01T00:00:00Z",
+        "startedAt": if started { serde_json::json!("2026-01-01T00:00:00Z") } else { serde_json::Value::Null },
+        "completedAt": if started && status != "running" { serde_json::json!("2026-01-01T00:00:05Z") } else { serde_json::Value::Null },
+    })
+}
+
+fn run_json(status: &str) -> serde_json::Value {
+    serde_json::json!([status_run("run-1", 1, status, true)])
+}
+
+fn item_json(id: &str, kind: serde_json::Value) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "id": id, "threadId": "t", "runId": "run-1", "nodeId": "root", "parentItemId": null, "ordinal": 1, "status": "failed",
+        "title": null, "startedAt": "2026-01-01T00:00:03Z", "completedAt": null, "updatedAt": "2026-01-01T00:00:04Z",
+    });
+    if let (Some(object), Some(extra)) = (item.as_object_mut(), kind.as_object()) {
+        object.extend(extra.clone());
+    }
+    item
+}
+
+fn limit_failure(reset_at: &str) -> serde_json::Value {
+    item_json("e1", serde_json::json!({
+        "type": "error",
+        "failure": { "class": "usage_limit", "message": "{\"error\":{\"message\":\"Limit hit\"}}", "code": "subscription_sharing_usage_limit_exceeded", "resetAt": reset_at, "retryable": null },
+    }))
+}
+
+fn status_shell(extra: serde_json::Value) -> crate::shell::ThreadShell {
+    let mut value = serde_json::json!({
+        "id": "t", "projectId": "p", "title": "T", "providerInstanceId": "codex",
+        "modelSelection": { "instanceId": "codex", "model": "m" }, "runtimeMode": "auto", "interactionMode": "default",
+        "branch": null, "worktreePath": null, "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t" },
+        "latestRunId": "run-1", "latestRunCompletedAt": "2026-01-01T00:00:05Z", "activeRunId": null, "status": "failed",
+        "pendingRuntimeRequest": null, "latestVisibleMessage": null, "latestUserMessageAt": null, "hasActionableProposedPlan": false,
+        "itemCount": 0, "visibleItemCount": 0, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:06Z",
+        "archivedAt": null, "settledOverride": null, "settledAt": null, "deletedAt": null,
+    });
+    if let (Some(object), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+        object.extend(extra.clone());
+    }
+    serde_json::from_value(value).expect("shell")
+}
+
+/// `threadErrorSummary`: the failed run's root failure, unless the session reports another error.
+#[test]
+fn the_error_banner_reads_the_failed_runs_root_failure() {
+    let failure = limit_failure("2026-01-01T05:00:00Z");
+    let error = thread_error(&projection_with(run_json("failed"), serde_json::json!([failure]), serde_json::json!([]))).expect("an error");
+    assert!(error.is_usage_limit() && error.chatgpt_limit() && !error.workspace_limit() && error.limit_blocked());
+    assert_eq!(error.reset_at.as_deref(), Some("2026-01-01T05:00:00Z"));
+    assert_eq!(error_banner_message(&error.message), "Limit hit");
+    assert!(error_can_expand(&error.message, &error_banner_message(&error.message)));
+    assert!(!error_can_expand("Short", "Short"));
+    let session = serde_json::json!([{ "id": "s", "providerInstanceId": "codex", "lastError": "Session crashed" }]);
+    let other = thread_error(&projection_with(run_json("failed"), serde_json::json!([failure]), session)).expect("an error");
+    assert_eq!((other.message.as_str(), other.class, other.reset_at), ("Session crashed", None, None));
+    assert!(thread_error(&projection_with(run_json("completed"), serde_json::json!([failure]), serde_json::json!([]))).is_none());
+}
+
+/// `usageLimitRunPresentedAsLatest`: queued runs that never started leave the limited run latest,
+/// and the recovery banner takes over from the error banner.
+#[test]
+fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
+    let runs = serde_json::json!([status_run("run-1", 1, "failed", true), status_run("run-2", 2, "queued", false)]);
+    let projection = projection_with(runs, serde_json::json!([limit_failure("2026-01-01T05:00:00Z")]), serde_json::json!([]));
+    assert_eq!(presented_latest_run(&projection).map(|run| run.id.as_str()), Some("run-1"));
+    let error = thread_error(&projection).expect("an error");
+    assert!(error.limit_blocked());
+    let shell = status_shell(serde_json::json!({}));
+    assert!(timeline_thread_error(Some(error.clone()), Some(&shell)).is_none());
+    assert!(timeline_thread_error(Some(error.clone()), Some(&status_shell(serde_json::json!({ "latestRunId": null })))).is_some());
+
+    let now = parse_iso_ms("2026-01-01T01:00:00Z").expect("now");
+    let recovery = limit_recovery(Some(&error), &shell, now).expect("recovery");
+    assert_eq!(recovery.id(), "usage-limit-recovery:run-1");
+    assert!(recovery.can_schedule && !recovery.scheduled && !recovery.snoozed && !recovery.reset_passed);
+    assert_eq!(recovery.description(now, 0), "Resets 5:00 AM");
+    let resume = recovery.toggle_resume("c", "t").expect("resume");
+    assert_eq!(resume["limitRecovery"], serde_json::json!({ "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true }));
+    assert_eq!(recovery.toggle_snooze("c", "t", now).expect("snooze")["limitRecovery"]["snooze"], true);
+    assert_eq!(recovery.toggle_snooze("c", "t", parse_iso_ms("2026-01-01T06:00:00Z").expect("later")), Err(SnoozeRefused));
+
+    let scheduled = status_shell(serde_json::json!({
+        "snoozedUntil": "2026-01-01T05:00:00.000Z",
+        "limitRecovery": { "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true, "snooze": true },
+    }));
+    let recovery = limit_recovery(Some(&error), &scheduled, now).expect("recovery");
+    assert!(recovery.scheduled && recovery.snoozed);
+    assert_eq!(recovery.toggle_snooze("c", "t", now).expect("wake")["limitRecovery"]["snooze"], false);
+    let after = limit_recovery(Some(&error), &scheduled, parse_iso_ms("2026-01-01T05:00:00Z").expect("reset")).expect("recovery");
+    assert!(!after.snoozed && after.reset_passed && after.deadline().is_none());
+
+    let no_reset = thread_error(&projection_with(run_json("failed"), serde_json::json!([item_json("e1", serde_json::json!({
+        "type": "error", "failure": { "class": "usage_limit", "message": "Limit", "code": null, "retryable": null },
+    }))]), serde_json::json!([]))).expect("an error");
+    let recovery = limit_recovery(Some(&no_reset), &shell, now).expect("recovery");
+    assert!(!recovery.can_schedule);
+    assert_eq!(recovery.description(now, 0), "Reset time unavailable; retry manually");
+}
+
+/// `presentRunStop`: Stopping shows from the request until its result; an ended run's Stop only
+/// once the provider stops answering, and only while its background work is pending.
+#[test]
+fn a_stop_shows_until_the_provider_confirms_it() {
+    let request = item_json("stop", serde_json::json!({ "type": "run_interrupt_request", "message": "Stop", "status": "completed" }));
+    let result = item_json("done", serde_json::json!({ "type": "run_interrupt_result", "message": "Stopped", "status": "completed" }));
+    let stop = run_stop(&projection_with(run_json("running"), serde_json::json!([request]), serde_json::json!([])), false).expect("stopping");
+    assert_eq!((stop.run_id.as_str(), stop.requested_at.as_str(), stop.title()), ("run-1", "2026-01-01T00:00:03Z", "Stopping"));
+    assert!(!stop.unresponsive && !stop.background && stop.description().is_none());
+    assert!(run_stop(&projection_with(run_json("running"), serde_json::json!([request, result]), serde_json::json!([])), false).is_none());
+    assert!(run_stop(&projection_with(run_json("completed"), serde_json::json!([request]), serde_json::json!([])), true).is_none());
+
+    let unanswered = item_json("stop", serde_json::json!({
+        "type": "run_interrupt_request", "message": "Stop", "status": "completed", "unresponsiveAt": "2026-01-01T00:00:13Z",
+    }));
+    let stop = run_stop(&projection_with(run_json("running"), serde_json::json!([unanswered]), serde_json::json!([])), false).expect("unresponsive");
+    assert_eq!(stop.title(), "Agent not responding to Stop");
+    let ended = projection_with(run_json("completed"), serde_json::json!([unanswered]), serde_json::json!([]));
+    assert!(run_stop(&ended, true).is_some_and(|stop| stop.background));
+    assert!(run_stop(&ended, false).is_none());
+    assert_eq!(elapsed_since("2026-01-01T00:00:03Z", parse_iso_ms("2026-01-01T00:00:03Z").expect("now")).as_deref(), Some("1s"));
+}
+
+/// `presentProviderGoal` as `goalNowItem` titles it.
+#[test]
+fn goal_lines_match_the_web() {
+    let goal = |value: serde_json::Value, working: bool| goal_line(&value, working).expect("a goal");
+    let set = goal(serde_json::json!({ "objective": "Ship it", "status": "active" }), false);
+    assert_eq!((set.title.as_str(), set.objective.as_str(), set.can_resume), ("Goal set", "Ship it", false));
+    assert_eq!(goal(serde_json::json!({ "objective": "Ship it", "status": "active" }), true).title, "Pursuing goal");
+    let paused = goal(
+        serde_json::json!({ "objective": "Ship it", "status": "paused", "tokensUsed": 12_400, "tokenBudget": 2_500_000, "timeUsedSeconds": 90, "checks": 1 }),
+        false,
+    );
+    assert_eq!(paused.title, "Goal paused · 12k / 2.5m tokens · 1m 30s · 1 check");
+    assert!(paused.can_resume);
+    assert_eq!(goal(serde_json::json!({ "objective": "x", "status": "budget_limited", "tokensUsed": 999 }), false).title, "Goal reached its token budget · 999 tokens");
+    assert!(!goal(serde_json::json!({ "objective": "x", "status": "complete" }), false).can_resume);
+}
+
+#[test]
+fn upcoming_times_name_the_day() {
+    let now = parse_iso_ms("2026-03-10T12:00:00Z").expect("now");
+    assert_eq!(format_upcoming("2026-03-10T18:30:00Z", now, 0).as_deref(), Some("6:30 PM"));
+    assert_eq!(format_upcoming("2026-03-11T09:05:00Z", now, 0).as_deref(), Some("tomorrow at 9:05 AM"));
+    assert_eq!(format_upcoming("2026-03-14T09:05:00Z", now, 0).as_deref(), Some("3/14 9:05 AM"));
+    assert_eq!(format_upcoming("2027-01-02T09:05:00Z", now, 0).as_deref(), Some("1/2/2027 9:05 AM"));
+    assert_eq!(format_upcoming("2026-03-09T09:05:00Z", now, 0).as_deref(), Some("yesterday at 9:05 AM"));
+}
+
+#[test]
+fn relative_labels_match_the_web() {
+    assert_eq!(relative_time_label(30_000), "just now");
+    assert_eq!(relative_time_label(5 * 60_000), "5m ago");
+    assert_eq!(relative_time_label(3 * 3_600_000), "3h ago");
+    assert_eq!(relative_time_label(49 * 3_600_000), "2d ago");
+}

@@ -225,6 +225,9 @@ pub enum TurnItemKind {
     },
     RunInterruptRequest {
         message: String,
+        /// Set once the provider failed to confirm the Stop in time.
+        #[serde(default)]
+        unresponsive_at: Option<String>,
     },
     RunInterruptResult {
         message: String,

@@ -11,6 +11,7 @@ mod find;
 mod folds;
 mod presentation;
 mod rows;
+mod status;
 mod time;
 mod tool_activity;
 mod user_input;
@@ -38,7 +39,12 @@ pub use presentation::{
 };
 pub use find::{FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, SEARCH_THREAD, bar_label, decode_result, format_count, search_request, step_index, step_locally};
 pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};
-pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, parse_iso_ms};
+pub use status::{
+    CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, LimitRecovery, ProviderBanner, RunStop, SnoozeRefused, StatusLine, ThreadError, elapsed_since,
+    error_banner_message, error_can_expand, goal_line, limit_recovery, presented_latest_run, provider_banner, relative_time_label, run_stop, status_line,
+    thread_error, timeline_thread_error,
+};
+pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, format_upcoming, parse_iso_ms};
 pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name};
 pub use user_input::{has_question_answer, question_answer_preview, question_answer_text, question_text_preview};
 

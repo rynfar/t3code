@@ -337,6 +337,8 @@ export function threadCases() {
       sequence: ++sequence,
       event: event("subagent.updated", subagentFor(sub, { progress: "half" })),
     });
+    const stop = turnItem("interrupt_request", "live-stop", 1003, { runId, rich: true });
+    c.stream({ kind: "event", sequence: ++sequence, event: itemEvent(stop) });
     const cp = turnItem("checkpoint", "live-cp", 1002, { runId });
     c.stream({
       kind: "event",
