@@ -135,8 +135,8 @@ impl AppState {
 
     fn delete_next(&mut self, mut ids: Vec<String>, fallback: Option<String>, cx: &mut Context<Self>) {
         if ids.is_empty() {
-            let shell = &self.shell;
-            let missing: Vec<String> = self.sidebar.selection.selected().iter().filter(|id| shell.thread(id).is_none()).cloned().collect();
+            let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+            let missing: Vec<String> = self.sidebar.selection.selected().iter().filter(|id| mounts.thread(shell, id).is_none()).cloned().collect();
             if self.sidebar.selection.remove(&missing) {
                 self.selection_changed(cx);
             }

@@ -76,7 +76,7 @@ impl ThreadView {
             let thread = &projection.thread;
             let local = self.local_error.clone().map(|message| ThreadError { message, class: None, code: None, reset_at: None, runtime_failed: false });
             next.error = local
-                .or_else(|| timeline_thread_error(thread_error(projection), state.shell.thread(thread_id)))
+                .or_else(|| timeline_thread_error(thread_error(projection), state.thread_shell(thread_id)))
                 .filter(|error| !self.banners.dismissed_errors.contains(&error.banner_key(thread_id)));
             let instance = if thread.provider_instance_id.is_empty() { &thread.model_selection.instance_id } else { &thread.provider_instance_id };
             let provider = state.server_config.config.as_ref().and_then(|config| config.providers.iter().find(|provider| &provider.instance_id == instance));
@@ -101,7 +101,7 @@ impl ThreadView {
     fn sync_footer(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let working = state.is_selected_thread_running();
-        let shell = self.thread_id.as_deref().and_then(|id| state.shell.thread(id));
+        let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
         let background = !working && shell.is_some_and(|shell| !shell.pending_background_tasks.is_empty());
         let now = chrono::Utc::now().timestamp_millis();
         let config_loaded = state.server_config.config.is_some();

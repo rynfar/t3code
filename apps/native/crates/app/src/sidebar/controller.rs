@@ -171,13 +171,13 @@ impl AppState {
     }
 
     pub fn can_navigate(&self, back: bool) -> bool {
-        self.sidebar.history.can_go(back, |id| self.shell.thread(id).is_some())
+        self.sidebar.history.can_go(back, |id| self.thread_shell(id).is_some())
     }
 
     /// `navigation.back` / `navigation.forward`.
     pub fn navigate_history(&mut self, back: bool, cx: &mut Context<Self>) {
-        let shell = &self.shell;
-        if let Some(id) = self.sidebar.history.go(back, |id| shell.thread(id).is_some()).map(str::to_owned) {
+        let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+        if let Some(id) = self.sidebar.history.go(back, |id| mounts.thread(shell, id).is_some()).map(str::to_owned) {
             self.select_thread(&id, cx);
         }
     }

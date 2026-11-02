@@ -33,7 +33,7 @@ impl ComposerMention {
 impl AppState {
     /// The open thread's worktree or project root, else the new-thread draft's project.
     pub fn active_project_target(&self) -> Option<ProjectTarget> {
-        let thread = self.selected_thread.as_deref().and_then(|id| self.shell.thread(id));
+        let thread = self.selected_thread.as_deref().and_then(|id| self.thread_shell(id));
         let project_id = thread.map(|thread| thread.project_id.clone()).or_else(|| self.draft_project.clone())?;
         let project = self.shell.project(&project_id)?;
         let cwd = thread.and_then(|thread| thread.worktree_path.clone()).unwrap_or_else(|| project.workspace_root.clone());

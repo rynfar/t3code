@@ -528,6 +528,7 @@ fn older_settled_listing_and_counts() {
             project_scope: None,
             connected: true,
             now: iso(NOW),
+            dragging: None,
         },
         &mut InboxReturnTracker::default(),
     );

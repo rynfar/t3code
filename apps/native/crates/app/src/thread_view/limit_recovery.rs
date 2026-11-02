@@ -52,7 +52,7 @@ impl LimitRecoveryBanner {
             .projection
             .as_ref()
             .filter(|projection| thread_id.as_deref() == Some(projection.thread.id.as_str()))
-            .and_then(|projection| limit_recovery(thread_error(projection).as_ref(), state.shell.thread(&projection.thread.id)?, now));
+            .and_then(|projection| limit_recovery(thread_error(projection).as_ref(), state.thread_shell(&projection.thread.id)?, now));
         if thread_id == self.thread_id && next == self.recovery {
             return;
         }

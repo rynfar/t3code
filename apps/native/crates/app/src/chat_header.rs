@@ -96,7 +96,7 @@ impl ChatHeader {
 impl Render for ChatHeader {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let app = self.state.read(cx);
-        let Some(thread) = app.selected_thread.as_deref().and_then(|id| app.shell.thread(id)) else {
+        let Some(thread) = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id)) else {
             return crate::new_thread::breadcrumb(&self.state, cx).into_any_element();
         };
         let p = palette(cx);
@@ -111,7 +111,7 @@ impl Render for ChatHeader {
             .then(|| thread.lineage.parent_thread_id.clone())
             .flatten()
             .map(|id| {
-                let title = app.shell.thread(&id).map_or_else(|| "Parent thread".to_owned(), |parent| parent.title.clone());
+                let title = app.thread_shell(&id).map_or_else(|| "Parent thread".to_owned(), |parent| parent.title.clone());
                 (id, title)
             });
         let separator = || div().flex_none().text_color(hsla(p.icon_muted)).child("/");

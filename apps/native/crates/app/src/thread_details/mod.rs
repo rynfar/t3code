@@ -199,7 +199,7 @@ impl Details {
 
 /// The open thread's project scripts, decoded from the shell.
 pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)> {
-    let thread = state.selected_thread.as_deref().and_then(|id| state.shell.thread(id))?;
+    let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
     let project = state.shell.project(&thread.project_id)?;
     let scripts = project.scripts.iter().filter_map(|value| serde_json::from_value(value.clone()).ok()).collect();
     Some((project.id.clone(), scripts))

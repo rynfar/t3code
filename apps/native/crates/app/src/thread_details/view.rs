@@ -32,7 +32,7 @@ struct Inputs {
 }
 
 fn inputs(state: &AppState) -> Option<Inputs> {
-    let thread = state.selected_thread.as_deref().and_then(|id| state.shell.thread(id))?;
+    let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
     let project = state.shell.project(&thread.project_id)?;
     Some(Inputs {
         thread_id: thread.id.clone(),
