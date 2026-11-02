@@ -9,7 +9,9 @@ Everything is measured at the default interface font size of 16px.
   the color table below: `--markdown`.
 - Generator inputs: `apps/web/src/index.css`, `packages/shared/src/themePalettes.ts`,
   `apps/web/src/themePalette.ts` (role → CSS variable names), `packages/contracts/src/settings.ts`
-  (font-size settings) and Tailwind's `theme.css` (the palette and scales). It evaluates the real
+  (font-size settings), Tailwind's `theme.css` (the palette and scales), and the `@pierre/highlights`
+  syntax palettes the web's code surfaces use (`SYNTAX_DARK` = pierre-dark, `SYNTAX_LIGHT` = t3-light from
+  `lib/readableSyntaxTheme.ts`), applied as gpui-component's highlight theme. It evaluates the real
   cascade (`var()`, `color-mix()`, `light-dark()`, `--alpha()`, oklch) and per-channel clips to sRGB,
   so the hex values match Tailwind's published values and what Chromium paints on an sRGB display.
 - If a section here and `tokens.rs` disagree, `tokens.rs` wins.

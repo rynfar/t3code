@@ -21,6 +21,7 @@ struct SurfaceAction {
 }
 
 const SURFACE_ACTIONS: &[SurfaceAction] = &[
+    SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface },
     SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface },
     SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface },
 ];
@@ -29,6 +30,8 @@ fn surface_icon(surface: &Surface) -> Icon {
     match surface.kind {
         SurfaceKind::Diff => Icon::FileDiff,
         SurfaceKind::PullRequests => Icon::Link2,
+        SurfaceKind::Files => Icon::Files,
+        SurfaceKind::File { .. } => Icon::File,
     }
 }
 
@@ -84,6 +87,10 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
     let p = palette(cx);
     let title: SharedString = surface.title().into();
     let id = surface.id.clone();
+    let file_path = match &surface.kind {
+        SurfaceKind::File { relative_path, .. } => Some(relative_path.clone()),
+        _ => None,
+    };
     let (activate, close, middle) = (state.clone(), state.clone(), state.clone());
     let (activate_id, close_id, middle_id) = (id.clone(), id.clone(), id.clone());
     let group: SharedString = format!("tab-{id}").into();
@@ -160,6 +167,13 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
                 PopupMenuItem::new(label)
                     .disabled(disabled)
                     .on_click(move |_, _, cx| state.update(cx, |state, cx| run(state, &id, cx)))
+            };
+            let menu = match file_path.clone() {
+                Some(path) => {
+                    let state = state.clone();
+                    menu.item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| state.update(cx, |state, cx| state.copy_file_path(&path, cx))))
+                }
+                None => menu,
             };
             menu.item(item("Close", false, |state, id, cx| state.close_surface(id, cx)))
                 .item(item("Close others", count <= 1, |state, id, cx| state.close_other_surfaces(id, cx)))

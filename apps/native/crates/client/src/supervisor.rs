@@ -104,6 +104,12 @@ impl ClientHandle {
         crate::pull_requests::fetch_diff(&self.credentials, payload).await
     }
 
+    /// Downloads a signed asset (`assets.createUrl`) over HTTP, at most `max_bytes`. Run it on
+    /// the network runtime.
+    pub async fn asset_bytes(&self, relative_url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        crate::asset::fetch_asset(&self.credentials.http_base, relative_url, max_bytes).await
+    }
+
     /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
     /// `Closed` while disconnected rather than waiting for a reconnect. The request is queued
     /// before this returns, so calls made in order reach the server in order (terminal input

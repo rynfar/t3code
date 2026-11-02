@@ -154,7 +154,7 @@ fn persisted_state_drops_unknown_surfaces() {
         "threads": { "t": { "isOpen": true, "activeSurfaceId": "diff",
             "surfaces": [{ "id": "browser:1", "kind": "preview", "resourceId": "1" }, { "id": "diff", "kind": "diff" }] } },
         "widths": { "t": 480.0 },
-        "closed": [{ "threadId": "t", "surface": { "id": "files", "kind": "files" } },
+        "closed": [{ "threadId": "t", "surface": { "id": "device", "kind": "device" } },
                    { "threadId": "t", "surface": { "id": "diff", "kind": "diff" } }]
     }"#;
     let panels: RightPanels = serde_json::from_str(json).expect("decode");
@@ -184,7 +184,7 @@ fn persisted_state_survives_bad_entries_and_repairs_the_active_tab() {
                 "surfaces": [{ "id": "browser:1", "kind": "preview" }, { "id": "diff", "kind": "diff" }] },
             "hidden": { "isOpen": false, "activeSurfaceId": "gone", "surfaces": [{ "id": "diff", "kind": "diff" }] },
             "broken": "not a panel",
-            "emptied": { "isOpen": true, "activeSurfaceId": "files", "surfaces": [{ "id": "files", "kind": "files" }] }
+            "emptied": { "isOpen": true, "activeSurfaceId": "device", "surfaces": [{ "id": "device", "kind": "device" }] }
         },
         "widths": { "kept": 480, "bad": "wide" },
         "closed": "nope"
@@ -207,4 +207,62 @@ fn lenient_maps_keep_good_entries() {
     let map: HashMap<String, u32> = decode_lenient_map(Some(&value));
     assert_eq!(map.len(), 2);
     assert!(decode_lenient_map::<u32>(None).is_empty());
+}
+
+fn file_reveal(panels: &RightPanels, thread: &str, id: &str) -> Option<(Option<u64>, u64)> {
+    panels.panel(thread).surfaces.iter().find(|surface| surface.id == id).and_then(|surface| match &surface.kind {
+        SurfaceKind::File { reveal_line, reveal_request_id, .. } => Some((*reveal_line, *reveal_request_id)),
+        _ => None,
+    })
+}
+
+#[test]
+fn open_file_replaces_the_explorer_and_bumps_the_reveal() {
+    let mut panels = RightPanels::default();
+    assert!(panels.open_file("t", None, None));
+    assert_eq!(ids(&panels, "t"), vec!["files"]);
+    panels.open("t", Surface::diff());
+    assert!(panels.open_file("t", Some("src/a.rs"), Some(12)));
+    assert_eq!(ids(&panels, "t"), vec!["diff", "file:src/a.rs"]);
+    assert_eq!(panels.panel("t").active_surface_id.as_deref(), Some("file:src/a.rs"));
+    assert_eq!(file_reveal(&panels, "t", "file:src/a.rs"), Some((Some(12), 1)));
+    panels.activate("t", "diff");
+    assert!(panels.open_file("t", Some("src/a.rs"), None));
+    assert_eq!(file_reveal(&panels, "t", "file:src/a.rs"), Some((None, 2)));
+    assert_eq!(ids(&panels, "t"), vec!["diff", "file:src/a.rs"]);
+    assert_eq!(panels.active_surface("t").map(Surface::title).as_deref(), Some("a.rs"));
+}
+
+#[test]
+fn navigate_folder_moves_in_place_or_beside_the_source() {
+    let mut panels = RightPanels::default();
+    panels.open_file("t", Some("src/a.rs"), None);
+    assert!(panels.navigate_folder("t", "file:src/a.rs", "src", true));
+    assert_eq!(ids(&panels, "t"), vec!["file:src/a.rs", "file:src"]);
+    assert!(panels.navigate_folder("t", "file:src", "", false));
+    assert_eq!(ids(&panels, "t"), vec!["file:src/a.rs", "files"]);
+    assert_eq!(panels.panel("t").active_surface_id.as_deref(), Some("files"));
+    assert!(panels.close_file_surfaces("t"));
+    assert!(!panels.is_open("t"));
+}
+
+#[test]
+fn persisted_file_tabs_decode_and_normalize_reveal_lines() {
+    let value = serde_json::json!({ "threads": { "t": {
+        "isOpen": true,
+        "activeSurfaceId": "file:a.rs",
+        "surfaces": [
+            { "id": "file:a.rs", "kind": "file", "relativePath": "a.rs", "revealLine": 3.7, "revealRequestId": 2 },
+            { "id": "file:b.rs", "kind": "file", "relativePath": "b.rs", "revealLine": "x" },
+            { "id": "files", "kind": "files" },
+            { "id": "file:c.rs", "kind": "file" },
+        ],
+    } } });
+    let panels = RightPanels::from_value(&value);
+    assert_eq!(ids(&panels, "t"), vec!["file:a.rs", "file:b.rs", "files"]);
+    assert_eq!(file_reveal(&panels, "t", "file:a.rs"), Some((Some(3), 2)));
+    assert_eq!(file_reveal(&panels, "t", "file:b.rs"), Some((None, 0)));
+    let saved = serde_json::to_value(&panels).unwrap();
+    assert_eq!(saved["threads"]["t"]["surfaces"][0]["relativePath"], "a.rs");
+    assert_eq!(saved["threads"]["t"]["surfaces"][0]["revealRequestId"], 2);
 }

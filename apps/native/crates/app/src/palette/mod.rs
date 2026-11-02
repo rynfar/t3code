@@ -235,13 +235,15 @@ impl CommandPalette {
         }
     }
 
-    /// Enter opens the file in the preferred editor (or mentions it when the server has none);
-    /// Cmd+Enter mentions it in the composer.
+    /// Enter opens the file in the right panel (`openFile`); without an open thread, in the
+    /// preferred editor (or mentions it when the server has none). Cmd+Enter mentions it.
     fn open_target(&mut self, path: String, line: Option<u64>, mention: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.state.read(cx).active_project_target().map(|target| target.cwd) else { return };
         self.close(window, cx);
         self.state.update(cx, |state, cx| {
-            if mention || !state.open_in_editor(&cwd, &path, line, cx) {
+            if !mention && state.file_workspace().is_some() {
+                state.open_file(&path, line, cx);
+            } else if mention || !state.open_in_editor(&cwd, &path, line, cx) {
                 state.request_composer_mention(crate::project_files::ComposerMention { path, line }, cx);
             }
         });
@@ -518,6 +520,7 @@ impl CommandPalette {
             Mode::Command => "Open".to_owned(),
             Mode::Browse => "Enter folder / Add".to_owned(),
             Mode::NewProject => "Create project".to_owned(),
+            _ if self.state.read(cx).file_workspace().is_some() => "Open file".to_owned(),
             _ => self.state.read(cx).preferred_editor_label().map_or_else(|| "Mention".to_owned(), |editor| format!("Open in {editor}")),
         };
         let hint = |key: &'static str, label: String| div().flex().items_center().gap(px(6.)).child(div().px(px(4.)).h(px(20.)).flex().items_center().rounded(px(4.)).bg(hsla(p.foreground).opacity(0.07)).child(key)).child(label);

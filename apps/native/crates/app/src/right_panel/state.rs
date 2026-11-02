@@ -81,7 +81,7 @@ impl AppState {
         store::save_ui_state(STORE, &self.panels);
     }
 
-    fn mutate_panels(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PanelState, &str) -> bool) {
+    pub(crate) fn mutate_panels(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PanelState, &str) -> bool) {
         let Some(thread_id) = self.panel_thread() else { return };
         let diff_was_visible = self.panels.diff_visible(&thread_id);
         if change(&mut self.panels, &thread_id) {
