@@ -201,6 +201,7 @@ impl AppState {
             cx.emit(AppEvent::Thread);
         }
         if config_changed {
+            self.sync_server_config(cx);
             cx.emit(AppEvent::ServerConfig);
         }
     }

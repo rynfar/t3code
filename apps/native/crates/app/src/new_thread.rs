@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, Entity, FontWeight, IntoElement, KeyBinding, ParentElement, Render, SharedString, Styled,
+    App, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled,
     Subscription, Window, actions, div, prelude::*, px,
 };
 use gpui_component::tooltip::Tooltip;
@@ -22,7 +22,6 @@ use crate::theme::{hsla, palette};
 actions!(t3, [NewThread]);
 
 pub fn init(state: Entity<AppState>, cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-n", NewThread, None)]);
     cx.on_action(move |_: &NewThread, cx| state.update(cx, start_new_thread));
 }
 

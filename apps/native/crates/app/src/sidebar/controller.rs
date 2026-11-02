@@ -130,6 +130,14 @@ impl AppState {
         self.track_visit(cx);
     }
 
+    /// Applies the server config's keybindings and capabilities (`subscribeServerConfig`).
+    pub(crate) fn sync_server_config(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.server_config.config.as_ref() else { return };
+        self.sidebar.capabilities.auto_settle_opt_out = config.environment.capabilities.thread_auto_settle_opt_out == Some(true);
+        let keybindings = config.keybindings.clone();
+        crate::keymap::install(&keybindings, cx);
+    }
+
     pub fn toggle_shelf(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
         self.sidebar.shelves.toggle(shelf);
         self.rebuild_sidebar(cx);
