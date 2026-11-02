@@ -1,18 +1,30 @@
-//! RPC method names and command payloads, as `packages/contracts` defines them.
-//! The native client identifies as the desktop surface and creates work with
-//! `creationSource: "web"`, which is what the desktop web view sends.
+//! RPC method names and command payloads, as `packages/contracts` defines them and
+//! `client-runtime/src/operations/commands.ts` sends them. The native client identifies as the
+//! desktop surface and creates work with `creationSource: "web"`, which is what the desktop web
+//! view sends.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+
+use crate::model::ModelSelection;
+use crate::server_config::{InteractionMode, RuntimeMode};
 
 pub mod method {
     pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
     pub const SERVER_PROBE: &str = "server.probe";
+    pub const SERVER_UPDATE_SETTINGS: &str = "server.updateSettings";
     pub const SUBSCRIBE_SHELL: &str = "orchestration.subscribeShell";
     pub const SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
     pub const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
+    pub const LAUNCH_THREAD: &str = "orchestration.launchThread";
 }
 
 pub const CREATION_SOURCE: &str = "web";
+
+/// Per-cwd provider snapshots are left out: the native composer has no slash-command menu yet,
+/// and `server.refreshProviders` fetches them on demand when it does.
+pub fn subscribe_server_config() -> Value {
+    json!({ "workspaceSnapshotsOnDemand": true })
+}
 
 /// Asks for the `synchronized` marker so "no rows" can mean empty rather than still loading.
 pub fn subscribe_shell(after_sequence: Option<u64>) -> Value {
@@ -75,8 +87,57 @@ pub fn send_message(command_id: &str, thread_id: &str, text: &str, mode: &Dispat
     })
 }
 
+/// `ComposerDispatchMode` after `planComposerTurn`: what a send does to a running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerDispatch {
+    Auto,
+    Queue,
+    Steer,
+}
+
+/// The composer's send to a server thread, as `startThreadTurn` builds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComposerMessage<'a> {
+    pub command_id: &'a str,
+    pub thread_id: &'a str,
+    pub message_id: &'a str,
+    pub text: &'a str,
+    pub title_seed: &'a str,
+    pub model_selection: &'a ModelSelection,
+    pub dispatch: ComposerDispatch,
+}
+
+pub fn composer_message(message: &ComposerMessage) -> Value {
+    let mut command = json!({
+        "type": "message.dispatch",
+        "commandId": message.command_id,
+        "createdBy": "user",
+        "creationSource": CREATION_SOURCE,
+        "threadId": message.thread_id,
+        "messageId": message.message_id,
+        "text": message.text,
+        "attachments": [],
+        "titleSeed": message.title_seed,
+        "modelSelection": message.model_selection,
+    });
+    match message.dispatch {
+        ComposerDispatch::Queue => command["dispatchMode"] = json!({ "type": "queue_after_active" }),
+        ComposerDispatch::Auto | ComposerDispatch::Steer => {
+            let intent = if message.dispatch == ComposerDispatch::Steer { "steer" } else { "auto" };
+            command["deliveryIntent"] = json!(intent);
+            command["dispatchMode"] = json!({ "type": "start_immediately" });
+        }
+    }
+    command
+}
+
 pub fn stop_thread(command_id: &str, thread_id: &str) -> Value {
     json!({ "type": "thread.stop", "commandId": command_id, "threadId": thread_id })
+}
+
+/// What servers without the `threadStop` capability take: stop the run and hold its queue.
+pub fn interrupt_run(command_id: &str, thread_id: &str, run_id: &str) -> Value {
+    json!({ "type": "run.interrupt", "commandId": command_id, "threadId": thread_id, "runId": run_id, "holdQueue": true })
 }
 
 /// Commands that take only `commandId` and `threadId`: archive, unarchive, pin, unpin, settle…
@@ -84,18 +145,131 @@ pub fn simple_thread_command(kind: &str, command_id: &str, thread_id: &str) -> V
     json!({ "type": kind, "commandId": command_id, "threadId": thread_id })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub fn set_runtime_mode(command_id: &str, thread_id: &str, mode: RuntimeMode) -> Value {
+    json!({ "type": "thread.runtime-mode.set", "commandId": command_id, "threadId": thread_id, "runtimeMode": mode })
+}
 
-    #[test]
-    fn send_message_matches_message_dispatch_schema() {
-        let command = send_message("c1", "t1", "hi", &DispatchMode::StartImmediately);
-        assert_eq!(command["type"], "message.dispatch");
-        assert_eq!(command["messageId"], "c1");
-        assert_eq!(command["dispatchMode"], json!({ "type": "start_immediately" }));
-        assert_eq!(command["creationSource"], "web");
-        let steer = send_message("c2", "t1", "x", &DispatchMode::SteerActive { target_run_id: "r1".into() });
-        assert_eq!(steer["dispatchMode"], json!({ "type": "steer_active", "targetRunId": "r1" }));
+pub fn set_interaction_mode(command_id: &str, thread_id: &str, mode: InteractionMode) -> Value {
+    json!({
+        "type": "thread.interaction-mode.set",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "interactionMode": mode,
+    })
+}
+
+pub fn set_model_selection(command_id: &str, thread_id: &str, selection: &ModelSelection) -> Value {
+    json!({
+        "type": "thread.model-selection.set",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "modelSelection": selection,
+    })
+}
+
+/// `ProviderApprovalDecision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApprovalDecision {
+    Accept,
+    AcceptForSession,
+    AcceptAlways,
+    Decline,
+    Cancel,
+}
+
+impl ApprovalDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalDecision::Accept => "accept",
+            ApprovalDecision::AcceptForSession => "acceptForSession",
+            ApprovalDecision::AcceptAlways => "acceptAlways",
+            ApprovalDecision::Decline => "decline",
+            ApprovalDecision::Cancel => "cancel",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<ApprovalDecision> {
+        [Self::Accept, Self::AcceptForSession, Self::AcceptAlways, Self::Decline, Self::Cancel]
+            .into_iter()
+            .find(|decision| decision.as_str() == value)
     }
 }
+
+/// `feedback` declines with a message to the agent, for live requests that support it.
+pub fn respond_to_approval(
+    command_id: &str,
+    thread_id: &str,
+    request_id: &str,
+    decision: ApprovalDecision,
+    feedback: Option<&str>,
+) -> Value {
+    let mut command = json!({
+        "type": "runtime-request.respond",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "requestId": request_id,
+        "decision": decision.as_str(),
+    });
+    if let Some(feedback) = feedback {
+        command["feedback"] = json!(feedback);
+    }
+    command
+}
+
+pub fn respond_to_user_input(command_id: &str, thread_id: &str, request_id: &str, answers: Map<String, Value>) -> Value {
+    json!({
+        "type": "runtime-request.respond",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "requestId": request_id,
+        "answers": answers,
+    })
+}
+
+pub fn dismiss_user_input(command_id: &str, thread_id: &str, request_id: &str) -> Value {
+    json!({ "type": "thread.user-input.dismiss", "commandId": command_id, "threadId": thread_id, "requestId": request_id })
+}
+
+/// `OrchestrationV2ThreadLaunchInput` for a draft's first send, as `startThreadTurn` builds it
+/// with `bootstrap.createThread`. Threads start in the project checkout; worktree launches come
+/// with the branch toolbar (ledger CO-WORKSPACE).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchThread<'a> {
+    pub command_id: &'a str,
+    pub thread_id: &'a str,
+    pub project_id: &'a str,
+    pub title: &'a str,
+    pub model_selection: &'a ModelSelection,
+    pub runtime_mode: RuntimeMode,
+    pub interaction_mode: InteractionMode,
+    pub message_id: &'a str,
+    pub text: &'a str,
+}
+
+pub fn launch_thread(launch: &LaunchThread) -> Value {
+    json!({
+        "commandId": launch.command_id,
+        "creationSource": CREATION_SOURCE,
+        "threadId": launch.thread_id,
+        "projectId": launch.project_id,
+        "title": launch.title,
+        "generateTitle": true,
+        "modelSelection": launch.model_selection,
+        "runtimeMode": launch.runtime_mode,
+        "interactionMode": launch.interaction_mode,
+        "workspaceStrategy": { "type": "root" },
+        "initialMessage": {
+            "messageId": launch.message_id,
+            "text": launch.text,
+            "attachments": [],
+        },
+    })
+}
+
+/// `server.updateSettings` with `setModelFavorites`, as `useToggleEnvironmentModelFavorite` saves.
+pub fn set_model_favorite(provider: &str, model: &str, favorite: bool) -> Value {
+    json!({ "patch": { "setModelFavorites": [{ "provider": provider, "model": model, "favorite": favorite }] } })
+}
+
+#[cfg(test)]
+mod tests;

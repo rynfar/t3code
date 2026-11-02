@@ -1,11 +1,16 @@
 pub mod commands;
+pub mod composer;
 pub mod history;
 pub mod model;
 pub mod pairing;
+pub mod providers;
+pub mod requests;
 pub mod rpc;
+pub mod server_config;
 pub mod shell;
 pub mod sidebar;
 pub mod thread;
 pub mod timeline;
+pub mod traits;
 pub mod turn_item;
 pub mod wire;
