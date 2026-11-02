@@ -255,6 +255,32 @@ pub fn ghost_icon_button(id: impl Into<ElementId>, icon: Icon, on_click: impl Fn
     focusable(button, cx).into_any_element()
 }
 
+/// An `icon-xs` ghost button with a tooltip, dimmed and inert while `disabled`.
+pub fn tooltip_icon_button(
+    id: impl Into<ElementId>,
+    icon: Icon,
+    tooltip: &'static str,
+    disabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let button = div()
+        .id(id)
+        .size(px(24.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .child(icon.render(px(12.), hsla(p.muted_foreground)))
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx));
+    if disabled {
+        return button.opacity(0.64).into_any_element();
+    }
+    focusable(button.cursor_pointer().hover(|style| style.bg(hsla(p.accent))).on_click(on_click), cx).into_any_element()
+}
+
 /// Mono text block for expanded tool details: code size on a 1.625 line, `secondary_label`.
 pub fn mono_block(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
     div()

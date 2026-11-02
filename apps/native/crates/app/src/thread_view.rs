@@ -17,7 +17,7 @@ use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement
 use t3_core::history::HistoryControl;
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
-    derive_rows, detail_request, detail_revision, needs_detail_fetch, rows_equal, turn_diffs_by_message, update_entries,
+    derive_rows, detail_request, detail_revision, needs_detail_fetch, fork_support, rows_equal, turn_diffs_by_message, update_entries,
 };
 use t3_core::diff::TurnDiffSummary;
 
@@ -48,6 +48,8 @@ pub struct ThreadView {
     find: Option<find::FindUi>,
     footer: status::ThreadFooter,
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
+    fork_support: HashMap<String, bool>,
+    forking: std::collections::HashSet<String>,
     /// What `turn_diffs` was derived from: the message count and the checkpoints.
     turn_diff_source: Option<(usize, Vec<t3_core::thread::Entity>)>,
     banners: status::Banners,
@@ -84,6 +86,8 @@ impl ThreadView {
             find: None,
             footer: status::ThreadFooter::default(),
             turn_diffs: HashMap::new(),
+            fork_support: HashMap::new(),
+            forking: std::collections::HashSet::new(),
             turn_diff_source: None,
             banners: status::Banners::default(),
             local_error: None,
@@ -124,6 +128,7 @@ impl ThreadView {
             Some(projection) => {
                 update_entries(&mut self.entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
                 self.activity = derive_activity(projection);
+                self.fork_support = fork_support(projection);
                 let thread = &projection.thread;
                 self.workspace_root =
                     thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|p| p.workspace_root.clone()));
@@ -326,6 +331,37 @@ impl ThreadView {
         }
     }
 
+    /// `onForkFromRun`: forks into `<title> fork`, then opens it once the shell lists it. A failure
+    /// shows in the error banner.
+    pub fn fork_from_run(&mut self, source_thread_id: &str, run_id: &str, cx: &mut Context<Self>) {
+        if self.forking.contains(run_id) {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(title) = self.thread_id.as_deref().and_then(|id| state.shell.thread(id)).map(|thread| thread.title.clone()) else { return };
+        let target = crate::app_state::uuid_v4();
+        let command = t3_core::timeline::fork_from_run(&crate::app_state::uuid_v4(), source_thread_id, &target, run_id, &title);
+        let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
+        let run_id = run_id.to_owned();
+        self.forking.insert(run_id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |view, cx| {
+                view.forking.remove(&run_id);
+                match result {
+                    Ok(_) => view.state.update(cx, |state, cx| state.select_when_listed(&target, cx)),
+                    Err(error) => {
+                        let message = error.to_string();
+                        view.show_local_error(if message.trim().is_empty() { t3_core::timeline::FORK_FAILED.to_owned() } else { message }, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn open_turn_diff(&mut self, run_id: &str, file_path: Option<&str>, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| state.open_turn_diff(run_id, file_path, cx));
     }
@@ -368,6 +404,8 @@ impl ThreadView {
             working_timer: self.working_timer.as_ref(),
             find_target: self.find.as_ref().and_then(|find| find.active_entry()),
             turn_diffs: &self.turn_diffs,
+            fork_support: &self.fork_support,
+            forking: &self.forking,
         };
         render(&env, &mut self.markdown)
     }

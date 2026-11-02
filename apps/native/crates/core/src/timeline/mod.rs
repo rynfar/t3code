@@ -10,6 +10,7 @@ mod entries;
 mod changed_files;
 mod find;
 mod folds;
+mod fork;
 mod presentation;
 mod rows;
 mod status;
@@ -42,6 +43,7 @@ pub use changed_files::{
     ChangedFileRow, DiffStat, TreeNode, changed_file_rows, changed_file_tree, changed_files_label, directory_paths, has_directories, hidden_files_label,
     turn_diffs_by_message,
 };
+pub use fork::{FORK_FAILED, FORK_LABEL, can_fork, fork_from_run, fork_support};
 pub use find::{FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, SEARCH_THREAD, bar_label, decode_result, format_count, search_request, step_index, step_locally};
 pub use rows::{RowsCache, RowsInput, derive_rows, fold_membership};
 pub use status::{

@@ -1090,3 +1090,29 @@ fn a_turns_changed_files_ride_on_its_last_assistant_message() {
     assert_eq!(diffs.keys().collect::<Vec<_>>(), ["a2"]);
     assert_eq!(diffs["a2"].run_id, "run-1");
 }
+
+/// `canForkProjectedAssistantItem`: completed assistant messages fork unless the provider can't.
+#[test]
+fn forking_needs_a_completed_assistant_message_and_a_capable_provider() {
+    let mut projection = projection_json(serde_json::json!({}), serde_json::json!([]), serde_json::json!([]), serde_json::json!([]));
+    let item = |status: &str, provider_thread: Option<&str>| -> crate::turn_item::TurnItem {
+        serde_json::from_value(item_json("a1", serde_json::json!({
+            "type": "assistant_message", "messageId": "m1", "text": "Done", "streaming": false, "status": status, "providerThreadId": provider_thread,
+        })))
+        .expect("item")
+    };
+    assert!(can_fork(&item("completed", None), &fork_support(&projection)));
+    assert!(!can_fork(&item("running", None), &fork_support(&projection)));
+    projection.provider_threads = vec![crate::thread::Entity { id: "pt".into(), value: serde_json::json!({ "id": "pt", "providerSessionId": "ps" }) }];
+    let session = |capabilities: serde_json::Value| vec![crate::thread::Entity { id: "ps".into(), value: serde_json::json!({ "id": "ps", "capabilities": capabilities }) }];
+    projection.provider_sessions = session(serde_json::json!({
+        "threads": { "canForkThread": true, "canForkFromTurn": true }, "identity": { "nativeThreadIds": "weak" }, "context": { "supportsFullThreadHandoff": false },
+    }));
+    assert!(!can_fork(&item("completed", Some("pt")), &fork_support(&projection)));
+    projection.provider_sessions = session(serde_json::json!({
+        "threads": { "canForkThread": true, "canForkFromTurn": true }, "identity": { "nativeThreadIds": "strong" }, "context": { "supportsFullThreadHandoff": false },
+    }));
+    assert!(can_fork(&item("completed", Some("pt")), &fork_support(&projection)));
+    let command = fork_from_run("c", "t", "t2", "run-1", "Refactor");
+    assert_eq!((command["type"].as_str(), command["sourcePoint"]["runId"].as_str(), command["title"].as_str()), (Some("thread.fork"), Some("run-1"), Some("Refactor fork")));
+}

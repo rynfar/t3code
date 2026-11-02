@@ -176,8 +176,7 @@ impl ThreadView {
                 view.footer.goal_pending = false;
                 if let Err(error) = result {
                     let message = error.to_string();
-                    view.local_error = Some(if message.trim().is_empty() { failure.to_owned() } else { message });
-                    view.sync_banners(cx);
+                    view.show_local_error(if message.trim().is_empty() { failure.to_owned() } else { message }, cx);
                 }
                 view.list.remeasure_items(view.header_count() + view.rows.len()..view.header_count() + view.rows.len() + 1);
                 cx.notify();
@@ -310,6 +309,12 @@ impl ThreadView {
             );
         }
         v_flex().w_full().children(lines).into_any_element()
+    }
+
+    /// A failure from an action taken in this view, shown in the error banner.
+    pub(super) fn show_local_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.local_error = Some(message);
+        self.sync_banners(cx);
     }
 
     fn dismiss_error(&mut self, key: String, cx: &mut Context<Self>) {

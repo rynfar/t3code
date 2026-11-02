@@ -69,6 +69,9 @@ pub struct RowEnv<'a> {
     pub find_target: Option<&'a str>,
     /// Each turn's changed files, by the assistant message that ends it.
     pub turn_diffs: &'a HashMap<String, Arc<t3_core::diff::TurnDiffSummary>>,
+    /// Fork capability by provider thread, and the runs a fork is being created from.
+    pub fork_support: &'a HashMap<String, bool>,
+    pub forking: &'a HashSet<String>,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.

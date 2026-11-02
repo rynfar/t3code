@@ -19,6 +19,8 @@ pub struct TurnItem {
     pub node_id: Option<String>,
     pub parent_item_id: Option<String>,
     #[serde(default)]
+    pub provider_thread_id: Option<String>,
+    #[serde(default)]
     pub provider_turn_id: Option<String>,
     #[serde(default)]
     pub tool_surface: Option<String>,
