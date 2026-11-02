@@ -38,7 +38,7 @@ pub fn icon(glyph: Icon, size: f32, color: Hsla) -> Svg {
     svg().path(glyph.path()).size(r(size)).flex_none().text_color(color)
 }
 
-fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+pub fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
     move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }
 
@@ -210,12 +210,19 @@ impl RenderOnce for Button {
 pub struct Switch {
     id: ElementId,
     checked: bool,
+    disabled: bool,
     on_change: Option<ValueHandler<bool>>,
 }
 
 impl Switch {
     pub fn new(id: impl Into<ElementId>, checked: bool) -> Self {
-        Switch { id: id.into(), checked, on_change: None }
+        Switch { id: id.into(), checked, disabled: false, on_change: None }
+    }
+
+    /// Shown at 64% and inert, as a read-only status.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
     }
 
     pub fn on_change(mut self, handler: impl Fn(bool, &mut Window, &mut App) + 'static) -> Self {
@@ -232,7 +239,8 @@ impl RenderOnce for Switch {
         let focused = focus.is_focused(window);
         let thumb = if dark && !self.checked { hsla(p.muted_foreground) } else { hsla(p.background) };
         let next = !self.checked;
-        let handler = self.on_change;
+        let disabled = self.disabled;
+        let handler = self.on_change.filter(|_| !disabled);
         h_flex()
             .id(self.id)
             .track_focus(&focus)
@@ -243,7 +251,8 @@ impl RenderOnce for Switch {
             .rounded_full()
             .bg(if self.checked { hsla(p.primary) } else { hsla(p.input) })
             .when(focused, |this| this.shadow(focus_ring(hsla(p.ring))))
-            .cursor_pointer()
+            .when(disabled, |this| this.opacity(0.64))
+            .when(!disabled, |this| this.cursor_pointer())
             .child(
                 div()
                     .size(r(14.))

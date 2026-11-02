@@ -639,6 +639,8 @@ pub struct ServerSettings {
     pub provider_panel: crate::settings::providers::background::ProviderPanelSettings,
     #[serde(flatten)]
     pub worktrees: crate::settings::worktrees::WorktreeSettings,
+    #[serde(flatten)]
+    pub source_control: crate::settings::source_control::SourceControlSettings,
 }
 
 /// `providerInstances` in the server's order, which is the order the provider settings list

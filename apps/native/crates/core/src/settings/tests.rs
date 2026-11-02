@@ -267,13 +267,17 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
             Section::Keybindings,
             Section::Providers,
             Section::Threads,
+            Section::ScheduledTasks,
+            Section::SourceControl,
+            Section::Worktrees,
             Section::Connections,
+            Section::Access,
             Section::Labs,
             Section::About,
             Section::Archived
         ]
     );
-    assert_eq!(groups.iter().map(|(heading, _)| *heading).collect::<Vec<_>>(), vec![None, Some("Agents"), Some("Connections"), None]);
+    assert_eq!(groups.iter().map(|(heading, _)| *heading).collect::<Vec<_>>(), vec![None, Some("Agents"), Some("Code"), Some("Connections"), None]);
     assert!(search::items().iter().all(|item| item.section.is_available()));
 }
 

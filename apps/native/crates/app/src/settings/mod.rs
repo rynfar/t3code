@@ -11,6 +11,7 @@ pub(crate) mod controls;
 mod general;
 mod keybindings;
 mod providers;
+mod source_control;
 pub(crate) mod store;
 mod threads;
 mod worktrees;
@@ -202,6 +203,7 @@ pub struct SettingsView {
     pub(crate) archive: archive::ArchiveState,
     pub(crate) providers: providers::ProvidersState,
     pub(crate) worktrees: worktrees::WorktreesState,
+    pub(crate) source_control: source_control::SourceControlState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -244,6 +246,7 @@ impl SettingsView {
             archive: archive::ArchiveState::default(),
             providers: providers::ProvidersState::new(window, cx),
             worktrees: worktrees::WorktreesState::new(window, cx),
+            source_control: source_control::SourceControlState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -271,6 +274,7 @@ impl SettingsView {
         self.scroll_to_target = target.is_some();
         if let Some(target) = target.as_deref() {
             self.worktrees.reveal(target);
+            self.source_control.reveal(target);
         }
         self.target = target;
         if changed || self.target.is_none() {
@@ -332,6 +336,7 @@ impl SettingsView {
         self.commit_focused_thread_field(window, cx);
         self.commit_focused_provider_field(window, cx);
         self.commit_focused_worktree_field(window, cx);
+        self.commit_focused_source_control_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -418,7 +423,7 @@ impl SettingsView {
             .chain(self.providers.inputs())
             .chain(self.worktrees.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
-            || self.worktrees.instructions.focus_handle(cx).is_focused(window)
+            || [&self.worktrees.instructions].into_iter().chain(self.source_control.textareas()).any(|input| input.focus_handle(cx).is_focused(window))
     }
 
     fn render_nav(&self, layout: ModalLayout, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -626,6 +631,7 @@ impl SettingsView {
             Section::Keybindings => self.keybindings_page(window, cx),
             Section::Providers => self.providers_page(window, cx),
             Section::Worktrees => self.worktrees_page(window, cx),
+            Section::SourceControl => self.source_control_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),

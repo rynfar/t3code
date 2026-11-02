@@ -72,7 +72,7 @@ impl ThreadsState {
 }
 
 /// The models a default-model select offers: every selectable provider instance, grouped.
-fn model_options(config: &ServerConfig) -> Vec<SelectOption> {
+pub(super) fn model_options(config: &ServerConfig) -> Vec<SelectOption> {
     providers::entries(config, None)
         .into_iter()
         .filter(|entry| entry.enabled && entry.provider.is_available())
@@ -86,16 +86,16 @@ fn model_options(config: &ServerConfig) -> Vec<SelectOption> {
         .collect()
 }
 
-fn selection_value(selection: &ModelSelection) -> String {
+pub(super) fn selection_value(selection: &ModelSelection) -> String {
     format!("{}{SELECTION_SEPARATOR}{}", selection.instance_id, selection.model)
 }
 
-fn parse_selection(value: &str) -> Option<ModelSelection> {
+pub(super) fn parse_selection(value: &str) -> Option<ModelSelection> {
     let (instance_id, model) = value.split_once(SELECTION_SEPARATOR)?;
     Some(ModelSelection { instance_id: instance_id.to_owned(), model: model.to_owned(), options: None })
 }
 
-fn selection_label(config: &ServerConfig, selection: &ModelSelection) -> String {
+pub(super) fn selection_label(config: &ServerConfig, selection: &ModelSelection) -> String {
     config
         .provider(&selection.instance_id)
         .and_then(|provider| provider.models.iter().find(|model| model.slug == selection.model))

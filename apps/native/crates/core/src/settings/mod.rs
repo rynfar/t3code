@@ -9,7 +9,9 @@ pub mod keybindings;
 pub mod providers;
 pub mod quit_hold;
 pub mod search;
+pub mod scheduled_tasks;
 pub mod snooze;
+pub mod source_control;
 pub mod worktrees;
 
 use serde::de::DeserializeOwned;

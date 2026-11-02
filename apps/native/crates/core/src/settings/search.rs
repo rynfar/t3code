@@ -65,8 +65,11 @@ impl Section {
                 | Section::Keybindings
                 | Section::Providers
                 | Section::Threads
+                | Section::ScheduledTasks
+                | Section::SourceControl
                 | Section::Worktrees
                 | Section::Connections
+                | Section::Access
                 | Section::Labs
                 | Section::About
                 | Section::Archived
@@ -176,7 +179,18 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
         SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
         SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),
+        SearchItem::new("automatic-pull", "Automatically pull", SourceControl, &["auto pull default branch current checkout fast forward upstream"]),
+        SearchItem::new("remove-agent-credits-on-merge", "Remove agent credits when merging", SourceControl, &["pull request GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"]),
+        SearchItem::new("pull-request-merge-method", "Default merge method", SourceControl, &["pull request merge squash rebase last selected"]),
+        SearchItem::new("source-control", "Source control", SourceControl, &["version control git GitHub ghes enterprise GitLab GitCafe Forgejo gitea tea codeberg Bitbucket Azure DevOps hosting integrations credentials scan server environment"]),
         SearchItem::new("worktree-branch-naming", "Worktree branch naming", Worktrees, &["static semantic prefix custom prompt instructions feat fix refactor chore"]),
+        SearchItem::new("source-control-writing-style", "Source control writing style", SourceControl, &["repository conventions conventional commits custom instructions change descriptions request titles"]),
+        SearchItem::new("follow-change-request-templates", "Follow change request templates", SourceControl, &["repository pr pull request description structure"]),
+        SearchItem::new("source-control-writer-model", "Source control writer model", SourceControl, &["override generated commit change request pr titles descriptions branch bookmark"]),
+        SearchItem::new("review-guides", "Review guides (beta)", SourceControl, &["pull request pr guided review guide tour beta experimental"]),
+        SearchItem::new("review-guide-model", "Review guide model", SourceControl, &["pull request pr guided review guide brief maintainer"]).target("review-guides"),
+        SearchItem::new("review-guide-instructions", "Review guide instructions", SourceControl, &["pull request pr guided review guide preferences taste prompt custom"]).target("review-guides"),
+        SearchItem::new("connections-environment", "This machine", Access, &["connections server backend local remote access administrative permissions scope pairing links qr code authorized clients sessions revoke endpoint"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),
     ]
