@@ -18,7 +18,7 @@ use super::folds::{
     terminal_assistant_ids, turn_folds, unsettled_run_id, work_group_id,
 };
 use super::presentation::compaction_tokens;
-use super::{ChatMessage, EntryKind, Role, RowKind, SourceActivity, TimelineEntry, TimelineRow, Tone, ToolStatus, WorkLogEntry};
+use super::{ChatMessage, EntryKind, Role, RowKind, SourceActivity, TimelineEntry, TimelineRow, Tone, ToolStatus, WorkLogEntry, rows_equal};
 use crate::turn_item::{TurnItem, TurnItemKind};
 
 const LIVE_ACTIVITY_ROW_ID: &str = "live-activity-row";
@@ -43,26 +43,27 @@ struct Previous {
     entries: Vec<Arc<TimelineEntry>>,
     activity: ThreadActivity,
     expanded: [HashSet<String>; 3],
-    rows: Vec<TimelineRow>,
+    rows: Vec<Arc<TimelineRow>>,
 }
 
 /// A streamed token changes one assistant message and nothing else, so the previous rows hold
-/// with that message swapped in: `replaceStreamingMessageRows`.
-fn replace_streaming_rows(input: &RowsInput, previous: &Previous) -> Option<Vec<TimelineRow>> {
+/// with that message swapped in: `replaceStreamingMessageRows`. Patches `previous` in place and
+/// reports whether it could.
+fn patch_streaming_rows(input: &RowsInput, previous: &mut Previous) -> bool {
     if input.entries.len() != previous.entries.len()
         || *input.activity != previous.activity
         || *input.expanded_run_ids != previous.expanded[0]
         || *input.expanded_attempt_ids != previous.expanded[1]
         || *input.expanded_work_group_ids != previous.expanded[2]
     {
-        return None;
+        return false;
     }
-    let mut replacements: HashMap<usize, Arc<ChatMessage>> = HashMap::new();
-    for (next, before) in input.entries.iter().zip(&previous.entries) {
+    let mut replacements: Vec<(usize, Arc<ChatMessage>)> = Vec::new();
+    for (index, (next, before)) in input.entries.iter().zip(&previous.entries).enumerate() {
         if Arc::ptr_eq(next, before) {
             continue;
         }
-        let (Some(new), Some(old)) = (next.message(), before.message()) else { return None };
+        let (Some(new), Some(old)) = (next.message(), before.message()) else { return false };
         let streaming_text_only = new.role == Role::Assistant
             && old.role == Role::Assistant
             && new.streaming
@@ -73,25 +74,28 @@ fn replace_streaming_rows(input: &RowsInput, previous: &Previous) -> Option<Vec<
             && next.created_at == before.created_at
             && next.attempt == before.attempt;
         if !streaming_text_only {
-            return None;
+            return false;
         }
-        replacements.insert(Arc::as_ptr(old) as usize, new.clone());
+        replacements.push((index, new.clone()));
     }
-    Some(
-        previous
-            .rows
-            .iter()
-            .map(|row| {
-                let mut row = row.clone();
-                if let RowKind::Message { message, .. } | RowKind::AssistantMeta { message, .. } = &mut row.kind
-                    && let Some(next) = replacements.get(&(Arc::as_ptr(message) as usize))
-                {
-                    *message = next.clone();
+    for (index, message) in replacements {
+        let old = previous.entries[index].message().map(|m| Arc::as_ptr(m) as usize);
+        previous.entries[index] = input.entries[index].clone();
+        for row in previous.rows.iter_mut() {
+            let matches = match &row.kind {
+                RowKind::Message { message, .. } | RowKind::AssistantMeta { message, .. } => Some(Arc::as_ptr(message) as usize) == old,
+                _ => false,
+            };
+            if matches {
+                let mut patched = (**row).clone();
+                if let RowKind::Message { message: slot, .. } | RowKind::AssistantMeta { message: slot, .. } = &mut patched.kind {
+                    *slot = message.clone();
                 }
-                row
-            })
-            .collect(),
-    )
+                *row = Arc::new(patched);
+            }
+        }
+    }
+    true
 }
 
 fn settle_superseded_reasoning(entries: &[Arc<TimelineEntry>], cache: &mut RowsCache) -> Vec<Arc<TimelineEntry>> {
@@ -128,13 +132,24 @@ fn expanded_group_row(group_id: &str, created_at: &str, entries: Vec<Arc<WorkLog
     row(format!("{group_id}:details"), Some(created_at.to_owned()), RowKind::Work { entries, expanded_group: true, display_label: None })
 }
 
-/// `deriveMessagesTimelineRows`.
-pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
-    let rows = cache
-        .previous
-        .as_ref()
-        .and_then(|previous| replace_streaming_rows(input, previous))
-        .unwrap_or_else(|| derive_all_rows(input, cache));
+/// `deriveMessagesTimelineRows`. Unchanged rows keep their `Arc` across derives
+/// (`computeStableMessagesTimelineRows`), so a view can diff them by pointer.
+pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<Arc<TimelineRow>> {
+    if let Some(previous) = cache.previous.as_mut()
+        && patch_streaming_rows(input, previous)
+    {
+        return previous.rows.clone();
+    }
+    let fresh = derive_all_rows(input, cache);
+    let previous_rows: HashMap<&str, &Arc<TimelineRow>> =
+        cache.previous.iter().flat_map(|previous| previous.rows.iter()).map(|row| (row.id.as_str(), row)).collect();
+    let rows: Vec<Arc<TimelineRow>> = fresh
+        .into_iter()
+        .map(|row| match previous_rows.get(row.id.as_str()) {
+            Some(previous) if rows_equal(previous, &row) => Arc::clone(previous),
+            _ => Arc::new(row),
+        })
+        .collect();
     cache.previous = Some(Previous {
         entries: input.entries.to_vec(),
         activity: input.activity.clone(),

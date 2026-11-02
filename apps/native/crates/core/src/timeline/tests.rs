@@ -56,7 +56,7 @@ impl Input {
             expanded_attempt_ids: &none,
             expanded_work_group_ids: &self.groups,
         };
-        derive_rows(&input, &mut RowsCache::default())
+        derive_rows(&input, &mut RowsCache::default()).iter().map(|row| (**row).clone()).collect()
     }
 }
 
@@ -397,7 +397,7 @@ fn a_streamed_token_patches_rows_like_a_full_derive() {
             expanded_attempt_ids: &none,
             expanded_work_group_ids: &input.groups,
         };
-        derive_rows(&rows_input, cache)
+        derive_rows(&rows_input, cache).iter().map(|row| (**row).clone()).collect::<Vec<_>>()
     };
     let mut cache = RowsCache::default();
     let first = derive(&[prompt.clone(), streaming("Hel")], &mut cache);
@@ -449,7 +449,7 @@ fn incremental_derives_match_a_fresh_derive_at_every_streamed_frame() {
         let derive = |entries_cache: &mut EntriesCache, rows_cache: &mut RowsCache| {
             let entries = derive_entries(entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
             let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none };
-            derive_rows(&input, rows_cache).iter().map(row_summary).collect::<Vec<_>>()
+            derive_rows(&input, rows_cache).iter().map(|row| row_summary(row)).collect::<Vec<_>>()
         };
         let incremental = derive(&mut entries_cache, &mut rows_cache);
         let fresh = derive(&mut EntriesCache::default(), &mut RowsCache::default());
@@ -770,4 +770,51 @@ fn a_new_node_re_resolves_cached_attempts() {
     assert!(before[0].attempt.is_none());
     let after = derive_entries(&mut cache, &visible, &attempts, &nodes, &[]);
     assert_eq!(after[0].attempt.as_ref().map(|a| a.id.as_str()), Some("attempt-1"));
+}
+
+#[test]
+fn a_streamed_token_replaces_only_its_own_row() {
+    let streaming = |text: &str| {
+        let entry = message("reply", Role::Assistant, text, Some("run-1"), "2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z");
+        let EntryKind::Message(m) = &entry.kind else { unreachable!() };
+        let mut m = (**m).clone();
+        m.streaming = true;
+        Arc::new(TimelineEntry { kind: EntryKind::Message(Arc::new(m)), ..(*entry).clone() })
+    };
+    let prompt = message("user-1", Role::User, "Go", Some("run-1"), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+    let activity = running("run-1");
+    let none = HashSet::new();
+    let mut cache = RowsCache::default();
+    let mut derive = |entries: &[Arc<TimelineEntry>]| {
+        derive_rows(&RowsInput { entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none }, &mut cache)
+    };
+    let first = derive(&[prompt.clone(), streaming("Hel")]);
+    let second = derive(&[prompt, streaming("Hello")]);
+    let changed: Vec<&str> = first.iter().zip(&second).filter(|(a, b)| !Arc::ptr_eq(a, b)).map(|(_, b)| b.id.as_str()).collect();
+    assert_eq!(changed, ["reply-entry"]);
+}
+
+#[test]
+fn withheld_output_is_requested_by_revision_and_decoded() {
+    let command = |status: &str| -> crate::turn_item::TurnItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "cmd", "threadId": "t", "runId": "r", "nodeId": null, "parentItemId": null, "ordinal": 1, "status": status,
+            "title": null, "startedAt": null, "completedAt": null, "updatedAt": "2026-01-01T00:00:09Z",
+            "type": "command_execution", "input": "ls", "outputOmitted": true,
+        }))
+        .expect("item decodes")
+    };
+    assert!(needs_detail_fetch(&command("completed")));
+    assert_eq!(detail_request(&command("running"))["revision"], "live");
+    assert_eq!(detail_request(&command("completed")), serde_json::json!({ "threadId": "t", "itemId": "cmd", "revision": "2026-01-01T00:00:09Z" }));
+    let mut fetched = serde_json::to_value(serde_json::json!({ "item": {
+        "id": "cmd", "threadId": "t", "runId": "r", "nodeId": null, "parentItemId": null, "ordinal": 1, "status": "completed",
+        "title": null, "startedAt": null, "completedAt": null, "updatedAt": "2026-01-01T00:00:09Z",
+        "type": "command_execution", "input": "ls", "output": "a\nb", "exitCode": 0,
+    }}))
+    .expect("json");
+    let item = decode_detail(fetched.take()).expect("decodes").expect("present");
+    assert!(matches!(&item.kind, crate::turn_item::TurnItemKind::CommandExecution { output: Some(output), .. } if output == "a\nb"));
+    assert!(decode_detail(serde_json::json!({ "item": null })).expect("decodes").is_none());
+    assert_eq!(command_output_text(r#"{"stdout":"out","stderr":"","interrupted":false}"#).as_deref(), Some("out"));
 }
