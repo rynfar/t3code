@@ -134,6 +134,18 @@ impl Render for SideChatPane {
                 .child(self.composer.clone())
                 .into_any_element()
         };
-        v_flex().size_full().min_h_0().child(header).child(body)
+        // The open thread's chat shortcuts ignore keys from a side chat (`isInSideChatPane`); its
+        // own composer handles them before they get here.
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .on_action(|_: &crate::composer::ToggleModelPicker, _, _| {})
+            .on_action(|_: &crate::composer::OpenPermissions, _, _| {})
+            .on_action(|_: &crate::thread_view::FindInThread, _, _| {})
+            .on_action(|_: &crate::keymap::SettleThread, _, _| {})
+            .on_action(|_: &crate::keymap::PinThread, _, _| {})
+            .on_action(|_: &crate::keymap::CopyThreadReference, _, _| {})
+            .child(header)
+            .child(body)
     }
 }

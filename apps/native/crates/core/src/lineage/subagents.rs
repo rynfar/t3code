@@ -405,32 +405,44 @@ impl NativeChildStep {
 
 const EFFORT_OPTION_IDS: [&str; 6] = ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level"];
 
-/// `formatModelSelectionEffort`: the effort a subagent runs at, from what the provider reported
-/// first, else the selection. `variant` falls back to its default choice.
+/// `formatModelSelectionEffort`: the effort a subagent runs at, from the selection's explicit
+/// choice, else what the provider reported for the same model. A value the catalog lacks is
+/// not shown as its default (`getProviderOptionCurrentLabel`).
 pub fn effort_label(
     selection: &crate::model::ModelSelection,
     model: Option<&crate::server_config::ProviderModel>,
     reported: Option<&crate::model::ModelSelection>,
 ) -> Option<String> {
     use crate::server_config::OptionDescriptor;
-    use crate::traits::{OptionValue, current_label, resolve_descriptors, selections};
+    use crate::traits::{OptionValue, selections};
     let descriptors = &model?.capabilities.as_ref()?.option_descriptors;
-    let stated = |id: &str| {
-        let pick = |selection: Option<&crate::model::ModelSelection>| selections(selection?.options.as_ref()).into_iter().find(|option| option.id == id);
-        pick(reported).or_else(|| pick(Some(selection)))
-    };
+    let explicit = selections(selection.options.as_ref());
+    let reported = reported.filter(|reported| reported.instance_id == selection.instance_id && reported.model == selection.model).map(|reported| selections(reported.options.as_ref()));
     for id in EFFORT_OPTION_IDS {
-        let Some(descriptor @ OptionDescriptor::Select(_)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
-        let value = stated(id);
-        if value.is_none() && id != "variant" {
-            continue;
-        }
-        if value.as_ref().is_some_and(|value| matches!(value.value, OptionValue::Bool(_))) {
-            continue;
-        }
-        let resolved = resolve_descriptors(std::slice::from_ref(descriptor), &value.into_iter().collect::<Vec<_>>());
-        if let Some(label) = resolved.first().and_then(current_label) {
-            return Some(label);
+        let Some(OptionDescriptor::Select(descriptor)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
+        let chosen = explicit.iter().find(|option| option.id == id).map(|option| &option.value);
+        // `getReportedOptionValue`: only for options the selection leaves unstated.
+        let reported = reported.as_ref().filter(|_| chosen.is_none()).and_then(|options| options.iter().find(|option| option.id == id)).map(|option| &option.value);
+        let value = match chosen.or(reported) {
+            Some(OptionValue::Bool(_)) => continue,
+            Some(OptionValue::Str(value)) => Some(value.as_str()),
+            None if id == "variant" => None,
+            None => continue,
+        };
+        let current = match reported {
+            Some(OptionValue::Str(value)) => Some(value.as_str()),
+            _ if id == "variant" && chosen.is_none() => None,
+            _ => value.filter(|value| !value.is_empty()).or_else(|| descriptor.options.iter().find(|option| option.is_default).map(|option| option.id.as_str())),
+        };
+        let label = descriptor.options.iter().find(|option| Some(option.id.as_str()) == current).map(|option| option.label.clone()).or_else(|| {
+            if matches!(reported, Some(OptionValue::Str(value)) if value == "default") {
+                Some("Default".to_owned())
+            } else {
+                (id == "variant").then(|| "Unknown".to_owned())
+            }
+        });
+        if label.is_some() {
+            return label;
         }
     }
     None
@@ -452,16 +464,43 @@ pub fn reported_model_selection(projection: &ThreadProjection) -> Option<crate::
 }
 
 impl Subagent {
+    /// `currentSubagent` in `ThreadRelationshipsControl.tsx`: a finished task whose child thread
+    /// runs again, or ran since, takes that run's status and times.
+    pub fn current(&self, child: Option<&crate::shell::ThreadShell>) -> Subagent {
+        let Some(child) = child.filter(|_| !is_active_status(&self.status)) else { return self.clone() };
+        let live = child.activity_run_status.clone().or_else(|| (child.status == "queued").then(|| "queued".to_owned()));
+        let since = self.completed_at.as_deref().or(self.started_at.as_deref()).unwrap_or(&self.updated_at);
+        let newer = child.latest_run_requested_at.as_deref().and_then(parse_iso_ms).zip(parse_iso_ms(since)).is_some_and(|(run, task)| run > task);
+        if live.is_none() && !newer {
+            return self.clone();
+        }
+        let (started_at, completed_at) = match live {
+            Some(_) => (child.activity_run_started_at.clone().flatten(), None),
+            None => (child.latest_run_started_at.clone(), child.latest_run_completed_at.clone().flatten()),
+        };
+        let status = match live.as_deref().unwrap_or(&child.status) {
+            "preparing" | "starting" | "queued" => "pending",
+            "rolled_back" => "interrupted",
+            status => status,
+        };
+        Subagent { status: status.to_owned(), started_at, completed_at, progress: None, result: None, ..self.clone() }
+    }
+
     /// `canStop` in `ThreadRelationshipsControl.tsx`: app-owned tasks, and Claude's native tasks
-    /// with a strong reference, once started and while they work.
-    pub fn can_stop(&self) -> bool {
-        let live = is_active_status(&self.status);
+    /// with a strong reference, once started and while they work. `child` is the task's thread,
+    /// which may run again after the task finished.
+    pub fn can_stop(&self, child: Option<&crate::shell::ThreadShell>) -> bool {
+        let current = self.current(child);
         let strong = self.native_task_ref.as_ref().is_some_and(|reference| {
             reference.get("strength").and_then(Value::as_str) == Some("strong") && reference.get("nativeId").is_some_and(|id| !id.is_null())
         });
         let stoppable = self.origin.as_deref() == Some("app_owned")
-            || (self.origin.as_deref() == Some("provider_native") && self.driver.as_deref() == Some("claudeAgent") && self.run_id.is_some() && strong && live);
-        stoppable && self.started_at.is_some() && live
+            || (self.origin.as_deref() == Some("provider_native")
+                && self.driver.as_deref() == Some("claudeAgent")
+                && self.run_id.is_some()
+                && strong
+                && is_active_status(&self.status));
+        stoppable && current.started_at.is_some() && is_active_status(&current.status)
     }
 
     /// `canStopWorkflow`: a running Claude workflow coordinator.

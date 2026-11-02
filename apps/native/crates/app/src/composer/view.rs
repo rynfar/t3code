@@ -18,7 +18,7 @@ use t3_core::traits;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
 use super::model_picker::permissions_section;
-use super::{Composer, MenuKey, PasteAsText, Resolved, StashPrompt, Target, TogglePlanMode, runtime_mode_icon};
+use super::{Composer, MenuKey, OpenPermissions, PasteAsText, Resolved, StashPrompt, Target, ToggleModelPicker, TogglePlanMode, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
@@ -272,6 +272,9 @@ impl Render for Composer {
                     }
                 }))
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
+                // Each composer takes its own shortcuts, so a side chat's never reach the open thread's.
+                .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
+                .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| this.open_permissions(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).
                 .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
                     if this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {

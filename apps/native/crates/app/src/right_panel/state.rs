@@ -5,17 +5,23 @@
 use std::collections::HashMap;
 
 use gpui::Context;
-use serde::Serialize;
+use serde_json::json;
 use t3_client::store;
 use t3_core::diff::{DiffSelection, Layout, TurnDiffSummary};
 use t3_core::right_panel::{RightPanels, Surface, SurfaceKind, decode_lenient_map};
 
 use crate::app_state::{AppEvent, AppState};
 
+/// The diff layout and file tree, which every environment shares.
 const STORE: &str = "panels";
 
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Thread-keyed panel state is per environment, as the web keys it by `scopedThreadKey`: a tab
+/// saved for one server's thread never acts on another's.
+fn environment_store(environment: &str) -> String {
+    format!("panels-{environment}")
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct PanelState {
     pub panels: RightPanels,
     /// `t3code:diff-panel-state:v1` `byThreadKey`.
@@ -27,21 +33,32 @@ pub struct PanelState {
     pub diff_file_tree_open: bool,
     /// The thread whose diff was opened by an explicit request (a turn's "files changed"), so
     /// opening it keeps that selection instead of resetting to the branch scope.
-    #[serde(skip)]
     explicit_diff_open: Option<String>,
+    /// The saved environment these threads belong to.
+    environment: Option<String>,
 }
 
 impl PanelState {
     /// Each key decodes on its own: a corrupt entry falls back to its default and the rest load.
-    pub fn load() -> PanelState {
-        let Some(value) = store::load_ui_state(STORE) else { return PanelState::default() };
+    pub fn load(environment: Option<&str>) -> PanelState {
+        let shared = store::load_ui_state(STORE);
+        let scoped = environment.and_then(|environment| store::load_ui_state(&environment_store(environment)));
         PanelState {
-            panels: value.get("panels").map(RightPanels::from_value).unwrap_or_default(),
-            diff_selections: decode_lenient_map(value.get("diffSelections")),
-            branch_base_refs: decode_lenient_map(value.get("branchBaseRefs")),
-            diff_layout: value.get("diffLayout").and_then(|layout| serde_json::from_value(layout.clone()).ok()).unwrap_or_default(),
-            diff_file_tree_open: value.get("diffFileTreeOpen").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            panels: scoped.as_ref().and_then(|value| value.get("panels")).map(RightPanels::from_value).unwrap_or_default(),
+            diff_selections: decode_lenient_map(scoped.as_ref().and_then(|value| value.get("diffSelections"))),
+            branch_base_refs: decode_lenient_map(scoped.as_ref().and_then(|value| value.get("branchBaseRefs"))),
+            diff_layout: shared.as_ref().and_then(|value| value.get("diffLayout")).and_then(|layout| serde_json::from_value(layout.clone()).ok()).unwrap_or_default(),
+            diff_file_tree_open: shared.as_ref().and_then(|value| value.get("diffFileTreeOpen")).and_then(serde_json::Value::as_bool).unwrap_or(false),
             explicit_diff_open: None,
+            environment: environment.map(str::to_owned),
+        }
+    }
+
+    fn save(&self) {
+        store::save_ui_state(STORE, &json!({ "diffLayout": self.diff_layout, "diffFileTreeOpen": self.diff_file_tree_open }));
+        if let Some(environment) = &self.environment {
+            let scoped = json!({ "panels": self.panels, "diffSelections": self.diff_selections, "branchBaseRefs": self.branch_base_refs });
+            store::save_ui_state(&environment_store(environment), &scoped);
         }
     }
 
@@ -79,7 +96,7 @@ impl AppState {
     pub(crate) fn save_panels(&mut self, cx: &mut Context<Self>) {
         self.sync_side_threads(cx);
         cx.emit(AppEvent::RightPanel);
-        store::save_ui_state(STORE, &self.panels);
+        self.panels.save();
     }
 
     pub(crate) fn mutate_panels(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PanelState, &str) -> bool) {

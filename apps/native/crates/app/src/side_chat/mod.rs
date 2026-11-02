@@ -85,11 +85,14 @@ impl AppState {
     }
 
     /// The side threads the open thread needs: its showing side chat tab and the children that
-    /// ask for an approval.
+    /// ask for an approval. A side chat the shell does not list (deleted, or not yet loaded) has
+    /// no stream, as `SideChatPane` reads no projection without a shell.
     fn wanted_side_threads(&self) -> Vec<String> {
         let Some(selected) = self.selected_thread.as_deref() else { return Vec::new() };
         let mut wanted: Vec<String> = Vec::new();
-        if let Some(id) = self.panels.panels.active_surface(selected).and_then(Surface::side_chat_thread) {
+        if let Some(id) = self.panels.panels.active_surface(selected).and_then(Surface::side_chat_thread)
+            && self.thread_shell(id).is_some()
+        {
             wanted.push(id.to_owned());
         }
         if let Some(snapshot) = &self.shell.snapshot {
@@ -197,7 +200,11 @@ impl AppState {
         match prompt {
             Some(text) => {
                 let command = side_chat::first_message_command(&uuid_v4(), &target, &uuid_v4(), &text);
+                let environment = self.environments.active.clone();
                 self.dispatch_then(command, None, cx, move |state, ok, cx| {
+                    if state.environments.active != environment {
+                        return;
+                    }
                     if ok {
                         state.show_side_chat_tab(&parent, &target, cx);
                     } else {

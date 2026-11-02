@@ -103,7 +103,7 @@ impl AppState {
             server_config: ServerConfigState::default(),
             client_settings: ClientSettings::from_json(&store::load_client_settings().unwrap_or_default()),
             draft_project: None,
-            panels: crate::right_panel::PanelState::load(),
+            panels: Default::default(),
             pull_requests_open: false,
             restore_thread: store::load_last_thread(),
             omitted: Default::default(),
@@ -141,6 +141,8 @@ impl AppState {
         self.select_when_listed = None;
         self.restore_thread = None;
         self.thread = ThreadState::default();
+        // Side subscriptions and a side chat start (with its timeout) belong to this environment.
+        self.side_threads = Default::default();
         self.server_config = ServerConfigState::default();
         self.draft_project = None;
         self.pull_requests_open = false;
@@ -154,6 +156,8 @@ impl AppState {
     pub(crate) fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
         let (client, mut events) = t3_client::supervisor::start(&self.runtime, credentials);
         self.client = Some(client);
+        self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
+        cx.emit(AppEvent::RightPanel);
         self.set_phase(Phase::Online(ConnectionStatus::Connecting), cx);
         self._pump = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = events.recv().await {
@@ -446,17 +450,24 @@ impl AppState {
         self.stop_thread(&thread_id, cx);
     }
 
-    /// `stop_selected_thread` for any thread with a loaded detail, such as a side chat.
+    /// `stop_selected_thread` for any thread, such as a side chat.
     pub fn stop_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let thread_id = thread_id.to_owned();
+        if let Some(command) = self.stop_command(thread_id) {
+            self.dispatch(command, cx);
+        }
+    }
+
+    /// What `interruptThreadTurn` sends to stop `thread_id`; a thread whose detail is not loaded
+    /// here falls back to its shell's active run on servers without `thread.stop`.
+    pub(crate) fn stop_command(&self, thread_id: &str) -> Option<Value> {
         let thread_stop = self.server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.thread_stop == Some(true));
-        let projection = self.thread_state(&thread_id).projection.as_ref().filter(|projection| projection.thread.id == thread_id);
-        let command = match workflows::stop_target(projection, thread_stop) {
-            StopTarget::Thread => commands::stop_thread(&uuid_v4(), &thread_id),
-            StopTarget::Run(run_id) => commands::interrupt_run(&uuid_v4(), &thread_id, &run_id),
-            StopTarget::Nothing => return,
-        };
-        self.dispatch(command, cx);
+        let projection = self.thread_state(thread_id).projection.as_ref().filter(|projection| projection.thread.id == thread_id);
+        let active_run = self.thread_shell(thread_id).and_then(|thread| thread.active_run_id.as_deref());
+        match workflows::stop_target(projection, active_run, thread_stop) {
+            StopTarget::Thread => Some(commands::stop_thread(&uuid_v4(), thread_id)),
+            StopTarget::Run(run_id) => Some(commands::interrupt_run(&uuid_v4(), thread_id, &run_id)),
+            StopTarget::Nothing => None,
+        }
     }
 
     /// One unary RPC, run and decoded on the network runtime so large replies never parse on the

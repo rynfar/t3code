@@ -144,11 +144,12 @@ pub enum StopTarget {
     Nothing,
 }
 
-pub fn stop_target(projection: Option<&ThreadProjection>, thread_stop: bool) -> StopTarget {
+/// `active_run_id` is the shell's, for a thread whose detail is not loaded here.
+pub fn stop_target(projection: Option<&ThreadProjection>, active_run_id: Option<&str>, thread_stop: bool) -> StopTarget {
     if thread_stop {
         return StopTarget::Thread;
     }
-    let Some(projection) = projection else { return StopTarget::Nothing };
+    let Some(projection) = projection else { return active_run_id.map_or(StopTarget::Nothing, |run_id| StopTarget::Run(run_id.to_owned())) };
     let running = projection
         .runs
         .iter()

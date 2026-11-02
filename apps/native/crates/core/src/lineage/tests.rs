@@ -312,7 +312,7 @@ fn commands_carry_the_fields_the_server_reads() {
 }
 
 #[test]
-fn effort_reads_the_reported_selection_first_and_variant_falls_back_to_its_default() {
+fn effort_prefers_the_explicit_choice_and_never_shows_an_unstated_default() {
     let model: crate::server_config::ProviderModel = serde_json::from_value(json!({
         "slug": "gpt", "name": "GPT", "isCustom": false,
         "capabilities": {"optionDescriptors": [
@@ -325,9 +325,26 @@ fn effort_reads_the_reported_selection_first_and_variant_falls_back_to_its_defau
     let chosen = selection(json!([{"id": "reasoningEffort", "value": "low"}]));
     assert_eq!(effort_label(&chosen, Some(&model), None).as_deref(), Some("Low"));
     let reported = selection(json!([{"id": "reasoningEffort", "value": "high"}]));
-    assert_eq!(effort_label(&chosen, Some(&model), Some(&reported)).as_deref(), Some("High"));
+    assert_eq!(effort_label(&chosen, Some(&model), Some(&reported)).as_deref(), Some("Low"), "an explicit choice outranks the report");
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), Some(&reported)).as_deref(), Some("High"));
+    let other: crate::model::ModelSelection = serde_json::from_value(json!({"instanceId": "codex", "model": "other", "options": [{"id": "reasoningEffort", "value": "high"}]})).expect("selection");
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), Some(&other)), None, "a report for another model is ignored");
+    let default = selection(json!([{"id": "reasoningEffort", "value": "default"}]));
+    assert_eq!(effort_label(&selection(json!([])), Some(&model), Some(&default)).as_deref(), Some("Default"));
+    assert_eq!(effort_label(&selection(json!([{"id": "reasoningEffort", "value": "max"}])), Some(&model), None), None, "an unknown choice is not shown as the default");
     assert_eq!(effort_label(&selection(json!([])), Some(&model), None), None, "an unstated effort is not shown");
     assert_eq!(effort_label(&chosen, None, None), None);
+
+    let variant: crate::server_config::ProviderModel = serde_json::from_value(json!({
+        "slug": "gpt", "name": "GPT", "isCustom": false,
+        "capabilities": {"optionDescriptors": [
+            {"id": "variant", "label": "Reasoning", "type": "select", "options": [{"id": "none", "label": "None"}, {"id": "thinking", "label": "Thinking", "isDefault": true}]}
+        ]}
+    }))
+    .expect("model");
+    assert_eq!(effort_label(&selection(json!([])), Some(&variant), None).as_deref(), Some("Unknown"), "an unstated variant is not its default");
+    assert_eq!(effort_label(&selection(json!([{"id": "variant", "value": "none"}])), Some(&variant), None).as_deref(), Some("None"));
+    assert_eq!(effort_label(&selection(json!([{"id": "variant", "value": "gone"}])), Some(&variant), None).as_deref(), Some("Unknown"));
 }
 
 #[test]
@@ -342,12 +359,27 @@ fn labels_and_stop_rules_follow_the_relationships_panel() {
     assert_eq!(relationship_status_label(None), "Unknown");
 
     let agent = |extra: Value| decode_agents(vec![subagent("a", Some("r1"), "running", T, extra)]).remove(0);
-    assert!(agent(json!({"origin": "app_owned"})).can_stop());
-    assert!(!agent(json!({"origin": "app_owned", "startedAt": null})).can_stop(), "not started yet");
+    assert!(agent(json!({"origin": "app_owned"})).can_stop(None));
+    assert!(!agent(json!({"origin": "app_owned", "startedAt": null})).can_stop(None), "not started yet");
     let strong = json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}});
-    assert!(agent(strong.clone()).can_stop());
-    assert!(!agent(json!({"origin": "provider_native", "driver": "codex", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}})).can_stop());
-    assert!(!agent(json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "weak", "nativeId": "x"}})).can_stop());
+    assert!(agent(strong.clone()).can_stop(None));
+    assert!(!agent(json!({"origin": "provider_native", "driver": "codex", "nativeTaskRef": {"strength": "strong", "nativeId": "x"}})).can_stop(None));
+    assert!(!agent(json!({"origin": "provider_native", "driver": "claudeAgent", "nativeTaskRef": {"strength": "weak", "nativeId": "x"}})).can_stop(None));
     assert!(agent(merge(strong.clone(), json!({"workflow": {"phases": [], "agents": []}}))).can_stop_workflow());
-    assert!(!agent(strong).can_stop_workflow());
+    assert!(!agent(strong.clone()).can_stop_workflow());
+
+    // A finished task whose child thread runs again takes the child's run (`currentSubagent`).
+    let later = "2026-11-01T00:05:00.000Z";
+    let done = |extra: Value| decode_agents(vec![subagent("a", Some("r1"), "completed", T, merge(json!({"childThreadId": "kid", "completedAt": T}), extra))]).remove(0);
+    let resumed = child("kid", "t1", "subagent", "running", json!({"activityRunStatus": "running", "activityRunStartedAt": later, "latestRunRequestedAt": later}));
+    let app_owned = done(json!({"origin": "app_owned"}));
+    assert!(!app_owned.can_stop(None));
+    assert!(app_owned.can_stop(Some(&resumed)), "a resumed child keeps Stop");
+    let current = app_owned.current(Some(&resumed));
+    assert_eq!((current.status.as_str(), current.started_at.as_deref(), current.completed_at), ("running", Some(later), None));
+    let queued = child("kid", "t1", "subagent", "queued", json!({"latestRunRequestedAt": later}));
+    assert_eq!(app_owned.current(Some(&queued)).status, "pending");
+    let idle = child("kid", "t1", "subagent", "completed", json!({"latestRunRequestedAt": T}));
+    assert_eq!(app_owned.current(Some(&idle)), app_owned, "no newer run, no live run");
+    assert!(!done(strong).can_stop(Some(&resumed)), "a provider task's own status decides");
 }

@@ -74,7 +74,7 @@ pub fn relationships(state: &AppState, thread: &ThreadShell) -> Relationships {
             .unwrap_or_else(|| row.thread_id.clone());
         let stop = agent.and_then(|agent| match &workflow {
             Some(_) if agent.can_stop_workflow() => Some(StopAction::Workflow { thread_id: thread.id.clone(), subagent_id: agent.id.clone() }),
-            None if agent.can_stop() => Some(StopAction::Subagent { owner: thread.id.clone(), subagent_id: agent.id.clone() }),
+            None if agent.can_stop(node) => Some(StopAction::Subagent { owner: thread.id.clone(), subagent_id: agent.id.clone() }),
             _ => None,
         });
         LineageRow {
@@ -153,7 +153,9 @@ impl AppState {
                 if let Some(stop) = stop {
                     self.dispatch_then(stop, None, cx, |_, _, _| {});
                 }
-                self.dispatch_then(t3_core::commands::stop_thread(&uuid_v4(), &child), Some("Could not stop subagent"), cx, |_, _, _| {});
+                if let Some(stop_child) = self.stop_command(&child) {
+                    self.dispatch_then(stop_child, Some("Could not stop subagent"), cx, |_, _, _| {});
+                }
             }
             _ => {
                 if let Some(stop) = stop {

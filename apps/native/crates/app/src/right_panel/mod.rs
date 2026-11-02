@@ -68,8 +68,12 @@ impl RightPanelView {
         let pull_requests = cx.new(|cx| crate::pull_requests::ThreadPullRequestsPanel::new(state.clone(), cx));
         let files = cx.new(|cx| FilesPanel::new(state.clone(), window, cx));
         let subscription = cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {
-            AppEvent::RightPanel => cx.notify(),
+            AppEvent::RightPanel => {
+                this.prune_side_chats(cx);
+                cx.notify();
+            }
             AppEvent::Selection => {
+                this.prune_side_chats(cx);
                 // A pending width save belongs to the thread that was showing: flush it now.
                 let flush = this._save_width.take().is_some();
                 state.update(cx, |state, cx| {
@@ -97,9 +101,20 @@ impl RightPanelView {
         }));
     }
 
+    /// Drops the panes whose tab closed, or that belong to a thread no longer showing, with their
+    /// transcript caches and subscriptions.
+    fn prune_side_chats(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let open: Vec<String> = state
+            .selected_thread
+            .as_deref()
+            .map(|thread| state.panels.panels.panel(thread).surfaces.iter().filter_map(|surface| surface.side_chat_thread().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        self.side_chats.retain(|pane| open.iter().any(|id| id == pane.read(cx).thread_id()));
+    }
+
     /// The side chat's pane, kept while its tab stays open so its scroll and draft survive tab switches.
-    fn side_chat_pane(&mut self, thread_id: &str, panel: &t3_core::right_panel::ThreadPanel, window: &mut Window, cx: &mut Context<Self>) -> Entity<crate::side_chat::SideChatPane> {
-        self.side_chats.retain(|pane| panel.surfaces.iter().any(|surface| surface.side_chat_thread() == Some(pane.read(cx).thread_id())));
+    fn side_chat_pane(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<crate::side_chat::SideChatPane> {
         if let Some(pane) = self.side_chats.iter().find(|pane| pane.read(cx).thread_id() == thread_id) {
             return pane.clone();
         }
@@ -156,7 +171,7 @@ impl Render for RightPanelView {
             Some(SurfaceKind::Files | SurfaceKind::File { .. }) => {
                 self.files.clone().cached(StyleRefinement::default().size_full()).into_any_element()
             }
-            Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, &panel, window, cx).into_any_element(),
+            Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, window, cx).into_any_element(),
             None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
         };
         v_flex()
