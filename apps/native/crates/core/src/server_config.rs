@@ -367,6 +367,8 @@ pub struct ServerConfig {
     /// The shell can omit older settled threads; `getOlderSettledThreads` serves them.
     #[serde(default)]
     pub shell_older_settled: bool,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub available_editors: Vec<String>,
 }
 
 impl ServerConfig {

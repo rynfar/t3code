@@ -32,6 +32,8 @@ actions!(
         UndoThreadAction,
         CopyThreadReference,
         ToggleCommandPalette,
+        ToggleFilePicker,
+        ToggleProjectSearch,
         Unimplemented,
     ]
 );
@@ -55,6 +57,8 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "thread.undo" => Box::new(UndoThreadAction),
         "thread.copyReference" => Box::new(CopyThreadReference),
         "commandPalette.toggle" => Box::new(ToggleCommandPalette),
+        "filePicker.toggle" => Box::new(ToggleFilePicker),
+        "projectSearch.toggle" => Box::new(ToggleProjectSearch),
         "chat.new" => Box::new(crate::new_thread::NewThread),
         "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),

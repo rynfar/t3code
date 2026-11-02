@@ -42,6 +42,8 @@ pub enum AppEvent {
     Notice,
     /// Right panel tabs, visibility, width, or the diff selection changed.
     RightPanel,
+    /// A file was queued in `composer_mentions` for the composer.
+    ComposerMention,
 }
 
 pub struct AppState {
@@ -49,6 +51,7 @@ pub struct AppState {
     pub shell: ShellState,
     pub sidebar: SidebarController,
     pub toast: Option<Toast>,
+    pub composer_mentions: Vec<crate::project_files::ComposerMention>,
     pub(crate) toast_timer: Option<Task<()>>,
     pub selected_thread: Option<String>,
     pub thread: ThreadState,
@@ -80,6 +83,7 @@ impl AppState {
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
             toast: None,
+            composer_mentions: Vec::new(),
             toast_timer: None,
             selected_thread: None,
             thread: ThreadState::default(),
