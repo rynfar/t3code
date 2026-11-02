@@ -287,3 +287,5 @@ async fn report(events: &Events, context: &str, message: String) {
     let _ = events.send(ClientEvent::StreamError { context: context.to_owned(), message }).await;
 }
 
+#[cfg(test)]
+mod tests;
