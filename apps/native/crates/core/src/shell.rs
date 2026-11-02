@@ -112,6 +112,9 @@ pub struct ThreadShell {
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub lineage: Lineage,
+    /// `{ type: "run", threadId, runId }` for a fork from a run; other sources name no thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<serde_json::Value>,
     #[serde(default)]
     pub creation_source: Option<String>,
     #[serde(default)]

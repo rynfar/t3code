@@ -29,6 +29,14 @@ const SURFACE_ACTIONS: &[SurfaceAction] = &[
 /// Opens the launcher entry named `label` (case-insensitive), as clicking it would.
 #[cfg(feature = "snapshot")]
 pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<AppState>) -> bool {
+    // An existing side chat of the open thread, by `side-chat:<thread>`; starting one would write.
+    if let Some(thread_id) = label.strip_prefix("side-chat:") {
+        let is_side_chat = state.selected_thread.as_deref().zip(state.thread_shell(thread_id)).is_some_and(|(parent, thread)| t3_core::side_chat::is_side_chat_of(thread, parent));
+        if is_side_chat {
+            state.open_related_thread(thread_id, cx);
+        }
+        return is_side_chat;
+    }
     let Some(action) = SURFACE_ACTIONS.iter().find(|action| action.label.eq_ignore_ascii_case(label)) else { return false };
     (action.open)(state, cx);
     true
@@ -40,7 +48,18 @@ fn surface_icon(surface: &Surface) -> Icon {
         SurfaceKind::PullRequests => Icon::Link2,
         SurfaceKind::Files => Icon::Files,
         SurfaceKind::File { .. } => Icon::File,
+        SurfaceKind::SideChat { .. } => Icon::MessagesSquare,
     }
+}
+
+/// The launcher's "Side chat" entry while the open thread offers side chats, with why it is
+/// unavailable (`SURFACE_UNAVAILABLE_HINTS.sideChat` when nothing more specific applies).
+fn side_chat_entry(state: &AppState) -> Option<Option<&'static str>> {
+    state.side_chats_offered().then(|| state.side_chat_disabled_reason().or(state.side_threads.is_starting().then_some("Starting a side chat…")))
+}
+
+fn open_side_chat(state: &mut AppState, cx: &mut gpui::Context<AppState>) {
+    state.open_side_chat(None, cx);
 }
 
 pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: bool, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -55,6 +74,7 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
         })
         .collect();
     let add_state = state.clone();
+    let side_chat = side_chat_entry(state.read(cx));
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
         .flex_none()
@@ -76,14 +96,21 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
                         .icon(Icon::Plus)
                         .tooltip("Add panel surface")
                         .dropdown_menu(move |menu, _, _| {
-                            SURFACE_ACTIONS.iter().fold(menu, |menu, action| {
+                            let menu = SURFACE_ACTIONS.iter().fold(menu, |menu, action| {
                                 let state = add_state.clone();
                                 let open = action.open;
                                 menu.item(
                                     PopupMenuItem::new(action.label)
                                         .on_click(move |_, _, cx| state.update(cx, open)),
                                 )
-                            })
+                            });
+                            match side_chat {
+                                Some(reason) => {
+                                    let state = add_state.clone();
+                                    menu.item(PopupMenuItem::new("Side chat").disabled(reason.is_some()).on_click(move |_, _, cx| state.update(cx, open_side_chat)))
+                                }
+                                None => menu,
+                            }
                         }),
                 ),
         )
@@ -93,7 +120,13 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
 
 fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
-    let title: SharedString = surface.title().into();
+    let side_chat = surface.side_chat_thread().and_then(|id| state.read(cx).thread_shell(id));
+    let title: SharedString = side_chat.map_or_else(|| surface.title().into(), |thread| thread.title.clone().into());
+    // Static dot: a side chat tab can stay open for a whole run.
+    let dot = side_chat.and_then(t3_core::side_chat::TabState::of).map(|tab_state| match tab_state {
+        t3_core::side_chat::TabState::Running => hsla(p.muted_foreground),
+        _ => hsla(p.info),
+    });
     let id = surface.id.clone();
     let file_path = match &surface.kind {
         SurfaceKind::File { relative_path, .. } => Some(relative_path.clone()),
@@ -165,7 +198,8 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
                         .text_color(hsla(p.foreground))
                         .invisible()
                         .group_hover(group, |style| style.visible()),
-                ),
+                )
+                .children(dot.map(|dot| div().absolute().top(px(0.)).right(px(0.)).size(px(6.)).rounded_full().bg(dot))),
         )
         .child(div().min_w_0().truncate().child(title))
         .context_menu(move |menu, _, _| {
@@ -194,7 +228,8 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
 /// `RightPanelEmptyState`: shown while the panel has no tab.
 pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
-    let rows: Vec<_> = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
+    let side_chat = side_chat_entry(state.read(cx));
+    let mut rows: Vec<_> = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
         let state = state.clone();
         let open = action.open;
         let row_id = ElementId::from(("surface-launcher", index));
@@ -213,6 +248,30 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
             .child(div().flex_1().min_w_0().truncate().child(action.label))
             .child(kbd(action.shortcut, cx))
     }).collect();
+    if let Some(reason) = side_chat {
+        let row_id = ElementId::from(("surface-launcher", SURFACE_ACTIONS.len()));
+        let open_state = state.clone();
+        rows.push(
+            focusable(h_flex().id(row_id.clone()), row_id, reason.is_none(), window, cx)
+                .h(px(32.))
+                .w_full()
+                .px(px(10.))
+                .gap(px(10.))
+                .rounded(px(8.))
+                .text_sm()
+                .text_color(hsla(p.foreground))
+                .when(reason.is_some(), |this| this.opacity(0.64))
+                .when(reason.is_none(), |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
+                        .on_click(move |_, _, cx| open_state.update(cx, open_side_chat))
+                })
+                .when_some(reason, |this, reason| this.tooltip(move |window, cx| super::tooltip_view(reason.into(), window, cx)))
+                .child(Icon::MessagesSquare.svg().size(px(16.)).text_color(hsla(p.foreground)))
+                .child(div().flex_1().min_w_0().truncate().child("Side chat"))
+                .child(kbd("S", cx)),
+        );
+    }
     div()
         .flex_1()
         .flex()

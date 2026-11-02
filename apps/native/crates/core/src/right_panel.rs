@@ -36,6 +36,8 @@ pub enum SurfaceKind {
         #[serde(default)]
         reveal_request_id: u64,
     },
+    #[serde(rename_all = "camelCase")]
+    SideChat { thread_id: String },
 }
 
 /// `normalizeRevealLine`: a positive whole line, anything else none.
@@ -64,6 +66,11 @@ impl Surface {
         }
     }
 
+    /// `side-chat:<thread>`, as `openSideChat` keys it.
+    pub fn side_chat(thread_id: &str) -> Surface {
+        Surface { id: format!("side-chat:{thread_id}"), kind: SurfaceKind::SideChat { thread_id: thread_id.to_owned() } }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -78,6 +85,14 @@ impl Surface {
                 let start = relative_path.rfind(['/', '\\']).map_or(0, |index| index + 1);
                 relative_path[start..].to_owned()
             }
+            SurfaceKind::SideChat { .. } => "Side chat".to_owned(),
+        }
+    }
+
+    pub fn side_chat_thread(&self) -> Option<&str> {
+        match &self.kind {
+            SurfaceKind::SideChat { thread_id } => Some(thread_id),
+            _ => None,
         }
     }
 }
@@ -450,7 +465,8 @@ impl RightPanels {
         let mut index = 0;
         while index < self.closed.len() {
             let entry = &self.closed[index];
-            if !thread_exists(&entry.thread_id) {
+            // A closed side chat tab the server since deleted is skipped like a deleted thread.
+            if !thread_exists(&entry.thread_id) || entry.surface.side_chat_thread().is_some_and(|id| !thread_exists(id)) {
                 index += 1;
                 continue;
             }

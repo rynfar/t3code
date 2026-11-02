@@ -1,6 +1,6 @@
 //! The card's sections (`ThreadDetailsPanel.tsx`): Workspace (environment and worktree, open in
 //! editor, project scripts), Version Control (branch and pull request, Git actions, changes)
-//! and Lineage (`ThreadRelationshipsControl.tsx`, parent and child threads from the shell).
+//! Lineage and Side chats (`ThreadRelationshipsControl.tsx`, rows from `crate::lineage`).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -15,6 +15,7 @@ use t3_core::vcs::{self, editor_label, editor_options};
 use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, split_row};
 use super::{Details, project_scripts, run_button_script};
 use crate::app_state::AppState;
+use crate::lineage::{LineageRow, MergeBack, Relationships, StopAction};
 use crate::git::{self, BranchPicker, GitDialogs, GitStore};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -249,70 +250,61 @@ pub fn version_control(ctx: &Ctx, separated: bool, cx: &App) -> Option<AnyElemen
     (!rows.is_empty()).then(|| section(separated, None, cx).child(v_flex().children(rows)).into_any_element())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineageKind {
-    Parent { agent: bool },
-    Fork,
-    Subagent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageRow {
-    pub thread_id: String,
-    pub title: String,
-    pub kind: LineageKind,
-}
-
-/// The thread's parent, then the forks and subagents that name it as their parent. Side chats
-/// have their own section on the web and are left out here.
-pub fn lineage_rows(state: &AppState, thread: &ThreadShell) -> Vec<LineageRow> {
-    let Some(snapshot) = state.shell.snapshot.as_ref() else { return Vec::new() };
-    let find = |id: &str| snapshot.threads.iter().chain(snapshot.archived_threads.iter()).find(|candidate| candidate.id == id);
-    let mut rows = Vec::new();
-    if let Some(parent_id) = thread.lineage.parent_thread_id.as_deref() {
-        let title = find(parent_id).map_or_else(|| parent_id.to_owned(), |parent| parent.title.clone());
-        rows.push(LineageRow { thread_id: parent_id.to_owned(), title, kind: LineageKind::Parent { agent: thread.lineage.relationship_to_parent.as_deref() == Some("subagent") } });
-    }
-    let children = snapshot.threads.iter().filter(|child| child.lineage.parent_thread_id.as_deref() == Some(thread.id.as_str()) && child.lineage.side_chat != Some(true));
-    let (subagents, forks): (Vec<&ThreadShell>, Vec<&ThreadShell>) = children.partition(|child| child.lineage.relationship_to_parent.as_deref() == Some("subagent"));
-    rows.extend(forks.into_iter().map(|child| LineageRow { thread_id: child.id.clone(), title: child.title.clone(), kind: LineageKind::Fork }));
-    rows.extend(subagents.into_iter().map(|child| LineageRow { thread_id: child.id.clone(), title: child.title.clone(), kind: LineageKind::Subagent }));
-    rows
-}
-
-/// `relationshipLabel` and the row icon.
-fn lineage_presentation(kind: LineageKind) -> (Icon, &'static str) {
-    match kind {
-        LineageKind::Parent { agent: true } => (Icon::CornerLeftUp, "Parent agent"),
-        LineageKind::Parent { agent: false } => (Icon::CornerLeftUp, "Parent thread"),
-        LineageKind::Fork => (Icon::GitFork, "Fork"),
-        LineageKind::Subagent => (Icon::Bot, "Subagent"),
-    }
-}
-
-pub fn lineage(ctx: &Ctx, shown: usize, separated: bool, on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> Option<AnyElement> {
-    if !ctx.details.read(cx).items.shows("lineage") {
-        return None;
-    }
-    let app = ctx.state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
-    let rows = lineage_rows(app, thread);
-    if rows.is_empty() {
-        return None;
-    }
+/// One related thread: opens it (a side chat in its tab), with Merge back on the fork's source
+/// and Stop on a subagent or workflow that can still be stopped.
+fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, cx: &App) -> AnyElement {
     let p = palette(cx);
-    let hidden = rows.len().saturating_sub(shown);
-    let rendered = rows.into_iter().take(shown).map(|row| {
-        let (icon, relationship) = lineage_presentation(row.kind);
+    let (state, id) = (ctx.state.clone(), row.thread_id.clone());
+    let primary = Row::new(SharedString::from(format!("lineage-{}", row.thread_id)), row.title.clone())
+        .icon(row.icon)
+        .trailing(div().flex_none().text_size(px(11.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(row.status))
+        .tooltip(format!("{}\n{} · Open thread", row.title, row.relationship))
+        .on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_related_thread(&id, cx)));
+    if let (true, Some(merge)) = (row.merge_target, merge) {
         let state = ctx.state.clone();
-        let id = row.thread_id.clone();
-        Row::new(SharedString::from(format!("lineage-{}", row.thread_id)), row.title.clone())
-            .icon(icon)
-            .trailing(div().flex_none().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(relationship))
-            .tooltip(format!("{}\nOpen thread", row.title))
-            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.select_thread(&id, cx)))
-    });
+        let tooltip = match (&merge.target_title, merge.ready) {
+            (_, false) => "Complete a run in this fork before merging it back".to_owned(),
+            (Some(title), true) => format!("Merge this conversation back into {title}"),
+            (None, true) => "Merge this conversation back into its source".to_owned(),
+        };
+        let button = crate::right_panel::Button::new(SharedString::from(format!("lineage-merge-{}", row.thread_id)))
+            .icon(Icon::GitMerge)
+            .icon_size(12.)
+            .disabled(!merge.ready)
+            .tooltip(tooltip)
+            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.merge_back_selected(cx)));
+        return split_row(format!("lineage-split-{}", row.thread_id), primary, button, cx).into_any_element();
+    }
+    if let Some(action) = row.stop.clone() {
+        let state = ctx.state.clone();
+        let label = if matches!(action, StopAction::Workflow { .. }) { "Stop workflow" } else { "Stop subagent" };
+        let button = crate::right_panel::Button::new(SharedString::from(format!("lineage-stop-{}", row.thread_id)))
+            .icon(Icon::Square)
+            .icon_size(12.)
+            .tooltip(label)
+            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.run_stop_action(&action, cx)));
+        return split_row(format!("lineage-split-{}", row.thread_id), primary, button, cx).into_any_element();
+    }
+    primary.into_any_element()
+}
+
+pub fn lineage(ctx: &Ctx, rows: &Relationships, shown: usize, separated: bool, on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> Option<AnyElement> {
+    if !ctx.details.read(cx).items.shows("lineage") || rows.lineage.is_empty() {
+        return None;
+    }
+    let hidden = rows.lineage.len().saturating_sub(shown);
+    let rendered: Vec<AnyElement> = rows.lineage.iter().take(shown).map(|row| relationship_row(ctx, row, rows.merge.as_ref(), cx)).collect();
     let list = v_flex().id("details-lineage").max_h(px(216.)).overflow_y_scroll().children(rendered);
     let more = (hidden > 0).then(|| Row::new("lineage-more", format!("Show {} more", hidden.min(LINEAGE_PAGE))).icon(Icon::Plus).on_click(on_more));
     Some(section(separated, Some("Lineage".into()), cx).child(list).children(more).into_any_element())
+}
+
+/// The thread's side chats, which open in their right panel tab.
+pub fn side_chats(ctx: &Ctx, rows: &Relationships, separated: bool, cx: &App) -> Option<AnyElement> {
+    if !ctx.details.read(cx).items.shows("sideChats") || rows.side_chats.is_empty() {
+        return None;
+    }
+    let rendered: Vec<AnyElement> = rows.side_chats.iter().map(|row| relationship_row(ctx, row, None, cx)).collect();
+    let list = v_flex().id("details-side-chats").max_h(px(216.)).overflow_y_scroll().children(rendered);
+    Some(section(separated, Some("Side chats".into()), cx).child(list).into_any_element())
 }

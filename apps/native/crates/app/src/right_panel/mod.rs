@@ -56,6 +56,8 @@ pub struct RightPanelView {
     diff: Entity<DiffPanel>,
     pull_requests: Entity<crate::pull_requests::ThreadPullRequestsPanel>,
     files: Entity<FilesPanel>,
+    /// One pane per open side chat tab of the showing thread.
+    side_chats: Vec<Entity<crate::side_chat::SideChatPane>>,
     _save_width: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -80,7 +82,7 @@ impl RightPanelView {
             }
             _ => {}
         });
-        RightPanelView { state, diff, pull_requests, files, _save_width: None, _subscription: subscription }
+        RightPanelView { state, diff, pull_requests, files, side_chats: Vec::new(), _save_width: None, _subscription: subscription }
     }
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
@@ -93,6 +95,17 @@ impl RightPanelView {
             cx.background_executor().timer(Duration::from_millis(400)).await;
             let _ = this.update(cx, |this, cx| this.state.update(cx, |state, cx| state.set_right_panel_width(width, true, cx)));
         }));
+    }
+
+    /// The side chat's pane, kept while its tab stays open so its scroll and draft survive tab switches.
+    fn side_chat_pane(&mut self, thread_id: &str, panel: &t3_core::right_panel::ThreadPanel, window: &mut Window, cx: &mut Context<Self>) -> Entity<crate::side_chat::SideChatPane> {
+        self.side_chats.retain(|pane| panel.surfaces.iter().any(|surface| surface.side_chat_thread() == Some(pane.read(cx).thread_id())));
+        if let Some(pane) = self.side_chats.iter().find(|pane| pane.read(cx).thread_id() == thread_id) {
+            return pane.clone();
+        }
+        let pane = cx.new(|cx| crate::side_chat::SideChatPane::new(self.state.clone(), thread_id.to_owned(), window, cx));
+        self.side_chats.push(pane.clone());
+        pane
     }
 
     fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -143,6 +156,7 @@ impl Render for RightPanelView {
             Some(SurfaceKind::Files | SurfaceKind::File { .. }) => {
                 self.files.clone().cached(StyleRefinement::default().size_full()).into_any_element()
             }
+            Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, &panel, window, cx).into_any_element(),
             None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
         };
         v_flex()

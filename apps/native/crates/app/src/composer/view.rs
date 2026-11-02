@@ -174,7 +174,13 @@ impl Composer {
         let running = self.snapshot.running;
         let stop = || {
             RoundButton::new("stop", RoundKind::Stop, "Interrupt")
-                .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.stop_selected_thread(cx))))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let fixed = this.fixed.clone();
+                    this.state.update(cx, |state, cx| match fixed {
+                        Some(id) => state.stop_thread(&id, cx),
+                        None => state.stop_selected_thread(cx),
+                    })
+                }))
         };
         if let (Some(input), Some(progress)) = (self.active_input(), self.progress()) {
             let responding = self.responding.contains(&input.request_id) || !input.can_respond();
@@ -250,7 +256,8 @@ impl Render for Composer {
         let surface = hsla(if dark { p.surface_raised } else { p.card });
         let outline = if dark { gpui::white().opacity(0.05) } else { gpui::black().opacity(0.08) };
         let show_permissions = resolved.runtime_mode != resolved.default_runtime_mode;
-        div().w_full().flex().justify_center().px(px(48.)).pb(px(16.)).pt(px(8.)).child(
+        let gutter = if self.fixed.is_some() { 12. } else { 48. };
+        div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
                 .key_context("Composer")
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
@@ -273,7 +280,7 @@ impl Render for Composer {
                 .children(error.map(|error| {
                     div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
-                .child(self.limit_recovery.clone())
+                .when(self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
                 .children(question.as_ref().map(|input| self.render_question(input, cx)))
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))

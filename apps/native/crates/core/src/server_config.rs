@@ -253,6 +253,8 @@ pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub thread_force_stop: Option<bool>,
     #[serde(default)]
+    pub side_chats: Option<bool>,
+    #[serde(default)]
     pub thread_auto_settle_opt_out: Option<bool>,
     #[serde(default)]
     pub project_organization: Option<bool>,

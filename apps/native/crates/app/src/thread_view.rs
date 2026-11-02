@@ -61,13 +61,26 @@ pub struct ThreadView {
     rewind: rewind::RewindUi,
     media: Entity<crate::media::MediaCache>,
     viewer: Entity<crate::media::MediaViewer>,
+    /// A side chat's own thread, shown in the right panel; `None` follows the selection.
+    fixed: Option<String>,
     _subscription: Subscription,
 }
 
 impl ThreadView {
-    pub fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_for(state, None, window, cx)
+    }
+
+    /// The transcript of `thread_id` whatever is selected, for a side chat tab.
+    pub fn embedded(state: Entity<AppState>, thread_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new_for(state, Some(thread_id), window, cx);
+        view.sync(cx);
+        view
+    }
+
+    fn new_for(state: Entity<AppState>, fixed: Option<String>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
-            AppEvent::Thread | AppEvent::Selection => this.sync(cx),
+            AppEvent::Thread | AppEvent::Selection | AppEvent::SideThread => this.sync(cx),
             AppEvent::History => this.sync_history(cx),
             AppEvent::Shell | AppEvent::ServerConfig => this.sync_status(cx),
             _ => {}
@@ -102,6 +115,7 @@ impl ThreadView {
             rewind: rewind::RewindUi::default(),
             media,
             viewer,
+            fixed,
             _subscription: subscription,
         }
     }
@@ -110,10 +124,17 @@ impl ThreadView {
         usize::from(self.history.is_some())
     }
 
+    pub(crate) fn thread_state<'a>(&self, state: &'a AppState) -> &'a t3_core::thread::ThreadState {
+        match &self.fixed {
+            Some(id) => state.thread_state(id),
+            None => &state.thread,
+        }
+    }
+
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let selected = state.selected_thread.clone();
-        if selected == self.thread_id && state.thread.is_merging_history() {
+        let selected = self.fixed.clone().or_else(|| state.selected_thread.clone());
+        if selected == self.thread_id && self.thread_state(state).is_merging_history() {
             return;
         }
         if selected != self.thread_id {
@@ -134,7 +155,7 @@ impl ThreadView {
             self.list.reset(0);
         }
         let state = self.state.read(cx);
-        match state.thread.projection.as_ref() {
+        match self.thread_state(state).projection.as_ref() {
             Some(projection) => {
                 update_entries(&mut self.entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
                 self.activity = derive_activity(projection);
@@ -160,7 +181,7 @@ impl ThreadView {
 
     /// The control above the first row: shown, hidden, or relabelled without touching rows.
     fn sync_history(&mut self, cx: &mut Context<Self>) {
-        let next = self.state.read(cx).thread.history_control();
+        let next = self.thread_state(self.state.read(cx)).history_control();
         if next == self.history {
             return;
         }
@@ -175,7 +196,10 @@ impl ThreadView {
     }
 
     pub fn load_earlier(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| state.load_older_history(cx));
+        match self.fixed.clone() {
+            Some(id) => self.state.update(cx, |state, cx| state.load_older_side_history(&id, cx)),
+            None => self.state.update(cx, |state, cx| state.load_older_history(cx)),
+        }
     }
 
     fn rederive(&mut self, cx: &mut Context<Self>) {
@@ -321,14 +345,14 @@ impl ThreadView {
     }
 
     pub fn open_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| state.select_thread(thread_id, cx));
+        self.state.update(cx, |state, cx| state.open_related_thread(thread_id, cx));
     }
 
     /// Re-derives the changed-files cards when the checkpoints or messages change, remeasuring
     /// only the assistant rows whose card appeared, changed or went.
     fn sync_turn_diffs(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let Some(projection) = state.thread.projection.as_ref() else { return };
+        let Some(projection) = self.thread_state(state).projection.as_ref() else { return };
         if self.turn_diff_source.as_ref().is_some_and(|(messages, checkpoints)| *messages == projection.messages.len() && *checkpoints == projection.checkpoints) {
             return;
         }
@@ -379,6 +403,10 @@ impl ThreadView {
     }
 
     pub fn open_turn_diff(&mut self, run_id: &str, file_path: Option<&str>, cx: &mut Context<Self>) {
+        // The diff panel shows the open thread's checkpoints, not a side chat's.
+        if self.fixed.is_some() {
+            return;
+        }
         self.state.update(cx, |state, cx| state.open_turn_diff(run_id, file_path, cx));
     }
 
@@ -428,6 +456,11 @@ impl ThreadView {
         render(&env, &mut self.markdown)
     }
 
+    /// The transcript's side padding: the narrow-window gutter inside the right panel.
+    fn gutter(&self) -> f32 {
+        if self.fixed.is_some() { 12. } else { 48. }
+    }
+
     pub fn render_group_member(&mut self, entry: &Arc<WorkLogEntry>, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.with_env(|env, markdown| render_group_member(entry, env, markdown, cx))
     }
@@ -442,12 +475,12 @@ fn toggle(set: &mut std::collections::HashSet<String>, key: &str) -> bool {
     true
 }
 
-fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>) -> gpui::AnyElement {
+fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>, gutter: f32) -> gpui::AnyElement {
     div()
         .w_full()
         .flex()
         .justify_center()
-        .px(crate::theme::rem(48.))
+        .px(crate::theme::rem(gutter))
         .when(first, |this| this.pt(crate::theme::rem(16.)))
         .child(div().w_full().min_w_0().when_some(max_width, |this, width| this.max_w(width)).child(content))
         .into_any_element()
@@ -455,7 +488,7 @@ fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>) -
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let thread = &self.state.read(cx).thread;
+        let thread = self.thread_state(self.state.read(cx));
         let loading = thread.projection.is_none() && !thread.is_merging_history();
         let muted = hsla(palette(cx).muted_foreground);
         if loading {
@@ -497,11 +530,13 @@ impl Render for ThreadView {
                         Some(control) => history_control(control.has_more, control.loading, control.error.as_deref(), cx),
                         None => div().into_any_element(),
                     };
-                    return lane(content, true, crate::theme::chat_max_width(cx));
+                    return lane(content, true, crate::theme::chat_max_width(cx), this.gutter());
                 }
-                let Some(row) = this.rows.get(ix - offset).cloned() else { return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx)) };
+                let Some(row) = this.rows.get(ix - offset).cloned() else {
+                    return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx), this.gutter());
+                };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
-                lane(content, ix == 0, crate::theme::chat_max_width(cx))
+                lane(content, ix == 0, crate::theme::chat_max_width(cx), this.gutter())
             }),
         )
         .size_full();

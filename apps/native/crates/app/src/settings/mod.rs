@@ -10,7 +10,7 @@ mod archive;
 pub(crate) mod controls;
 mod general;
 mod keybindings;
-mod store;
+pub(crate) mod store;
 mod threads;
 
 use gpui::{

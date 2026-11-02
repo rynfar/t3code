@@ -13,6 +13,7 @@ pub const ITEMS: &[(&str, &str, bool)] = &[
     ("gitActions", "Git actions", true),
     ("changes", "Changes", true),
     ("lineage", "Lineage", true),
+    ("sideChats", "Side chats", true),
 ];
 
 fn default_visible(id: &str) -> bool {
