@@ -29,6 +29,24 @@ pub fn load_client_settings() -> Option<String> {
     std::fs::read_to_string(base()?.join("settings.json")).ok()
 }
 
+/// UI state the web keeps in `localStorage` (panel tabs and widths, diff selections), one JSON
+/// file per store. A missing or unreadable file reads as `None`.
+pub fn load_ui_state<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
+    let text = std::fs::read_to_string(base()?.join(format!("{name}.json"))).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Written to a temporary file and renamed, so a crash never leaves half a file.
+pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
+    let Some(base) = base() else { return };
+    let Ok(text) = serde_json::to_string(value) else { return };
+    let _ = std::fs::create_dir_all(&base);
+    let temporary = base.join(format!(".{name}.json.tmp"));
+    if std::fs::write(&temporary, text).is_ok() {
+        let _ = std::fs::rename(&temporary, base.join(format!("{name}.json")));
+    }
+}
+
 pub fn load() -> Option<Credentials> {
     let text = std::fs::read_to_string(path()?).ok()?;
     serde_json::from_str(&text).ok()
