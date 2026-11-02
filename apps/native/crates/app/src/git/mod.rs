@@ -97,6 +97,8 @@ pub struct GitStore {
     status_feed: Option<Feed>,
     terminal_feed: Option<Feed>,
     grants_task: Option<Task<()>>,
+    /// The connection the feeds and the target's reads belong to.
+    connection: Option<u64>,
     refs_task: Option<Task<()>>,
     success_timer: Option<Task<()>>,
     tick: Option<Task<()>>,
@@ -164,6 +166,7 @@ impl GitStore {
             status_feed: None,
             terminal_feed: None,
             grants_task: None,
+            connection: None,
             refs_task: None,
             success_timer: None,
             tick: None,
@@ -194,12 +197,23 @@ impl GitStore {
 
     fn sync_target(&mut self, cx: &mut Context<Self>) {
         let next = Self::resolve_target(self.state.read(cx));
-        let connected = self.state.read(cx).client_handle().is_some();
-        if !connected {
+        let current = self.state.read(cx).connection_id();
+        let connected = current.is_some();
+        if current != self.connection {
+            // Another environment: nothing read from the last one applies, and its feeds hold
+            // its client open.
+            self.connection = current;
             self.terminal_feed = None;
             self.status_feed = None;
             self.grants_task = None;
-        } else {
+            self.grants = None;
+            self.terminals = Terminals::default();
+            self.target = None;
+            self.status = None;
+            self.status_error = None;
+            cx.emit(GitEvent::Changed);
+        }
+        if connected {
             if self.terminal_feed.is_none() {
                 self.start_terminal_feed(cx);
             }
