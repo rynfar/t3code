@@ -77,7 +77,12 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "terminal.splitVertical" => Box::new(crate::terminal::SplitTerminalVertical),
         "terminal.new" => Box::new(crate::terminal::NewTerminal),
         "terminal.close" => Box::new(crate::terminal::CloseTerminal),
-        _ => Box::new(Unimplemented),
+        "threadPanel.toggle" => Box::new(crate::thread_details::ToggleThreadPanel),
+        "editor.openFavorite" => Box::new(crate::thread_details::OpenFavoriteEditor),
+        other => match t3_core::project_scripts::project_script_id_from_command(other) {
+            Some(script_id) => Box::new(crate::thread_details::RunProjectScript { script_id: script_id.to_owned() }),
+            None => Box::new(Unimplemented),
+        },
     }
 }
 
