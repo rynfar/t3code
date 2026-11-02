@@ -19,7 +19,7 @@ use t3_core::preview::address::{DEFAULT_SEARCH_TEMPLATE, HistoryEntry, RECENT_SH
 use t3_core::preview::stream::StreamInput;
 use t3_core::preview::{DiscoveredServer, NavStatus, SessionSnapshot, decode_discovered_servers, describe_error, error_label, host_label, method, shows_empty_state, step_zoom};
 
-use super::frame::{FrameEvent, FrameView};
+use super::frame::{CONTROL_BAR_HEIGHT, FrameEvent, FrameView};
 use super::{AUTHORIZATION_ERROR, Abort, Availability, FocusUrl, Previews, PreviewsEvent, Refresh, ResetZoom, ZoomIn, ZoomOut};
 use crate::app_state::AppState;
 use crate::icons::Icon;
@@ -516,8 +516,7 @@ impl PreviewPane {
         let details = self.unreachable_details;
         div()
             .id("preview-unreachable")
-            .absolute()
-            .inset_0()
+            .size_full()
             .overflow_y_scroll()
             .bg(hsla(p.background))
             .child(
@@ -614,14 +613,19 @@ impl Render for PreviewPane {
             Some(NavStatus::LoadFailed { url, code, description, .. }) if !blocked => Some(self.render_unreachable(url, *code, description, cx)),
             _ => None,
         };
+        // The stream's control bar stays above these, as the web keeps it visible, so control of an
+        // agent's tab can still be taken from them.
+        let top = if self.frame.is_some() { CONTROL_BAR_HEIGHT } else { 0. };
         let body = div()
             .relative()
             .flex_1()
             .min_h_0()
             .overflow_hidden()
             .children(self.frame.clone().map(|frame| frame.cached(StyleRefinement::default().size_full())))
-            .when(empty, |this| this.child(div().absolute().inset_0().bg(hsla(p.background)).child(self.render_empty(cx))))
-            .children(unreachable);
+            .when(empty, |this| {
+                this.child(div().absolute().top(px(top)).bottom_0().left_0().right_0().bg(hsla(p.background)).child(self.render_empty(cx)))
+            })
+            .children(unreachable.map(|page| div().absolute().top(px(top)).bottom_0().left_0().right_0().child(page)));
         root.on_action(cx.listener(|this, _: &Refresh, _, cx| this.send(StreamInput::Reload { ignore_cache: None }, cx)))
             .on_action(cx.listener(|this, _: &FocusUrl, window, cx| {
                 this.url.update(cx, |input, cx| {

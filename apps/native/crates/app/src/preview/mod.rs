@@ -164,6 +164,9 @@ impl Previews {
             AppEvent::ServerConfig => this.sync_server_browser(cx),
             AppEvent::Selection => {
                 this.panel_changed(cx);
+                if let Some(thread) = this.state.read(cx).selected_thread.clone() {
+                    this.sync_panel(&thread, &[], cx);
+                }
                 this.list_selected(cx);
             }
             AppEvent::RightPanel => this.panel_changed(cx),
@@ -372,7 +375,10 @@ impl Previews {
                     let previous = thread.clone();
                     if thread.reconcile(&list) {
                         this.follow(&thread_id, &previous, cx);
-                    } else if !thread.list_loaded {
+                    } else if thread.list_loaded {
+                        // Unchanged since the events this client applied, but its panel may not be.
+                        this.sync_panel(&thread_id, &[], cx);
+                    } else {
                         // An event overtook the list; ask again before trusting it for tab cleanup.
                         cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.list_selected(cx))).detach();
                     }
@@ -411,14 +417,27 @@ impl Previews {
         if let Some((_, tab)) = self.pending_popup.take_if(|(thread, tab)| thread == thread_id && next.session(tab).is_some()) {
             fronted.push(tab);
         }
-        let tabs = next.panel_tabs();
+        self.sync_panel(thread_id, &fronted, cx);
+    }
+
+    /// The selected thread's browser tabs follow its sessions; `fronted` tabs come to the front.
+    /// Also run when a thread comes back into view, since a background thread's sessions change
+    /// without touching its panel.
+    fn sync_panel(&mut self, thread_id: &str, fronted: &[String], cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_thread.as_deref() != Some(thread_id) {
+            return;
+        }
+        let tabs = self.threads.get(thread_id).and_then(ThreadPreviews::panel_tabs);
+        if tabs.is_none() && fronted.is_empty() {
+            return;
+        }
         self.state.update(cx, |state, cx| {
             state.mutate_panels(cx, |panels, thread| {
                 let mut changed = false;
                 if let Some((tabs, hidden)) = &tabs {
                     changed |= panels.panels.reconcile_browser_surfaces(thread, tabs, hidden);
                 }
-                for tab in &fronted {
+                for tab in fronted {
                     changed |= panels.panels.open_browser(thread, Some(tab));
                 }
                 changed

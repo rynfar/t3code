@@ -370,8 +370,9 @@ pub fn grow_cap(size: (f64, f64), scale_factor: f64, current: Option<(u32, u32)>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomKey {
     pub key: String,
+    /// Empty when the layout table does not know the key.
     pub code: String,
-    pub key_code: u32,
+    pub key_code: Option<u32>,
     /// Only for printable keys without Ctrl or Meta; Enter carries "\r" so forms submit.
     pub text: Option<String>,
 }
@@ -396,49 +397,64 @@ fn named(key: &str) -> Option<(&'static str, &'static str, u32)> {
     })
 }
 
-fn punctuation(key: char) -> Option<(&'static str, u32)> {
-    Some(match key {
-        '-' => ("Minus", 189),
-        '=' => ("Equal", 187),
-        '[' => ("BracketLeft", 219),
-        ']' => ("BracketRight", 221),
-        '\\' => ("Backslash", 220),
-        ';' => ("Semicolon", 186),
-        '\'' => ("Quote", 222),
-        ',' => ("Comma", 188),
-        '.' => ("Period", 190),
-        '/' => ("Slash", 191),
-        '`' => ("Backquote", 192),
-        _ => return None,
-    })
+/// The physical key behind a character on a US layout, with its Windows virtual key code.
+/// GPUI names a shifted digit or symbol by what it types (Shift+1 is `"!"`), so both halves map.
+fn physical(key: char) -> Option<(String, u32)> {
+    let digit = |digit: char| Some((format!("Digit{digit}"), u32::from(digit)));
+    let symbol = |code: &str, key_code: u32| Some((code.to_owned(), key_code));
+    match key {
+        'a'..='z' | 'A'..='Z' => Some((format!("Key{}", key.to_ascii_uppercase()), u32::from(key.to_ascii_uppercase()))),
+        '0'..='9' => digit(key),
+        ')' => digit('0'),
+        '!' => digit('1'),
+        '@' => digit('2'),
+        '#' => digit('3'),
+        '$' => digit('4'),
+        '%' => digit('5'),
+        '^' => digit('6'),
+        '&' => digit('7'),
+        '*' => digit('8'),
+        '(' => digit('9'),
+        '-' | '_' => symbol("Minus", 189),
+        '=' | '+' => symbol("Equal", 187),
+        '[' | '{' => symbol("BracketLeft", 219),
+        ']' | '}' => symbol("BracketRight", 221),
+        '\\' | '|' => symbol("Backslash", 220),
+        ';' | ':' => symbol("Semicolon", 186),
+        '\'' | '"' => symbol("Quote", 222),
+        ',' | '<' => symbol("Comma", 188),
+        '.' | '>' => symbol("Period", 190),
+        '/' | '?' => symbol("Slash", 191),
+        '`' | '~' => symbol("Backquote", 192),
+        _ => None,
+    }
 }
 
-/// Maps a GPUI keystroke (`key` is the unmodified key name, `key_char` what it types) to the DOM
-/// key event the server replays. `None` for modifier-only and unmapped keys.
+/// Maps a GPUI keystroke to the DOM key event the server replays. `key` is GPUI's key name:
+/// lowercase for letters (with `shift` set), the typed character for shifted digits and
+/// symbols, or a name such as `enter`; `key_char` is what the keystroke types. A character this
+/// layout table does not know still goes out with its text, and the server derives its key code.
+/// `None` for modifier-only and unmapped non-printing keys.
 pub fn dom_key(key: &str, key_char: Option<&str>, shortcut: bool) -> Option<DomKey> {
     if let Some((name, code, key_code)) = named(key) {
         let text = (key == "enter" && !shortcut).then(|| "\r".to_owned());
-        return Some(DomKey { key: name.to_owned(), code: code.to_owned(), key_code, text });
+        return Some(DomKey { key: name.to_owned(), code: code.to_owned(), key_code: Some(key_code), text });
     }
     if let Some(number) = key.strip_prefix('f').and_then(|rest| rest.parse::<u32>().ok()).filter(|n| (1..=24).contains(n)) {
         let name = format!("F{number}");
-        return Some(DomKey { key: name.clone(), code: name, key_code: 111 + number, text: None });
+        return Some(DomKey { key: name.clone(), code: name, key_code: Some(111 + number), text: None });
     }
     let typed = key_char.filter(|typed| typed.chars().count() == 1);
     if key == "space" {
         let key = typed.unwrap_or(" ").to_owned();
-        return Some(DomKey { text: (!shortcut).then(|| key.clone()), key, code: "Space".to_owned(), key_code: 32 });
+        return Some(DomKey { text: (!shortcut).then(|| key.clone()), key, code: "Space".to_owned(), key_code: Some(32) });
     }
     let mut chars = key.chars();
     let (Some(base), None) = (chars.next(), chars.next()) else { return None };
-    let (code, key_code) = match base {
-        'a'..='z' => (format!("Key{}", base.to_ascii_uppercase()), u32::from(base.to_ascii_uppercase())),
-        '0'..='9' => (format!("Digit{base}"), u32::from(base)),
-        other => {
-            let (code, key_code) = punctuation(other)?;
-            (code.to_owned(), key_code)
-        }
-    };
+    if base.is_control() {
+        return None;
+    }
+    let (code, key_code) = physical(base).map_or((String::new(), None), |(code, key_code)| (code, Some(key_code)));
     let dom = typed.map_or_else(|| base.to_string(), str::to_owned);
     Some(DomKey { text: (!shortcut).then(|| dom.clone()), key: dom, code, key_code })
 }
@@ -540,19 +556,31 @@ mod tests {
         assert_eq!(grow_cap((500., 200.), 2., Some((800, 600))), Some((1000, 600)));
     }
 
+    /// Keystrokes as `gpui_macos::events::parse_keystroke` builds them: letters keep their
+    /// lowercase name with `shift` set, shifted digits and symbols are named by what they type.
     #[test]
     fn keystrokes_become_dom_key_events() {
         let key = |key: &str, typed: Option<&str>, shortcut| dom_key(key, typed, shortcut).map(|dom| (dom.key, dom.code, dom.key_code, dom.text));
-        assert_eq!(key("a", Some("a"), false), Some(("a".into(), "KeyA".into(), 65, Some("a".into()))));
-        assert_eq!(key("a", Some("A"), false), Some(("A".into(), "KeyA".into(), 65, Some("A".into()))));
-        assert_eq!(key("c", None, true), Some(("c".into(), "KeyC".into(), 67, None)));
-        assert_eq!(key("1", Some("!"), false), Some(("!".into(), "Digit1".into(), 49, Some("!".into()))));
-        assert_eq!(key("/", Some("?"), false), Some(("?".into(), "Slash".into(), 191, Some("?".into()))));
-        assert_eq!(key("enter", None, false), Some(("Enter".into(), "Enter".into(), 13, Some("\r".into()))));
-        assert_eq!(key("enter", None, true), Some(("Enter".into(), "Enter".into(), 13, None)));
-        assert_eq!(key("left", None, false), Some(("ArrowLeft".into(), "ArrowLeft".into(), 37, None)));
-        assert_eq!(key("space", Some(" "), false), Some((" ".into(), "Space".into(), 32, Some(" ".into()))));
-        assert_eq!(key("f5", None, false), Some(("F5".into(), "F5".into(), 116, None)));
+        let some = |key: &str, code: &str, key_code: Option<u32>, text: Option<&str>| Some((key.to_owned(), code.to_owned(), key_code, text.map(str::to_owned)));
+        assert_eq!(key("a", Some("a"), false), some("a", "KeyA", Some(65), Some("a")));
+        assert_eq!(key("a", Some("A"), false), some("A", "KeyA", Some(65), Some("A")));
+        assert_eq!(key("c", None, true), some("c", "KeyC", Some(67), None));
+        assert_eq!(key("1", Some("1"), false), some("1", "Digit1", Some(49), Some("1")));
+        assert_eq!(key("!", Some("!"), false), some("!", "Digit1", Some(49), Some("!")));
+        assert_eq!(key("@", Some("@"), false), some("@", "Digit2", Some(50), Some("@")));
+        assert_eq!(key("{", Some("{"), false), some("{", "BracketLeft", Some(219), Some("{")));
+        assert_eq!(key(":", Some(":"), false), some(":", "Semicolon", Some(186), Some(":")));
+        assert_eq!(key("?", Some("?"), false), some("?", "Slash", Some(191), Some("?")));
+        assert_eq!(key("\"", Some("\""), false), some("\"", "Quote", Some(222), Some("\"")));
+        // Option+A types å on the A key.
+        assert_eq!(key("a", Some("å"), false), some("å", "KeyA", Some(65), Some("å")));
+        // A key no table knows (German ö) still types; the server derives its key code.
+        assert_eq!(key("ö", Some("ö"), false), some("ö", "", None, Some("ö")));
+        assert_eq!(key("enter", None, false), some("Enter", "Enter", Some(13), Some("\r")));
+        assert_eq!(key("enter", None, true), some("Enter", "Enter", Some(13), None));
+        assert_eq!(key("left", None, false), some("ArrowLeft", "ArrowLeft", Some(37), None));
+        assert_eq!(key("space", Some(" "), false), some(" ", "Space", Some(32), Some(" ")));
+        assert_eq!(key("f5", None, false), some("F5", "F5", Some(116), None));
         assert_eq!(key("shift", None, false), None);
         assert_eq!(modifiers(true, false, true, true), 13);
     }

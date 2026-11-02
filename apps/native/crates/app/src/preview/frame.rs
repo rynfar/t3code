@@ -28,6 +28,10 @@ use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
 
+/// The control bar: an `xs` button with `py-1` and its bottom border, held with or without the
+/// button so overlays below it never shift.
+pub const CONTROL_BAR_HEIGHT: f32 = 33.;
+
 /// Pointer moves and wheel deltas coalesce for about one display frame, as the web batches them
 /// per animation frame.
 const INPUT_FLUSH_MS: u64 = 16;
@@ -502,7 +506,8 @@ impl FrameView {
     }
 
     fn key(&mut self, action: KeyAction, keystroke: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.controlled() {
+        // Only the page's own focus types into it; a dialog's prompt field inside this view keeps its keys.
+        if !self.controlled() || !self.focus.is_focused(window) {
             return;
         }
         let modifiers = &keystroke.modifiers;
@@ -532,7 +537,7 @@ impl FrameView {
             action,
             key: dom.key,
             code: dom.code,
-            key_code: Some(dom.key_code),
+            key_code: dom.key_code,
             text: if action == KeyAction::Down { dom.text } else { None },
             modifiers: modifier_bits(modifiers),
         });
@@ -554,10 +559,10 @@ impl FrameView {
         let control = self.control.clone();
         h_flex()
             .flex_none()
+            .h(px(CONTROL_BAR_HEIGHT))
             .justify_between()
             .gap(px(8.))
             .px(px(8.))
-            .py(px(4.))
             .border_b_1()
             .border_color(hsla(p.border))
             .bg(hsla(p.background))
@@ -621,6 +626,8 @@ impl FrameView {
             .border_color(hsla(p.border))
             .bg(hsla(p.background))
             .shadow_lg()
+            // Clicks on the card stay off the page, which would take focus from the prompt field.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(div().text_sm().text_color(hsla(p.foreground)).child(dialog.message.clone()));
         Some(if yours {
             card.when(prompt, |this| this.child(Input::new(&self.prompt)))
@@ -643,7 +650,18 @@ impl FrameView {
 
     fn render_blocker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let p = palette(cx);
-        let base = || v_flex().absolute().inset_0().items_center().justify_center().gap(px(12.)).p(px(16.)).bg(hsla(p.background)).text_center();
+        let base = || {
+            v_flex()
+                .absolute()
+                .inset_0()
+                .items_center()
+                .justify_center()
+                .gap(px(12.))
+                .p(px(16.))
+                .bg(hsla(p.background))
+                .text_center()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
         if let Some(setup) = &self.host_setup {
             return Some(
                 base()
