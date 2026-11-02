@@ -105,6 +105,10 @@ pub struct FileChangeDetail {
     pub path: String,
     #[serde(default)]
     pub old_path: Option<String>,
+    #[serde(default)]
+    pub file_type: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

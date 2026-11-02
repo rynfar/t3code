@@ -250,23 +250,41 @@ fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope
         return unavailable("Video", if image.alt.is_empty() { &resolved.name } else { &image.alt }, cx);
     }
     let Some(source) = resolved.source else { return unavailable("Image unavailable", &image.alt, cx) };
+    let name: SharedString = if image.alt.trim().is_empty() { resolved.name.into() } else { image.alt.clone().into() };
+    let id = SharedString::from(format!("md-media:{index}:{}", image.url));
+    framed_image(id, source, name, &image.alt, 480., scope, cx)
+}
+
+/// `ChatMarkdownAssetImage` for an image a tool returned: within 480 wide and 256 tall
+/// (`maxHeightRem={16}`), opening the viewer on click.
+pub fn tool_output_image(id: SharedString, source: MediaSource, alt: &str, cx: &mut App) -> AnyElement {
+    let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
+    let Some(scope) = scope else { return unavailable("Image", alt, cx) };
+    framed_image(id, source, SharedString::from(alt.to_owned()), alt, 256., &scope, cx)
+}
+
+/// An image at its own aspect, at most 480 wide and `max_height` tall, radius 8 with a 40%
+/// border. A 16:9 frame holds its place until the size is known.
+fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: &str, max_height: f32, scope: &MediaScope, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     let state = media::image(&source, Variant::Thumb, scope.owner, cx);
     if let ImageState::Failed(_) = state {
-        return unavailable("Image unavailable", &image.alt, cx);
+        return unavailable("Image unavailable", alt, cx);
     }
     let (width, height) = match media::dimensions(&source, cx) {
         Some((width, height)) => {
-            let fit = (480. / width.max(1) as f32).min(480. / height.max(1) as f32).min(1.);
+            let fit = (480. / width.max(1) as f32).min(max_height / height.max(1) as f32).min(1.);
             (width as f32 * fit, height as f32 * fit)
         }
-        None => (480., 270.),
+        None => {
+            let height = max_height.min(270.);
+            (height * 16. / 9., height)
+        }
     };
-    let name: SharedString = if image.alt.trim().is_empty() { resolved.name.into() } else { image.alt.clone().into() };
     let viewer = scope.viewer.clone();
     let item = ViewerItem { source: source.clone(), name };
     let frame = div()
-        .id(SharedString::from(format!("md-media:{index}:{}", image.url)))
+        .id(id)
         .relative()
         .w(px(width))
         .max_w(relative(1.))

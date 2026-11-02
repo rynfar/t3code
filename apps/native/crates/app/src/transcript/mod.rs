@@ -3,6 +3,7 @@
 
 mod changed_files;
 mod command_output;
+mod inspector;
 pub mod markdown;
 mod media;
 mod messages;

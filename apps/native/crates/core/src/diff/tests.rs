@@ -492,6 +492,8 @@ fn file_change(file_name: &str, diff_str: Option<&str>, changes: &[(&str, &str, 
                     operation: (*operation).into(),
                     path: (*path).into(),
                     old_path: old_path.map(str::to_owned),
+                    file_type: None,
+                    mime_type: None,
                 })
                 .collect()
         }),

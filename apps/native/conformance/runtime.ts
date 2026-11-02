@@ -30,6 +30,7 @@ import type * as NotificationGateModule from "../../../apps/web/src/components/T
 import type * as WireProjectionModule from "../../../apps/server/src/orchestration-v2/WireProjection.ts";
 import type * as TerminalOutputModule from "../../../packages/shared/src/terminalOutput.ts";
 import type * as CommandOutputModule from "../../../packages/client-runtime/src/state/commandOutput.ts";
+import type * as ItemDetailModule from "../../../packages/client-runtime/src/work-log/itemDetail.ts";
 
 export const ROOT = NodePath.resolve(
   NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
@@ -92,6 +93,9 @@ export const TerminalOutput = await importSource<typeof TerminalOutputModule>(
 export const CommandOutput = await importSource<typeof CommandOutputModule>(
   "packages/client-runtime/src/state/commandOutput.ts",
 );
+export const ItemDetail = await importSource<typeof ItemDetailModule>(
+  "packages/client-runtime/src/work-log/itemDetail.ts",
+);
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Item = OrchestrationV2TurnItem;
@@ -107,6 +111,7 @@ const codecs = {
   shellItem: Schema.toCodecJson(Contracts.OrchestrationV2ShellStreamItem),
   shellSnapshot: Schema.toCodecJson(Contracts.OrchestrationV2ShellSnapshot),
   threadShell: Schema.toCodecJson(Contracts.OrchestrationV2ThreadShell),
+  turnItemResult: Schema.toCodecJson(Contracts.OrchestrationV2GetTurnItemResult),
 };
 
 export const toJson = (value: unknown): Json => JSON.parse(JSON.stringify(value)) as Json;
@@ -124,6 +129,10 @@ const encodeShellItemSync = Schema.encodeSync(codecs.shellItem);
 export const encodeShellItem = (value: OrchestrationV2ShellStreamItem) =>
   toJson(encodeShellItemSync(value));
 const encodeShellSnapshotSync = Schema.encodeSync(codecs.shellSnapshot);
+const encodeTurnItemResultSync = Schema.encodeSync(codecs.turnItemResult);
+/** `orchestration.getTurnItem`'s result as the server sends it. */
+export const encodeTurnItemResult = (value: ContractsModule.OrchestrationV2GetTurnItemResult) =>
+  toJson(encodeTurnItemResultSync(value));
 const encodeThreadShellSync = Schema.encodeSync(codecs.threadShell);
 export const encodeThreadShell = (value: ContractsModule.OrchestrationV2ThreadShell) =>
   toJson(encodeThreadShellSync(value));

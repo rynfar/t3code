@@ -469,3 +469,58 @@ fn command_output_matches_typescript() {
     }
     report.finish("command-output", 1000);
 }
+
+/// Each non-whitespace character's capture, `None` where nothing is captured.
+fn captures_by_char(runs: impl IntoIterator<Item = (String, Option<String>)>) -> Vec<(char, Option<String>)> {
+    runs.into_iter().flat_map(|(text, capture)| text.chars().map(move |c| (c, capture.clone())).collect::<Vec<_>>()).filter(|(c, _)| !c.is_whitespace()).collect()
+}
+
+#[test]
+fn item_detail_matches_typescript() {
+    use t3_core::json_text::{is_json_text, json_tokens};
+    use t3_core::timeline::{ToolCallLines, decode_detail, detail_revision, needs_detail_fetch, turn_item_has_detail, turn_item_output_images, turn_item_output_text};
+    use t3_core::turn_item::TurnItemKind;
+
+    let mut report = Report::default();
+    for case in fixture("item-detail.jsonl") {
+        let name = text(&case, "name").unwrap_or_default();
+        if let Some(json) = text(&case, "json") {
+            let is_json = case["isJson"] == true;
+            report.check(&format!("{name} is JSON"), is_json_text(&json), is_json);
+            if is_json {
+                let rust = json_tokens(&json).into_iter().map(|(range, token)| (json[range].to_owned(), Some(token.capture().to_owned())));
+                let typescript = list(&case, "runs").iter().map(|run| (run[0].as_str().unwrap_or_default().to_owned(), run[1].as_str().map(str::to_owned)));
+                report.check(&format!("{name} runs"), captures_by_char(rust), captures_by_char(typescript));
+            }
+            report.compared += 1;
+            continue;
+        }
+        let item = decode_detail(case["result"].clone()).expect("getTurnItem results decode");
+        let Some(item) = item else {
+            report.check(&format!("{name} item"), case["result"]["item"].is_null(), true);
+            report.compared += 1;
+            continue;
+        };
+        report.check(&format!("{name} needs fetch"), needs_detail_fetch(&item), case["needsFetch"] == true);
+        report.check(&format!("{name} revision"), detail_revision(&item), text(&case, "revision").unwrap_or_default());
+        report.check(&format!("{name} output text"), turn_item_output_text(&item), text(&case, "outputText"));
+        let images: Vec<Value> = turn_item_output_images(&item).iter().map(|image| image.to_json()).collect();
+        report.check(&format!("{name} output images"), images, list(&case, "outputImages").to_vec());
+        report.check(&format!("{name} has detail"), turn_item_has_detail(&item), case["hasDetail"] == true);
+        let lines = match &item.kind {
+            TurnItemKind::CommandExecution { input, .. } => Some(ToolCallLines::command(input)),
+            TurnItemKind::DynamicTool { input, .. } => Some(ToolCallLines::args(input)),
+            _ => None,
+        };
+        let expected = (!case["callLines"].is_null()).then(|| {
+            let call = &case["callLines"];
+            let args = call["args"].as_array().map(|args| {
+                args.iter().map(|pair| (pair[0].as_str().unwrap_or_default().to_owned(), pair[1].as_str().unwrap_or_default().to_owned())).collect()
+            });
+            ToolCallLines { command: text(call, "command"), args, args_text: text(call, "argsText") }
+        });
+        report.check(&format!("{name} call lines"), lines, expected);
+        report.compared += 1;
+    }
+    report.finish("item-detail", 40);
+}

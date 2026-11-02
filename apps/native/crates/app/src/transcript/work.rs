@@ -1,22 +1,22 @@
-//! Work, tool and reasoning rows: `TimelineWorkGroupRows.tsx`, `TimelineWorkEntryRow.tsx`,
-//! `TimelinePendingApprovalRow.tsx` and the details of `V2ItemInspector.tsx`, laid out per
-//! design system §7.7. Approval actions belong to the composer, so the row shows state only.
+//! Work, tool and reasoning rows: `TimelineWorkGroupRows.tsx`, `TimelineWorkEntryRow.tsx` and
+//! `TimelinePendingApprovalRow.tsx`, laid out per design system §7.7; an open tool row shows the
+//! inspector (`inspector.rs`). Approval actions belong to the composer, so the row shows state only.
 
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListSizingBehavior, ListState, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, list, prelude::FluentBuilder, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use serde_json::Value;
 use t3_core::timeline::{
-    RowKind, TimelineRow, WorkIcon, has_question_answer, question_answer_preview, question_text_preview, WorkLogEntry, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args, summary_icon,
-    tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group,
-    work_entry_read_output, work_log_entry_is_tool_like, ToolGroupAction, ToolStatus, command_output_text,
+    EntryBody, RowKind, TimelineRow, WorkIcon, WorkLogEntry, answered_questions, detail_revision, entry_body, entry_can_expand, entry_fetches_detail,
+    has_question_answer, live_thought_line, live_work_entry_label, question_answer_preview, question_text_preview, summary_icon, work_entry_display_indicates_tool_failure,
+    work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group, work_log_entry_is_tool_like, ToolStatus,
 };
-use t3_core::turn_item::TurnItemKind;
+use t3_core::turn_item::{TurnItem, TurnItemKind};
 
 use super::command_output;
+use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
-use super::parts::{chevron, focusable, icon_slot, mono_block, outline_button, timestamp, work_line, work_row_frame};
+use super::parts::{chevron, focusable, icon_slot, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -195,7 +195,7 @@ fn entry_row(
     } else {
         hsla(p.foreground).opacity(0.8)
     };
-    let can_expand = if reasoning { entry.detail.as_deref().is_some_and(|d| !d.trim().is_empty()) } else { has_details(entry, env) };
+    let can_expand = entry_can_expand(entry, env.workspace_root);
     let mut trailing = Vec::new();
     if failed && !severe {
         trailing.push(Icon::WorkX.render(px(12.), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
@@ -238,321 +238,69 @@ fn entry_row(
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(prose(&state, cx)),
         );
-    } else if expanded && let Some(details) = entry_details(entry, env, cx) {
-        // Streamed output scrolls in its own capped panel, which follows the tail.
-        let streams = env.command_outputs.is_some() && matches!(entry.item.as_ref().map(|item| &item.kind), Some(TurnItemKind::CommandExecution { .. }));
-        frame = frame.child(
-            div()
-                .id(SharedString::from(format!("work-detail:{}", entry.id)))
-                .mt(px(2.))
-                .mb(px(6.))
-                .ml(px(28.))
-                .when(!streams, |this| this.max_h(px(256.)).overflow_y_scroll())
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(details),
-        );
+    } else if expanded && let Some(body) = entry_body(entry, env.workspace_root) {
+        frame = frame.child(expanded_body(entry, body, env, cx));
     }
     frame.into_any_element()
 }
 
-/// Whether a row opens to anything: `turnItemHasDetail` plus the plain-output cases.
-fn has_details(entry: &WorkLogEntry, env: &RowEnv) -> bool {
-    if tool_group_action(entry) == ToolGroupAction::Read {
-        return work_entry_read_output(entry, env.workspace_root).is_some();
-    }
-    if let Some(args) = skill_args(entry) {
-        return args.is_some();
-    }
-    let non_empty = |text: &str| !text.trim().is_empty();
-    let from_item = entry.item.as_ref().is_some_and(|item| match &item.kind {
-        TurnItemKind::CommandExecution { input, output, output_omitted, exit_code, .. } => {
-            non_empty(input) || *output_omitted || output.as_deref().is_some_and(non_empty) || exit_code.is_some_and(|c| c != 0)
+/// What an open row shows under its line: the answers it was given, or a panel with the
+/// inspector or a read's or skill's plain output (`WorkLogDetails kind="panel"`).
+fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+    let Some(item) = entry.item.clone() else { return div().into_any_element() };
+    let content = match body {
+        EntryBody::QuestionAnswer => {
+            let questions = entry.question_answer.as_ref().map(answered_questions).unwrap_or_default();
+            let id = SharedString::from(format!("work-answers:{}", entry.id));
+            return div().id(id).on_click(|_, _, cx| cx.stop_propagation()).child(question_history(&entry.id, &questions, cx)).into_any_element();
         }
-        TurnItemKind::FileChange { .. } => true,
-        TurnItemKind::FileSearch { pattern, results } => results.as_ref().is_some_and(|r| !r.is_empty()) || pattern.as_deref().is_some_and(non_empty),
-        TurnItemKind::WebSearch { patterns, results } => results.as_ref().is_some_and(|r| !r.is_empty()) || patterns.as_ref().is_some_and(|p| !p.is_empty()),
-        TurnItemKind::DynamicTool { input, output_omitted, .. } => *output_omitted || !input.is_null(),
-        TurnItemKind::ApprovalRequest { prompt, .. } => prompt.as_deref().is_some_and(non_empty),
-        TurnItemKind::UserInputRequest { questions, .. } => !questions.is_empty(),
-        TurnItemKind::Notification { detail, .. } => detail.as_deref().is_some_and(non_empty),
-        TurnItemKind::SystemNotice { message } => non_empty(message),
-        TurnItemKind::Error { failure, .. } => non_empty(&failure.message),
-        TurnItemKind::TodoList { steps, .. } => !steps.is_empty(),
-        TurnItemKind::Compaction { summary, .. } => summary.as_deref().is_some_and(non_empty),
-        _ => false,
-    });
-    from_item || (entry.item.is_none() && [entry.command.as_deref(), entry.detail.as_deref()].into_iter().flatten().any(non_empty))
-}
-
-fn json_text(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_default()
-}
-
-/// `formatToolValue`: text content blocks as text, other values as pretty JSON.
-fn tool_value_text(value: &Value) -> Option<String> {
-    fn blocks(value: &Value, depth: usize) -> Option<String> {
-        if depth > 4 {
-            return None;
-        }
-        match value {
-            Value::String(text) => Some(text.clone()),
-            Value::Array(items) => items.iter().map(|item| blocks(item, depth + 1)).collect::<Option<Vec<_>>>().map(|parts| {
-                parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n")
-            }),
-            Value::Object(object) => {
-                if object.get("type").and_then(Value::as_str) == Some("text") {
-                    return object.get("text").and_then(Value::as_str).map(str::to_owned);
-                }
-                if object.get("type").and_then(Value::as_str) == Some("image") {
-                    return Some("[image]".into());
-                }
-                let keys: Vec<&String> = object.keys().filter(|k| *k != "isError" && *k != "is_error").collect();
-                if keys.len() == 1 && keys[0] == "content" {
-                    return object.get("content").and_then(|content| blocks(content, depth + 1));
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-    match value {
-        Value::Null => None,
-        other => match blocks(other, 0) {
-            Some(text) => Some(text).filter(|t| !t.trim().is_empty()),
-            None => Some(json_text(other)).filter(|t| t != "{}" && t != "[]"),
-        },
-    }
-}
-
-fn muted_line(text: impl Into<SharedString>, cx: &App) -> AnyElement {
-    div().text_xs().italic().text_color(hsla(palette(cx).muted_foreground)).child(text.into()).into_any_element()
-}
-
-fn fetched_item<'a>(entry: &WorkLogEntry, env: &'a RowEnv) -> Option<&'a Arc<t3_core::turn_item::TurnItem>> {
-    match env.details.get(&entry.item.as_ref()?.id)? {
-        Detail::Loaded { item, .. } => Some(item),
-        _ => None,
-    }
-}
-
-/// `ToolOutput`'s states for output fetched with `getTurnItem`.
-fn fetch_status(entry: &WorkLogEntry, env: &RowEnv, cx: &App) -> AnyElement {
-    let detail = entry.item.as_ref().and_then(|item| env.details.get(&item.id));
-    match detail {
-        Some(Detail::Failed { message, .. }) => {
-            div().text_xs().text_color(hsla(palette(cx).destructive)).child(format!("Couldn't load output: {message}")).into_any_element()
-        }
-        Some(Detail::Missing { .. }) => muted_line("Output is no longer available.", cx),
-        Some(Detail::Loaded { .. }) => muted_line("No output.", cx),
-        Some(Detail::Loading { .. }) | None => muted_line("Loading output…", cx),
-    }
-}
-
-/// The expanded body: `V2ItemInspector` for projected items, plain output for reads and skills.
-fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<AnyElement> {
-    let p = palette(cx);
-    if tool_group_action(entry) == ToolGroupAction::Read {
-        return work_entry_read_output(entry, env.workspace_root).map(|paths| mono_block(paths, cx).into_any_element());
-    }
-    if let Some(args) = skill_args(entry) {
-        return args.map(|args| mono_block(args, cx).into_any_element());
-    }
-    let item = entry.item.as_ref()?;
-    let mut parts: Vec<AnyElement> = Vec::new();
-    match &item.kind {
-        TurnItemKind::CommandExecution { input, output, output_omitted, exit_code, .. } => {
-            parts.push(mono_block(format!("$ {}", t3_core::timeline::command_display_text(input)), cx).text_color(hsla(p.foreground).opacity(0.85)).into_any_element());
+        EntryBody::Plain { text, fetches } => v_flex()
+            .w_full()
+            .min_w_0()
+            .children(text.map(|text| plain_body(&entry.id, &text, cx)))
+            .when(fetches, |this| this.child(ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::OutputOnly)))
+            .into_any_element(),
+        EntryBody::Inspector => {
+            let mut inspector = ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::Full).workspace_root(env.workspace_root);
             // The server streams the output, live and then final, in place of the item's own.
-            if let Some(outputs) = env.command_outputs {
-                parts.extend(command_output::panel(&entry.id, outputs.get(&entry.id), cx));
-                if let Some(code) = exit_code.filter(|code| *code != 0) {
-                    parts.push(mono_block(format!("exit {code}"), cx).text_color(hsla(p.destructive)).into_any_element());
-                }
-                return Some(v_flex().gap(px(6.)).w_full().min_w_0().children(parts).into_any_element());
+            if let Some(outputs) = env.command_outputs
+                && matches!(item.kind, TurnItemKind::CommandExecution { .. })
+            {
+                inspector = inspector.output_slot(command_output::panel(&entry.id, outputs.get(&entry.id), cx));
             }
-            let fetched = fetched_item(entry, env);
-            let output = match (*output_omitted, fetched) {
-                (true, Some(item)) => match &item.kind {
-                    TurnItemKind::CommandExecution { output, .. } => output.clone(),
-                    _ => None,
-                },
-                _ => output.clone(),
-            };
-            match output.as_deref().and_then(command_output_text) {
-                Some(output) => parts.push(mono_block(output.trim_end().to_owned(), cx).into_any_element()),
-                None if *output_omitted => parts.push(fetch_status(entry, env, cx)),
-                None => {}
-            }
-            let exit_code = match fetched.map(|item| &item.kind) {
-                Some(TurnItemKind::CommandExecution { exit_code, .. }) => exit_code.or(*exit_code),
-                _ => *exit_code,
-            };
-            if let Some(code) = exit_code.filter(|code| *code != 0) {
-                parts.push(mono_block(format!("exit {code}"), cx).text_color(hsla(p.destructive)).into_any_element());
-            }
-        }
-        TurnItemKind::FileChange { file_name, additions, deletions, diff_str, changes, .. } => {
-            let mut header = h_flex().gap(px(8.)).flex_wrap().child(mono_block(format_workspace_relative_path(file_name, env.workspace_root), cx).w_auto());
-            if additions.is_some() || deletions.is_some() {
-                header = header.child(
-                    h_flex()
-                        .gap(px(4.))
-                        .text_xs()
-                        .child(div().text_color(hsla(p.diff_addition_foreground)).child(format!("+{}", additions.unwrap_or(0))))
-                        .child(div().text_color(hsla(p.diff_deletion_foreground)).child(format!("-{}", deletions.unwrap_or(0)))),
-                );
-            }
-            if env.tool_diffs {
-                let target = t3_core::diff::ToolCallTarget::of(item);
+            if env.tool_diffs && matches!(item.kind, TurnItemKind::FileChange { .. }) {
+                let target = t3_core::diff::ToolCallTarget::of(&item);
                 let open = cx.listener(move |view, _, _, cx| view.open_tool_call_diff(target.clone(), cx));
-                header = header.child(outline_button(SharedString::from(format!("open-tool-diff:{}", item.id)), "Open diff", open, cx));
+                inspector = inspector.open_diff(Some(outline_button(SharedString::from(format!("open-tool-diff:{}", item.id)), "Open diff", open, cx)));
             }
-            parts.push(header.into_any_element());
-            if item.status == "failed" && let Some(diff) = diff_str.as_deref().filter(|d| !d.trim().is_empty()) {
-                parts.push(mono_block(diff.to_owned(), cx).into_any_element());
-            }
-            for change in changes.iter().flatten() {
-                let old = change.old_path.as_deref().map(|old| format!("{old} → ")).unwrap_or_default();
-                parts.push(mono_block(format!("{} {old}{}", change.operation, format_workspace_relative_path(&change.path, env.workspace_root)), cx).into_any_element());
-            }
+            inspector.into_any_element()
         }
-        TurnItemKind::FileSearch { pattern, results } => {
-            if let Some(pattern) = pattern.as_deref().filter(|p| !p.trim().is_empty()) {
-                parts.push(mono_block(pattern.to_owned(), cx).into_any_element());
-            }
-            for result in results.iter().flatten() {
-                let file = result.get("fileName").and_then(Value::as_str).unwrap_or_default();
-                let line = result.get("line").and_then(Value::as_u64).map(|l| format!(":{l}")).unwrap_or_default();
-                let preview = result.get("preview").and_then(Value::as_str).map(|p| format!("\n{p}")).unwrap_or_default();
-                parts.push(mono_block(format!("{}{line}{preview}", format_workspace_relative_path(file, env.workspace_root)), cx).into_any_element());
-            }
-        }
-        TurnItemKind::WebSearch { patterns, results } => {
-            if let Some(patterns) = patterns.as_ref().filter(|p| !p.is_empty()) {
-                parts.push(mono_block(patterns.join("\n"), cx).into_any_element());
-            }
-            for result in results.iter().flatten() {
-                let get = |key: &str| result.get(key).and_then(Value::as_str).map(str::to_owned);
-                let title = get("title").or_else(|| get("url")).unwrap_or_else(|| "Search result".into());
-                parts.push(
-                    v_flex()
-                        .text_xs()
-                        .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title))
-                        .children(get("snippet").map(|snippet| div().text_color(hsla(p.muted_foreground)).child(snippet)))
-                        .into_any_element(),
-                );
-            }
-        }
-        TurnItemKind::DynamicTool { input, output, output_omitted, .. } => {
-            match input {
-                Value::Object(object) if object.get("truncated") != Some(&Value::Bool(true)) => {
-                    for (key, value) in object {
-                        let text = match value {
-                            Value::String(text) if !text.is_empty() => text.clone(),
-                            other => serde_json::to_string(other).unwrap_or_default(),
-                        };
-                        parts.push(
-                            h_flex()
-                                .items_start()
-                                .gap(px(6.))
-                                .child(mono_block(key.clone(), cx).w_auto().flex_none().text_color(hsla(p.muted_foreground)))
-                                .child(mono_block(text, cx).text_color(hsla(p.foreground).opacity(0.85)))
-                                .into_any_element(),
-                        );
-                    }
-                }
-                other => {
-                    if let Some(text) = tool_value_text(other) {
-                        parts.push(mono_block(text, cx).into_any_element());
-                    }
-                }
-            }
-            let output = match (*output_omitted, fetched_item(entry, env).map(|item| &item.kind)) {
-                (true, Some(TurnItemKind::DynamicTool { output, .. })) => output.clone(),
-                (true, _) => None,
-                (false, _) => output.clone(),
-            };
-            match output.as_ref().and_then(tool_value_text) {
-                Some(text) => parts.push(mono_block(text, cx).text_color(hsla(p.muted_foreground)).into_any_element()),
-                None if *output_omitted => parts.push(fetch_status(entry, env, cx)),
-                None => {}
-            }
-        }
-        TurnItemKind::ApprovalRequest { prompt: Some(prompt), .. } => parts.push(mono_block(prompt.clone(), cx).into_any_element()),
-        TurnItemKind::UserInputRequest { questions, question_answer, .. } => {
-            let text = questions
-                .iter()
-                .map(|question| {
-                    let mut lines = vec![question.get("question").and_then(Value::as_str).unwrap_or_default().to_owned()];
-                    for option in question.get("options").and_then(Value::as_array).into_iter().flatten() {
-                        lines.push(format!("• {}", option.get("label").and_then(Value::as_str).unwrap_or_default()));
-                    }
-                    lines.join("\n")
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            if !text.trim().is_empty() {
-                parts.push(mono_block(text, cx).into_any_element());
-            }
-            if let Some(answers) = question_answer.as_ref().and_then(|a| a.get("answers")).and_then(Value::as_object) {
-                for answer in answers.values() {
-                    let text = match answer {
-                        Value::String(text) => text.clone(),
-                        Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
-                        other => answer_text(other),
-                    };
-                    if !text.is_empty() {
-                        parts.push(div().ml(px(12.)).text_size(px(14.)).text_color(hsla(p.muted_foreground)).child(text).into_any_element());
-                    }
-                }
-            }
-        }
-        TurnItemKind::Notification { detail: Some(detail), .. } => parts.push(mono_block(detail.clone(), cx).into_any_element()),
-        TurnItemKind::SystemNotice { message } if !message.trim().is_empty() => parts.push(mono_block(message.clone(), cx).into_any_element()),
-        TurnItemKind::Error { failure, .. } => parts.push(mono_block(failure.message.clone(), cx).into_any_element()),
-        TurnItemKind::TodoList { steps, explanation, .. } => {
-            if let Some(explanation) = explanation.as_deref().filter(|e| !e.trim().is_empty()) {
-                parts.push(div().text_xs().text_color(hsla(p.muted_foreground)).child(explanation.to_owned()).into_any_element());
-            }
-            let text = steps
-                .iter()
-                .map(|step| {
-                    let mark = match step.status.as_str() {
-                        "completed" => "✓",
-                        "running" | "in_progress" => "◉",
-                        _ => "○",
-                    };
-                    format!("{mark} {}", step.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            parts.push(mono_block(text, cx).into_any_element());
-        }
-        TurnItemKind::Compaction { summary: Some(summary), .. } => parts.push(mono_block(summary.clone(), cx).into_any_element()),
-        _ => {}
-    }
-    if parts.is_empty() {
-        let fallback = [entry.command.as_deref(), entry.detail.as_deref()].into_iter().flatten().map(str::trim).filter(|t| !t.is_empty()).collect::<Vec<_>>();
-        if fallback.is_empty() {
-            return None;
-        }
-        parts.push(mono_block(fallback.join("\n\n"), cx).into_any_element());
-    }
-    Some(v_flex().gap(px(6.)).w_full().min_w_0().children(parts).into_any_element())
+    };
+    div()
+        .id(SharedString::from(format!("work-detail:{}", entry.id)))
+        .w_full()
+        .min_w_0()
+        .mt(px(2.))
+        .mb(px(6.))
+        .pb(px(8.))
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(content)
+        .into_any_element()
 }
 
-fn answer_text(value: &Value) -> String {
-    match value {
-        Value::Object(object) => object
-            .get("answers")
-            .or_else(|| object.get("text"))
-            .map(|inner| match inner {
-                Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
-                Value::String(text) => text.clone(),
-                _ => String::new(),
-            })
-            .unwrap_or_default(),
-        _ => String::new(),
+/// Where the fetch of the entry's withheld detail stands for its item's current revision.
+fn fetch_state(entry: &WorkLogEntry, item: &TurnItem, env: &RowEnv) -> Fetch {
+    if !entry_fetches_detail(entry, env.command_outputs.is_some()) {
+        return Fetch::None;
+    }
+    match env.details.get(&item.id) {
+        Some(detail) if detail.revision() == detail_revision(item) => match detail {
+            Detail::Loading { .. } => Fetch::Pending,
+            Detail::Loaded { item, .. } => Fetch::Loaded(item.clone()),
+            Detail::Missing { .. } => Fetch::Missing,
+            Detail::Failed { message, .. } => Fetch::Failed(SharedString::from(message.clone())),
+        },
+        _ => Fetch::Pending,
     }
 }
 

@@ -11,6 +11,7 @@ import { shellCases } from "./shellCases.ts";
 import { shelfCases } from "./shelfCases.ts";
 import { notifyCases } from "./notifyCases.ts";
 import { commandOutputCases } from "./commandOutputCases.ts";
+import { itemDetailCases } from "./itemDetailCases.ts";
 
 const OUTPUT_DIR = "apps/native/crates/core/tests/conformance";
 
@@ -23,6 +24,7 @@ function fixtures(): Record<string, ReadonlyArray<unknown>> {
     "shelf.jsonl": shelfCases(),
     "notify.jsonl": notifyCases(),
     "command-output.jsonl": commandOutputCases(),
+    "item-detail.jsonl": itemDetailCases(),
   };
 }
 

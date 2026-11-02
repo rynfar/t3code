@@ -464,8 +464,13 @@ pub fn command_display_text(command: &str) -> String {
             shell_script(&tokens).map(|script| script.trim().to_owned()).filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| trimmed.to_owned());
-    unwrapped
-        .chars()
+    with_visible_control_characters(&unwrapped)
+}
+
+/// `withVisibleControlCharacters`: control characters other than tab and line breaks as their
+/// Control Pictures glyphs.
+pub fn with_visible_control_characters(text: &str) -> String {
+    text.chars()
         .map(|c| match c {
             '\u{7f}' => '␡',
             '\t' | '\n' | '\r' => c,
