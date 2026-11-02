@@ -20,6 +20,7 @@ const ITEM_HEIGHT: f32 = 28.;
 pub enum ContextMenuEvent {
     Rename(String),
     Delete(String),
+    CustomSnooze(String),
 }
 
 struct OpenMenu {
@@ -72,7 +73,7 @@ impl ContextMenu {
             is_running: !thread.can_archive(),
             supports,
             snooze_presets: &presets,
-            available: Available { new_thread_on_branch: false, custom_snooze: false, project_settings: false },
+            available: Available { new_thread_on_branch: false, custom_snooze: true, project_settings: false },
         });
         self.open = Some(OpenMenu { thread_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
         window.focus(&self.focus, cx);
@@ -114,6 +115,7 @@ impl ContextMenu {
         match action {
             ThreadAction::Rename => cx.emit(ContextMenuEvent::Rename(open.thread_id)),
             ThreadAction::Delete => cx.emit(ContextMenuEvent::Delete(open.thread_id)),
+            ThreadAction::SnoozeCustom => cx.emit(ContextMenuEvent::CustomSnooze(open.thread_id)),
             action => self.state.update(cx, |state, cx| state.run_thread_action(&open.thread_id, action, &open.presets, cx)),
         }
     }

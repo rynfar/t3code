@@ -255,3 +255,54 @@ pub fn is_woke_unseen(woke_at: Option<Ms>, settled: bool, last_visited_at: Optio
     let Some(woke_at) = woke_at.filter(|_| !settled) else { return false };
     [last_visited_at, latest_run_completed_at].into_iter().flatten().all(|seen| seen < woke_at)
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationUnit {
+    Minutes,
+    Hours,
+    Days,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomSnoozeInput<'a> {
+    Date { date: &'a str, time: &'a str },
+    Duration { amount: &'a str, unit: DurationUnit },
+}
+
+fn fixed_digits(text: &str, pattern: &[usize]) -> Option<Vec<i64>> {
+    let parts: Vec<&str> = text.split(['-', ':']).collect();
+    (parts.len() == pattern.len() && parts.iter().zip(pattern).all(|(part, len)| part.len() == *len && part.bytes().all(|b| b.is_ascii_digit())))
+        .then(|| parts.iter().filter_map(|part| part.parse().ok()).collect())
+}
+
+/// `resolveCustomSnooze`: a future wake time, or `None` for invalid, rolled-over, nonexistent
+/// (DST gap) or past input. Duration days are 24 hours.
+pub fn resolve_custom_snooze(input: &CustomSnoozeInput, now: Ms, zone: &dyn Zone) -> Option<Ms> {
+    let wake = match input {
+        CustomSnoozeInput::Duration { amount, unit } => {
+            let amount: f64 = amount.trim().parse().ok().filter(|value: &f64| value.is_finite() && *value > 0.0)?;
+            let unit_ms = match unit {
+                DurationUnit::Minutes => MINUTE_MS,
+                DurationUnit::Hours => HOUR_MS,
+                DurationUnit::Days => DAY_MS,
+            } as f64;
+            let wake = now as f64 + amount * unit_ms;
+            // JS Dates end at ±8.64e15 ms; beyond that the input is invalid.
+            (wake.abs() <= 8.64e15).then_some(wake.round() as Ms)?
+        }
+        CustomSnoozeInput::Date { date, time } => {
+            let [year, month, day] = fixed_digits(date, &[4, 2, 2])?[..] else { return None };
+            let [hour, minute] = fixed_digits(time, &[2, 2])?[..] else { return None };
+            let wake = from_local(year, month, day, hour, minute, zone);
+            let local = to_local(wake, zone);
+            ((local.year, local.month, local.day, local.hour, local.minute) == (year, month, day, hour, minute)).then_some(wake)?
+        }
+    };
+    (wake > now).then_some(wake)
+}
+
+/// `localSnoozeDate` and `localSnoozeTime`: the dialog's prefilled fields.
+pub fn local_snooze_fields(at: Ms, zone: &dyn Zone) -> (String, String) {
+    let local = to_local(at, zone);
+    (format!("{:04}-{:02}-{:02}", local.year, local.month, local.day), format!("{:02}:{:02}", local.hour, local.minute))
+}

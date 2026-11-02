@@ -16,6 +16,7 @@ use crate::keymap::{
     JumpToThread9, NextThread, PinThread, PreviousThread, SettleThread, ToggleCommandPalette, ToggleSidebar, UndoThreadAction, Unimplemented,
 };
 use crate::palette::CommandPalette;
+use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
 use crate::theme::{hsla, palette};
 use crate::thread_view::ThreadView;
@@ -33,6 +34,7 @@ pub struct Workspace {
     menu: Entity<ContextMenu>,
     dialog: Entity<ConfirmDialog>,
     palette: Entity<CommandPalette>,
+    snooze: Entity<SnoozeDialog>,
     _subscription: Subscription,
 }
 
@@ -41,7 +43,8 @@ impl Workspace {
         let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
         let dialog = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
         let palette = cx.new(|cx| CommandPalette::new(state.clone(), window, cx));
-        let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), menu.clone(), dialog.clone(), window, cx));
+        let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+        let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
@@ -51,7 +54,7 @@ impl Workspace {
                 cx.notify();
             }
         });
-        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, _subscription: subscription }
+        Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, _subscription: subscription }
     }
 
     fn render_titlebar(&self, cx: &App) -> impl IntoElement {
@@ -168,6 +171,7 @@ impl Render for Workspace {
             .child(self.render_sidebar_toggle(cx))
             .child(self.menu.clone())
             .child(self.dialog.clone())
+            .child(self.snooze.clone())
             .child(self.palette.clone())
             .children(toast.map(|toast| toast.render(cx)))
             .into_any_element()

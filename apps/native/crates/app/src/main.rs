@@ -9,6 +9,7 @@ mod menus;
 mod new_thread;
 mod palette;
 mod sidebar;
+mod snooze_dialog;
 mod theme;
 mod thread_view;
 mod toast;

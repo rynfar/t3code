@@ -621,3 +621,42 @@ fn search_ranks_title_matches_before_branch_matches() {
     assert_eq!(search_titles(&model, "menu", iso(NOW)), ["b", "a"]);
     assert!(search_titles(&model, "  ", iso(NOW)).is_empty());
 }
+
+/// America/Los_Angeles around the 2027-03-14 spring-forward.
+struct LosAngeles;
+
+impl Zone for LosAngeles {
+    fn offset_seconds_at(&self, utc_ms: Ms) -> i64 {
+        if utc_ms >= iso("2027-03-14T10:00:00.000Z") { -7 * 3600 } else { -8 * 3600 }
+    }
+}
+
+#[test]
+fn custom_snooze_rejects_invalid_or_past_calendar_input() {
+    let now = local(2026, 9, 14, 14, 30);
+    for (date, time) in [("2026-09-14", "14:30"), ("2027-02-29", "09:00"), ("2026-09-15", "24:00"), ("2026-9-15", "09:00")] {
+        assert_eq!(resolve_custom_snooze(&CustomSnoozeInput::Date { date, time }, now, &FixedZone(0)), None, "{date} {time}");
+    }
+    assert_eq!(resolve_custom_snooze(&CustomSnoozeInput::Date { date: "2026-09-15", time: "09:00" }, now, &FixedZone(0)), Some(local(2026, 9, 15, 9, 0)));
+    assert_eq!(local_snooze_fields(local(2026, 9, 15, 9, 5), &FixedZone(0)), ("2026-09-15".to_owned(), "09:05".to_owned()));
+}
+
+#[test]
+fn custom_snooze_resolves_durations_from_the_confirmation_time() {
+    let confirmed = local(2026, 9, 14, 14, 35);
+    for (unit, amount, elapsed) in [(DurationUnit::Minutes, "45", 45 * MINUTE_MS), (DurationUnit::Hours, "1.5", 90 * MINUTE_MS), (DurationUnit::Days, "2", 48 * HOUR_MS)] {
+        assert_eq!(resolve_custom_snooze(&CustomSnoozeInput::Duration { amount, unit }, confirmed, &FixedZone(0)), Some(confirmed + elapsed));
+    }
+    for amount in ["0", "NaN", "1e300", "-1", ""] {
+        assert_eq!(resolve_custom_snooze(&CustomSnoozeInput::Duration { amount, unit: DurationUnit::Hours }, confirmed, &FixedZone(0)), None, "{amount}");
+    }
+}
+
+#[test]
+fn custom_snooze_rejects_the_spring_gap_and_keeps_days_at_24_hours() {
+    let input = CustomSnoozeInput::Date { date: "2027-03-14", time: "02:30" };
+    assert_eq!(resolve_custom_snooze(&input, iso("2027-03-01T00:00:00Z"), &LosAngeles), None);
+    let before = from_local(2027, 3, 13, 12, 0, &LosAngeles);
+    let wake = resolve_custom_snooze(&CustomSnoozeInput::Duration { amount: "1", unit: DurationUnit::Days }, before, &LosAngeles);
+    assert_eq!(wake, Some(from_local(2027, 3, 14, 13, 0, &LosAngeles)));
+}

@@ -22,6 +22,7 @@ use t3_core::sidebar::time::{MINUTE_MS, Ms};
 use crate::app_state::{AppEvent, AppState};
 use crate::context_menu::{ContextMenu, ContextMenuEvent};
 use crate::dialog::ConfirmDialog;
+use crate::snooze_dialog::SnoozeDialog;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::workspace::TITLEBAR_HEIGHT;
@@ -46,7 +47,14 @@ pub struct SidebarPane {
 }
 
 impl SidebarPane {
-    pub fn new(state: Entity<AppState>, menu: Entity<ContextMenu>, dialog: Entity<ConfirmDialog>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        menu: Entity<ContextMenu>,
+        dialog: Entity<ConfirmDialog>,
+        snooze: Entity<SnoozeDialog>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscriptions = vec![
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
@@ -69,6 +77,7 @@ impl SidebarPane {
             }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
                 ContextMenuEvent::Rename(thread_id) => this.start_rename(thread_id, window, cx),
+                ContextMenuEvent::CustomSnooze(thread_id) => snooze.update(cx, |snooze, cx| snooze.open(thread_id, window, cx)),
                 ContextMenuEvent::Delete(thread_id) => {
                     let Some(title) = this.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
                     let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
