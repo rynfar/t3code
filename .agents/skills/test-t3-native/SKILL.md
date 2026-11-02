@@ -23,6 +23,11 @@ node apps/server/src/bin.ts pair --base-dir "$PWD/.t3"   # check `--help` if fla
 
 Never print or commit the token. Never consume the developer's own pairing links.
 
+Don't start the server with `--auto-bootstrap-project-from-cwd`: it registers the checkout you
+started it from as a project, and anything that writes (git actions, worktree launches, file
+saves, rewind/revert) then edits that checkout. For write tests, `git init` a scratch repo under
+the scratchpad, add it as a project, test there, and remove it afterwards.
+
 ## 2. Build and launch
 
 ```sh
