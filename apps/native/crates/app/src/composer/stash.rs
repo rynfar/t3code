@@ -89,6 +89,7 @@ impl Composer {
             id: uuid_v4(),
             created_at: now_ms(),
             threads: Draft::saved_threads(self.mentions(&target), &prompt),
+            terminals: Draft::saved_terminals(self.terminals_for(&target), &prompt),
             attachments: attachments.iter().filter_map(SavedAttachment::of).collect(),
             prompt,
         };
@@ -131,6 +132,7 @@ impl Composer {
             }
         }
         self.seed_mentions(&target, threads);
+        self.seed_terminals(&target, entry.terminals.clone());
         let prompt = rules::merge_prompt(&self.prompt(cx), &entry.prompt);
         self.set_prompt(&prompt, window, cx);
         let end = prompt.len();

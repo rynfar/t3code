@@ -49,6 +49,8 @@ pub enum AppEvent {
     SidebarSelection,
     /// A prompt is waiting for the composer (`take_composer_restore`).
     ComposerRestore,
+    /// A terminal selection is waiting for the composer (`take_terminal_context`).
+    ComposerTerminalContext,
     /// A side subscription (side chat tab, child approval) changed, or an action on one did.
     SideThread,
 }
@@ -84,6 +86,8 @@ pub struct AppState {
     select_when_listed: Option<String>,
     /// A prompt handed back to the composer for a thread, as "Edit from here" restores one.
     composer_restore: Option<(String, String)>,
+    /// A terminal selection added to a thread's chat, as the drawer hands it over.
+    composer_terminal_context: Option<(String, t3_core::composer::context::TerminalSelection)>,
     client: Option<ClientHandle>,
     /// Counts clients started, so state tied to one never outlives a switch to the next.
     connection: u64,
@@ -122,6 +126,7 @@ impl AppState {
             side_threads: Default::default(),
             select_when_listed: None,
             composer_restore: None,
+            composer_terminal_context: None,
             client: None,
             connection: 0,
             runtime,
@@ -160,6 +165,7 @@ impl AppState {
         self.draft_project = None;
         self.pull_requests_open = false;
         self.composer_mentions.clear();
+        self.composer_terminal_context = None;
         self.last_error = None;
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::Selection);
@@ -465,6 +471,19 @@ impl AppState {
 
     pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<String> {
         if self.composer_restore.as_ref().is_some_and(|(thread, _)| thread == thread_id) { self.composer_restore.take().map(|(_, prompt)| prompt) } else { None }
+    }
+
+    /// Hands a terminal selection to the composer of `thread_id` ("Add to chat").
+    pub fn add_terminal_context(&mut self, thread_id: &str, selection: t3_core::composer::context::TerminalSelection, cx: &mut Context<Self>) {
+        self.composer_terminal_context = Some((thread_id.to_owned(), selection));
+        cx.emit(AppEvent::ComposerTerminalContext);
+    }
+
+    pub fn take_terminal_context(&mut self, thread_id: &str) -> Option<t3_core::composer::context::TerminalSelection> {
+        match &self.composer_terminal_context {
+            Some((thread, _)) if thread == thread_id => self.composer_terminal_context.take().map(|(_, selection)| selection),
+            _ => None,
+        }
     }
 
     pub(crate) fn client_handle(&self) -> Option<ClientHandle> {

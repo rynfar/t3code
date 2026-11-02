@@ -770,7 +770,7 @@ pub fn search_key(trigger: &Trigger) -> String {
 
 // --- Thread references (`composerContextReferences.ts`) ---
 
-const CONTEXT_HREF_PREFIX: &str = "t3-context://v1/";
+pub const CONTEXT_HREF_PREFIX: &str = "t3-context://v1/";
 pub const CONTEXT_LABEL_MAX_CHARS: usize = 200;
 
 /// The digest that tells apart producer ids sharing a truncated slug.
@@ -948,7 +948,7 @@ pub fn title_text(text: &str) -> String {
 
 /// `buildMessageContext` for thread references alone.
 pub fn message_context(text: &str, threads: &[ThreadContext]) -> Option<Value> {
-    super::attachments::message_context(text, threads, &[])
+    super::attachments::message_context(text, threads, &[], &[])
 }
 
 #[cfg(test)]

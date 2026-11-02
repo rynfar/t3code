@@ -8,6 +8,7 @@ use gpui::{App, Context, Window};
 use serde_json::Value;
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
+use t3_core::composer::context::{ExpiredNotice, TerminalSend, expired_toast_copy};
 use t3_core::composer::menu::SlashCommand;
 use t3_core::composer::{self as rules, FollowUpBehavior, SubmitIntent};
 use t3_core::model::ModelSelection;
@@ -55,11 +56,17 @@ impl Composer {
             self.save_queued_edit(window, cx);
             return;
         }
-        let text = self.prompt(cx).trim().to_owned();
+        let prompt = self.prompt(cx);
         let staged = self.staged_attachments();
-        if text.is_empty() && staged.is_empty() {
+        // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
+        let terminals = TerminalSend::of(&prompt, self.current_terminals());
+        if !terminals.has_content(staged.len(), self.linked_threads(&prompt)) {
+            if terminals.expired > 0 {
+                self.expired_toast(terminals.expired, ExpiredNotice::Empty, cx);
+            }
             return;
         }
+        let text = terminals.text;
         if let Some(reason) = attachments::send_block_reason(&staged) {
             self.error = Some(reason);
             cx.notify();
@@ -80,11 +87,21 @@ impl Composer {
             return;
         }
         let outgoing = self.outgoing(text, &staged);
+        if terminals.expired > 0 {
+            self.expired_toast(terminals.expired, ExpiredNotice::Omitted, cx);
+        }
         match self.snapshot.target.clone() {
             Some(Target::Draft(project_id)) => self.launch(project_id, outgoing, intent, window, cx),
             Some(Target::Thread(thread_id)) => self.send(thread_id, outgoing, intent, window, cx),
             None => {}
         }
+    }
+
+    /// `buildExpiredTerminalContextToastCopy` as a warning.
+    fn expired_toast(&self, count: usize, notice: ExpiredNotice, cx: &mut Context<Self>) {
+        let (title, description) = expired_toast_copy(count, notice);
+        let toast = Toast::new(ToastKind::Warning, title).description(description);
+        self.state.update(cx, |state, cx| state.show_toast(toast, cx));
     }
 
     /// `sideChatDisabledReason` for this composer; a side chat's own composer cannot start one.

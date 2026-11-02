@@ -1,5 +1,5 @@
 //! Per-thread composer drafts that survive thread switches and restarts: the prompt, the model,
-//! permission and mode choices, mentioned threads, and uploaded attachments. Ports the persisted
+//! permission and mode choices, mentioned threads, terminal excerpts, and uploaded attachments. Ports the persisted
 //! shape of `web/src/composerDraftStore.ts` (one entry per `composerTargetKey`, empty drafts
 //! dropped, writes debounced by `COMPOSER_PERSIST_DEBOUNCE_MS`). Attachments persist only once
 //! uploaded: their server copy outlives a restart (pending uploads are kept a day), their bytes
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::attachments::{Attachment, AttachmentKind, Upload};
+use super::context::TerminalContext;
 use super::menu::ThreadContext;
 use crate::model::ModelSelection;
 use crate::server_config::{InteractionMode, RuntimeMode};
@@ -88,6 +89,8 @@ pub struct Draft {
     pub runtime_mode: Option<RuntimeMode>,
     pub interaction_mode: Option<InteractionMode>,
     pub threads: Vec<SavedThread>,
+    /// Terminal excerpts the prompt links, with their text (`PersistedTerminalContextDraft`).
+    pub terminals: Vec<TerminalContext>,
     pub attachments: Vec<SavedAttachment>,
     pub updated_at: i64,
 }
@@ -104,6 +107,17 @@ impl Draft {
 
     pub fn thread_contexts(&self) -> Vec<ThreadContext> {
         self.threads.iter().map(|thread| ThreadContext::new(&thread.environment_id, &thread.thread_id, &thread.title)).collect()
+    }
+
+    /// The excerpts a draft keeps: those its prompt links.
+    pub fn saved_terminals(terminals: &[TerminalContext], prompt: &str) -> Vec<TerminalContext> {
+        super::context::referenced(prompt, terminals).into_iter().cloned().collect()
+    }
+
+    /// The prompt as restored: drafts from before inline links get their excerpts linked
+    /// (`migrateLegacyTerminalContextPlaceholders`).
+    pub fn restored_prompt(&self) -> String {
+        super::context::migrate_legacy_placeholders(&self.prompt, &self.terminals)
     }
 
     pub fn saved_threads(threads: &[ThreadContext], prompt: &str) -> Vec<SavedThread> {

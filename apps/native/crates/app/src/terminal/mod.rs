@@ -3,6 +3,7 @@
 //! and every pure rule live in `t3_core::terminal`. The `terminal.*` commands reach these
 //! actions through `keymap` (the web's `mod+j`, and `mod+n`/`mod+d`/`mod+shift+d`/`mod+w` while a
 //! terminal is focused); the clipboard keys the web's surface handles itself are bound here.
+//! "Add to chat" hands a selection to the thread's composer as a terminal excerpt.
 
 mod colors;
 mod drawer;
@@ -26,7 +27,7 @@ use crate::theme::{hsla, palette};
 
 actions!(
     terminal,
-    [ToggleTerminal, NewTerminal, SplitTerminal, SplitTerminalVertical, CloseTerminal, Copy, Paste, SelectAll, Clear, JumpToLatest]
+    [ToggleTerminal, NewTerminal, SplitTerminal, SplitTerminalVertical, CloseTerminal, Copy, Paste, SelectAll, Clear, JumpToLatest, AddToChat]
 );
 
 const CONTEXT: &str = "Terminal";

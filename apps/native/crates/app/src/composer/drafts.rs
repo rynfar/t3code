@@ -1,5 +1,5 @@
 //! Per-thread drafts (`web/src/composerDraftStore.ts`): switching threads keeps each one's prompt,
-//! choices, mentioned threads and attachments, and the drafts are written under
+//! choices, mentioned threads, terminal excerpts and attachments, and the drafts are written under
 //! `T3_NATIVE_HOME` (atomically, debounced) so they survive a restart. The shape lives in
 //! `t3_core::composer::drafts`.
 
@@ -43,6 +43,7 @@ impl Composer {
                 Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode },
             );
             self.seed_mentions(&target, draft.thread_contexts());
+            self.seed_terminals(&target, draft.terminals.clone());
             self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect());
         }
         self.drafts.store = store;
@@ -52,6 +53,7 @@ impl Composer {
         let choices = self.choices.get(target).cloned().unwrap_or_default();
         Draft {
             threads: Draft::saved_threads(self.mentions(target), &prompt),
+            terminals: Draft::saved_terminals(self.terminals_for(target), &prompt),
             attachments: self.staged_for(target).iter().filter_map(|staged| SavedAttachment::of(&staged.attachment)).collect(),
             prompt,
             model_selection: choices.model,
@@ -115,7 +117,7 @@ impl Composer {
                 self.schedule_draft_save(cx);
             }
         }
-        let incoming = to.and_then(|to| self.drafts.store.get(&key(to))).map(|draft| draft.prompt.clone()).unwrap_or_default();
+        let incoming = to.and_then(|to| self.drafts.store.get(&key(to))).map(Draft::restored_prompt).unwrap_or_default();
         self.set_prompt(&incoming, window, cx);
         let end = incoming.len();
         self.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));

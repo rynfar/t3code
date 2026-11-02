@@ -1,5 +1,5 @@
 //! Prompt stash and prompt history. The stash (`web/src/promptStashStore.ts`, `useComposerStash.ts`,
-//! `ComposerStashMenu.tsx`) parks a prompt with its mentions and uploaded attachments under
+//! `ComposerStashMenu.tsx`) parks a prompt with its mentions, terminal excerpts and uploaded attachments under
 //! Mod+S, twenty deep, newest first. History (`composerPromptHistory.ts`) recalls what the user
 //! sent in this thread with Up and Down at the prompt's edges.
 
@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
+use super::context::TerminalContext;
 use super::drafts::{SavedAttachment, SavedThread};
 use super::menu::context_references;
 use crate::thread::ThreadProjection;
@@ -29,6 +30,8 @@ pub struct StashEntry {
     pub attachments: Vec<SavedAttachment>,
     #[serde(default)]
     pub threads: Vec<SavedThread>,
+    #[serde(default)]
+    pub terminals: Vec<TerminalContext>,
 }
 
 impl StashEntry {

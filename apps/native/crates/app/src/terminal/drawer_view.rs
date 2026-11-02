@@ -272,6 +272,8 @@ impl TerminalDrawer {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
+                    // A row centers its children, so the pane takes the row's height explicitly.
+                    .h_full()
                     .border_color(line)
                     .when(index > 0 && vertical, |this| this.border_t_1())
                     .when(index > 0 && !vertical, |this| this.border_l_1())

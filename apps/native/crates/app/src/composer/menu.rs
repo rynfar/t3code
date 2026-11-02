@@ -101,7 +101,7 @@ impl Composer {
         worktree.or_else(|| Some(state.shell.project(self.snapshot.project_id.as_deref()?)?.workspace_root.clone()))
     }
 
-    fn environment_id(&self, cx: &App) -> String {
+    pub(super) fn environment_id(&self, cx: &App) -> String {
         let config = self.state.read(cx).server_config.config.as_ref();
         config.map(|config| config.environment.environment_id.clone()).unwrap_or_else(|| t3_core::sidebar::ENVIRONMENT_ID.to_owned())
     }
@@ -429,11 +429,18 @@ impl Composer {
         self.focus(window, cx);
     }
 
-    /// The `context` a send to the current target carries: the threads its text still links,
-    /// then its attachments.
+    /// The `context` a send to the current target carries: the terminal excerpts and threads
+    /// its text still links, then its attachments.
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
-        t3_core::composer::attachments::message_context(text, threads, attachments)
+        t3_core::composer::attachments::message_context(text, threads, self.current_terminals(), attachments)
+    }
+
+    /// How many mentioned threads `text` links, which make a message sendable on their own.
+    pub(super) fn linked_threads(&self, text: &str) -> usize {
+        let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
+        let linked = rules::referenced_context_ids(text);
+        threads.iter().filter(|thread| linked.contains(&thread.context_id.as_str())).count()
     }
 
     pub(super) fn mentions(&self, target: &Target) -> &[ThreadContext] {
@@ -446,9 +453,10 @@ impl Composer {
         }
     }
 
-    /// Forgets a target's mentioned threads once its message went out.
+    /// Forgets a target's mentioned threads and terminal excerpts once its message went out.
     pub(super) fn clear_mentions(&mut self, target: &Target) {
         self.menu.threads.remove(target);
+        self.clear_terminals(target);
     }
 
     pub(super) fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

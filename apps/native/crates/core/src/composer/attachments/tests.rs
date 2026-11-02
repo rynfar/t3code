@@ -85,16 +85,29 @@ fn sends_carry_uploaded_attachments_and_their_records() {
     let pasted = Attachment { kind: AttachmentKind::File, pasted_text: true, id: "p1".into(), ..ready.clone() };
     assert_eq!(pasted.chat_attachment().unwrap()["source"], json!({ "_tag": "pasted-text" }));
     let thread = ThreadContext::new("env", "t1", "Other");
-    let text = format!("see {}", thread.reference());
-    let context = message_context(&text, &[thread], std::slice::from_ref(&ready)).unwrap();
+    let terminal = |id: &str, text: &str| crate::composer::context::TerminalContext {
+        id: id.into(),
+        thread_id: "t0".into(),
+        created_at: "2026-11-02T00:00:00.000Z".into(),
+        terminal_id: "term-1".into(),
+        terminal_label: "Terminal 1".into(),
+        line_start: 3,
+        line_end: 4,
+        text: text.into(),
+    };
+    // Unlinked excerpts (kept for undo) stay home; linked ones lead, as `buildMessageContext` orders them.
+    let (linked, unlinked) = (terminal("x1", "$ ls\nsrc"), terminal("x2", "other"));
+    let text = format!("see {} and {}", thread.reference(), linked.reference());
+    let context = message_context(&text, &[thread], &[unlinked, linked.clone()], std::slice::from_ref(&ready)).unwrap();
     let records = context["records"].as_array().unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0]["kind"], "thread");
-    assert_eq!(records[1], json!({
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0], linked.record());
+    assert_eq!(records[1]["kind"], "thread");
+    assert_eq!(records[2], json!({
         "version": 1, "kind": "image", "contextId": "image_a1", "label": "shot.png",
         "attachmentId": "att-1", "name": "shot.png", "mimeType": "image/png", "sizeBytes": 2048,
     }));
-    assert_eq!(message_context("plain", &[], &[]), None);
+    assert_eq!(message_context("plain", &[], &[], &[]), None);
 }
 
 #[test]

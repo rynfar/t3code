@@ -362,6 +362,7 @@ impl Render for Composer {
                                 .pt(px(16.))
                                 .pb(px(8.))
                                 .children(self.render_attachments(cx))
+                                .children(self.render_context_chips(cx))
                                 .child(Textarea::new(&self.input).appearance(false).line_height(px(22.75))),
                         )
                         .child(

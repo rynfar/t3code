@@ -97,6 +97,8 @@ const palettes = (await import(
 )) as {
   BUILT_IN_THEMES: readonly ThemeDefinition[];
   THEME_COLOR_ROLES: readonly string[];
+  T3_CODE_LIGHT_THEME_COLORS: Roles;
+  T3_CODE_DARK_THEME_COLORS: Roles;
 };
 
 function appThemeVariables(): ReadonlyMap<string, string> {
@@ -559,6 +561,229 @@ const usageTokens = (): ColorToken[] => {
   ];
 };
 
+// Context chip inks: `contextChipVariables` (`themePalette.ts`) solves each accent's OKLCH
+// lightness to read on the theme's surfaces at runtime, so this runs the same math per palette.
+// The default theme measures `getStandardPaintedThemeColors`; named themes their own roles.
+const CHIP_ACCENTS = "apps/web/src/lib/contextChipAccents.ts";
+const CHIP_KINDS = ["terminal", "thread", "environment"] as const;
+const culoriPackage = require.resolve("culori/package.json");
+const culoriVersion = (
+  JSON.parse(NodeFS.readFileSync(culoriPackage, "utf8")) as { version: string }
+).version;
+const culori = require("culori") as {
+  parse: (value: string) => object | undefined;
+  converter: (
+    mode: string,
+  ) => (color: object) => { l?: number; c?: number; h?: number; alpha?: number };
+};
+const culoriOklch = culori.converter("oklch");
+
+type ChipRgb = Readonly<{ r: number; g: number; b: number }>;
+type ChipLch = Readonly<{ L: number; C: number; h: number }>;
+
+const chipAccents = (() => {
+  const accents = new Map<string, string>();
+  for (const match of read(CHIP_ACCENTS).matchAll(/^\s*"?([a-z-]+)"?: "(oklch\([^"]+\))",$/gm))
+    accents.set(match[1]!, match[2]!);
+  for (const kind of CHIP_KINDS)
+    if (!accents.has(kind)) throw new Error(`No ${kind} accent in ${CHIP_ACCENTS}`);
+  return accents;
+})();
+
+const chipContrast = (() => {
+  const match = /const CONTEXT_CHIP_CONTRAST = (\d+(?:\.\d+)?);/.exec(read(WEB_PALETTE));
+  if (!match) throw new Error(`CONTEXT_CHIP_CONTRAST not found in ${WEB_PALETTE}`);
+  return Number(match[1]);
+})();
+
+// `STANDARD_WEB_PAINTED_COLORS`: what index.css paints over the shared standard palette.
+const standardPainted = (() => {
+  const source = read(WEB_PALETTE);
+  const start = source.indexOf("const STANDARD_WEB_PAINTED_COLORS");
+  const end = source.indexOf("};", start);
+  if (start < 0 || end < 0)
+    throw new Error(`STANDARD_WEB_PAINTED_COLORS not found in ${WEB_PALETTE}`);
+  const painted: Record<Appearance, Record<string, string>> = { light: {}, dark: {} };
+  for (const [, appearance, body] of source
+    .slice(start, end)
+    .matchAll(/(light|dark): \{([^}]*)\}/g))
+    for (const [, role, value] of body!.matchAll(/(\w+): "([^"]+)"/g))
+      painted[appearance as Appearance][role!] = value!;
+  return painted;
+})();
+
+function chipParse(value: string): { color: ChipLch; alpha: number } | null {
+  const input = value.trim();
+  const parsed = culori.parse(input);
+  if (!parsed) return null;
+  const color = culoriOklch(parsed);
+  const [L, C, h] = [color.l ?? 0, color.c ?? 0, color.h ?? 0];
+  const alpha = /\/\s*none\s*\)$/i.test(input) ? 0 : (color.alpha ?? 1);
+  if (![L, C, h, alpha].every(Number.isFinite)) return null;
+  return {
+    color: { L: Math.min(1, Math.max(0, L)), C: Math.max(0, C), h },
+    alpha: Math.min(1, Math.max(0, alpha)),
+  };
+}
+
+// `decodeThemeColors`: the standard palette is measured in its canonical OKLCH form.
+function chipCanonical(value: string): string {
+  const parsed = chipParse(value);
+  if (!parsed) throw new Error(`Unparseable theme color "${value}"`);
+  const format = (n: number, precision: number) =>
+    (Math.abs(n) < 10 ** -precision / 2 ? 0 : n)
+      .toFixed(precision)
+      .replace(/(?:\.0+|(?:(\.[0-9]*?)0+))$/, "$1");
+  const { color, alpha } = parsed;
+  const hue = color.C < 0.0000005 ? 0 : ((color.h % 360) + 360) % 360;
+  const body = `${format(color.L, 6)} ${format(color.C, 6)} ${format(hue, 3)}`;
+  return alpha < 1 ? `oklch(${body} / ${format(alpha, 4)})` : `oklch(${body})`;
+}
+
+function chipLinear({ L, C, h }: ChipLch): ChipRgb {
+  const hr = (h * Math.PI) / 180;
+  const [a, b] = [C * Math.cos(hr), C * Math.sin(hr)];
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+  return {
+    r: 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    g: -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    b: -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+  };
+}
+
+// `mapThemeOklchToSrgbGamut`: chroma bisected into sRGB, hue and lightness kept.
+function chipGamut(color: ChipLch): ChipLch {
+  const inGamut = (C: number) => {
+    const linear = chipLinear({ ...color, C });
+    return [linear.r, linear.g, linear.b].every((v) => v >= -0.0001 && v <= 1.0001);
+  };
+  if (inGamut(color.C)) return color;
+  let [low, high] = [0, color.C];
+  const resolution = 0.000001;
+  const steps = Math.max(
+    1,
+    Math.ceil(Math.log2(Math.max(color.C, resolution)) - Math.log2(resolution)),
+  );
+  for (let step = 0; step < steps; step += 1) {
+    const mid = (low + high) / 2;
+    if (inGamut(mid)) low = mid;
+    else high = mid;
+  }
+  return { ...color, C: low };
+}
+
+function chipRgb(color: ChipLch, round = true): ChipRgb {
+  const linear = chipLinear(chipGamut(color));
+  const channel = (v: number) => {
+    const c = v <= 0.0031308 ? v * 12.92 : 1.055 * v ** (1 / 2.4) - 0.055;
+    const srgb = Math.min(1, Math.max(0, c)) * 255;
+    return round ? Math.round(srgb) : srgb;
+  };
+  return { r: channel(linear.r), g: channel(linear.g), b: channel(linear.b) };
+}
+
+function chipLuminance({ r, g, b }: ChipRgb): number {
+  const linear = (v: number) => {
+    const n = v / 255;
+    return n <= 0.03928 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+function chipContrastRatio(first: ChipRgb, second: ChipRgb): number {
+  const [x, y] = [chipLuminance(first), chipLuminance(second)];
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+
+function chipSolve(
+  base: ChipLch,
+  against: readonly ChipRgb[],
+  minContrast: number,
+  direction: "lighter" | "darker",
+): ChipLch {
+  const contrastOf = (color: ChipLch) =>
+    Math.min(...against.map((surface) => chipContrastRatio(chipRgb(color), surface)));
+  let low = direction === "lighter" ? base.L : 0;
+  let high = direction === "lighter" ? 1 : base.L;
+  if (contrastOf(base) >= minContrast) return base;
+  for (let step = 0; step < 18; step += 1) {
+    const mid = (low + high) / 2;
+    const passes = contrastOf({ ...base, L: mid }) >= minContrast;
+    if (passes === (direction === "lighter")) high = mid;
+    else low = mid;
+  }
+  return { ...base, L: direction === "lighter" ? high : low };
+}
+
+const chipInkCache = new Map<string, ReadonlyMap<string, string>>();
+
+function chipInks(variant: Variant): ReadonlyMap<string, string> {
+  const key = `${variant.theme?.id ?? ""}:${variant.appearance}`;
+  const cached = chipInkCache.get(key);
+  if (cached) return cached;
+  const colors: Roles = themeRoles(variant) ?? {
+    ...Object.fromEntries(
+      Object.entries(
+        variant.appearance === "dark"
+          ? palettes.T3_CODE_DARK_THEME_COLORS
+          : palettes.T3_CODE_LIGHT_THEME_COLORS,
+      ).map(([role, value]) => [role, chipCanonical(value)]),
+    ),
+    ...standardPainted[variant.appearance],
+  };
+  const role = (name: string) => {
+    const value = colors[name];
+    if (value === undefined) throw new Error(`Theme role ${name} missing for context chips`);
+    return value;
+  };
+  const white: ChipRgb = { r: 255, g: 255, b: 255 };
+  const black: ChipRgb = { r: 0, g: 0, b: 0 };
+  const parsedCanvas = chipParse(role("canvas"));
+  const canvas = parsedCanvas ? chipRgb(parsedCanvas.color, false) : white;
+  const onCanvas = (value: string): ChipRgb => {
+    const parsed = chipParse(value);
+    if (!parsed) return canvas;
+    const top = chipRgb(parsed.color, false);
+    const mixChannel = (from: number, to: number) => from + (to - from) * parsed.alpha;
+    return {
+      r: mixChannel(canvas.r, top.r),
+      g: mixChannel(canvas.g, top.g),
+      b: mixChannel(canvas.b, top.b),
+    };
+  };
+  const isDark = (color: ChipRgb) => chipLuminance(color) < 0.179;
+  const surfaces = [canvas, onCanvas(role("surface")), onCanvas(role("surfaceRaised"))];
+  if (isDark(onCanvas(role("messageSurface"))) === isDark(canvas))
+    surfaces.push(onCanvas(role("messageSurface")));
+  const onSurfaces = (color: ChipRgb) =>
+    Math.min(...surfaces.map((surface) => chipContrastRatio(color, surface)));
+  const [blackContrast, whiteContrast] = [onSurfaces(black), onSurfaces(white)];
+  const direction = blackContrast >= whiteContrast ? "darker" : "lighter";
+  const minContrast = Math.min(chipContrast, Math.max(blackContrast, whiteContrast));
+  const inks = new Map<string, string>();
+  const sources: (readonly [string, string])[] = [
+    ...CHIP_KINDS.map((kind) => [kind, chipAccents.get(kind)!] as const),
+    ["invalid", role("errorForeground")],
+  ];
+  for (const [name, accent] of sources) {
+    const parsed = chipParse(accent);
+    if (!parsed) throw new Error(`Unparseable context chip accent "${accent}"`);
+    const { r, g, b } = chipRgb(chipSolve(parsed.color, surfaces, minContrast, direction));
+    inks.set(name, `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`);
+  }
+  chipInkCache.set(key, inks);
+  return inks;
+}
+
+const chipTokens = (): ColorToken[] =>
+  [...CHIP_KINDS, "invalid" as const].map((kind) => ({
+    name: `context_chip_${kind}`,
+    web: `--context-chip-${kind}`,
+    css: ({ variant }) => chipInks(variant).get(kind)!,
+  }));
+
 // What a changed diff row paints: Pierre mixes its line color `in lab` over the code surface
 // (lines 88%/80%, gutter 91%/85%) toward the override `diffRendering.ts` sets
 // (`--diffs-bg-{kind}-override` and `--diffs-bg-{kind}-number-override`). Inside the viewer
@@ -787,6 +1012,7 @@ const COLOR_TOKENS: readonly ColorToken[] = [
   ...statusHue("plan", "violet", 90),
   ...statusHue("completed", "emerald", 90),
   ...usageTokens(),
+  ...chipTokens(),
   {
     name: "glass_surface",
     web: "@utility surface-glass",
@@ -1221,7 +1447,9 @@ function renderRust(): string {
     SETTINGS,
     USAGE_PROVIDERS,
     USAGE_BREAKDOWN,
+    CHIP_ACCENTS,
     `tailwindcss@${tailwindVersion}/theme.css`,
+    `culori@${culoriVersion}`,
     `@pierre/highlights@${highlightsVersion}`,
   ];
   lines.push(

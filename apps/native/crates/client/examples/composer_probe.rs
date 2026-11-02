@@ -1,9 +1,10 @@
 //! Headless check of the composer menus against a live server: runs the `@` path search and the
 //! `/` and `$` lists for a project, then (with `--send`) launches a thread whose first message
-//! mentions a file and an existing thread, and prints the user message the server recorded.
+//! mentions a file and an existing thread and links a terminal excerpt, prints the user message
+//! the server recorded, and archives the thread (`--keep` leaves it).
 //!
 //!   cargo run -p t3-client --example composer_probe -- [--query <text>] [--project <id>]
-//!       [--provider <instance>] [--send [--image <png>]]
+//!       [--provider <instance>] [--send [--image <png>] [--keep]] [--cleanup <thread>]
 
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use t3_client::store;
 use t3_client::supervisor::{ClientEvent, start};
 use t3_core::commands::{self, LaunchThread, method};
 use t3_core::composer::attachments;
+use t3_core::composer::context::{TerminalContext, TerminalSelection};
 use t3_core::composer::menu::{self, SlashMenuOptions, ThreadContext, TriggerKind};
 use t3_core::model::ModelSelection;
 use t3_core::server_config::{InteractionMode, RuntimeMode, ServerConfigState};
@@ -77,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
     println!("$: {}", dollar.iter().map(|item| item.label.as_str()).collect::<Vec<_>>().join("  "));
     assert_eq!(trigger.kind, TriggerKind::Path);
 
+    if let Some(thread_id) = flag("--cleanup") {
+        return cleanup(&client, &thread_id).await;
+    }
     if let Some(thread_id) = flag("--queue") {
         return queue_probe(&client, &mut events, &thread_id, provider).await;
     }
@@ -90,7 +95,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(context) = &thread_context {
         text.push_str(&format!("and compare with {} ", context.reference()));
     }
-    let text = text.trim_end().to_owned();
+    let (thread_id, command_id, message_id) = (uuid(), uuid(), uuid());
+    let selection = TerminalSelection {
+        terminal_id: "term-1".into(),
+        terminal_label: "Terminal 1".into(),
+        line_start: 3,
+        line_end: 4,
+        text: "\r\n$ cargo test -p t3-core\r\ntest result: ok\n".into(),
+    };
+    let terminal = TerminalContext::new(selection, &uuid(), &thread_id, "2026-11-02T00:00:00.000Z").expect("an excerpt");
+    let edit = t3_core::composer::context::add_terminal_context(&text, text.len(), &[], &terminal).expect("a link");
+    let text = edit.apply(&text).trim_end().to_owned();
     // `--image <png>` uploads it and sends it with the message.
     let mut staged = Vec::new();
     if let Some(path) = flag("--image") {
@@ -113,11 +128,10 @@ async fn main() -> anyhow::Result<()> {
         attachment.upload = attachments::Upload::Ready { attachment_id };
         staged.push(attachment);
     }
-    let context = attachments::message_context(&text, thread_context.as_slice(), &staged);
+    let context = attachments::message_context(&text, thread_context.as_slice(), std::slice::from_ref(&terminal), &staged);
     let chat_attachments = attachments::chat_attachments(&staged).unwrap_or_default();
     let model = provider.models.first().map(|model| model.slug.clone()).unwrap_or_default();
     let selection = ModelSelection { instance_id: provider.instance_id.clone(), model, options: None };
-    let (thread_id, command_id, message_id) = (uuid(), uuid(), uuid());
     let payload = commands::launch_thread(&LaunchThread {
         command_id: &command_id,
         thread_id: &thread_id,
@@ -145,11 +159,25 @@ async fn main() -> anyhow::Result<()> {
             let text = value.as_str().unwrap_or_default();
             if let Some(start) = text.find("UserMessage") {
                 println!("recorded: {}", &text[start..text.len().min(start + 2400)]);
+                if !args.iter().any(|a| a == "--keep") {
+                    cleanup(&client, &thread_id).await?;
+                }
                 return Ok(());
             }
         }
     }
     println!("no user message seen; {}", json!({ "threadId": thread_id }));
+    if !args.iter().any(|a| a == "--keep") {
+        cleanup(&client, &thread_id).await?;
+    }
+    Ok(())
+}
+
+/// Stops whatever the probe's thread runs and archives it (`--cleanup <thread>` alone).
+async fn cleanup(client: &t3_client::supervisor::ClientHandle, thread_id: &str) -> anyhow::Result<()> {
+    let stopped = client.request(method::DISPATCH_COMMAND, commands::stop_thread(&uuid(), thread_id)).await;
+    let archived = client.request(method::DISPATCH_COMMAND, t3_core::thread_actions::archive(&uuid(), thread_id)).await;
+    println!("stopped {thread_id}: {}, archived: {}", stopped.is_ok(), archived.is_ok());
     Ok(())
 }
 

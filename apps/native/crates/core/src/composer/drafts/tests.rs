@@ -31,13 +31,25 @@ fn the_store_round_trips_and_skips_bad_entries() {
         upload: Upload::Ready { attachment_id: "att-1".into() },
     };
     let thread = ThreadContext::new("env", "t2", "Other");
-    let prompt = format!("see {}", thread.reference());
+    let excerpt = TerminalContext {
+        id: "x1".into(),
+        thread_id: "t1".into(),
+        created_at: "2026-11-02T00:00:00.000Z".into(),
+        terminal_id: "term-1".into(),
+        terminal_label: "Terminal 1".into(),
+        line_start: 2,
+        line_end: 3,
+        text: "$ cargo test\nok".into(),
+    };
+    let unlinked = TerminalContext { id: "x2".into(), ..excerpt.clone() };
+    let prompt = format!("see {} and {}", thread.reference(), excerpt.reference());
     let full = Draft {
         prompt: prompt.clone(),
         model_selection: Some(ModelSelection { instance_id: "codex".into(), model: "gpt-5".into(), options: None }),
         runtime_mode: Some(RuntimeMode::FullAccess),
         interaction_mode: Some(InteractionMode::Default),
         threads: Draft::saved_threads(&[thread.clone(), ThreadContext::new("env", "t3", "Unlinked")], &prompt),
+        terminals: Draft::saved_terminals(&[unlinked, excerpt.clone()], &prompt),
         attachments: vec![SavedAttachment::of(&attachment).unwrap()],
         updated_at: 7,
     };
@@ -49,6 +61,16 @@ fn the_store_round_trips_and_skips_bad_entries() {
     assert_eq!(restored.keys().count(), 1);
     assert_eq!(full.threads.len(), 1, "only threads the prompt still links are kept");
     assert_eq!(full.thread_contexts(), [thread]);
+    assert_eq!(full.terminals, std::slice::from_ref(&excerpt), "excerpts keep their text, and only linked ones are kept");
+    assert_eq!(store.to_value()["drafts"]["thread:t1"]["terminals"][0]["terminalLabel"], "Terminal 1");
+    // An entry from before excerpts kept their text restores as expired; a placeholder becomes its link.
+    let mut legacy = store.to_value();
+    legacy["drafts"]["thread:t1"]["prompt"] = json!("look \u{FFFC}");
+    legacy["drafts"]["thread:t1"]["terminals"][0].as_object_mut().unwrap().remove("text");
+    let legacy = DraftStore::from_value(Some(&legacy));
+    let legacy = legacy.get(&thread_key("t1")).unwrap();
+    assert!(legacy.terminals[0].is_expired());
+    assert_eq!(legacy.restored_prompt(), format!("look {}", excerpt.reference()));
     assert_eq!(full.attachments[0].restore(), attachment);
     let uploading = Attachment { upload: Upload::Uploading, ..attachment };
     assert_eq!(SavedAttachment::of(&uploading), None, "bytes do not survive a restart");
