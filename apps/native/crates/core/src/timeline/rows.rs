@@ -159,11 +159,17 @@ pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<Arc<Timeline
     rows
 }
 
-fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
-    let entries = settle_superseded_reasoning(input.entries, cache);
-    let entries = entries.as_slice();
-    let activity = input.activity;
-    let pending = &activity.pending_approval_ids;
+struct FoldSetup {
+    unsettled: Option<String>,
+    terminal_ids: HashSet<String>,
+    itemized: HashSet<String>,
+    superseded: HashMap<String, super::folds::SupersededFold>,
+    active_runs: HashSet<String>,
+    runless: bool,
+    folds: HashMap<String, super::folds::TurnFold>,
+}
+
+fn fold_setup(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> FoldSetup {
     let is_working = activity.is_working;
     let unsettled = unsettled_run_id(activity);
     let terminal_ids = terminal_assistant_ids(entries);
@@ -196,6 +202,35 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             runless_active: runless,
         },
     );
+    FoldSetup { unsettled, terminal_ids, itemized, superseded, active_runs, runless, folds }
+}
+
+/// The fold hiding each entry, so find can open it: `timelineTurnFoldRunIdsByEntryId`, plus the
+/// superseded-attempt folds (entry id to attempt id).
+pub fn fold_membership(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> (HashMap<String, String>, HashMap<String, String>) {
+    let setup = fold_setup(entries, activity);
+    let mut runs = HashMap::new();
+    for fold in setup.folds.values() {
+        for id in &fold.hidden {
+            runs.insert(id.clone(), fold.run_id.clone());
+        }
+    }
+    let mut attempts = HashMap::new();
+    for fold in setup.superseded.values() {
+        for id in &fold.hidden {
+            attempts.insert(id.clone(), fold.attempt_id.clone());
+        }
+    }
+    (runs, attempts)
+}
+
+fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
+    let entries = settle_superseded_reasoning(input.entries, cache);
+    let entries = entries.as_slice();
+    let activity = input.activity;
+    let pending = &activity.pending_approval_ids;
+    let is_working = activity.is_working;
+    let FoldSetup { unsettled, terminal_ids, itemized, superseded, active_runs, runless, folds } = fold_setup(entries, activity);
 
     let mut collapsed: HashSet<String> = HashSet::new();
     let mut collapsed_members: HashSet<String> = HashSet::new();
@@ -556,6 +591,7 @@ fn push_work_group(
         RowKind::WorkToggle {
             run_id: refs.first().and_then(|w| w.run_id.clone()),
             group_id: group_id.clone(),
+            entries: visible.clone(),
             hidden_count: refs.len(),
             expanded,
             summary,

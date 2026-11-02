@@ -448,6 +448,10 @@ impl AppState {
             }
             ThreadAction::CopyThread => self.copy(actions::thread_reference(&thread.title, &thread.id), "Thread copied", Some(thread.title.clone()), cx),
             ThreadAction::CopyThreadId => self.copy(thread.id.clone(), "Thread ID copied", Some(thread.id.clone()), cx),
+            ThreadAction::Find => {
+                self.select_thread(thread_id, cx);
+                cx.dispatch_action(&crate::thread_view::FindInThread);
+            }
             _ => {}
         }
     }

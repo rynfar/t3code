@@ -19,7 +19,7 @@ use t3_core::turn_item::TurnItem;
 use crate::thread_view::ThreadView;
 use markdown::MarkdownStore;
 pub use notices::history_control;
-pub use parts::Clock;
+pub use parts::{Clock, ghost_icon_button, ghost_text_button};
 pub use timer::WorkingTimer;
 
 /// Disclosure state the user controls. Folds and groups feed row derivation; the rest only
@@ -60,6 +60,8 @@ pub struct RowEnv<'a> {
     /// Scroll state of each open work group's own virtualized list.
     pub group_lists: &'a RefCell<HashMap<String, ListState>>,
     pub working_timer: Option<&'a Entity<WorkingTimer>>,
+    /// The entry holding find's active match, tinted where it draws.
+    pub find_target: Option<&'a str>,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.
@@ -100,10 +102,35 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         RowKind::Event { item, subagents, resource_summary } => notices::event_row(id, item, subagents, *resource_summary, env, cx),
         RowKind::ProposedPlan(plan) => messages::plan_card(id, plan, env, markdown, cx),
     };
-    div().w_full().min_w_0().pb(px(bottom_space(row))).child(content).into_any_element()
+    let found = env.find_target.is_some_and(|target| holds(row, target));
+    div()
+        .w_full()
+        .min_w_0()
+        .pb(px(bottom_space(row)))
+        .child(if found { found_tint(content, cx) } else { content })
+        .into_any_element()
+}
+
+/// Whether the row draws `entry_id` itself (an open group tints only the member).
+fn holds(row: &TimelineRow, entry_id: &str) -> bool {
+    match &row.kind {
+        RowKind::Message { message, .. } => message.id == entry_id,
+        RowKind::Work { entries, expanded_group: false, .. } | RowKind::WorkLive { entries, .. } | RowKind::WorkToggle { entries, .. } => {
+            entries.iter().any(|entry| entry.id == entry_id)
+        }
+        RowKind::Event { item, subagents, .. } => item.id == entry_id || subagents.iter().any(|member| member.id == entry_id),
+        RowKind::ProposedPlan(_) => row.id == entry_id,
+        _ => false,
+    }
+}
+
+/// Find's active match: the row behind it takes the `search_match_background` tint.
+fn found_tint(content: AnyElement, cx: &Context<ThreadView>) -> AnyElement {
+    div().rounded(px(8.)).bg(crate::theme::hsla(crate::theme::palette(cx).search_match_background).opacity(0.45)).child(content).into_any_element()
 }
 
 /// One member of an open work group, drawn by the group's own virtualized list.
 pub fn render_group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
-    work::group_member(entry, env, markdown, cx)
+    let content = work::group_member(entry, env, markdown, cx);
+    if env.find_target == Some(entry.id.as_str()) { found_tint(content, cx) } else { content }
 }
