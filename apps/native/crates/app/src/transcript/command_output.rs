@@ -21,6 +21,8 @@ use crate::theme::{hsla, palette, rem};
 
 /// `FOLLOW_SLACK_PX`: a reader this close to the bottom keeps following new output.
 const FOLLOW_SLACK: f32 = 8.;
+/// `mono_frame`'s line: code size on a 1.625 line.
+const LINE_HEIGHT: f32 = crate::theme::metrics::DEFAULT_CODE_FONT_SIZE * 1.625;
 
 /// One open command row's subscription. Dropping it interrupts the stream.
 pub struct CommandOutputSlot {
@@ -52,10 +54,14 @@ impl CommandOutputSlot {
         }
     }
 
-    pub fn update(&mut self, status: CommandOutputStatus) {
+    /// Takes the newest output; returns whether the row's height may have changed.
+    pub fn update(&mut self, status: CommandOutputStatus) -> bool {
         // Measured against the last layout, before the new output lands: only a reader already
-        // at the bottom is pinned to it.
+        // at the bottom is pinned to it, and output that already filled the cap keeps it full.
         let following = f32::from(self.scroll.max_offset().y + self.scroll.offset().y) <= FOLLOW_SLACK;
+        let filled = self.scroll.max_offset().y > px(0.);
+        let visible_lines = f32::from(self.scroll.bounds().size.height) / LINE_HEIGHT;
+        let resized = !(filled && status.keeps_capped_height(&self.status, visible_lines));
         let changed = status.output.as_ref().map(|output| &output.text) != self.status.output.as_ref().map(|output| &output.text);
         self.status = status;
         if changed {
@@ -64,6 +70,7 @@ impl CommandOutputSlot {
         if following {
             self.scroll.scroll_to_bottom();
         }
+        resized
     }
 
     fn display(&self, output: &CommandOutput, dark: bool) -> Display {

@@ -112,6 +112,23 @@ impl CommandOutputStatus {
     }
 }
 
+impl CommandOutputStatus {
+    /// Whether the panel keeps its height going from `before` to `self` once the output filled
+    /// its capped scroller, which shows `visible_lines`: the same branch and notice, and at least
+    /// that many lines, so however they wrap the output still fills the cap.
+    pub fn keeps_capped_height(&self, before: &CommandOutputStatus, visible_lines: f32) -> bool {
+        match (before.panel(), self.panel()) {
+            (Panel::Output(old), Panel::Output(new)) => old.truncated == new.truncated && drawn_lines(&new.text) as f32 >= visible_lines,
+            _ => false,
+        }
+    }
+}
+
+/// Lines the panel draws: a final newline draws no empty line.
+fn drawn_lines(text: &str) -> usize {
+    text.matches('\n').count() + usize::from(!text.ends_with('\n'))
+}
+
 /// `formatEnvironmentQueryError`.
 pub fn error_message(message: &str) -> String {
     if message.trim().is_empty() { "The environment request failed.".to_owned() } else { message.to_owned() }
@@ -199,5 +216,17 @@ mod tests {
         let kept = CommandOutputStatus { output: output("hi", true), error: Some("lost".into()) };
         assert!(matches!(kept.panel(), Panel::Output(output) if &*output.text == "hi"));
         assert_eq!(error_message("  "), "The environment request failed.");
+    }
+
+    #[test]
+    fn a_filled_panel_keeps_its_height_until_its_lines_or_notice_change() {
+        let status = |text: &str, truncated: bool| CommandOutputStatus { output: Some(CommandOutput { text: Arc::from(text), truncated, running: true }), error: None };
+        let ten = "line\n".repeat(10);
+        let twelve = "line\n".repeat(12);
+        assert!(status(&twelve, false).keeps_capped_height(&status(&ten, false), 10.), "more lines past the cap draw the same height");
+        assert!(!status(&ten, false).keeps_capped_height(&status(&twelve, false), 10.5), "fewer lines than the cap holds may shrink it");
+        assert!(!status(&twelve, true).keeps_capped_height(&status(&ten, false), 10.), "the truncation notice adds a line");
+        let waiting = CommandOutputStatus { output: Some(CommandOutput { text: Arc::from(""), truncated: false, running: true }), error: None };
+        assert!(!status(&twelve, false).keeps_capped_height(&waiting, 10.), "the first output changes the branch");
     }
 }

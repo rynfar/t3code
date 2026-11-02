@@ -17,7 +17,7 @@ pub use limit_recovery::LimitRecoveryBanner;
 use gpui::{Context, Entity, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Window, actions, div, list, prelude::*, px};
 use t3_core::history::HistoryControl;
 use t3_core::timeline::{
-    EntriesCache, GET_TURN_ITEM, RowKind, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
+    EntriesCache, GET_TURN_ITEM, RowKind, open_command_items, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
     derive_rows, detail_request, detail_revision, needs_detail_fetch, fork_support, rows_equal, turn_diffs_by_message, update_entries,
 };
 use t3_core::diff::TurnDiffSummary;
@@ -188,7 +188,6 @@ impl ThreadView {
         self.sync_turn_diffs(cx);
         self.sync_status(cx);
         self.refresh_open_details(cx);
-        self.sync_command_outputs(cx);
         self.refresh_find_after_change(cx);
     }
 
@@ -240,6 +239,8 @@ impl ThreadView {
         let open: std::collections::HashSet<&str> =
             self.rows.iter().filter(|row| matches!(row.kind, RowKind::Work { expanded_group: true, .. })).map(|row| row.id.as_str()).collect();
         self.group_lists.borrow_mut().retain(|id, _| open.contains(id.as_str()));
+        // Folding or opening a group or turn changes which open commands are drawn.
+        self.sync_command_outputs(cx);
         cx.notify();
     }
 
@@ -354,15 +355,8 @@ impl ThreadView {
             self.remeasure_where(|row| matches!(row.kind, RowKind::Work { .. }));
             cx.notify();
         }
-        let wanted: HashMap<String, Arc<t3_core::turn_item::TurnItem>> = if streams && connection.is_some() {
-            self.ui
-                .expanded_entries
-                .iter()
-                .filter_map(|id| Some((id.clone(), self.find_entry(id)?.item.clone().filter(|item| streams_output(item))?)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let wanted: HashMap<String, Arc<t3_core::turn_item::TurnItem>> =
+            if streams && connection.is_some() { open_command_items(&self.rows, &self.ui.expanded_entries).into_iter().collect() } else { HashMap::new() };
         let target = |item: &t3_core::turn_item::TurnItem| (item.thread_id.clone(), item.id.clone(), connection);
         self.command_outputs.retain(|id, slot| wanted.get(id).is_some_and(|item| slot.target == target(item)));
         let missing: Vec<(String, Arc<t3_core::turn_item::TurnItem>)> = wanted.into_iter().filter(|(id, _)| !self.command_outputs.contains_key(id)).collect();
@@ -380,11 +374,11 @@ impl ThreadView {
                 while status.changed().await.is_ok() {
                     let next = status.borrow_and_update().clone();
                     let updated = this.update(cx, |view, cx| {
-                        if let Some(slot) = view.command_outputs.get_mut(&key) {
-                            slot.update(next);
+                        let Some(slot) = view.command_outputs.get_mut(&key) else { return };
+                        if slot.update(next) {
                             view.remeasure_entry(&key);
-                            cx.notify();
                         }
+                        cx.notify();
                     });
                     if updated.is_err() {
                         return;
@@ -395,12 +389,17 @@ impl ThreadView {
         }
     }
 
+    /// Remeasures the row that draws `key`, and only the open group list holding it.
     fn remeasure_entry(&self, key: &str) {
-        self.remeasure_where(|row| {
-            row.id.ends_with(key) || matches!(&row.kind, RowKind::Work { entries, .. } if entries.iter().any(|e| e.id == key))
-        });
-        for list in self.group_lists.borrow().values() {
-            list.remeasure();
+        let offset = self.header_count();
+        let lists = self.group_lists.borrow();
+        for (index, row) in self.rows.iter().enumerate() {
+            if row.id.ends_with(key) || matches!(&row.kind, RowKind::Work { entries, .. } if entries.iter().any(|e| e.id == key)) {
+                self.list.remeasure_items(offset + index..offset + index + 1);
+                if let Some(list) = lists.get(&row.id) {
+                    list.remeasure();
+                }
+            }
         }
     }
 

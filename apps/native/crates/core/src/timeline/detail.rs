@@ -2,8 +2,13 @@
 //! `turnItemNeedsDetailFetch`, `turnItemDetailRevision` and `commandOutputText` from
 //! `packages/client-runtime/src/work-log/itemDetail.ts`.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
+use super::presentation::work_entry_is_visible_in_group;
+use super::{RowKind, TimelineRow};
 use crate::turn_item::{TurnItem, TurnItemKind};
 use crate::wire;
 
@@ -62,4 +67,21 @@ pub fn command_output_text(output: &str) -> Option<String> {
     };
     let text = [stdout, stderr].into_iter().filter(|part| !part.trim().is_empty()).collect::<Vec<_>>().join("\n");
     (!text.is_empty()).then_some(text)
+}
+
+/// The open command entries the rows draw, with their items: where the web mounts
+/// `CommandOutputPanel`. Entries in a folded group or turn are not drawn, so they get none.
+pub fn open_command_items(rows: &[Arc<TimelineRow>], expanded: &HashSet<String>) -> Vec<(String, Arc<TurnItem>)> {
+    rows.iter()
+        .filter_map(|row| match &row.kind {
+            RowKind::Work { entries, expanded_group, .. } => Some((entries, *expanded_group)),
+            _ => None,
+        })
+        .flat_map(|(entries, expanded_group)| entries.iter().filter(move |entry| work_entry_is_visible_in_group(entry, expanded_group)))
+        .filter(|entry| expanded.contains(&entry.id))
+        .filter_map(|entry| {
+            let item = entry.item.clone()?;
+            matches!(item.kind, TurnItemKind::CommandExecution { .. }).then(|| (entry.id.clone(), item))
+        })
+        .collect()
 }
