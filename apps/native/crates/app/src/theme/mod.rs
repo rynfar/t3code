@@ -126,15 +126,25 @@ fn halves(theme: &ThemePreference) -> (&'static Palette, &'static Palette) {
     (light, dark)
 }
 
+/// The first installed family of the web's `--font-mono` stack (`index.css`): SF Mono is not an
+/// installed family on every Mac, and an unknown family falls back to the proportional UI font.
+const MONO_STACK: &[&str] = &["SF Mono", "SFMono-Regular", "Menlo", "Consolas", "Liberation Mono"];
+
+fn mono_family(cx: &App) -> &'static str {
+    let installed = cx.text_system().all_font_names();
+    MONO_STACK.iter().copied().find(|family| installed.iter().any(|name| name == family)).unwrap_or(MONO_STACK[0])
+}
+
 fn install(cx: &mut App) {
     let dark = is_dark(cx);
+    let mono = mono_family(cx);
     let preferences = preferences(cx).clone();
     let (light_palette, dark_palette) = halves(&preferences.theme);
     cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }));
     let size = preferences.interface_font_size;
     let theme = Theme::global_mut(cx);
-    theme.light_theme = Rc::new(config("T3 Code Light", light_palette, false, size));
-    theme.dark_theme = Rc::new(config("T3 Code Dark", dark_palette, true, size));
+    theme.light_theme = Rc::new(config("T3 Code Light", light_palette, false, size, mono));
+    theme.dark_theme = Rc::new(config("T3 Code Dark", dark_palette, true, size, mono));
     theme.font_size = px(size);
 }
 
@@ -149,7 +159,7 @@ fn hex(color: u32) -> String {
     format!("#{color:08x}")
 }
 
-fn config(name: &str, p: &Palette, dark: bool, font_size: f32) -> ThemeConfig {
+fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str) -> ThemeConfig {
     let colors: serde_json::Map<String, serde_json::Value> = [
         ("background", hex(p.background)),
         ("foreground", hex(p.foreground)),
@@ -208,7 +218,7 @@ fn config(name: &str, p: &Palette, dark: bool, font_size: f32) -> ThemeConfig {
         "mode": if dark { "dark" } else { "light" },
         "font.family": ".SystemUIFont",
         "font.size": font_size,
-        "mono_font.family": "SF Mono",
+        "mono_font.family": mono,
         "mono_font.size": metrics::DEFAULT_CODE_FONT_SIZE,
         "radius": metrics::CONTROL_RADIUS as usize,
         "radius.lg": metrics::RADIUS_XL as usize,
