@@ -410,6 +410,12 @@ impl ThreadView {
         self.state.update(cx, |state, cx| state.open_turn_diff(run_id, file_path, cx));
     }
 
+    /// A file change's "Open diff". A side chat's opens in the thread's diff too: the target
+    /// names its own thread.
+    pub fn open_tool_call_diff(&mut self, target: t3_core::diff::ToolCallTarget, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| state.open_tool_call_diff(target, cx));
+    }
+
     /// Expand or Collapse all folders; a folder's own toggle resets with it, as on the web.
     pub fn toggle_changed_files_all(&mut self, run_id: &str, message_id: &str, cx: &mut Context<Self>) {
         toggle(&mut self.ui.changed_files_open, run_id);

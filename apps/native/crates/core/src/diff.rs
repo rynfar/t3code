@@ -3,12 +3,15 @@
 //! `resolveFileDiffPath`, `buildFileDiffIdentityKey`), the row layout Pierre's stacked and split
 //! views paint, the file tree (`components/diffs/diffFileTree.logic.ts`), and the scope logic of
 //! `apps/web/src/diffPanelStore.ts`, `client-runtime/src/state/threadCheckpoints.ts` and
-//! `apps/web/src/state/queries.ts` (`useCheckpointDiff`).
+//! `apps/web/src/state/queries.ts` (`useCheckpointDiff`), and one tool call's recorded patch
+//! (`apps/web/src/lib/toolCallDiff.ts`).
 
 mod parse;
 mod rows;
 mod scope;
+mod tool_call;
 mod tree;
+mod whitespace;
 
 use std::sync::Arc;
 
@@ -19,7 +22,9 @@ pub use scope::{
     TurnDiffSummary, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
     diff_preview_request, preview_is_repository, turn_diff_summaries, workspace_mutation_id,
 };
+pub use tool_call::{RecordedContent, ToolCallDiff, ToolCallTarget, tool_call_diff};
 pub use tree::{TreeRow, TreeRowKind, file_tree_rows};
+pub use whitespace::hide_whitespace_changes;
 
 /// Pierre's `FileDiffMetadata.type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

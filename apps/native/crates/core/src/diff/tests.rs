@@ -476,3 +476,190 @@ fn workspace_mutation_id_tracks_finished_file_tools_and_checkpoints() {
     assert_ne!(workspace_mutation_id(items.iter(), Some("2026-01-01T00:00:00Z")), Some(id));
     assert_eq!(workspace_mutation_id(items[2..].iter(), None), None);
 }
+
+fn file_change(file_name: &str, diff_str: Option<&str>, changes: &[(&str, &str, Option<&str>)]) -> crate::turn_item::TurnItemKind {
+    crate::turn_item::TurnItemKind::FileChange {
+        file_name: file_name.into(),
+        additions: None,
+        deletions: None,
+        diff_str: diff_str.map(str::to_owned),
+        old_str: None,
+        new_str: None,
+        changes: (!changes.is_empty()).then(|| {
+            changes
+                .iter()
+                .map(|(operation, path, old_path)| crate::turn_item::FileChangeDetail {
+                    operation: (*operation).into(),
+                    path: (*path).into(),
+                    old_path: old_path.map(str::to_owned),
+                })
+                .collect()
+        }),
+    }
+}
+
+fn recorded(kind: &crate::turn_item::TurnItemKind) -> ToolCallDiff {
+    tool_call_diff(kind).expect("a file change")
+}
+
+/// The text a file's `side` lines hold, newlines included, as Pierre's line arrays join.
+fn side_text(file: &FileDiff, side: LineKind) -> (usize, String) {
+    let lines: Vec<&DiffLine> = file.hunks.iter().flat_map(|hunk| &hunk.lines).filter(|line| line.kind == side || line.kind == LineKind::Context).collect();
+    let text = lines.iter().map(|line| format!("{}{}", line.text, if line.no_newline_at_eof { "" } else { "\n" })).collect();
+    (lines.len(), text)
+}
+
+#[test]
+fn tool_call_hunks_get_file_headers_including_renamed_paths() {
+    for (changes, path) in [(vec![], "old.ts"), (vec![("update", "new.ts", Some("old.ts"))], "new.ts")] {
+        let patch = recorded(&file_change("old.ts", Some("@@ -1 +1 @@\n-before\n+after\n"), &changes)).patch.expect("patch");
+        let files = files(&patch);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path(), path);
+        assert!(side_text(&files[0], LineKind::Addition).1.contains("after"));
+        assert!(side_text(&files[0], LineKind::Deletion).1.contains("before"));
+    }
+}
+
+#[test]
+fn tool_call_added_and_deleted_contents_become_one_sided_hunks() {
+    let contents = [
+        ("first\nsecond", ""),
+        ("@@ -0,0 +1 @@\n+content", "\n"),
+        ("@@ -1 +0,0 @@\n-content", "\n"),
+        ("first\nsecond", "\n"),
+        ("--- notes\nsecond", "\n"),
+        ("diff --git notes\nsecond", "\n"),
+        ("--- a/embedded.ts\n+++ b/embedded.ts\n@@ -1 +1 @@\n-before\n+after", "\n"),
+        ("diff --git a/embedded.ts b/embedded.ts\n--- a/embedded.ts\n+++ b/embedded.ts\n@@ -1 +1 @@\n-before\n+after", "\n"),
+    ];
+    for operation in ["add", "delete"] {
+        for (content, ending) in contents {
+            let recorded_content = format!("{content}{ending}");
+            let kind = file_change("file with spaces.ts", Some(&recorded_content), &[(operation, "file with spaces.ts", None)]);
+            let files = files(&recorded(&kind).patch.expect("patch"));
+            let file = &files[0];
+            assert_eq!(file.path(), "file with spaces.ts", "{operation} {content:?}");
+            let lines = content.split('\n').count();
+            let (added, deleted) = (side_text(file, LineKind::Addition), side_text(file, LineKind::Deletion));
+            assert_eq!(added.0, if operation == "add" { lines } else { 0 }, "{operation} {content:?}");
+            assert_eq!(deleted.0, if operation == "delete" { lines } else { 0 }, "{operation} {content:?}");
+            assert_eq!(if operation == "add" { added.1 } else { deleted.1 }, recorded_content, "{operation} {content:?}");
+        }
+    }
+}
+
+#[test]
+fn tool_call_content_without_a_diff_is_kept_out_of_the_patch() {
+    for (operation, label) in [("add", "Recorded content after"), ("delete", "Recorded content before")] {
+        let diff = recorded(&file_change("empty.ts", Some(""), &[(operation, "empty.ts", None)]));
+        assert_eq!(diff.content, vec![RecordedContent { label, text: String::new() }]);
+        assert_eq!(diff.patch.as_deref(), Some(""));
+    }
+    let mut kind = file_change("a.ts", None, &[]);
+    if let crate::turn_item::TurnItemKind::FileChange { old_str, new_str, .. } = &mut kind {
+        (*old_str, *new_str) = (Some("before".into()), Some(String::new()));
+    }
+    assert_eq!(
+        recorded(&kind),
+        ToolCallDiff {
+            patch: None,
+            content: vec![
+                RecordedContent { label: "Recorded content before", text: "before".into() },
+                RecordedContent { label: "Recorded content after", text: String::new() },
+            ],
+            truncated: false,
+            recorded_files: 0,
+        }
+    );
+    assert_eq!(tool_call_diff(&crate::turn_item::TurnItemKind::SystemNotice { message: "x".into() }), None);
+}
+
+#[test]
+fn tool_call_drops_transport_truncation_markers() {
+    let suffix = "\n… output truncated for transport";
+    let diff = recorded(&file_change("a.ts", Some(&format!("first\nsecond{suffix}")), &[("add", "a.ts", None)]));
+    assert!(diff.truncated);
+    let patch = diff.patch.expect("patch");
+    assert!(!patch.contains("output truncated"));
+    assert_eq!(files(&patch)[0].additions, 2);
+    let mut kind = file_change("a.ts", None, &[]);
+    if let crate::turn_item::TurnItemKind::FileChange { new_str, .. } = &mut kind {
+        *new_str = Some(format!("content{suffix}"));
+    }
+    let diff = recorded(&kind);
+    assert!(diff.truncated);
+    assert_eq!(diff.content, vec![RecordedContent { label: "Recorded content after", text: "content".into() }]);
+}
+
+#[test]
+fn tool_call_keeps_complete_patches_and_unsupported_output() {
+    for operation in ["add", "delete"] {
+        let add = operation == "add";
+        let patch = [
+            "diff --git a/a.ts b/a.ts",
+            if add { "--- /dev/null" } else { "--- a/a.ts" },
+            if add { "+++ b/a.ts" } else { "+++ /dev/null" },
+            if add { "@@ -0,0 +1 @@" } else { "@@ -1 +0,0 @@" },
+            if add { "+content" } else { "-content" },
+            "",
+        ]
+        .join("\n");
+        assert_eq!(recorded(&file_change("a.ts", Some(&patch), &[(operation, "a.ts", None)])).patch, Some(patch));
+    }
+    for patch in [None, Some(""), Some("provider output"), Some("--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-a\n+b\n")] {
+        assert_eq!(recorded(&file_change("a.ts", patch, &[])).patch.as_deref(), patch);
+    }
+    let two = recorded(&file_change("a.ts", Some("@@ -1 +1 @@\n-a\n+b\n"), &[("update", "a.ts", None), ("update", "b.ts", None)]));
+    assert_eq!(two.omitted_files(1), 1);
+}
+
+#[test]
+fn tool_call_target_follows_the_row_the_thread_shows() {
+    let row = |status: &str, kind: &str| crate::thread::ProjectedTurnItem {
+        position: 0,
+        visibility: crate::thread::Visibility::Local,
+        source_thread_id: "t".into(),
+        source_item_id: "f1".into(),
+        item: std::sync::Arc::new(crate::turn_item::TurnItem { updated_at: "2026-01-02T00:00:00Z".into(), ..tool_item("f1", kind, status) }),
+    };
+    let target = ToolCallTarget::of(&tool_item("f1", "file_change", "running"));
+    assert_eq!(target, ToolCallTarget { thread_id: "t".into(), item_id: "f1".into(), revision: "live".into() });
+    assert_eq!(target.resolve(&[row("completed", "file_change")]).revision, "2026-01-02T00:00:00Z");
+    assert_eq!(target.resolve(&[row("completed", "command_execution")]), target);
+    assert_eq!(target.resolve(&[]), target);
+    assert_eq!(target.request(), json!({ "threadId": "t", "itemId": "f1", "revision": "live" }));
+
+    let selection = DiffSelection::ToolCall(target.clone());
+    let text = serde_json::to_string(&selection).expect("encode");
+    assert_eq!(text, r#"{"kind":"tool-call","threadId":"t","itemId":"f1","revision":"live"}"#);
+    assert_eq!(serde_json::from_str::<DiffSelection>(&text).expect("decode"), selection);
+    let scope = DiffScope::resolve(&selection, &[]);
+    assert_eq!((scope.clone(), scope.label(&[]).as_str()), (DiffScope::ToolCall(target), "Tool call"));
+    assert_eq!(DiffSelection::git(&selection, Some("dev"), false), DiffSelection::Branch { base_ref: Some("dev".into()) });
+}
+
+#[test]
+fn hiding_whitespace_turns_whitespace_only_edits_into_context() {
+    let patch = parse_patch("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,4 +1,4 @@\n def f():\n-  return 1\n-x = 1\n+    return 1\n+x = 2\n tail\n");
+    let ParsedPatch::Files(files) = hide_whitespace_changes(&patch) else { panic!("files") };
+    let lines = &files[0].hunks[0].lines;
+    let shape: Vec<(LineKind, &str, Option<u32>, Option<u32>)> = lines.iter().map(|line| (line.kind, &*line.text, line.old_line, line.new_line)).collect();
+    assert_eq!(
+        shape,
+        vec![
+            (LineKind::Context, "def f():", Some(1), Some(1)),
+            (LineKind::Context, "    return 1", Some(2), Some(2)),
+            (LineKind::Deletion, "x = 1", Some(3), None),
+            (LineKind::Addition, "x = 2", None, Some(3)),
+            (LineKind::Context, "tail", Some(4), Some(4)),
+        ]
+    );
+    assert_eq!((files[0].additions, files[0].deletions), (1, 1));
+
+    let reindent = parse_patch("--- a/b.rs\n+++ b/b.rs\n@@ -1,2 +1,2 @@\n-a\n-\tb\n+  a\n+ b\n");
+    let ParsedPatch::Files(files) = hide_whitespace_changes(&reindent) else { panic!("files") };
+    assert!(files[0].hunks[0].lines.iter().all(|line| line.kind == LineKind::Context));
+    assert_eq!((files[0].additions, files[0].deletions), (0, 0));
+    assert_eq!(hide_whitespace_changes(&ParsedPatch::Empty), ParsedPatch::Empty);
+}

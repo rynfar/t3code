@@ -237,6 +237,37 @@ pub fn ghost_button(
     focusable(button.cursor_pointer().hover(|style| style.bg(hsla(p.accent))).on_click(on_click), cx).into_any_element()
 }
 
+/// An `xs` outline text button (24 tall, pad-x 7, 12px text, `input` border, control shadow).
+pub fn outline_button(id: impl Into<ElementId>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
+    let p = palette(cx);
+    let dark = gpui_component::ActiveTheme::theme(cx).is_dark();
+    let (fill, hover) = if dark { (hsla(p.input).opacity(0.32), hsla(p.input).opacity(0.64)) } else { (hsla(p.popover), hsla(p.accent).opacity(0.5)) };
+    let shadow = gpui::BoxShadow { color: gpui::black().opacity(0.05), offset: gpui::point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: false };
+    let button = div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(24.))
+        .px(px(7.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(hsla(p.input))
+        .bg(fill)
+        .shadow(vec![shadow])
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(hsla(p.foreground))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .child(label.into())
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx)
+        });
+    focusable(button, cx).into_any_element()
+}
+
 /// An `icon-xs` ghost button (24 square) with a 12px icon.
 pub fn ghost_icon_button(id: impl Into<ElementId>, icon: Icon, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
     let p = palette(cx);
