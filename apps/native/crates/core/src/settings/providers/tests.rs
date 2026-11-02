@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use super::auth::{self, AccountAction};
+use crate::settings::ServerSettingChange;
 use super::background::ProviderPanelSettings;
 use super::*;
 use crate::server_config::{ServerConfig, ServerConfigState, ServerConfigStreamEvent};
@@ -139,6 +140,27 @@ fn instance_edits_build_upsert_mutations_and_keep_other_keys() {
     let cleared = with_accent(&with_display_name(&previous, " "), "blue");
     assert_eq!((cleared.display_name, cleared.accent_color), (None, None));
     assert_eq!(remove_payload("codex_work"), json!({ "patch": {}, "providerInstanceMutation": { "operation": "remove", "instanceId": "codex_work" } }));
+
+    // Rename, then change the accent before the rename's reply: the accent save is built from the
+    // settings the rename left, so it keeps the new name.
+    let rename = ServerSettingChange::ProviderInstance { instance_id: "codex_work".into(), edit: InstanceEdit::DisplayName("Personal".into()) };
+    let accent = ServerSettingChange::ProviderInstance { instance_id: "codex_work".into(), edit: InstanceEdit::Accent("#10b981".into()) };
+    let renamed = rename.payload_for(Some(&settings)).expect("rename changes the instance");
+    let after_rename = settings_with_instance(&settings, "codex_work", &renamed["providerInstanceMutation"]["instance"]);
+    let accent_payload = accent.payload_for(Some(&after_rename)).expect("accent changes the instance");
+    assert_eq!(accent_payload["providerInstanceMutation"]["instance"]["displayName"], "Personal");
+    assert_eq!(accent_payload["providerInstanceMutation"]["instance"]["accentColor"], "#10b981");
+    assert_eq!(rename.payload_for(Some(&after_rename)), None);
+    assert_eq!(accent.payload_for(None), None);
+    let default_slot = ServerSettingChange::ProviderInstance { instance_id: "claudeAgent".into(), edit: InstanceEdit::Enabled(false) };
+    assert_eq!(default_slot.payload_for(Some(&settings)).expect("disables")["providerInstanceMutation"]["instance"], json!({ "driver": "claudeAgent", "enabled": false }));
+}
+
+fn settings_with_instance(settings: &ServerSettings, instance_id: &str, instance: &Value) -> ServerSettings {
+    let mut instances: serde_json::Map<String, Value> =
+        settings.provider_instances.iter().map(|(id, config)| (id.to_owned(), serde_json::to_value(config).unwrap())).collect();
+    instances.insert(instance_id.to_owned(), instance.clone());
+    self::settings(json!({ "providerInstances": instances }))
 }
 
 #[test]
@@ -192,11 +214,31 @@ fn models_group_favorites_visible_then_hidden_in_the_users_order() {
         order,
         [("c", ModelGroup::Favorite), ("d", ModelGroup::Visible), ("b", ModelGroup::Visible), ("z", ModelGroup::Visible), ("a", ModelGroup::Hidden)]
     );
-    assert_eq!(models_summary(&grouped), "5 models \u{00b7} 1 favorite \u{00b7} 1 hidden");
+    assert_eq!(models_summary(&grouped, &["a".into(), "z".into()]), "5 models \u{00b7} 1 favorite \u{00b7} 1 hidden");
     assert_eq!(moved_order(&grouped, "b", false), Some(vec!["c".into(), "b".into(), "d".into(), "z".into(), "a".into()]));
     // Moves stay inside a group.
     assert_eq!(moved_order(&grouped, "d", false), None);
     assert_eq!(moved_order(&grouped, "z", true), None);
+
+    // "Disable all" hides favorites too: they stay in Favorites but show as hidden, so their
+    // switch offers to show them again.
+    let hidden: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+    let grouped = group_models(models_for_display(&live, &custom), &["c".into()], &hidden, &["d".into(), "b".into()]);
+    let rows = model_rows(&grouped, &hidden, "");
+    let drawn: Vec<_> = rows.iter().map(|row| (row.model.slug.as_str(), row.group, row.hidden, row.heading, row.can_move_up, row.can_move_down)).collect();
+    assert_eq!(
+        drawn,
+        [
+            ("c", ModelGroup::Favorite, true, Some("Favorites"), false, false),
+            ("z", ModelGroup::Visible, false, Some("All"), false, false),
+            ("d", ModelGroup::Hidden, true, Some("Hidden from picker"), false, true),
+            ("b", ModelGroup::Hidden, true, None, true, true),
+            ("a", ModelGroup::Hidden, true, None, true, false),
+        ]
+    );
+    assert_eq!(models_summary(&grouped, &hidden), "5 models \u{00b7} 1 favorite \u{00b7} 4 hidden");
+    // A filter applies only past the threshold.
+    assert_eq!(model_rows(&grouped, &hidden, "b").len(), 5);
 }
 
 #[test]
@@ -384,6 +426,16 @@ fn auth_payloads() {
     );
     assert!(state.requires_consent() && state.accepts_callback());
     assert_eq!(auth::logout_payload("cursor"), json!({ "instanceId": "cursor" }));
+    assert_eq!(auth::terminal_line_payload("cursor", &state, "y"), None);
+    let terminal = auth_state(json!({
+        "instanceId": "acp", "phase": "waiting", "flowId": "f2", "authorizationUrl": null, "expiresAt": null, "message": null,
+        "interaction": { "type": "terminal", "id": "t1", "output": "Paste the code: " },
+    }));
+    assert_eq!(
+        auth::terminal_line_payload("acp", &terminal, "ABCD-1234"),
+        Some(json!({ "instanceId": "acp", "flowId": "f2", "interactionId": "t1", "response": { "type": "terminal", "data": "ABCD-1234\r" } }))
+    );
+    assert_eq!(auth::terminal_line_payload("acp", &terminal, &"x".repeat(4_096)), None);
 }
 
 fn cursor(value: Value) -> ServerProvider {

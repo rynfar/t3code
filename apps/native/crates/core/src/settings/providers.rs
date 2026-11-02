@@ -9,6 +9,8 @@
 pub mod auth;
 pub mod background;
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{Map, Value, json};
 
 use crate::providers;
@@ -468,6 +470,38 @@ pub fn upsert_payload(settings: &ServerSettings, instance_id: &str, previous: &P
     mutation_payload(json!({ "operation": "upsert", "instanceId": instance_id, "instance": instance_json(next) }), patch)
 }
 
+/// One change to an instance. The save queue turns it into an upsert only when it is sent, so
+/// edits queued before an earlier save answers build on that save rather than undo it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InstanceEdit {
+    Enabled(bool),
+    DisplayName(String),
+    Accent(String),
+    AddCustomModel(String),
+    RemoveCustomModel(String),
+}
+
+impl InstanceEdit {
+    pub fn apply(&self, instance: &ProviderInstanceConfig) -> ProviderInstanceConfig {
+        match self {
+            InstanceEdit::Enabled(enabled) => with_enabled(instance, *enabled),
+            InstanceEdit::DisplayName(name) => with_display_name(instance, name),
+            InstanceEdit::Accent(accent) => with_accent(instance, accent),
+            InstanceEdit::AddCustomModel(slug) => with_custom_model_added(instance, slug),
+            InstanceEdit::RemoveCustomModel(slug) => with_custom_model_removed(instance, slug),
+        }
+    }
+}
+
+/// The upsert `edit` makes to `instance_id` as `settings` stand now; `None` when it changes
+/// nothing. An unconfigured default slot starts from its driver's defaults.
+pub fn edit_payload(settings: &ServerSettings, instance_id: &str, edit: &InstanceEdit) -> Option<Value> {
+    let previous =
+        settings.provider_instances.get(instance_id).cloned().unwrap_or_else(|| ProviderInstanceConfig { driver: instance_id.to_owned(), ..Default::default() });
+    let next = edit.apply(&previous);
+    (next != previous).then(|| upsert_payload(settings, instance_id, &previous, &next))
+}
+
 /// Deletes a custom instance, or resets a default slot to its unconfigured defaults.
 pub fn remove_payload(instance_id: &str) -> Value {
     mutation_payload(json!({ "operation": "remove", "instanceId": instance_id }), Map::new())
@@ -668,29 +702,75 @@ pub enum ModelGroup {
 /// `groupModelsForDisplay`: favorites, then the rest, then built-ins hidden from the picker, each
 /// in the user's order and then the server's.
 pub fn group_models(models: Vec<DisplayModel>, favorites: &[String], hidden: &[String], order: &[String]) -> Vec<(DisplayModel, ModelGroup)> {
-    let group = |model: &DisplayModel| {
-        if favorites.contains(&model.slug) {
-            ModelGroup::Favorite
-        } else if !model.is_custom && hidden.contains(&model.slug) {
-            ModelGroup::Hidden
-        } else {
-            ModelGroup::Visible
-        }
-    };
-    let mut ranked: Vec<(usize, DisplayModel)> = models.into_iter().enumerate().collect();
-    ranked.sort_by_key(|(index, model)| {
-        let rank = order.iter().position(|slug| *slug == model.slug).unwrap_or(usize::MAX);
-        let group = match group(model) {
-            ModelGroup::Favorite => 0,
-            ModelGroup::Visible => 1,
-            ModelGroup::Hidden => 2,
-        };
-        (group, rank, *index)
-    });
-    ranked.into_iter().map(|(_, model)| {
-        let group = group(&model);
-        (model, group)
-    }).collect()
+    let favorites: HashSet<&str> = favorites.iter().map(String::as_str).collect();
+    let hidden: HashSet<&str> = hidden.iter().map(String::as_str).collect();
+    let mut rank: HashMap<&str, usize> = HashMap::with_capacity(order.len());
+    for (index, slug) in order.iter().enumerate() {
+        rank.entry(slug.as_str()).or_insert(index);
+    }
+    let mut ranked: Vec<((u8, usize, usize), DisplayModel, ModelGroup)> = models
+        .into_iter()
+        .enumerate()
+        .map(|(index, model)| {
+            let (key, group) = if favorites.contains(model.slug.as_str()) {
+                (0, ModelGroup::Favorite)
+            } else if !model.is_custom && hidden.contains(model.slug.as_str()) {
+                (2, ModelGroup::Hidden)
+            } else {
+                (1, ModelGroup::Visible)
+            };
+            ((key, rank.get(model.slug.as_str()).copied().unwrap_or(usize::MAX), index), model, group)
+        })
+        .collect();
+    ranked.sort_by_key(|(key, _, _)| *key);
+    ranked.into_iter().map(|(_, model, group)| (model, group)).collect()
+}
+
+/// The models list offers a filter past this many models.
+pub const MODEL_FILTER_THRESHOLD: usize = 8;
+
+/// One drawn row of the models list (`ProviderModelsSection.tsx`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRow {
+    pub model: DisplayModel,
+    pub group: ModelGroup,
+    /// Hidden from the picker. A hidden favorite stays in Favorites, so this is not its group.
+    pub hidden: bool,
+    pub heading: Option<&'static str>,
+    pub can_move_up: bool,
+    pub can_move_down: bool,
+}
+
+/// The rows `filter` (trimmed, lowercase) leaves, with group headings and move buttons. A
+/// filter applies only past `MODEL_FILTER_THRESHOLD` models, and moving needs the full list.
+pub fn model_rows(grouped: &[(DisplayModel, ModelGroup)], hidden: &[String], filter: &str) -> Vec<ModelRow> {
+    let hidden: HashSet<&str> = hidden.iter().map(String::as_str).collect();
+    let filtering = grouped.len() > MODEL_FILTER_THRESHOLD && !filter.is_empty();
+    let has_favorites = grouped.iter().any(|(_, group)| *group == ModelGroup::Favorite);
+    let mut previous = None;
+    grouped
+        .iter()
+        .enumerate()
+        .filter(|(_, (model, _))| !filtering || model.name.to_lowercase().contains(filter) || model.slug.to_lowercase().contains(filter))
+        .map(|(position, (model, group))| {
+            let starts_group = previous != Some(*group);
+            previous = Some(*group);
+            let heading = match group {
+                ModelGroup::Favorite if starts_group && has_favorites => Some("Favorites"),
+                ModelGroup::Visible if starts_group && has_favorites => Some("All"),
+                ModelGroup::Hidden if starts_group => Some("Hidden from picker"),
+                _ => None,
+            };
+            ModelRow {
+                model: model.clone(),
+                group: *group,
+                hidden: !model.is_custom && hidden.contains(model.slug.as_str()),
+                heading,
+                can_move_up: !filtering && position > 0 && grouped[position - 1].1 == *group,
+                can_move_down: !filtering && grouped.get(position + 1).is_some_and(|(_, next)| next == group),
+            }
+        })
+        .collect()
 }
 
 /// `describeModelCapabilities`: "Fast mode", and "No reasoning" where the others reason.
@@ -719,10 +799,10 @@ pub fn has_reasoning(model: &DisplayModel) -> bool {
 }
 
 /// The models summary beside the list's actions: "12 models · 2 favorites · 3 hidden".
-pub fn models_summary(grouped: &[(DisplayModel, ModelGroup)]) -> String {
+pub fn models_summary(grouped: &[(DisplayModel, ModelGroup)], hidden: &[String]) -> String {
     let count = grouped.len();
     let favorites = grouped.iter().filter(|(_, group)| *group == ModelGroup::Favorite).count();
-    let hidden = grouped.iter().filter(|(_, group)| *group == ModelGroup::Hidden).count();
+    let hidden = grouped.iter().filter(|(model, _)| !model.is_custom && hidden.contains(&model.slug)).count();
     let mut text = format!("{count} model{}", if count == 1 { "" } else { "s" });
     if favorites > 0 {
         text.push_str(&format!(" \u{00b7} {favorites} favorite{}", if favorites == 1 { "" } else { "s" }));

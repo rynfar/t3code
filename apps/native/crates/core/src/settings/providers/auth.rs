@@ -152,6 +152,18 @@ pub fn credentials_payload(instance_id: &str, state: &AuthState, values: &[(Stri
     respond_payload(instance_id, state, json!({ "type": "credentials", "values": values }))
 }
 
+/// `provider.auth.respond` typing one line, then Enter, into a terminal sign-in.
+pub fn terminal_line_payload(instance_id: &str, state: &AuthState, line: &str) -> Option<Value> {
+    let data = format!("{line}\r");
+    if data.encode_utf16().count() > TERMINAL_DATA_MAX || !matches!(state.interaction, Some(Interaction::Terminal { .. })) {
+        return None;
+    }
+    respond_payload(instance_id, state, json!({ "type": "terminal", "data": data }))
+}
+
+/// `ProviderAuthResponse` terminal `data` caps at 4,096 characters.
+const TERMINAL_DATA_MAX: usize = 4_096;
+
 fn respond_payload(instance_id: &str, state: &AuthState, response: Value) -> Option<Value> {
     let flow_id = state.flow_id.as_deref()?;
     let interaction = state.interaction.as_ref()?;

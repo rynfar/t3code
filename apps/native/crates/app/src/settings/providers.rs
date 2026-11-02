@@ -13,14 +13,14 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, IntoElement, KeyBinding, ParentElement, SharedString, Styled, Subscription,
-    Task, Window, div, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, IntoElement, KeyBinding, ListAlignment, ListState, ParentElement, SharedString,
+    Styled, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::Value;
 use t3_client::session::RpcError;
-use t3_core::server_config::{ProviderInstanceConfig, ServerProvider};
+use t3_core::server_config::ServerProvider;
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::providers::auth::{self, AuthState, InstallState};
 use t3_core::settings::providers::background::{IDLE_COMPACTION_MODES, ProviderPanelSettings};
@@ -86,6 +86,8 @@ pub(crate) struct ProvidersState {
     /// Instances whose `server.updateProvider` call this client has in flight.
     dispatching: HashSet<String>,
     update_error: Option<(String, String)>,
+    /// A failure with no row of its own to show it (the web's toasts), as a title and detail.
+    notice: Option<(&'static str, String)>,
     advisory_open: Option<String>,
     advisory_closed_at: Option<Instant>,
     auth: Option<AuthSession>,
@@ -96,10 +98,14 @@ pub(crate) struct ProvidersState {
     pub(crate) model_filter: Entity<InputState>,
     pub(crate) health_interval: Entity<InputState>,
     pub(crate) callback_url: Entity<InputState>,
+    pub(crate) terminal_line: Entity<InputState>,
     /// The credentials form, keyed by the flow and interaction it answers.
     credentials: Option<(String, CredentialInputs)>,
     adding_custom_model: bool,
     custom_model_error: Option<String>,
+    /// The models list renders only the rows in view, from `model_rows`.
+    models_list: ListState,
+    model_rows: editor::ModelRows,
     /// The account email shows only after a click (`RedactedSensitiveText`).
     email_revealed: bool,
     method_id: SharedString,
@@ -119,6 +125,7 @@ impl ProvidersState {
         let model_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter models"));
         let health_interval = cx.new(|cx| InputState::new(window, cx));
         let callback_url = cx.new(|cx| InputState::new(window, cx));
+        let terminal_line = cx.new(|cx| InputState::new(window, cx).placeholder("Type a reply, then press Enter"));
         let subscriptions = vec![
             cx.subscribe_in(&display_name, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -157,12 +164,18 @@ impl ProvidersState {
                     this.submit_callback(cx);
                 }
             }),
+            cx.subscribe_in(&terminal_line, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_terminal_line(window, cx);
+                }
+            }),
         ];
         ProvidersState {
             selected: None,
             refreshing: false,
             dispatching: HashSet::new(),
             update_error: None,
+            notice: None,
             advisory_open: None,
             advisory_closed_at: None,
             auth: None,
@@ -173,9 +186,12 @@ impl ProvidersState {
             model_filter,
             health_interval,
             callback_url,
+            terminal_line,
             credentials: None,
             adding_custom_model: false,
             custom_model_error: None,
+            models_list: ListState::new(0, ListAlignment::Top, px(128.)),
+            model_rows: editor::ModelRows::default(),
             email_revealed: false,
             method_id: SharedString::default(),
             synced_instance: None,
@@ -187,7 +203,7 @@ impl ProvidersState {
 
     /// The text fields a `/` keystroke must not steal focus from.
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
-        let mut inputs = vec![&self.display_name, &self.accent, &self.custom_model, &self.model_filter, &self.health_interval, &self.callback_url];
+        let mut inputs = vec![&self.display_name, &self.accent, &self.custom_model, &self.model_filter, &self.health_interval, &self.callback_url, &self.terminal_line];
         inputs.extend(self.credentials.iter().flat_map(|(_, fields)| fields.iter().map(|(_, input)| input)));
         if let Some(dialog) = &self.dialog {
             inputs.extend(dialog.inputs());
@@ -311,8 +327,9 @@ impl SettingsView {
         let providers = self.render_providers_section(&data, window, cx);
         let advanced = self.render_advanced(&data.panel, cx);
         let dialog = self.render_add_dialog(window, cx);
+        let notice = self.render_notice(cx);
         vec![
-            Block::new(&["providers"], div().child(providers).children(dialog)),
+            Block::new(&["providers"], v_flex().gap(r(16.)).children(notice).child(providers).children(dialog)),
             Block::new(&["provider-health-check-interval", "compact-idle-threads"], advanced),
         ]
     }
@@ -429,7 +446,7 @@ impl SettingsView {
                 None => view.headline.clone(),
             },
         };
-        let toggle = cx.listener(move |this, checked: &bool, _, cx| this.update_instance(&toggle_id, |instance| model::with_enabled(instance, *checked), cx));
+        let toggle = cx.listener(move |this, checked: &bool, _, cx| this.update_instance(&toggle_id, model::InstanceEdit::Enabled(*checked), cx));
         h_flex()
             .id(("provider-row", index))
             .min_h(r(72.))
@@ -901,23 +918,8 @@ impl SettingsView {
     }
 
     /// Saves an edit of one instance as an upsert.
-    fn update_instance(&mut self, instance_id: &str, edit: impl FnOnce(&ProviderInstanceConfig) -> ProviderInstanceConfig, cx: &mut Context<Self>) {
-        let payload = {
-            let app = self.state.read(cx);
-            let Some(config) = app.server_config.config.as_ref() else { return };
-            let previous = config
-                .settings
-                .provider_instances
-                .get(instance_id)
-                .cloned()
-                .unwrap_or_else(|| ProviderInstanceConfig { driver: instance_id.to_owned(), ..Default::default() });
-            let next = edit(&previous);
-            if next == previous {
-                return;
-            }
-            model::upsert_payload(&config.settings, instance_id, &previous, &next)
-        };
-        store::update_server(&self.state, ServerSettingChange::Prepared(payload), cx);
+    fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
+        store::update_server(&self.state, ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
     }
 
     fn selected_instance_id(&self, cx: &App) -> Option<String> {
@@ -931,7 +933,7 @@ impl SettingsView {
     fn commit_display_name(&mut self, cx: &mut Context<Self>) {
         let Some(instance_id) = self.selected_instance_id(cx) else { return };
         let value = self.providers.display_name.read(cx).value().to_string();
-        self.update_instance(&instance_id, |instance| model::with_display_name(instance, &value), cx);
+        self.update_instance(&instance_id, model::InstanceEdit::DisplayName(value.to_string()), cx);
     }
 
     /// Saves a typed accent color, or puts the saved one back when it is not a `#rrggbb`.
@@ -947,7 +949,7 @@ impl SettingsView {
             self.providers.accent.update(cx, |input, cx| input.set_value(saved.unwrap_or_default(), window, cx));
             return;
         }
-        self.update_instance(&instance_id, |instance| model::with_accent(instance, &value), cx);
+        self.update_instance(&instance_id, model::InstanceEdit::Accent(value.to_string()), cx);
     }
 
     fn commit_health_interval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -994,6 +996,32 @@ impl SettingsView {
 }
 
 /// The 6px dot a warning or error shows (`PROVIDER_STATUS_STYLES`).
+impl SettingsView {
+    fn render_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (title, detail) = self.providers.notice.clone()?;
+        let p = palette(cx);
+        Some(
+            h_flex()
+                .items_start()
+                .gap(r(8.))
+                .px(r(14.))
+                .py(r(12.))
+                .rounded(r(12.))
+                .border_1()
+                .border_color(hsla(p.error).opacity(0.32))
+                .bg(hsla(p.error_surface))
+                .text_sm()
+                .text_color(hsla(p.error_foreground))
+                .child(v_flex().flex_1().min_w_0().gap(r(2.)).child(div().font_weight(FontWeight::MEDIUM).child(title)).child(div().opacity(0.8).child(detail)))
+                .child(Button::new("provider-notice-dismiss", ButtonVariant::GhostMuted, ButtonSize::IconMicro).icon(Icon::X).tooltip("Dismiss").on_click(cx.listener(|this, _, _, cx| {
+                    this.providers.notice = None;
+                    cx.notify();
+                })))
+                .into_any_element(),
+        )
+    }
+}
+
 fn status_dot(status: StatusKey, cx: &App) -> gpui::Div {
     let p = palette(cx);
     let color = match status {

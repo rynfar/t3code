@@ -116,6 +116,8 @@ pub enum ServerSettingChange {
     /// A whole `server.updateSettings` payload a panel built itself: provider instance mutations
     /// and model preferences (`settings::providers`).
     Prepared(Value),
+    /// Built from the settings as they stand when the queue sends it (`providers::edit_payload`).
+    ProviderInstance { instance_id: String, edit: providers::InstanceEdit },
 }
 
 impl ServerSettingChange {
@@ -133,7 +135,7 @@ impl ServerSettingChange {
             ServerSettingChange::SnoozePresets(_) => "snoozePresets",
             ServerSettingChange::AddProjectBaseDirectory(_) => "addProjectBaseDirectory",
             ServerSettingChange::ResponseStreamingMode(_) => "responseStreamingMode",
-            ServerSettingChange::Prepared(_) => "",
+            ServerSettingChange::Prepared(_) | ServerSettingChange::ProviderInstance { .. } => "",
         }
     }
 
@@ -155,10 +157,20 @@ impl ServerSettingChange {
             ServerSettingChange::AddProjectBaseDirectory(path) => json!(path.trim()),
             ServerSettingChange::ResponseStreamingMode(mode) => json!(mode),
             ServerSettingChange::Prepared(payload) => payload.get("patch").cloned().unwrap_or_default(),
+            ServerSettingChange::ProviderInstance { .. } => Value::Null,
         }
     }
 
-    /// The `server.updateSettings` payload.
+    /// The payload to send now, given the settings every earlier save left; `None` when there is
+    /// nothing to send.
+    pub fn payload_for(&self, settings: Option<&ServerSettings>) -> Option<Value> {
+        match self {
+            ServerSettingChange::ProviderInstance { instance_id, edit } => providers::edit_payload(settings?, instance_id, edit),
+            _ => Some(self.payload()),
+        }
+    }
+
+    /// The `server.updateSettings` payload of a change that does not depend on current settings.
     pub fn payload(&self) -> Value {
         if let ServerSettingChange::Prepared(payload) = self {
             return payload.clone();

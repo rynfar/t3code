@@ -4,7 +4,7 @@
 //! Runtime form, Environment variables, and Codex's managed ChatGPT runtime are not ported; a
 //! managed Codex instance signs in through the generic Account row.
 
-use gpui::{AnyElement, AppContext, Context, FontWeight, IntoElement, ParentElement, PromptLevel, SharedString, Styled, Window, div, prelude::*, px, relative};
+use gpui::{AnyElement, AppContext, Context, FontWeight, IntoElement, ParentElement, PromptLevel, SharedString, Styled, Window, div, list, prelude::*, px, relative};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
@@ -21,7 +21,28 @@ use crate::theme::{hsla, palette};
 
 const SERVER_ACCEPT_ACP_URL_AUTH: &str = "server.acceptAcpRegistryUrlAuth";
 /// `FILTER_THRESHOLD`: the models list offers a filter past this many models.
-const FILTER_THRESHOLD: usize = 8;
+const MODEL_ROW_HEIGHT: f32 = 28.;
+const MODELS_MAX_HEIGHT: f32 = 256.;
+
+/// What the models list draws, kept between frames so the list can build only the rows in view.
+#[derive(Default)]
+pub(super) struct ModelRows {
+    instance_id: String,
+    filter: String,
+    filtering: bool,
+    flag_missing_reasoning: bool,
+    rows: Vec<model::ModelRow>,
+}
+
+/// A row, plus the group heading above it: tighter for the list's first row.
+fn model_entry_height(index: usize, row: &model::ModelRow) -> f32 {
+    MODEL_ROW_HEIGHT
+        + match row.heading {
+            None => 0.,
+            Some(_) if index == 0 => 24.,
+            Some(_) => 40.,
+        }
+}
 
 /// Whether the editor shows an Account row, which needs `provider.auth.subscribe`.
 pub(super) fn shows_account(selected: &Selected) -> bool {
@@ -189,7 +210,7 @@ impl SettingsView {
                                 this.child(
                                     Button::new("enable-antigravity", ButtonVariant::Outline, ButtonSize::Sm)
                                         .label("Enable Antigravity")
-                                        .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, |instance| model::with_enabled(instance, true), cx))),
+                                        .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, model::InstanceEdit::Enabled(true), cx))),
                                 )
                             }),
                     )
@@ -406,7 +427,8 @@ impl SettingsView {
                             .font_family(cx.theme().mono_font_family.clone())
                             .child(tail.join("\n")),
                     )
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Typing into the sign-in terminal needs the web or desktop app for now."))
+                    .child(Input::new(&self.providers.terminal_line).small())
+                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Sends the line followed by Enter. For prompts that need arrow keys, use the web or desktop app."))
                     .into_any_element(),
             );
         }
@@ -499,20 +521,14 @@ impl SettingsView {
         let instance_id = selected.row.instance_id.clone();
         let driver = selected.row.driver.clone();
         let filter = self.providers.model_filter.read(cx).value().trim().to_lowercase();
-        let filtering = selected.models.len() > FILTER_THRESHOLD && !filter.is_empty();
-        let visible: Vec<&(DisplayModel, ModelGroup)> = selected
-            .models
-            .iter()
-            .filter(|(model, _)| !filtering || model.name.to_lowercase().contains(&filter) || model.slug.to_lowercase().contains(&filter))
-            .collect();
-        let has_favorites = selected.models.iter().any(|(_, group)| *group == ModelGroup::Favorite);
-        let flag_missing_reasoning = selected.models.iter().any(|(model, _)| model::has_reasoning(model));
+        let filtering = selected.models.len() > model::MODEL_FILTER_THRESHOLD && !filter.is_empty();
+        self.sync_model_rows(selected, if filtering { filter } else { String::new() });
         let display: Vec<DisplayModel> = selected.models.iter().map(|(model, _)| model.clone()).collect();
         let built_in = display.iter().any(|model| !model.is_custom);
         let all_hidden = model::all_built_in_hidden(&display, &selected.hidden);
 
         let mut toolbar = h_flex().flex_wrap().gap(r(8.));
-        if selected.models.len() > FILTER_THRESHOLD {
+        if selected.models.len() > model::MODEL_FILTER_THRESHOLD {
             toolbar = toolbar.child(div().w(r(224.)).child(Input::new(&self.providers.model_filter).small()));
         }
         let mut counts = h_flex().gap(r(8.));
@@ -530,7 +546,7 @@ impl SettingsView {
                     })),
             );
         }
-        counts = counts.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(model::models_summary(&selected.models)));
+        counts = counts.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(model::models_summary(&selected.models, &selected.hidden)));
         toolbar = toolbar.child(counts).child(div().flex_1());
         let can_add = driver != "antigravity";
         if can_add && !self.providers.adding_custom_model {
@@ -550,30 +566,24 @@ impl SettingsView {
             );
         }
 
-        let mut list = v_flex();
-        if visible.is_empty() {
-            list = list.child(
-                div().px(r(8.)).py(r(8.)).text_xs().text_color(hsla(p.muted_foreground)).child(if filtering { "No models match." } else { "No models reported for this provider yet." }),
-            );
-        }
-        let mut previous: Option<ModelGroup> = None;
-        for (index, (model, group)) in visible.iter().enumerate() {
-            let starts_group = previous != Some(*group);
-            previous = Some(*group);
-            let heading = match group {
-                ModelGroup::Favorite if starts_group && has_favorites => Some("Favorites"),
-                ModelGroup::Visible if starts_group && has_favorites => Some("All"),
-                ModelGroup::Hidden if starts_group => Some("Hidden from picker"),
-                _ => None,
-            };
-            if let Some(heading) = heading {
-                list = list.child(div().px(r(8.)).pb(r(6.)).pt(r(if index == 0 { 4. } else { 20. })).text_size(r(11.)).text_color(hsla(p.muted_foreground)).child(heading));
-            }
-            let position = selected.models.iter().position(|(candidate, _)| candidate.slug == model.slug).unwrap_or(0);
-            let can_up = !filtering && position > 0 && selected.models[position - 1].1 == *group;
-            let can_down = !filtering && selected.models.get(position + 1).is_some_and(|(_, next)| next == group);
-            list = list.child(self.render_model_row(&instance_id, model, *group, index, can_up, can_down, filtering, flag_missing_reasoning, cx));
-        }
+        let rows = &self.providers.model_rows.rows;
+        let list = if rows.is_empty() {
+            div()
+                .px(r(16.))
+                .py(r(8.))
+                .text_xs()
+                .text_color(hsla(p.muted_foreground))
+                .child(if filtering { "No models match." } else { "No models reported for this provider yet." })
+                .into_any_element()
+        } else {
+            let height: f32 = rows.iter().enumerate().map(|(index, row)| model_entry_height(index, row)).sum();
+            div()
+                .mt(r(8.))
+                .mx(r(-8.))
+                .h(r(height.min(MODELS_MAX_HEIGHT)))
+                .child(list(self.providers.models_list.clone(), cx.processor(|this, index: usize, _, cx| this.render_model_entry(index, cx))).size_full())
+                .into_any_element()
+        };
 
         let add_row = (can_add && self.providers.adding_custom_model).then(|| {
             h_flex()
@@ -602,28 +612,59 @@ impl SettingsView {
                         .child("Model preferences and custom models are saved on the selected environment and shared across connected devices."),
                 )
                 .child(toolbar)
-                .child(div().id("provider-models-list").mt(r(8.)).mx(r(-8.)).max_h(r(256.)).overflow_y_scroll().child(list))
+                .child(list)
                 .children(add_row)
                 .children(error),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_model_row(
-        &self,
-        instance_id: &str,
-        model: &DisplayModel,
-        group: ModelGroup,
-        index: usize,
-        can_up: bool,
-        can_down: bool,
-        filtering: bool,
-        flag_missing_reasoning: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// Rebuilds the drawn rows when the models, preferences or filter change. A new instance or
+    /// filter, or a different row count, starts the list over; otherwise it keeps its scroll.
+    fn sync_model_rows(&mut self, selected: &Selected, filter: String) {
+        let rows = model::model_rows(&selected.models, &selected.hidden, &filter);
+        let current = &self.providers.model_rows;
+        let restart = current.instance_id != selected.row.instance_id || current.filter != filter || current.rows.len() != rows.len();
+        if !restart && current.rows == rows {
+            return;
+        }
+        if restart {
+            self.providers.models_list.reset(rows.len());
+        } else {
+            self.providers.models_list.remeasure();
+        }
+        self.providers.model_rows = ModelRows {
+            instance_id: selected.row.instance_id.clone(),
+            filtering: !filter.is_empty(),
+            filter,
+            flag_missing_reasoning: selected.models.iter().any(|(model, _)| model::has_reasoning(model)),
+            rows,
+        };
+    }
+
+    fn render_model_entry(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.providers.model_rows.rows.get(index).cloned() else { return div().into_any_element() };
+        let heading = row.heading.map(|heading| {
+            div()
+                .h(r(model_entry_height(index, &row) - MODEL_ROW_HEIGHT))
+                .flex()
+                .items_end()
+                .px(r(8.))
+                .pb(r(6.))
+                .text_size(r(11.))
+                .text_color(hsla(palette(cx).muted_foreground))
+                .child(heading)
+        });
+        v_flex().w_full().children(heading).child(self.render_model_row(index, &row, cx)).into_any_element()
+    }
+
+    fn render_model_row(&self, index: usize, row: &model::ModelRow, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let hidden = group == ModelGroup::Hidden;
-        let favorite = group == ModelGroup::Favorite;
+        let ModelRows { instance_id, filtering, flag_missing_reasoning, .. } = &self.providers.model_rows;
+        let (instance_id, filtering, flag_missing_reasoning) = (instance_id.as_str(), *filtering, *flag_missing_reasoning);
+        let model = &row.model;
+        let (can_up, can_down) = (row.can_move_up, row.can_move_down);
+        let hidden = row.hidden;
+        let favorite = row.group == ModelGroup::Favorite;
         let labels = model::capability_labels(model, flag_missing_reasoning);
         let star_id = instance_id.to_owned();
         let star_slug = model.slug.clone();
@@ -687,6 +728,7 @@ impl SettingsView {
         let switch = if model.is_custom { switch } else { switch.on_change(move |shown, window, cx| toggle(&shown, window, cx)) };
         h_flex()
             .id(("model-row", index))
+            .w_full()
             .h(r(28.))
             .px(r(8.))
             .gap(r(8.))
@@ -730,7 +772,7 @@ impl SettingsView {
         };
         match validated {
             Ok(slug) => {
-                self.update_instance(&instance_id, |instance| model::with_custom_model_added(instance, &slug), cx);
+                self.update_instance(&instance_id, model::InstanceEdit::AddCustomModel(slug.to_string()), cx);
                 self.providers.adding_custom_model = false;
                 self.providers.custom_model_error = None;
                 self.providers.model_filter.update(cx, |input, cx| input.set_value("", window, cx));
@@ -743,7 +785,7 @@ impl SettingsView {
 
     /// `handleRemove`: drops the model, and its place in the order and favorites.
     fn remove_custom_model(&mut self, instance_id: &str, slug: &str, cx: &mut Context<Self>) {
-        self.update_instance(instance_id, |instance| model::with_custom_model_removed(instance, slug), cx);
+        self.update_instance(instance_id, model::InstanceEdit::RemoveCustomModel(slug.to_owned()), cx);
         let (order, favorite) = {
             let app = self.state.read(cx);
             let Some(config) = app.server_config.config.as_ref() else { return };
@@ -796,7 +838,7 @@ impl SettingsView {
                     Some(this.state.read(cx).rpc(model::SERVER_UNINSTALL_ACP_REGISTRY_BINARY, model::uninstall_acp_payload(&agent)))
                 }
                 Err(error) => {
-                    this.providers.update_error = Some((String::new(), format!("Could not delete provider instance: {}", failure_text(&error, "The settings update failed."))));
+                    this.providers.notice = Some(("Could not delete provider instance", failure_text(&error, "The settings update failed.")));
                     cx.notify();
                     None
                 }
@@ -804,7 +846,10 @@ impl SettingsView {
             if let Ok(Some(uninstall)) = uninstall
                 && let Err(error) = uninstall.await
             {
-                tracing::warn!(%error, "provider deleted, but managed files remain");
+                let _ = this.update(cx, |this, cx| {
+                    this.providers.notice = Some(("Provider deleted, but managed files remain", failure_text(&error, "Managed binary cleanup failed.")));
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -815,15 +860,15 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                let message = match result {
+                let notice = match result {
                     Ok(reply) if reply.get("accepted").and_then(Value::as_bool) == Some(false) => {
-                        Some("Authentication request expired. Refresh the provider and start the authentication flow again.".to_owned())
+                        Some(("Authentication request expired", "Refresh the provider and start the authentication flow again.".to_owned()))
                     }
                     Ok(_) => None,
-                    Err(error) => Some(format!("Could not continue authentication: {}", failure_text(&error, "The authentication request expired."))),
+                    Err(error) => Some(("Could not continue authentication", failure_text(&error, "The authentication request expired."))),
                 };
-                if let Some(message) = message {
-                    this.providers.update_error = Some((String::new(), message));
+                if let Some(notice) = notice {
+                    this.providers.notice = Some(notice);
                     cx.notify();
                 }
             });
@@ -929,6 +974,15 @@ impl SettingsView {
         let payload = self.providers.auth.as_ref().and_then(|session| session.state.as_ref()).and_then(|state| auth::credentials_payload(instance_id, state, &values));
         if let Some(payload) = payload {
             self.providers.credentials = None;
+            self.auth_command(auth::AUTH_RESPOND, payload, cx);
+        }
+    }
+
+    pub(super) fn submit_terminal_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let line = self.providers.terminal_line.read(cx).value().to_string();
+        let payload = self.providers.auth.as_ref().and_then(|session| session.state.as_ref().and_then(|state| auth::terminal_line_payload(&session.instance_id, state, &line)));
+        if let Some(payload) = payload {
+            self.providers.terminal_line.update(cx, |input, cx| input.set_value("", window, cx));
             self.auth_command(auth::AUTH_RESPOND, payload, cx);
         }
     }
