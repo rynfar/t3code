@@ -63,6 +63,13 @@ pub fn clear_error(cx: &mut App) {
     cx.global_mut::<ClientPrefs>().error = None;
 }
 
+/// Shows `message` above the settings page until the next edit, as a failed save does; toasts
+/// sit under the settings modal.
+pub fn show_error(message: impl Into<SharedString>, cx: &mut App) {
+    cx.global_mut::<ClientPrefs>().error = Some(message.into());
+    cx.refresh_windows();
+}
+
 /// Applies a client setting everywhere at once and saves the changed keys in the background.
 pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
