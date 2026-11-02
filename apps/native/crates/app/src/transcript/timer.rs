@@ -1,7 +1,8 @@
-//! "Working for 12s": the one transcript label that changes on a timer (`WorkingTimer` in
-//! `TimelineWorkGroupRows.tsx`, `tickTextContent.ts`). It is its own view so the tick redraws
-//! only it, and it stops notifying when it was not painted since the last tick (scrolled out
-//! of the list's render window, or the window is hidden), resuming once drawn again.
+//! "Working for 12s", the Stop line's time and a running worktree setup stage's time: the
+//! transcript labels that change on a timer (`WorkingTimer` in `TimelineWorkGroupRows.tsx`,
+//! `tickTextContent.ts`, `LiveElapsed` in `WorktreeSetupCard.tsx`). Each is its own view so the
+//! tick redraws only it, and it stops notifying when it was not painted since the last tick
+//! (scrolled out of the list's render window, or the window is hidden), resuming once drawn again.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -16,6 +17,8 @@ pub enum TimerKind {
     Compacting,
     /// Just the elapsed time, as the Stop line shows it (`runStopNowItem`).
     Elapsed,
+    /// A running worktree setup stage's time (`LiveElapsed` in `WorktreeSetupCard.tsx`).
+    SetupStage,
 }
 
 pub struct WorkingTimer {
@@ -62,6 +65,7 @@ impl Render for WorkingTimer {
             (TimerKind::Working, Some(elapsed)) => format!("Working for {elapsed}"),
             (TimerKind::Working, None) => "Working...".to_owned(),
             (TimerKind::Elapsed, _) => elapsed_since(&self.started_at, chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            (TimerKind::SetupStage, _) => t3_core::worktree_setup::live_label(&self.started_at, chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         };
         div().whitespace_nowrap().child(label)
     }

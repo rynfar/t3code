@@ -11,6 +11,7 @@ mod notices;
 mod parts;
 mod timer;
 mod work;
+mod worktree_setup;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +27,7 @@ pub use command_output::CommandOutputSlot;
 pub use notices::history_control;
 pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_button, inline_button};
 pub use timer::{TimerKind, WorkingTimer};
+pub use worktree_setup::SetupEnv;
 
 /// Disclosure state the user controls. Folds and groups feed row derivation; the rest only
 /// change how a row draws.
@@ -86,6 +88,7 @@ pub struct RowEnv<'a> {
     /// Open command rows' streamed output, by entry; `None` when the server does not stream it
     /// (`commandOutputStreaming`), so rows show the item's own output instead.
     pub command_outputs: Option<&'a HashMap<String, CommandOutputSlot>>,
+    pub setup: &'a SetupEnv,
 }
 
 /// Space below a row: `TimelineRowContent` and `WorkLogBlock`.
@@ -102,7 +105,7 @@ fn bottom_space(row: &TimelineRow) -> f32 {
         RowKind::TurnFold { .. } | RowKind::Working { .. } => 6.,
         RowKind::Message { grouped_with_next: true, .. } => 4.,
         RowKind::Message { message, show_assistant_meta: false, .. } if message.role == Role::Assistant => 8.,
-        RowKind::Event { .. } | RowKind::AttemptFold { .. } => 8.,
+        RowKind::Event { .. } | RowKind::AttemptFold { .. } | RowKind::WorktreeSetup { .. } => 8.,
         _ => 16.,
     }
 }
@@ -112,9 +115,15 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
     let content = match &row.kind {
         RowKind::Work { .. } => work::work_section(row, env, markdown, cx),
         RowKind::WorkLive { .. } => work::live_row(row, env, cx),
+        // `ThinkingTimelineRow` keeps its slot blank while the worktree is prepared.
+        RowKind::Thinking { .. } if env.setup.view.preparing => worktree_setup::empty_work_row(id),
         RowKind::Thinking { group_id, .. } => work::thinking_row(id, group_id.as_deref(), cx),
         RowKind::WorkToggle { .. } => work::group_header(row, env, cx),
-        RowKind::Working { compacting } => notices::working_row(*compacting, env, cx),
+        RowKind::Working { compacting } => {
+            let chip = worktree_setup::background_chip(env, cx);
+            notices::working_row(*compacting, env, chip, cx)
+        }
+        RowKind::WorktreeSetup { snapshot, embedded } => worktree_setup::card("worktree-setup", snapshot, *embedded, env, cx),
         RowKind::TurnFold { run_id, label, expanded } => notices::turn_fold(id, run_id, label, *expanded, row.created_at.as_deref(), env, cx),
         RowKind::AttemptFold { attempt_id, label, expanded } => notices::attempt_fold(id, attempt_id, label, *expanded, cx),
         RowKind::ContextCompaction { label, tokens, title, failed, failure, .. } => {

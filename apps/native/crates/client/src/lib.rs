@@ -13,6 +13,7 @@ pub mod status;
 pub mod store;
 pub mod supervisor;
 pub mod upload;
+pub mod worktree_setup;
 
 #[cfg(test)]
 mod test_server;

@@ -97,6 +97,10 @@ struct Snapshot {
     pending: PendingRequests,
     /// Messages waiting behind the active turn.
     queue: t3_core::composer::queue::QueueState,
+    /// Worktree setup holds the send back (`worktreeSetupBlocksSend`).
+    setup_blocks_send: bool,
+    /// The run is being prepared, so a send queues behind it (`sendQueuesBehindSetup`).
+    setup_queues: bool,
 }
 
 /// Everything the footer and send read, resolved against the server config.
@@ -164,6 +168,8 @@ pub struct Composer {
     drafts: drafts::Drafts,
     queue: queue::Queue,
     stash_state: stash::Stashed,
+    /// The open thread's worktree setup; a side chat's composer has none.
+    setup: Option<Entity<crate::worktree_setup::WorktreeSetupStore>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -185,7 +191,8 @@ impl Composer {
                 .submit_on_enter(true)
         });
         let picker = cx.new(|cx| ModelPicker::new(state.clone(), window, cx));
-        let subscriptions = vec![
+        let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
+        let mut subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { secondary, shift: false } => this.on_enter(*secondary, window, cx),
                 InputEvent::Change => this.on_prompt_change(cx),
@@ -217,6 +224,9 @@ impl Composer {
             // Caret moves change the token under it; blinks find the caret unchanged and stop.
             cx.observe(&input, |this, _, cx| this.sync_menu(false, cx)),
         ];
+        if let Some(setup) = &setup {
+            subscriptions.push(cx.subscribe_in(setup, window, |this, _, _: &crate::worktree_setup::SetupEvent, window, cx| this.refresh(false, window, cx)));
+        }
         let limit_recovery = cx.new(|cx| crate::thread_view::LimitRecoveryBanner::new(state.clone(), cx));
         let mut composer = Composer {
             limit_recovery,
@@ -249,6 +259,7 @@ impl Composer {
             drafts: Default::default(),
             queue: Default::default(),
             stash_state: Default::default(),
+            setup,
             _subscriptions: subscriptions,
         };
         composer.load_drafts();
@@ -281,7 +292,11 @@ impl Composer {
             projection.map(requests::pending_requests).unwrap_or_default()
         };
         let running = state.is_thread_running(thread_id);
+        let setup = self.setup.as_ref().and_then(|setup| setup.read(cx).view_for(Some(thread_id)));
+        let (setup_blocks_send, setup_queues) = setup.map_or((false, false), |view| (view.blocks_send, view.queues_behind_setup));
         Snapshot {
+            setup_blocks_send,
+            setup_queues,
             project_id: shell.map(|thread| thread.project_id.clone()),
             running,
             thread_model: shell.map(|thread| thread.model_selection.clone()),

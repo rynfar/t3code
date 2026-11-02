@@ -7,6 +7,7 @@
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --history 3     # page earlier history
 //!   cargo run -p t3-client --example probe -- --config
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --command-output   # stream every command's output
+//!   cargo run -p t3-client --example probe -- --thread <thread-id> --worktree-setup   # follow its worktree setup
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --turn-items   # fetch withheld tool output
 //!   cargo run -p t3-client --example probe -- --local   # one-click pair with T3 Code on this Mac
 //!
@@ -218,6 +219,36 @@ async fn main() -> anyhow::Result<()> {
     let mut config = ServerConfigState::default();
     let mut seen: HashSet<String> = HashSet::new();
     let mut command_outputs: HashMap<String, t3_client::command_output::CommandOutputStream> = HashMap::new();
+    let _worktree_setup = watched.as_deref().filter(|_| has("--worktree-setup")).map(|thread_id| {
+        let stream = t3_client::worktree_setup::subscribe(&tokio::runtime::Handle::current(), client.clone(), thread_id, Default::default());
+        let mut feed = stream.feed.clone();
+        tokio::spawn(async move {
+            while feed.changed().await.is_ok() {
+                let next = feed.borrow_and_update().clone();
+                match &next.latest {
+                    None => println!("worktree-setup: null (held={})", next.held.is_some()),
+                    Some(snapshot) => {
+                        let stages: Vec<String> = snapshot
+                            .stages
+                            .iter()
+                            .map(|stage| format!("{:?}={:?}{}", stage.id, stage.status, t3_core::worktree_setup::stage_trailing(stage).map(|t| format!("({t})")).unwrap_or_default()))
+                            .collect();
+                        println!(
+                            "worktree-setup: seq={} phase={:?} \"{}\" path={:?} script={:?} stages=[{}] error={:?}",
+                            snapshot.sequence,
+                            snapshot.phase,
+                            t3_core::worktree_setup::header_label(snapshot),
+                            snapshot.worktree_path,
+                            snapshot.setup_script.as_ref().map(|script| &script.name),
+                            stages.join(", "),
+                            snapshot.error
+                        );
+                    }
+                }
+            }
+        });
+        stream
+    });
     let deadline = tokio::time::sleep(Duration::from_secs(seconds));
     tokio::pin!(deadline);
     loop {
@@ -460,7 +491,7 @@ async fn main() -> anyhow::Result<()> {
         println!("settled: count={} listed={} hidden={}", model.settled_count, model.listed_settled_count, model.hidden_settled_count);
         for row in model.rows.iter().take(12) {
             match row {
-                t3_core::sidebar::SidebarRow::Thread { index, section } => println!("  {section:?}: {}", model.threads[*index].title),
+                t3_core::sidebar::SidebarRow::Thread { index, section } => println!("  {section:?}: {} ({})", model.threads[*index].title, model.threads[*index].id),
                 other => println!("  {other:?}"),
             }
         }

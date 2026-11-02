@@ -348,6 +348,14 @@ impl TerminalDrawer {
         self.changed(window, cx);
     }
 
+    /// Opens and focuses one of the selected thread's terminals, such as the worktree setup
+    /// script's (`openSetupTerminal`).
+    pub fn open_terminal(&mut self, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.selected_thread(cx) else { return };
+        self.layouts.ensure(&thread_id, terminal_id, true, Some(true));
+        self.changed(window, cx);
+    }
+
     fn open_if_closed(&mut self, cx: &App) {
         if let Some((thread_id, layout)) = self.layout(cx)
             && !layout.terminal_open

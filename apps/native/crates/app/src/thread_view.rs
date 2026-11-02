@@ -29,7 +29,8 @@ use t3_core::diff::TurnDiffSummary;
 use crate::app_state::{AppEvent, AppState};
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::MarkdownStore;
-use crate::transcript::{Clock, CommandOutputSlot, Detail, RowEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+use crate::transcript::{Clock, CommandOutputSlot, Detail, RowEnv, SetupEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+use crate::worktree_setup::{SetupEvent, WorktreeSetupStore};
 
 actions!(thread_view, [FindInThread]);
 
@@ -75,7 +76,10 @@ pub struct ThreadView {
     viewer: Entity<crate::media::MediaViewer>,
     /// A side chat's own thread, shown in the right panel; `None` follows the selection.
     fixed: Option<String>,
-    _subscription: Subscription,
+    /// The open thread's worktree setup; a side chat has none.
+    setup: Option<Entity<WorktreeSetupStore>>,
+    setup_env: SetupEnv,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ThreadView {
@@ -104,6 +108,11 @@ impl ThreadView {
         });
         let media = crate::media::cache(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
+        let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
+        let mut subscriptions = vec![subscription];
+        if let Some(setup) = &setup {
+            subscriptions.push(cx.subscribe(setup, |this, _, _: &SetupEvent, cx| this.sync_setup(cx)));
+        }
         ThreadView {
             state,
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
@@ -137,7 +146,9 @@ impl ThreadView {
             media,
             viewer,
             fixed,
-            _subscription: subscription,
+            setup,
+            setup_env: SetupEnv::default(),
+            _subscriptions: subscriptions,
         }
     }
 
@@ -177,6 +188,8 @@ impl ThreadView {
             self.reset_rewind();
             self.anchor_gap.borrow_mut().take();
             self.list.reset(0);
+            self.setup_env = SetupEnv::default();
+            self.read_setup(cx);
         }
         let state = self.state.read(cx);
         match self.thread_state(state).projection.as_ref() {
@@ -272,6 +285,7 @@ impl ThreadView {
             expanded_run_ids: &self.ui.expanded_runs,
             expanded_attempt_ids: &self.ui.expanded_attempts,
             expanded_work_group_ids: &self.ui.expanded_groups,
+            worktree_setup: self.setup_env.view.visible.as_ref(),
         };
         let next = derive_rows(&input, &mut self.rows_cache);
         self.sync_timer(&next, cx);
@@ -296,9 +310,11 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// One timer view per working stretch; nothing else in the transcript ticks.
+    /// One timer view per working stretch, none while the row says the worktree is being set
+    /// up; besides it only a running setup stage ticks (`sync_setup`).
     fn sync_timer(&mut self, rows: &[Arc<TimelineRow>], cx: &mut Context<Self>) {
-        let working = rows.iter().find_map(|row| match (&row.kind, &row.created_at) {
+        let preparing = self.setup_env.view.preparing;
+        let working = rows.iter().filter(|_| !preparing).find_map(|row| match (&row.kind, &row.created_at) {
             (RowKind::Working { compacting }, Some(started)) => Some((started.clone(), *compacting)),
             _ => None,
         });
@@ -586,6 +602,7 @@ impl ThreadView {
             rewind_disabled: self.rewind.busy() || self.activity.is_working,
             tool_diffs: self.fixed.is_none(),
             command_outputs: self.streams_output.then_some(&self.command_outputs),
+            setup: &self.setup_env,
         };
         render(&env, &mut self.markdown)
     }
@@ -597,6 +614,77 @@ impl ThreadView {
 
     pub fn render_group_member(&mut self, entry: &Arc<WorkLogEntry>, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.with_env(|env, markdown| render_group_member(entry, env, markdown, cx))
+    }
+}
+
+impl ThreadView {
+    /// Takes the store's view of the open thread's setup, if it follows this one. Returns whether
+    /// it changed.
+    fn read_setup(&mut self, cx: &mut Context<Self>) -> bool {
+        let next = match &self.setup {
+            Some(store) => store.read(cx).view_for(self.thread_id.as_deref()).cloned().unwrap_or_default(),
+            None => return false,
+        };
+        if next == self.setup_env.view {
+            return false;
+        }
+        if next.background.is_none() {
+            self.setup_env.popover_open = false;
+        }
+        self.setup_env.view = next;
+        // Only a running stage ticks, and only while setup runs: a settled card never repaints.
+        let starts = self.setup_env.live_starts();
+        self.setup_env.timers.retain(|started_at, _| starts.contains(started_at));
+        for started_at in starts {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.setup_env.timers.entry(started_at) {
+                let started_at = slot.key().clone();
+                slot.insert(cx.new(|cx| WorkingTimer::new(started_at, TimerKind::SetupStage, cx)));
+            }
+        }
+        true
+    }
+
+    fn sync_setup(&mut self, cx: &mut Context<Self>) {
+        if self.read_setup(cx) {
+            self.rederive(cx);
+            // The working row's label and chip follow it without the row changing.
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_setup_details(&mut self, cx: &mut Context<Self>) {
+        self.setup_env.details_open = !self.setup_env.details_open;
+        self.remeasure_where(|row| matches!(row.kind, RowKind::WorktreeSetup { .. }));
+        cx.notify();
+    }
+
+    pub fn toggle_setup_popover(&mut self, cx: &mut Context<Self>) {
+        // The click that dismissed the popover also lands on its trigger.
+        let just_dismissed = self.setup_env.popover_dismissed.take().is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(250));
+        if !just_dismissed {
+            self.setup_env.popover_open = !self.setup_env.popover_open;
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_setup_popover(&mut self, cx: &mut Context<Self>) {
+        if self.setup_env.popover_open {
+            self.setup_env.popover_open = false;
+            self.setup_env.popover_dismissed = Some(std::time::Instant::now());
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_setup(&mut self, cx: &mut Context<Self>) {
+        if let Some(store) = &self.setup {
+            store.update(cx, |store, cx| store.cancel(cx));
+        }
+    }
+
+    pub fn work_locally(&mut self, cx: &mut Context<Self>) {
+        if let Some(store) = &self.setup {
+            store.update(cx, |store, cx| store.work_locally(cx));
+        }
     }
 }
 

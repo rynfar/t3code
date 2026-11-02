@@ -1,6 +1,5 @@
 //! Timeline entries to rows: `deriveMessagesTimelineRows`
-//! (`apps/web/src/components/chat/MessagesTimeline.logic.ts`). Not ported yet: worktree-setup
-//! rows, HTML/MCP-app frames, revert targets, per-turn diff summaries, deferred-work loading,
+//! (`apps/web/src/components/chat/MessagesTimeline.logic.ts`). Not ported yet: HTML/MCP-app frames, revert targets, per-turn diff summaries, deferred-work loading,
 //! idle-resume compaction titles and the T3 delegate-row filter.
 
 use std::collections::{HashMap, HashSet};
@@ -20,8 +19,11 @@ use super::folds::{
 use super::presentation::compaction_tokens;
 use super::{ChatMessage, EntryKind, Role, RowKind, SourceActivity, TimelineEntry, TimelineRow, Tone, ToolStatus, WorkLogEntry, rows_equal};
 use crate::turn_item::{TurnItem, TurnItemKind};
+use crate::worktree_setup::{self, Phase, Snapshot};
 
 const LIVE_ACTIVITY_ROW_ID: &str = "live-activity-row";
+const WORKING_ROW_ID: &str = "working-indicator-row";
+const WORKTREE_SETUP_ROW_ID: &str = "worktree-setup-row";
 
 pub struct RowsInput<'a> {
     pub entries: &'a [Arc<TimelineEntry>],
@@ -29,6 +31,8 @@ pub struct RowsInput<'a> {
     pub expanded_run_ids: &'a HashSet<String>,
     pub expanded_attempt_ids: &'a HashSet<String>,
     pub expanded_work_group_ids: &'a HashSet<String>,
+    /// The setup card's snapshot, as `resolveVisibleWorktreeSetup` picks it.
+    pub worktree_setup: Option<&'a Arc<Snapshot>>,
 }
 
 /// Keeps settled copies of superseded "Thinking" entries stable across derives, as the web's
@@ -43,6 +47,7 @@ struct Previous {
     entries: Vec<Arc<TimelineEntry>>,
     activity: ThreadActivity,
     expanded: [HashSet<String>; 3],
+    worktree_setup: Option<Arc<Snapshot>>,
     rows: Vec<Arc<TimelineRow>>,
 }
 
@@ -55,6 +60,7 @@ fn patch_streaming_rows(input: &RowsInput, previous: &mut Previous) -> bool {
         || *input.expanded_run_ids != previous.expanded[0]
         || *input.expanded_attempt_ids != previous.expanded[1]
         || *input.expanded_work_group_ids != previous.expanded[2]
+        || !same_setup(input.worktree_setup, previous.worktree_setup.as_ref())
     {
         return false;
     }
@@ -96,6 +102,14 @@ fn patch_streaming_rows(input: &RowsInput, previous: &mut Previous) -> bool {
         }
     }
     true
+}
+
+fn same_setup(a: Option<&Arc<Snapshot>>, b: Option<&Arc<Snapshot>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn settle_superseded_reasoning(entries: &[Arc<TimelineEntry>], cache: &mut RowsCache) -> Vec<Arc<TimelineEntry>> {
@@ -154,6 +168,7 @@ pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<Arc<Timeline
         entries: input.entries.to_vec(),
         activity: input.activity.clone(),
         expanded: [input.expanded_run_ids.clone(), input.expanded_attempt_ids.clone(), input.expanded_work_group_ids.clone()],
+        worktree_setup: input.worktree_setup.cloned(),
         rows: rows.clone(),
     });
     rows
@@ -336,7 +351,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
     let working_row = || {
         compaction
             .working_row()
-            .map(|compacting| row("working-indicator-row", activity.active_turn_started_at.clone(), RowKind::Working { compacting }))
+            .map(|compacting| row(WORKING_ROW_ID, activity.active_turn_started_at.clone(), RowKind::Working { compacting }))
     };
     let mut index = 0;
     while index < entries.len() {
@@ -521,12 +536,14 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
         index += 1;
     }
 
+    let setup_owns_working_slot = place_worktree_setup(&mut rows, input.worktree_setup, activity);
     if is_working && !rows.iter().any(|r| matches!(r.kind, RowKind::Working { .. })) && header_index >= entries.len() {
         rows.extend(working_row());
     }
     let turn_ended = activity.latest_run.as_ref().is_some_and(|run| run.turn_ended);
     if is_working
         && !turn_ended
+        && !setup_owns_working_slot
         && !compaction.active
         && !compaction.only_run_finished
         && (latest_failed || (!has_activity_row && pending.is_empty()))
@@ -545,6 +562,36 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
     }
     let rows = attach_trailing_tool_groups(attach_created_thread_summaries(rows, entries, &collapsed_members));
     finalize_grouping(rows)
+}
+
+/// Places the setup card after the first user message, or under the working row it speaks for
+/// while setup runs or just finished and the agent has not taken over. Returns whether setup owns
+/// the working slot, which then has no "Thinking" row under it. Once the agent took over, a
+/// running setup leaves the card to the working row's chip, and a settled one collapses.
+fn place_worktree_setup(rows: &mut Vec<TimelineRow>, setup: Option<&Arc<Snapshot>>, activity: &ThreadActivity) -> bool {
+    let Some(setup) = setup else { return false };
+    let turn_started = activity.latest_run.as_ref().is_some_and(|run| run.started_at.is_some());
+    let handed_off = worktree_setup::agent_started(setup) && turn_started;
+    let owns_working_slot = !handed_off && matches!(setup.phase, Phase::Running | Phase::Done);
+    if handed_off && setup.running() {
+        return owns_working_slot;
+    }
+    let setup_row = row(WORKTREE_SETUP_ROW_ID, Some(setup.started_at.clone()), RowKind::WorktreeSetup { snapshot: setup.clone(), embedded: handed_off });
+    let working = if owns_working_slot { rows.iter().position(|r| matches!(r.kind, RowKind::Working { .. })) } else { None };
+    match working {
+        Some(index) => rows.insert(index + 1, setup_row),
+        None => {
+            let first_user = rows.iter().position(|r| matches!(&r.kind, RowKind::Message { message, .. } if message.role == Role::User));
+            let at = first_user.map_or(rows.len(), |index| index + 1);
+            let mut placed = Vec::with_capacity(2);
+            if owns_working_slot {
+                placed.push(row(WORKING_ROW_ID, Some(setup.started_at.clone()), RowKind::Working { compacting: false }));
+            }
+            placed.push(setup_row);
+            rows.splice(at..at, placed);
+        }
+    }
+    owns_working_slot
 }
 
 fn push_work_group(

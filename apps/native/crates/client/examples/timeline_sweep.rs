@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
                 let activity = derive_activity(&projection);
                 let (none, expanded_runs): (HashSet<String>, HashSet<String>) =
                     (HashSet::new(), projection.runs.iter().map(|run| run.id.clone()).collect());
-                let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &expanded_runs, expanded_attempt_ids: &none, expanded_work_group_ids: &none };
+                let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &expanded_runs, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None };
                 let mut rows_cache = RowsCache::default();
                 let rows = derive_rows(&input, &mut rows_cache);
                 let elapsed = started.elapsed();
@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
                         RowKind::AssistantMeta { .. } => "assistant-meta",
                         RowKind::Event { .. } => "event",
                         RowKind::ProposedPlan(_) => "proposed-plan",
+                        RowKind::WorktreeSetup { .. } => "worktree-setup",
                     };
                     *kinds.entry(kind).or_default() += 1;
                 }

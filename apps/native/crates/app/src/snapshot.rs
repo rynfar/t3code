@@ -26,6 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
+[--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
 
@@ -123,6 +124,8 @@ pub struct Options {
     context_meter: bool,
     /// Opens the welcome wizard at a step whatever the first-run gate decides.
     welcome: Option<crate::onboarding::Step>,
+    /// A `WorktreeSetupSnapshot` file shown for `--thread` instead of the server's.
+    worktree_setup: Option<PathBuf>,
     gestures: Vec<Gesture>,
     width: f32,
     height: f32,
@@ -160,6 +163,7 @@ impl Options {
                 Some("agents") => crate::onboarding::Step::Agents,
                 _ => crate::onboarding::Step::Connection,
             }),
+            worktree_setup: flag("--worktree-setup").map(PathBuf::from),
             gestures: gestures(&args),
             width: number("--width", 1440.),
             height: number("--height", 900.),
@@ -256,6 +260,13 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         state.update(&mut cx, |state, cx| state.select_thread(thread, cx));
         let loaded = state.clone();
         pump(&mut cx, options.wait, move |cx| loaded.read_with(cx, |state, _| state.thread.projection.is_some()));
+    }
+    if let Some(path) = &options.worktree_setup {
+        let text = std::fs::read_to_string(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        let value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let snapshot = t3_core::worktree_setup::decode_event(value).map_err(|error| error.to_string())?.ok_or("the worktree setup file holds null")?;
+        let store = cx.update(|cx| crate::worktree_setup::store(&state, cx));
+        store.update(&mut cx, |store, cx| store.show_fixture(snapshot, cx));
     }
     if options.appearance.is_some() || options.font_size.is_some() {
         cx.update(|cx| {
