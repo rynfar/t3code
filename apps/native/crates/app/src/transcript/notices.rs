@@ -73,10 +73,13 @@ pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, cx:
     focusable(fold, cx).into_any_element()
 }
 
-/// `WorkingTimelineRow`: "Working for 12s". The label is its own view that ticks itself.
-pub fn working_row(compacting: bool, env: &RowEnv, cx: &App) -> AnyElement {
+/// `WorkingTimelineRow`: "Working for 12s", whose label is its own view that ticks itself, or
+/// "Setting up worktree…" while the worktree is prepared, with the background setup chip.
+pub fn working_row(compacting: bool, env: &RowEnv, chip: Option<AnyElement>, cx: &App) -> AnyElement {
     let p = palette(cx);
+    let preparing = env.setup.view.preparing;
     let label = match env.working_timer {
+        _ if preparing => div().whitespace_nowrap().child(t3_core::worktree_setup::PREPARING_LABEL).into_any_element(),
         Some(timer) => timer.clone().into_any_element(),
         None => div().child(if compacting { "Compacting…" } else { "Working..." }).into_any_element(),
     };
@@ -93,8 +96,9 @@ pub fn working_row(compacting: bool, env: &RowEnv, cx: &App) -> AnyElement {
                 .px(px(4.))
                 .text_size(px(14.))
                 .text_color(hsla(p.muted_foreground))
-                .when(compacting, |this| this.child(Icon::Minimize2.render(px(12.), hsla(p.muted_foreground))))
-                .child(label),
+                .when(compacting && !preparing, |this| this.child(Icon::Minimize2.render(px(12.), hsla(p.muted_foreground))))
+                .child(label)
+                .children(chip),
         )
         .into_any_element()
 }

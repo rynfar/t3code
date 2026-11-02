@@ -219,9 +219,12 @@ impl Composer {
             (false, true, _) => (RoundKind::Steer, "Steer message"),
             _ => (RoundKind::Send, "Submit message"),
         };
-        let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some();
+        let blocked = self.snapshot.setup_blocks_send;
+        let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some() || blocked;
         let tooltip: SharedString = if resolved.model.is_none() {
             "No provider available".into()
+        } else if blocked {
+            t3_core::worktree_setup::SEND_BLOCKED.into()
         } else if let Some(reason) = attachment_block {
             reason.into()
         } else if self.sending {

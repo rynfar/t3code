@@ -82,7 +82,7 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   [--thread <id>] [--right-panel diff] [--settings appearance] [--palette] \
   [--new-thread] [--attach <file>]... [--prompt "@src"] \
   [--usage cost|tokens|limits] [--usage-period day|week|month|quarter] [--usage-model] \
-  [--context-meter] [--click <x>,<y>]... [--width 1440] [--height 900] [--dark | --light] [--wait 6]
+  [--context-meter] [--worktree-setup <snapshot.json>] [--click <x>,<y>]... [--width 1440] [--height 900] [--dark | --light] [--wait 6]
 ```
 
 - `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher),
@@ -99,6 +99,8 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   A click that writes (send, approve, archive) reaches the server, so use a scratch server.
 - A home with no saved environment renders the connect screen (set `T3CODE_HOME` as above to
   show the one-click local option).
+- `--worktree-setup` shows a `WorktreeSetupSnapshot` JSON file as `--thread`'s worktree setup
+  instead of the server's, so the setup card's states render without a real worktree launch.
 - `--new-thread` opens the new-thread draft; `--prompt` types into the composer last, so a trigger
   (`@src`, `/`, `$rev`) shows its menu; `--attach` drops files on the composer. Attaching uploads
   them (pending uploads the server sweeps after a day), so use it only against a scratch server.

@@ -399,6 +399,7 @@ pub enum Float {
     AboveStart,
     AboveEnd,
     BelowStart,
+    BelowEnd,
 }
 
 /// A popup painted above everything (layer 130), kept inside the window.
@@ -407,6 +408,7 @@ pub fn floating(position: Float, content: impl IntoElement) -> AnyElement {
         Float::AboveStart => (gpui::Anchor::BottomLeft, div().absolute().top_0().left_0()),
         Float::AboveEnd => (gpui::Anchor::BottomRight, div().absolute().top_0().right_0()),
         Float::BelowStart => (gpui::Anchor::TopLeft, div().absolute().bottom_0().left_0()),
+        Float::BelowEnd => (gpui::Anchor::TopRight, div().absolute().bottom_0().right_0()),
     };
     host.child(gpui::deferred(gpui::anchored().anchor(anchor).snap_to_window_with_margin(px(8.)).child(content)).with_priority(1))
         .into_any_element()

@@ -43,6 +43,7 @@ mod toast;
 mod transcript;
 mod usage;
 mod workspace;
+mod worktree_setup;
 
 use gpui::{App, Bounds, Entity, TitlebarOptions, Window, WindowBounds, WindowOptions, point, prelude::*, px, size};
 use gpui_component::Root;

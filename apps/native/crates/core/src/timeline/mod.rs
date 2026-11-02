@@ -302,6 +302,11 @@ pub enum RowKind {
         resource_summary: bool,
     },
     ProposedPlan(Arc<ProposedPlan>),
+    /// The worktree setup card; `embedded` once the agent took over and setup settled.
+    WorktreeSetup {
+        snapshot: Arc<crate::worktree_setup::Snapshot>,
+        embedded: bool,
+    },
 }
 
 impl RowKind {
@@ -350,6 +355,7 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
             Arc::ptr_eq(ia, ib) && ra == rb && sa.len() == sb.len() && sa.iter().zip(sb).all(|(l, r)| Arc::ptr_eq(l, r))
         }
         (RowKind::ProposedPlan(pa), RowKind::ProposedPlan(pb)) => Arc::ptr_eq(pa, pb),
+        (RowKind::WorktreeSetup { snapshot: sa, embedded: ea }, RowKind::WorktreeSetup { snapshot: sb, embedded: eb }) => Arc::ptr_eq(sa, sb) && ea == eb,
         (
             RowKind::WorkToggle { run_id: ra, group_id: ga, entries: ea, hidden_count: ha, expanded: xa, summary: sa, summary_kind: ka, tool_surface: ta, has_failure: fa },
             RowKind::WorkToggle { run_id: rb, group_id: gb, entries: eb, hidden_count: hb, expanded: xb, summary: sb, summary_kind: kb, tool_surface: tb, has_failure: fb },

@@ -274,7 +274,13 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &JumpToThread9, _, cx| this.jump(8, cx)))
             .bg(theme.background)
             .text_color(theme.foreground)
-            .on_action(move |_: &ToggleTerminal, window, cx| drawer.update(cx, |drawer, cx| drawer.toggle(window, cx)))
+            .on_action({
+                let drawer = drawer.clone();
+                move |_: &ToggleTerminal, window, cx| drawer.update(cx, |drawer, cx| drawer.toggle(window, cx))
+            })
+            .on_action(move |action: &crate::worktree_setup::OpenSetupTerminal, window, cx| {
+                drawer.update(cx, |drawer, cx| drawer.open_terminal(&action.terminal_id, window, cx))
+            })
             .when(!collapsed, |this| {
                 this.child(
                     div()

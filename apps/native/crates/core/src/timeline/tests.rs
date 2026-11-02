@@ -40,11 +40,12 @@ struct Input {
     activity: ThreadActivity,
     runs: HashSet<String>,
     groups: HashSet<String>,
+    setup: Option<Arc<crate::worktree_setup::Snapshot>>,
 }
 
 impl Input {
     fn idle() -> Self {
-        Input { activity: ThreadActivity::default(), runs: HashSet::new(), groups: HashSet::new() }
+        Input { activity: ThreadActivity::default(), runs: HashSet::new(), groups: HashSet::new(), setup: None }
     }
 
     fn rows(&self, entries: &[Arc<TimelineEntry>]) -> Vec<TimelineRow> {
@@ -55,6 +56,7 @@ impl Input {
             expanded_run_ids: &self.runs,
             expanded_attempt_ids: &none,
             expanded_work_group_ids: &self.groups,
+            worktree_setup: self.setup.as_ref(),
         };
         derive_rows(&input, &mut RowsCache::default()).iter().map(|row| (**row).clone()).collect()
     }
@@ -387,7 +389,7 @@ fn a_streamed_token_patches_rows_like_a_full_derive() {
         Arc::new(TimelineEntry { kind: EntryKind::Message(Arc::new(m)), ..(*entry).clone() })
     };
     let prompt = message("user-1", Role::User, "Go", Some("run-1"), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
-    let input = Input { activity: running("run-1"), runs: HashSet::new(), groups: HashSet::new() };
+    let input = Input { activity: running("run-1"), runs: HashSet::new(), groups: HashSet::new(), setup: None };
     let none = HashSet::new();
     let derive = |entries: &[Arc<TimelineEntry>], cache: &mut RowsCache| {
         let rows_input = RowsInput {
@@ -396,6 +398,7 @@ fn a_streamed_token_patches_rows_like_a_full_derive() {
             expanded_run_ids: &input.runs,
             expanded_attempt_ids: &none,
             expanded_work_group_ids: &input.groups,
+            worktree_setup: None,
         };
         derive_rows(&rows_input, cache).iter().map(|row| (**row).clone()).collect::<Vec<_>>()
     };
@@ -448,7 +451,7 @@ fn incremental_derives_match_a_fresh_derive_at_every_streamed_frame() {
         let activity = derive_activity(projection);
         let derive = |entries_cache: &mut EntriesCache, rows_cache: &mut RowsCache| {
             let entries = derive_entries(entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
-            let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none };
+            let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None };
             derive_rows(&input, rows_cache).iter().map(|row| row_summary(row)).collect::<Vec<_>>()
         };
         let incremental = derive(&mut entries_cache, &mut rows_cache);
@@ -786,7 +789,7 @@ fn a_streamed_token_replaces_only_its_own_row() {
     let none = HashSet::new();
     let mut cache = RowsCache::default();
     let mut derive = |entries: &[Arc<TimelineEntry>]| {
-        derive_rows(&RowsInput { entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none }, &mut cache)
+        derive_rows(&RowsInput { entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None }, &mut cache)
     };
     let first = derive(&[prompt.clone(), streaming("Hel")]);
     let second = derive(&[prompt, streaming("Hello")]);
@@ -1339,4 +1342,92 @@ fn open_command_items_follow_folded_groups() {
     assert_eq!(open_items(&input), [("cmd-2".to_owned(), "item-2".to_owned())]);
     input.runs.clear();
     assert_eq!(open_items(&input), [], "a folded turn draws none of its entries");
+}
+
+#[test]
+fn keeps_the_working_header_in_place_across_worktree_setup_handoff() {
+    use crate::worktree_setup::Snapshot;
+    let setup = |phase: &str, stages: serde_json::Value| -> Arc<Snapshot> {
+        let value = serde_json::json!({
+            "threadId": "thread-setup", "phase": phase, "startedAt": "2026-01-01T00:00:00Z", "endedAt": null,
+            "branch": "feature", "baseRef": "main", "worktreePath": null, "setupScript": null,
+            "stages": stages, "error": null, "sequence": 3,
+        });
+        Arc::new(crate::worktree_setup::decode_event(value).unwrap().unwrap())
+    };
+    let stage = |id: &str, status: &str| {
+        serde_json::json!({
+            "id": id, "status": status, "startedAt": "2026-01-01T00:00:10Z",
+            "endedAt": if status == "done" { serde_json::json!("2026-01-01T00:00:11Z") } else { serde_json::Value::Null },
+            "percent": null, "detail": null, "tail": [],
+        })
+    };
+    let kinds = |rows: &[TimelineRow]| -> Vec<&'static str> {
+        rows.iter()
+            .map(|row| match &row.kind {
+                RowKind::Message { .. } => "message",
+                RowKind::Working { .. } => "working",
+                RowKind::Thinking { .. } => "thinking",
+                RowKind::WorktreeSetup { embedded: false, .. } => "worktree-setup",
+                RowKind::WorktreeSetup { embedded: true, .. } => "worktree-setup:embedded",
+                _ => "other",
+            })
+            .collect()
+    };
+    let user = message("user-1", Role::User, "Build it", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+    let mut assistant = message("assistant-1", Role::Assistant, "On it", Some("turn-1"), "2026-01-01T00:00:30Z", "2026-01-01T00:00:30Z");
+    if let EntryKind::Message(m) = &mut Arc::make_mut(&mut assistant).kind {
+        Arc::make_mut(m).streaming = true;
+    }
+    let mut working = running("turn-1");
+    working.latest_run = None;
+    let mut input = Input { activity: working, runs: HashSet::new(), groups: HashSet::new(), setup: Some(setup("running", serde_json::json!([]))) };
+
+    let rows = input.rows(&[]);
+    assert_eq!(kinds(&rows), ["working", "worktree-setup"]);
+    assert_eq!((rows[0].id.as_str(), rows[0].created_at.as_deref()), ("working-indicator-row", Some("2026-01-01T00:00:00Z")));
+    assert_eq!(rows[1].id, "worktree-setup-row");
+
+    input.setup = Some(setup("failed", serde_json::json!([])));
+    assert_eq!(kinds(&input.rows(&[user.clone(), assistant])), ["message", "worktree-setup", "working", "message", "thinking"]);
+
+    let handed_off = serde_json::json!([stage("setup-script", "running"), stage("agent", "done")]);
+    input.setup = Some(setup("running", handed_off.clone()));
+    assert_eq!(kinds(&input.rows(std::slice::from_ref(&user))), ["message", "working", "worktree-setup"]);
+    input.setup = Some(setup("done", serde_json::json!([stage("setup-script", "done"), stage("agent", "done")])));
+    assert_eq!(kinds(&input.rows(std::slice::from_ref(&user))), ["message", "working", "worktree-setup"]);
+
+    // The turn started: a running setup leaves the card to the working row's chip.
+    input.activity.latest_run = running("turn-1").latest_run;
+    input.setup = Some(setup("running", handed_off));
+    assert_eq!(kinds(&input.rows(std::slice::from_ref(&user))), ["message", "working", "thinking"]);
+    input.setup = Some(setup("running", serde_json::json!([stage("setup-script", "done"), stage("agent", "done")])));
+    assert_eq!(kinds(&input.rows(std::slice::from_ref(&user))), ["message", "working", "thinking"]);
+    // A settled setup the agent took over collapses where it was.
+    input.setup = Some(setup("done", serde_json::json!([stage("setup-script", "failed"), stage("agent", "done")])));
+    assert_eq!(kinds(&input.rows(std::slice::from_ref(&user))), ["message", "worktree-setup:embedded", "working", "thinking"]);
+}
+
+#[test]
+fn a_new_setup_snapshot_rederives_rows_a_streamed_token_would_patch() {
+    let setup = |sequence: u64| -> Arc<crate::worktree_setup::Snapshot> {
+        let value = serde_json::json!({ "threadId": "t", "phase": "running", "startedAt": "2026-01-01T00:00:00Z", "stages": [], "sequence": sequence });
+        Arc::new(crate::worktree_setup::decode_event(value).unwrap().unwrap())
+    };
+    let entries = vec![message("user-1", Role::User, "Go", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")];
+    let (none, activity) = (HashSet::new(), ThreadActivity::default());
+    let mut cache = RowsCache::default();
+    let mut derive = |snapshot: &Arc<crate::worktree_setup::Snapshot>| {
+        let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: Some(snapshot) };
+        derive_rows(&input, &mut cache)
+    };
+    let (first, second) = (setup(1), setup(2));
+    let before = derive(&first);
+    let after = derive(&second);
+    let card = |rows: &[Arc<TimelineRow>]| rows.iter().find_map(|row| match &row.kind {
+        RowKind::WorktreeSetup { snapshot, .. } => Some(snapshot.sequence),
+        _ => None,
+    });
+    assert_eq!((card(&before), card(&after)), (Some(1), Some(2)));
+    assert!(Arc::ptr_eq(&before[0], &after[0]), "the unchanged message row keeps its identity");
 }
