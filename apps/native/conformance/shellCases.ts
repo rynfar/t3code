@@ -250,6 +250,7 @@ export function shellCases() {
           shellRow("rich", {
             lineage: { ...thread.lineage, sideChat: false },
             activityRunStatus: "running",
+            latestRunStopRequested: true,
             lastError: "Provider unavailable",
             snoozedUntil: thread.updatedAt,
             pinnedAt: thread.updatedAt,
@@ -289,6 +290,7 @@ export function shellCases() {
           shellRow("archived-rich", {
             lineage: { ...thread.lineage, sideChat: true },
             activityRunStatus: null,
+            latestRunStopRequested: false,
             lastError: null,
             snoozedUntil: null,
             pinnedAt: null,

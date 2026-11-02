@@ -24,6 +24,7 @@ import type * as DedupedBodiesModule from "../../../packages/shared/src/orchestr
 import type * as TimelineModule from "../../../packages/shared/src/orchestrationV2Timeline.ts";
 import type * as ThreadStreamModule from "../../../apps/server/src/orchestration-v2/ThreadStream.ts";
 import type * as HistoryPagingModule from "../../../apps/server/src/orchestration-v2/threadHistoryPaging.ts";
+import type * as NotificationGateModule from "../../../apps/web/src/components/ThreadNotificationCoordinator.logic.ts";
 import type * as WireProjectionModule from "../../../apps/server/src/orchestration-v2/WireProjection.ts";
 
 export const ROOT = NodePath.resolve(
@@ -68,6 +69,9 @@ export const ThreadStream = await importSource<typeof ThreadStreamModule>(
 );
 export const HistoryPaging = await importSource<typeof HistoryPagingModule>(
   "apps/server/src/orchestration-v2/threadHistoryPaging.ts",
+);
+export const NotificationGate = await importSource<typeof NotificationGateModule>(
+  "apps/web/src/components/ThreadNotificationCoordinator.logic.ts",
 );
 export const WireProjection = await importSource<typeof WireProjectionModule>(
   "apps/server/src/orchestration-v2/WireProjection.ts",
