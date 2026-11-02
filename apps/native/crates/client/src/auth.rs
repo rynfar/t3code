@@ -132,6 +132,15 @@ pub async fn issue_rpc_ticket(credentials: &Credentials) -> Result<String, AuthE
     }
 }
 
+/// Mints a single-use `media` ticket for a socket that cannot carry a bearer header, such as the
+/// preview stream (`resolveDeviceHubAccess`). Older servers answer only the bare path.
+pub async fn issue_media_ticket(credentials: &Credentials) -> Result<String, AuthError> {
+    match post_ticket(credentials, "/api/auth/websocket-ticket/media").await {
+        Err(AuthError::Unexpected { status: 404, .. }) => post_ticket(credentials, "/api/auth/websocket-ticket").await,
+        other => other,
+    }
+}
+
 async fn post_ticket(credentials: &Credentials, path: &str) -> Result<String, AuthError> {
     let host = credentials.http_base.clone();
     let response = http()

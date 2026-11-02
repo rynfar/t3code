@@ -126,6 +126,11 @@ impl ClientHandle {
         crate::asset::fetch_asset(&self.credentials.http_base, relative_url, max_bytes).await
     }
 
+    /// Opens the stream of one viewed preview tab on `runtime`. Dropping it closes the socket.
+    pub fn preview_stream(&self, runtime: &tokio::runtime::Handle, target: crate::preview_stream::StreamTarget) -> crate::preview_stream::PreviewStream {
+        crate::preview_stream::open(runtime, self.credentials.clone(), target)
+    }
+
     /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
     /// `Closed` while disconnected rather than waiting for a reconnect. The request is queued
     /// before this returns, so calls made in order reach the server in order (terminal input
