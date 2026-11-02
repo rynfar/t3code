@@ -31,7 +31,7 @@ actions!(settings, [OpenSettings, CloseSettings, FocusSettingsSearch]);
 struct Host {
     state: Entity<AppState>,
     view: Option<Entity<SettingsView>>,
-    pending: Option<Section>,
+    pending: Option<(Section, Option<String>)>,
 }
 
 impl Global for Host {}
@@ -50,8 +50,34 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
 
 /// Opens settings at `section`, or moves an open modal there.
 pub fn open(section: Section, cx: &mut App) {
-    cx.global_mut::<Host>().pending = Some(section);
+    open_at(section, None, cx);
+}
+
+/// Opens settings at the row a settings search result names, as the palette's results do.
+pub fn open_setting(id: &str, cx: &mut App) {
+    if let Some(item) = search::items().into_iter().find(|item| item.id == id) {
+        open_at(item.section, Some(item.anchor().to_owned()), cx);
+    }
+}
+
+fn open_at(section: Section, anchor: Option<String>, cx: &mut App) {
+    cx.global_mut::<Host>().pending = Some((section, anchor));
     cx.refresh_windows();
+}
+
+/// The settings search results the command palette lists (`CommandPalette.tsx`).
+pub fn palette_items() -> Vec<t3_core::palette::CommandPaletteItem> {
+    search::items()
+        .into_iter()
+        .map(|item| t3_core::palette::CommandPaletteItem {
+            value: format!("setting:{}", item.id),
+            search_terms: [item.title.clone(), item.section.label().to_owned()].into_iter().chain(item.terms.iter().cloned()).collect(),
+            description: Some(format!("Settings \u{00b7} {}", item.section.label())),
+            secondary: item.secondary,
+            title: item.title,
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn close(cx: &mut App) {
@@ -62,12 +88,12 @@ fn close(cx: &mut App) {
 
 /// The modal layer, drawn by the workspace above everything else while settings are open.
 pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-    if let Some(section) = cx.global_mut::<Host>().pending.take() {
+    if let Some((section, anchor)) = cx.global_mut::<Host>().pending.take() {
         match cx.global::<Host>().view.clone() {
-            Some(view) => view.update(cx, |view, cx| view.navigate(section, None, cx)),
+            Some(view) => view.update(cx, |view, cx| view.navigate(section, anchor, cx)),
             None => {
                 let state = cx.global::<Host>().state.clone();
-                let view = cx.new(|cx| SettingsView::new(state, section, window, cx));
+                let view = cx.new(|cx| SettingsView::new(state, section, anchor, window, cx));
                 view.read(cx).focus.clone().focus(window, cx);
                 cx.global_mut::<Host>().view = Some(view);
             }
@@ -152,7 +178,7 @@ impl Focusable for SettingsView {
 }
 
 impl SettingsView {
-    fn new(state: Entity<AppState>, section: Section, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<AppState>, section: Section, anchor: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscriptions = vec![
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, window, cx| match event {
@@ -185,7 +211,7 @@ impl SettingsView {
             server_address: t3_client::store::load().map(|credentials| credentials.http_base).unwrap_or_default(),
             _subscriptions: subscriptions,
         };
-        view.navigate(section, None, cx);
+        view.navigate(section, anchor, cx);
         view
     }
 

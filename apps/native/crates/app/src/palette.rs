@@ -34,6 +34,7 @@ pub struct CommandPalette {
     root: Vec<CommandPaletteGroup>,
     threads: Vec<CommandPaletteItem>,
     projects: Vec<CommandPaletteItem>,
+    settings: Vec<CommandPaletteItem>,
     groups: Vec<CommandPaletteGroup>,
     highlighted: Option<String>,
     focus_return: Option<FocusHandle>,
@@ -66,6 +67,7 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     }
     items.push(action("action:previous-thread", "Previous thread", &["navigate"], Some("thread.previous")));
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
+    items.push(action("action:settings", "Open settings", &["settings", "preferences", "configuration", "keybindings"], None));
     items
 }
 
@@ -88,6 +90,7 @@ impl CommandPalette {
             root: Vec::new(),
             threads: Vec::new(),
             projects: Vec::new(),
+            settings: crate::settings::palette_items(),
             groups: Vec::new(),
             highlighted: None,
             focus_return: None,
@@ -175,7 +178,7 @@ impl CommandPalette {
             is_in_submenu: false,
             all_options: None,
             project_search_items: &self.projects,
-            settings_search_items: &[],
+            settings_search_items: &self.settings,
             thread_search_items: &self.threads,
             now: now_ms(),
         });
@@ -236,9 +239,15 @@ impl CommandPalette {
                 "copy-thread" => keymap::action_for("thread.copyReference"),
                 "previous-thread" => keymap::action_for("thread.previous"),
                 "next-thread" => keymap::action_for("thread.next"),
+                "settings" => {
+                    crate::settings::open(t3_core::settings::search::Section::General, cx);
+                    return;
+                }
                 _ => return,
             };
             window.dispatch_action(action, cx);
+        } else if let Some(id) = value.strip_prefix("setting:") {
+            crate::settings::open_setting(id, cx);
         } else if let Some(rest) = value.strip_prefix("thread:") {
             let thread_id = rest.split_once(':').map_or(rest, |(_, id)| id).to_owned();
             self.state.update(cx, |state, cx| state.select_thread(&thread_id, cx));
