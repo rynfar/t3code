@@ -502,6 +502,16 @@ pub struct EnvironmentCapabilities {
     pub thread_auto_settle_opt_out: Option<bool>,
     #[serde(default)]
     pub project_organization: Option<bool>,
+    #[serde(default)]
+    pub worktrees_directory: Option<bool>,
+    #[serde(default)]
+    pub storage_cleanup: Option<bool>,
+    #[serde(default)]
+    pub storage_cleanup_run: Option<bool>,
+    #[serde(default)]
+    pub settled_worktree_cleanup: Option<bool>,
+    #[serde(default)]
+    pub one_time_schedules: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -629,6 +639,10 @@ pub struct ServerSettings {
     pub threads: crate::settings::ThreadSettings,
     #[serde(flatten)]
     pub provider_panel: crate::settings::providers::background::ProviderPanelSettings,
+    #[serde(flatten)]
+    pub worktrees: crate::settings::worktrees::WorktreeSettings,
+    #[serde(flatten)]
+    pub source_control: crate::settings::source_control::SourceControlSettings,
 }
 
 /// `providerInstances` in the server's order, which is the order the provider settings list
@@ -701,6 +715,9 @@ pub struct ServerConfig {
     /// Where `server.upsertKeybinding` writes; Settings opens it in an editor.
     #[serde(default)]
     pub keybindings_config_path: Option<String>,
+    /// `ManagedPolicySummary`, kept raw; scheduled tasks read its runtime mode ceiling.
+    #[serde(default)]
+    pub managed_policy: Option<Value>,
     /// The workspace "Start without a project" opens (`projects.ensureScratch`); absent on
     /// servers without scratch projects.
     #[serde(default)]

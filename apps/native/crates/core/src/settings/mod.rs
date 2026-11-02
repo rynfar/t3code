@@ -4,12 +4,16 @@
 //! `web/src/hooks/useSettings.ts` sends the server half of a unified patch. Labels and copy follow
 //! `web/src/components/settings/SettingsPanels.tsx` and `ProjectDefaultsSettings.tsx`.
 
+pub mod access;
 pub mod archive;
 pub mod keybindings;
 pub mod providers;
 pub mod quit_hold;
 pub mod search;
+pub mod scheduled_tasks;
 pub mod snooze;
+pub mod source_control;
+pub mod worktrees;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};

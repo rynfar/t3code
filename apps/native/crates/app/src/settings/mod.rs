@@ -5,14 +5,18 @@
 //! sections take arrow keys, and closing commits the focused field first.
 
 mod about;
+mod access;
 mod appearance;
 mod archive;
 pub(crate) mod controls;
 mod general;
 mod keybindings;
 mod providers;
+mod scheduled_tasks;
+mod source_control;
 pub(crate) mod store;
 mod threads;
+mod worktrees;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyBinding,
@@ -200,6 +204,10 @@ pub struct SettingsView {
     pub(crate) keybindings: keybindings::KeybindingsState,
     pub(crate) archive: archive::ArchiveState,
     pub(crate) providers: providers::ProvidersState,
+    pub(crate) worktrees: worktrees::WorktreesState,
+    pub(crate) source_control: source_control::SourceControlState,
+    pub(crate) scheduled: scheduled_tasks::ScheduledTasksState,
+    pub(crate) access: access::AccessPageState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -241,6 +249,10 @@ impl SettingsView {
             keybindings: keybindings::KeybindingsState::new(window, cx),
             archive: archive::ArchiveState::default(),
             providers: providers::ProvidersState::new(window, cx),
+            worktrees: worktrees::WorktreesState::new(window, cx),
+            source_control: source_control::SourceControlState::new(window, cx),
+            scheduled: scheduled_tasks::ScheduledTasksState::new(window, cx),
+            access: access::AccessPageState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -266,12 +278,22 @@ impl SettingsView {
         let changed = self.section != section;
         self.section = section;
         self.scroll_to_target = target.is_some();
+        if let Some(target) = target.as_deref() {
+            self.worktrees.reveal(target);
+            self.source_control.reveal(target);
+        }
         self.target = target;
         if changed || self.target.is_none() {
             self.scroll.set_offset(point(px(0.), px(0.)));
         }
         if section == Section::Archived {
             self.load_archive(cx);
+        }
+        if section != Section::ScheduledTasks {
+            self.scheduled.stream = None;
+        }
+        if section != Section::Access {
+            self.access.close();
         }
         cx.notify();
     }
@@ -325,6 +347,8 @@ impl SettingsView {
     fn commit_focused_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_focused_thread_field(window, cx);
         self.commit_focused_provider_field(window, cx);
+        self.commit_focused_worktree_field(window, cx);
+        self.commit_focused_source_control_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -409,7 +433,11 @@ impl SettingsView {
             .into_iter()
             .chain(self.threads.time_inputs())
             .chain(self.providers.inputs())
+            .chain(self.worktrees.inputs())
+            .chain(self.scheduled.inputs())
+            .chain([&self.access.label])
             .any(|input| input.focus_handle(cx).is_focused(window))
+            || [&self.worktrees.instructions, self.scheduled.textarea()].into_iter().chain(self.source_control.textareas()).any(|input| input.focus_handle(cx).is_focused(window))
     }
 
     fn render_nav(&self, layout: ModalLayout, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -616,6 +644,10 @@ impl SettingsView {
             Section::Threads => self.threads_page(window, cx),
             Section::Keybindings => self.keybindings_page(window, cx),
             Section::Providers => self.providers_page(window, cx),
+            Section::Worktrees => self.worktrees_page(window, cx),
+            Section::SourceControl => self.source_control_page(window, cx),
+            Section::ScheduledTasks => self.scheduled_tasks_page(cx),
+            Section::Access => self.access_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
@@ -636,6 +668,10 @@ fn section_icon(section: Section) -> Icon {
         Section::Keybindings => Icon::Keyboard,
         Section::Providers => Icon::Bot,
         Section::Threads => Icon::MessagesSquare,
+        Section::ScheduledTasks => Icon::CalendarClock,
+        Section::SourceControl => Icon::GitBranch,
+        Section::Worktrees => Icon::FolderTree,
+        Section::Access => Icon::ShieldCheck,
         Section::Connections => Icon::Server,
         Section::Maintenance => Icon::Wrench,
         Section::Labs => Icon::FlaskConical,

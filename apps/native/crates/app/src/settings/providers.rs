@@ -55,7 +55,7 @@ impl Drop for AbortOnDrop {
 
 /// A live streaming RPC: the network loop that resubscribes after a reconnect, and the pump
 /// that hands its items to the view.
-struct Stream {
+pub(super) struct Stream {
     _driver: AbortOnDrop,
     _pump: Task<()>,
 }
@@ -232,7 +232,7 @@ struct PageData {
     panel: ProviderPanelSettings,
 }
 
-fn failure_text(error: &RpcError, fallback: &str) -> String {
+pub(super) fn failure_text(error: &RpcError, fallback: &str) -> String {
     match error {
         RpcError::Failure(failure) => Some(auth::failure_message(failure)).filter(|text| !text.trim().is_empty()).unwrap_or_else(|| fallback.to_owned()),
         RpcError::Closed => "The connection closed. Try again once it reconnects.".to_owned(),
@@ -739,7 +739,7 @@ impl SettingsView {
 
     /// A streaming RPC whose items reach `on_item` on the UI thread, batched per frame. It
     /// resubscribes after a reconnect and stops on a server failure, which it reports.
-    fn subscribe(
+    pub(super) fn subscribe(
         &self,
         method: &'static str,
         payload: Value,

@@ -65,7 +65,11 @@ impl Section {
                 | Section::Keybindings
                 | Section::Providers
                 | Section::Threads
+                | Section::ScheduledTasks
+                | Section::SourceControl
+                | Section::Worktrees
                 | Section::Connections
+                | Section::Access
                 | Section::Labs
                 | Section::About
                 | Section::Archived
@@ -130,6 +134,10 @@ impl SearchItem {
 pub fn items() -> Vec<SearchItem> {
     use Section::*;
     vec![
+        SearchItem::new("storage-worktree-keep-when", "Keep worktrees with local changes", Worktrees, &["any local files uncommitted changes edited tracked files ignored env build output cleanup"])
+            .target("storage-worktrees"),
+        SearchItem::new("storage-worktrees", "Worktree cleanup", Worktrees, &["disk storage automatic delete deleted archived threads old inactive merged settled unchanged worktrees retention days project inherit off custom"]),
+        SearchItem::new("storage-worktrees-location", "Worktree location", Worktrees, &["worktree location folder directory path drive external disk"]),
         SearchItem::new("project-defaults", "Project defaults and overrides", Threads, &["model workspace environments projects inheritance checkout"]),
         SearchItem::new("default-model", "Default model", Threads, &["new thread project provider reasoning effort"]),
         SearchItem::new("fallback-model", "Fallback model", Threads, &["fallback agent provider out of usage new threads"]),
@@ -158,6 +166,8 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("send-shortcut", "Send shortcut", Chat, &["enter return command ctrl multiline prompt new line composer"]),
         SearchItem::new("follow-up-behavior", "Follow-up behavior", Chat, &["queue steer running turn send default behavior composer"]),
         SearchItem::new("new-threads", "New threads", Threads, &["default workspace mode draft local worktree"]),
+        SearchItem::new("worktree-submodules", "Submodules", Worktrees, &["git submodule init recursive top-level none worktree t3.json"]),
+        SearchItem::new("start-from-origin", "Start from remote", Worktrees, &["new worktrees start remote origin latest fetched branch local"]),
         SearchItem::new("add-project-starts-in", "Add project starts in", Threads, &["base directory folder browser path home"]),
         SearchItem::new("unpin-confirmation", "Unpin confirmation", General, &["ask before thread pinned section"]),
         SearchItem::new("archive-confirmation", "Archive confirmation", General, &["ask before thread second click inline action"]),
@@ -169,6 +179,18 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
         SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
         SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),
+        SearchItem::new("automatic-pull", "Automatically pull", SourceControl, &["auto pull default branch current checkout fast forward upstream"]),
+        SearchItem::new("remove-agent-credits-on-merge", "Remove agent credits when merging", SourceControl, &["pull request GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"]),
+        SearchItem::new("pull-request-merge-method", "Default merge method", SourceControl, &["pull request merge squash rebase last selected"]),
+        SearchItem::new("source-control", "Source control", SourceControl, &["version control git GitHub ghes enterprise GitLab GitCafe Forgejo gitea tea codeberg Bitbucket Azure DevOps hosting integrations credentials scan server environment"]),
+        SearchItem::new("worktree-branch-naming", "Worktree branch naming", Worktrees, &["static semantic prefix custom prompt instructions feat fix refactor chore"]),
+        SearchItem::new("source-control-writing-style", "Source control writing style", SourceControl, &["repository conventions conventional commits custom instructions change descriptions request titles"]),
+        SearchItem::new("follow-change-request-templates", "Follow change request templates", SourceControl, &["repository pr pull request description structure"]),
+        SearchItem::new("source-control-writer-model", "Source control writer model", SourceControl, &["override generated commit change request pr titles descriptions branch bookmark"]),
+        SearchItem::new("review-guides", "Review guides (beta)", SourceControl, &["pull request pr guided review guide tour beta experimental"]),
+        SearchItem::new("review-guide-model", "Review guide model", SourceControl, &["pull request pr guided review guide brief maintainer"]).target("review-guides"),
+        SearchItem::new("review-guide-instructions", "Review guide instructions", SourceControl, &["pull request pr guided review guide preferences taste prompt custom"]).target("review-guides"),
+        SearchItem::new("connections-environment", "This machine", Access, &["connections server backend local remote access administrative permissions scope pairing links qr code authorized clients sessions revoke endpoint"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),
     ]
