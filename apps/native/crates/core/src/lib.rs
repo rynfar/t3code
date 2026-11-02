@@ -1,3 +1,4 @@
+pub mod client_settings;
 pub mod commands;
 pub mod composer;
 pub mod diff;
@@ -15,6 +16,7 @@ pub mod right_panel;
 pub mod rpc;
 pub mod search;
 pub mod server_config;
+pub mod settings;
 pub mod shell;
 pub mod sidebar;
 pub mod terminal;
