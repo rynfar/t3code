@@ -455,7 +455,7 @@ impl AppState {
     }
 
     /// The environment's saved snooze options, or the defaults before its settings load (`Sidebar.snooze.ts`).
-    fn snooze_settings(&self) -> Vec<SnoozePresetSetting> {
+    pub(crate) fn snooze_settings(&self) -> Vec<SnoozePresetSetting> {
         self.server_config.config.as_ref().map_or_else(|| DEFAULT_SNOOZE_PRESETS.to_vec(), |config| menu_settings(&config.settings.threads.snooze_presets))
     }
 

@@ -8,7 +8,7 @@ use gpui::{Context, Modifiers};
 use t3_core::sidebar::Section;
 use t3_core::sidebar::drag::{DropPlan, DropPlanInput, DropTarget, plan_thread_drop, position_of, resolve_drop_target_at_slot};
 use t3_core::sidebar::selection::{BulkAction, BulkSelection};
-use t3_core::sidebar::settled::{self, DEFAULT_SNOOZE_PRESETS, SnoozePreset};
+use t3_core::sidebar::settled::{self, SnoozePreset};
 use t3_core::thread_actions::{self as actions, UndoKind};
 
 use super::controller::{SystemZone, now_ms, time_label, uuid};
@@ -73,10 +73,8 @@ impl AppState {
         let threads: Vec<_> = ids.iter().filter_map(|id| model.thread(id)).collect();
         match action {
             BulkAction::Unpin => {
-                for thread in threads.iter().filter(|thread| thread.pinned) {
-                    self.unpin_thread(&thread.id, cx);
-                }
-                self.clear_thread_selection(cx);
+                let pinned = threads.iter().filter(|thread| thread.pinned).map(|thread| thread.id.clone()).collect();
+                self.request_unpin_threads(pinned, cx);
             }
             BulkAction::Settle => {
                 for thread in threads.iter().filter(|thread| !thread.is_settled()) {
@@ -85,7 +83,7 @@ impl AppState {
                 self.clear_thread_selection(cx);
             }
             BulkAction::SnoozePreset(preset) => {
-                let Some(preset) = settled::pick_snooze_preset(shown_presets, &preset, now_ms(), &DEFAULT_SNOOZE_PRESETS, &SystemZone, &time_label) else { return };
+                let Some(preset) = settled::pick_snooze_preset(shown_presets, &preset, now_ms(), &self.snooze_settings(), &SystemZone, &time_label) else { return };
                 self.clear_thread_selection(cx);
                 for thread in &threads {
                     self.snooze_thread(&thread.id, preset.snoozed_until, cx);

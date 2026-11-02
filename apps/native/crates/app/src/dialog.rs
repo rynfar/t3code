@@ -59,6 +59,26 @@ impl AppState {
         ask(title, description, "Unpin", move |state, cx| state.unpin_thread(&id, cx), cx);
     }
 
+    /// Unpins a multi-selection, asking once first while "Confirm thread unpin" is on.
+    pub fn request_unpin_threads(&mut self, thread_ids: Vec<String>, cx: &mut Context<Self>) {
+        let confirm = crate::settings::client_settings(cx).confirm_thread_unpin() && !thread_ids.is_empty();
+        let (title, description) = match thread_ids.as_slice() {
+            [only] => unpin_confirmation(&self.thread_title(only)),
+            ids => (format!("Unpin {} threads?", ids.len()), "This will move the threads out of your pinned section."),
+        };
+        let unpin = move |state: &mut AppState, cx: &mut Context<AppState>| {
+            for id in &thread_ids {
+                state.unpin_thread(id, cx);
+            }
+            state.clear_thread_selection(cx);
+        };
+        if confirm {
+            ask(title, description, "Unpin", unpin, cx);
+        } else {
+            unpin(self, cx);
+        }
+    }
+
     /// Archives, asking first while "Confirm thread archive" is on. A thread that cannot be
     /// archived says why without asking.
     pub fn request_archive_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
