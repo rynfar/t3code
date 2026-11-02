@@ -58,6 +58,7 @@ pub struct AppState {
     pub draft_project: Option<String>,
     pub panels: crate::right_panel::PanelState,
     restore_thread: Option<String>,
+    pub(crate) notifications: crate::notifications::NotificationCenter,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
     client: Option<ClientHandle>,
@@ -85,6 +86,7 @@ impl AppState {
             draft_project: None,
             panels: crate::right_panel::PanelState::load(),
             restore_thread: store::load_last_thread(),
+            notifications: Default::default(),
             select_when_listed: None,
             client: None,
             runtime,
@@ -185,6 +187,7 @@ impl AppState {
             }
         }
         if shell_changed {
+            self.observe_notifications(cx);
             if sidebar_changed {
                 self.rebuild_sidebar(cx);
             }

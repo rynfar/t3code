@@ -9,6 +9,7 @@ mod icons;
 mod keymap;
 mod menus;
 mod new_thread;
+mod notifications;
 mod palette;
 mod right_panel;
 mod sidebar;
@@ -51,6 +52,12 @@ fn main() {
         composer::init(cx);
         keymap::init(cx);
         let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
+        cx.on_system_notification_response({
+            let state = state.downgrade();
+            move |response, cx| {
+                let _ = state.update(cx, |state, cx| state.open_notification(&response.tag, cx));
+            }
+        });
         menus::init(state.clone(), cx);
         new_thread::init(state.clone(), cx);
         right_panel::init(state.clone(), cx);
