@@ -31,6 +31,7 @@ actions!(
 const CONTEXT: &str = "Terminal";
 
 pub fn init(cx: &mut App) {
+    element::set_typography(element::load_typography(), cx);
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),

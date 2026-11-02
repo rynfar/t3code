@@ -1,7 +1,8 @@
 //! A terminal pane: one session painted by `TerminalElement`, with keyboard and IME input,
-//! selection, scrollback and the clipboard. Ports `TerminalSessionViewport` in
-//! `apps/web/src/components/ThreadTerminalDrawer.tsx`: its context menu (Copy, Paste, Select
-//! all, Jump to latest), the editing shortcuts, and the exit handling.
+//! selection, scrollback, the clipboard, and mouse reports for programs that track the mouse.
+//! Ports `TerminalSessionViewport` in `apps/web/src/components/ThreadTerminalDrawer.tsx` (its
+//! context menu, editing shortcuts and exit handling) and the pointer handling of
+//! `apps/web/src/terminal/ghostty/surface.ts`.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -10,22 +11,20 @@ use std::time::Duration;
 
 use gpui::{
     Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, Styled, Subscription, Task, UTF16Selection, Window, div, px,
 };
 use gpui_component::menu::ContextMenuExt;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
-use t3_core::terminal::emulator::{GridPoint, SelectionType, Side, Snapshot, TermMode, ThemeColors, hit_cell};
+use t3_core::terminal::emulator::{self, GridPoint, MouseAction, SelectionType, Side, TermMode, ThemeColors, hit_cell};
 use t3_core::terminal::{self, Grid, KeyInput, encode_key, encode_paste, shortcut_data};
 
 use super::colors;
-use super::element::TerminalElement;
-use super::session::{Session, Signal, Target};
+use super::element::{RowCache, TerminalElement, TerminalFont};
+use super::session::{Frame, Session, Signal, Target};
 use super::{Clear, Copy, JumpToLatest, Paste, SelectAll};
 
-/// The pane repaints at most once per frame however fast output arrives.
-const FRAME: Duration = Duration::from_millis(16);
 /// The PTY hears a new grid only after the size settles, so a drag does not reflow the prompt.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const DRAG_THRESHOLD: f32 = 2.;
@@ -53,15 +52,36 @@ struct Drag {
     armed: bool,
 }
 
+/// `shouldReportTerminalMouse`: Shift, Control and Command keep the pointer for selection.
+fn reports_mouse(modifiers: &Modifiers) -> bool {
+    !modifiers.shift && !modifiers.control && !modifiers.platform
+}
+
+/// `ghosttyMouseButton` for the buttons a pointer press can report.
+fn report_button(button: MouseButton) -> Option<emulator::MouseButton> {
+    match button {
+        MouseButton::Left => Some(emulator::MouseButton::Left),
+        MouseButton::Middle => Some(emulator::MouseButton::Middle),
+        MouseButton::Right => Some(emulator::MouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
+}
+
 pub struct TerminalPane {
     session: Session,
     focus: FocusHandle,
-    frame: Rc<RefCell<Snapshot>>,
+    frame: Rc<RefCell<Frame>>,
+    rows: Rc<RefCell<RowCache>>,
     geometry: Option<Geometry>,
+    /// The grid and cell size the emulator was last fitted to.
+    fitted: Option<(Grid, (f32, f32))>,
     marked: Option<String>,
     drag: Option<Drag>,
+    /// The button whose press went to the program, and the cell it last reported.
+    reporting: Option<(MouseButton, (usize, usize))>,
     scroll_remainder: f32,
     theme: Option<ThemeColors>,
+    resize_pending: bool,
     resize_settle: Option<Task<()>>,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -91,9 +111,7 @@ impl TerminalPane {
                 let alive = match signal {
                     Signal::Changed => {
                         signals.pending.store(false, std::sync::atomic::Ordering::Release);
-                        let alive = this.update(cx, |_, cx| cx.notify()).is_ok();
-                        cx.background_executor().timer(FRAME).await;
-                        alive
+                        this.update(cx, |_, cx| cx.notify()).is_ok()
                     }
                     Signal::Exited => this.update(cx, |_, cx| cx.emit(PaneEvent::Exited)).is_ok(),
                 };
@@ -105,16 +123,21 @@ impl TerminalPane {
         let subscriptions = vec![
             cx.on_focus(&focus, window, |pane, _, cx| pane.focus_changed(true, cx)),
             cx.on_blur(&focus, window, |pane, _, cx| pane.focus_changed(false, cx)),
+            cx.observe_global::<TerminalFont>(|_, cx| cx.notify()),
         ];
         TerminalPane {
             session,
             focus,
             frame: Rc::default(),
+            rows: Rc::default(),
             geometry: None,
+            fitted: None,
             marked: None,
             drag: None,
+            reporting: None,
             scroll_remainder: 0.,
             theme: Some(theme),
+            resize_pending: false,
             resize_settle: None,
             _pump: pump,
             _subscriptions: subscriptions,
@@ -125,24 +148,33 @@ impl TerminalPane {
         &self.session.target.terminal_id
     }
 
-    pub fn is_read_only(&self) -> bool {
-        self.session.shared.lock().read_only
-    }
-
-    /// Called from the element's prepaint with this frame's fit.
-    pub(super) fn laid_out(&mut self, measured: Grid, geometry: Geometry, cx: &mut Context<Self>) {
-        self.geometry = Some(geometry);
-        let changed = {
-            let mut core = self.session.shared.lock();
-            let changed = core.measured != Some(measured);
-            core.measured = Some(measured);
-            changed
-        };
-        if changed {
+    /// Called from the element's prepaint with the grid and cell size that fit this frame. The
+    /// emulator is touched only when they change; the PTY hears the grid once it settles.
+    pub(super) fn fit(&mut self, measured: Grid, cell: (f32, f32), cx: &mut Context<Self>) {
+        if self.fitted == Some((measured, cell)) {
+            return;
+        }
+        let regrid = self.fitted.is_none_or(|(grid, _)| grid != measured);
+        self.fitted = Some((measured, cell));
+        self.session.update(|core| core.lay_out(measured, cell));
+        if regrid {
+            self.resize_pending = true;
             self.resize_settle = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(RESIZE_SETTLE).await;
-                let _ = this.update(cx, |pane, _| pane.session.send_resize());
+                let _ = this.update(cx, |pane, _| pane.flush_resize());
             }));
+        }
+    }
+
+    pub(super) fn set_geometry(&mut self, geometry: Geometry) {
+        self.geometry = Some(geometry);
+    }
+
+    /// Sends a grid still settling now, so input that follows reaches a shell with the settled
+    /// width (`onWindowPointerRelease`).
+    fn flush_resize(&mut self) {
+        if std::mem::take(&mut self.resize_pending) {
+            self.session.send_resize();
         }
     }
 
@@ -156,15 +188,17 @@ impl TerminalPane {
 
     /// Sends input and follows the output again, like typing into any terminal does.
     fn input(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.flush_resize();
         let scrolled = {
-            let mut core = self.session.shared.lock();
+            let core = self.session.shared.lock();
             if core.read_only {
                 return;
             }
-            let scrolled = core.emulator.display_offset() > 0;
-            core.emulator.scroll_to_bottom();
-            scrolled
+            core.emulator.display_offset() > 0
         };
+        if scrolled {
+            self.session.update(|core| core.emulator.scroll_to_bottom());
+        }
         let writes = self.session.write(data);
         if !writes.is_empty() {
             cx.spawn(async move |this, cx| {
@@ -183,7 +217,7 @@ impl TerminalPane {
     }
 
     fn note(&mut self, message: &str, cx: &mut Context<Self>) {
-        self.session.shared.lock().emulator.print_local(&terminal::system_message(message));
+        self.session.update(|core| core.emulator.print_local(&terminal::system_message(message)));
         cx.notify();
     }
 
@@ -204,7 +238,7 @@ impl TerminalPane {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.session.shared.lock().emulator.select_all();
+        self.session.update(|core| core.emulator.select_all());
         cx.notify();
     }
 
@@ -213,7 +247,7 @@ impl TerminalPane {
     }
 
     fn jump_to_latest(&mut self, _: &JumpToLatest, _: &mut Window, cx: &mut Context<Self>) {
-        self.session.shared.lock().emulator.scroll_to_bottom();
+        self.session.update(|core| core.emulator.scroll_to_bottom());
         cx.notify();
     }
 
@@ -240,49 +274,99 @@ impl TerminalPane {
         self.input(&data, cx);
     }
 
-    fn hit(&self, position: Point<Pixels>) -> Option<(GridPoint, Side)> {
+    /// The visible cell under a pointer, clamped to the grid.
+    fn cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize, Side)> {
         let geometry = self.geometry?;
-        let (row, col, side) = hit_cell(
+        Some(hit_cell(
             f32::from(position.x - geometry.origin.x),
             f32::from(position.y - geometry.origin.y),
             geometry.cell_width,
             geometry.line_height,
             geometry.cols,
             geometry.rows,
-        );
+        ))
+    }
+
+    fn hit(&self, position: Point<Pixels>) -> Option<(GridPoint, Side)> {
+        let (row, col, side) = self.cell_at(position)?;
         Some((self.session.shared.lock().emulator.point_at(row, col), side))
+    }
+
+    /// The report a pointer event sends to a program tracking the mouse, if it sends one.
+    fn mouse_report(&self, action: MouseAction, button: emulator::MouseButton, alt: bool, position: Point<Pixels>) -> Option<(String, (usize, usize))> {
+        let (row, col, _) = self.cell_at(position)?;
+        let core = self.session.shared.lock();
+        if core.read_only {
+            return None;
+        }
+        Some((core.emulator.mouse_report(action, button, alt, row, col)?, (row, col)))
+    }
+
+    /// Capture phase, so a press the program takes never starts a selection or the context menu.
+    fn report_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(button) = report_button(event.button).filter(|_| reports_mouse(&event.modifiers)) else { return };
+        let Some((report, cell)) = self.mouse_report(MouseAction::Press, button, event.modifiers.alt, event.position) else { return };
+        cx.stop_propagation();
+        window.focus(&self.focus, cx);
+        cx.emit(PaneEvent::Activated);
+        self.reporting = Some((event.button, cell));
+        self.input(&report, cx);
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         cx.emit(PaneEvent::Activated);
         let Some((point, side)) = self.hit(event.position) else { return };
-        let mut core = self.session.shared.lock();
-        let armed = match event.click_count {
-            0 => return,
-            1 if event.modifiers.shift && core.emulator.has_selection() => {
+        let (click_count, extend) = (event.click_count, event.modifiers.shift);
+        let armed = self.session.update(|core| match click_count {
+            0 => None,
+            1 if extend && core.emulator.has_selection() => {
                 core.emulator.update_selection(point, side);
-                true
+                Some(true)
             }
             1 => {
                 core.emulator.clear_selection();
-                false
+                Some(false)
             }
             2 => {
                 core.emulator.start_selection(SelectionType::Semantic, point, side);
-                true
+                Some(true)
             }
             _ => {
                 core.emulator.start_selection(SelectionType::Lines, point, side);
-                true
+                Some(true)
             }
-        };
-        drop(core);
+        });
+        let Some(armed) = armed else { return };
         self.drag = Some(Drag { origin: event.position, armed });
         cx.notify();
     }
 
+    /// Drags with a reported button, and hover motion for programs that track all motion
+    /// (DEC 1003), go to the program once per cell.
+    fn report_motion(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let held = self.reporting;
+        if held.is_none() && !reports_mouse(&event.modifiers) {
+            return false;
+        }
+        let button = held.and_then(|(button, _)| report_button(button)).unwrap_or(emulator::MouseButton::None);
+        let Some((report, cell)) = self.mouse_report(MouseAction::Motion, button, event.modifiers.alt, event.position) else {
+            return held.is_some();
+        };
+        if let Some((button, last)) = held {
+            if last == cell {
+                return true;
+            }
+            self.reporting = Some((button, cell));
+        }
+        self.input(&report, cx);
+        true
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.report_motion(event, cx) {
+            return;
+        }
         let Some(mut drag) = self.drag.filter(|_| event.pressed_button == Some(MouseButton::Left)) else { return };
         if !drag.armed {
             let travel = event.position - drag.origin;
@@ -290,18 +374,30 @@ impl TerminalPane {
                 return;
             }
             let Some((anchor, side)) = self.hit(drag.origin) else { return };
-            self.session.shared.lock().emulator.start_selection(SelectionType::Simple, anchor, side);
+            self.session.update(|core| core.emulator.start_selection(SelectionType::Simple, anchor, side));
             drag.armed = true;
             self.drag = Some(drag);
         }
         if let Some((point, side)) = self.hit(event.position) {
-            self.session.shared.lock().emulator.update_selection(point, side);
+            self.session.update(|core| core.emulator.update_selection(point, side));
             cx.notify();
         }
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.drag = None;
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.flush_resize();
+        if let Some((button, _)) = self.reporting.filter(|(button, _)| *button == event.button) {
+            self.reporting = None;
+            let report = report_button(button)
+                .and_then(|button| self.mouse_report(MouseAction::Release, button, event.modifiers.alt, event.position));
+            if let Some((report, _)) = report {
+                self.input(&report, cx);
+            }
+            return;
+        }
+        if event.button == MouseButton::Left {
+            self.drag = None;
+        }
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -313,32 +409,24 @@ impl TerminalPane {
             return;
         }
         self.scroll_remainder -= lines as f32;
-        let (row, col, _) = hit_cell(
-            f32::from(event.position.x - geometry.origin.x),
-            f32::from(event.position.y - geometry.origin.y),
-            geometry.cell_width,
-            geometry.line_height,
-            geometry.cols,
-            geometry.rows,
-        );
+        let Some((row, col, _)) = self.cell_at(event.position) else { return };
         let input = {
-            let mut core = self.session.shared.lock();
-            let input = if event.modifiers.shift { None } else { core.emulator.wheel_input(lines, row, col) };
-            if input.is_none() {
-                core.emulator.scroll(lines);
-            }
-            input
+            let core = self.session.shared.lock();
+            if core.read_only { None } else { core.emulator.wheel_input(lines, row, col, reports_mouse(&event.modifiers)) }
         };
         cx.stop_propagation();
         match input {
             Some(input) => self.input(&input, cx),
-            None => cx.notify(),
+            None => {
+                self.session.update(|core| core.emulator.scroll(lines));
+                cx.notify();
+            }
         }
     }
 
     fn cursor_bounds(&self) -> Option<Bounds<Pixels>> {
         let geometry = self.geometry?;
-        let cursor = self.frame.borrow().cursor?;
+        let cursor = self.frame.borrow().snapshot.cursor?;
         Some(Bounds::new(
             gpui::point(
                 geometry.origin.x + px(geometry.cell_width * cursor.col as f32),
@@ -353,7 +441,7 @@ impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = colors::theme_colors(cx);
         if self.theme != Some(theme) {
-            self.session.shared.lock().emulator.set_theme(theme);
+            self.session.update(|core| core.emulator.set_theme(theme));
             self.theme = Some(theme);
         }
         let paint = colors::paint(cx);
@@ -362,8 +450,9 @@ impl Render for TerminalPane {
         let menu_focus = self.focus.clone();
         let element = TerminalElement::new(
             cx.entity(),
-            self.session.shared.clone(),
+            self.session.front.clone(),
             self.frame.clone(),
+            self.rows.clone(),
             self.focus.clone(),
             focused,
             self.marked.clone().map(SharedString::from),
@@ -382,10 +471,15 @@ impl Render for TerminalPane {
             .on_action(cx.listener(Self::clear))
             .on_action(cx.listener(Self::jump_to_latest))
             .on_key_down(cx.listener(Self::key_down))
+            .capture_any_mouse_down(cx.listener(Self::report_mouse_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(element)
             .context_menu(move |menu, _, _| {
