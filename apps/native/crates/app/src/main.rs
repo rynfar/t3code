@@ -14,6 +14,7 @@ mod notifications;
 mod palette;
 mod provider_icon;
 mod right_panel;
+mod settings;
 mod sidebar;
 mod snooze_dialog;
 mod terminal;
@@ -61,6 +62,7 @@ fn main() {
             }
         });
         menus::init(state.clone(), cx);
+        settings::init(state.clone(), cx);
         new_thread::init(state.clone(), cx);
         right_panel::init(state.clone(), cx);
         terminal::init(cx);

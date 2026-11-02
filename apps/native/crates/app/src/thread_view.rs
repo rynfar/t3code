@@ -23,7 +23,6 @@ use crate::transcript::{Clock, Detail, RowEnv, TranscriptUi, WorkingTimer, histo
 
 actions!(thread_view, [FindInThread]);
 
-pub const CONTENT_MAX_WIDTH: f32 = 736.;
 const DETAIL_CACHE_LIMIT: usize = 64;
 
 pub struct ThreadView {
@@ -319,14 +318,14 @@ fn toggle(set: &mut std::collections::HashSet<String>, key: &str) -> bool {
     true
 }
 
-fn lane(content: gpui::AnyElement, first: bool) -> gpui::AnyElement {
+fn lane(content: gpui::AnyElement, first: bool, max_width: Option<f32>) -> gpui::AnyElement {
     div()
         .w_full()
         .flex()
         .justify_center()
         .px(px(48.))
         .when(first, |this| this.pt(px(16.)))
-        .child(div().w_full().min_w_0().max_w(px(CONTENT_MAX_WIDTH)).child(content))
+        .child(div().w_full().min_w_0().when_some(max_width, |this, width| this.max_w(px(width))).child(content))
         .into_any_element()
 }
 
@@ -362,11 +361,11 @@ impl Render for ThreadView {
                         Some(control) => history_control(control.has_more, control.loading, control.error.as_deref(), cx),
                         None => div().into_any_element(),
                     };
-                    return lane(content, true);
+                    return lane(content, true, crate::theme::chat_max_width(cx));
                 }
                 let Some(row) = this.rows.get(ix - offset).cloned() else { return div().into_any_element() };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
-                lane(content, ix == 0)
+                lane(content, ix == 0, crate::theme::chat_max_width(cx))
             }),
         )
         .size_full();

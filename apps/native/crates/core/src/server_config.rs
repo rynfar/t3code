@@ -243,6 +243,8 @@ impl ServerProvider {
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentCapabilities {
     #[serde(default)]
+    pub thread_auto_settlement_scope: Option<bool>,
+    #[serde(default)]
     pub thread_stop: Option<bool>,
     #[serde(default)]
     pub thread_auto_settle_opt_out: Option<bool>,
@@ -255,6 +257,10 @@ pub struct EnvironmentDescriptor {
     pub environment_id: String,
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
+    pub server_version: String,
+    #[serde(default)]
+    pub orchestration_protocol_version: Option<u32>,
     #[serde(default)]
     pub capabilities: EnvironmentCapabilities,
 }
@@ -335,6 +341,8 @@ pub struct ServerSettings {
     pub project_settings_overrides: HashMap<String, ProjectSettingsOverrides>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub provider_instances: HashMap<String, ProviderInstanceConfig>,
+    #[serde(flatten)]
+    pub threads: crate::settings::ThreadSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

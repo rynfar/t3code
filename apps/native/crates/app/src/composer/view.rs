@@ -21,7 +21,7 @@ use super::model_picker::permissions_section;
 use super::{Composer, Resolved, Target, TogglePlanMode, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
-use crate::theme::{hsla, metrics, palette};
+use crate::theme::{hsla, palette};
 
 /// The web's collapsed-composer prompt. Its full placeholder names @ files, $ skills and
 /// / commands, which come with the composer menus (ledger CO-TRIGGERS).
@@ -269,7 +269,7 @@ impl Render for Composer {
                     }
                 }))
                 .w_full()
-                .max_w(px(metrics::CHAT_CONTENT_MAX_WIDTH))
+                .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(px(width)))
                 .children(error.map(|error| {
                     div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
