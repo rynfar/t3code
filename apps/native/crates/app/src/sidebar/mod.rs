@@ -7,6 +7,7 @@
 mod bulk;
 pub mod controller;
 mod drag;
+mod favicons;
 mod project_filter;
 mod row;
 mod search;

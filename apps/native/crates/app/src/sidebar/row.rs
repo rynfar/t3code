@@ -2,7 +2,7 @@
 //! `sidebar/SidebarListMarkers.tsx`): 78px cards for pinned, active and working threads, 36px slim
 //! rows for snoozed and settled ones, shelf headers, and the Settled "Show more" button.
 
-use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, point, prelude::*, px};
+use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, img, point, prelude::*, px};
 use t3_core::sidebar::settled::{self, snooze_wake_label};
 use t3_core::sidebar::status::{self, StatusIcon, StatusTone, ThreadStatus, TopStatus};
 use t3_core::sidebar::thread::SidebarThread;
@@ -334,6 +334,7 @@ impl SidebarPane {
                                 .items_center()
                                 .gap(px(6.))
                                 .min_w_0()
+                                .child(self.favicon(&thread.project_id, false, cx))
                                 .children(self.pin_indicator(thread, cx))
                                 .child(
                                     div()
@@ -436,6 +437,7 @@ impl SidebarPane {
                         .items_center()
                         .gap(px(10.))
                         .px(px(10.))
+                        .child(self.favicon(&thread.project_id, !active && section != Section::Settled, cx))
                         .child(self.render_title(thread, title_color, state.recede, cx))
                         .children(self.pin_indicator(thread, cx))
                         .child(
@@ -454,6 +456,29 @@ impl SidebarPane {
                         ),
                 ),
             )
+            .into_any_element()
+    }
+
+    /// The 16px project icon, or the folder fallback. Slim rows mute it until hovered.
+    fn favicon(&self, project_id: &str, muted: bool, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let size = px(16.);
+        let Some(image) = self.state.read(cx).sidebar.favicons.image(project_id) else {
+            return div()
+                .flex_none()
+                .when(muted, |this| this.opacity(0.4).group_hover("sidebar-row", |this| this.opacity(1.)))
+                .child(Icon::Folder.sized(size).text_color(hsla(p.sidebar_icon)))
+                .into_any_element();
+        };
+        if !muted {
+            return img(image).flex_none().size(size).into_any_element();
+        }
+        div()
+            .flex_none()
+            .relative()
+            .size(size)
+            .child(img(image.clone()).size(size).grayscale(true).opacity(0.4).group_hover("sidebar-row", |this| this.invisible()))
+            .child(div().absolute().top_0().left_0().invisible().group_hover("sidebar-row", |this| this.visible()).child(img(image).size(size)))
             .into_any_element()
     }
 
@@ -558,6 +583,7 @@ fn hover_card(state: &crate::app_state::AppState, thread_id: &str, project: Opti
     ThreadHoverCard {
         title: thread.map(|thread| thread.title.clone()).unwrap_or_default().into(),
         project: project.map(Into::into),
+        favicon: thread.and_then(|thread| state.sidebar.favicons.image(&thread.project_id)),
         branch: thread.and_then(|thread| thread.branch.clone()).map(Into::into),
         model: model.map(Into::into),
         error,

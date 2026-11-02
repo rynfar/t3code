@@ -191,8 +191,14 @@ impl ContextMenu {
         let key = event.keystroke.key.as_str();
         let in_submenu = open.submenu.is_some();
         match key {
-            "escape" if in_submenu => open.submenu = None,
-            "escape" => return self.close(cx),
+            "escape" if in_submenu => {
+                cx.stop_propagation();
+                open.submenu = None;
+            }
+            "escape" => {
+                cx.stop_propagation();
+                return self.close(cx);
+            }
             "down" | "up" => {
                 if let Some(parent) = open.submenu {
                     let enabled = Self::enabled(&open.items[parent].children);

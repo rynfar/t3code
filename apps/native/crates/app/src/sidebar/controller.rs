@@ -92,6 +92,7 @@ pub struct SidebarController {
     pub selection: t3_core::sidebar::selection::ThreadSelection,
     /// The thread being dragged and the section it left.
     pub drag: Option<(String, t3_core::sidebar::Section)>,
+    pub favicons: super::favicons::FaviconStore,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
     wake_timer: Option<Task<()>>,
@@ -143,6 +144,9 @@ impl AppState {
             })
         });
         self.track_visit(cx);
+        if connected(&self.phase) {
+            self.ensure_favicons(cx);
+        }
     }
 
     /// Applies the server config's keybindings and capabilities (`subscribeServerConfig`).

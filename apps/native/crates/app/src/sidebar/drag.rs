@@ -195,6 +195,7 @@ impl SidebarPane {
 pub struct ThreadHoverCard {
     pub title: SharedString,
     pub project: Option<SharedString>,
+    pub favicon: Option<std::sync::Arc<gpui::Image>>,
     pub branch: Option<SharedString>,
     pub model: Option<SharedString>,
     /// The error line and whether it is a usage limit.
@@ -246,7 +247,13 @@ impl Render for ThreadHoverCard {
                             .gap(px(6.))
                             .text_xs()
                             .text_color(hsla(p.muted_foreground))
-                            .children(self.project.clone().map(|project| line(Icon::Folder, project)))
+                            .children(self.project.clone().map(|project| {
+                                let icon = match self.favicon.clone() {
+                                    Some(image) => gpui::img(image).size(px(12.)).flex_none().into_any_element(),
+                                    None => Icon::Folder.sized(px(12.)).flex_none().text_color(hsla(p.muted_foreground)).into_any_element(),
+                                };
+                                div().flex().items_center().gap(px(8.)).min_w_0().child(icon).child(div().min_w_0().truncate().text_color(hsla(p.foreground).opacity(0.75)).child(project))
+                            }))
                             .children(self.branch.clone().map(|branch| line(Icon::GitBranch, branch)))
                             .children(self.model.clone().map(|model| line(Icon::Bot, model)))
                             .children(error),

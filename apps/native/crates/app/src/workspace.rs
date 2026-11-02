@@ -154,7 +154,7 @@ impl Render for Workspace {
             .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
             }))
-            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.state.update(cx, |state, cx| state.clear_thread_selection(cx)) {
                     cx.stop_propagation();
                 }
