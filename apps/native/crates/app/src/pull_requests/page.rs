@@ -93,6 +93,8 @@ pub struct PullRequestsPage {
     /// Line counts by `pullRequestDiffStatKey`, kept across reads (GitHub listings omit them).
     stats: HashMap<String, (u64, u64)>,
     requested: HashSet<String>,
+    /// A refresh epoch passed, so counts `listStats` measured are read again.
+    restat: bool,
     focus: FocusHandle,
     connected: bool,
     open: bool,
@@ -145,6 +147,7 @@ impl PullRequestsPage {
             options: FilterOptions::default(),
             stats: HashMap::new(),
             requested: HashSet::new(),
+            restat: false,
             focus: cx.focus_handle(),
             connected: false,
             open: false,
@@ -241,6 +244,7 @@ impl PullRequestsPage {
             return;
         }
         self.requested.clear();
+        self.restat = true;
         self.fetch(None, true, cx);
         if let Some(detail) = &self.detail {
             detail.update(cx, |detail, cx| detail.refresh(cx));
@@ -359,6 +363,8 @@ impl PullRequestsPage {
                 self.data.key = Some(key);
                 self.data.result = Some(answer);
                 self.fetch_stats(cx);
+                #[cfg(feature = "snapshot")]
+                self.select_for_snapshot(cx);
             }
             Err(error) => self.data.error = Some(error),
         }
@@ -370,7 +376,15 @@ impl PullRequestsPage {
     /// batches the contract takes.
     fn fetch_stats(&mut self, cx: &mut Context<Self>) {
         let Some(result) = &self.data.result else { return };
-        let wanted: Vec<_> = result.entries.iter().filter(|entry| needs_stats(entry) && !self.requested.contains(&stat_key(&entry.project_id, entry.number))).collect();
+        let restat = std::mem::take(&mut self.restat);
+        let wanted: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|entry| {
+                let key = stat_key(&entry.project_id, entry.number);
+                (needs_stats(entry) || (restat && self.stats.contains_key(&key))) && !self.requested.contains(&key)
+            })
+            .collect();
         let batches = stats_inputs(wanted.iter().copied());
         if batches.is_empty() {
             return;
@@ -390,12 +404,16 @@ impl PullRequestsPage {
         cx.spawn(async move |this, cx| {
             let Ok(stats) = settle(task).await else { return };
             let _ = this.update(cx, |this, cx| {
+                let mut answered = HashSet::new();
                 for stat in stats.stats {
-                    this.stats.insert(stat_key(&stat.project_id, stat.number), (stat.additions, stat.deletions));
+                    let key = stat_key(&stat.project_id, stat.number);
+                    this.stats.insert(key.clone(), (stat.additions, stat.deletions));
+                    answered.insert(key);
                 }
                 let Some(result) = this.data.result.as_mut() else { return };
-                for entry in result.entries.iter_mut().filter(|entry| needs_stats(entry)) {
-                    if let Some((additions, deletions)) = this.stats.get(&stat_key(&entry.project_id, entry.number)) {
+                for entry in result.entries.iter_mut() {
+                    let key = stat_key(&entry.project_id, entry.number);
+                    if let Some((additions, deletions)) = this.stats.get(&key).filter(|_| answered.contains(&key)) {
                         entry.additions = *additions;
                         entry.deletions = *deletions;
                     }
@@ -514,6 +532,17 @@ impl PullRequestsPage {
         self.detail = Some(cx.new(|cx| DetailView::new(state, page, reference.clone(), entry, cx)));
         self.selected = Some(reference);
         cx.notify();
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn select_for_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some((number, code)) = cx.try_global::<super::SnapshotSelection>().map(|wanted| (wanted.number, wanted.code)) else { return };
+        let Some(reference) = self.data.result.as_ref().and_then(|result| result.entries.iter().find(|entry| entry.number == number)).map(PrRef::of) else { return };
+        cx.remove_global::<super::SnapshotSelection>();
+        self.select(reference, cx);
+        if code && let Some(detail) = &self.detail {
+            detail.update(cx, |detail, cx| detail.set_tab(super::detail::Tab::Code, cx));
+        }
     }
 
     pub(super) fn close_detail(&mut self, cx: &mut Context<Self>) {
