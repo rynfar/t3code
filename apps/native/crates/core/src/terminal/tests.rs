@@ -352,11 +352,14 @@ fn layouts_persist_only_non_default_threads() {
     layouts.set_height("t1", 320.);
     layouts.set_open("t2", true);
     layouts.close("t2", "term-1");
-    let restored = TerminalLayouts::from_json(&layouts.to_json());
+    let json = serde_json::to_string(layouts.saved()).unwrap();
+    let mut saved: std::collections::HashMap<String, ThreadTerminalLayout> = serde_json::from_str(&json).unwrap();
+    assert!(!saved.contains_key("t2"));
+    saved.insert("t3".into(), ThreadTerminalLayout::default());
+    let restored = TerminalLayouts::from_saved(saved);
     assert_eq!(restored.get("t1"), layouts.get("t1"));
     assert_eq!(restored.get("t1").terminal_height, 320.);
-    assert_eq!(restored.get("t2"), ThreadTerminalLayout::default());
-    assert_eq!(TerminalLayouts::from_json("not json"), TerminalLayouts::default());
+    assert_eq!(restored.saved().len(), 1);
 }
 
 #[test]

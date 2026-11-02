@@ -63,6 +63,11 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "rightPanel.close" => Box::new(crate::right_panel::CloseActiveSurface),
         "view.reopenClosed" => Box::new(crate::right_panel::ReopenClosedView),
         "diff.toggle" => Box::new(crate::right_panel::ToggleDiff),
+        "terminal.toggle" => Box::new(crate::terminal::ToggleTerminal),
+        "terminal.split" => Box::new(crate::terminal::SplitTerminal),
+        "terminal.splitVertical" => Box::new(crate::terminal::SplitTerminalVertical),
+        "terminal.new" => Box::new(crate::terminal::NewTerminal),
+        "terminal.close" => Box::new(crate::terminal::CloseTerminal),
         _ => Box::new(Unimplemented),
     }
 }

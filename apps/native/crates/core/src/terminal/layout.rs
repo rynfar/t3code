@@ -413,8 +413,8 @@ pub struct TerminalLayouts {
 }
 
 impl TerminalLayouts {
-    pub fn from_json(text: &str) -> Self {
-        let by_thread: HashMap<String, ThreadTerminalLayout> = serde_json::from_str(text).unwrap_or_default();
+    /// Restores saved layouts, normalizing each and dropping threads left at the defaults.
+    pub fn from_saved(by_thread: HashMap<String, ThreadTerminalLayout>) -> Self {
         let by_thread = by_thread
             .into_iter()
             .filter(|(thread_id, _)| !thread_id.is_empty())
@@ -424,8 +424,9 @@ impl TerminalLayouts {
         TerminalLayouts { by_thread, suppressed: HashMap::new() }
     }
 
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(&self.by_thread).unwrap_or_else(|_| "{}".to_owned())
+    /// What is persisted: the layouts, without the in-flight close suppressions.
+    pub fn saved(&self) -> &HashMap<String, ThreadTerminalLayout> {
+        &self.by_thread
     }
 
     pub fn get(&self, thread_id: &str) -> ThreadTerminalLayout {
