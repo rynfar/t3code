@@ -18,7 +18,9 @@ use t3_core::device::{Device, DeviceFeed, Opened, Operation, Operations, SETTING
 use t3_core::right_panel::{DeviceTarget, RightPanels, Surface};
 
 pub use pane::DevicePane;
+pub(crate) use pane::{HostRetry, host_updates};
 pub use setup::DeviceSetupDialog;
+pub(crate) use setup::setup_status;
 
 use crate::app_state::{AppEvent, AppState};
 

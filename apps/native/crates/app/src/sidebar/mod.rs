@@ -67,6 +67,8 @@ pub struct SidebarPane {
     live_rendered: bool,
     clock: Option<(ClockRate, Task<()>)>,
     drag: Option<drag::PaneDrag>,
+    /// A thread or project menu is open; rows show no hover card over it.
+    menu_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -110,6 +112,14 @@ impl SidebarPane {
                 InputEvent::PressEnter { .. } => this.open_search_result(window, cx),
                 _ => {}
             }),
+            // The web's thread menu is the native one, which takes the pointer from the rows.
+            cx.observe(&menu, |this, menu, cx| {
+                let open = menu.read(cx).is_open();
+                if open != this.menu_open {
+                    this.menu_open = open;
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
                 ContextMenuEvent::Rename(thread_id) => this.start_rename(thread_id, window, cx),
                 ContextMenuEvent::CustomSnooze(thread_ids) => snooze.update(cx, |snooze, cx| snooze.open(thread_ids.clone(), window, cx)),
@@ -148,6 +158,7 @@ impl SidebarPane {
             live_rendered: false,
             clock: None,
             drag: None,
+            menu_open: false,
             _subscriptions: subscriptions,
         };
         pane.sync_rows(cx);

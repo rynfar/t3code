@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use t3_core::device::{AGENT_DESCRIPTION, HUB_DESCRIPTION, HostStatus, Platform, PlatformStatus, ProbeGate, SETUP_STEPS, ServiceState, SetupStatus, configure_hub_payload};
 use t3_core::right_panel::{Surface, SurfaceKind};
 
-use super::pane::{HostRetry, host_updates};
+use super::{HostRetry, host_updates};
 use super::{Devices, DevicesEvent, devices};
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
@@ -218,7 +218,7 @@ impl DeviceSetupDialog {
 }
 
 /// `DeviceHubSetupStatus` and `AgentDeviceSetupStatus`: a check or a static spinner and a line.
-fn setup_status(status: Option<SetupStatus>, cx: &App) -> Option<AnyElement> {
+pub(crate) fn setup_status(status: Option<SetupStatus>, cx: &App) -> Option<AnyElement> {
     let status = status?;
     let p = palette(cx);
     let icon = if status.pending { Icon::LoaderCircle.svg().size(px(12.)).text_color(hsla(p.muted_foreground)) } else { Icon::Check.svg().size(px(12.)).text_color(hsla(p.success)) };

@@ -78,6 +78,7 @@ impl Section {
                 | Section::Keybindings
                 | Section::Providers
                 | Section::Threads
+                | Section::Devices
                 | Section::ScheduledTasks
                 | Section::Projects
                 | Section::SourceControl
@@ -216,6 +217,8 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
         SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
         SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),
+        SearchItem::new("agent-device-access", "Agents can use devices", Devices, &["allow simulator emulator ios android drive tools sessions"]).target("devices"),
+        SearchItem::new("device-hub", "Use devices", Devices, &["device hub simulator emulator ios android install start version"]).target("devices"),
         SearchItem::new("automatic-pull", "Automatically pull", SourceControl, &["auto pull default branch current checkout fast forward upstream"]),
         SearchItem::new("remove-agent-credits-on-merge", "Remove agent credits when merging", SourceControl, &["pull request GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"]),
         SearchItem::new("pull-request-merge-method", "Default merge method", SourceControl, &["pull request merge squash rebase last selected"]),

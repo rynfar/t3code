@@ -9,6 +9,7 @@ mod access;
 mod appearance;
 mod archive;
 pub(crate) mod controls;
+mod devices;
 mod diagnostics;
 mod general;
 mod keybindings;
@@ -256,6 +257,7 @@ pub struct SettingsView {
     pub(crate) secrets: secrets::SecretsState,
     pub(crate) maintenance: maintenance::MaintenanceState,
     pub(crate) diagnostics: diagnostics::DiagnosticsState,
+    pub(crate) devices: devices::DevicesState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -305,6 +307,7 @@ impl SettingsView {
             secrets: secrets::SecretsState::new(window, cx),
             maintenance: maintenance::MaintenanceState::new(window, cx),
             diagnostics: diagnostics::DiagnosticsState::new(window, cx),
+            devices: devices::DevicesState::new(cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -738,6 +741,7 @@ impl SettingsView {
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
+            Section::Devices => self.devices_page(cx),
             _ => Vec::new(),
         }
     }
@@ -755,6 +759,7 @@ fn section_icon(section: Section) -> Icon {
         Section::Keybindings => Icon::Keyboard,
         Section::Providers => Icon::Bot,
         Section::Threads => Icon::MessagesSquare,
+        Section::Devices => Icon::Smartphone,
         Section::ScheduledTasks => Icon::CalendarClock,
         Section::Projects => Icon::PanelsTopLeft,
         Section::SourceControl => Icon::GitBranch,

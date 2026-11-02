@@ -288,12 +288,12 @@ impl HostRetry for DevicePane {
 }
 
 /// Whoever shows host updates remembers which host's Retry runs.
-pub(super) trait HostRetry: 'static {
+pub(crate) trait HostRetry: 'static {
     fn set_retrying(&mut self, host: Option<String>);
 }
 
 /// `DeviceHostUpdates`: hosts installing, starting or failed, with Retry where the server can.
-pub(super) fn host_updates<V: HostRetry>(service: &ServiceState, devices: &Entity<Devices>, retrying: Option<&str>, owner: gpui::WeakEntity<V>, cx: &App) -> Option<AnyElement> {
+pub(crate) fn host_updates<V: HostRetry>(service: &ServiceState, devices: &Entity<Devices>, retrying: Option<&str>, owner: gpui::WeakEntity<V>, cx: &App) -> Option<AnyElement> {
     let updates = service.host_updates();
     if updates.is_empty() {
         return None;

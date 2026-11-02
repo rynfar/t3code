@@ -3,6 +3,7 @@
 //! rows for snoozed and settled ones, shelf headers, and the Settled "Show more" button.
 
 use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, img, point, prelude::*, px};
+use gpui_component::Sizable as _;
 use t3_core::sidebar::settled::{self, snooze_wake_label};
 use t3_core::sidebar::status::{self, StatusIcon, StatusTone, ThreadStatus, TopStatus};
 use t3_core::sidebar::thread::SidebarThread;
@@ -136,7 +137,7 @@ impl SidebarPane {
             .when(!active && !selected, |this| this.hover(|this| this.bg(hsla(p.sidebar_row_hover))))
             .when(recede_working, |this| this.opacity(0.7).hover(|this| this.opacity(1.)))
             .when(dragging, |this| this.opacity(0.5))
-            .when(self.drag.is_none(), |this| this.tooltip(move |_, cx| {
+            .when(self.drag.is_none() && !self.menu_open, |this| this.tooltip(move |_, cx| {
                 let hover = hover_card(card.0.read(cx), &card.1, card.2.clone());
                 cx.new(|_| hover).into()
             }))
@@ -177,14 +178,18 @@ impl SidebarPane {
                 }))
                 .flex_1()
                 .min_w_0()
-                .h(px(20.))
-                .px(px(4.))
+                .h(crate::theme::rem(20.))
+                .flex()
+                .items_center()
+                .px(crate::theme::rem(4.))
                 .rounded(px(4.))
                 .border_1()
-                .border_color(hsla(p.input))
+                .border_color(hsla(p.foreground))
                 .bg(hsla(p.card))
-                .text_sm()
-                .child(gpui_component::input::Input::new(input).appearance(false).bordered(false))
+                .text_color(hsla(p.card_foreground))
+                .font_weight(FontWeight::MEDIUM)
+                // The input's own height and padding would not fit the field: one `text-sm` line, centered.
+                .child(gpui_component::input::Input::new(input).appearance(false).bordered(false).xsmall().px_0().h_full().text_sm())
                 .into_any_element();
         }
         let title: SharedString = thread.title.clone().into();

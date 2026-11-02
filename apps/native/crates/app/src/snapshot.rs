@@ -27,7 +27,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -125,6 +125,8 @@ pub struct Options {
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
+    /// The interface font size, as Settings → Appearance sets it.
+    font_size: Option<f32>,
     wait: f32,
 }
 
@@ -162,6 +164,7 @@ impl Options {
             } else {
                 None
             },
+            font_size: flag("--font-size").and_then(|value| value.parse().ok()),
             wait: number("--wait", 6.),
         })
     }
@@ -248,10 +251,12 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let loaded = state.clone();
         pump(&mut cx, options.wait, move |cx| loaded.read_with(cx, |state, _| state.thread.projection.is_some()));
     }
-    if let Some(mode) = options.appearance {
+    if options.appearance.is_some() || options.font_size.is_some() {
         cx.update(|cx| {
-            let preferences = crate::theme::Preferences { mode, ..crate::theme::preferences(cx).clone() };
-            crate::theme::set_preferences(preferences, cx);
+            let current = crate::theme::preferences(cx).clone();
+            let mode = options.appearance.unwrap_or(current.mode);
+            let interface_font_size = options.font_size.unwrap_or(current.interface_font_size);
+            crate::theme::set_preferences(crate::theme::Preferences { mode, interface_font_size, ..current }, cx);
         });
     }
     if let Some(surface) = &options.right_panel {
