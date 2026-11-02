@@ -115,3 +115,27 @@ fn spans_past_the_cap_become_one_plain_remainder() {
     assert_eq!(spans[2].style, None);
     assert_eq!(terminal_output_plain_text("\u{1b}[0;31mred\u{1b}[0m \u{1b}[x"), "red \u{1b}[x");
 }
+
+/// Native only: `origin` plus the drawn text's length is everything folded, counted in UTF-8
+/// bytes without escapes, while the tail drops whole lines or cuts one mid-way.
+#[test]
+fn origin_counts_the_plain_bytes_the_tail_dropped() {
+    let mut state = TerminalOutputState::default();
+    let mut folded = 0;
+    for _ in 0..20 {
+        let chunk = "é\u{1b}[1mbold\u{1b}[0m n\n";
+        state.append(chunk, 64);
+        folded += terminal_output_plain_text(chunk).len();
+        assert_eq!(state.origin + terminal_output_plain_text(&state.text).len(), folded, "{:?}", state.text);
+    }
+    assert!(state.truncated && state.origin > 0);
+    let mut state = TerminalOutputState::default();
+    state.append(&"x".repeat(40), 16);
+    state.append(&"y".repeat(10), 16);
+    assert_eq!((state.text.as_str(), state.origin), ("xxxxxxyyyyyyyyyy", 34));
+    // A line below another trims its start, then the line above scrolls out.
+    let mut state = TerminalOutputState::default();
+    state.append("header\nabcdefghij", 16);
+    state.append("klmnopqrst", 16);
+    assert_eq!((state.text.as_str(), state.origin), ("efghijklmnopqrst", 11));
+}

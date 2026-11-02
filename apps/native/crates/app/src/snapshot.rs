@@ -5,13 +5,17 @@
 //!
 //! It never writes to the server unless told to (`--attach`, or a `--click` on a control that
 //! writes): it only subscribes and reads. Local UI state goes to a throwaway copy of the home, so
-//! the caller's saved panels and last thread stay as they were.
+//! the caller's saved panels and last thread stay as they were. It runs on the real platform, so a
+//! `--keys` copy reaches the system clipboard.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{AnyWindowHandle, Entity, VisualTestAppContext, px, size};
+use gpui::{
+    AnyWindowHandle, Entity, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, VisualTestAppContext,
+    point, px, size,
+};
 use t3_core::client_settings::AppearanceMode;
 use t3_core::settings::search::{NAV_GROUPS, Section};
 use t3_core::usage::{UsageMetric, UsagePeriod};
@@ -22,7 +26,81 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] \
-[--click <x>,<y>]... [--hover <x>,<y>] [--scroll <x>,<y>,<dy>] [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
+[--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
+[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--width 1440] [--height 900] [--dark|--light] [--wait 6]";
+
+/// Input replayed in command-line order once everything else is open, at window points.
+enum Gesture {
+    /// Left presses: `--click`, `--double-click`, `--triple-click`, `--shift-click`.
+    Click { at: Point<Pixels>, count: usize, shift: bool },
+    RightClick(Point<Pixels>),
+    /// The pointer rests here, so hover states show.
+    Hover(Point<Pixels>),
+    /// Press, move in steps, release.
+    Drag(Point<Pixels>, Point<Pixels>),
+    /// One wheel step of `dy` pixels with the pointer left there; positive scrolls toward the top.
+    Scroll(Point<Pixels>, f32),
+    /// Space-separated keystrokes, as `cmd-a escape`.
+    Keys(String),
+}
+
+fn gestures(args: &[String]) -> Vec<Gesture> {
+    args.windows(2)
+        .filter_map(|pair| {
+            let numbers: Option<Vec<f32>> = pair[1].split(',').map(|number| number.trim().parse().ok()).collect();
+            let at = |n: &[f32]| point(px(n[0]), px(n[1]));
+            let click = |n: &[f32], count, shift| Gesture::Click { at: at(n), count, shift };
+            Some(match (pair[0].as_str(), numbers.as_deref()) {
+                ("--click", Some(n @ [_, _])) => click(n, 1, false),
+                ("--double-click", Some(n @ [_, _])) => click(n, 2, false),
+                ("--triple-click", Some(n @ [_, _])) => click(n, 3, false),
+                ("--shift-click", Some(n @ [_, _])) => click(n, 1, true),
+                ("--right-click", Some(n @ [_, _])) => Gesture::RightClick(at(n)),
+                ("--hover", Some(n @ [_, _])) => Gesture::Hover(at(n)),
+                ("--drag", Some(n @ [_, _, _, _])) => Gesture::Drag(at(n), at(&n[2..])),
+                ("--scroll", Some(n @ [_, _, dy])) => Gesture::Scroll(at(n), *dy),
+                ("--keys", _) => Gesture::Keys(pair[1].clone()),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gesture) {
+    let none = Modifiers::default();
+    match gesture {
+        Gesture::Click { at, count, shift } => {
+            let modifiers = Modifiers { shift: *shift, ..Modifiers::default() };
+            cx.simulate_mouse_move(window, *at, None, modifiers);
+            for click_count in 1..=*count {
+                cx.simulate_event(window, MouseDownEvent { button: MouseButton::Left, position: *at, modifiers, click_count, first_mouse: false });
+                cx.simulate_event(window, MouseUpEvent { button: MouseButton::Left, position: *at, modifiers, click_count });
+            }
+        }
+        Gesture::RightClick(at) => {
+            cx.simulate_mouse_move(window, *at, None, none);
+            cx.simulate_mouse_down(window, *at, MouseButton::Right, none);
+            cx.simulate_mouse_up(window, *at, MouseButton::Right, none);
+        }
+        Gesture::Drag(from, to) => {
+            cx.simulate_mouse_move(window, *from, None, none);
+            cx.simulate_mouse_down(window, *from, MouseButton::Left, none);
+            for step in 1..=8 {
+                let t = step as f32 / 8.;
+                cx.simulate_mouse_move(window, point(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t), MouseButton::Left, none);
+            }
+            cx.simulate_mouse_up(window, *to, MouseButton::Left, none);
+        }
+        Gesture::Hover(at) => cx.simulate_mouse_move(window, *at, None, none),
+        Gesture::Scroll(at, dy) => {
+            cx.simulate_mouse_move(window, *at, None, none);
+            pump(cx, 0.5, |_| false);
+            let delta = ScrollDelta::Pixels(point(px(0.), px(*dy)));
+            cx.simulate_event(window, ScrollWheelEvent { position: *at, delta, modifiers: none, touch_phase: TouchPhase::Moved });
+        }
+        Gesture::Keys(keys) => cx.simulate_keystrokes(window, keys),
+    }
+}
 
 pub struct Options {
     out: PathBuf,
@@ -43,12 +121,7 @@ pub struct Options {
     usage_period: Option<String>,
     usage_model: bool,
     context_meter: bool,
-    /// Left clicks at window points, in order, after everything else is open.
-    clicks: Vec<(f32, f32)>,
-    /// The pointer rests here after the clicks, so hover states show.
-    hover: Option<(f32, f32)>,
-    /// A wheel of `dy` pixels at a point, last, with the pointer left there.
-    scroll: Option<(f32, f32, f32)>,
+    gestures: Vec<Gesture>,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -79,16 +152,7 @@ impl Options {
             usage_period: flag("--usage-period"),
             usage_model: has("--usage-model"),
             context_meter: has("--context-meter"),
-            clicks: args
-                .windows(2)
-                .filter(|pair| pair[0] == "--click")
-                .filter_map(|pair| pair[1].split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?))))
-                .collect(),
-            hover: flag("--hover").and_then(|pair| pair.split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))),
-            scroll: flag("--scroll").and_then(|value| {
-                let mut parts = value.split(',').map(|part| part.trim().parse::<f32>().ok());
-                Some((parts.next()??, parts.next()??, parts.next()??))
-            }),
+            gestures: gestures(&args),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -274,23 +338,9 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         cx.update(|cx| crate::usage::open_read_only(metric, period, options.usage_model, cx));
         pump(&mut cx, options.wait.max(30.), |cx| cx.update(crate::usage::is_settled));
     }
-    for &(x, y) in &options.clicks {
+    for gesture in &options.gestures {
         pump(&mut cx, options.wait.min(3.), |_| false);
-        let position = gpui::point(px(x), px(y));
-        cx.simulate_mouse_move(window, position, None, gpui::Modifiers::default());
-        cx.simulate_click(window, position, gpui::Modifiers::default());
-    }
-    if let Some((x, y)) = options.hover {
-        pump(&mut cx, options.wait.min(3.), |_| false);
-        cx.simulate_mouse_move(window, gpui::point(px(x), px(y)), None, gpui::Modifiers::default());
-    }
-    if let Some((x, y, dy)) = options.scroll {
-        pump(&mut cx, options.wait.min(3.), |_| false);
-        let position = gpui::point(px(x), px(y));
-        cx.simulate_mouse_move(window, position, None, gpui::Modifiers::default());
-        pump(&mut cx, 0.5, |_| false);
-        let delta = gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(dy)));
-        cx.simulate_event(window, gpui::ScrollWheelEvent { position, delta, ..Default::default() });
+        replay(&mut cx, window, gesture);
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;

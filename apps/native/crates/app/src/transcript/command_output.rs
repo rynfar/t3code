@@ -1,22 +1,22 @@
 //! An expanded command row's output: `CommandOutputPanel.tsx`. `t3_client::command_output`
 //! subscribes and folds frames on the network runtime; a slot holds the newest result, pins the
 //! scroller to the tail while the reader stays at the bottom, and draws the web's loading,
-//! empty, error and truncation states. Nothing here ticks: a slot redraws only when a frame lands.
+//! empty, error and truncation states. The output is selectable text, as the browser makes it on
+//! the web. Nothing here ticks: a slot redraws only when a frame lands.
 
 use std::cell::RefCell;
-use std::ops::Range;
-use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement,
-    StrikethroughStyle, Styled, StyledText, Task, UnderlineStyle, div, prelude::FluentBuilder, px,
+    StrikethroughStyle, Styled, Task, UnderlineStyle, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{ActiveTheme, v_flex};
 use t3_client::command_output::CommandOutputStream;
 use t3_core::command_output::{CommandOutput, CommandOutputStatus, LOADING, NO_OUTPUT, Panel, TRUNCATED};
-use t3_core::terminal_output::{DARK_PALETTE, LIGHT_PALETTE, MAX_SPANS, Rgb, SpanStyle, terminal_output_spans};
+use t3_core::terminal_output::{DARK_PALETTE, LIGHT_PALETTE, Rgb, SpanStyle, terminal_output_display};
 
 use super::parts::{mono_block, mono_frame};
+use crate::selectable_text::{Highlights, SelectableText};
 use crate::theme::{hsla, palette, rem};
 
 /// `FOLLOW_SLACK_PX`: a reader this close to the bottom keeps following new output.
@@ -39,7 +39,7 @@ pub struct CommandOutputSlot {
 #[derive(Clone)]
 struct Display {
     text: SharedString,
-    highlights: Arc<[(Range<usize>, HighlightStyle)]>,
+    highlights: Highlights,
 }
 
 impl CommandOutputSlot {
@@ -103,27 +103,9 @@ fn highlight(style: &SpanStyle) -> HighlightStyle {
     }
 }
 
-/// `terminalOutputSpans` joined into one text with highlighted ranges. A final newline is
-/// dropped: a `pre-wrap` block does not draw an empty last line for it.
 fn build_display(text: &str, palette: &[Rgb; 16]) -> Display {
-    let mut joined = String::with_capacity(text.len());
-    let mut highlights = Vec::new();
-    for span in terminal_output_spans(text, palette, MAX_SPANS) {
-        let start = joined.len();
-        joined.push_str(&span.text);
-        if let Some(style) = span.style.as_ref() {
-            highlights.push((start..joined.len(), highlight(style)));
-        }
-    }
-    if joined.ends_with('\n') {
-        joined.pop();
-        let end = joined.len();
-        highlights.retain_mut(|(range, _)| {
-            range.end = range.end.min(end);
-            range.start < range.end
-        });
-    }
-    Display { text: joined.into(), highlights: highlights.into() }
+    let display = terminal_output_display(text, palette);
+    Display { text: display.text.into(), highlights: display.styles.iter().map(|(range, style)| (range.clone(), highlight(style))).collect() }
 }
 
 fn note(text: impl Into<SharedString>, cx: &App) -> AnyElement {
@@ -150,6 +132,15 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
         .max_h(rem(320.))
         .overflow_y_scroll()
         .track_scroll(&slot.scroll)
-        .child(mono_frame(cx).text_color(hsla(palette(cx).muted_foreground)).child(StyledText::new(display.text).with_highlights(display.highlights.iter().cloned())));
+        .child(
+            mono_frame(cx)
+                .text_color(hsla(palette(cx).muted_foreground))
+                .child(
+                    SelectableText::new(SharedString::from(format!("command-output-text:{entry_id}")), display.text)
+                        .highlights(display.highlights)
+                        .origin(output.origin)
+                        .autoscroll(&slot.scroll),
+                ),
+        );
     Some(v_flex().w_full().min_w_0().when(output.truncated, |this| this.child(note(TRUNCATED, cx))).child(scroller).into_any_element())
 }

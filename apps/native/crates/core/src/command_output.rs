@@ -70,13 +70,15 @@ impl CommandOutputView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutput {
     pub text: Arc<str>,
+    /// `TerminalOutputState::origin`: lets a selection follow the text as the tail drops its front.
+    pub origin: usize,
     pub truncated: bool,
     pub running: bool,
 }
 
 impl From<&CommandOutputView> for CommandOutput {
     fn from(view: &CommandOutputView) -> Self {
-        CommandOutput { text: Arc::from(view.output.text.as_str()), truncated: view.output.truncated, running: view.running }
+        CommandOutput { text: Arc::from(view.output.text.as_str()), origin: view.output.origin, truncated: view.output.truncated, running: view.running }
     }
 }
 
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn panel_follows_the_web_branches() {
-        let output = |text: &str, running: bool| Some(CommandOutput { text: Arc::from(text), truncated: false, running });
+        let output = |text: &str, running: bool| Some(CommandOutput { text: Arc::from(text), origin: 0, truncated: false, running });
         assert_eq!(CommandOutputStatus::default().panel(), Panel::Loading);
         let waiting = CommandOutputStatus { output: output("", true), error: None };
         assert_eq!(waiting.panel(), Panel::Waiting);
@@ -220,13 +222,13 @@ mod tests {
 
     #[test]
     fn a_filled_panel_keeps_its_height_until_its_lines_or_notice_change() {
-        let status = |text: &str, truncated: bool| CommandOutputStatus { output: Some(CommandOutput { text: Arc::from(text), truncated, running: true }), error: None };
+        let status = |text: &str, truncated: bool| CommandOutputStatus { output: Some(CommandOutput { text: Arc::from(text), origin: 0, truncated, running: true }), error: None };
         let ten = "line\n".repeat(10);
         let twelve = "line\n".repeat(12);
         assert!(status(&twelve, false).keeps_capped_height(&status(&ten, false), 10.), "more lines past the cap draw the same height");
         assert!(!status(&ten, false).keeps_capped_height(&status(&twelve, false), 10.5), "fewer lines than the cap holds may shrink it");
         assert!(!status(&twelve, true).keeps_capped_height(&status(&ten, false), 10.), "the truncation notice adds a line");
-        let waiting = CommandOutputStatus { output: Some(CommandOutput { text: Arc::from(""), truncated: false, running: true }), error: None };
+        let waiting = CommandOutputStatus { output: Some(CommandOutput { text: Arc::from(""), origin: 0, truncated: false, running: true }), error: None };
         assert!(!status(&twelve, false).keeps_capped_height(&waiting, 10.), "the first output changes the branch");
     }
 }

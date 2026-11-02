@@ -29,6 +29,9 @@ pub struct TerminalOutputState {
     /// An unfinished escape sequence awaiting the next chunk.
     pending: Vec<u16>,
     screen: Screen,
+    /// Native only: where `text` starts in all the output folded so far, in UTF-8 bytes of the
+    /// text without its escapes, so a reader can follow text as the bounded tail drops its front.
+    pub origin: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,11 +45,13 @@ struct Screen {
     col: usize,
     pen: String,
     saved: Option<(usize, usize)>,
+    /// Where the live window starts, as `TerminalOutputState::origin` counts.
+    window_start: usize,
 }
 
 impl Default for Screen {
     fn default() -> Self {
-        Screen { settled: Vec::new(), lines: vec![Line::default()], row: 0, col: 0, pen: String::new(), saved: None }
+        Screen { settled: Vec::new(), lines: vec![Line::default()], row: 0, col: 0, pen: String::new(), saved: None, window_start: 0 }
     }
 }
 
@@ -69,6 +74,27 @@ impl Line {
         let len = runs.iter().map(|run| run.text.len()).sum();
         Line { runs, len }
     }
+
+    fn utf8_len(&self) -> usize {
+        self.runs.iter().map(|run| utf8_len(&run.text)).sum()
+    }
+}
+
+/// UTF-8 bytes of UTF-16 text, an unpaired surrogate counting as the replacement character.
+fn utf8_len(units: &[u16]) -> usize {
+    char::decode_utf16(units.iter().copied()).map(|character| character.map_or(3, char::len_utf8)).sum()
+}
+
+/// UTF-8 bytes of the text once its SGR escapes are stripped, as `terminal_output_spans` does.
+fn plain_utf8_len(text: &[u16]) -> usize {
+    let mut len = 0;
+    let mut rest = text;
+    while let Some(at) = rest.windows(2).position(|pair| pair == [ESC, b'[' as u16]) {
+        let Some(end) = rest[at..].iter().position(|&unit| unit == b'm' as u16) else { break };
+        len += utf8_len(&rest[..at]);
+        rest = &rest[at + end + 1..];
+    }
+    len + utf8_len(rest)
 }
 
 fn units(text: &str) -> Vec<u16> {
@@ -397,6 +423,7 @@ struct Terminal {
     /// Output was discarded on purpose (scrollback cleared or window over budget).
     dropped: bool,
     max_chars: usize,
+    window_start: usize,
 }
 
 impl Terminal {
@@ -418,12 +445,16 @@ impl Terminal {
         // Trim each write to max_chars columns so results do not depend on chunk boundaries.
         if line.len > self.max_chars {
             let mut removed = line.len - self.max_chars;
+            // The lost start moves the window's start on: a line this long fills the tail, so
+            // nothing above it is drawn while the offsets after it stay put.
+            let head: Vec<u16> = line.runs.iter().flat_map(|run| run.text.iter().copied()).take(removed + 1).collect();
             trim_line_start(&mut line.runs, removed);
             // Never start on a lone low surrogate.
             if line.runs.first().and_then(|run| run.text.first()).is_some_and(|&unit| is_low_surrogate(unit)) {
                 trim_line_start(&mut line.runs, 1);
                 removed += 1;
             }
+            self.window_start += utf8_len(&head[..removed]);
             line.len -= removed;
             self.dropped = true;
             self.col = self.col.saturating_sub(removed);
@@ -457,6 +488,7 @@ impl Terminal {
     }
 
     fn settle(&mut self, line: &Line) {
+        self.window_start += line.utf8_len() + 1;
         serialize_line(line, &mut self.settled);
         self.settled.push(NEWLINE);
         if self.settled.len() > 2 * self.max_chars {
@@ -654,6 +686,7 @@ impl TerminalOutputState {
             saved: screen.saved,
             dropped: false,
             max_chars,
+            window_start: screen.window_start,
         };
         self.pending = terminal.feed(&input);
         let mut truncated = self.truncated;
@@ -691,9 +724,20 @@ impl TerminalOutputState {
             serialize_line(line, &mut combined);
         }
         let (text, tail_truncated) = tail(&combined, max_chars);
+        // The text ends where the window does, wherever the tails cut its front.
+        let window: usize = terminal.lines.iter().map(Line::utf8_len).sum::<usize>() + terminal.lines.len() - 1;
+        self.origin = (terminal.window_start + window).saturating_sub(plain_utf8_len(&text));
         self.text = String::from_utf16_lossy(&text);
         self.truncated = truncated || settled_truncated || tail_truncated;
-        self.screen = Screen { settled, lines: terminal.lines, row: terminal.row, col: terminal.col, pen: terminal.pen, saved: terminal.saved };
+        self.screen = Screen {
+            settled,
+            lines: terminal.lines,
+            row: terminal.row,
+            col: terminal.col,
+            pen: terminal.pen,
+            saved: terminal.saved,
+            window_start: terminal.window_start,
+        };
     }
 
     /// The unfinished escape carried into the next chunk.
@@ -910,6 +954,36 @@ pub fn terminal_output_spans(text: &str, palette: &[Rgb; 16], max_spans: usize) 
         }
     }
     out.spans
+}
+
+/// What `CommandOutputPanel` draws: the spans joined into one text, and the styled byte ranges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalDisplay {
+    pub text: String,
+    pub styles: Vec<(std::ops::Range<usize>, SpanStyle)>,
+}
+
+/// `terminalOutputSpans` (capped at `MAX_SPANS`) joined. A final newline is dropped: a
+/// `pre-wrap` block does not draw an empty last line for it.
+pub fn terminal_output_display(text: &str, palette: &[Rgb; 16]) -> TerminalDisplay {
+    let mut joined = String::with_capacity(text.len());
+    let mut styles = Vec::new();
+    for span in terminal_output_spans(text, palette, MAX_SPANS) {
+        let start = joined.len();
+        joined.push_str(&span.text);
+        if let Some(style) = span.style {
+            styles.push((start..joined.len(), style));
+        }
+    }
+    if joined.ends_with('\n') {
+        joined.pop();
+        let end = joined.len();
+        styles.retain_mut(|(range, _)| {
+            range.end = range.end.min(end);
+            range.start < range.end
+        });
+    }
+    TerminalDisplay { text: joined, styles }
 }
 
 /// `terminalOutputPlainText`: the text without its SGR escapes.

@@ -6578,6 +6578,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "unicode-normalization",
+ "unicode-segmentation",
  "url",
 ]
 
