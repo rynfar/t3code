@@ -51,11 +51,10 @@ impl AppState {
         self.show_toast(Toast::new(ToastKind::Success, "Mention copied").description(path.to_owned()), cx);
     }
 
-    /// "Add to chat": the composer has no insertion hook yet, so the mention goes to the
-    /// clipboard to paste. Route this to the composer once it accepts insertions.
+    /// "Add to chat": queued for the composer like the file picker's mentions (which also copy
+    /// it while no composer drains the queue).
     pub fn add_file_to_chat(&mut self, path: &str, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(composer_file_link(path)));
-        self.show_toast(Toast::new(ToastKind::Success, "Mention copied").description("Paste it into the chat to add the file."), cx);
+        self.request_composer_mention(crate::project_files::ComposerMention { path: path.to_owned(), line: None }, cx);
     }
 
     /// The file tab's "Copy path" (`copyRightPanelFilePath`): the path as the tab names it, with
