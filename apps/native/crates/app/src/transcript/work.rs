@@ -392,9 +392,11 @@ fn entry_details(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Context<ThreadView
                         .child(div().text_color(hsla(p.diff_deletion_foreground)).child(format!("-{}", deletions.unwrap_or(0)))),
                 );
             }
-            let target = t3_core::diff::ToolCallTarget::of(item);
-            let open = cx.listener(move |view, _, _, cx| view.open_tool_call_diff(target.clone(), cx));
-            header = header.child(outline_button(SharedString::from(format!("open-tool-diff:{}", item.id)), "Open diff", open, cx));
+            if env.tool_diffs {
+                let target = t3_core::diff::ToolCallTarget::of(item);
+                let open = cx.listener(move |view, _, _, cx| view.open_tool_call_diff(target.clone(), cx));
+                header = header.child(outline_button(SharedString::from(format!("open-tool-diff:{}", item.id)), "Open diff", open, cx));
+            }
             parts.push(header.into_any_element());
             if item.status == "failed" && let Some(diff) = diff_str.as_deref().filter(|d| !d.trim().is_empty()) {
                 parts.push(mono_block(diff.to_owned(), cx).into_any_element());

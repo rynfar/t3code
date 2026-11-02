@@ -410,8 +410,7 @@ impl ThreadView {
         self.state.update(cx, |state, cx| state.open_turn_diff(run_id, file_path, cx));
     }
 
-    /// A file change's "Open diff". A side chat's opens in the thread's diff too: the target
-    /// names its own thread.
+    /// A file change's "Open diff".
     pub fn open_tool_call_diff(&mut self, target: t3_core::diff::ToolCallTarget, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| state.open_tool_call_diff(target, cx));
     }
@@ -458,6 +457,7 @@ impl ThreadView {
             forking: &self.forking,
             revert_counts: &self.rewind.counts,
             rewind_disabled: self.rewind.busy() || self.activity.is_working,
+            tool_diffs: self.fixed.is_none(),
         };
         render(&env, &mut self.markdown)
     }

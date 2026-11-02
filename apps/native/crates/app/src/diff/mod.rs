@@ -279,8 +279,8 @@ impl DiffPanel {
             && connected
             && !self.pending
             && self.error.is_none()
-            && !self.has_loaded()
             && let Some(key) = self.request.clone()
+            && source::needs_fetch(&key, self.loaded.as_ref().map(|(loaded, _)| loaded))
         {
             self.fetch(key, cx);
         }
@@ -290,8 +290,8 @@ impl DiffPanel {
         }
     }
 
-    /// Whether the current request's source has an answer, even one with nothing to show (a
-    /// cwd that is not a repository), so it is not asked again on every event.
+    /// Whether the current request's source has something to show, even nothing (a cwd that is
+    /// not a repository), possibly from an older revision while the current one is fetched.
     fn has_loaded(&self) -> bool {
         match (&self.request, &self.loaded) {
             (Some(request), Some((key, _))) => key.same_source(request),

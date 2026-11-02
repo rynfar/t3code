@@ -41,6 +41,13 @@ impl RequestKey {
     }
 }
 
+/// Whether `request` still has to be fetched: only an exact answer counts. An older revision of
+/// the same source stays on screen meanwhile (`same_source`), so a request made while the panel
+/// was hidden is fetched once it shows.
+pub fn needs_fetch(request: &RequestKey, loaded: Option<&RequestKey>) -> bool {
+    loaded != Some(request)
+}
+
 #[derive(Clone)]
 pub enum Loaded {
     /// `repository` is false when the server found no VCS at the cwd (`sources: []`).
@@ -95,5 +102,25 @@ pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHand
                 exact.as_ref().map(|exact| Parsed::from_patch(hide_whitespace_changes(&exact.patch), exact.truncated, None, None, None));
             Ok(Loaded::ToolCall(Arc::new(ToolCall { exact, ignoring_whitespace, diff })))
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_revision_shows_the_old_patch_but_is_still_fetched() {
+        let tool_call = |revision: &str| RequestKey::ToolCall {
+            environment: "e".into(),
+            target: ToolCallTarget { thread_id: "t".into(), item_id: "f1".into(), revision: revision.into() },
+        };
+        let (live, settled) = (tool_call("live"), tool_call("2026-01-02T00:00:00Z"));
+        assert!(settled.same_source(&live), "the running patch stays on screen while the settled one loads");
+        assert!(needs_fetch(&settled, Some(&live)));
+        assert!(!needs_fetch(&live, Some(&live)));
+        assert!(needs_fetch(&live, None));
+        let git = |revision| RequestKey::Git { environment: "e".into(), cwd: "/r".into(), base_ref: None, ignore_whitespace: true, revision };
+        assert!(git(2).same_source(&git(1)) && needs_fetch(&git(2), Some(&git(1))));
     }
 }
