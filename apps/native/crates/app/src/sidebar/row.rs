@@ -178,17 +178,17 @@ impl SidebarPane {
                 }))
                 .flex_1()
                 .min_w_0()
-                .h(px(20.))
+                .h(crate::theme::rem(20.))
                 .flex()
                 .items_center()
-                .px(px(4.))
+                .px(crate::theme::rem(4.))
                 .rounded(px(4.))
                 .border_1()
                 .border_color(hsla(p.foreground))
                 .bg(hsla(p.card))
                 .text_color(hsla(p.card_foreground))
                 .font_weight(FontWeight::MEDIUM)
-                // The input's own height and padding would not fit the 20px field: one text line, centered.
+                // The input's own height and padding would not fit the field: one `text-sm` line, centered.
                 .child(gpui_component::input::Input::new(input).appearance(false).bordered(false).xsmall().px_0().h_full().text_sm())
                 .into_any_element();
         }
