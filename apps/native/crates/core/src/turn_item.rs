@@ -1,7 +1,7 @@
 //! `OrchestrationV2TurnItem`: base fields shared by every item, plus a `type`-tagged body.
 //! Unknown `type`s decode to `TurnItemKind::Unknown` and are filtered out, as the web's
 //! `ForwardCompatibleUnionArray` does. Nested shapes the native UI does not render yet stay
-//! as `Value`.
+//! as `Value`. `deferredWork` is never requested (no `acceptDeferredWork`), so it is not modeled.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -27,6 +27,15 @@ pub struct TurnItem {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub updated_at: String,
+    // Wire-only dedupe markers (`DedupedBodyMarker`); `wire::restore_turn_item_bodies` clears them.
+    #[serde(default)]
+    pub text_omitted: bool,
+    #[serde(default)]
+    pub files_omitted: bool,
+    #[serde(default)]
+    pub prompt_omitted: bool,
+    #[serde(default)]
+    pub result_omitted: bool,
     #[serde(flatten)]
     pub kind: TurnItemKind,
 }
