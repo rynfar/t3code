@@ -18,7 +18,7 @@ use super::ThreadView;
 use crate::app_state::uuid_v4;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::glass;
-use crate::icons::Icon;
+use crate::icons::{Icon, ProviderLogo, provider_logo};
 use crate::theme::{hsla, metrics, palette};
 use crate::toast::{Toast, ToastKind};
 use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, ghost_text_button, inline_button};
@@ -361,7 +361,7 @@ impl ThreadView {
                 }),
                 cx,
             );
-            banners.push(alert(banner.warning, Icon::Info, Some(banner.title.clone()), vec![body], vec![dismiss], f32::INFINITY, cx));
+            banners.push(alert(banner.warning, AlertIcon::Lucide(Icon::Info), Some(banner.title.clone()), vec![body], vec![dismiss], f32::INFINITY, cx));
         }
         if let (Some(error), Some(thread_id)) = (&lines.error, self.thread_id.as_deref()) {
             let key = error.banner_key(thread_id);
@@ -394,15 +394,26 @@ impl ThreadView {
                 vec![text.into_any_element()]
             };
             let actions = self.render_error_actions(error, key, cx);
-            banners.push(alert(error.is_usage_limit(), Icon::CircleAlert, None, body, actions, 768., cx));
+            let icon = match (error.chatgpt_limit(), provider_logo("codex")) {
+                (true, Some(ProviderLogo::Mono(path))) => AlertIcon::Mark(path),
+                _ => AlertIcon::Lucide(Icon::CircleAlert),
+            };
+            banners.push(alert(error.is_usage_limit(), icon, None, body, actions, 768., cx));
         }
         Some(v_flex().absolute().top_0().left_0().right_0().items_center().px(px(16.)).children(banners).into_any_element())
     }
 }
 
+enum AlertIcon {
+    /// Drawn in the variant's color.
+    Lucide(Icon),
+    /// A brand mark in `foreground` (the OpenAI mark on ChatGPT limits).
+    Mark(&'static str),
+}
+
 /// `Alert` with `surface="glass"` and `controlAlignment="first-line"` in the error or warning
 /// variant: glass over `background`, tinted 4% toward the variant, 32% variant border.
-fn alert(warning: bool, icon: Icon, title: Option<String>, body: Vec<AnyElement>, actions: Vec<AnyElement>, max_width: f32, cx: &mut Context<ThreadView>) -> AnyElement {
+fn alert(warning: bool, icon: AlertIcon, title: Option<String>, body: Vec<AnyElement>, actions: Vec<AnyElement>, max_width: f32, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
     let (tint, accent, text): (Hsla, Hsla, Hsla) =
         if warning { (hsla(p.warning), hsla(p.warning), hsla(p.warning_foreground)) } else { (hsla(p.destructive), hsla(p.error), hsla(p.error_foreground)) };
@@ -428,7 +439,10 @@ fn alert(warning: bool, icon: Icon, title: Option<String>, body: Vec<AnyElement>
                         .line_height(px(20.))
                         .text_color(text)
                         .when(has_actions, |this| this.min_h(px(24.)))
-                        .child(div().flex_none().h(px(20.)).w(px(16.)).flex().items_center().child(icon.render(px(16.), accent)))
+                        .child(div().flex_none().h(px(20.)).w(px(16.)).flex().items_center().child(match icon {
+                            AlertIcon::Lucide(icon) => icon.render(px(16.), accent),
+                            AlertIcon::Mark(path) => gpui::svg().path(path).size(px(16.)).text_color(hsla(p.foreground)),
+                        }))
                         .child(
                             v_flex()
                                 .flex_1()
