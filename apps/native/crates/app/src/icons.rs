@@ -45,6 +45,7 @@ icons! {
     Bug => "icons/lucide/bug.svg",
     Check => "icons/lucide/check.svg",
     ChevronDown => "icons/lucide/chevron-down.svg",
+    ChevronLeft => "icons/lucide/chevron-left.svg",
     ChevronRight => "icons/lucide/chevron-right.svg",
     ChevronUp => "icons/lucide/chevron-up.svg",
     ChevronsDownUp => "icons/lucide/chevrons-down-up.svg",

@@ -57,6 +57,8 @@ pub struct ThreadView {
     local_error: Option<String>,
     clock: Clock,
     window_height: f32,
+    media: Entity<crate::media::MediaCache>,
+    viewer: Entity<crate::media::MediaViewer>,
     _subscription: Subscription,
 }
 
@@ -68,6 +70,8 @@ impl ThreadView {
             AppEvent::Shell | AppEvent::ServerConfig => this.sync_status(cx),
             _ => {}
         });
+        let media = crate::media::cache(&state, cx);
+        let viewer = cx.new(crate::media::MediaViewer::new);
         ThreadView {
             state,
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
@@ -93,6 +97,8 @@ impl ThreadView {
             local_error: None,
             clock: Clock::now(),
             window_height: 0.,
+            media,
+            viewer,
             _subscription: subscription,
         }
     }
@@ -304,6 +310,10 @@ impl ThreadView {
         cx.notify();
     }
 
+    pub fn open_media(&mut self, items: Vec<crate::media::ViewerItem>, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.viewer.update(cx, |viewer, cx| viewer.open(items, index, window, cx));
+    }
+
     pub fn open_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| state.select_thread(thread_id, cx));
     }
@@ -460,6 +470,14 @@ impl Render for ThreadView {
         self.clock = Clock::now();
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
+        self.media.update(cx, |media, cx| media.begin_frame(window, cx));
+        let scope = crate::media::MediaScope {
+            owner: cx.entity_id(),
+            thread_id: self.thread_id.clone(),
+            workspace_root: self.workspace_root.clone(),
+            viewer: self.viewer.downgrade(),
+        };
+        crate::media::set_scope(scope, cx);
         let find_bar = self.render_find_bar(cx);
         let banners = self.render_banners(cx);
         let transcript = list(
@@ -479,6 +497,6 @@ impl Render for ThreadView {
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(banners).children(find_bar).into_any_element()
+        div().relative().size_full().child(transcript).children(banners).children(find_bar).child(self.viewer.clone()).into_any_element()
     }
 }

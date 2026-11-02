@@ -3,6 +3,7 @@
 
 mod changed_files;
 pub mod markdown;
+mod media;
 mod messages;
 mod notices;
 mod parts;
