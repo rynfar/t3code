@@ -98,6 +98,12 @@ impl ClientHandle {
         Ok(())
     }
 
+    /// A pull request's patch over HTTP (`POST /api/pull-requests/diff`). Run it on the network
+    /// runtime.
+    pub async fn pull_request_diff(&self, payload: Value) -> Result<Value, crate::pull_requests::HttpFailure> {
+        crate::pull_requests::fetch_diff(&self.credentials, payload).await
+    }
+
     /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
     /// `Closed` while disconnected rather than waiting for a reconnect. The request is queued
     /// before this returns, so calls made in order reach the server in order (terminal input
