@@ -35,6 +35,62 @@ pub struct RowsInput<'a> {
 #[derive(Default)]
 pub struct RowsCache {
     settled: HashMap<usize, (Arc<TimelineEntry>, Arc<TimelineEntry>)>,
+    previous: Option<Previous>,
+}
+
+struct Previous {
+    entries: Vec<Arc<TimelineEntry>>,
+    activity: ThreadActivity,
+    expanded: [HashSet<String>; 3],
+    rows: Vec<TimelineRow>,
+}
+
+/// A streamed token changes one assistant message and nothing else, so the previous rows hold
+/// with that message swapped in: `replaceStreamingMessageRows`.
+fn replace_streaming_rows(input: &RowsInput, previous: &Previous) -> Option<Vec<TimelineRow>> {
+    if input.entries.len() != previous.entries.len()
+        || *input.activity != previous.activity
+        || *input.expanded_run_ids != previous.expanded[0]
+        || *input.expanded_attempt_ids != previous.expanded[1]
+        || *input.expanded_work_group_ids != previous.expanded[2]
+    {
+        return None;
+    }
+    let mut replacements: HashMap<usize, Arc<ChatMessage>> = HashMap::new();
+    for (next, before) in input.entries.iter().zip(&previous.entries) {
+        if Arc::ptr_eq(next, before) {
+            continue;
+        }
+        let (Some(new), Some(old)) = (next.message(), before.message()) else { return None };
+        let streaming_text_only = new.role == Role::Assistant
+            && old.role == Role::Assistant
+            && new.streaming
+            && old.streaming
+            && new.id == old.id
+            && new.run_id == old.run_id
+            && next.id == before.id
+            && next.created_at == before.created_at
+            && next.attempt == before.attempt;
+        if !streaming_text_only {
+            return None;
+        }
+        replacements.insert(Arc::as_ptr(old) as usize, new.clone());
+    }
+    Some(
+        previous
+            .rows
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                if let RowKind::Message { message, .. } | RowKind::AssistantMeta { message, .. } = &mut row.kind
+                    && let Some(next) = replacements.get(&(Arc::as_ptr(message) as usize))
+                {
+                    *message = next.clone();
+                }
+                row
+            })
+            .collect(),
+    )
 }
 
 fn settle_superseded_reasoning(entries: &[Arc<TimelineEntry>], cache: &mut RowsCache) -> Vec<Arc<TimelineEntry>> {
@@ -51,6 +107,7 @@ fn settle_superseded_reasoning(entries: &[Arc<TimelineEntry>], cache: &mut RowsC
                 None => {
                     let mut work = (**work).clone();
                     work.status = Some(ToolStatus::Completed);
+                    work.facts = std::sync::OnceLock::new();
                     Arc::new(TimelineEntry { kind: EntryKind::Work(Arc::new(work)), ..(**entry).clone() })
                 }
             };
@@ -72,6 +129,21 @@ fn expanded_group_row(group_id: &str, created_at: &str, entries: Vec<Arc<WorkLog
 
 /// `deriveMessagesTimelineRows`.
 pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
+    let rows = cache
+        .previous
+        .as_ref()
+        .and_then(|previous| replace_streaming_rows(input, previous))
+        .unwrap_or_else(|| derive_all_rows(input, cache));
+    cache.previous = Some(Previous {
+        entries: input.entries.to_vec(),
+        activity: input.activity.clone(),
+        expanded: [input.expanded_run_ids.clone(), input.expanded_attempt_ids.clone(), input.expanded_work_group_ids.clone()],
+        rows: rows.clone(),
+    });
+    rows
+}
+
+fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
     let entries = settle_superseded_reasoning(input.entries, cache);
     let entries = entries.as_slice();
     let activity = input.activity;

@@ -62,12 +62,27 @@ fn indicates_failure(entry: &WorkLogEntry, include_command: bool) -> bool {
     !text.is_empty() && tool_output_indicates_failure(&text)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntryFacts {
+    failure: bool,
+    display_failure: bool,
+    action: ToolGroupAction,
+}
+
+fn facts(entry: &WorkLogEntry) -> &EntryFacts {
+    entry.facts.get_or_init(|| EntryFacts {
+        failure: indicates_failure(entry, true),
+        display_failure: indicates_failure(entry, false),
+        action: compute_tool_group_action(entry),
+    })
+}
+
 pub fn work_entry_indicates_tool_failure(entry: &WorkLogEntry) -> bool {
-    indicates_failure(entry, true)
+    facts(entry).failure
 }
 
 pub fn work_entry_display_indicates_tool_failure(entry: &WorkLogEntry) -> bool {
-    indicates_failure(entry, false)
+    facts(entry).display_failure
 }
 
 pub fn work_entry_indicates_tool_success(entry: &WorkLogEntry) -> bool {
@@ -143,6 +158,10 @@ fn dynamic_tool(entry: &WorkLogEntry) -> Option<(Option<&str>, &Value)> {
 
 /// `toolGroupAction`.
 pub fn tool_group_action(entry: &WorkLogEntry) -> ToolGroupAction {
+    facts(entry).action
+}
+
+fn compute_tool_group_action(entry: &WorkLogEntry) -> ToolGroupAction {
     use ToolGroupAction::*;
     if entry.item_type == Some("thread_created") {
         return ThreadCreate;

@@ -29,7 +29,7 @@ pub use entries::{EntriesCache, derive_entries, item_type_name};
 pub use presentation::{
     SummaryKind, ToolGroupAction, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args,
     summary_icon, summarize_tool_group, tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label,
-    work_entry_icon, work_entry_read_output, work_log_entry_is_tool_like,
+    work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_log_entry_is_tool_like,
 };
 pub use rows::{RowsCache, RowsInput, derive_rows};
 pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, parse_iso_ms};
@@ -93,6 +93,9 @@ pub struct WorkLogEntry {
     pub question_answer: Option<Value>,
     pub item: Option<Arc<TurnItem>>,
     pub visibility: Option<Visibility>,
+    /// Failure and action, computed on first use. Entries are shared across derives, so this
+    /// keeps output scans off the per-token path.
+    pub(crate) facts: std::sync::OnceLock<presentation::EntryFacts>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

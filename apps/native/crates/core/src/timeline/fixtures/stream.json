@@ -1,0 +1,1577 @@
+[
+  {
+    "kind": "snapshot",
+    "projection": {
+      "attempts": [
+        {
+          "attemptOrdinal": 1,
+          "completedAt": "2026-11-02T09:38:58.090Z",
+          "id": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:attempt:1",
+          "nativeThreadId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7",
+          "providerInstanceId": "devReplay",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": null,
+          "reason": "initial",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "startedAt": "2026-11-02T09:38:51.208Z",
+          "status": "completed"
+        }
+      ],
+      "checkpointScopes": [],
+      "checkpoints": [],
+      "contextHandoffs": [],
+      "contextTransfers": [],
+      "messages": [],
+      "nodes": [
+        {
+          "checkpointScopeId": "checkpoint-scope:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:name:root",
+          "completedAt": "2026-11-02T09:38:58.134Z",
+          "countsForRun": true,
+          "id": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "kind": "root_turn",
+          "nativeItemRef": null,
+          "parentNodeId": null,
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": null,
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:51.208Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:53.340Z",
+          "countsForRun": false,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Areasoning%3A0",
+          "kind": "reasoning",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:reasoning:0",
+            "strength": "weak"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:52.860Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:56.992Z",
+          "countsForRun": false,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aplan%3Alegacy",
+          "kind": "todo_list",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:plan:legacy",
+            "strength": "weak"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:53.340Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:53.843Z",
+          "countsForRun": true,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-read",
+          "kind": "tool_call",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "c6f4b47b-17ae-4a01-8075-df00583d2163-showcase-read",
+            "strength": "strong"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:53.592Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:54.522Z",
+          "countsForRun": false,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A0",
+          "kind": "assistant_message",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:assistant:0",
+            "strength": "weak"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:54.125Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:55.035Z",
+          "countsForRun": true,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-edit",
+          "kind": "tool_call",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "c6f4b47b-17ae-4a01-8075-df00583d2163-showcase-edit",
+            "strength": "strong"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:54.522Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:56.739Z",
+          "countsForRun": true,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-test",
+          "kind": "tool_call",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "c6f4b47b-17ae-4a01-8075-df00583d2163-showcase-test",
+            "strength": "strong"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:55.535Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        {
+          "checkpointScopeId": null,
+          "completedAt": "2026-11-02T09:38:58.073Z",
+          "countsForRun": false,
+          "id": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A1",
+          "kind": "assistant_message",
+          "nativeItemRef": {
+            "driver": "acpRegistry",
+            "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:assistant:1",
+            "strength": "weak"
+          },
+          "parentNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "runtimeRequestId": null,
+          "startedAt": "2026-11-02T09:38:57.028Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        }
+      ],
+      "plans": [
+        {
+          "id": "plan:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider:acpRegistry:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:98aa3e3f-4ada-46c2-a40d-95f1580f50b6",
+          "kind": "todo_list",
+          "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aplan%3Alegacy",
+          "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "status": "completed",
+          "steps": [
+            {
+              "durationMs": 744,
+              "id": "acp-step-1",
+              "status": "completed",
+              "text": "Read the package manifest"
+            },
+            {
+              "durationMs": 1186,
+              "id": "acp-step-2",
+              "status": "completed",
+              "text": "Add a clamp helper"
+            },
+            {
+              "durationMs": 1711,
+              "id": "acp-step-3",
+              "status": "completed",
+              "text": "Run the tests"
+            }
+          ],
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        }
+      ],
+      "providerSessions": [],
+      "providerThreads": [],
+      "providerTurns": [],
+      "runs": [
+        {
+          "activeAttemptId": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:attempt:1",
+          "checkpointId": "checkpoint:scope:checkpoint-scope%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aname%3Aroot:name:1",
+          "completedAt": "2026-11-02T09:38:58.134Z",
+          "contextHandoffId": null,
+          "id": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+          "modelSelection": {
+            "instanceId": "devReplay",
+            "model": "showcase"
+          },
+          "ordinal": 1,
+          "providerInstanceId": "devReplay",
+          "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "queuePosition": null,
+          "requestedAt": "2026-11-02T09:38:50.938Z",
+          "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+          "startedAt": "2026-11-02T09:38:51.208Z",
+          "status": "completed",
+          "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "userMessageId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "workspacePreparation": {
+            "type": "root"
+          }
+        }
+      ],
+      "runtimeRequests": [],
+      "subagents": [],
+      "thread": {
+        "activeProviderThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "archivedAt": null,
+        "branch": null,
+        "createdAt": "2026-11-02T09:38:50.896Z",
+        "createdBy": "agent",
+        "creationSource": "mcp",
+        "deletedAt": null,
+        "forkedFrom": null,
+        "id": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "interactionMode": "default",
+        "lastVisitedAt": "2026-11-02T09:38:50.936Z",
+        "lineage": {
+          "parentThreadId": null,
+          "relationshipToParent": null,
+          "rootThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+        },
+        "modelSelection": {
+          "instanceId": "devReplay",
+          "model": "showcase"
+        },
+        "projectId": "e2a348c9-cc1d-4e35-a84f-7d9faf0ff6d4",
+        "providerInstanceId": "devReplay",
+        "pullRequests": [],
+        "runtimeMode": "full-access",
+        "settledAt": null,
+        "settledOverride": null,
+        "snoozedAt": null,
+        "snoozedUntil": null,
+        "title": "Synthetic stream",
+        "updatedAt": "2026-11-02T09:38:58.134Z",
+        "worktreePath": null
+      },
+      "turnItems": [],
+      "updatedAt": "2026-11-02T09:38:58.134Z",
+      "visibleTurnItems": [
+        {
+          "item": {
+            "attachments": [],
+            "completedAt": "2026-11-02T09:38:50.938Z",
+            "createdBy": "agent",
+            "creationSource": "mcp",
+            "id": "turn-item:message:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "inputIntent": "turn_start",
+            "messageId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "nativeItemRef": null,
+            "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+            "ordinal": 1000001,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": null,
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:50.938Z",
+            "status": "completed",
+            "text": "go",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": null,
+            "type": "user_message",
+            "updatedAt": "2026-11-02T09:38:50.938Z"
+          },
+          "position": 0,
+          "sourceItemId": "turn-item:message:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:51.002Z",
+            "exitCode": 0,
+            "id": "turn-item:provider:acpRegistry:native-item:workspace-preparation%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "input": "Preparing workspace",
+            "nativeItemRef": null,
+            "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+            "ordinal": 1000002,
+            "outputOmitted": true,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": null,
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:50.938Z",
+            "status": "completed",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": "Workspace ready",
+            "type": "command_execution",
+            "updatedAt": "2026-11-02T09:38:51.002Z"
+          },
+          "position": 1,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:workspace-preparation%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:53.340Z",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Areasoning%3A0",
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:reasoning:0",
+              "strength": "weak"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Areasoning%3A0",
+            "ordinal": 1000003,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:52.860Z",
+            "status": "completed",
+            "streaming": false,
+            "text": "The user wants a short tour. I will read the manifest, add a small helper, run the tests, and then summarize with some markdown.",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": null,
+            "type": "reasoning",
+            "updatedAt": "2026-11-02T09:38:53.340Z"
+          },
+          "position": 2,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Areasoning%3A0",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:56.992Z",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aplan%3Alegacy",
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:plan:legacy",
+              "strength": "weak"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aplan%3Alegacy",
+            "ordinal": 1000004,
+            "parentItemId": null,
+            "planId": "plan:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider:acpRegistry:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:98aa3e3f-4ada-46c2-a40d-95f1580f50b6",
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:53.340Z",
+            "status": "completed",
+            "steps": [
+              {
+                "id": "acp-step-1",
+                "status": "completed",
+                "text": "Read the package manifest"
+              },
+              {
+                "id": "acp-step-2",
+                "status": "completed",
+                "text": "Add a clamp helper"
+              },
+              {
+                "id": "acp-step-3",
+                "status": "completed",
+                "text": "Run the tests"
+              }
+            ],
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": null,
+            "type": "todo_list",
+            "updatedAt": "2026-11-02T09:38:56.992Z"
+          },
+          "position": 3,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aplan%3Alegacy",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:53.843Z",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-read",
+            "input": {
+              "path": "/workspace/app/package.json"
+            },
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "c6f4b47b-17ae-4a01-8075-df00583d2163-showcase-read",
+              "strength": "strong"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-read",
+            "ordinal": 1000005,
+            "outputOmitted": true,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:53.592Z",
+            "status": "completed",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": "Read /workspace/app/package.json",
+            "toolName": "Read",
+            "type": "dynamic_tool",
+            "updatedAt": "2026-11-02T09:38:53.843Z"
+          },
+          "position": 4,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-read",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:54.522Z",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A0",
+            "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A0",
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:assistant:0",
+              "strength": "weak"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A0",
+            "ordinal": 1000006,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:54.125Z",
+            "status": "completed",
+            "streaming": false,
+            "text": "The project has a single math module. I will add a `clamp` helper beside `sum`.\n\n",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": null,
+            "type": "assistant_message",
+            "updatedAt": "2026-11-02T09:38:54.522Z"
+          },
+          "position": 5,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A0",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:55.035Z",
+            "fileName": "/workspace/app/src/math.ts",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-edit",
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "c6f4b47b-17ae-4a01-8075-df00583d2163-showcase-edit",
+              "strength": "strong"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-edit",
+            "ordinal": 1000007,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:54.522Z",
+            "status": "completed",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": "Changed files",
+            "type": "file_change",
+            "updatedAt": "2026-11-02T09:38:55.035Z"
+          },
+          "position": 6,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-edit",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:56.739Z",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-test",
+            "input": "vp test run",
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "c6f4b47b-17ae-4a01-8075-df00583d2163-showcase-test",
+              "strength": "strong"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-test",
+            "ordinal": 1000008,
+            "outputOmitted": true,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:55.535Z",
+            "status": "completed",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": "Tool",
+            "type": "command_execution",
+            "updatedAt": "2026-11-02T09:38:56.739Z"
+          },
+          "position": 7,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Ac6f4b47b-17ae-4a01-8075-df00583d2163-showcase-test",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "completedAt": "2026-11-02T09:38:58.073Z",
+            "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A1",
+            "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A1",
+            "nativeItemRef": {
+              "driver": "acpRegistry",
+              "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:1:assistant:1",
+              "strength": "weak"
+            },
+            "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A1",
+            "ordinal": 1000009,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1",
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "startedAt": "2026-11-02T09:38:57.028Z",
+            "status": "completed",
+            "streaming": false,
+            "text": "## Done\n\nI added `clamp` next to `sum` and the tests pass.\n\n- Reads the manifest first\n- Asks before it writes\n- Streams a terminal result\n\n```ts\nclamp(12, 0, 10); // 10\nclamp(-3, 0, 10); // 0\n```\n\n| Step | Tool | Result |\n| --- | --- | --- |\n| Read | `read` | 1 file |\n| Edit | `edit` | +4 lines |\n| Test | `execute` | 12 passed |\n\nThis turn is a replay. It costs nothing, so send it again as often as you need.",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": null,
+            "type": "assistant_message",
+            "updatedAt": "2026-11-02T09:38:58.073Z"
+          },
+          "position": 8,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A1%3Aassistant%3A1",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        },
+        {
+          "item": {
+            "checkpointId": "checkpoint:scope:checkpoint-scope%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aname%3Aroot:name:1",
+            "completedAt": "2026-11-02T09:38:58.134Z",
+            "files": [],
+            "id": "turn-item:provider:acpRegistry:native-item:checkpoint%3Acheckpoint%3Ascope%3Acheckpoint-scope%253Athread%253Amcp%25253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%253Aname%253Aroot%3Aname%3A1",
+            "nativeItemRef": null,
+            "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1:root",
+            "ordinal": 1000010,
+            "parentItemId": null,
+            "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+            "providerTurnId": null,
+            "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:1",
+            "scopeId": "checkpoint-scope:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:name:root",
+            "startedAt": "2026-11-02T09:38:58.134Z",
+            "status": "completed",
+            "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+            "title": null,
+            "type": "checkpoint",
+            "updatedAt": "2026-11-02T09:38:58.134Z"
+          },
+          "position": 9,
+          "sourceItemId": "turn-item:provider:acpRegistry:native-item:checkpoint%3Acheckpoint%3Ascope%3Acheckpoint-scope%253Athread%253Amcp%25253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%253Aname%253Aroot%3Aname%3A1",
+          "sourceThreadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+          "visibility": "local"
+        }
+      ]
+    },
+    "snapshotSequence": 1238
+  },
+  {
+    "kind": "synchronized"
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:command:afb0fb34-bafb-445d-b456-d6858d7d874a:919e01f6-9b63-4283-87a7-22de20ade5e3",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:32.378Z",
+      "payload": {
+        "activeAttemptId": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "checkpointId": null,
+        "completedAt": null,
+        "contextHandoffId": null,
+        "id": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "modelSelection": {
+          "instanceId": "devReplay",
+          "model": "showcase"
+        },
+        "ordinal": 2,
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "queuePosition": null,
+        "requestedAt": "2026-11-02T09:39:32.378Z",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "startedAt": null,
+        "status": "starting",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "userMessageId": "afb0fb34-bafb-445d-b456-d6858d7d874a"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run.created"
+    },
+    "kind": "event",
+    "sequence": 1240
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:command:afb0fb34-bafb-445d-b456-d6858d7d874a:05287227-3bca-4f95-bc1f-34752369d262",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:32.378Z",
+      "payload": {
+        "attemptOrdinal": 1,
+        "completedAt": null,
+        "id": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": null,
+        "reason": "initial",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": null,
+        "status": "pending"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run-attempt.created"
+    },
+    "kind": "event",
+    "sequence": 1241
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:command:afb0fb34-bafb-445d-b456-d6858d7d874a:634ff655-e2c7-4a7d-9a24-c074b57359c5",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:32.378Z",
+      "payload": {
+        "attachments": [],
+        "completedAt": "2026-11-02T09:39:32.378Z",
+        "createdBy": "user",
+        "creationSource": "web",
+        "id": "turn-item:message:afb0fb34-bafb-445d-b456-d6858d7d874a",
+        "inputIntent": "turn_start",
+        "messageId": "afb0fb34-bafb-445d-b456-d6858d7d874a",
+        "nativeItemRef": null,
+        "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "ordinal": 2000001,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": null,
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:32.378Z",
+        "status": "completed",
+        "text": "go",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "user_message",
+        "updatedAt": "2026-11-02T09:39:32.378Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1245
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:a119a642-82f2-44dc-8a55-6ba5cb7d02f6",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:32.423Z",
+      "payload": {
+        "activeAttemptId": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "checkpointId": null,
+        "completedAt": null,
+        "contextHandoffId": null,
+        "id": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "modelSelection": {
+          "instanceId": "devReplay",
+          "model": "showcase"
+        },
+        "ordinal": 2,
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "queuePosition": null,
+        "requestedAt": "2026-11-02T09:39:32.378Z",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "startedAt": "2026-11-02T09:39:32.423Z",
+        "status": "running",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "userMessageId": "afb0fb34-bafb-445d-b456-d6858d7d874a"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run.updated"
+    },
+    "kind": "event",
+    "sequence": 1248
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:f5a09513-939a-494b-8c7f-dc4ff23f999b",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:32.423Z",
+      "payload": {
+        "attemptOrdinal": 1,
+        "completedAt": null,
+        "id": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "nativeThreadId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7",
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": null,
+        "reason": "initial",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:32.423Z",
+        "status": "running"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run-attempt.updated"
+    },
+    "kind": "event",
+    "sequence": 1249
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:f3ec316a-d163-4af2-b519-eedaaedf09d0",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Areasoning%3A0",
+      "occurredAt": "2026-11-02T09:39:33.139Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:33.137Z",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Areasoning%3A0",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:reasoning:0",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Areasoning%3A0",
+        "ordinal": 2000002,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:32.665Z",
+        "status": "completed",
+        "streaming": false,
+        "text": "The user wants a short tour. I will read the manifest, add a small helper, run the tests, and then summarize with some markdown.",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "reasoning",
+        "updatedAt": "2026-11-02T09:39:33.137Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1255
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:29a8c7e3-3093-4fc8-8624-936bab8ddcdc",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+      "occurredAt": "2026-11-02T09:39:33.146Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:plan:legacy",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "ordinal": 2000003,
+        "parentItemId": null,
+        "planId": "plan:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider:acpRegistry:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:be6ced36-ab9a-4086-ac2b-7a528feac282",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.137Z",
+        "status": "running",
+        "steps": [
+          {
+            "id": "acp-step-1",
+            "status": "running",
+            "text": "Read the package manifest"
+          },
+          {
+            "id": "acp-step-2",
+            "status": "pending",
+            "text": "Add a clamp helper"
+          },
+          {
+            "id": "acp-step-3",
+            "status": "pending",
+            "text": "Run the tests"
+          }
+        ],
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "todo_list",
+        "updatedAt": "2026-11-02T09:39:33.137Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1258
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:70fb5135-76de-458b-aaed-76864d90f0c5",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+      "occurredAt": "2026-11-02T09:39:33.391Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+        "input": {
+          "path": "/workspace/app/package.json"
+        },
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "a575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+          "strength": "strong"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+        "ordinal": 2000004,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.389Z",
+        "status": "pending",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": "Read /workspace/app/package.json",
+        "toolName": "Read",
+        "type": "dynamic_tool",
+        "updatedAt": "2026-11-02T09:39:33.389Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1260
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:360f662e-cf1a-4972-8464-e6e1902c337a",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+      "occurredAt": "2026-11-02T09:39:33.643Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:33.641Z",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+        "input": {
+          "path": "/workspace/app/package.json"
+        },
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "a575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+          "strength": "strong"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-read",
+        "ordinal": 2000004,
+        "outputOmitted": true,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.389Z",
+        "status": "completed",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": "Read /workspace/app/package.json",
+        "toolName": "Read",
+        "type": "dynamic_tool",
+        "updatedAt": "2026-11-02T09:39:33.641Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1262
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:9cd4c644-5f0f-4dd6-bc64-48cb88305daa",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+      "occurredAt": "2026-11-02T09:39:33.969Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:plan:legacy",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "ordinal": 2000003,
+        "parentItemId": null,
+        "planId": "plan:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider:acpRegistry:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:be6ced36-ab9a-4086-ac2b-7a528feac282",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.137Z",
+        "status": "running",
+        "steps": [
+          {
+            "id": "acp-step-1",
+            "status": "completed",
+            "text": "Read the package manifest"
+          },
+          {
+            "id": "acp-step-2",
+            "status": "running",
+            "text": "Add a clamp helper"
+          },
+          {
+            "id": "acp-step-3",
+            "status": "pending",
+            "text": "Run the tests"
+          }
+        ],
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "todo_list",
+        "updatedAt": "2026-11-02T09:39:33.893Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1264
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:64e2afa7-de4a-4d1e-9a01-761973b369cf",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+      "occurredAt": "2026-11-02T09:39:34.104Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+        "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:assistant:0",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+        "ordinal": 2000005,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.975Z",
+        "status": "running",
+        "streaming": true,
+        "text": "The project has a single math module. I will add a `clamp` helper beside `sum`.\n\n",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "assistant_message",
+        "updatedAt": "2026-11-02T09:39:34.102Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1266
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:8fabd02c-da36-4420-a8ca-46a385907e31",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+      "occurredAt": "2026-11-02T09:39:34.306Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:34.302Z",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+        "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:assistant:0",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A0",
+        "ordinal": 2000005,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.975Z",
+        "status": "completed",
+        "streaming": false,
+        "text": "The project has a single math module. I will add a `clamp` helper beside `sum`.\n\n",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "assistant_message",
+        "updatedAt": "2026-11-02T09:39:34.302Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1269
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:1ed56e58-9d21-41e2-8099-57c9c8901ae6",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+      "occurredAt": "2026-11-02T09:39:34.311Z",
+      "payload": {
+        "completedAt": null,
+        "fileName": "/workspace/app/src/math.ts",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "a575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+          "strength": "strong"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+        "ordinal": 2000006,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:34.302Z",
+        "status": "pending",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": "Changed files",
+        "type": "file_change",
+        "updatedAt": "2026-11-02T09:39:34.302Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1271
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:bd5f03d6-994f-462e-b72b-8c4d325136b5",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+      "occurredAt": "2026-11-02T09:39:34.809Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:34.806Z",
+        "fileName": "/workspace/app/src/math.ts",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "a575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+          "strength": "strong"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-edit",
+        "ordinal": 2000006,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:34.302Z",
+        "status": "completed",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": "Changed files",
+        "type": "file_change",
+        "updatedAt": "2026-11-02T09:39:34.806Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1273
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:77d3a252-0a96-4236-af13-5d8f8fd815d8",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+      "occurredAt": "2026-11-02T09:39:35.061Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:plan:legacy",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "ordinal": 2000003,
+        "parentItemId": null,
+        "planId": "plan:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider:acpRegistry:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:be6ced36-ab9a-4086-ac2b-7a528feac282",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.137Z",
+        "status": "running",
+        "steps": [
+          {
+            "id": "acp-step-1",
+            "status": "completed",
+            "text": "Read the package manifest"
+          },
+          {
+            "id": "acp-step-2",
+            "status": "completed",
+            "text": "Add a clamp helper"
+          },
+          {
+            "id": "acp-step-3",
+            "status": "running",
+            "text": "Run the tests"
+          }
+        ],
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "todo_list",
+        "updatedAt": "2026-11-02T09:39:35.057Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1275
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:e742ffad-fbb8-4f66-9c8e-74eb41adb4b0",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+      "occurredAt": "2026-11-02T09:39:35.311Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+        "input": "vp test run",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "a575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+          "strength": "strong"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+        "ordinal": 2000007,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:35.309Z",
+        "status": "running",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": "Ran command",
+        "type": "command_execution",
+        "updatedAt": "2026-11-02T09:39:35.309Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1277
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:18e938d1-1ffb-4a17-b8c9-effd47c38f9d",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+      "occurredAt": "2026-11-02T09:39:36.512Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:36.510Z",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+        "input": "vp test run",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "a575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+          "strength": "strong"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Atool%3Aa575856b-3166-4787-a32a-f6ee05d56dd2-showcase-test",
+        "ordinal": 2000007,
+        "outputOmitted": true,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:35.309Z",
+        "status": "completed",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": "Tool",
+        "type": "command_execution",
+        "updatedAt": "2026-11-02T09:39:36.510Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1279
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:d30c5ff3-4628-4689-94af-ff52105515ae",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+      "occurredAt": "2026-11-02T09:39:36.769Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:36.763Z",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:plan:legacy",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aplan%3Alegacy",
+        "ordinal": 2000003,
+        "parentItemId": null,
+        "planId": "plan:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider:acpRegistry:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:be6ced36-ab9a-4086-ac2b-7a528feac282",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:33.137Z",
+        "status": "completed",
+        "steps": [
+          {
+            "id": "acp-step-1",
+            "status": "completed",
+            "text": "Read the package manifest"
+          },
+          {
+            "id": "acp-step-2",
+            "status": "completed",
+            "text": "Add a clamp helper"
+          },
+          {
+            "id": "acp-step-3",
+            "status": "completed",
+            "text": "Run the tests"
+          }
+        ],
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "todo_list",
+        "updatedAt": "2026-11-02T09:39:36.763Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1282
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:19db399b-a411-4ad9-a1a4-ac1a7f270c69",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+      "occurredAt": "2026-11-02T09:39:36.942Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:assistant:1",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "ordinal": 2000008,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:36.794Z",
+        "status": "running",
+        "streaming": true,
+        "text": "## Done\n\nI added `clamp` next to `sum` and the tests pass.\n\n",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "assistant_message",
+        "updatedAt": "2026-11-02T09:39:36.940Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1284
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:5060553b-06af-4d88-aee4-a3170d31ee03",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+      "occurredAt": "2026-11-02T09:39:37.380Z",
+      "payload": {
+        "completedAt": null,
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:assistant:1",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "ordinal": 2000008,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:36.794Z",
+        "status": "running",
+        "streaming": true,
+        "text": "## Done\n\nI added `clamp` next to `sum` and the tests pass.\n\n- Reads the manifest first\n- Asks before it writes\n- Streams a terminal result\n\n```ts\nclamp(12, 0, 10); // 10\nclamp(-3, 0, 10); // 0\n```\n\n",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "assistant_message",
+        "updatedAt": "2026-11-02T09:39:37.378Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1286
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:provider-session:provider-session%3Aprovider-instance%3AdevReplay%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Ad9f15cb6-29ae-4ce0-966c-33564e30e9cc:495ab649-69a6-4208-a44f-3d483df27796",
+      "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+      "occurredAt": "2026-11-02T09:39:37.767Z",
+      "payload": {
+        "completedAt": "2026-11-02T09:39:37.764Z",
+        "id": "turn-item:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "messageId": "message:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "nativeItemRef": {
+          "driver": "acpRegistry",
+          "nativeId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7:turn:2:assistant:1",
+          "strength": "weak"
+        },
+        "nodeId": "node:provider:acpRegistry:native-item:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2%3Aassistant%3A1",
+        "ordinal": 2000008,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": "provider-turn:provider:acpRegistry:native-turn:provider-instance%3AdevReplay%3Afe439809-6c81-4f33-8068-eadcdb4bf0a7%3Aturn%3A2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:36.794Z",
+        "status": "completed",
+        "streaming": false,
+        "text": "## Done\n\nI added `clamp` next to `sum` and the tests pass.\n\n- Reads the manifest first\n- Asks before it writes\n- Streams a terminal result\n\n```ts\nclamp(12, 0, 10); // 10\nclamp(-3, 0, 10); // 0\n```\n\n| Step | Tool | Result |\n| --- | --- | --- |\n| Read | `read` | 1 file |\n| Edit | `edit` | +4 lines |\n| Test | `execute` | 12 passed |\n\nThis turn is a replay. It costs nothing, so send it again as often as you need.",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "assistant_message",
+        "updatedAt": "2026-11-02T09:39:37.764Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1289
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:7ff468e2-7d55-4065-a841-c6cabed1c198",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:37.776Z",
+      "payload": {
+        "attemptOrdinal": 1,
+        "completedAt": "2026-11-02T09:39:37.776Z",
+        "id": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "nativeThreadId": "fe439809-6c81-4f33-8068-eadcdb4bf0a7",
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": null,
+        "reason": "initial",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "startedAt": "2026-11-02T09:39:32.423Z",
+        "status": "completed"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run-attempt.updated"
+    },
+    "kind": "event",
+    "sequence": 1292
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:e9e76db3-010d-438d-8874-362da48abd2b",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:37.776Z",
+      "payload": {
+        "activeAttemptId": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "checkpointId": null,
+        "completedAt": null,
+        "contextHandoffId": null,
+        "id": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "modelSelection": {
+          "instanceId": "devReplay",
+          "model": "showcase"
+        },
+        "ordinal": 2,
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "queuePosition": null,
+        "requestedAt": "2026-11-02T09:39:32.378Z",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "startedAt": "2026-11-02T09:39:32.423Z",
+        "status": "waiting",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "userMessageId": "afb0fb34-bafb-445d-b456-d6858d7d874a"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run.updated"
+    },
+    "kind": "event",
+    "sequence": 1293
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:command:command%3Aeffect%3Acheckpoint.capture%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:fcd39d0a-0789-4bc0-ab04-5ec215fdaf6f",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:37.785Z",
+      "payload": {
+        "appRunOrdinal": 2,
+        "capturedAt": "2026-11-02T09:39:37.785Z",
+        "files": [],
+        "id": "checkpoint:scope:checkpoint-scope%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aname%3Aroot:name:2",
+        "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "ordinalWithinScope": 2,
+        "parentCheckpointId": "checkpoint:scope:checkpoint-scope%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aname%3Aroot:name:1",
+        "ref": "refs/t3/orchestration-v2/checkpoints/MWMyZDRkZWY4N2ZiYzMwMGJiM2YzNDI0MTljOTM4YjI/ordinal/2",
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "scopeId": "checkpoint-scope:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:name:root",
+        "status": "ready",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "checkpoint.captured"
+    },
+    "kind": "event",
+    "sequence": 1296
+  },
+  {
+    "event": {
+      "driver": "acpRegistry",
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:command:command%3Aeffect%3Acheckpoint.capture%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:af27f533-e746-4e7c-a7dd-36ed1a69651d",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:37.785Z",
+      "payload": {
+        "checkpointId": "checkpoint:scope:checkpoint-scope%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aname%3Aroot:name:2",
+        "completedAt": "2026-11-02T09:39:37.785Z",
+        "files": [],
+        "id": "turn-item:provider:acpRegistry:native-item:checkpoint%3Acheckpoint%3Ascope%3Acheckpoint-scope%253Athread%253Amcp%25253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%253Aname%253Aroot%3Aname%3A2",
+        "nativeItemRef": null,
+        "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "ordinal": 2000009,
+        "parentItemId": null,
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "providerTurnId": null,
+        "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "scopeId": "checkpoint-scope:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:name:root",
+        "startedAt": "2026-11-02T09:39:37.785Z",
+        "status": "completed",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "title": null,
+        "type": "checkpoint",
+        "updatedAt": "2026-11-02T09:39:37.785Z"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "turn-item.updated"
+    },
+    "kind": "event",
+    "sequence": 1297
+  },
+  {
+    "event": {
+      "id": "event:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:command:command%3Aeffect%3Acheckpoint.capture%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:429a3931-ab95-4516-888f-5730f0d6f0a0",
+      "nodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+      "occurredAt": "2026-11-02T09:39:37.785Z",
+      "payload": {
+        "activeAttemptId": "run-attempt:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:attempt:1",
+        "checkpointId": "checkpoint:scope:checkpoint-scope%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aname%3Aroot:name:2",
+        "completedAt": "2026-11-02T09:39:37.785Z",
+        "contextHandoffId": null,
+        "id": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+        "modelSelection": {
+          "instanceId": "devReplay",
+          "model": "showcase"
+        },
+        "ordinal": 2,
+        "providerInstanceId": "devReplay",
+        "providerThreadId": "provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A1",
+        "queuePosition": null,
+        "requestedAt": "2026-11-02T09:39:32.378Z",
+        "rootNodeId": "node:run:run%3Athread%3Amcp%253Ad91b633e-1adf-4074-a0ec-07b00ed5489b%3Aordinal%3A2:root",
+        "startedAt": "2026-11-02T09:39:32.423Z",
+        "status": "completed",
+        "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+        "userMessageId": "afb0fb34-bafb-445d-b456-d6858d7d874a"
+      },
+      "providerInstanceId": "devReplay",
+      "runId": "run:thread:mcp%3Ad91b633e-1adf-4074-a0ec-07b00ed5489b:ordinal:2",
+      "threadId": "mcp:d91b633e-1adf-4074-a0ec-07b00ed5489b",
+      "type": "run.updated"
+    },
+    "kind": "event",
+    "sequence": 1298
+  }
+]

@@ -374,3 +374,85 @@ fn plan_titles_and_bodies() {
     assert_eq!(plan_title(plan).as_deref(), Some("Ship it"));
     assert_eq!(strip_displayed_plan_markdown(plan), "Do the work.");
 }
+
+#[test]
+fn a_streamed_token_patches_rows_like_a_full_derive() {
+    let streaming = |text: &str| {
+        let entry = message("reply", Role::Assistant, text, Some("run-1"), "2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z");
+        let EntryKind::Message(m) = &entry.kind else { unreachable!() };
+        let mut m = (**m).clone();
+        m.streaming = true;
+        Arc::new(TimelineEntry { kind: EntryKind::Message(Arc::new(m)), ..(*entry).clone() })
+    };
+    let prompt = message("user-1", Role::User, "Go", Some("run-1"), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+    let input = Input { activity: running("run-1"), runs: HashSet::new(), groups: HashSet::new() };
+    let none = HashSet::new();
+    let derive = |entries: &[Arc<TimelineEntry>], cache: &mut RowsCache| {
+        let rows_input = RowsInput {
+            entries,
+            activity: &input.activity,
+            expanded_run_ids: &input.runs,
+            expanded_attempt_ids: &none,
+            expanded_work_group_ids: &input.groups,
+        };
+        derive_rows(&rows_input, cache)
+    };
+    let mut cache = RowsCache::default();
+    let first = derive(&[prompt.clone(), streaming("Hel")], &mut cache);
+    let patched = derive(&[prompt.clone(), streaming("Hello")], &mut cache);
+    let full = derive(&[prompt, streaming("Hello")], &mut RowsCache::default());
+    assert_eq!(ids(&patched), ids(&full));
+    assert!(rows_equal(&first[0], &patched[0]));
+    let text = |rows: &[TimelineRow]| {
+        rows.iter().find_map(|row| match &row.kind {
+            RowKind::Message { message, .. } if message.role == Role::Assistant => Some(message.text.to_string()),
+            _ => None,
+        })
+    };
+    assert_eq!(text(&patched).as_deref(), Some("Hello"));
+    assert_eq!(text(&patched), text(&full));
+}
+
+fn row_summary(row: &TimelineRow) -> String {
+    let detail = match &row.kind {
+        RowKind::Work { entries, display_label, expanded_group } => {
+            format!("work {:?} {display_label:?} {expanded_group}", entries.iter().map(|e| (&e.id, e.status)).collect::<Vec<_>>())
+        }
+        RowKind::WorkLive { entry, entries, active, .. } => format!("live {} {} {active}", entry.id, entries.len()),
+        RowKind::WorkToggle { summary, hidden_count, has_failure, .. } => format!("toggle {summary} {hidden_count} {has_failure}"),
+        RowKind::Message { message, show_assistant_meta, show_copy, .. } => {
+            format!("message {} {} {} {show_assistant_meta} {show_copy}", message.id, message.text, message.streaming)
+        }
+        RowKind::AssistantMeta { message, .. } => format!("meta {}", message.id),
+        RowKind::TurnFold { label, expanded, .. } => format!("fold {label} {expanded}"),
+        RowKind::Event { item, subagents, .. } => format!("event {} {}", item.id, subagents.len()),
+        other => format!("{other:?}"),
+    };
+    format!("{} {:?} {} {detail}", row.id, row.created_at, row.continues_work_log)
+}
+
+#[test]
+fn incremental_derives_match_a_fresh_derive_at_every_streamed_frame() {
+    let frames: Vec<ThreadStreamItem> = serde_json::from_str(include_str!("fixtures/stream.json")).expect("stream decodes");
+    let mut state = ThreadState::default();
+    let (mut entries_cache, mut rows_cache) = (EntriesCache::default(), RowsCache::default());
+    let none = HashSet::new();
+    let mut checked = 0;
+    for frame in frames {
+        if !state.apply(frame) {
+            continue;
+        }
+        let Some(projection) = state.projection.as_ref() else { continue };
+        let activity = derive_activity(projection);
+        let derive = |entries_cache: &mut EntriesCache, rows_cache: &mut RowsCache| {
+            let entries = derive_entries(entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
+            let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none };
+            derive_rows(&input, rows_cache).iter().map(row_summary).collect::<Vec<_>>()
+        };
+        let incremental = derive(&mut entries_cache, &mut rows_cache);
+        let fresh = derive(&mut EntriesCache::default(), &mut RowsCache::default());
+        assert_eq!(incremental, fresh);
+        checked += 1;
+    }
+    assert!(checked > 10, "only {checked} frames changed the projection");
+}
