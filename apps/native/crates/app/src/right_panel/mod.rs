@@ -22,6 +22,7 @@ pub use state::PanelState;
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::diff::DiffPanel;
+use crate::files::FilesPanel;
 use crate::theme::{hsla, palette};
 use crate::workspace::SIDEBAR_WIDTH;
 
@@ -52,6 +53,7 @@ pub struct RightPanelView {
     state: Entity<AppState>,
     diff: Entity<DiffPanel>,
     pull_requests: Entity<crate::pull_requests::ThreadPullRequestsPanel>,
+    files: Entity<FilesPanel>,
     _save_width: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -60,6 +62,7 @@ impl RightPanelView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|cx| DiffPanel::new(state.clone(), window, cx));
         let pull_requests = cx.new(|cx| crate::pull_requests::ThreadPullRequestsPanel::new(state.clone(), cx));
+        let files = cx.new(|cx| FilesPanel::new(state.clone(), window, cx));
         let subscription = cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {
             AppEvent::RightPanel => cx.notify(),
             AppEvent::Selection => {
@@ -75,7 +78,7 @@ impl RightPanelView {
             }
             _ => {}
         });
-        RightPanelView { state, diff, pull_requests, _save_width: None, _subscription: subscription }
+        RightPanelView { state, diff, pull_requests, files, _save_width: None, _subscription: subscription }
     }
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
@@ -135,6 +138,9 @@ impl Render for RightPanelView {
             // Cached: transcript streaming redraws the window, but only diff changes repaint it.
             Some(SurfaceKind::Diff) => self.diff.clone().cached(StyleRefinement::default().size_full()).into_any_element(),
             Some(SurfaceKind::PullRequests) => self.pull_requests.clone().into_any_element(),
+            Some(SurfaceKind::Files | SurfaceKind::File { .. }) => {
+                self.files.clone().cached(StyleRefinement::default().size_full()).into_any_element()
+            }
             None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
         };
         v_flex()

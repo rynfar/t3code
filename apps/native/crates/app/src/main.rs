@@ -5,6 +5,7 @@ mod connect;
 mod context_menu;
 mod dialog;
 mod diff;
+mod files;
 mod git;
 mod glass;
 mod icons;
@@ -74,6 +75,7 @@ fn main() {
         right_panel::init(state.clone(), cx);
         pull_requests::init(state.clone(), cx);
         terminal::init(cx);
+        files::init(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
         cx.open_window(
             WindowOptions {

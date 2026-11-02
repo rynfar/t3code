@@ -35,6 +35,16 @@ gpui-component = { workspace = true, features = [
   "tree-sitter-yaml",
 ] }
 gpui-component-assets.workspace = true
+# Bounded decoding of file previews; the formats are a subset of what GPUI already builds.
+image = { version = "0.25.1", default-features = false, features = [
+  "bmp",
+  "gif",
+  "ico",
+  "jpeg",
+  "png",
+  "tiff",
+  "webp",
+] }
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
