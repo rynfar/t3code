@@ -25,6 +25,7 @@ pub struct FakeServer {
     addr: SocketAddr,
     connections: mpsc::UnboundedReceiver<Connection>,
     session: Arc<Mutex<Value>>,
+    descriptor: Arc<Mutex<Option<Value>>>,
 }
 
 pub struct Connection {
@@ -39,17 +40,24 @@ impl FakeServer {
         let (tx, connections) = mpsc::unbounded_channel();
         let session = Arc::new(Mutex::new(json!({"authenticated": true, "auth": {}, "permissions": ["terminal:operate"]})));
         let served = session.clone();
+        let descriptor = Arc::new(Mutex::new(None));
+        let described = descriptor.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (tx, session) = (tx.clone(), served.clone());
+                let (tx, session, descriptor) = (tx.clone(), served.clone(), described.clone());
                 tokio::spawn(async move {
-                    if let Some(connection) = serve(stream, session).await {
+                    if let Some(connection) = serve(stream, session, descriptor).await {
                         let _ = tx.send(connection);
                     }
                 });
             }
         });
-        FakeServer { addr, connections, session }
+        FakeServer { addr, connections, session, descriptor }
+    }
+
+    /// What `GET /.well-known/t3/environment` answers from now on; `None` answers 404.
+    pub fn set_descriptor(&self, descriptor: Option<Value>) {
+        *self.descriptor.lock().expect("descriptor") = descriptor;
     }
 
     /// What `GET /api/auth/session` answers from now on.
@@ -93,7 +101,7 @@ async fn respond_json(mut stream: TcpStream, body: Value) {
     let _ = stream.shutdown().await;
 }
 
-async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>) -> Option<Connection> {
+async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>) -> Option<Connection> {
     let head = read_head(&mut stream).await?;
     let path = head.split_whitespace().nth(1)?.to_owned();
     let header = |name: &str| {
@@ -104,6 +112,16 @@ async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>) -> Option<Conn
     };
     if head.starts_with("POST /api/auth/websocket-ticket") {
         respond_json(stream, json!({ "ticket": "ticket" })).await;
+        return None;
+    }
+    if head.starts_with("GET /.well-known/t3/environment") {
+        let descriptor = descriptor.lock().expect("descriptor").clone();
+        match descriptor {
+            Some(descriptor) => respond_json(stream, descriptor).await,
+            None => {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+            }
+        }
         return None;
     }
     if head.starts_with("GET /api/auth/session") {

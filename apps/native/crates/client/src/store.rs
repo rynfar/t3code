@@ -1,11 +1,19 @@
-//! Saved connection: one environment for now. Lives in the OS config dir, owner-only.
+//! What the app keeps on this device, in the OS config dir: saved environments (owner-only, they
+//! hold credentials), the last open thread, client settings, and UI state.
+//!
+//! Saved environments mirror the web's saved connection catalog (`client-runtime/src/connection/
+//! catalog.ts`, `profileStore.ts`) in what this client uses: each paired server with its label,
+//! address, and credential. One is connected at a time; the list is ready for more. The single
+//! `connection.json` of earlier builds is still read when no `environments.json` exists.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
-use crate::auth::Credentials;
+use serde::{Deserialize, Serialize};
+
+use crate::auth::{Credentials, Paired};
 
 static HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -24,8 +32,204 @@ fn base() -> Option<PathBuf> {
         .or_else(|| dirs::config_dir().map(|dir| dir.join("T3 Code Native")))
 }
 
-fn path() -> Option<PathBuf> {
-    Some(base()?.join("connection.json"))
+const ENVIRONMENTS: &str = "environments.json";
+/// The single saved connection of earlier builds.
+const LEGACY_CONNECTION: &str = "connection.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedEnvironment {
+    /// This device's key for the entry; stable across re-pairing.
+    pub id: String,
+    /// The server's own `environmentId`, once known.
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    pub label: String,
+    pub http_base: String,
+    /// `None` once the server rejected it: the entry stays until it is paired again or removed.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub server_version: Option<String>,
+    /// Paired with this Mac's own T3 Code through `t3 pair`, which can pair it again.
+    #[serde(default)]
+    pub local: bool,
+}
+
+impl SavedEnvironment {
+    pub fn credentials(&self) -> Option<Credentials> {
+        let access_token = self.access_token.clone()?;
+        Some(Credentials { http_base: self.http_base.clone(), access_token })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedEnvironments {
+    /// The environment to connect at launch; `None` after an explicit disconnect.
+    #[serde(default)]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub environments: Vec<SavedEnvironment>,
+}
+
+/// `host[:port]` of an address, the label of an environment that has not told us its name.
+fn host_label(http_base: &str) -> String {
+    url::Url::parse(http_base)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| url.port().map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"))))
+        .unwrap_or_else(|| http_base.to_owned())
+}
+
+impl SavedEnvironments {
+    /// The single connection earlier builds saved, as the active environment.
+    pub fn from_legacy(credentials: Credentials) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        let environment = SavedEnvironment {
+            id: id.clone(),
+            environment_id: None,
+            label: host_label(&credentials.http_base),
+            http_base: credentials.http_base,
+            access_token: Some(credentials.access_token),
+            server_version: None,
+            local: false,
+        };
+        SavedEnvironments { active: Some(id), environments: vec![environment] }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&SavedEnvironment> {
+        self.environments.iter().find(|environment| environment.id == id)
+    }
+
+    pub fn active(&self) -> Option<&SavedEnvironment> {
+        self.get(self.active.as_deref()?)
+    }
+
+    /// The entry for a server: the same `environmentId`, else the same address.
+    pub fn find(&self, environment_id: Option<&str>, http_base: &str) -> Option<&SavedEnvironment> {
+        environment_id
+            .and_then(|wanted| self.environments.iter().find(|environment| environment.environment_id.as_deref() == Some(wanted)))
+            .or_else(|| self.environments.iter().find(|environment| environment.http_base == http_base))
+    }
+
+    /// Saves a pairing and makes it active. Pairing a saved server again refreshes its entry
+    /// instead of adding a second one. Returns the entry's id.
+    pub fn upsert(&mut self, paired: &Paired, local: bool) -> String {
+        let descriptor = paired.descriptor.as_ref();
+        let environment_id = descriptor.map(|d| d.environment_id.clone()).filter(|id| !id.is_empty());
+        let http_base = &paired.credentials.http_base;
+        let existing = self.find(environment_id.as_deref(), http_base).map(|environment| environment.id.clone());
+        let id = existing.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let previous = existing.and_then(|id| self.get(&id).cloned());
+        let label = descriptor
+            .map(|d| d.label.trim().to_owned())
+            .filter(|label| !label.is_empty())
+            .or_else(|| previous.as_ref().map(|environment| environment.label.clone()))
+            .unwrap_or_else(|| host_label(http_base));
+        let environment = SavedEnvironment {
+            id: id.clone(),
+            environment_id: environment_id.or_else(|| previous.as_ref().and_then(|environment| environment.environment_id.clone())),
+            label,
+            http_base: http_base.clone(),
+            access_token: Some(paired.credentials.access_token.clone()),
+            server_version: descriptor
+                .map(|d| d.server_version.clone())
+                .filter(|version| !version.is_empty())
+                .or_else(|| previous.as_ref().and_then(|environment| environment.server_version.clone())),
+            local: local || previous.is_some_and(|environment| environment.local),
+        };
+        match self.environments.iter_mut().find(|entry| entry.id == id) {
+            Some(entry) => *entry = environment,
+            None => self.environments.push(environment),
+        }
+        self.active = Some(id.clone());
+        id
+    }
+
+    /// Forgets an environment and its credential. Returns whether it was saved.
+    pub fn remove(&mut self, id: &str) -> bool {
+        let before = self.environments.len();
+        self.environments.retain(|environment| environment.id != id);
+        if self.active.as_deref() == Some(id) {
+            self.active = None;
+        }
+        self.environments.len() != before
+    }
+
+    /// Drops a credential the server rejected; the entry stays so it can be paired again.
+    pub fn revoke(&mut self, id: &str) {
+        if let Some(environment) = self.environments.iter_mut().find(|environment| environment.id == id) {
+            environment.access_token = None;
+        }
+    }
+
+    /// Takes the name, id, and version the connected server reports. Returns whether anything
+    /// changed.
+    pub fn update_identity(&mut self, id: &str, environment_id: &str, label: &str, server_version: &str) -> bool {
+        let Some(environment) = self.environments.iter_mut().find(|environment| environment.id == id) else { return false };
+        let before = environment.clone();
+        if !environment_id.is_empty() {
+            environment.environment_id = Some(environment_id.to_owned());
+        }
+        if !label.trim().is_empty() {
+            environment.label = label.trim().to_owned();
+        }
+        if !server_version.is_empty() {
+            environment.server_version = Some(server_version.to_owned());
+        }
+        *environment != before
+    }
+}
+
+fn decode_environments(environments: Option<&str>, legacy: Option<&str>) -> SavedEnvironments {
+    if let Some(text) = environments {
+        return serde_json::from_str(text).unwrap_or_default();
+    }
+    legacy.and_then(|text| serde_json::from_str::<Credentials>(text).ok()).map(SavedEnvironments::from_legacy).unwrap_or_default()
+}
+
+/// Saved environments, migrating the single connection of earlier builds on first read.
+pub fn load_environments() -> SavedEnvironments {
+    let Some(base) = base() else { return SavedEnvironments::default() };
+    let environments = std::fs::read_to_string(base.join(ENVIRONMENTS)).ok();
+    let legacy = environments.is_none().then(|| std::fs::read_to_string(base.join(LEGACY_CONNECTION)).ok()).flatten();
+    let saved = decode_environments(environments.as_deref(), legacy.as_deref());
+    if legacy.is_some()
+        && let Err(error) = save_environments(&saved)
+    {
+        tracing::warn!(%error, "could not migrate the saved connection");
+    }
+    saved
+}
+
+pub fn save_environments(saved: &SavedEnvironments) -> std::io::Result<()> {
+    let base = base().ok_or_else(|| std::io::Error::other("no config directory"))?;
+    let text = serde_json::to_string_pretty(saved).map_err(std::io::Error::other)?;
+    write_private(&base, ENVIRONMENTS, &text)?;
+    // Earlier builds read the legacy file; keep a forgotten credential from lingering there.
+    let legacy = base.join(LEGACY_CONNECTION);
+    if let Some(credentials) = std::fs::read_to_string(&legacy).ok().and_then(|text| serde_json::from_str::<Credentials>(&text).ok())
+        && saved.find(None, &credentials.http_base).and_then(|environment| environment.access_token.as_deref()) != Some(credentials.access_token.as_str())
+    {
+        let _ = std::fs::remove_file(legacy);
+    }
+    Ok(())
+}
+
+/// An owner-only file written to a temporary and renamed over the target.
+fn write_private(base: &Path, name: &str, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(base)?;
+    let temporary = base.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&temporary).and_then(|mut file| file.write_all(text.as_bytes())).and_then(|()| std::fs::rename(&temporary, base.join(name)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// The thread that was open last, restored on launch the way the web restores its route.
@@ -160,30 +364,16 @@ fn write_atomically(base: &Path, name: &str, text: &str) {
     }
 }
 
+/// The active environment's credentials (the probes and examples connect with these).
 pub fn load() -> Option<Credentials> {
-    let text = std::fs::read_to_string(path()?).ok()?;
-    serde_json::from_str(&text).ok()
+    load_environments().active()?.credentials()
 }
 
+/// Saves a pairing as the active environment.
 pub fn save(credentials: &Credentials) -> std::io::Result<()> {
-    let path = path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let text = serde_json::to_string_pretty(credentials).map_err(std::io::Error::other)?;
-    std::fs::write(&path, text)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-pub fn forget() {
-    if let Some(path) = path() {
-        let _ = std::fs::remove_file(path);
-    }
+    let mut saved = load_environments();
+    saved.upsert(&Paired { credentials: credentials.clone(), descriptor: None }, false);
+    save_environments(&saved)
 }
 
 #[cfg(test)]
@@ -233,6 +423,79 @@ mod tests {
             .collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read_to_string(dir.join(&backups[0])).unwrap(), "{not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn paired(http_base: &str, token: &str, environment_id: &str, label: &str) -> Paired {
+        let descriptor = (!environment_id.is_empty()).then(|| t3_core::server_config::EnvironmentDescriptor {
+            environment_id: environment_id.into(),
+            label: label.into(),
+            server_version: "0.1.7".into(),
+            ..Default::default()
+        });
+        Paired { credentials: Credentials { http_base: http_base.into(), access_token: token.into() }, descriptor }
+    }
+
+    #[test]
+    fn the_single_legacy_connection_migrates_as_the_active_environment() {
+        let legacy = r#"{"http_base":"http://127.0.0.1:3773","access_token":"old"}"#;
+        let saved = decode_environments(None, Some(legacy));
+        let active = saved.active().expect("migrated entry is active");
+        assert_eq!((active.label.as_str(), active.http_base.as_str()), ("127.0.0.1:3773", "http://127.0.0.1:3773"));
+        assert_eq!(active.credentials().map(|c| c.access_token), Some("old".to_owned()));
+        // Once environments are saved, the legacy file is never read again.
+        assert_eq!(decode_environments(Some(r#"{"environments":[]}"#), Some(legacy)), SavedEnvironments::default());
+        assert_eq!(decode_environments(None, Some("not json")), SavedEnvironments::default());
+        assert_eq!(decode_environments(Some("{}"), None), SavedEnvironments::default());
+    }
+
+    #[test]
+    fn pairing_a_saved_server_again_refreshes_its_entry_and_activates_it() {
+        let mut saved = decode_environments(None, Some(r#"{"http_base":"http://127.0.0.1:3773","access_token":"old"}"#));
+        let migrated = saved.active.clone().expect("active");
+        // The local server pairs again: same address, now with a descriptor.
+        let id = saved.upsert(&paired("http://127.0.0.1:3773", "new", "env-mac", "MacBook Pro"), true);
+        assert_eq!(id, migrated);
+        let studio = saved.upsert(&paired("https://studio.ts.net", "s1", "env-studio", "Studio"), false);
+        assert_eq!((saved.environments.len(), saved.active.as_deref()), (2, Some(studio.as_str())));
+        // Same environment through another address: still one entry, and it stays local.
+        saved.upsert(&paired("http://192.168.1.4:3773", "lan", "env-mac", ""), false);
+        let mac = saved.get(&id).expect("kept");
+        assert_eq!((mac.label.as_str(), mac.http_base.as_str(), mac.local), ("MacBook Pro", "http://192.168.1.4:3773", true));
+        assert_eq!((mac.server_version.as_deref(), saved.environments.len()), (Some("0.1.7"), 2));
+        assert_eq!(saved.active.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn revoked_and_removed_environments() {
+        let mut saved = SavedEnvironments::default();
+        let mac = saved.upsert(&paired("http://127.0.0.1:3773", "t", "env-mac", "MacBook Pro"), true);
+        saved.revoke(&mac);
+        assert_eq!(saved.get(&mac).and_then(SavedEnvironment::credentials), None);
+        assert_eq!(saved.active.as_deref(), Some(mac.as_str()), "a rejected entry stays until paired again or removed");
+        assert!(saved.update_identity(&mac, "env-mac", "Mac mini", "0.2.0"));
+        assert!(!saved.update_identity(&mac, "env-mac", "Mac mini", "0.2.0"));
+        assert_eq!(saved.get(&mac).map(|e| e.label.as_str()), Some("Mac mini"));
+        assert!(saved.remove(&mac));
+        assert_eq!((saved.active.clone(), saved.environments.len()), (None, 0));
+        assert!(!saved.remove(&mac));
+    }
+
+    #[test]
+    fn saved_environments_are_owner_only_and_round_trip() {
+        let dir = std::env::temp_dir().join(format!("t3-environments-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut saved = SavedEnvironments::default();
+        saved.upsert(&paired("http://127.0.0.1:3773", "t", "env-mac", "MacBook Pro"), true);
+        write_private(&dir, ENVIRONMENTS, &serde_json::to_string(&saved).unwrap_or_default()).expect("writes");
+        let text = std::fs::read_to_string(dir.join(ENVIRONMENTS)).unwrap_or_default();
+        assert_eq!(decode_environments(Some(&text), None), saved);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(ENVIRONMENTS)).map(|m| m.permissions().mode() & 0o777).unwrap_or_default();
+            assert_eq!(mode, 0o600);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

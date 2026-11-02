@@ -5,31 +5,31 @@ use std::future::Future;
 
 use gpui::{Context, EventEmitter, Task};
 use serde_json::Value;
-use t3_client::auth::{self, Credentials};
+use t3_client::auth::Credentials;
 use t3_client::session::RpcError;
-use t3_client::store;
+use t3_client::store::{self, SavedEnvironments};
 use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
 use t3_core::commands::{self, method};
 use t3_core::composer::ClientSettings;
 use t3_core::history::{HistoryStep, PageOutcome};
-use t3_core::pairing::parse_pairing_link;
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::thread::ThreadState;
 use t3_core::workflows::{self, StopTarget};
 
+use crate::environments::ConnectScreen;
 use crate::sidebar::controller::SidebarController;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
-    /// No saved credentials, or they stopped working.
-    Unpaired { error: Option<String> },
-    Pairing,
+    /// No environment connected: the connect screen.
+    Unpaired,
     Online(ConnectionStatus),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
+    /// The connection, the saved environments, or the connect screen changed.
     Phase,
     Shell,
     Selection,
@@ -51,6 +51,8 @@ pub enum AppEvent {
 
 pub struct AppState {
     pub phase: Phase,
+    pub environments: SavedEnvironments,
+    pub connect: ConnectScreen,
     pub shell: ShellState,
     pub sidebar: SidebarController,
     pub toasts: crate::toast::Toasts,
@@ -85,7 +87,9 @@ const MAX_BATCH: usize = 512;
 impl AppState {
     pub fn new(runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
         let mut state = AppState {
-            phase: Phase::Unpaired { error: None },
+            phase: Phase::Unpaired,
+            environments: store::load_environments(),
+            connect: ConnectScreen::default(),
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
             toasts: Default::default(),
@@ -107,54 +111,43 @@ impl AppState {
             runtime,
             _pump: None,
         };
-        if let Some(credentials) = store::load() {
-            state.start_client(credentials, cx);
+        match state.environments.active().and_then(|environment| environment.credentials()) {
+            Some(credentials) => state.start_client(credentials, cx),
+            None => state.refresh_local_server(cx),
         }
         state
     }
 
-    pub fn pair(&mut self, link: &str, cx: &mut Context<Self>) {
-        let link = match parse_pairing_link(link, None) {
-            Ok(link) => link,
-            Err(error) => {
-                self.set_phase(Phase::Unpaired { error: Some(error.to_string()) }, cx);
-                return;
-            }
-        };
-        self.set_phase(Phase::Pairing, cx);
-        let redeem = self.runtime.spawn(async move { auth::redeem_pairing(&link).await });
-        cx.spawn(async move |this, cx| {
-            let result = redeem.await.map_err(|error| error.to_string()).and_then(|r| r.map_err(|e| e.to_string()));
-            let _ = this.update(cx, |state, cx| match result {
-                Ok(credentials) => {
-                    if let Err(error) = store::save(&credentials) {
-                        tracing::warn!(%error, "could not save credentials");
-                    }
-                    state.start_client(credentials, cx);
-                }
-                Err(error) => state.set_phase(Phase::Unpaired { error: Some(error) }, cx),
-            });
-        })
-        .detach();
+    /// Drops the event pump so a closing client's queued events never reach the next one.
+    /// Never call it from inside the pump.
+    pub(crate) fn stop_pump(&mut self) {
+        self._pump = None;
     }
 
-    pub fn forget_connection(&mut self, cx: &mut Context<Self>) {
-        store::forget();
+    /// Drops the client and everything that belonged to its environment.
+    pub(crate) fn clear_connection_state(&mut self, cx: &mut Context<Self>) {
         self.client = None;
-        self._pump = None;
         self.shell = ShellState::default();
+        let collapsed = self.sidebar.collapsed;
         self.sidebar = SidebarController::default();
+        self.sidebar.collapsed = collapsed;
         self.omitted = Default::default();
+        self.notifications = Default::default();
         self.selected_thread = None;
+        self.select_when_listed = None;
+        self.restore_thread = None;
         self.thread = ThreadState::default();
         self.server_config = ServerConfigState::default();
         self.draft_project = None;
-        self.set_phase(Phase::Unpaired { error: None }, cx);
+        self.pull_requests_open = false;
+        self.composer_mentions.clear();
+        self.last_error = None;
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::Selection);
+        cx.emit(AppEvent::Thread);
     }
 
-    fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
+    pub(crate) fn start_client(&mut self, credentials: Credentials, cx: &mut Context<Self>) {
         let (client, mut events) = t3_client::supervisor::start(&self.runtime, credentials);
         self.client = Some(client);
         self.set_phase(Phase::Online(ConnectionStatus::Connecting), cx);
@@ -180,11 +173,7 @@ impl AppState {
         let mut resynchronized = false;
         for event in batch {
             match event {
-                ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => {
-                    store::forget();
-                    self.client = None;
-                    self.set_phase(Phase::Unpaired { error: Some(reason) }, cx);
-                }
+                ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => self.credentials_rejected(reason, cx),
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
                 ClientEvent::Shell(item) => {
                     resynchronized |= matches!(item, ShellStreamItem::Synchronized);
@@ -240,6 +229,7 @@ impl AppState {
         }
         if config_changed {
             self.sync_server_config(cx);
+            self.sync_environment_identity();
             cx.emit(AppEvent::ServerConfig);
         }
     }
@@ -254,7 +244,7 @@ impl AppState {
         cx.emit(AppEvent::Thread);
     }
 
-    fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
+    pub(crate) fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
         if self.phase != phase {
             self.phase = phase;
             cx.emit(AppEvent::Phase);

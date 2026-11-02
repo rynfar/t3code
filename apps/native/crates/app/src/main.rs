@@ -5,6 +5,7 @@ mod connect;
 mod context_menu;
 mod dialog;
 mod diff;
+mod environments;
 mod files;
 mod git;
 mod glass;

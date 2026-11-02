@@ -81,16 +81,19 @@ fn pump(cx: &mut VisualTestAppContext, seconds: f32, done: impl Fn(&mut VisualTe
     }
 }
 
-/// A private copy of the saved connection, so nothing the snapshot persists reaches the
-/// caller's home.
+/// A private copy of the saved environments, so nothing the snapshot persists reaches the
+/// caller's home. A home with none renders the connect screen.
 fn isolated_home() -> Result<PathBuf, String> {
     let source = std::env::var_os("T3_NATIVE_HOME")
         .map(PathBuf::from)
-        .ok_or("set T3_NATIVE_HOME to the native home whose saved connection to use")?;
+        .ok_or("set T3_NATIVE_HOME to the native home whose saved environments to use")?;
     let home = std::env::temp_dir().join(format!("t3-native-snapshot-{}", std::process::id()));
     std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
-    std::fs::copy(source.join("connection.json"), home.join("connection.json"))
-        .map_err(|error| format!("no saved connection in {}: {error}", source.display()))?;
+    for name in ["environments.json", "connection.json"] {
+        if source.join(name).exists() {
+            std::fs::copy(source.join(name), home.join(name)).map_err(|error| format!("could not copy {name}: {error}"))?;
+        }
+    }
     Ok(home)
 }
 

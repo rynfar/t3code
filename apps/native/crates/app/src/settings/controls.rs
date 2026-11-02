@@ -61,6 +61,8 @@ fn activates(event: &KeyDownEvent) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonVariant {
+    /// `primary` fill: the screen's main action.
+    Default,
     Ghost,
     GhostMuted,
     Outline,
@@ -77,6 +79,8 @@ pub enum ButtonSize {
     Compact,
     /// 28 tall, 14px text.
     Sm,
+    /// 32 tall, 14px text (`default`).
+    Default,
 }
 
 /// `button.tsx` in the variants and sizes settings use.
@@ -135,9 +139,15 @@ impl RenderOnce for Button {
             ButtonSize::IconSm => (28., 0., 8., 16., true),
             ButtonSize::Compact => (28., 7., 6., 14., false),
             ButtonSize::Sm => (28., 9., 8., 16., false),
+            ButtonSize::Default => (32., 11., 8., 16., false),
         };
         let transparent = gpui::transparent_black();
         let (fill, border, text, icon_color, hover_fill, hover_text) = match self.variant {
+            ButtonVariant::Default => {
+                let fill = hsla(p.primary);
+                let text = hsla(p.primary_foreground);
+                (fill, fill, text, text, fill.opacity(0.9), text)
+            }
             ButtonVariant::Ghost => (transparent, transparent, hsla(p.foreground), hsla(p.muted_foreground), hsla(p.accent), hsla(p.foreground)),
             ButtonVariant::GhostMuted => {
                 (transparent, transparent, hsla(p.muted_foreground), hsla(p.muted_foreground), hsla(p.accent), hsla(p.foreground))
@@ -163,7 +173,11 @@ impl RenderOnce for Button {
             .h(r(height))
             .when(square, |this| this.w(r(height)).justify_center())
             .px(r(pad))
-            .gap(r(if compact_text { 4. } else { 6. }))
+            .gap(r(match self.size {
+                ButtonSize::Compact => 4.,
+                ButtonSize::Default => 8.,
+                _ => 6.,
+            }))
             .rounded(r(radius))
             .border_1()
             .border_color(border)

@@ -45,6 +45,15 @@ cargo run -p t3-client --example probe -- --pair '<pairing link>' --seconds 5
 cargo run -p t3-client --example probe -- --thread <thread-id> --seconds 10
 ```
 
+### One-click "Connect to T3 Code on this Mac"
+
+The connect screen finds a running server under `$T3CODE_HOME` (default `~/.t3`) and pairs by
+running `t3 pair`. Never let it reach the live install: point `T3CODE_HOME` at a scratch home whose
+`userdata/server-runtime.json` is a copy of the dev server's, and `T3_NATIVE_T3_BIN` at a script
+that drops the app's `pair` and `--base-dir` arguments and runs
+`node src/bin.ts pair --base-dir <dev server home> …` from `apps/server`. With the override set,
+the app never falls back to the installed `t3`. `probe -- --local` runs the same flow headless.
+
 ## 3. Drive and capture
 
 - First launch shows the connect screen; paste the pairing link (or run the probe with
@@ -66,7 +75,7 @@ When the screen is locked or screen recording is denied, a real window gets no f
 
 ```sh
 cd apps/native
-export T3_NATIVE_HOME="$(git rev-parse --show-toplevel)/.t3/native"   # whose saved connection to use
+export T3_NATIVE_HOME="$(git rev-parse --show-toplevel)/.t3/native"   # whose saved environments to use
 cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
   [--thread <id>] [--right-panel diff] [--settings appearance] [--palette] \
   [--width 1440] [--height 900] [--dark | --light] [--wait 6]
@@ -74,6 +83,8 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
 
 - `--right-panel` takes a launcher entry name (`diff`, and any surface added to the launcher);
   `--settings` a section (`appearance`, `chat`, `keybindings`, …).
+- A home with no saved environment renders the connect screen (set `T3CODE_HOME` as above to
+  show the one-click local option).
 - It only subscribes and reads; it never writes to the server. Local UI state goes to a
   throwaway copy of the home, so `T3_NATIVE_HOME` keeps its panels and last thread.
 - One PNG per run at 2x. The first build with the feature compiles GPUI's test support once.

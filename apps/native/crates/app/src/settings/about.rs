@@ -1,11 +1,10 @@
-//! Environments and About. The native app holds one paired environment, so Environments shows
-//! that connection (label, address, server and protocol versions, status) with Disconnect; the
-//! web's saved, linked and remote environment management is not ported. About shows the app
-//! version (`AboutSettingsPanel` in `SettingsPanels.tsx`).
+//! Environments and About. Environments shows the connected environment (label, address, server
+//! and protocol versions, status) with Switch environment, Disconnect, and Remove; the saved list
+//! lives on the connect screen the switcher opens. Linked and relay environments are not ported.
+//! About shows the app version (`AboutSettingsPanel` in `SettingsPanels.tsx`).
 
 use gpui::{Context, IntoElement, ParentElement, div};
 use t3_client::auth::ORCHESTRATION_PROTOCOL_VERSION;
-use t3_client::supervisor::ConnectionStatus;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, muted_text, section};
 use super::{Block, SettingsView, close};
@@ -15,19 +14,21 @@ impl SettingsView {
     pub(super) fn environments(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
         let state = self.state.read(cx);
         let environment = state.server_config.config.as_ref().map(|config| config.environment.clone()).unwrap_or_default();
-        let address = self.server_address.clone();
+        let saved = state.active_environment().cloned();
+        let address = saved.as_ref().map(|saved| saved.http_base.clone()).unwrap_or_default();
         let status = match &state.phase {
-            Phase::Online(ConnectionStatus::Connected) => "Connected".to_owned(),
-            Phase::Online(ConnectionStatus::Connecting) => "Connecting\u{2026}".to_owned(),
-            Phase::Online(ConnectionStatus::Reconnecting { reason, .. }) => format!("Reconnecting: {reason}"),
-            Phase::Online(ConnectionStatus::NeedsPairing { reason }) => reason.clone(),
-            Phase::Pairing => "Pairing\u{2026}".to_owned(),
-            Phase::Unpaired { .. } => "Not connected".to_owned(),
+            Phase::Online(status) => status.summary().0,
+            Phase::Unpaired => "Not connected".to_owned(),
         };
-        let label = if environment.label.is_empty() { "Environment".to_owned() } else { environment.label.clone() };
+        let label = [environment.label.as_str(), saved.as_ref().map_or("", |saved| saved.label.as_str())]
+            .into_iter()
+            .find(|label| !label.trim().is_empty())
+            .unwrap_or("Environment")
+            .to_owned();
         let protocol = environment.orchestration_protocol_version.unwrap_or(ORCHESTRATION_PROTOCOL_VERSION);
         let value = |text: String| muted_text(text, cx);
-        let disconnect_state = self.state.clone();
+        let (switch_state, disconnect_state, remove_state) = (self.state.clone(), self.state.clone(), self.state.clone());
+        let remove_id = saved.as_ref().map(|saved| saved.id.clone());
         let connection = section(
             "Environments",
             vec![
@@ -40,14 +41,29 @@ impl SettingsView {
                     .control(value(if environment.server_version.is_empty() { "Unknown".to_owned() } else { environment.server_version.clone() }))
                     .into_any_element(),
                 Row::new("orchestration-protocol", "Orchestration protocol").control(value(protocol.to_string())).into_any_element(),
-                Row::new("disconnect", "Disconnect from server")
-                    .description("Forget this server on this device. Pair again with a new pairing link.")
-                    .control(
-                        Button::new("disconnect-server", ButtonVariant::DestructiveOutline, ButtonSize::Sm).label("Disconnect").on_click(move |_, window, cx| {
+                Row::new("switch-environment", "Switch environment")
+                    .description("Connect to another saved environment, or pair a new one.")
+                    .control(Button::new("switch-environment-button", ButtonVariant::Outline, ButtonSize::Sm).label("Switch\u{2026}").on_click(move |_, window, cx| {
+                        close(window, cx);
+                        switch_state.update(cx, |state, cx| state.open_switcher(cx));
+                    }))
+                    .into_any_element(),
+                Row::new("disconnect", "Disconnect")
+                    .description("Stop using this environment for now. It stays saved on this device.")
+                    .control(Button::new("disconnect-server", ButtonVariant::Outline, ButtonSize::Sm).label("Disconnect").on_click(move |_, window, cx| {
+                        close(window, cx);
+                        disconnect_state.update(cx, |state, cx| state.disconnect(cx));
+                    }))
+                    .into_any_element(),
+                Row::new("remove-environment", "Remove from this device")
+                    .description("Forget this environment and its credential. Pair again with a new pairing link.")
+                    .control(Button::new("remove-environment-button", ButtonVariant::DestructiveOutline, ButtonSize::Sm).label("Remove").disabled(remove_id.is_none()).on_click(
+                        move |_, window, cx| {
+                            let Some(id) = remove_id.clone() else { return };
                             close(window, cx);
-                            disconnect_state.update(cx, |state, cx| state.forget_connection(cx));
-                        }),
-                    )
+                            remove_state.update(cx, |state, cx| state.remove_environment(&id, cx));
+                        },
+                    ))
                     .into_any_element(),
             ],
             cx,

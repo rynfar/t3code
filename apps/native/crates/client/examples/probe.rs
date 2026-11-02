@@ -6,6 +6,10 @@
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --send "hello"   # costs a turn
 //!   cargo run -p t3-client --example probe -- --thread <thread-id> --history 3     # page earlier history
 //!   cargo run -p t3-client --example probe -- --config
+//!   cargo run -p t3-client --example probe -- --local   # one-click pair with T3 Code on this Mac
+//!
+//! `--local` runs `t3 pair` against the server it finds under `T3CODE_HOME`. Point both
+//! `T3CODE_HOME` and `T3_NATIVE_T3_BIN` at a dev server, never the live install.
 //!
 //! Launch a thread and drive it. The provider and model are required so a probe can never fall
 //! back to a paid default; use the free `devReplay` / `showcase` pair on a dev server:
@@ -54,6 +58,16 @@ async fn main() -> anyhow::Result<()> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let has = |name: &str| args.iter().any(|a| a == name);
     let credentials = match flag("--pair") {
+        None if has("--local") => {
+            let server = t3_client::local::discover().await.ok_or_else(|| anyhow::anyhow!("no running T3 Code under the T3 home"))?;
+            println!("found {} at {} (version {})", server.label(), server.state.origin, server.server_version().unwrap_or("unknown"));
+            let paired = t3_client::local::pair(&server).await?;
+            let mut saved = store::load_environments();
+            saved.upsert(&paired, true);
+            store::save_environments(&saved)?;
+            println!("paired with {} as {:?}", paired.credentials.http_base, saved.active().map(|environment| environment.label.as_str()));
+            paired.credentials
+        }
         Some(link) => {
             let link = t3_core::pairing::parse_pairing_link(&link, None)?;
             let credentials = auth::redeem_pairing(&link).await?;
