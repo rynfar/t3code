@@ -4,13 +4,16 @@
 
 use serde::{Deserialize, Serialize};
 use t3_core::auth::AuthSessionState;
+pub use t3_core::compatibility::ORCHESTRATION_PROTOCOL_VERSION;
+use t3_core::compatibility::protocol_mismatch;
 use t3_core::pairing::{PairingLink, websocket_base};
+use t3_core::server_config::EnvironmentDescriptor;
 
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const BOOTSTRAP_TOKEN_TYPE: &str = "urn:t3:params:oauth:token-type:environment-bootstrap";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
-/// `ORCHESTRATION_PROTOCOL_VERSION` in `packages/contracts/src/environment.ts`.
-pub const ORCHESTRATION_PROTOCOL_VERSION: u32 = 2;
+/// `WELL_KNOWN_ENVIRONMENT_PATH`: the unauthenticated descriptor every server answers.
+const DESCRIPTOR_PATH: &str = "/.well-known/t3/environment";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
@@ -28,6 +31,16 @@ pub enum AuthError {
     Unreachable { host: String, source: reqwest::Error },
     #[error("Unexpected response from {host} ({status}): {body}")]
     Unexpected { host: String, status: u16, body: String },
+    /// The server speaks another orchestration protocol; the message says which side to update.
+    #[error("{0}")]
+    Incompatible(String),
+}
+
+/// A redeemed pairing and, when the server answered it, its descriptor (label, id, version).
+#[derive(Debug, Clone)]
+pub struct Paired {
+    pub credentials: Credentials,
+    pub descriptor: Option<EnvironmentDescriptor>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +58,36 @@ fn http() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("reqwest client builds")
+}
+
+/// `GET /.well-known/t3/environment`: who the server is and which protocol it speaks.
+pub async fn fetch_descriptor(http_base: &str) -> Result<EnvironmentDescriptor, AuthError> {
+    let host = http_base.to_owned();
+    let response = http()
+        .get(format!("{http_base}{DESCRIPTOR_PATH}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AuthError::Unexpected { host, status: status.as_u16(), body });
+    }
+    response.json().await.map_err(|source| AuthError::Unreachable { host, source })
+}
+
+/// Pairs with a link, refusing a server on another protocol before spending its token. A server
+/// whose descriptor can't be read (an older one, or a proxy) still pairs, as it always has.
+pub async fn pair_with_link(link: &PairingLink) -> Result<Paired, AuthError> {
+    let descriptor = fetch_descriptor(&link.http_base).await.ok();
+    if let Some(descriptor) = &descriptor
+        && let Some(mismatch) = protocol_mismatch(descriptor)
+    {
+        return Err(AuthError::Incompatible(mismatch.message(&descriptor.label)));
+    }
+    let credentials = redeem_pairing(link).await?;
+    Ok(Paired { credentials, descriptor })
 }
 
 pub async fn redeem_pairing(link: &PairingLink) -> Result<Credentials, AuthError> {

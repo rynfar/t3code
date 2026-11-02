@@ -210,3 +210,30 @@ async fn streams_deliver_chunks_and_interrupt_when_dropped() {
         }
     }
 }
+
+async fn next_status(events: &mut mpsc::Receiver<ClientEvent>) -> ConnectionStatus {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("an event arrives").expect("open");
+        if let ClientEvent::Status(status) = event {
+            return status;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_server_on_another_protocol_blocks_until_retried() {
+    let mut server = FakeServer::start().await;
+    let newer = t3_core::compatibility::ORCHESTRATION_PROTOCOL_VERSION + 1;
+    server.set_descriptor(Some(json!({ "environmentId": "env", "label": "Studio", "serverVersion": "9.0.0", "orchestrationProtocolVersion": newer })));
+    let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connecting);
+    let ConnectionStatus::Unsupported { reason, server_outdated: false } = next_status(&mut events).await else { panic!("blocked as unsupported") };
+    assert!(reason.contains("Studio"));
+
+    // Fixed on the server: Retry connects, still reading as a recovery from that failure.
+    server.set_descriptor(Some(json!({ "environmentId": "env", "label": "Studio", "serverVersion": "9.0.0", "orchestrationProtocolVersion": newer - 1 })));
+    client.retry_now();
+    assert!(matches!(next_status(&mut events).await, ConnectionStatus::Reconnecting { reason: last, .. } if last == reason));
+    server.connection().await;
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connected);
+}

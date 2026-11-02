@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 use t3_core::auth::AuthSessionState;
 use t3_core::commands::{self, ShellOptions, method};
+use t3_core::compatibility::{ProtocolMismatch, protocol_mismatch};
 use t3_core::server_config::ServerConfigStreamEvent;
 use t3_core::shell::ShellStreamItem;
 use t3_core::history::HistoryPage;
@@ -24,7 +25,10 @@ use crate::session::{RpcError, Session, StreamHandle};
 pub enum ConnectionStatus {
     Connecting,
     Connected,
+    /// Waiting to try again; `reason` is the last failure.
     Reconnecting { reason: String, attempt: u32 },
+    /// The server speaks another orchestration protocol. Nothing retries until `retry_now`.
+    Unsupported { reason: String, server_outdated: bool },
     NeedsPairing { reason: String },
 }
 
@@ -41,6 +45,7 @@ enum Command {
     OpenThread(String),
     CloseThread(String),
     RefreshSessionState,
+    RetryNow,
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
     Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>> },
 }
@@ -75,6 +80,11 @@ impl ClientHandle {
     /// Fetches the grants again on the live connection, unless a fetch is already running.
     pub fn refresh_session_state(&self) {
         let _ = self.commands.send(Command::RefreshSessionState);
+    }
+
+    /// Reconnects now instead of waiting out the backoff, or checks a blocked server again.
+    pub fn retry_now(&self) {
+        let _ = self.commands.send(Command::RetryNow);
     }
 
     /// Sends an orchestration command. Resolves with the committed sequence or the server's error.
@@ -172,11 +182,13 @@ async fn supervise(
 ) {
     let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
+    let mut last_failure = String::new();
     loop {
+        // An attempt after a failure still reads as reconnecting, with the reason it failed.
         let _ = events.send(ClientEvent::Status(if attempt == 0 {
             ConnectionStatus::Connecting
         } else {
-            ConnectionStatus::Reconnecting { reason: "Reconnecting…".into(), attempt }
+            ConnectionStatus::Reconnecting { reason: last_failure.clone(), attempt }
         })).await;
         let reason = match connect(&credentials).await {
             Ok(session) => {
@@ -195,12 +207,22 @@ async fn supervise(
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::NeedsPairing { reason })).await;
                 return;
             }
+            Err(ConnectError::Unsupported { reason, server_outdated }) => {
+                let _ = events.send(ClientEvent::Status(ConnectionStatus::Unsupported { reason: reason.clone(), server_outdated })).await;
+                if !wait_draining(None, &mut commands, &mut resume).await {
+                    return;
+                }
+                attempt += 1;
+                last_failure = reason;
+                continue;
+            }
             Err(ConnectError::Transient(reason)) => reason,
         };
         attempt += 1;
+        last_failure = reason.clone();
         let _ = events.send(ClientEvent::Status(ConnectionStatus::Reconnecting { reason, attempt })).await;
         let delay = Duration::from_millis((500u64 << attempt.min(5)).min(15_000));
-        if !wait_draining(delay, &mut commands, &mut resume).await {
+        if !wait_draining(Some(delay), &mut commands, &mut resume).await {
             return;
         }
     }
@@ -208,10 +230,19 @@ async fn supervise(
 
 enum ConnectError {
     Unauthorized(String),
+    Unsupported { reason: String, server_outdated: bool },
     Transient(String),
 }
 
 async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
+    // `orchestrationProtocolCompatibilityError`: a server on another protocol is blocked, not
+    // retried. One that can't describe itself is left to the socket to accept or refuse.
+    if let Ok(descriptor) = auth::fetch_descriptor(&credentials.http_base).await
+        && let Some(mismatch) = protocol_mismatch(&descriptor)
+    {
+        let server_outdated = mismatch == ProtocolMismatch::ServerOutdated;
+        return Err(ConnectError::Unsupported { reason: mismatch.message(&descriptor.label), server_outdated });
+    }
     let ticket = auth::issue_rpc_ticket(credentials).await.map_err(|error| match error {
         AuthError::Unauthorized | AuthError::Rejected(_) => ConnectError::Unauthorized(error.to_string()),
         other => ConnectError::Transient(other.to_string()),
@@ -225,15 +256,22 @@ async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
     })
 }
 
-/// While waiting to reconnect, keep track of threads opened or closed and fail dispatches.
-async fn wait_draining(delay: Duration, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> bool {
-    let sleep = tokio::time::sleep(delay);
+/// While waiting to reconnect (until `retry_now` when `delay` is `None`), keep track of threads
+/// opened or closed and fail dispatches.
+async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> bool {
+    let sleep = async {
+        match delay {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::pin!(sleep);
     loop {
         tokio::select! {
             _ = &mut sleep => return true,
             command = commands.recv() => match command {
                 None => return false,
+                Some(Command::RetryNow) => return true,
                 Some(Command::OpenThread(id)) => { resume.threads.entry(id).or_insert(None); }
                 Some(Command::CloseThread(id)) => { resume.threads.remove(&id); }
                 Some(Command::RefreshSessionState) => {}
@@ -332,6 +370,7 @@ async fn run_session(
                     if let Some(task) = forwarders.remove(&thread_id) { task.abort(); }
                 }
                 Some(Command::RefreshSessionState) => fetch.start(),
+                Some(Command::RetryNow) => {}
                 Some(Command::Request { method, payload, reply }) => {
                     let response = session.send_request(method, payload);
                     tokio::spawn(async move {

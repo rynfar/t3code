@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client_settings;
 pub mod commands;
+pub mod compatibility;
 pub mod composer;
 pub mod diff;
 pub mod families;
@@ -9,6 +10,7 @@ pub mod git_actions;
 pub mod history;
 pub mod keybindings;
 pub mod lists;
+pub mod local_server;
 pub mod media;
 pub mod model;
 pub mod notifications;
