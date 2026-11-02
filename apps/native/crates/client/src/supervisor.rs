@@ -3,12 +3,14 @@
 //! last sequence it saw. Frames are decoded here, off the UI thread.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use t3_core::commands::{self, method};
 use t3_core::shell::ShellStreamItem;
-use t3_core::thread::ThreadStreamItem;
+use t3_core::history::HistoryPage;
+use t3_core::thread::{ThreadStreamItem, decode_thread_stream_item};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -40,6 +42,7 @@ enum Command {
 #[derive(Clone)]
 pub struct ClientHandle {
     commands: mpsc::UnboundedSender<Command>,
+    credentials: Arc<Credentials>,
 }
 
 impl ClientHandle {
@@ -57,6 +60,11 @@ impl ClientHandle {
         self.commands.send(Command::Dispatch { command, reply }).map_err(|_| RpcError::Closed)?;
         rx.await.unwrap_or(Err(RpcError::Closed))
     }
+
+    /// Fetches and decodes one page of earlier history over HTTP. Run it on the network runtime.
+    pub async fn history_page(&self, thread_id: &str, cursor: &str) -> Result<HistoryPage, String> {
+        crate::history::fetch_history_page(&self.credentials, thread_id, cursor).await
+    }
 }
 
 /// Bounded so a stalled UI pushes back through acks to the server instead of buffering forever.
@@ -68,8 +76,9 @@ type Events = mpsc::Sender<ClientEvent>;
 pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
+    let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()) };
     runtime.spawn(supervise(credentials, command_rx, events));
-    (ClientHandle { commands }, event_rx)
+    (handle, event_rx)
 }
 
 struct Resume {
@@ -188,7 +197,7 @@ async fn run_session(
                 let Some((thread_id, value)) = frame else { continue };
                 if !resume.threads.contains_key(&thread_id) { continue }
                 match value {
-                    Some(Ok(value)) => match serde_json::from_value::<ThreadStreamItem>(value) {
+                    Some(Ok(value)) => match decode_thread_stream_item(value) {
                         Ok(item) => {
                             if let Some(sequence) = thread_sequence(&item) {
                                 resume.threads.insert(thread_id.clone(), Some(sequence));
@@ -277,3 +286,4 @@ async fn report(events: &Events, context: &str, message: String) {
     tracing::warn!(context, %message, "stream failed");
     let _ = events.send(ClientEvent::StreamError { context: context.to_owned(), message }).await;
 }
+
