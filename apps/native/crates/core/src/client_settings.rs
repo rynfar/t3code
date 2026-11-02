@@ -2,7 +2,8 @@
 //! `contracts/src/settings.ts`, plus the theme preferences `web/src/hooks/useTheme.ts` stores
 //! under `t3code:theme` and `t3code:theme-appearance-mode`. The file keeps every key it does not
 //! model, so a newer build's settings survive an older one, and an invalid value reads as the
-//! contract's default without dropping the rest.
+//! contract's default without dropping the rest. Edits are saved as patches over the file as it
+//! is at write time, never as this instance's whole copy.
 
 use serde_json::{Map, Value};
 
@@ -251,16 +252,25 @@ impl ClientSettingsDoc {
 
     /// Applies one edit. Returns false when the stored value is already that.
     pub fn apply(&mut self, change: &ClientSettingChange) -> bool {
-        if let ClientSettingChange::Theme(_) = change {
-            let mode = self.appearance_mode();
-            self.entries.insert(THEME_APPEARANCE_MODE_KEY.to_owned(), Value::String(mode.as_str().to_owned()));
-        }
+        !self.apply_change(change).is_empty()
+    }
+
+    /// Applies one edit and returns the keys it changed: the patch to save onto the file.
+    pub fn apply_change(&mut self, change: &ClientSettingChange) -> Map<String, Value> {
+        let mut patch = Map::new();
         let (key, value) = change.entry();
         if self.entries.get(key) == Some(&value) {
-            return false;
+            return patch;
         }
-        self.entries.insert(key.to_owned(), value);
-        true
+        if let ClientSettingChange::Theme(_) = change {
+            let mode = Value::String(self.appearance_mode().as_str().to_owned());
+            if self.entries.get(THEME_APPEARANCE_MODE_KEY) != Some(&mode) {
+                patch.insert(THEME_APPEARANCE_MODE_KEY.to_owned(), mode);
+            }
+        }
+        patch.insert(key.to_owned(), value);
+        self.entries.extend(patch.clone());
+        patch
     }
 
     /// The composer's view of the same file.
@@ -383,6 +393,27 @@ pub fn project_grouping_from_toggle(enabled: bool, last_enabled: ProjectGrouping
         (true, ProjectGroupingMode::RepositoryPath) => ProjectGroupingMode::RepositoryPath,
         (true, _) => ProjectGroupingMode::Repository,
     }
+}
+
+/// The settings file after a patch, and whether the file it replaces must be kept aside first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedSettings {
+    pub text: String,
+    pub backup: bool,
+}
+
+/// Lays a patch over the file as it is now, not as this instance loaded it, so another
+/// instance's saves survive. A file that is not a settings object is never patched in place:
+/// it is backed up and replaced by the patch alone.
+pub fn merge_patch(current: Option<&str>, patch: &Map<String, Value>) -> MergedSettings {
+    let current = current.filter(|text| !text.trim().is_empty());
+    let (mut entries, backup) = match current.map(serde_json::from_str::<Value>) {
+        None => (Map::new(), false),
+        Some(Ok(Value::Object(entries))) => (entries, false),
+        Some(_) => (Map::new(), true),
+    };
+    entries.extend(patch.clone());
+    MergedSettings { text: serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "{}".to_owned()), backup }
 }
 
 #[cfg(test)]
