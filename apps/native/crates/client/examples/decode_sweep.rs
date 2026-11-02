@@ -67,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
     for (kind, count) in &item_kinds {
         println!("  {kind}: {count}");
     }
+    let mut largest: Vec<_> = snapshots.iter().collect();
+    largest.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    for (thread_id, (items, visible)) in largest.into_iter().take(3) {
+        println!("  largest: {thread_id} items={items} visible={visible}");
+    }
     for (context, message) in &errors {
         println!("ERROR {context}: {message}");
     }
