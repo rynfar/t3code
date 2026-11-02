@@ -62,6 +62,12 @@ impl Workspace {
                 }
             }),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            // Coming back to the app retires its delivered notifications, as the web's focus does.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.state.update(cx, |state, cx| state.clear_pending_notifications(cx));
+                }
+            }),
         ];
         Workspace { state, sidebar, thread, composer, draft, connect, menu, dialog, palette, snooze, right_panel, terminal, _subscriptions: subscriptions }
     }
@@ -197,7 +203,18 @@ impl Render for Workspace {
             .child(self.dialog.clone())
             .child(self.snooze.clone())
             .child(self.palette.clone())
-            .children(toast.map(|toast| toast.render(cx)))
+            .children(toast.map(|toast| {
+                let element = toast.render(cx);
+                match toast.open_thread {
+                    Some(thread_id) => div()
+                        .id("toast-open-thread")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.select_thread(&thread_id, cx))))
+                        .child(element)
+                        .into_any_element(),
+                    None => element,
+                }
+            }))
             .into_any_element()
     }
 }

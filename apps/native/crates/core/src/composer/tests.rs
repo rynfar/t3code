@@ -26,8 +26,19 @@ fn enter_sends_unless_the_shortcut_needs_a_modifier() {
 
 #[test]
 fn client_settings_read_web_keys_and_ignore_bad_values() {
-    let settings = ClientSettings::from_json(r#"{"sendShortcut": "mod-enter", "followUpBehavior": "queue", "planModeEnabled": true}"#);
-    assert_eq!(settings, ClientSettings { send_shortcut: SendShortcut::ModEnter, follow_up_behavior: FollowUpBehavior::Queue, plan_mode_enabled: true });
+    let settings = ClientSettings::from_json(
+        r#"{"sendShortcut": "mod-enter", "followUpBehavior": "queue", "planModeEnabled": true, "notificationMode": "notifications-and-sound", "inAppNotificationsEnabled": true}"#,
+    );
+    assert_eq!(
+        settings,
+        ClientSettings {
+            send_shortcut: SendShortcut::ModEnter,
+            follow_up_behavior: FollowUpBehavior::Queue,
+            plan_mode_enabled: true,
+            notification_mode: crate::notifications::NotificationMode::NotificationsAndSound,
+            in_app_notifications_enabled: true,
+        }
+    );
     let partial = ClientSettings::from_json(r#"{"sendShortcut": "shift-enter", "planModeEnabled": "yes"}"#);
     assert_eq!(partial, ClientSettings::default());
     assert_eq!(ClientSettings::from_json("not json"), ClientSettings::default());

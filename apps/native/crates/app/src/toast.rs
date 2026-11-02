@@ -18,15 +18,22 @@ pub struct Toast {
     pub kind: ToastKind,
     pub title: SharedString,
     pub description: Option<SharedString>,
+    /// Clicking the toast opens this thread ("Open thread" on the web's thread notifications).
+    pub open_thread: Option<String>,
 }
 
 impl Toast {
     pub fn new(kind: ToastKind, title: impl Into<SharedString>) -> Toast {
-        Toast { kind, title: title.into(), description: None }
+        Toast { kind, title: title.into(), description: None, open_thread: None }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Toast {
         self.description = Some(description.into());
+        self
+    }
+
+    pub fn open_thread(mut self, thread_id: String) -> Toast {
+        self.open_thread = Some(thread_id);
         self
     }
 
@@ -62,7 +69,8 @@ impl Toast {
                     .flex_col()
                     .min_w_0()
                     .child(div().font_weight(FontWeight::MEDIUM).child(self.title.clone()))
-                    .children(self.description.clone().map(|text| div().text_color(hsla(p.muted_foreground)).child(text))),
+                    .children(self.description.clone().map(|text| div().text_color(hsla(p.muted_foreground)).child(text)))
+                    .children(self.open_thread.as_ref().map(|_| div().pt(px(4.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.primary)).child("Open thread"))),
             )
             .into_any_element()
     }

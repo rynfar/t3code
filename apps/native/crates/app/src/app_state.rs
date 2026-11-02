@@ -60,6 +60,7 @@ pub struct AppState {
     restore_thread: Option<String>,
     /// Rows the shell leaves to on-demand reads: older settled pages and thread families.
     pub(crate) omitted: crate::omitted_rows::OmittedRows,
+    pub(crate) notifications: crate::notifications::NotificationCenter,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
     client: Option<ClientHandle>,
@@ -88,6 +89,7 @@ impl AppState {
             panels: crate::right_panel::PanelState::load(),
             restore_thread: store::load_last_thread(),
             omitted: Default::default(),
+            notifications: Default::default(),
             select_when_listed: None,
             client: None,
             runtime,
@@ -190,6 +192,7 @@ impl AppState {
         }
         if shell_changed {
             self.sync_omitted_rows(cx);
+            self.observe_notifications(cx);
             if sidebar_changed {
                 self.rebuild_sidebar(cx);
             }

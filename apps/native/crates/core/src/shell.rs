@@ -99,6 +99,9 @@ pub struct ThreadShell {
     #[serde(default)]
     pub active_provider_thread_id: Option<String>,
     pub latest_run_id: Option<String>,
+    /// Stop was requested for the latest run; its end is quiet (no completion notification).
+    #[serde(default)]
+    pub latest_run_stop_requested: Option<bool>,
     #[serde(default)]
     pub latest_run_requested_at: Option<String>,
     #[serde(default)]

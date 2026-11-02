@@ -5,6 +5,7 @@ pub mod families;
 pub mod history;
 pub mod keybindings;
 pub mod model;
+pub mod notifications;
 pub mod pairing;
 pub mod palette;
 pub mod providers;

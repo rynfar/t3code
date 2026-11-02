@@ -39,6 +39,9 @@ pub struct ClientSettings {
     pub follow_up_behavior: FollowUpBehavior,
     /// Legacy Build/Plan toggle and Shift+Tab. Off sends every turn in build mode.
     pub plan_mode_enabled: bool,
+    pub notification_mode: crate::notifications::NotificationMode,
+    /// Toasts for other threads while the window is focused.
+    pub in_app_notifications_enabled: bool,
 }
 
 impl ClientSettings {
@@ -57,6 +60,12 @@ impl ClientSettings {
         }
         if let Some(value) = field("planModeEnabled").and_then(|v| v.as_bool()) {
             settings.plan_mode_enabled = value;
+        }
+        if let Some(value) = field("notificationMode").and_then(|v| serde_json::from_value(v).ok()) {
+            settings.notification_mode = value;
+        }
+        if let Some(value) = field("inAppNotificationsEnabled").and_then(|v| v.as_bool()) {
+            settings.in_app_notifications_enabled = value;
         }
         settings
     }
