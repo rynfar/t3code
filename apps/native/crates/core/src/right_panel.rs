@@ -43,21 +43,49 @@ impl Surface {
 }
 
 /// `ThreadRightPanelState`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadPanel {
     pub is_open: bool,
     pub active_surface_id: Option<String>,
-    #[serde(deserialize_with = "known_surfaces")]
     pub surfaces: Vec<Surface>,
-    #[serde(default)]
     pub maximized: bool,
 }
 
-/// Persisted surfaces of a kind this build does not know are dropped instead of failing the load.
-fn known_surfaces<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Surface>, D::Error> {
-    let values = Vec::<Value>::deserialize(deserializer)?;
-    Ok(values.into_iter().filter_map(|value| serde_json::from_value(value).ok()).collect())
+impl ThreadPanel {
+    /// The persisted-state migration in `rightPanelStore.ts`: surfaces this build does not know
+    /// are dropped, and the active tab and visibility are repaired to match what is left.
+    fn from_value(value: &Value) -> ThreadPanel {
+        let surfaces: Vec<Surface> = value
+            .get("surfaces")
+            .and_then(Value::as_array)
+            .map(|surfaces| surfaces.iter().filter_map(|surface| serde_json::from_value(surface.clone()).ok()).collect())
+            .unwrap_or_default();
+        let raw_active = value.get("activeSurfaceId").and_then(Value::as_str);
+        let persisted_active = raw_active.filter(|id| surfaces.iter().any(|surface| surface.id == *id)).map(str::to_owned);
+        let is_open = !surfaces.is_empty()
+            && value.get("isOpen").and_then(Value::as_bool).unwrap_or(persisted_active.is_some());
+        let active_surface_id = persisted_active.or_else(|| if is_open { surfaces.first().map(|surface| surface.id.clone()) } else { None });
+        ThreadPanel {
+            is_open,
+            active_surface_id,
+            surfaces,
+            maximized: value.get("maximized").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+}
+
+/// A map whose entries decode one by one: a bad entry is dropped, the rest survive.
+pub fn decode_lenient_map<T: serde::de::DeserializeOwned>(value: Option<&Value>) -> HashMap<String, T> {
+    value
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(key, entry)| serde_json::from_value(entry.clone()).ok().map(|entry| (key.clone(), entry)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl ThreadPanel {
@@ -103,22 +131,45 @@ pub fn clamp_width(width: f32, viewport_width: f32, row_width: f32) -> f32 {
     width.clamp(MIN_WIDTH, max)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RightPanels {
-    #[serde(default)]
     threads: HashMap<String, ThreadPanel>,
     /// `t3code:preview-panel-width:<thread>`.
-    #[serde(default)]
     widths: HashMap<String, f32>,
     /// Newest first.
-    #[serde(default, deserialize_with = "known_closed_views")]
     closed: Vec<ClosedView>,
 }
 
-fn known_closed_views<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<ClosedView>, D::Error> {
-    let values = Vec::<Value>::deserialize(deserializer)?;
-    Ok(values.into_iter().filter_map(|value| serde_json::from_value(value).ok()).collect())
+impl RightPanels {
+    /// Decodes persisted state without trusting it: every part that fails to decode falls back
+    /// on its own, so one bad entry never costs the user their other tabs.
+    pub fn from_value(value: &Value) -> RightPanels {
+        let threads = value
+            .get("threads")
+            .and_then(Value::as_object)
+            .map(|threads| {
+                threads
+                    .iter()
+                    .map(|(thread, panel)| (thread.clone(), ThreadPanel::from_value(panel)))
+                    .filter(|(_, panel)| !panel.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let closed = value
+            .get("closed")
+            .and_then(Value::as_array)
+            .map(|closed| closed.iter().filter_map(|view| serde_json::from_value(view.clone()).ok()).take(CLOSED_VIEW_LIMIT).collect())
+            .unwrap_or_default();
+        let widths = decode_lenient_map::<f32>(value.get("widths")).into_iter().filter(|(_, width)| width.is_finite()).collect();
+        RightPanels { threads, widths, closed }
+    }
+}
+
+impl<'de> Deserialize<'de> for RightPanels {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(RightPanels::from_value(&Value::deserialize(deserializer)?))
+    }
 }
 
 static EMPTY: ThreadPanel = ThreadPanel { is_open: false, active_surface_id: None, surfaces: Vec::new(), maximized: false };

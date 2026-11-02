@@ -28,6 +28,10 @@ pub enum DiffRow {
     Split { file: usize, hunk: usize, left: Option<usize>, right: Option<usize> },
     /// A binary file, whose patch carries no lines.
     Notice { file: usize },
+    /// Pierre's "No newline at end of file" row under the line that lacks one (stacked).
+    NoNewline { file: usize, hunk: usize, line: usize },
+    /// The same marker in the split layout, on the side(s) whose line lacks a newline.
+    SplitNoNewline { file: usize, hunk: usize, left: Option<usize>, right: Option<usize> },
 }
 
 impl DiffRow {
@@ -37,7 +41,9 @@ impl DiffRow {
             | DiffRow::Separator { file, .. }
             | DiffRow::Line { file, .. }
             | DiffRow::Split { file, .. }
-            | DiffRow::Notice { file } => file,
+            | DiffRow::Notice { file }
+            | DiffRow::NoNewline { file, .. }
+            | DiffRow::SplitNoNewline { file, .. } => file,
         }
     }
 }
@@ -47,31 +53,43 @@ pub fn separator_label(hidden: u32) -> String {
     format!("{hidden} unmodified line{}", if hidden == 1 { "" } else { "s" })
 }
 
+/// Every file's rows, in order. Views that fold files keep `file_rows` per file instead, so a
+/// fold rebuilds only that file.
 pub fn build_rows(files: &[FileDiff], collapsed: &HashSet<String>, layout: Layout) -> Vec<DiffRow> {
-    let capacity = files.len() + files.iter().map(FileDiff::line_count).sum::<usize>();
-    let mut rows = Vec::with_capacity(capacity);
-    for (file_index, file) in files.iter().enumerate() {
-        rows.push(DiffRow::FileHeader { file: file_index });
-        if collapsed.contains(&file.key()) {
-            continue;
+    files
+        .iter()
+        .enumerate()
+        .flat_map(|(index, file)| file_rows(index, file, collapsed.contains(&file.key()), layout))
+        .collect()
+}
+
+/// One file's rows: its header, then (unless collapsed) separators and lines.
+pub fn file_rows(file_index: usize, file: &FileDiff, collapsed: bool, layout: Layout) -> Vec<DiffRow> {
+    if collapsed {
+        return vec![DiffRow::FileHeader { file: file_index }];
+    }
+    if file.binary {
+        return vec![DiffRow::FileHeader { file: file_index }, DiffRow::Notice { file: file_index }];
+    }
+    let mut rows = Vec::with_capacity(1 + file.hunks.len() + file.line_count());
+    rows.push(DiffRow::FileHeader { file: file_index });
+    let mut previous_end: Option<u32> = None;
+    for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+        let hidden = hidden_before(hunk, previous_end);
+        if hidden > 0 {
+            rows.push(DiffRow::Separator { file: file_index, hunk: hunk_index, hidden });
         }
-        if file.binary {
-            rows.push(DiffRow::Notice { file: file_index });
-            continue;
-        }
-        let mut previous_end: Option<u32> = None;
-        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-            let hidden = hidden_before(hunk, previous_end);
-            if hidden > 0 {
-                rows.push(DiffRow::Separator { file: file_index, hunk: hunk_index, hidden });
+        previous_end = Some(hunk_end(hunk));
+        match layout {
+            Layout::Stacked => {
+                for (line, diff_line) in hunk.lines.iter().enumerate() {
+                    rows.push(DiffRow::Line { file: file_index, hunk: hunk_index, line });
+                    if diff_line.no_newline_at_eof {
+                        rows.push(DiffRow::NoNewline { file: file_index, hunk: hunk_index, line });
+                    }
+                }
             }
-            previous_end = Some(hunk_end(hunk));
-            match layout {
-                Layout::Stacked => rows.extend(
-                    (0..hunk.lines.len()).map(|line| DiffRow::Line { file: file_index, hunk: hunk_index, line }),
-                ),
-                Layout::Split => push_split(&mut rows, file_index, hunk_index, hunk),
-            }
+            Layout::Split => push_split(&mut rows, file_index, hunk_index, hunk),
         }
     }
     rows
@@ -102,6 +120,9 @@ fn push_split(rows: &mut Vec<DiffRow>, file: usize, hunk_index: usize, hunk: &Hu
     while index < lines.len() {
         if lines[index].kind == LineKind::Context {
             rows.push(DiffRow::Split { file, hunk: hunk_index, left: Some(index), right: Some(index) });
+            if lines[index].no_newline_at_eof {
+                rows.push(DiffRow::SplitNoNewline { file, hunk: hunk_index, left: Some(index), right: Some(index) });
+            }
             index += 1;
             continue;
         }
@@ -116,12 +137,13 @@ fn push_split(rows: &mut Vec<DiffRow>, file: usize, hunk_index: usize, hunk: &Hu
         let deletions = additions_start - deletions_start;
         let additions = index - additions_start;
         for offset in 0..deletions.max(additions) {
-            rows.push(DiffRow::Split {
-                file,
-                hunk: hunk_index,
-                left: (offset < deletions).then_some(deletions_start + offset),
-                right: (offset < additions).then_some(additions_start + offset),
-            });
+            let left = (offset < deletions).then_some(deletions_start + offset);
+            let right = (offset < additions).then_some(additions_start + offset);
+            rows.push(DiffRow::Split { file, hunk: hunk_index, left, right });
+            let marked = |side: Option<usize>| side.filter(|&line| lines[line].no_newline_at_eof);
+            if marked(left).is_some() || marked(right).is_some() {
+                rows.push(DiffRow::SplitNoNewline { file, hunk: hunk_index, left: marked(left), right: marked(right) });
+            }
         }
     }
 }

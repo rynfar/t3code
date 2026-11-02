@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::thread::Entity;
+use crate::turn_item::{TurnItem, TurnItemKind};
 
 pub mod method {
     pub const GET_TURN_DIFF: &str = "orchestration.getTurnDiff";
@@ -243,6 +244,30 @@ pub struct DiffPreviewSource {
     pub head_ref: Option<String>,
     /// Totals over every changed file; set when `diff` holds only some of them.
     pub totals: Option<(u64, u64)>,
+}
+
+/// A `ReviewDiffPreviewResult` with no sources at all: the cwd is not a repository
+/// (`ReviewService.getDiffPreview` answers `sources: []` when no VCS is detected).
+pub fn preview_is_repository(value: &Value) -> bool {
+    value.get("sources").and_then(Value::as_array).is_some_and(|sources| !sources.is_empty())
+}
+
+/// `deriveWorkspaceMutationId`: changes whenever the agent may have changed the workspace, so
+/// git diffs refetch mid-turn. File tools are explicit; finished commands count because a shell
+/// command can change files without reporting them. `items` are the visible turn items in order.
+pub fn workspace_mutation_id<'a>(
+    items: impl DoubleEndedIterator<Item = &'a TurnItem>,
+    latest_checkpoint_completed_at: Option<&str>,
+) -> Option<String> {
+    let item_id = items
+        .rev()
+        .filter(|item| matches!(item.kind, TurnItemKind::CommandExecution { .. } | TurnItemKind::FileChange { .. }))
+        .find(|item| !matches!(item.status.as_str(), "pending" | "running" | "waiting"))
+        .map(|item| item.id.as_str());
+    if item_id.is_none() && latest_checkpoint_completed_at.is_none() {
+        return None;
+    }
+    Some(json!([item_id, latest_checkpoint_completed_at]).to_string())
 }
 
 /// Picks the source for `kind` from a `ReviewDiffPreviewResult`.

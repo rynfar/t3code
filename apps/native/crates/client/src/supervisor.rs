@@ -49,6 +49,11 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
+    /// The server this handle talks to; caches keyed by it never mix environments.
+    pub fn environment(&self) -> &str {
+        &self.credentials.http_base
+    }
+
     pub fn open_thread(&self, thread_id: &str) {
         let _ = self.commands.send(Command::OpenThread(thread_id.to_owned()));
     }

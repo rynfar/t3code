@@ -175,3 +175,36 @@ fn width_clamps_to_the_window_and_the_thread_column() {
     // A narrow window never inverts the clamp.
     assert_eq!(clamp_width(500., 720., 464.), MIN_WIDTH);
 }
+
+#[test]
+fn persisted_state_survives_bad_entries_and_repairs_the_active_tab() {
+    let json = r#"{
+        "threads": {
+            "kept": { "isOpen": true, "activeSurfaceId": "browser:1",
+                "surfaces": [{ "id": "browser:1", "kind": "preview" }, { "id": "diff", "kind": "diff" }] },
+            "hidden": { "isOpen": false, "activeSurfaceId": "gone", "surfaces": [{ "id": "diff", "kind": "diff" }] },
+            "broken": "not a panel",
+            "emptied": { "isOpen": true, "activeSurfaceId": "files", "surfaces": [{ "id": "files", "kind": "files" }] }
+        },
+        "widths": { "kept": 480, "bad": "wide" },
+        "closed": "nope"
+    }"#;
+    let panels: RightPanels = serde_json::from_str(json).expect("decode");
+    // The active tab was dropped, so the first remaining one takes over while open.
+    assert_eq!(panels.panel("kept").active_surface_id.as_deref(), Some("diff"));
+    assert!(panels.is_open("kept"));
+    assert_eq!(panels.panel("hidden").active_surface_id, None);
+    assert!(!panels.is_open("hidden"));
+    assert_eq!(panels.panel("broken"), &ThreadPanel::default());
+    assert!(!panels.threads.contains_key("emptied"));
+    assert_eq!((panels.width("kept"), panels.width("bad")), (Some(480.), None));
+    assert!(panels.closed_views().is_empty());
+}
+
+#[test]
+fn lenient_maps_keep_good_entries() {
+    let value = serde_json::json!({ "a": 1, "b": "x", "c": 3 });
+    let map: HashMap<String, u32> = decode_lenient_map(Some(&value));
+    assert_eq!(map.len(), 2);
+    assert!(decode_lenient_map::<u32>(None).is_empty());
+}

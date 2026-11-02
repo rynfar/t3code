@@ -158,6 +158,48 @@ fn marks_lines_without_a_trailing_newline() {
     assert!(!lines[0].no_newline_at_eof);
     assert!(lines[1].no_newline_at_eof && lines[2].no_newline_at_eof);
     assert_eq!(files[0].change, ChangeKind::Modified);
+    // Pierre paints a "No newline at end of file" row under each such line.
+    assert_eq!(
+        build_rows(&files, &HashSet::new(), Layout::Stacked),
+        vec![
+            DiffRow::FileHeader { file: 0 },
+            DiffRow::Line { file: 0, hunk: 0, line: 0 },
+            DiffRow::Line { file: 0, hunk: 0, line: 1 },
+            DiffRow::NoNewline { file: 0, hunk: 0, line: 1 },
+            DiffRow::Line { file: 0, hunk: 0, line: 2 },
+            DiffRow::NoNewline { file: 0, hunk: 0, line: 2 },
+        ]
+    );
+    assert_eq!(
+        build_rows(&files, &HashSet::new(), Layout::Split)[2..],
+        [
+            DiffRow::Split { file: 0, hunk: 0, left: Some(1), right: Some(2) },
+            DiffRow::SplitNoNewline { file: 0, hunk: 0, left: Some(1), right: Some(2) },
+        ]
+    );
+}
+
+#[test]
+fn keeps_carriage_returns_in_content_but_not_in_headers() {
+    let patch = "diff --git a/w.txt b/w.txt\r\n--- a/w.txt\r\n+++ b/w.txt\r\n@@ -1,2 +1,2 @@ ctx\r\n keep\r\n-x\r\n+x\n";
+    let files = files(patch);
+    assert_eq!(files[0].path(), "w.txt");
+    assert_eq!(files[0].hunks[0].context, "ctx");
+    let texts: Vec<_> = files[0].hunks[0].lines.iter().map(|line| (line.kind, &*line.text)).collect();
+    assert_eq!(texts, vec![(LineKind::Context, "keep\r"), (LineKind::Deletion, "x\r"), (LineKind::Addition, "x")]);
+}
+
+#[test]
+fn combined_diffs_fall_back_to_raw_text() {
+    let patch = "diff --cc file.txt\nindex 1,2..3\n--- a/file.txt\n+++ b/file.txt\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n -b\n++c\n";
+    assert!(matches!(parse_patch(patch), ParsedPatch::Raw { .. }));
+}
+
+#[test]
+fn collapsed_and_binary_files_build_only_their_header_rows() {
+    let parsed = files(MODIFIED);
+    assert_eq!(file_rows(3, &parsed[0], true, Layout::Split), vec![DiffRow::FileHeader { file: 3 }]);
+    assert_eq!(file_rows(0, &parsed[0], false, Layout::Stacked).len(), 12);
 }
 
 #[test]
@@ -398,4 +440,39 @@ fn compact_counts_match_the_web() {
     for (value, expected) in cases {
         assert_eq!(compact_count(value), expected, "{value}");
     }
+}
+
+#[test]
+fn preview_without_sources_means_no_repository() {
+    assert!(!preview_is_repository(&json!({ "cwd": "/x", "sources": [] })));
+    assert!(preview_is_repository(&json!({ "sources": [{ "kind": "working-tree", "diff": "" }] })));
+}
+
+fn tool_item(id: &str, kind: &str, status: &str) -> crate::turn_item::TurnItem {
+    let body = match kind {
+        "command_execution" => json!({ "input": "ls" }),
+        "file_change" => json!({ "fileName": "a.rs" }),
+        _ => json!({ "text": "hi", "messageId": "msg", "streaming": false }),
+    };
+    let mut value = json!({ "id": id, "threadId": "t", "runId": "r", "nodeId": null, "parentItemId": null,
+        "ordinal": 1, "status": status, "title": null, "startedAt": null, "completedAt": null, "type": kind });
+    if let (Some(object), Some(extra)) = (value.as_object_mut(), body.as_object()) {
+        object.extend(extra.clone());
+    }
+    serde_json::from_value(value).expect("turn item")
+}
+
+#[test]
+fn workspace_mutation_id_tracks_finished_file_tools_and_checkpoints() {
+    let items = [
+        tool_item("c1", "command_execution", "completed"),
+        tool_item("f1", "file_change", "running"),
+        tool_item("m1", "assistant_message", "completed"),
+    ];
+    let id = workspace_mutation_id(items.iter(), None).expect("id");
+    assert!(id.contains("c1") && !id.contains("f1"));
+    let done = [tool_item("c1", "command_execution", "completed"), tool_item("f1", "file_change", "completed")];
+    assert_ne!(workspace_mutation_id(done.iter(), None), Some(id.clone()));
+    assert_ne!(workspace_mutation_id(items.iter(), Some("2026-01-01T00:00:00Z")), Some(id));
+    assert_eq!(workspace_mutation_id(items[2..].iter(), None), None);
 }

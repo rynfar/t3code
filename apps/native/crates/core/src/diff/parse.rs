@@ -9,16 +9,32 @@ use super::{ChangeKind, DiffLine, FileDiff, Hunk, LineKind, ParsedPatch};
 /// Pierre's `--diffs-tab-size`.
 const TAB_SIZE: usize = 2;
 
+const UNSUPPORTED: &str = "Unsupported diff format. Showing raw patch.";
+
 pub fn parse_patch(patch: &str) -> ParsedPatch {
     if patch.trim().is_empty() {
         return ParsedPatch::Empty;
     }
-    let files = Parser { lines: patch.lines().collect(), at: 0 }.files();
+    // Content keeps its `\r`, so a line-ending change still reads as a change.
+    let mut lines: Vec<&str> = patch.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    // Merge commits' combined diffs (`diff --cc`) have multi-column hunks this view cannot show.
+    if lines.iter().any(|line| line.starts_with("diff --cc ") || line.starts_with("diff --combined ")) {
+        return ParsedPatch::Raw { text: patch.to_owned(), reason: UNSUPPORTED };
+    }
+    let files = Parser { lines, at: 0 }.files();
     if files.is_empty() {
-        ParsedPatch::Raw { text: patch.to_owned(), reason: "Unsupported diff format. Showing raw patch." }
+        ParsedPatch::Raw { text: patch.to_owned(), reason: UNSUPPORTED }
     } else {
         ParsedPatch::Files(files)
     }
+}
+
+/// A header line without the `\r` a CRLF-encoded patch leaves on it.
+fn strip_cr(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 struct Parser<'a> {
@@ -41,14 +57,19 @@ struct Header {
 }
 
 impl<'a> Parser<'a> {
+    /// The current line as a header: structure never depends on a trailing `\r`.
     fn peek(&self) -> Option<&'a str> {
+        self.lines.get(self.at).copied().map(strip_cr)
+    }
+
+    fn peek_raw(&self) -> Option<&'a str> {
         self.lines.get(self.at).copied()
     }
 
     fn files(mut self) -> Vec<FileDiff> {
         let mut files = Vec::new();
         while let Some(line) = self.peek() {
-            if line.starts_with("diff --git ") || is_minus_header(line, self.lines.get(self.at + 1).copied()) {
+            if line.starts_with("diff --git ") || is_minus_header(line, self.lines.get(self.at + 1).copied().map(strip_cr)) {
                 files.push(self.file());
             } else {
                 self.at += 1;
@@ -99,7 +120,7 @@ impl<'a> Parser<'a> {
         }
         let mut hunks = Vec::new();
         while let Some(line) = self.peek() {
-            if line.starts_with("diff --git ") || is_minus_header(line, self.lines.get(self.at + 1).copied()) {
+            if line.starts_with("diff --git ") || is_minus_header(line, self.lines.get(self.at + 1).copied().map(strip_cr)) {
                 break;
             }
             match parse_hunk_header(line) {
@@ -116,7 +137,7 @@ impl<'a> Parser<'a> {
     fn hunk_body(&mut self, mut hunk: Hunk) -> Hunk {
         let (mut old_left, mut new_left) = (hunk.old_count, hunk.new_count);
         let (mut old_line, mut new_line) = (hunk.old_start, hunk.new_start);
-        while let Some(line) = self.peek() {
+        while let Some(line) = self.peek_raw() {
             if line.starts_with('\\') {
                 if let Some(last) = hunk.lines.last_mut() {
                     last.no_newline_at_eof = true;
@@ -132,7 +153,7 @@ impl<'a> Parser<'a> {
                 Some(b'-') if old_left > 0 => (LineKind::Deletion, &line[1..]),
                 Some(b' ') if old_left > 0 && new_left > 0 => (LineKind::Context, &line[1..]),
                 // Some tools strip the space from blank context lines.
-                None if old_left > 0 && new_left > 0 => (LineKind::Context, ""),
+                None | Some(b'\r') if old_left > 0 && new_left > 0 => (LineKind::Context, ""),
                 _ => break,
             };
             let (old, new) = match kind {

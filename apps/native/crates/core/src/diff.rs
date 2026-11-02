@@ -13,11 +13,11 @@ mod tree;
 use std::sync::Arc;
 
 pub use parse::parse_patch;
-pub use rows::{DiffRow, Layout, build_rows, separator_label};
+pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{
     CheckpointFile, method, DiffPreviewSource, DiffScope, DiffSelection, FileTotals, PreviewSourceKind,
     TurnDiffSummary, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
-    diff_preview_request, turn_diff_summaries,
+    diff_preview_request, preview_is_repository, turn_diff_summaries, workspace_mutation_id,
 };
 pub use tree::{TreeRow, TreeRowKind, file_tree_rows};
 
