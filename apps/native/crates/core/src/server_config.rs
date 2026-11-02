@@ -511,6 +511,10 @@ pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub settled_worktree_cleanup: Option<bool>,
     #[serde(default)]
+    pub database_storage: Option<bool>,
+    #[serde(default)]
+    pub otlp_endpoint_check: Option<bool>,
+    #[serde(default)]
     pub one_time_schedules: Option<bool>,
     /// The server hosts headless Chromium tabs streamed over `/api/preview-stream`.
     #[serde(default)]
@@ -653,6 +657,12 @@ pub struct ServerSettings {
     pub worktrees: crate::settings::worktrees::WorktreeSettings,
     #[serde(flatten)]
     pub source_control: crate::settings::source_control::SourceControlSettings,
+    #[serde(flatten)]
+    pub maintenance: crate::settings::maintenance::MaintenanceSettings,
+    #[serde(default, deserialize_with = "lenient")]
+    pub secret_providers: crate::settings::secrets::SecretProviders,
+    #[serde(default, deserialize_with = "lenient")]
+    pub observability: crate::settings::diagnostics::ObservabilitySettings,
 }
 
 /// `providerInstances` in the server's order, which is the order the provider settings list
@@ -732,6 +742,12 @@ pub struct ServerConfig {
     /// servers without scratch projects.
     #[serde(default)]
     pub scratch_workspace_root: Option<String>,
+    /// What the server runs with: its logs folder and OTLP exports (Settings → Diagnostics).
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub observability: Option<crate::settings::diagnostics::ServerObservability>,
+    /// Settings patches may carry `secretProviders`.
+    #[serde(default)]
+    pub secret_provider_settings: Option<bool>,
 }
 
 impl ServerConfig {

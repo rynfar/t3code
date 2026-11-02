@@ -660,13 +660,17 @@ pub fn group(rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
 pub struct Row {
     id: SharedString,
     title: SharedString,
+    title_icon: Option<Icon>,
+    title_tooltip: Option<SharedString>,
     description: Option<SharedString>,
+    description_content: Option<AnyElement>,
     status: Option<SharedString>,
     control: Option<AnyElement>,
     reset: Option<ClickHandler>,
     reset_tooltip: Option<SharedString>,
     below: Option<AnyElement>,
     highlighted: bool,
+    unavailable: Option<SharedString>,
 }
 
 impl Row {
@@ -674,14 +678,43 @@ impl Row {
         Row {
             id: id.into(),
             title: title.into(),
+            title_icon: None,
+            title_tooltip: None,
             description: None,
+            description_content: None,
             status: None,
             control: None,
             reset: None,
             reset_tooltip: None,
             below: None,
             highlighted: false,
+            unavailable: None,
         }
+    }
+
+    /// `SettingsRow`'s inert control: dimmed, unclickable, and saying why on hover (a grant this
+    /// connection lacks). The reset button hides too.
+    pub fn unavailable(mut self, message: Option<impl Into<SharedString>>) -> Self {
+        self.unavailable = message.map(Into::into);
+        self
+    }
+
+    /// A mark before the title, such as a secret provider's brand (18px, `foreground` at 80%).
+    pub fn title_icon(mut self, icon: Icon) -> Self {
+        self.title_icon = Some(icon);
+        self
+    }
+
+    /// `PolicyTooltip`: an info button after the title that explains the setting on hover.
+    pub fn title_tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.title_tooltip = Some(text.into());
+        self
+    }
+
+    /// A description with its own parts, in the description's place and type.
+    pub fn description_content(mut self, content: impl IntoElement) -> Self {
+        self.description_content = Some(content.into_any_element());
+        self
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
@@ -732,7 +765,8 @@ impl RenderOnce for Row {
         let stacked = ModalLayout::of(window).rows_stacked;
         let has_below = self.below.is_some();
         let reset_tooltip = self.reset_tooltip.unwrap_or_else(|| "Reset to default".into());
-        let reset = self.reset.map(|handler| {
+        let unavailable = self.unavailable;
+        let reset = self.reset.filter(|_| unavailable.is_none()).map(|handler| {
             Button::new(ElementId::Name(format!("{}-reset", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                 .icon(Icon::Undo2)
                 .tooltip(reset_tooltip)
@@ -759,19 +793,36 @@ impl RenderOnce for Row {
                                 h_flex()
                                     .min_h(r(20.))
                                     .gap(r(6.))
-                                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.title))
+                                    .children(self.title_icon.map(|glyph| icon(glyph, 18., hsla(p.foreground).opacity(0.8))))
+                                    .child(div().min_w_0().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.title))
+                                    .children(self.title_tooltip.map(|text| {
+                                        Button::new(ElementId::Name(format!("{}-details", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                                            .icon(Icon::Info)
+                                            .tooltip(text)
+                                    }))
                                     .child(div().size(r(20.)).flex().items_center().justify_center().children(reset)),
                             )
-                            .children(self.description.map(|description| {
+                            .children(self.description.map(|description| description.into_any_element()).or(self.description_content).map(|description| {
                                 div().max_w(r(672.)).text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description)
                             }))
                             .children(self.status.map(|status| div().pt(r(2.)).text_xs().text_color(hsla(p.muted_foreground)).child(status))),
                     )
                     .children(self.control.map(|control| {
+                        let id = self.id.clone();
                         h_flex()
                             .gap(r(8.))
                             .map(|this| if stacked { this.w_full().min_w_0() } else { this.flex_none().max_w(r(420.)).justify_end() })
-                            .child(control)
+                            .map(|this| match unavailable {
+                                Some(message) => this.child(
+                                    div()
+                                        .id(ElementId::Name(format!("{id}-unavailable").into()))
+                                        .relative()
+                                        .child(div().opacity(0.5).child(control))
+                                        .child(div().absolute().inset_0().occlude())
+                                        .tooltip(tooltip(message)),
+                                ),
+                                None => this.child(control),
+                            })
                     })),
             )
             .children(self.below)
@@ -805,6 +856,150 @@ impl ModalLayout {
         let row_content = block - 2. - 32. * rem;
         ModalLayout { full_bleed, inset: r(inset), nav_compact, rows_stacked: row_content < 512. * rem }
     }
+}
+
+/// `InlineButton`'s tones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineTone {
+    Muted,
+    Destructive,
+}
+
+/// `InlineButton`: text-sized, 500 weight, underlined on hover; dimmed to 64% when disabled.
+#[derive(IntoElement)]
+pub struct InlineButton {
+    id: ElementId,
+    label: SharedString,
+    tone: InlineTone,
+    tooltip: Option<SharedString>,
+    disabled: bool,
+    on_click: Option<ClickHandler>,
+}
+
+impl InlineButton {
+    pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>, tone: InlineTone) -> Self {
+        InlineButton { id: id.into(), label: label.into(), tone, tooltip: None, disabled: false, on_click: None }
+    }
+
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_click = Some(Rc::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for InlineButton {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let (text, hover) = match self.tone {
+            InlineTone::Muted => (hsla(p.muted_foreground), hsla(p.foreground)),
+            InlineTone::Destructive => (hsla(p.destructive_foreground), hsla(p.destructive_foreground)),
+        };
+        div()
+            .id(self.id)
+            .flex_none()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(text)
+            .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
+            .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.text_color(hover).underline()))
+            .child(self.label)
+            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
+            .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
+                this.on_click(move |event, window, cx| {
+                    cx.stop_propagation();
+                    handler(event, window, cx)
+                })
+            })
+    }
+}
+
+/// A dialog over the settings modal (design system §6.4): backdrop, dialog glass, a header with
+/// title and description, a scrolling panel and a footer. A click on the backdrop dismisses;
+/// Escape reaches `SettingsView::on_close`, which closes the open dialog first.
+pub struct DialogFrame {
+    pub id: &'static str,
+    pub title: SharedString,
+    pub description: SharedString,
+    pub max_width: f32,
+    pub body: AnyElement,
+    pub footer: AnyElement,
+    pub focus: FocusHandle,
+}
+
+impl DialogFrame {
+    pub fn render(self, window: &Window, on_dismiss: impl Fn(&mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
+        let p = palette(cx);
+        let dark = cx.theme().is_dark();
+        let viewport = window.viewport_size();
+        let dialog = v_flex()
+            .id(self.id)
+            .track_focus(&self.focus)
+            .occlude()
+            .relative()
+            .w_full()
+            .max_w(r(self.max_width))
+            .max_h(viewport.height - px(32.))
+            .rounded(r(16.))
+            .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+            .shadow(vec![BoxShadow {
+                color: gpui::black().opacity(if dark { 0.9 } else { 0.65 }),
+                offset: point(px(0.), px(24.)),
+                blur_radius: px(64.),
+                spread_radius: px(-24.),
+                inset: false,
+            }])
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                v_flex()
+                    .p(r(24.))
+                    .gap(r(8.))
+                    .child(div().text_xl().line_height(r(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(self.title))
+                    .when(!self.description.is_empty(), |this| this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(self.description))),
+            )
+            .child(div().id(ElementId::Name(format!("{}-panel", self.id).into())).flex_1().min_h_0().overflow_y_scroll().px(r(24.)).pt(r(4.)).pb(r(24.)).child(self.body))
+            .child(self.footer);
+        gpui::deferred(
+            gpui::anchored().position_mode(gpui::AnchoredPositionMode::Window).position(point(px(0.), px(0.))).child(
+                div()
+                    .id(ElementId::Name(format!("{}-backdrop", self.id).into()))
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(16.))
+                    .bg(hsla(p.dialog_backdrop))
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| on_dismiss(window, cx))
+                    .child(dialog),
+            ),
+        )
+        .with_priority(3)
+        .into_any_element()
+    }
+}
+
+/// The dialog footer: end-aligned buttons, 16 / 24 padding, a top border over `muted` at 72%
+/// (`bare` drops the border and fill).
+pub fn dialog_footer(bare: bool, buttons: Vec<AnyElement>, cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    h_flex()
+        .justify_end()
+        .gap(r(8.))
+        .px(r(24.))
+        .py(r(16.))
+        .when(!bare, |this| this.border_t_1().border_color(hsla(p.border)).rounded_b(r(15.)).bg(hsla(p.muted).opacity(0.72)))
+        .children(buttons)
 }
 
 /// A row's muted plain-text stand-in for a control ("No providers available").

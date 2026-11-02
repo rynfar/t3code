@@ -6,13 +6,16 @@
 
 pub mod access;
 pub mod archive;
+pub mod diagnostics;
 pub mod keybindings;
+pub mod maintenance;
 pub mod project_actions;
 pub mod projects;
 pub mod providers;
 pub mod quit_hold;
 pub mod search;
 pub mod scheduled_tasks;
+pub mod secrets;
 pub mod snooze;
 pub mod source_control;
 pub mod worktrees;

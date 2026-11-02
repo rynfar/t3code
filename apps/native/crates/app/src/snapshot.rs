@@ -99,6 +99,7 @@ fn section(name: &str) -> Option<Section> {
     NAV_GROUPS
         .iter()
         .flat_map(|(_, sections)| sections.iter().copied())
+        .chain([Section::Diagnostics])
         .find(|section| format!("{section:?}").to_lowercase() == name || section.label().to_lowercase().starts_with(&name))
 }
 
@@ -183,8 +184,19 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     if let Some(name) = &options.settings {
         // `projects:<project id>` opens a project's page; `:add-action` opens its action editor.
         let (name, project) = name.split_once(':').map_or((name.as_str(), None), |(name, project)| (name, Some(project)));
-        let section = section(name).ok_or_else(|| format!("unknown settings section {name:?}"))?;
+        // A settings search result's id lands on its row, scrolled into view.
+        let row = section(name).is_none().then(|| name.to_owned());
+        if let Some(id) = &row
+            && !t3_core::settings::search::items(t3_core::settings::search::Features { secrets: true }).iter().any(|item| &item.id == id)
+        {
+            return Err(format!("unknown settings section or row {name:?}"));
+        }
+        let section = section(name).unwrap_or(Section::General);
         match project {
+            _ if row.is_some() => {
+                let id = row.unwrap_or_default();
+                cx.update(|cx| crate::settings::open_setting(&id, cx));
+            }
             Some(project) => {
                 let (project, add_action) = project.strip_suffix(":add-action").map_or((project, false), |project| (project, true));
                 cx.update(|cx| crate::settings::open_project(project, cx));

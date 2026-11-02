@@ -130,7 +130,7 @@ fn qr_element(matrix: Rc<QrMatrix>) -> AnyElement {
 }
 
 impl SettingsView {
-    fn session(&self, cx: &App) -> Option<AuthSessionState> {
+    pub(super) fn session(&self, cx: &App) -> Option<AuthSessionState> {
         let handle = self.state.read(cx).client_handle()?;
         handle.session_state().borrow().clone()
     }

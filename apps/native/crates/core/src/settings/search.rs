@@ -1,7 +1,8 @@
 //! Settings sections, their sidebar order, and settings search: `SETTINGS_SECTION_LABELS`,
 //! `SETTINGS_NAV_GROUPS`, `SETTINGS_SEARCH_ITEMS` and `searchSettings` from
 //! `web/src/components/settings/settingsSearch.ts`. Only the entries for rows the native app
-//! renders are listed, so a result never lands on a page without its row.
+//! renders are listed, so a result never lands on a page without its row. Secrets ships behind
+//! `T3CODE_FEATURE_SECRETS`, as `isSecretsFeatureEnabled` gates it on the web.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
@@ -26,6 +27,8 @@ pub enum Section {
     Labs,
     About,
     Archived,
+    /// A detail page Maintenance links to; the nav highlights Maintenance while it is open.
+    Diagnostics,
 }
 
 impl Section {
@@ -52,12 +55,22 @@ impl Section {
             Section::Labs => "Labs",
             Section::About => "About",
             Section::Archived => "Archive",
+            Section::Diagnostics => "Diagnostics",
+        }
+    }
+
+    /// `SETTINGS_DETAIL_PAGE_PARENTS`: the nav entry a detail page highlights.
+    pub fn nav_parent(self) -> Section {
+        match self {
+            Section::Diagnostics => Section::Maintenance,
+            section => section,
         }
     }
 
     /// Sections the native app renders. The rest stay out of the sidebar until they port.
-    pub fn is_available(self) -> bool {
-        matches!(
+    pub fn is_available(self, features: Features) -> bool {
+        (self == Section::Secrets && features.secrets)
+            || matches!(
             self,
             Section::General
                 | Section::Appearance
@@ -71,10 +84,25 @@ impl Section {
                 | Section::Worktrees
                 | Section::Connections
                 | Section::Access
+                | Section::Maintenance
                 | Section::Labs
                 | Section::About
                 | Section::Archived
-        )
+                | Section::Diagnostics
+            )
+    }
+}
+
+/// Build-time features the web reads from its environment, read by the native app at launch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Features {
+    pub secrets: bool,
+}
+
+impl Features {
+    /// `isSecretsFeatureEnabled`: `T3CODE_FEATURE_SECRETS` set to `1` or `true`.
+    pub fn from_secrets_flag(value: Option<&str>) -> Features {
+        Features { secrets: value.is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true")) }
     }
 }
 
@@ -88,10 +116,10 @@ pub const NAV_GROUPS: &[(Option<&str>, &[Section])] = &[
 ];
 
 /// The sidebar the native app shows: available sections, groups left empty dropped.
-pub fn nav_groups() -> Vec<(Option<&'static str>, Vec<Section>)> {
+pub fn nav_groups(features: Features) -> Vec<(Option<&'static str>, Vec<Section>)> {
     NAV_GROUPS
         .iter()
-        .map(|(heading, sections)| (*heading, sections.iter().copied().filter(|section| section.is_available()).collect::<Vec<_>>()))
+        .map(|(heading, sections)| (*heading, sections.iter().copied().filter(|section| section.is_available(features)).collect::<Vec<_>>()))
         .filter(|(_, sections)| !sections.is_empty())
         .collect()
 }
@@ -132,13 +160,15 @@ impl SearchItem {
 }
 
 /// `SETTINGS_SEARCH_ITEMS` for the rows the native panels render, in the web's order.
-pub fn items() -> Vec<SearchItem> {
+pub fn items(features: Features) -> Vec<SearchItem> {
     use Section::*;
-    vec![
+    let mut items = vec![
         SearchItem::new("storage-worktree-keep-when", "Keep worktrees with local changes", Worktrees, &["any local files uncommitted changes edited tracked files ignored env build output cleanup"])
             .target("storage-worktrees"),
+        SearchItem::new("storage-delete-now", "Delete now", Maintenance, &["storage cleanup run now results report removed kept failed"]),
         SearchItem::new("storage-worktrees", "Worktree cleanup", Worktrees, &["disk storage automatic delete deleted archived threads old inactive merged settled unchanged worktrees retention days project inherit off custom"]),
         SearchItem::new("storage-worktrees-location", "Worktree location", Worktrees, &["worktree location folder directory path drive external disk"]),
+        SearchItem::new("storage-artifacts", "Artifacts and logs", Maintenance, &["disk storage delete old browser artifacts screenshots captures rotated logs cleanup retention"]),
         SearchItem::new("project-defaults", "Project defaults and overrides", Threads, &["model workspace environments projects inheritance checkout"]),
         SearchItem::new("project-overview", "Project overview", Projects, &["name icon emoji image checkout remove delete"]),
         SearchItem::new("default-model", "Default model", Threads, &["new thread project provider reasoning effort"]),
@@ -167,6 +197,9 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("response-streaming", "Response streaming", Threads, &["output token paragraph buffered wait turn legacy"]),
         SearchItem::new("send-shortcut", "Send shortcut", Chat, &["enter return command ctrl multiline prompt new line composer"]),
         SearchItem::new("follow-up-behavior", "Follow-up behavior", Chat, &["queue steer running turn send default behavior composer"]),
+        SearchItem::new("provider-update-checks", "Provider update checks", Maintenance, &["installed cli versions newer available codex claude cursor grok fx opencode"]),
+        SearchItem::new("continue-threads-after-server-update", "Continue threads after restarts", Maintenance, &["resume running active interrupted work restart reboot machine crash desktop update automatically"]),
+        SearchItem::new("background-activity", "Background activity", Maintenance, &["balanced performance battery saver advanced git fetch provider health refresh host power monitor idle policy"]),
         SearchItem::new("new-threads", "New threads", Threads, &["default workspace mode draft local worktree"]),
         SearchItem::new("worktree-submodules", "Submodules", Worktrees, &["git submodule init recursive top-level none worktree t3.json"]),
         SearchItem::new("start-from-origin", "Start from remote", Worktrees, &["new worktrees start remote origin latest fetched branch local"]),
@@ -176,6 +209,8 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("delete-confirmation", "Delete confirmation", General, &["ask before thread chat history"]),
         SearchItem::new("quit-confirmation", "Quit shortcut", General, &["confirmation desktop app exit direct hold double click press twice"]),
         SearchItem::new("app-version", "Version", About, &["about check for updates download install upgrade release"]),
+        SearchItem::new("telemetry-export", "OpenTelemetry export", Diagnostics, &["OTel OTLP telemetry export endpoints logs traces metrics Grafana"]),
+        SearchItem::new("diagnostics", "Diagnostics", Maintenance, &["logs traces processes resource history failures spans cpu memory"]),
         SearchItem::new("legacy-plan-mode", "Plan mode (legacy)", Labs, &["build plan composer old"]),
         SearchItem::new("legacy-context-window-indicator", "Context window indicator (legacy)", Labs, &["composer meter usage tokens circle old"]),
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
@@ -185,6 +220,7 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("remove-agent-credits-on-merge", "Remove agent credits when merging", SourceControl, &["pull request GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"]),
         SearchItem::new("pull-request-merge-method", "Default merge method", SourceControl, &["pull request merge squash rebase last selected"]),
         SearchItem::new("source-control", "Source control", SourceControl, &["version control git GitHub ghes enterprise GitLab GitCafe Forgejo gitea tea codeberg Bitbucket Azure DevOps hosting integrations credentials scan server environment"]),
+        SearchItem::new("git-fetch-interval", "Git fetch interval", Maintenance, &["automatic remote branch refresh background credentials security keys seconds off"]).target("background-activity"),
         SearchItem::new("worktree-branch-naming", "Worktree branch naming", Worktrees, &["static semantic prefix custom prompt instructions feat fix refactor chore"]),
         SearchItem::new("source-control-writing-style", "Source control writing style", SourceControl, &["repository conventions conventional commits custom instructions change descriptions request titles"]),
         SearchItem::new("follow-change-request-templates", "Follow change request templates", SourceControl, &["repository pr pull request description structure"]),
@@ -195,8 +231,12 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("project-actions", "Actions", Projects, &["commands scripts setup run dev server checkout worktree t3.json import"]),
         SearchItem::new("connections-environment", "This machine", Access, &["connections server backend local remote access administrative permissions scope pairing links qr code authorized clients sessions revoke endpoint"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
+        SearchItem::new("secret-providers", "Secret providers", Secrets, &["1password vault credentials api key"]),
+        SearchItem::new("secret-providers-add", "Add secret provider", Secrets, &["new 1password vault op cli account"]).target("secret-providers"),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),
-    ]
+    ];
+    items.retain(|item| item.section.is_available(features));
+    items
 }
 
 /// `KEYBINDING_SEARCH_ITEMS`, from the commands the environment's keymap binds.
