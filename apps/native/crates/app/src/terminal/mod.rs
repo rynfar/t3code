@@ -19,6 +19,7 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 
 pub use drawer::TerminalDrawer;
+pub use element::{set_typography, typography};
 
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -31,7 +32,6 @@ actions!(
 const CONTEXT: &str = "Terminal";
 
 pub fn init(cx: &mut App) {
-    element::set_typography(element::load_typography(), cx);
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),

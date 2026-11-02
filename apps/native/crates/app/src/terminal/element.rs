@@ -38,14 +38,11 @@ pub struct TerminalFont(pub TerminalTypography);
 
 impl Global for TerminalFont {}
 
-pub fn load_typography() -> TerminalTypography {
-    let settings = store::load_client_settings()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
+/// The terminal typography the client settings ask for.
+pub fn typography(settings: &serde_json::Map<String, serde_json::Value>) -> TerminalTypography {
     let advanced = store::load_ui_state(TYPOGRAPHY_ADVANCED).and_then(|value| value.as_bool()).unwrap_or(false);
     TerminalTypography::resolve(
-        &settings,
+        settings,
         advanced,
         FontSizeRange {
             default: metrics::DEFAULT_CODE_FONT_SIZE,
@@ -68,11 +65,14 @@ pub fn set_typography(typography: TerminalTypography, cx: &mut App) {
 }
 
 fn terminal_font(cx: &App) -> (Font, f32) {
-    let typography = &cx.global::<TerminalFont>().0;
-    let family = typography.family.clone().map_or_else(|| cx.theme().mono_font_family.clone(), SharedString::from);
+    let (family, size) = match cx.try_global::<TerminalFont>() {
+        Some(TerminalFont(typography)) => (typography.family.clone(), typography.size),
+        None => (None, metrics::DEFAULT_CODE_FONT_SIZE),
+    };
+    let family = family.map_or_else(|| cx.theme().mono_font_family.clone(), SharedString::from);
     let mut font = gpui::font(family);
     font.features = FontFeatures(std::sync::Arc::new(vec![("liga".into(), 0), ("calt".into(), 0), ("dlig".into(), 0)]));
-    (font, typography.size)
+    (font, size)
 }
 
 /// A shaped row: its segments and the grid column each starts at.
