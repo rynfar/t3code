@@ -1,12 +1,17 @@
 mod app_state;
 mod composer;
 mod connect;
+mod context_menu;
+mod dialog;
 mod icons;
+mod keymap;
 mod menus;
 mod new_thread;
+mod palette;
 mod sidebar;
 mod theme;
 mod thread_view;
+mod toast;
 mod transcript;
 mod workspace;
 
@@ -39,6 +44,7 @@ fn main() {
         gpui_component::init(cx);
         theme::init(cx);
         composer::init(cx);
+        keymap::init(cx);
         let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
         menus::init(state.clone(), cx);
         new_thread::init(state.clone(), cx);

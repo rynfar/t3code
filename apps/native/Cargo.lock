@@ -6440,6 +6440,7 @@ dependencies = [
  "gpui-component",
  "gpui_platform",
  "gpui_tokio",
+ "libc",
  "mimalloc",
  "serde_json",
  "t3-client",
