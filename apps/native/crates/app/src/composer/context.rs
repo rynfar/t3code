@@ -140,7 +140,7 @@ impl Composer {
     }
 
     /// Closes an open details popover; whether one was open. Escape does this from the prompt
-    /// and from the chip.
+    /// and from anything in the chip row.
     pub(super) fn close_context_details(&mut self, cx: &mut Context<Self>) -> bool {
         let closed = self.context.open.take().is_some();
         if closed {
@@ -219,10 +219,17 @@ impl Composer {
         }
         Some(
             h_flex()
+                .id("context-chips")
                 .flex_wrap()
                 .gap_x(px(12.))
                 .gap_y(px(4.))
                 .mb(px(8.))
+                // Escape from a focused chip or its X; the prompt's Escape action covers the rest.
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" && this.close_context_details(cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .children(chips.into_iter().map(|chip| self.render_chip(chip, cx)))
                 .into_any_element(),
         )
@@ -243,11 +250,6 @@ impl Composer {
                         }
                         this.context.open = if this.context.open.as_deref() == Some(toggle_id.as_str()) { None } else { Some(toggle_id.clone()) };
                         cx.notify();
-                    }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "escape" && this.close_context_details(cx) {
-                            cx.stop_propagation();
-                        }
                     }));
                 div()
                     .relative()
