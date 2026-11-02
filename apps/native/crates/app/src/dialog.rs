@@ -18,7 +18,7 @@ impl Global for Host {}
 
 /// Asks before running `on_confirm`, from code that has no window at hand. Without a dialog
 /// nothing runs: a confirmation that cannot be shown is a "no".
-fn ask(
+pub(crate) fn ask(
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     confirm_label: impl Into<SharedString>,

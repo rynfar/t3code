@@ -1,9 +1,9 @@
 //! Project favicons for sidebar rows (`ProjectFavicon.tsx`, `client-runtime/src/state/assets.ts`
 //! `createProjectFaviconUrlAtomFamily`). Each project's icon is minted and downloaded once per
-//! session on the network runtime and held in the bounded `FaviconCache`; GPUI decodes the bytes
-//! once and caches the texture.
+//! session and chosen image (`faviconPath`, which the server resolves) on the network runtime and
+//! held in the bounded `FaviconCache`; GPUI decodes the bytes once and caches the texture.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{Context, Image, ImageFormat};
@@ -17,7 +17,9 @@ pub struct FaviconStore {
     cache: FaviconCache,
     /// Project id to its cache key and decoded image, kept only while the cache holds the key.
     images: HashMap<String, (String, Arc<Image>)>,
-    requested: HashSet<String>,
+    /// Project id to the `faviconPath` its icon was asked for with, so choosing another image
+    /// fetches again.
+    requested: HashMap<String, Option<String>>,
 }
 
 impl FaviconStore {
@@ -41,18 +43,19 @@ fn image_format(format: FaviconFormat) -> ImageFormat {
 
 
 impl AppState {
-    /// Starts a fetch for every listed project not asked about yet this session.
+    /// Starts a fetch for every listed project not asked about yet this session, or whose chosen
+    /// image changed since.
     pub(crate) fn ensure_favicons(&mut self, cx: &mut Context<Self>) {
         let (Some(snapshot), Some(client)) = (self.shell.snapshot.as_ref(), self.client_handle()) else { return };
-        let wanted: Vec<(String, String)> = snapshot
+        let wanted: Vec<(String, String, Option<String>)> = snapshot
             .projects
             .iter()
-            .filter(|project| !self.sidebar.favicons.requested.contains(&project.id))
-            .map(|project| (project.id.clone(), project.workspace_root.clone()))
+            .filter(|project| self.sidebar.favicons.requested.get(&project.id) != Some(&project.favicon_path))
+            .map(|project| (project.id.clone(), project.workspace_root.clone(), project.favicon_path.clone()))
             .collect();
-        for (project_id, cwd) in wanted {
-            self.sidebar.favicons.requested.insert(project_id.clone());
-            let key = project_favicon_resource_key(ENVIRONMENT_ID, &cwd, None);
+        for (project_id, cwd, favicon_path) in wanted {
+            let key = project_favicon_resource_key(ENVIRONMENT_ID, &cwd, favicon_path.as_deref());
+            self.sidebar.favicons.requested.insert(project_id.clone(), favicon_path);
             let client = client.clone();
             let task = self.runtime().spawn(async move { t3_client::favicon::fetch_project_favicon(&client, &cwd).await });
             cx.spawn(async move |this, cx| {

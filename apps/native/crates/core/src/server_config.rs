@@ -599,6 +599,10 @@ pub struct ProjectSettingsOverrides {
     /// Present-null means no project default; absent inherits the environment's.
     #[serde(default, deserialize_with = "present_nullable")]
     pub pull_request_merge_method: Option<Option<crate::pull_requests::wire::MergeMethod>>,
+    /// The entry as the server sent it. A write replaces the whole entry, so it starts from this
+    /// to keep the keys this client does not read (`keepUnknownOverrideKeys`).
+    #[serde(skip)]
+    pub raw: serde_json::Map<String, Value>,
 }
 
 /// `ServerSettings`: the subset the composer reads. Absent keys take the contract's defaults.
@@ -622,7 +626,7 @@ pub struct ServerSettings {
     pub new_worktrees_start_from_origin: Option<bool>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub fallback_model_selection: Option<ModelSelection>,
-    #[serde(default, deserialize_with = "lenient_map")]
+    #[serde(default, deserialize_with = "overrides_map")]
     pub project_settings_overrides: HashMap<String, ProjectSettingsOverrides>,
     #[serde(default, deserialize_with = "lenient")]
     pub project_settings_folded: bool,
@@ -907,6 +911,19 @@ fn lenient_map<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<H
     Ok(entries
         .into_iter()
         .filter_map(|(key, value)| serde_json::from_value(value).ok().map(|value| (key, value)))
+        .collect())
+}
+
+fn overrides_map<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<String, ProjectSettingsOverrides>, D::Error> {
+    let Value::Object(entries) = Value::deserialize(d)? else { return Ok(HashMap::new()) };
+    Ok(entries
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let Value::Object(raw) = value else { return None };
+            let mut entry: ProjectSettingsOverrides = serde_json::from_value(Value::Object(raw.clone())).ok()?;
+            entry.raw = raw;
+            Some((key, entry))
+        })
         .collect())
 }
 

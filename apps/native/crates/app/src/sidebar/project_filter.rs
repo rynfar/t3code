@@ -1,6 +1,7 @@
 //! The sidebar's project filter (`SidebarProjectScope` in `Sidebar.tsx`): a popover listing
 //! project groups, pinned first; checking groups scopes the thread list to them, All projects
-//! clears it. Right-click opens the project menu; hover shows the pin toggle where supported.
+//! clears it. Right-click opens the project menu; hover shows the pin toggle where supported, and
+//! each row ends in a Project settings button.
 
 use std::collections::HashSet;
 
@@ -109,6 +110,7 @@ impl SidebarPane {
         for group in groups {
             let checked = scope.as_ref().is_some_and(|scope| group.member_project_ids.iter().all(|id| scope.contains(id)));
             let (toggle_group, menu_project, pin_group) = (group.clone(), group.representative_id.clone(), group.clone());
+            let settings_project = group.representative_id.clone();
             rows.push(
                 row(SharedString::from(format!("project-filter-{}", group.key)), checked)
                     .child(div().flex_1().min_w_0().truncate().child(group.label.clone()))
@@ -132,6 +134,24 @@ impl SidebarPane {
                                 }),
                         )
                     })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("project-settings-{}", group.key)))
+                            .flex_none()
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.))
+                            .hover(|this| this.bg(hsla(p.accent)))
+                            .child(Icon::Settings.render(px(14.), hsla(p.muted_foreground)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.project_filter = None;
+                                crate::settings::open_project(&settings_project, cx);
+                                cx.notify();
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_scope(&toggle_group, cx)))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();

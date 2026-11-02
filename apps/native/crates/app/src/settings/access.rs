@@ -136,7 +136,7 @@ impl SettingsView {
     }
 
     /// Whether this connection may `scope`; unknown grants leave the server to decide.
-    fn may(&self, scope: &str, cx: &App) -> bool {
+    pub(super) fn may(&self, scope: &str, cx: &App) -> bool {
         self.session(cx).is_none_or(|session| session.grants(scope))
     }
 

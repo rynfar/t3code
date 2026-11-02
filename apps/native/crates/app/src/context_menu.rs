@@ -87,7 +87,7 @@ impl ContextMenu {
             is_running: !thread.can_archive(),
             supports,
             snooze_presets: &presets,
-            available: Available { new_thread_on_branch: false, custom_snooze: true, project_settings: false },
+            available: Available { new_thread_on_branch: false, custom_snooze: true, project_settings: true },
         });
         let items = items.into_iter().map(|item| item.map(&MenuAction::Thread)).collect();
         self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new() });
@@ -160,6 +160,13 @@ impl ContextMenu {
                 self.state.update(cx, |state, cx| state.clear_thread_selection(cx));
                 cx.emit(ContextMenuEvent::CustomSnooze(open.selection));
             }
+            MenuAction::Thread(ThreadAction::ProjectSettings) => {
+                let project_id = self.state.read(cx).sidebar.model.thread(&open.target_id).map(|thread| thread.project_id.clone());
+                if let Some(project_id) = project_id {
+                    crate::settings::open_project(&project_id, cx);
+                }
+            }
+            MenuAction::Project(ProjectAction::Settings) => crate::settings::open_project(&open.target_id, cx),
             MenuAction::Bulk(action) => self.state.update(cx, |state, cx| state.run_bulk_action(&open.selection, action, &open.presets, cx)),
             MenuAction::Thread(action) => self.state.update(cx, |state, cx| state.run_thread_action(&open.target_id, action, &open.presets, cx)),
             MenuAction::Project(action) => self.state.update(cx, |state, cx| match action {
@@ -167,6 +174,7 @@ impl ContextMenu {
                 ProjectAction::CopyPath => state.copy_project_path(&open.target_id, cx),
                 ProjectAction::Pin => state.set_project_pinned(&open.target_id, true, cx),
                 ProjectAction::Unpin => state.set_project_pinned(&open.target_id, false, cx),
+                ProjectAction::Settings => {}
             }),
         }
     }

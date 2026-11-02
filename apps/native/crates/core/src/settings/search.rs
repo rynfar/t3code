@@ -66,6 +66,7 @@ impl Section {
                 | Section::Providers
                 | Section::Threads
                 | Section::ScheduledTasks
+                | Section::Projects
                 | Section::SourceControl
                 | Section::Worktrees
                 | Section::Connections
@@ -139,6 +140,7 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("storage-worktrees", "Worktree cleanup", Worktrees, &["disk storage automatic delete deleted archived threads old inactive merged settled unchanged worktrees retention days project inherit off custom"]),
         SearchItem::new("storage-worktrees-location", "Worktree location", Worktrees, &["worktree location folder directory path drive external disk"]),
         SearchItem::new("project-defaults", "Project defaults and overrides", Threads, &["model workspace environments projects inheritance checkout"]),
+        SearchItem::new("project-overview", "Project overview", Projects, &["name icon emoji image checkout remove delete"]),
         SearchItem::new("default-model", "Default model", Threads, &["new thread project provider reasoning effort"]),
         SearchItem::new("fallback-model", "Fallback model", Threads, &["fallback agent provider out of usage new threads"]),
         SearchItem::new("default-permissions", "Permissions", Threads, &["new thread default runtime mode supervised approvals auto accept edits full access"]),
@@ -190,6 +192,7 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("review-guides", "Review guides (beta)", SourceControl, &["pull request pr guided review guide tour beta experimental"]),
         SearchItem::new("review-guide-model", "Review guide model", SourceControl, &["pull request pr guided review guide brief maintainer"]).target("review-guides"),
         SearchItem::new("review-guide-instructions", "Review guide instructions", SourceControl, &["pull request pr guided review guide preferences taste prompt custom"]).target("review-guides"),
+        SearchItem::new("project-actions", "Actions", Projects, &["commands scripts setup run dev server checkout worktree t3.json import"]),
         SearchItem::new("connections-environment", "This machine", Access, &["connections server backend local remote access administrative permissions scope pairing links qr code authorized clients sessions revoke endpoint"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),

@@ -22,6 +22,12 @@ pub struct ProjectShell {
     pub pinned_at: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
+    /// A workspace image chosen as the icon; the server serves it as the project favicon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon_path: Option<String>,
+    /// `ProjectIconOverride`, kept raw (`settings::projects::ProjectIcon` reads it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_icon: Option<serde_json::Value>,
     /// `ProjectScript[]`, kept raw: the thread details decode them (`project_scripts`).
     #[serde(default)]
     pub scripts: Vec<serde_json::Value>,

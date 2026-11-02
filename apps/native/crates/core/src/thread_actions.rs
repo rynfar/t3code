@@ -258,9 +258,10 @@ pub enum ProjectAction {
     CopyPath,
     Pin,
     Unpin,
+    Settings,
 }
 
-/// The project menu (`handleProjectFolderContextMenu` in `Sidebar.tsx`), without Project settings.
+/// The project menu (`handleProjectFolderContextMenu` in `Sidebar.tsx`).
 pub fn build_project_menu(pinned: bool, can_pin: bool) -> Vec<MenuItem<ProjectAction>> {
     let mut items = vec![MenuItem::new(ProjectAction::NewThread, "New thread", None), MenuItem::new(ProjectAction::CopyPath, "Copy path", None)];
     if can_pin {
@@ -270,6 +271,7 @@ pub fn build_project_menu(pinned: bool, can_pin: bool) -> Vec<MenuItem<ProjectAc
             MenuItem::new(ProjectAction::Pin, "Pin project", Some("pin"))
         });
     }
+    items.push(MenuItem::new(ProjectAction::Settings, "Project settings", Some("settings")));
     items
 }
 
@@ -710,9 +712,9 @@ mod tests {
     #[test]
     fn project_menu_offers_pin_only_where_the_server_can() {
         let labels = |items: Vec<MenuItem<ProjectAction>>| items.into_iter().map(|item| item.label).collect::<Vec<_>>();
-        assert_eq!(labels(build_project_menu(false, true)), ["New thread", "Copy path", "Pin project"]);
-        assert_eq!(labels(build_project_menu(true, true)), ["New thread", "Copy path", "Unpin project"]);
-        assert_eq!(labels(build_project_menu(true, false)), ["New thread", "Copy path"]);
+        assert_eq!(labels(build_project_menu(false, true)), ["New thread", "Copy path", "Pin project", "Project settings"]);
+        assert_eq!(labels(build_project_menu(true, true)), ["New thread", "Copy path", "Unpin project", "Project settings"]);
+        assert_eq!(labels(build_project_menu(true, false)), ["New thread", "Copy path", "Project settings"]);
     }
 
     #[test]

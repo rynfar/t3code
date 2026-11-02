@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::server_config::ServerSettings;
 use crate::terminal::{self, Grid, LaunchLocation};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptIcon {
     Test,
@@ -27,8 +27,8 @@ pub enum ScriptIcon {
     Play,
 }
 
-/// `ProjectScript`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `ProjectScript`. Every field round-trips, since settings writes send whole script lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectScript {
     pub id: String,
@@ -38,12 +38,19 @@ pub struct ProjectScript {
     pub icon: ScriptIcon,
     #[serde(default)]
     pub run_on_worktree_create: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_on_settle: Option<bool>,
+    /// False holds the agent until a setup script exits.
+    #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+    pub run_async: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_open_preview: Option<bool>,
 }
 
 impl ProjectScript {
-    fn runs_on_settle(&self) -> bool {
+    pub fn runs_on_settle(&self) -> bool {
         self.run_on_settle == Some(true)
     }
 }
@@ -211,7 +218,7 @@ mod tests {
     use super::*;
 
     fn script(id: &str, setup: bool, settle: bool) -> ProjectScript {
-        ProjectScript { id: id.into(), name: id.to_uppercase(), command: format!("run {id}"), icon: ScriptIcon::Play, run_on_worktree_create: setup, run_on_settle: Some(settle) }
+        ProjectScript { id: id.into(), name: id.to_uppercase(), command: format!("run {id}"), run_on_worktree_create: setup, run_on_settle: Some(settle), ..Default::default() }
     }
 
     #[test]

@@ -11,6 +11,8 @@ mod archive;
 pub(crate) mod controls;
 mod general;
 mod keybindings;
+mod project_actions;
+mod projects;
 mod providers;
 mod scheduled_tasks;
 mod source_control;
@@ -38,6 +40,8 @@ struct Host {
     state: Entity<AppState>,
     view: Option<Entity<SettingsView>>,
     pending: Option<(Section, Option<String>)>,
+    /// The project a "Project settings" entry point opens the Projects page on.
+    pending_project: Option<String>,
     /// What had focus when the modal opened, focused again when it closes.
     previous_focus: Option<FocusHandle>,
 }
@@ -48,7 +52,7 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     store::init(cx);
     controls::init(cx);
     providers::init(cx);
-    cx.set_global(Host { state, view: None, pending: None, previous_focus: None });
+    cx.set_global(Host { state, view: None, pending: None, pending_project: None, previous_focus: None });
     cx.on_action(|_: &OpenSettings, cx| open(Section::General, cx));
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
@@ -74,6 +78,29 @@ pub fn open_setting(id: &str, cx: &mut App) {
 fn open_at(section: Section, anchor: Option<String>, cx: &mut App) {
     cx.global_mut::<Host>().pending = Some((section, anchor));
     cx.refresh_windows();
+}
+
+/// Opens Settings → Projects on the project holding `project_id`, from every "Project settings"
+/// entry point (`openProjectSettings` in `Sidebar.tsx`, the command palette).
+pub fn open_project(project_id: &str, cx: &mut App) {
+    cx.global_mut::<Host>().pending_project = Some(project_id.to_owned());
+    open_at(Section::Projects, None, cx);
+}
+
+/// Opens the Add action editor on the shown project (snapshots).
+#[cfg(feature = "snapshot")]
+pub fn open_add_action(cx: &mut App) {
+    if let Some(view) = cx.global::<Host>().view.clone() {
+        view.update(cx, |view, cx| view.queue_add_action(cx));
+        cx.refresh_windows();
+    }
+}
+
+/// Back to the project list once the shown project is removed.
+pub fn show_project_list(cx: &mut App) {
+    if let Some(view) = cx.global::<Host>().view.clone() {
+        view.update(cx, |view, cx| view.select_project(None, cx));
+    }
 }
 
 /// The settings search results the command palette lists (`CommandPalette.tsx`).
@@ -119,17 +146,24 @@ fn finish_close(window: &mut Window, cx: &mut App) {
 /// The modal layer, drawn by the workspace above everything else while settings are open.
 pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     if let Some((section, anchor)) = cx.global_mut::<Host>().pending.take() {
-        match cx.global::<Host>().view.clone() {
-            Some(view) => view.update(cx, |view, cx| view.navigate(section, anchor, cx)),
+        let view = match cx.global::<Host>().view.clone() {
+            Some(view) => {
+                view.update(cx, |view, cx| view.navigate(section, anchor, cx));
+                view
+            }
             None => {
                 let state = cx.global::<Host>().state.clone();
                 let previous = window.focused(cx);
                 let view = cx.new(|cx| SettingsView::new(state, section, anchor, window, cx));
                 view.read(cx).focus.clone().focus(window, cx);
                 let host = cx.global_mut::<Host>();
-                host.view = Some(view);
+                host.view = Some(view.clone());
                 host.previous_focus = previous;
+                view
             }
+        };
+        if let Some(project_id) = cx.global_mut::<Host>().pending_project.take() {
+            view.update(cx, |view, cx| view.select_project_id(&project_id, cx));
         }
     }
     let view = cx.global::<Host>().view.clone()?;
@@ -208,6 +242,7 @@ pub struct SettingsView {
     pub(crate) source_control: source_control::SourceControlState,
     pub(crate) scheduled: scheduled_tasks::ScheduledTasksState,
     pub(crate) access: access::AccessPageState,
+    pub(crate) projects: projects::ProjectsState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -253,6 +288,7 @@ impl SettingsView {
             source_control: source_control::SourceControlState::new(window, cx),
             scheduled: scheduled_tasks::ScheduledTasksState::new(window, cx),
             access: access::AccessPageState::new(window, cx),
+            projects: projects::ProjectsState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -295,6 +331,9 @@ impl SettingsView {
         if section != Section::Access {
             self.access.close();
         }
+        if section != Section::Projects {
+            self.projects.actions.close();
+        }
         cx.notify();
     }
 
@@ -334,6 +373,11 @@ impl SettingsView {
         if self.dismiss_keybinding_overlay(window, cx) {
             return;
         }
+        if self.projects.actions.dismiss() {
+            self.focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
         if !self.query(cx).trim().is_empty() {
             self.clear_search(window, cx);
             cx.notify();
@@ -349,6 +393,7 @@ impl SettingsView {
         self.commit_focused_provider_field(window, cx);
         self.commit_focused_worktree_field(window, cx);
         self.commit_focused_source_control_field(window, cx);
+        self.commit_focused_project_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -435,9 +480,13 @@ impl SettingsView {
             .chain(self.providers.inputs())
             .chain(self.worktrees.inputs())
             .chain(self.scheduled.inputs())
-            .chain([&self.access.label])
+            .chain([&self.access.label, &self.projects.name])
+            .chain(self.projects.actions.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
-            || [&self.worktrees.instructions, self.scheduled.textarea()].into_iter().chain(self.source_control.textareas()).any(|input| input.focus_handle(cx).is_focused(window))
+            || [&self.worktrees.instructions, self.scheduled.textarea(), &self.projects.actions.command]
+                .into_iter()
+                .chain(self.source_control.textareas())
+                .any(|input| input.focus_handle(cx).is_focused(window))
     }
 
     fn render_nav(&self, layout: ModalLayout, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -647,6 +696,7 @@ impl SettingsView {
             Section::Worktrees => self.worktrees_page(window, cx),
             Section::SourceControl => self.source_control_page(window, cx),
             Section::ScheduledTasks => self.scheduled_tasks_page(cx),
+            Section::Projects => self.projects_page(window, cx),
             Section::Access => self.access_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
@@ -669,6 +719,7 @@ fn section_icon(section: Section) -> Icon {
         Section::Providers => Icon::Bot,
         Section::Threads => Icon::MessagesSquare,
         Section::ScheduledTasks => Icon::CalendarClock,
+        Section::Projects => Icon::PanelsTopLeft,
         Section::SourceControl => Icon::GitBranch,
         Section::Worktrees => Icon::FolderTree,
         Section::Access => Icon::ShieldCheck,
@@ -685,7 +736,11 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = ModalLayout::of(window);
         let blocks = self.render_page(window, cx);
-        let archive_list = if self.section == Section::Archived { self.archive_list(self.scroll_to_target, cx) } else { None };
+        let archive_list = match self.section {
+            Section::Archived => self.archive_list(self.scroll_to_target, cx),
+            Section::Projects => self.project_list_view(cx),
+            _ => None,
+        };
         if self.scroll_to_target {
             self.scroll_to_target = false;
             if let Some(index) = self.target.as_deref().and_then(|target| blocks.iter().position(|block| block.anchors.iter().any(|anchor| anchor.as_ref() == target))) {
@@ -725,6 +780,7 @@ impl Render for SettingsView {
                 .children(blocks.into_iter().map(|block| div().w_full().max_w(r(896.)).px(r(24.)).child(block.element)))
                 .into_any_element(),
         };
+        let action_editor = self.action_editor_overlay(window, cx);
         h_flex()
             .relative()
             .size_full()
@@ -737,5 +793,6 @@ impl Render for SettingsView {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_nav(layout, window, cx))
             .child(v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(content))
+            .children(action_editor)
     }
 }

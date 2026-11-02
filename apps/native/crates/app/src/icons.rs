@@ -134,6 +134,7 @@ icons! {
     Palette => "icons/lucide/palette.svg",
     PanelLeft => "icons/lucide/panel-left.svg",
     PanelRight => "icons/lucide/panel-right.svg",
+    PanelsTopLeft => "icons/lucide/panels-top-left.svg",
     Paperclip => "icons/lucide/paperclip.svg",
     PenLine => "icons/lucide/pen-line.svg",
     Pencil => "icons/lucide/pencil.svg",

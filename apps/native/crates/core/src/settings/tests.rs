@@ -268,6 +268,7 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
             Section::Providers,
             Section::Threads,
             Section::ScheduledTasks,
+            Section::Projects,
             Section::SourceControl,
             Section::Worktrees,
             Section::Connections,

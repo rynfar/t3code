@@ -71,9 +71,10 @@ impl ThreadsState {
     }
 }
 
-/// The models a default-model select offers: every selectable provider instance, grouped.
-pub(super) fn model_options(config: &ServerConfig) -> Vec<SelectOption> {
-    providers::entries(config, None)
+/// The models a default-model select offers: every selectable provider instance, grouped. A
+/// project leaves out the instances it turned off.
+pub(super) fn model_options(config: &ServerConfig, project_id: Option<&str>) -> Vec<SelectOption> {
+    providers::entries(config, project_id)
         .into_iter()
         .filter(|entry| entry.enabled && entry.provider.is_available())
         .flat_map(|entry| {
@@ -176,7 +177,7 @@ impl SettingsView {
             cx,
         );
 
-        let options = model_options(&config);
+        let options = model_options(&config, None);
         let selection = settings
             .default_model_selection
             .clone()
@@ -677,7 +678,7 @@ impl SettingsView {
     }
 }
 
-fn env_mode_value(mode: ThreadEnvMode) -> &'static str {
+pub(super) fn env_mode_value(mode: ThreadEnvMode) -> &'static str {
     match mode {
         ThreadEnvMode::Local => "local",
         ThreadEnvMode::Worktree => "worktree",
