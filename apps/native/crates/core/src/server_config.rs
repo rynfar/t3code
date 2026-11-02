@@ -393,6 +393,9 @@ pub struct ProjectSettingsOverrides {
     pub provider_instances: HashMap<String, ProjectInstanceOverride>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub default_project_scripts: Option<Vec<ProjectScript>>,
+    /// Present-null means no project default; absent inherits the environment's.
+    #[serde(default, deserialize_with = "present_nullable")]
+    pub pull_request_merge_method: Option<Option<crate::pull_requests::wire::MergeMethod>>,
 }
 
 /// `ServerSettings`: the subset the composer reads. Absent keys take the contract's defaults.
@@ -427,6 +430,8 @@ pub struct ServerSettings {
     pub project_script_overrides: HashMap<String, Option<Vec<ProjectScript>>>,
     #[serde(default, deserialize_with = "lenient_map")]
     pub provider_instances: HashMap<String, ProviderInstanceConfig>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub pull_request_merge_method: Option<crate::pull_requests::wire::MergeMethod>,
     #[serde(flatten)]
     pub threads: crate::settings::ThreadSettings,
 }

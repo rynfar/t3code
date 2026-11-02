@@ -223,6 +223,8 @@ pub struct Capabilities {
     #[serde(default)]
     pub labels: Option<bool>,
     #[serde(default)]
+    pub stacks: Option<bool>,
+    #[serde(default)]
     pub stack_actions: Option<bool>,
 }
 
@@ -320,6 +322,31 @@ impl Detail {
     pub fn allowed_merge_methods(&self) -> Vec<MergeMethod> {
         self.capabilities.merge_methods.iter().copied().filter(|method| self.merge_capabilities.allows(*method)).collect()
     }
+}
+
+/// One layer of `PullRequestStack`, bottom first.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackLayer {
+    pub number: u64,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub is_draft: Option<bool>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    pub head_branch: String,
+    pub state: PrState,
+}
+
+/// `pullRequests.stack`: null when the pull request is in no stack.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Stack {
+    pub id: String,
+    pub number: u64,
+    pub url: String,
+    pub base: String,
+    pub layers: Vec<StackLayer>,
 }
 
 /// `pullRequests.checks`: null when the host has nothing to say.

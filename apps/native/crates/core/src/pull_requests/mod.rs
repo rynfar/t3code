@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use list::{Involvement, ListState, Sort};
-use query::{ChecksFilter, DraftFilter, ListFilters, ReviewFilter};
-use wire::{Action, ListEntry, MergeMethod};
+use query::{ChecksFilter, DraftFilter, ListFilters, ReviewFilter, truncate_utf16};
+use wire::{Action, ListEntry, MergeMethod, PrState, Stack};
 
 pub mod method {
     pub const LIST: &str = "pullRequests.list";
@@ -26,6 +26,8 @@ pub mod method {
     pub const ACTIVITY: &str = "pullRequests.activity";
     pub const RUN_ACTION: &str = "pullRequests.runAction";
     pub const INVALIDATE: &str = "pullRequests.invalidate";
+    pub const STACK: &str = "pullRequests.stack";
+    pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
 }
 
 /// `PAGE_SIZE` and `MAX_PAGE_SIZE` on the page.
@@ -149,7 +151,7 @@ pub fn list_input(preferences: &ListPreferences, sent_query: &str, limit: u32, c
         input.insert("filters".into(), json!(filters));
     }
     if !parsed.text.is_empty() {
-        input.insert("query".into(), json!(parsed.text.chars().take(200).collect::<String>()));
+        input.insert("query".into(), json!(truncate_utf16(&parsed.text, 200).trim_end()));
     }
     if let Some(cursors) = cursors.filter(|cursors| !cursors.is_empty()) {
         input.insert("cursors".into(), json!(cursors));
@@ -157,10 +159,53 @@ pub fn list_input(preferences: &ListPreferences, sent_query: &str, limit: u32, c
     Value::Object(input)
 }
 
-/// `pullRequests.listStats` for the rows still without line counts.
-pub fn stats_input<'a>(entries: impl IntoIterator<Item = &'a ListEntry>) -> Option<Value> {
-    let refs: Vec<Value> = entries.into_iter().filter(|entry| list::needs_stats(entry)).take(MAX_STATS_REFS).map(|entry| PrRef::of(entry).payload()).collect();
-    (!refs.is_empty()).then(|| json!({ "refs": refs }))
+/// `pullRequests.listStats` inputs for the rows still without line counts, in batches the
+/// contract accepts (`pullRequestStatsBatches`).
+pub fn stats_inputs<'a>(entries: impl IntoIterator<Item = &'a ListEntry>) -> Vec<Value> {
+    let refs: Vec<Value> = entries.into_iter().filter(|entry| list::needs_stats(entry)).map(|entry| PrRef::of(entry).payload()).collect();
+    refs.chunks(MAX_STATS_REFS).map(|batch| json!({ "refs": batch })).collect()
+}
+
+/// `pullRequests.invalidate`: one pull request's host reads, or every read when `None`.
+pub fn invalidate_input(reference: Option<&PrRef>) -> Value {
+    match reference {
+        Some(reference) => json!({ "reference": reference.payload() }),
+        None => json!({}),
+    }
+}
+
+/// The project's merge method setting (`usePullRequestDefaultMergeMethodResolver`): its
+/// override when it has one, null included, else the environment's.
+pub fn project_default_merge_method(settings: &crate::server_config::ServerSettings, project_id: &str) -> Option<MergeMethod> {
+    match settings.project_settings_overrides.get(project_id).and_then(|overrides| overrides.pull_request_merge_method) {
+        Some(method) => method,
+        None => settings.pull_request_merge_method,
+    }
+}
+
+/// A stack-scoped merge (`PullRequestStackMenu`): this layer and the unmerged ones below it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StackMerge {
+    pub count: usize,
+    pub input: Value,
+}
+
+/// `None` when the host could not take it: this layer is not open, or a layer below is closed,
+/// a draft, or has no known head to pin.
+pub fn stack_merge(stack: &Stack, reference: &PrRef, method: MergeMethod) -> Option<StackMerge> {
+    let position = stack.layers.iter().position(|layer| layer.number == reference.number)?;
+    if stack.layers[position].state != PrState::Open {
+        return None;
+    }
+    let layers: Vec<_> = stack.layers[..=position].iter().filter(|layer| layer.state != PrState::Merged).collect();
+    if layers.iter().any(|layer| layer.state != PrState::Open || layer.is_draft == Some(true)) {
+        return None;
+    }
+    let heads = layers.iter().map(|layer| Some(json!({ "number": layer.number, "headSha": layer.head_sha.as_deref()? }))).collect::<Option<Vec<_>>>()?;
+    let mut input = action_input(reference, Action::Merge, Some(method));
+    input["stackNumber"] = json!(stack.number);
+    input["expectedStackHeads"] = json!(heads);
+    Some(StackMerge { count: layers.len(), input })
 }
 
 /// `PullRequestActionInput`.
@@ -194,20 +239,46 @@ pub fn failure_message(tag: Option<&str>, error: &Value, fallback: &str) -> Stri
     }
 }
 
-/// `pullRequestActionToast`-style past tense for a finished action.
+/// `actionSuccessLabels`: a merge is only requested, since some hosts accept one before it lands.
 pub fn action_done_label(action: Action, term: &str) -> String {
     let capitalized = detail::capitalize(term);
     match action {
-        Action::Merge => format!("{capitalized} merged"),
+        Action::Merge => "Merge requested".to_owned(),
         Action::Close => format!("{capitalized} closed"),
         Action::Reopen => format!("{capitalized} reopened"),
-        Action::Ready => format!("{capitalized} ready for review"),
-        Action::Draft => format!("{capitalized} converted to draft"),
+        Action::Ready => "Marked ready for review".to_owned(),
+        Action::Draft => "Converted to draft".to_owned(),
+        Action::UpdateBranch => "Branch updated with the base branch".to_owned(),
         Action::EnableAutoMerge => "Auto-merge enabled".to_owned(),
         Action::DisableAutoMerge => "Auto-merge disabled".to_owned(),
+        Action::Revert => format!("Revert {term} opened"),
+        Action::DeleteBranch => "Branch deleted".to_owned(),
         Action::ApproveWorkflows => "Workflows approved".to_owned(),
-        _ => format!("{capitalized} updated"),
+        Action::Unknown => format!("{capitalized} updated"),
     }
+}
+
+/// `actionFailureLabels`.
+pub fn action_failed_label(action: Action, term: &str) -> String {
+    match action {
+        Action::Merge => format!("Could not merge this {term}"),
+        Action::Ready => "Could not mark this ready for review".to_owned(),
+        Action::Draft => "Could not convert this to a draft".to_owned(),
+        Action::Close => format!("Could not close this {term}"),
+        Action::Reopen => format!("Could not reopen this {term}"),
+        Action::UpdateBranch => "Could not update this branch".to_owned(),
+        Action::EnableAutoMerge => "Could not enable auto-merge".to_owned(),
+        Action::DisableAutoMerge => "Could not disable auto-merge".to_owned(),
+        Action::Revert => format!("Could not open a revert {term}"),
+        Action::DeleteBranch => "Could not delete this branch".to_owned(),
+        Action::ApproveWorkflows => "Could not approve workflows".to_owned(),
+        Action::Unknown => format!("Could not update this {term}"),
+    }
+}
+
+/// `pullRequestActionNeedsHostRefresh`: what the host only shows after its reads are dropped.
+pub fn action_needs_host_refresh(action: Action) -> bool {
+    matches!(action, Action::UpdateBranch | Action::ApproveWorkflows)
 }
 
 #[cfg(test)]
@@ -245,6 +316,75 @@ mod tests {
         let operation = json!({ "operation": "runAction", "detail": "Not mergeable" });
         assert_eq!(failure_message(Some("PullRequestOperationError"), &operation, "x"), "Pull request operation runAction failed: Not mergeable");
         assert_eq!(failure_message(None, &json!({}), "Could not load"), "Could not load");
+    }
+
+    fn entry(number: u64) -> ListEntry {
+        serde_json::from_value(json!({
+            "provider": "github", "host": "github.com", "projectId": "p", "projectTitle": "P", "repository": "a/b", "number": number,
+            "title": "t", "url": "u", "author": null, "headBranch": "h", "baseBranch": "main", "state": "open", "isDraft": false,
+            "mergeability": "mergeable", "additions": 0, "deletions": 0, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            "viewerReviewRequested": false, "labels": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stats_are_read_in_batches_of_five_hundred() {
+        let entries: Vec<ListEntry> = (1..=1203).map(entry).collect();
+        let batches = stats_inputs(&entries);
+        let sizes: Vec<usize> = batches.iter().map(|batch| batch["refs"].as_array().unwrap().len()).collect();
+        assert_eq!(sizes, vec![500, 500, 203]);
+        assert_eq!(batches[2]["refs"][202]["number"], 1203);
+        assert!(stats_inputs(&[]).is_empty());
+    }
+
+    #[test]
+    fn list_query_stays_within_the_contract_in_utf16_units() {
+        let input = list_input(&ListPreferences::default(), &"😀".repeat(150), PAGE_SIZE, None);
+        assert_eq!(input["query"].as_str().map(|query| query.encode_utf16().count()), Some(200));
+    }
+
+    #[test]
+    fn project_default_merge_method_reads_the_override_then_the_environment() {
+        let settings = |value: Value| -> crate::server_config::ServerSettings { serde_json::from_value(value).unwrap() };
+        let environment = settings(json!({ "pullRequestMergeMethod": "rebase" }));
+        assert_eq!(project_default_merge_method(&environment, "p"), Some(MergeMethod::Rebase));
+        let overridden = settings(json!({ "pullRequestMergeMethod": "rebase", "projectSettingsOverrides": { "p": { "pullRequestMergeMethod": "squash" }, "q": { "pullRequestMergeMethod": null } } }));
+        assert_eq!(project_default_merge_method(&overridden, "p"), Some(MergeMethod::Squash));
+        assert_eq!(project_default_merge_method(&overridden, "q"), None);
+        assert_eq!(project_default_merge_method(&overridden, "r"), Some(MergeMethod::Rebase));
+        assert_eq!(project_default_merge_method(&settings(json!({})), "p"), None);
+    }
+
+    #[test]
+    fn stack_merge_scopes_the_layers_through_this_one() {
+        let reference = PrRef { project_id: "p".into(), host: Some("git.cafe".into()), repository: "acme/app".into(), number: 3 };
+        let layer = |number: u64, state: &str, sha: Option<&str>| json!({ "number": number, "headBranch": format!("b{number}"), "state": state, "headSha": sha });
+        let stack = |layers: Vec<Value>| -> Stack { serde_json::from_value(json!({ "id": "s", "number": 9, "url": "u", "base": "main", "layers": layers })).unwrap() };
+        let held = stack(vec![layer(1, "merged", Some("s1")), layer(2, "open", Some("s2")), layer(3, "open", Some("s3")), layer(4, "open", Some("s4"))]);
+        let merge = stack_merge(&held, &reference, MergeMethod::Squash).unwrap();
+        assert_eq!(merge.count, 2);
+        assert_eq!(
+            merge.input,
+            json!({
+                "projectId": "p", "host": "git.cafe", "repository": "acme/app", "number": 3, "action": "merge", "mergeMethod": "squash",
+                "stackNumber": 9, "expectedStackHeads": [{ "number": 2, "headSha": "s2" }, { "number": 3, "headSha": "s3" }]
+            })
+        );
+        assert!(stack_merge(&stack(vec![layer(2, "open", None), layer(3, "open", Some("s3"))]), &reference, MergeMethod::Merge).is_none());
+        assert!(stack_merge(&stack(vec![layer(2, "closed", Some("s2")), layer(3, "open", Some("s3"))]), &reference, MergeMethod::Merge).is_none());
+        assert!(stack_merge(&stack(vec![layer(3, "merged", Some("s3"))]), &reference, MergeMethod::Merge).is_none());
+        assert!(stack_merge(&stack(vec![layer(4, "open", Some("s4"))]), &reference, MergeMethod::Merge).is_none());
+        let mut draft = stack(vec![layer(3, "open", Some("s3"))]);
+        draft.layers[0].is_draft = Some(true);
+        assert!(stack_merge(&draft, &reference, MergeMethod::Merge).is_none());
+    }
+
+    #[test]
+    fn invalidate_names_the_pull_request() {
+        let reference = PrRef { project_id: "p".into(), host: Some("github.com".into()), repository: "a/b".into(), number: 3 };
+        assert_eq!(invalidate_input(Some(&reference)), json!({ "reference": { "projectId": "p", "host": "github.com", "repository": "a/b", "number": 3 } }));
+        assert_eq!(invalidate_input(None), json!({}));
     }
 
     #[test]

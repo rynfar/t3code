@@ -111,6 +111,32 @@ fn repository_before<'a>(kind: &str, path: &'a str, route: &str) -> Option<(&'a 
     valid.then(|| (repository, &path[index + route.len()..]))
 }
 
+/// GitCafe has no self-hosted installs (`GITCAFE_HOSTS`).
+const GITCAFE_HOSTS: &[&str] = &["git.cafe", "staging.git.cafe"];
+
+/// GitCafe's `CHANGE_REQUEST_PATH`, `/<owner>/<repo>/pull(s)/<n>`, on its own hosts only: the
+/// route is GitHub's and Forgejo's shape too, so GitCafe claims it first.
+fn parse_gitcafe(url: &url::Url, host: &str) -> Option<(String, u64)> {
+    if !GITCAFE_HOSTS.contains(&host) {
+        return None;
+    }
+    let mut segments = url.path().strip_prefix('/')?.splitn(5, '/');
+    let (owner, name, route, digits) = (segments.next()?, segments.next()?, segments.next()?, segments.next()?);
+    let number: u64 = digits.parse().ok().filter(|number| *number > 0 && digits.chars().all(|c| c.is_ascii_digit()))?;
+    (!owner.is_empty() && !name.is_empty() && (route == "pull" || route == "pulls")).then(|| (format!("{owner}/{name}").to_lowercase(), number))
+}
+
+/// `canonicalizeGitCafePullRequestUrl`: GitCafe's own route for its pull requests, other URLs
+/// as given.
+fn canonical_url(value: &str) -> String {
+    let parsed = url::Url::parse(value).ok().filter(|url| url.scheme() == "https" || url.scheme() == "http");
+    let gitcafe = parsed.as_ref().and_then(|url| {
+        let host = url.host_str()?.to_lowercase();
+        parse_gitcafe(url, &host).map(|(repository, number)| format!("https://{host}/{repository}/pulls/{number}"))
+    });
+    gitcafe.unwrap_or_else(|| value.to_owned())
+}
+
 /// `sourceControlClients.parseChangeRequestUrl`.
 pub fn parse_change_request_url(value: &str) -> Option<ChangeRequestLink> {
     let url = url::Url::parse(value.trim()).ok()?;
@@ -118,6 +144,9 @@ pub fn parse_change_request_url(value: &str) -> Option<ChangeRequestLink> {
         return None;
     }
     let host = url.host_str()?.to_lowercase();
+    if let Some((repository, number)) = parse_gitcafe(&url, &host) {
+        return Some(ChangeRequestLink { host, repository, number, url: value.trim().to_owned() });
+    }
     ROUTES.iter().find_map(|(kind, route)| {
         let (repository, rest) = repository_before(kind, url.path(), route)?;
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -188,7 +217,7 @@ impl LinkProject {
             "github" => Some(below("pull")),
             "gitlab" => Some(below("-/merge_requests")),
             "bitbucket" => Some(below("pull-requests")),
-            "forgejo" => Some(below("pulls")),
+            "forgejo" | "gitcafe" => Some(below("pulls")),
             _ => None,
         }
     }
@@ -203,7 +232,7 @@ pub fn resolve_link_input(reference: &str, project: Option<&LinkProject>) -> Opt
     let trimmed = reference.trim();
     let parsed = if parse_change_request_url(trimmed).is_some() { Some(trimmed.to_owned()) } else { parse_reference(trimmed) }?;
     if let Some(link) = parse_change_request_url(&parsed) {
-        return Some(Ok(link));
+        return Some(Ok(ChangeRequestLink { url: canonical_url(&parsed), ..link }));
     }
     let number: u64 = parsed.parse().ok().filter(|number| *number >= 1)?;
     let Some(project) = project else {
@@ -295,6 +324,21 @@ mod tests {
         assert_eq!(command["type"], "thread.pull-request.link");
         assert_eq!(command["source"], "manual");
         assert_eq!(command["repository"], "acme/app");
+    }
+
+    #[test]
+    fn gitcafe_resolves_bare_numbers_and_claims_its_own_hosts() {
+        let project = LinkProject::from_identity(&serde_json::json!({
+            "canonicalKey": "git.cafe/acme/app", "provider": "gitcafe", "owner": "acme", "name": "app",
+            "locator": { "remoteUrl": "git@git.cafe:acme/app.git" }
+        }))
+        .unwrap();
+        let link = resolve_link_input("#12", Some(&project)).unwrap().unwrap();
+        assert_eq!((link.host.as_str(), link.repository.as_str(), link.number, link.url.as_str()), ("git.cafe", "acme/app", 12, "https://git.cafe/acme/app/pulls/12"));
+        let pasted = resolve_link_input("https://staging.git.cafe/Acme/App/pull/5/files", None).unwrap().unwrap();
+        assert_eq!((pasted.host.as_str(), pasted.repository.as_str(), pasted.url.as_str()), ("staging.git.cafe", "acme/app", "https://staging.git.cafe/acme/app/pulls/5"));
+        let github = resolve_link_input("https://github.com/Acme/App/pull/5", None).unwrap().unwrap();
+        assert_eq!(github.url, "https://github.com/Acme/App/pull/5");
     }
 
     #[test]

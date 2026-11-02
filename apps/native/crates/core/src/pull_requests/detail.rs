@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use super::wire::{Action, Activity, Actor, Check, CheckStatus, ChecksState, Comment, CommentKind, Detail, MergeMethod, Mergeability, PrState, ReviewThread};
+use super::wire::{Action, Activity, Actor, Check, CheckStatus, ChecksState, Comment, CommentKind, Detail, MergeMethod, Mergeability, PrState, ReviewThread, Stack};
 use crate::timeline::parse_iso_ms;
 
 /// `PULL_REQUEST_STATE_PRESENTATION` keys: an open draft reads as a draft.
@@ -158,9 +158,37 @@ pub fn merge_method_label(method: MergeMethod) -> &'static str {
     }
 }
 
-/// `resolvePullRequestMergeMethod`: the first of current, last selected that is allowed.
-pub fn resolve_merge_method(allowed: &[MergeMethod], current: Option<MergeMethod>, last: Option<MergeMethod>) -> MergeMethod {
-    [current, last].into_iter().flatten().find(|method| allowed.contains(method)).or_else(|| allowed.first().copied()).unwrap_or(MergeMethod::Merge)
+/// `resolvePullRequestMergeMethod`: the first of this pull request's pick, the project's default
+/// and the last pick that the repository allows.
+pub fn resolve_merge_method(allowed: &[MergeMethod], current: Option<MergeMethod>, project_default: Option<MergeMethod>, last: Option<MergeMethod>) -> MergeMethod {
+    [current, project_default, last].into_iter().flatten().find(|method| allowed.contains(method)).or_else(|| allowed.first().copied()).unwrap_or(MergeMethod::Merge)
+}
+
+/// Whether merging belongs to a stack (`allowsSinglePullRequestMerge` and `stackOwnsMerge` in
+/// `PullRequestDetailPanel.tsx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeGate {
+    /// A merge of this pull request alone may run.
+    pub single: bool,
+    /// The pull request is in a stack, so only a stack-scoped merge may run.
+    pub stack_owns: bool,
+    /// Why the merge control waits (`mergeBlockedReason`).
+    pub blocked: Option<&'static str>,
+}
+
+/// Where the host runs stack actions, a single merge waits for `pullRequests.stack` to say the
+/// pull request is in none. `stack` is `None` while that read is pending.
+pub fn merge_gate(detail: &Detail, stack: Option<&Result<Option<Stack>, String>>) -> MergeGate {
+    let supported = detail.capabilities.stacks == Some(true) && detail.capabilities.stack_actions == Some(true);
+    if !supported {
+        return MergeGate { single: true, stack_owns: false, blocked: None };
+    }
+    match stack {
+        Some(Ok(None)) => MergeGate { single: true, stack_owns: false, blocked: None },
+        Some(Ok(Some(_))) => MergeGate { single: false, stack_owns: true, blocked: Some("Checking stack membership…") },
+        Some(Err(_)) => MergeGate { single: false, stack_owns: false, blocked: Some("Couldn't check stack membership") },
+        None => MergeGate { single: false, stack_owns: false, blocked: Some("Checking stack membership…") },
+    }
 }
 
 /// `resolvePullRequestPrimaryControl`.
@@ -175,7 +203,7 @@ pub enum PrimaryControl {
     Closed,
 }
 
-pub fn primary_control(detail: &Detail) -> Option<PrimaryControl> {
+pub fn primary_control(detail: &Detail, stack_owns_merge: bool) -> Option<PrimaryControl> {
     let checks = checks_state(&detail.checks);
     match detail.state {
         PrState::Merged => return Some(PrimaryControl::Merged),
@@ -194,10 +222,10 @@ pub fn primary_control(detail: &Detail) -> Option<PrimaryControl> {
     if detail.allowed_merge_methods().is_empty() {
         return None;
     }
-    if detail.auto_merge_enabled == Some(false) && checks.is_some_and(|state| state != ChecksState::Passing) && detail.can(Action::EnableAutoMerge) {
+    if detail.auto_merge_enabled == Some(false) && checks.is_some_and(|state| state != ChecksState::Passing) && !stack_owns_merge && detail.can(Action::EnableAutoMerge) {
         return Some(PrimaryControl::EnableAutoMerge);
     }
-    detail.can(Action::Merge).then_some(PrimaryControl::Merge)
+    (!stack_owns_merge && detail.can(Action::Merge)).then_some(PrimaryControl::Merge)
 }
 
 /// `pullRequestReviewOutcome`.
@@ -407,6 +435,19 @@ pub fn change_request_term(provider: &str) -> &'static str {
     match provider {
         "gitlab" => "merge request",
         _ => "pull request",
+    }
+}
+
+/// The host's name (`sourceControlClients.get(provider).label`).
+pub fn host_label(provider: &str) -> &'static str {
+    match provider {
+        "github" => "GitHub",
+        "gitlab" => "GitLab",
+        "bitbucket" => "Bitbucket",
+        "azure-devops" => "Azure DevOps",
+        "forgejo" => "Forgejo",
+        "gitcafe" => "GitCafe",
+        _ => "source control",
     }
 }
 
