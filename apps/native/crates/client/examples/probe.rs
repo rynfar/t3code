@@ -13,6 +13,11 @@
 //!   cargo run -p t3-client --example probe -- --launch <project-id> "go" \
 //!     --provider devReplay --model showcase --runtime-mode approval-required \
 //!     --approve accept --answer --seconds 40
+//!
+//! Send as the composer does to a thread: permissions first, then the turn with its model:
+//!
+//!   cargo run -p t3-client --example probe -- --thread <thread-id> --compose "go on" \
+//!     --provider devReplay --model showcase --runtime-mode auto-accept-edits
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -64,6 +69,26 @@ async fn main() -> anyhow::Result<()> {
     let mut watched = flag("--thread");
     if let Some(thread_id) = &watched {
         client.open_thread(thread_id);
+        if let Some(text) = flag("--compose") {
+            let (Some(provider), Some(model)) = (flag("--provider"), flag("--model")) else {
+                anyhow::bail!("--compose needs --provider and --model (use devReplay / showcase on a dev server)");
+            };
+            let selection = ModelSelection { instance_id: provider, model, options: None };
+            if let Some(mode) = flag("--runtime-mode").as_deref().and_then(RuntimeMode::parse) {
+                println!("runtime-mode.set: {:?}", client.dispatch(commands::set_runtime_mode(&new_id(), thread_id, mode)).await);
+            }
+            let (command_id, message_id, title) = (new_id(), new_id(), title_seed(&text));
+            let message = commands::composer_message(&commands::ComposerMessage {
+                command_id: &command_id,
+                thread_id,
+                message_id: &message_id,
+                text: &text,
+                title_seed: &title,
+                model_selection: &selection,
+                dispatch: commands::ComposerDispatch::Auto,
+            });
+            println!("message.dispatch: {:?}", client.dispatch(message).await);
+        }
         if let Some(text) = flag("--send") {
             let command = commands::send_message(&new_id(), thread_id, &text, &commands::DispatchMode::QueueAfterActive);
             spawn_dispatch(&client, "dispatch".into(), command);
