@@ -1,11 +1,12 @@
 mod app_state;
 mod composer;
 mod connect;
+mod icons;
 mod menus;
 mod sidebar;
 mod theme;
 mod thread_view;
-mod transcript_row;
+mod transcript;
 mod workspace;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
@@ -33,7 +34,7 @@ fn main() {
     let handle = runtime.handle().clone();
     std::mem::forget(runtime);
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         theme::init(cx);
         let state = cx.new(|cx| app_state::AppState::new(handle.clone(), cx));
