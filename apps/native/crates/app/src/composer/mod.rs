@@ -13,6 +13,7 @@ mod model_picker;
 mod pending;
 mod queue;
 mod send;
+mod stash;
 pub(crate) use pending::banner_surface;
 mod view;
 
@@ -37,7 +38,7 @@ use crate::sidebar::controller::now_ms;
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText]);
+actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt]);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
@@ -159,6 +160,7 @@ pub struct Composer {
     attachments: attachments::Attachments,
     drafts: drafts::Drafts,
     queue: queue::Queue,
+    stash_state: stash::Stashed,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -236,9 +238,11 @@ impl Composer {
             attachments: Default::default(),
             drafts: Default::default(),
             queue: Default::default(),
+            stash_state: Default::default(),
             _subscriptions: subscriptions,
         };
         composer.load_drafts();
+        composer.load_stash();
         composer.refresh(true, window, cx);
         composer
     }
@@ -565,6 +569,7 @@ impl Composer {
     /// text: the send button's enabled state, or the active answer.
     fn on_prompt_change(&mut self, cx: &mut Context<Self>) {
         self.sync_menu(true, cx);
+        self.close_stash_menu(cx);
         if self.answering.is_none() {
             self.draft_changed(cx);
         }

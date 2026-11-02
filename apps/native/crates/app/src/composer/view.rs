@@ -18,7 +18,7 @@ use t3_core::traits;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
 use super::model_picker::permissions_section;
-use super::{Composer, MenuKey, PasteAsText, Resolved, Target, TogglePlanMode, runtime_mode_icon};
+use super::{Composer, MenuKey, PasteAsText, Resolved, StashPrompt, Target, TogglePlanMode, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
@@ -274,17 +274,23 @@ impl Render for Composer {
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).
                 .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                    if this.menu_key(MenuKey::Up, window, cx) {
+                    if this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {
                         cx.stop_propagation();
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                    if this.menu_key(MenuKey::Down, window, cx) {
+                    if this.stash_key(MenuKey::Down, window, cx)
+                        || this.menu_key(MenuKey::Down, window, cx)
+                        || this.history_key(false, window, cx)
+                    {
                         cx.stop_propagation();
                     }
                 }))
                 .capture_action(cx.listener(|this, action: &Enter, window, cx| {
-                    if !action.secondary && !action.shift && this.menu_key(MenuKey::Accept, window, cx) {
+                    if !action.secondary
+                        && !action.shift
+                        && (this.stash_key(MenuKey::Accept, window, cx) || this.menu_key(MenuKey::Accept, window, cx))
+                    {
                         cx.stop_propagation();
                     }
                 }))
@@ -294,10 +300,11 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    if this.menu_key(MenuKey::Dismiss, window, cx) {
+                    if this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
                         cx.stop_propagation();
                     }
                 }))
+                .on_action(cx.listener(|this, _: &StashPrompt, window, cx| this.stash_prompt(window, cx)))
                 .capture_action(cx.listener(|this, _: &Paste, window, cx| {
                     if this.input.read(cx).focus_handle(cx).is_focused(window) && this.paste(window, cx) {
                         cx.stop_propagation();
@@ -324,6 +331,8 @@ impl Render for Composer {
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))
                 })
+                .children(self.render_stash_badge(cx))
+                .children(self.render_stash_menu(cx))
                 .child(
                     div().relative().children(self.render_menu(cx)).child(
                     v_flex()

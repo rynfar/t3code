@@ -11,6 +11,7 @@ pub mod attachments;
 pub mod drafts;
 pub mod menu;
 pub mod queue;
+pub mod stash;
 
 use serde::Deserialize;
 

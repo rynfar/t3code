@@ -43,6 +43,7 @@ icons! {
     ArrowRightLeft => "icons/lucide/arrow-right-left.svg",
     ArrowUp => "icons/lucide/arrow-up.svg",
     Blocks => "icons/lucide/blocks.svg",
+    Bookmark => "icons/lucide/bookmark.svg",
     Bot => "icons/lucide/bot.svg",
     Bug => "icons/lucide/bug.svg",
     Check => "icons/lucide/check.svg",
