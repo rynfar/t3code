@@ -19,6 +19,12 @@ pub struct TurnItem {
     pub node_id: Option<String>,
     pub parent_item_id: Option<String>,
     #[serde(default)]
+    pub provider_turn_id: Option<String>,
+    #[serde(default)]
+    pub tool_surface: Option<String>,
+    #[serde(default)]
+    pub tool_source: Option<Value>,
+    #[serde(default)]
     pub ordinal: u64,
     #[serde(default)]
     pub status: String,
@@ -77,6 +83,26 @@ pub struct ProviderFailure {
     pub class: String,
     pub message: String,
     pub code: Option<String>,
+    #[serde(default)]
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRetry {
+    pub attempt: u64,
+    pub max_attempts: Option<u64>,
+    pub retry_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeDetail {
+    #[serde(default)]
+    pub operation: String,
+    pub path: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -101,6 +127,14 @@ pub enum TurnItemKind {
         scheduled_task_id: Option<String>,
         #[serde(default)]
         sender_thread_id: Option<String>,
+        #[serde(default)]
+        created_by: Option<String>,
+        #[serde(default)]
+        creation_source: Option<String>,
+        #[serde(default)]
+        idle_compaction: Option<String>,
+        #[serde(default)]
+        context: Option<Value>,
     },
     AssistantMessage {
         message_id: String,
@@ -129,6 +163,8 @@ pub enum TurnItemKind {
         questions: Vec<Value>,
         #[serde(default)]
         question_answer: Option<Value>,
+        #[serde(default)]
+        response_mode: Option<String>,
     },
     FileChange {
         file_name: String,
@@ -142,6 +178,8 @@ pub enum TurnItemKind {
         old_str: Option<String>,
         #[serde(default)]
         new_str: Option<String>,
+        #[serde(default)]
+        changes: Option<Vec<FileChangeDetail>>,
     },
     CommandExecution {
         input: String,
@@ -151,6 +189,8 @@ pub enum TurnItemKind {
         output_indicates_failure: Option<bool>,
         #[serde(default)]
         exit_code: Option<i64>,
+        #[serde(default)]
+        output_omitted: bool,
     },
     FileSearch {
         #[serde(default)]
@@ -173,6 +213,10 @@ pub enum TurnItemKind {
         reason: Option<String>,
         #[serde(default)]
         options: Option<Vec<Value>>,
+        #[serde(default)]
+        full_access_override: Option<String>,
+        #[serde(default)]
+        app_name: Option<String>,
     },
     Checkpoint {
         checkpoint_id: String,
@@ -190,6 +234,8 @@ pub enum TurnItemKind {
     },
     Error {
         failure: ProviderFailure,
+        #[serde(default)]
+        retry: Option<ProviderRetry>,
     },
     Compaction {
         #[serde(default)]
@@ -208,6 +254,8 @@ pub enum TurnItemKind {
     },
     Fork {
         target_thread_id: String,
+        #[serde(default)]
+        source: Option<Value>,
     },
     ThreadCreated {
         target_thread_id: String,
@@ -223,14 +271,24 @@ pub enum TurnItemKind {
         link_status: String,
         #[serde(default)]
         label: Option<String>,
+        #[serde(default)]
+        failure: Option<String>,
+        #[serde(default)]
+        linked_label: Option<String>,
     },
     Subagent {
         subagent_id: String,
         child_thread_id: Option<String>,
+        #[serde(default)]
         prompt: String,
         #[serde(default)]
         progress: Option<String>,
+        #[serde(default)]
         result: Option<String>,
+        #[serde(default)]
+        origin: Option<String>,
+        #[serde(default)]
+        driver: Option<String>,
     },
     DynamicTool {
         tool_name: Option<String>,
@@ -238,6 +296,10 @@ pub enum TurnItemKind {
         input: Value,
         #[serde(default)]
         output: Option<Value>,
+        #[serde(default)]
+        viewed_image_path: Option<String>,
+        #[serde(default)]
+        output_omitted: bool,
     },
     #[serde(other)]
     Unknown,

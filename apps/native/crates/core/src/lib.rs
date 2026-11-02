@@ -6,5 +6,6 @@ pub mod rpc;
 pub mod shell;
 pub mod sidebar;
 pub mod thread;
+pub mod timeline;
 pub mod turn_item;
 pub mod wire;

@@ -18,9 +18,25 @@ futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
-gpui-component.workspace = true
+# Syntax highlighting for markdown code blocks: the languages agents most often print.
+gpui-component = { workspace = true, features = [
+  "tree-sitter-bash",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-javascript",
+  "tree-sitter-python",
+  "tree-sitter-rust",
+  "tree-sitter-sql",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+] }
 serde_json.workspace = true
 time.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
