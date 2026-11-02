@@ -3,6 +3,7 @@
 //! with the helpers in `apps/web/src/components/Sidebar.logic.ts`.
 
 pub mod drag;
+pub mod favicon;
 pub mod grouping;
 pub mod history;
 pub mod inbox;
