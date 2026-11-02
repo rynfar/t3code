@@ -12,6 +12,8 @@ mod new_thread;
 mod omitted_rows;
 mod notifications;
 mod palette;
+mod project_files;
+mod projects;
 mod provider_icon;
 mod right_panel;
 mod settings;

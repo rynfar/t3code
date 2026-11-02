@@ -147,8 +147,8 @@ impl ThreadAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MenuItem {
-    pub action: ThreadAction,
+pub struct MenuItem<A = ThreadAction> {
+    pub action: A,
     pub label: String,
     /// Lucide icon name.
     pub icon: Option<&'static str>,
@@ -156,12 +156,26 @@ pub struct MenuItem {
     pub destructive: bool,
     pub separator_before: bool,
     pub checked: Option<bool>,
-    pub children: Vec<MenuItem>,
+    pub children: Vec<MenuItem<A>>,
 }
 
-impl MenuItem {
-    fn new(action: ThreadAction, label: impl Into<String>, icon: Option<&'static str>) -> MenuItem {
+impl<A> MenuItem<A> {
+    pub fn new(action: A, label: impl Into<String>, icon: Option<&'static str>) -> MenuItem<A> {
         MenuItem { action, label: label.into(), icon, disabled: false, destructive: false, separator_before: false, checked: None, children: Vec::new() }
+    }
+
+    /// The same menu with each action wrapped, so one menu view can show several kinds.
+    pub fn map<B>(self, wrap: &impl Fn(A) -> B) -> MenuItem<B> {
+        MenuItem {
+            action: wrap(self.action),
+            label: self.label,
+            icon: self.icon,
+            disabled: self.disabled,
+            destructive: self.destructive,
+            separator_before: self.separator_before,
+            checked: self.checked,
+            children: self.children.into_iter().map(|child| child.map(wrap)).collect(),
+        }
     }
 
     fn separated(mut self) -> Self {
@@ -212,6 +226,27 @@ pub struct Available {
 
 impl Available {
     pub const ALL: Available = Available { new_thread_on_branch: true, custom_snooze: true, project_settings: true };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectAction {
+    NewThread,
+    CopyPath,
+    Pin,
+    Unpin,
+}
+
+/// The project menu (`handleProjectFolderContextMenu` in `Sidebar.tsx`), without Project settings.
+pub fn build_project_menu(pinned: bool, can_pin: bool) -> Vec<MenuItem<ProjectAction>> {
+    let mut items = vec![MenuItem::new(ProjectAction::NewThread, "New thread", None), MenuItem::new(ProjectAction::CopyPath, "Copy path", None)];
+    if can_pin {
+        items.push(if pinned {
+            MenuItem::new(ProjectAction::Unpin, "Unpin project", Some("pin-off"))
+        } else {
+            MenuItem::new(ProjectAction::Pin, "Pin project", Some("pin"))
+        });
+    }
+    items
 }
 
 /// `buildThreadActionMenuItems`, without guest sharing and project promotion.
@@ -644,6 +679,14 @@ mod tests {
         let _second = store.begin(UndoKind::Pin, "a");
         store.show(UndoAction::Unpinned, first, Vec::new(), 0);
         assert_eq!(store.notice(), None);
+    }
+
+    #[test]
+    fn project_menu_offers_pin_only_where_the_server_can() {
+        let labels = |items: Vec<MenuItem<ProjectAction>>| items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+        assert_eq!(labels(build_project_menu(false, true)), ["New thread", "Copy path", "Pin project"]);
+        assert_eq!(labels(build_project_menu(true, true)), ["New thread", "Copy path", "Unpin project"]);
+        assert_eq!(labels(build_project_menu(true, false)), ["New thread", "Copy path"]);
     }
 
     #[test]

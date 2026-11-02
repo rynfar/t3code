@@ -7,7 +7,7 @@ use gpui::{
     ParentElement, Pixels, Point, Render, SharedString, Styled, Window, anchored, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
 use t3_core::sidebar::settled::{self, SnoozePreset};
-use t3_core::thread_actions::{Available, MenuItem, Supports, ThreadAction, ThreadActionMenuState, build_menu};
+use t3_core::thread_actions::{Available, MenuItem, ProjectAction, Supports, ThreadAction, ThreadActionMenuState, build_menu, build_project_menu};
 
 use crate::app_state::AppState;
 use crate::icons::Icon;
@@ -17,6 +17,12 @@ use crate::theme::{hsla, palette};
 const MENU_WIDTH: f32 = 220.;
 const ITEM_HEIGHT: f32 = 28.;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuAction {
+    Thread(ThreadAction),
+    Project(ProjectAction),
+}
+
 pub enum ContextMenuEvent {
     Rename(String),
     Delete(String),
@@ -24,8 +30,9 @@ pub enum ContextMenuEvent {
 }
 
 struct OpenMenu {
-    thread_id: String,
-    items: Vec<MenuItem>,
+    /// The thread or project the menu acts on.
+    target_id: String,
+    items: Vec<MenuItem<MenuAction>>,
     position: Point<Pixels>,
     highlighted: Option<usize>,
     submenu: Option<usize>,
@@ -77,7 +84,18 @@ impl ContextMenu {
             snooze_presets: &presets,
             available: Available { new_thread_on_branch: false, custom_snooze: true, project_settings: false },
         });
-        self.open = Some(OpenMenu { thread_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
+        let items = items.into_iter().map(|item| item.map(&MenuAction::Thread)).collect();
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The project menu, from a project row in the project filter.
+    pub fn open_for_project(&mut self, project_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(project) = state.shell.project(project_id) else { return };
+        let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -88,7 +106,7 @@ impl ContextMenu {
         let items = presets
             .iter()
             .map(|preset| MenuItem {
-                action: ThreadAction::SnoozePreset(preset.id.clone()),
+                action: MenuAction::Thread(ThreadAction::SnoozePreset(preset.id.clone())),
                 label: format!("{} ({})", preset.label, preset.when_label),
                 icon: None,
                 disabled: false,
@@ -98,7 +116,7 @@ impl ContextMenu {
                 children: Vec::new(),
             })
             .collect();
-        self.open = Some(OpenMenu { thread_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -110,19 +128,25 @@ impl ContextMenu {
         }
     }
 
-    fn activate(&mut self, action: ThreadAction, cx: &mut Context<Self>) {
+    fn activate(&mut self, action: MenuAction, cx: &mut Context<Self>) {
         let Some(open) = self.open.take() else { return };
         cx.emit(DismissEvent);
         cx.notify();
         match action {
-            ThreadAction::Rename => cx.emit(ContextMenuEvent::Rename(open.thread_id)),
-            ThreadAction::Delete => cx.emit(ContextMenuEvent::Delete(open.thread_id)),
-            ThreadAction::SnoozeCustom => cx.emit(ContextMenuEvent::CustomSnooze(open.thread_id)),
-            action => self.state.update(cx, |state, cx| state.run_thread_action(&open.thread_id, action, &open.presets, cx)),
+            MenuAction::Thread(ThreadAction::Rename) => cx.emit(ContextMenuEvent::Rename(open.target_id)),
+            MenuAction::Thread(ThreadAction::Delete) => cx.emit(ContextMenuEvent::Delete(open.target_id)),
+            MenuAction::Thread(ThreadAction::SnoozeCustom) => cx.emit(ContextMenuEvent::CustomSnooze(open.target_id)),
+            MenuAction::Thread(action) => self.state.update(cx, |state, cx| state.run_thread_action(&open.target_id, action, &open.presets, cx)),
+            MenuAction::Project(action) => self.state.update(cx, |state, cx| match action {
+                ProjectAction::NewThread => state.start_draft(&open.target_id, cx),
+                ProjectAction::CopyPath => state.copy_project_path(&open.target_id, cx),
+                ProjectAction::Pin => state.set_project_pinned(&open.target_id, true, cx),
+                ProjectAction::Unpin => state.set_project_pinned(&open.target_id, false, cx),
+            }),
         }
     }
 
-    fn enabled(items: &[MenuItem]) -> Vec<usize> {
+    fn enabled(items: &[MenuItem<MenuAction>]) -> Vec<usize> {
         items.iter().enumerate().filter(|(_, item)| !item.disabled).map(|(index, _)| index).collect()
     }
 
@@ -181,7 +205,7 @@ impl ContextMenu {
         cx.notify();
     }
 
-    fn render_item(&self, item: &MenuItem, index: usize, highlighted: bool, submenu_parent: Option<usize>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_item(&self, item: &MenuItem<MenuAction>, index: usize, highlighted: bool, submenu_parent: Option<usize>, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let text = if item.destructive { p.destructive_foreground } else if highlighted { p.accent_foreground } else { p.popover_foreground };
         let icon_color = if item.destructive { text } else { p.muted_foreground };
@@ -248,7 +272,7 @@ impl ContextMenu {
             }])
     }
 
-    fn render_list(&self, items: &[MenuItem], highlighted: Option<usize>, parent: Option<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_list(&self, items: &[MenuItem<MenuAction>], highlighted: Option<usize>, parent: Option<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = palette(cx);
         let mut children = Vec::new();
         for (index, item) in items.iter().enumerate() {
@@ -262,7 +286,7 @@ impl ContextMenu {
 }
 
 /// The y offset of item `index` inside a panel, counting separators.
-fn item_offset(items: &[MenuItem], index: usize) -> f32 {
+fn item_offset(items: &[MenuItem<MenuAction>], index: usize) -> f32 {
     let separators = items.iter().take(index + 1).enumerate().filter(|(i, item)| item.separator_before && *i > 0).count();
     4. + index as f32 * ITEM_HEIGHT + separators as f32 * 9.
 }

@@ -248,6 +248,8 @@ pub struct EnvironmentCapabilities {
     pub thread_stop: Option<bool>,
     #[serde(default)]
     pub thread_auto_settle_opt_out: Option<bool>,
+    #[serde(default)]
+    pub project_organization: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -367,6 +369,8 @@ pub struct ServerConfig {
     /// The shell can omit older settled threads; `getOlderSettledThreads` serves them.
     #[serde(default)]
     pub shell_older_settled: bool,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub available_editors: Vec<String>,
 }
 
 impl ServerConfig {

@@ -13,9 +13,9 @@ use crate::dialog::ConfirmDialog;
 use crate::icons::Icon;
 use crate::keymap::{
     self, CopyThreadReference, JumpToThread1, JumpToThread2, JumpToThread3, JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8,
-    JumpToThread9, NextThread, PinThread, PreviousThread, SettleThread, ToggleCommandPalette, ToggleSidebar, UndoThreadAction, Unimplemented,
+    JumpToThread9, NextThread, PinThread, PreviousThread, SettleThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch, ToggleSidebar, UndoThreadAction, Unimplemented,
 };
-use crate::palette::CommandPalette;
+use crate::palette::{CommandPalette, Mode as PaletteMode};
 use crate::right_panel::{self, RightPanelView};
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
@@ -140,6 +140,15 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| this.palette.update(cx, |palette, cx| palette.toggle(window, cx))))
+            .on_action(cx.listener(|this, _: &keymap::NavigateBack, _, cx| this.state.update(cx, |state, cx| state.navigate_history(true, cx))))
+            .on_action(cx.listener(|this, _: &keymap::NavigateForward, _, cx| this.state.update(cx, |state, cx| state.navigate_history(false, cx))))
+            .on_action(cx.listener(|this, _: &crate::palette::OpenAddProject, window, cx| {
+                this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Browse, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFilePicker, window, cx| this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Files, window, cx))))
+            .on_action(cx.listener(|this, _: &ToggleProjectSearch, window, cx| {
+                this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Content, window, cx));
+            }))
             .on_action(|_: &Unimplemented, _, cx| cx.propagate())
             .on_action(cx.listener(|this, _: &crate::thread_view::FindInThread, window, cx| this.thread.update(cx, |view, cx| view.open_find(window, cx))))
             .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {

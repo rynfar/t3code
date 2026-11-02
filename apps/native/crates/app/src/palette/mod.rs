@@ -1,6 +1,11 @@
 //! The command palette (`apps/web/src/components/CommandPalette.tsx`, design-system §5 and
-//! §6.8): 576 wide, at most 420 tall, radius 16, 10vh from the top. Actions, recent threads,
-//! and on a query, threads and projects ranked by `t3_core::palette`.
+//! §6.8): 576 wide, radius 16, 10vh from the top. Command mode lists actions, recent threads,
+//! and on a query, threads and projects ranked by `t3_core::palette`; go-to-file and content
+//! search are modes of the same overlay (`overlayModeForCommand`), and Escape goes back to it.
+
+mod content;
+mod files;
+mod projects;
 
 use std::collections::HashMap;
 
@@ -26,10 +31,39 @@ use crate::theme::{hsla, palette};
 
 const ENVIRONMENT: &str = t3_core::sidebar::ENVIRONMENT_ID;
 
+gpui::actions!(palette, [OpenAddProject]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Command,
+    Files,
+    Content,
+    /// Add project: browse the host's folders.
+    Browse,
+    NewProject,
+}
+
+impl Mode {
+    fn placeholder(self, project: Option<&str>) -> String {
+        match (self, project) {
+            (Mode::Command, _) => "Search commands, projects, and threads...".to_owned(),
+            (Mode::Files, _) => "Search files…".to_owned(),
+            (Mode::Content, Some(project)) => format!("Search in {project}"),
+            (Mode::Content, None) => "Search project contents…".to_owned(),
+            (Mode::Browse, _) => "Enter project path (e.g. ~/projects/my-app)".to_owned(),
+            (Mode::NewProject, _) => "Project name".to_owned(),
+        }
+    }
+}
+
 pub struct CommandPalette {
     state: Entity<AppState>,
     input: Entity<InputState>,
     open: bool,
+    mode: Mode,
+    files: files::FileSearch,
+    content: content::ContentSearch,
+    browse: projects::ProjectBrowse,
     query: String,
     root: Vec<CommandPaletteGroup>,
     threads: Vec<CommandPaletteItem>,
@@ -57,7 +91,11 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
         shortcut_command: command.map(str::to_owned),
         ..Default::default()
     };
-    let mut items = vec![action("action:toggle-sidebar", "Toggle sidebar", &["hide", "show", "panel"], Some("sidebar.toggle"))];
+    let mut items = vec![
+        action("action:add-project", "Add project", &["folder", "open", "import"], None),
+        action("action:new-project", "New project", &["create", "folder"], None),
+        action("action:toggle-sidebar", "Toggle sidebar", &["hide", "show", "panel"], Some("sidebar.toggle")),
+    ];
     if let Some(thread) = state.selected_thread.as_deref().and_then(|id| state.sidebar.model.thread(id)) {
         let pin = if thread.pinned { "Unpin thread" } else { "Pin thread" };
         let settle = if thread.is_settled() { "Un-settle thread" } else { "Settle thread" };
@@ -76,16 +114,40 @@ impl CommandPalette {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands, projects, and threads..."));
         let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
-                this.query = input.read(cx).value().to_string();
-                this.refilter(cx);
+                let query = input.read(cx).value().to_string();
+                match this.mode {
+                    Mode::Command => {
+                        this.query = query;
+                        this.refilter(cx);
+                    }
+                    Mode::Files => this.files.search(query, &this.state.clone(), cx),
+                    Mode::Content => this.content.search(query, &this.state.clone(), cx),
+                    Mode::Browse => this.browse.set_query(query, &this.state.clone(), cx),
+                    Mode::NewProject => this.query = query,
+                }
+                cx.notify();
             }
-            InputEvent::PressEnter { .. } => this.activate_highlighted(window, cx),
+            InputEvent::PressEnter { secondary, .. } => match this.mode {
+                Mode::Command => this.activate_highlighted(window, cx),
+                Mode::Files => this.open_file(*secondary, window, cx),
+                Mode::Content => this.open_match(*secondary, window, cx),
+                Mode::Browse => this.browse_pick(*secondary, window, cx),
+                Mode::NewProject => {
+                    let name = this.query.clone();
+                    this.close(window, cx);
+                    this.state.update(cx, |state, cx| state.create_new_project(&name, cx));
+                }
+            },
             _ => {}
         });
         CommandPalette {
             state,
             input,
             open: false,
+            mode: Mode::Command,
+            files: Default::default(),
+            content: Default::default(),
+            browse: Default::default(),
             query: String::new(),
             root: Vec::new(),
             threads: Vec::new(),
@@ -100,18 +162,106 @@ impl CommandPalette {
     }
 
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open {
+        self.toggle_mode(Mode::Command, window, cx);
+    }
+
+    /// `ToggleMode`: the same mode again closes the palette; another one switches to it.
+    pub fn toggle_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open && self.mode == mode {
             return self.close(window, cx);
         }
-        self.rebuild(cx);
+        if !self.open {
+            self.focus_return = window.focused(cx);
+        }
         self.open = true;
-        self.focus_return = window.focused(cx);
+        self.enter_mode(mode, window, cx);
+    }
+
+    fn enter_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = mode;
+        let target = self.state.read(cx).active_project_target();
+        let placeholder = mode.placeholder(target.as_ref().map(|target| target.project_name.as_str()));
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
+            input.set_placeholder(placeholder, window, cx);
             input.focus(window, cx);
         });
-        self.query.clear();
-        self.refilter(cx);
+        match mode {
+            Mode::Command => {
+                self.rebuild(cx);
+                self.query.clear();
+                self.refilter(cx);
+            }
+            Mode::Files => self.files.start(target, &self.state.clone(), cx),
+            Mode::Content => self.content.start(target),
+            Mode::Browse => {
+                self.browse.reset();
+                self.input.update(cx, |input, cx| input.set_value("~/", window, cx));
+                self.browse.set_query("~/".to_owned(), &self.state.clone(), cx);
+            }
+            Mode::NewProject => self.query.clear(),
+        }
+        cx.notify();
+    }
+
+    fn browse_pick(&mut self, add: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match self.browse.pick(add) {
+            Some(projects::BrowsePick::Add(path)) => {
+                self.close(window, cx);
+                self.state.update(cx, |state, cx| state.add_project(&path, cx));
+            }
+            Some(projects::BrowsePick::Enter(query)) => self.set_browse_query(query, window, cx),
+            None => {}
+        }
+    }
+
+    fn set_browse_query(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+        self.browse.set_query(query, &self.state.clone(), cx);
+        cx.notify();
+    }
+
+    /// Escape: a file or content search goes back to the command list; the list closes.
+    fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Command => self.close(window, cx),
+            _ => self.enter_mode(Mode::Command, window, cx),
+        }
+    }
+
+    /// Enter opens the file in the preferred editor (or mentions it when the server has none);
+    /// Cmd+Enter mentions it in the composer.
+    fn open_target(&mut self, path: String, line: Option<u64>, mention: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cwd) = self.state.read(cx).active_project_target().map(|target| target.cwd) else { return };
+        self.close(window, cx);
+        self.state.update(cx, |state, cx| {
+            if mention || !state.open_in_editor(&cwd, &path, line, cx) {
+                state.request_composer_mention(crate::project_files::ComposerMention { path, line }, cx);
+            }
+        });
+    }
+
+    fn open_file(&mut self, mention: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.files.highlighted_path() {
+            self.open_target(path, None, mention, window, cx);
+        }
+    }
+
+    fn open_match(&mut self, mention: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((path, line)) = self.content.selected_match() {
+            self.open_target(path, Some(line), mention, window, cx);
+        }
+    }
+
+    fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Command => self.move_highlight(step, cx),
+            Mode::Files => self.files.move_highlight(step),
+            Mode::Content => self.content.move_selection(step),
+            Mode::Browse => self.browse.move_highlight(step),
+            Mode::NewProject => {}
+        }
+        cx.notify();
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -230,6 +380,11 @@ impl CommandPalette {
     }
 
     fn activate(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match value {
+            "action:add-project" => return self.enter_mode(Mode::Browse, window, cx),
+            "action:new-project" => return self.enter_mode(Mode::NewProject, window, cx),
+            _ => {}
+        }
         self.close(window, cx);
         if let Some(command) = value.strip_prefix("action:") {
             let action: Box<dyn gpui::Action> = match command {
@@ -311,6 +466,72 @@ impl CommandPalette {
     }
 }
 
+impl CommandPalette {
+    /// Match case, whole word and regex: a segmented group in the input row.
+    fn render_content_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let options = self.content.options;
+        let toggle = |id: &'static str, label: &'static str, on: bool, underline: bool, pick: fn(&mut t3_core::project_search::ContentOptions)| {
+            div()
+                .id(id)
+                .h(px(24.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .font_family("SF Mono")
+                .text_xs()
+                .cursor_pointer()
+                .text_color(hsla(if on { p.foreground } else { p.muted_foreground }))
+                .when(on, |this| this.bg(hsla(p.input).opacity(0.72)))
+                .when(underline, |this| this.underline())
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.content.toggle_option(pick, &this.state.clone(), cx)))
+        };
+        div()
+            .flex()
+            .flex_none()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(hsla(p.border))
+            .bg(hsla(p.muted).opacity(0.3))
+            .child(toggle("match-case", "Aa", options.case_sensitive, false, |o| o.case_sensitive = !o.case_sensitive))
+            .child(toggle("whole-word", "ab", options.whole_word, true, |o| o.whole_word = !o.whole_word))
+            .child(toggle("use-regex", ".*", options.use_regex, false, |o| o.use_regex = !o.use_regex))
+    }
+
+    /// The footer hints (`CommandFooter`): navigate, the Enter action, and Escape.
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let enter = match self.mode {
+            Mode::Command => "Open".to_owned(),
+            Mode::Browse => "Enter folder / Add".to_owned(),
+            Mode::NewProject => "Create project".to_owned(),
+            _ => self.state.read(cx).preferred_editor_label().map_or_else(|| "Mention".to_owned(), |editor| format!("Open in {editor}")),
+        };
+        let hint = |key: &'static str, label: String| div().flex().items_center().gap(px(6.)).child(div().px(px(4.)).h(px(20.)).flex().items_center().rounded(px(4.)).bg(hsla(p.foreground).opacity(0.07)).child(key)).child(label);
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(16.))
+            .py(px(10.))
+            .border_t_1()
+            .border_color(hsla(p.border))
+            .text_xs()
+            .text_color(hsla(p.muted_foreground))
+            .child(hint("↑↓", "Navigate".to_owned()))
+            .child(hint("↵", enter))
+            .when(matches!(self.mode, Mode::Files | Mode::Content), |this| this.child(hint("⌘↵", "Mention in composer".to_owned())))
+            .when(self.mode == Mode::Browse, |this| this.child(hint("⌘↵", "Add folder".to_owned())).child(hint("Tab", "Complete".to_owned())))
+            .child(div().flex_1())
+            .child(hint("Esc", if self.mode == Mode::Command { "Close".to_owned() } else { "Back".to_owned() }))
+    }
+}
+
 impl Render for CommandPalette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
@@ -341,19 +562,27 @@ impl Render for CommandPalette {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
                             if !is_composing(&this.input, window, cx) {
-                                this.move_highlight(1, cx);
+                                this.move_selection(1, cx);
                                 cx.stop_propagation();
                             }
                         }))
                         .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
                             if !is_composing(&this.input, window, cx) {
-                                this.move_highlight(-1, cx);
+                                this.move_selection(-1, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &gpui_component::input::IndentInline, window, cx| {
+                            if this.mode == Mode::Browse && !is_composing(&this.input, window, cx) {
+                                if let Some(query) = this.browse.complete() {
+                                    this.set_browse_query(query, window, cx);
+                                }
                                 cx.stop_propagation();
                             }
                         }))
                         .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                             if !is_composing(&this.input, window, cx) {
-                                this.close(window, cx);
+                                this.escape(window, cx);
                                 cx.stop_propagation();
                             }
                         }))
@@ -373,7 +602,12 @@ impl Render for CommandPalette {
                             cx.propagate();
                         }))
                         .w(px(576.))
-                        .max_h(px(420.))
+                        .map(|this| match self.mode {
+                            Mode::Command => this.max_h(px(420.)),
+                            Mode::Files => this.max_h((window.viewport_size().height * 0.76).min(px(544.))),
+                            Mode::Content => this.h((window.viewport_size().height * 0.76).min(px(560.))),
+                            Mode::Browse | Mode::NewProject => this.max_h(px(420.)),
+                        })
                         .flex()
                         .flex_col()
                         .relative()
@@ -386,19 +620,39 @@ impl Render for CommandPalette {
                                 .py(px(6.))
                                 .border_b_1()
                                 .border_color(hsla(p.border))
-                                .child(div().h(px(34.)).flex().items_center().child(Input::new(&self.input).appearance(false).bordered(false))),
+                                .child(
+                                    div()
+                                        .h(px(34.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(div().flex_1().min_w_0().child(Input::new(&self.input).appearance(false).bordered(false)))
+                                        .when(self.mode == Mode::Content && self.content.target.is_some(), |this| this.child(self.render_content_options(cx))),
+                                ),
                         )
-                        .child(
-                            div()
+                        .child(match self.mode {
+                            Mode::Command => div()
                                 .id("palette-results")
                                 .flex_1()
                                 .min_h_0()
                                 .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
+                                .track_scroll(&self.scroll)
                                 .p(px(8.))
                                 .when(empty, |this| this.child(div().py(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("No results")))
-                                .children(rendered),
-                        ),
+                                .children(rendered)
+                                .into_any_element(),
+                            Mode::Files => self.files.render(cx),
+                            Mode::Content => self.content.render(cx),
+                            Mode::Browse => self.browse.render(cx),
+                            Mode::NewProject => div()
+                                .py(px(24.))
+                                .px(px(24.))
+                                .text_sm()
+                                .text_color(hsla(p.muted_foreground))
+                                .child("Name the project; the server creates its folder and a first commit.")
+                                .into_any_element(),
+                        })
+                        .child(self.render_footer(cx)),
                 ),
         )
         .with_priority(60)

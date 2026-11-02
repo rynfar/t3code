@@ -86,6 +86,9 @@ pub struct SidebarController {
     pub undo: ThreadUndoStore,
     pub capabilities: ThreadCapabilities,
     pub collapsed: bool,
+    pub history: t3_core::sidebar::history::NavHistory,
+    /// Project ids the thread list is filtered to, or every project.
+    pub project_scope: Option<std::collections::HashSet<String>>,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
     wake_timer: Option<Task<()>>,
@@ -114,7 +117,7 @@ impl AppState {
                     settings: &self.sidebar.settings,
                     shelves: &self.sidebar.shelves,
                     selected_thread_id: self.selected_thread.as_deref(),
-                    project_scope: None,
+                    project_scope: self.sidebar.project_scope.as_ref(),
                     connected: connected(&self.phase),
                     now,
                 },
@@ -155,6 +158,24 @@ impl AppState {
     pub fn show_more_settled(&mut self, cx: &mut Context<Self>) {
         self.retry_settled_pages(cx);
         self.sidebar.shelves.show_more_settled();
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Shell);
+    }
+
+    pub fn can_navigate(&self, back: bool) -> bool {
+        self.sidebar.history.can_go(back, |id| self.shell.thread(id).is_some())
+    }
+
+    /// `navigation.back` / `navigation.forward`.
+    pub fn navigate_history(&mut self, back: bool, cx: &mut Context<Self>) {
+        let shell = &self.shell;
+        if let Some(id) = self.sidebar.history.go(back, |id| shell.thread(id).is_some()).map(str::to_owned) {
+            self.select_thread(&id, cx);
+        }
+    }
+
+    pub fn set_project_scope(&mut self, scope: Option<std::collections::HashSet<String>>, cx: &mut Context<Self>) {
+        self.sidebar.project_scope = scope;
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Shell);
     }

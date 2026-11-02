@@ -5,6 +5,7 @@
 //! rendered `.cached()` and notifies itself only on shell, selection and notice changes.
 
 pub mod controller;
+mod project_filter;
 mod row;
 mod search;
 
@@ -51,6 +52,8 @@ pub struct SidebarPane {
     search_input: Entity<InputState>,
     search: SearchState,
     rename: Option<(String, Entity<InputState>)>,
+    /// Where the project filter popover opens, while it is open.
+    project_filter: Option<gpui::Point<gpui::Pixels>>,
     jump_hints: bool,
     jump_hint_timer: Option<Task<()>>,
     now: Ms,
@@ -115,6 +118,7 @@ impl SidebarPane {
             search_input,
             search: SearchState::default(),
             rename: None,
+            project_filter: None,
             jump_hints: false,
             jump_hint_timer: None,
             now: now_ms(),
@@ -271,14 +275,39 @@ impl SidebarPane {
                     .child(div().text_color(hsla(p.sidebar_foreground)).font_weight(FontWeight::SEMIBOLD).child("T3"))
                     .child(div().text_color(hsla(p.muted_foreground)).child("Code")),
             )
+            .child(self.render_history_button(true, cx))
+            .child(self.render_history_button(false, cx))
+    }
+
+    /// `HistoryNavigationButton`: ghost `icon-sm` with a 14px arrow, disabled at either end.
+    fn render_history_button(&self, back: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let enabled = self.state.read(cx).can_navigate(back);
+        let command = if back { "navigation.back" } else { "navigation.forward" };
+        let label = format!("{}{}", if back { "Go back" } else { "Go forward" }, crate::keymap::label(command, cx).map_or_else(String::new, |key| format!(" ({key})")));
+        div()
+            .id(if back { "history-back" } else { "history-forward" })
+            .size(px(28.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .when(!enabled, |this| this.opacity(0.64))
+            .when(enabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.sidebar_accent))))
+            .child((if back { Icon::ArrowLeft } else { Icon::ArrowRight }).render(px(14.), hsla(p.sidebar_icon)))
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+            .when(enabled, |this| this.on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.navigate_history(back, cx)))))
     }
 
     fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let searching = self.search.is_active();
-        div().px(px(8.)).pb(px(4.)).child(
+        div().px(px(8.)).pb(px(4.)).flex().items_center().gap(px(4.)).child(
             div()
                 .id("sidebar-search")
+                .flex_1()
+                .min_w_0()
                 .h(px(32.))
                 .flex()
                 .items_center()
@@ -327,6 +356,38 @@ impl SidebarPane {
                     )
                 }),
         )
+        .child(self.render_project_filter_button(cx))
+        .child(
+            div()
+                .id("add-project")
+                .size(px(28.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
+                .child(Icon::FolderPlus.render(px(16.), hsla(p.sidebar_icon)))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
+        )
+    }
+
+    /// The empty list copy, naming the filtered projects when a filter applies.
+    fn empty_message(&self, synchronized: bool, cx: &Context<Self>) -> String {
+        let state = self.state.read(cx);
+        if !synchronized {
+            return "Loading…".to_owned();
+        }
+        if state.shell.snapshot.as_ref().is_some_and(|snapshot| snapshot.projects.is_empty()) {
+            return "No projects yet".to_owned();
+        }
+        let Some(scope) = &state.sidebar.project_scope else { return "No threads yet".to_owned() };
+        let names: std::collections::BTreeSet<&String> = scope.iter().filter_map(|id| state.sidebar.model.project_names.get(id)).collect();
+        match names.iter().next() {
+            Some(name) if names.len() == 1 => format!("No threads in {name} yet"),
+            _ => "No threads in these projects yet".to_owned(),
+        }
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -380,7 +441,7 @@ impl Render for SidebarPane {
                 .justify_center()
                 .text_xs()
                 .text_color(hsla(p.muted_foreground).opacity(0.6))
-                .child(if !synchronized { "Loading…" } else if self.state.read(cx).shell.snapshot.as_ref().is_some_and(|s| s.projects.is_empty()) { "No projects yet" } else { "No threads yet" })
+                .child(self.empty_message(synchronized, cx))
                 .into_any_element()
         } else {
             list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx))).flex_1().into_any_element()
@@ -394,5 +455,6 @@ impl Render for SidebarPane {
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .children(self.render_footer(cx))
+            .children(self.render_project_filter(cx))
     }
 }
