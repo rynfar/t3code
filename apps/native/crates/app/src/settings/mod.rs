@@ -10,6 +10,7 @@ mod archive;
 pub(crate) mod controls;
 mod general;
 mod keybindings;
+mod providers;
 pub(crate) mod store;
 mod threads;
 
@@ -42,6 +43,7 @@ impl Global for Host {}
 pub fn init(state: Entity<AppState>, cx: &mut App) {
     store::init(cx);
     controls::init(cx);
+    providers::init(cx);
     cx.set_global(Host { state, view: None, pending: None, previous_focus: None });
     cx.on_action(|_: &OpenSettings, cx| open(Section::General, cx));
     cx.bind_keys([
@@ -197,6 +199,7 @@ pub struct SettingsView {
     pub(crate) threads: threads::ThreadsState,
     pub(crate) keybindings: keybindings::KeybindingsState,
     pub(crate) archive: archive::ArchiveState,
+    pub(crate) providers: providers::ProvidersState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -237,6 +240,7 @@ impl SettingsView {
             threads: threads::ThreadsState::new(window, cx),
             keybindings: keybindings::KeybindingsState::new(window, cx),
             archive: archive::ArchiveState::default(),
+            providers: providers::ProvidersState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -317,6 +321,7 @@ impl SettingsView {
     /// Saves what a commit-on-blur field holds, before the modal unmounts it.
     fn commit_focused_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_focused_thread_field(window, cx);
+        self.commit_focused_provider_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -400,6 +405,7 @@ impl SettingsView {
         [&self.search, &self.threads.base_directory, &self.threads.auto_settle_days, &self.keybindings.filter]
             .into_iter()
             .chain(self.threads.time_inputs())
+            .chain(self.providers.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
     }
 
@@ -606,6 +612,7 @@ impl SettingsView {
             Section::Labs => self.labs(cx),
             Section::Threads => self.threads_page(window, cx),
             Section::Keybindings => self.keybindings_page(cx),
+            Section::Providers => self.providers_page(window, cx),
             Section::Connections => self.environments(cx),
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),

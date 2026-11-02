@@ -63,6 +63,7 @@ impl Section {
                 | Section::Appearance
                 | Section::Chat
                 | Section::Keybindings
+                | Section::Providers
                 | Section::Threads
                 | Section::Connections
                 | Section::Labs
@@ -144,6 +145,7 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("auto-resume-limited-threads", "Resume after usage limits", Threads, &["usage quota rate limit reset recover continue"]),
         SearchItem::new("working-shelf", "Working section", General, &["hide fold running monitoring threads inbox sidebar shelf"]),
         SearchItem::new("auto-settle-inactive-threads", "Auto-settle inactive threads", Threads, &["sidebar inactivity days no activity automatically"]),
+        SearchItem::new("compact-idle-threads", "Compact idle threads", Providers, &["claude context compaction idle cache tokens usage summary resume"]),
         SearchItem::new("auto-settle-merged-threads", "Auto-settle merged threads", Threads, &["pull request merge closed automatically sidebar"]),
         SearchItem::new("keep-threads-with-pull-requests", "Keep threads with a PR", Threads, &["pull request inactivity auto-settle merge close sidebar"])
             .target("auto-settle-inactive-threads"),
@@ -165,6 +167,8 @@ pub fn items() -> Vec<SearchItem> {
         SearchItem::new("legacy-plan-mode", "Plan mode (legacy)", Labs, &["build plan composer old"]),
         SearchItem::new("legacy-context-window-indicator", "Context window indicator (legacy)", Labs, &["composer meter usage tokens circle old"]),
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
+        SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
+        SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]),
         SearchItem::new("archive", "Archived threads", Archived, &["restore reopen deleted history projects"]),
     ]

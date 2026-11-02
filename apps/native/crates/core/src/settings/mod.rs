@@ -6,6 +6,7 @@
 
 pub mod archive;
 pub mod keybindings;
+pub mod providers;
 pub mod quit_hold;
 pub mod search;
 pub mod snooze;
@@ -112,6 +113,9 @@ pub enum ServerSettingChange {
     SnoozePresets(Vec<SnoozePreset>),
     AddProjectBaseDirectory(String),
     ResponseStreamingMode(ResponseStreamingMode),
+    /// A whole `server.updateSettings` payload a panel built itself: provider instance mutations
+    /// and model preferences (`settings::providers`).
+    Prepared(Value),
 }
 
 impl ServerSettingChange {
@@ -129,6 +133,7 @@ impl ServerSettingChange {
             ServerSettingChange::SnoozePresets(_) => "snoozePresets",
             ServerSettingChange::AddProjectBaseDirectory(_) => "addProjectBaseDirectory",
             ServerSettingChange::ResponseStreamingMode(_) => "responseStreamingMode",
+            ServerSettingChange::Prepared(_) => "",
         }
     }
 
@@ -149,11 +154,15 @@ impl ServerSettingChange {
             ServerSettingChange::SnoozePresets(presets) => json!(presets),
             ServerSettingChange::AddProjectBaseDirectory(path) => json!(path.trim()),
             ServerSettingChange::ResponseStreamingMode(mode) => json!(mode),
+            ServerSettingChange::Prepared(payload) => payload.get("patch").cloned().unwrap_or_default(),
         }
     }
 
     /// The `server.updateSettings` payload.
     pub fn payload(&self) -> Value {
+        if let ServerSettingChange::Prepared(payload) = self {
+            return payload.clone();
+        }
         let mut patch = serde_json::Map::new();
         patch.insert(self.key().to_owned(), self.value());
         json!({ "patch": patch })

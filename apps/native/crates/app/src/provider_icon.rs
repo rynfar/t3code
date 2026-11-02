@@ -19,6 +19,12 @@ pub struct ProviderMark {
 }
 
 impl ProviderMark {
+    /// A mark from settings rather than a live entry: Settings → Providers shows instances the
+    /// server may not report yet. The badge shows while an accent is set.
+    pub fn configured(driver: &str, label: &str, accent: Option<u32>) -> Self {
+        ProviderMark { driver: driver.to_owned().into(), initials: providers::initials(label).into(), accent, badge: accent.is_some() }
+    }
+
     pub fn of(entry: &ProviderEntry, entries: &[ProviderEntry]) -> Self {
         ProviderMark {
             driver: entry.driver().to_owned().into(),
