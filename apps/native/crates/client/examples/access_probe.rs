@@ -77,7 +77,7 @@ async fn tasks(client: &ClientHandle, project_id: Option<String>, config: &Serve
     });
     let (Some(project_id), Some(model), true) = (project_id, model, write) else { return Ok(()) };
     let draft = Draft { title: "w16 probe".into(), prompt: "Probe task; never runs.".into(), enabled: false, project_id, model: Some(model), ..Draft::default() };
-    let input = draft.upsert_input(false, |_| None).map_err(|invalid| anyhow::anyhow!(invalid.description))?;
+    let input = draft.upsert_input(false, None, |_| None).map_err(|invalid| anyhow::anyhow!(invalid.description))?;
     let reply = client.request(method::UPSERT, input).await?;
     let id = reply["task"]["id"].as_str().unwrap_or_default().to_owned();
     let saved = scheduled_tasks::decode_list(&json!({ "tasks": [reply["task"].clone()] })).unwrap_or_default();

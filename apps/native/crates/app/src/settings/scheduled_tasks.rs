@@ -233,9 +233,11 @@ impl SettingsView {
             return;
         }
         self.read_editor_inputs(cx);
-        let once = self.thread_settings(cx).is_some_and(|config| config.environment.capabilities.one_time_schedules == Some(true));
+        let Some(config) = self.thread_settings(cx) else { return };
+        let once = config.environment.capabilities.one_time_schedules == Some(true);
+        let ceiling = scheduled_tasks::max_runtime_mode(config.managed_policy.as_ref()).map(str::to_owned);
         let Some(draft) = self.scheduled.editor.clone() else { return };
-        let input = match draft.upsert_input(once, field_to_iso) {
+        let input = match draft.upsert_input(once, ceiling.as_deref(), field_to_iso) {
             Ok(input) => input,
             Err(invalid) => {
                 self.scheduled.editor_error = Some(invalid);

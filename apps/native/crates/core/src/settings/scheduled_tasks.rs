@@ -348,6 +348,29 @@ const fn invalid(title: &'static str, description: &'static str) -> Invalid {
     Invalid { title, description }
 }
 
+/// `String(Math.max(1, everyMs / 60000))`: whole minutes print without a fraction.
+fn minutes_text(every_ms: u64) -> String {
+    let minutes = (every_ms as f64 / 60_000.).max(1.);
+    if minutes.fract() == 0. { format!("{}", minutes as u64) } else { format!("{minutes}") }
+}
+
+const RUNTIME_MODES: [&str; 4] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+
+/// `clampManagedRuntimeMode`: a mode above the ceiling drops to the highest one allowed; with
+/// no ceiling, or none allowed, the mode stays (tasks have no mode picker to fix it).
+pub fn clamp_runtime_mode(mode: &str, ceiling: Option<&str>) -> String {
+    let rank = |mode: &str| RUNTIME_MODES.iter().position(|candidate| *candidate == mode);
+    match (rank(mode), ceiling.and_then(rank)) {
+        (Some(mode_rank), Some(ceiling_rank)) if mode_rank > ceiling_rank => RUNTIME_MODES[ceiling_rank].to_owned(),
+        _ => mode.to_owned(),
+    }
+}
+
+/// `managedPolicy.limits.maxRuntimeMode` from the server config, kept raw.
+pub fn max_runtime_mode(policy: Option<&Value>) -> Option<&str> {
+    policy?.get("limits")?.get("maxRuntimeMode")?.as_str()
+}
+
 /// `HH:MM` or `H:MM`, 00:00 to 23:59.
 pub fn valid_time_of_day(value: &str) -> bool {
     let Some((hour, minute)) = value.split_once(':') else { return false };
@@ -373,7 +396,7 @@ impl Draft {
         match &task.schedule {
             Schedule::Interval { every_ms } => {
                 draft.schedule_mode = ScheduleMode::Interval;
-                draft.interval_minutes = format!("{}", (*every_ms as f64 / 60_000.).max(1.).round());
+                draft.interval_minutes = minutes_text(*every_ms);
             }
             Schedule::FixedTime { time_of_day, weekdays } => {
                 draft.time_of_day = time_of_day.clone();
@@ -401,7 +424,7 @@ impl Draft {
             }
             _ => {
                 draft.base_ref = text(strategy, "baseRef").unwrap_or_else(|| "main".to_owned());
-                draft.start_from_origin = strategy.get("startFromOrigin").and_then(Value::as_bool).unwrap_or(true);
+                draft.start_from_origin = strategy.get("startFromOrigin").and_then(Value::as_bool).unwrap_or(false);
             }
         }
         draft
@@ -433,8 +456,8 @@ impl Draft {
 
     /// `ScheduledTaskUpsertInput`, or why it cannot be sent. `to_iso` turns the local `run_at`
     /// field into an ISO time, `None` when that time does not exist; `once_supported` is the
-    /// `oneTimeSchedules` capability.
-    pub fn upsert_input(&self, once_supported: bool, to_iso: impl Fn(&str) -> Option<String>) -> Result<Value, Invalid> {
+    /// `oneTimeSchedules` capability; `max_runtime_mode` is the managed policy's ceiling.
+    pub fn upsert_input(&self, once_supported: bool, max_runtime_mode: Option<&str>, to_iso: impl Fn(&str) -> Option<String>) -> Result<Value, Invalid> {
         let model = self.model.as_ref().filter(|_| !self.title.trim().is_empty() && !self.prompt.trim().is_empty() && !self.project_id.is_empty());
         let Some(model) = model else { return Err(invalid("Scheduled task is incomplete", "Add a title, prompt, project, and model.")) };
         let schedule = match self.schedule_mode {
@@ -468,7 +491,14 @@ impl Draft {
                 let Some(every_ms) = every_ms else { return Err(invalid("Invalid interval", "Enter an interval of at least one minute.")) };
                 json!({ "type": "interval", "everyMs": every_ms as u64 })
             }
-            ScheduleMode::Webhook => self.webhook_schedule.clone().unwrap_or_else(|| json!({ "type": "webhook", "signature": null, "dedupe": {} })),
+            // Filters are not edited here; leaving them out keeps the server's current ones.
+            ScheduleMode::Webhook => match self.webhook_schedule.clone() {
+                Some(Value::Object(mut stored)) => {
+                    stored.remove("filters");
+                    Value::Object(stored)
+                }
+                _ => json!({ "type": "webhook", "signature": null, "dedupe": {} }),
+            },
         };
         let workspace = match self.workspace_mode {
             WorkspaceMode::Root => json!({ "type": "root" }),
@@ -495,7 +525,7 @@ impl Draft {
         input.insert("threadId".into(), json!(self.thread_id));
         input.insert("workspaceStrategy".into(), workspace);
         input.insert("modelSelection".into(), json!(model));
-        input.insert("runtimeMode".into(), json!(self.runtime_mode));
+        input.insert("runtimeMode".into(), json!(clamp_runtime_mode(&self.runtime_mode, max_runtime_mode)));
         input.insert("interactionMode".into(), json!(self.interaction_mode));
         input.insert("creationSource".into(), json!(crate::commands::CREATION_SOURCE));
         Ok(Value::Object(input))

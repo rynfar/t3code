@@ -66,7 +66,7 @@ fn a_draft_round_trips_a_task_and_validates_like_the_editor() {
     let draft = Draft::from_task(&stored, |_| None);
     assert_eq!(draft.weekdays.len(), 7, "every day shows every toggle on");
     assert_eq!((draft.base_ref.as_str(), draft.start_from_origin), ("develop", false));
-    let input = draft.upsert_input(true, |_| None).unwrap();
+    let input = draft.upsert_input(true, None, |_| None).unwrap();
     assert_eq!(input["id"], "task-1");
     assert_eq!(input["requireExisting"], true);
     assert_eq!(input["schedule"], json!({ "type": "fixed_time", "timeOfDay": "09:00" }), "all seven days leave weekdays out");
@@ -76,10 +76,10 @@ fn a_draft_round_trips_a_task_and_validates_like_the_editor() {
     assert_eq!(input["threadId"], Value::Null);
 
     let mut draft = Draft { title: "T".into(), prompt: "P".into(), project_id: "p".into(), ..Draft::default() };
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap_err().title, "Scheduled task is incomplete");
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap_err().title, "Scheduled task is incomplete");
     draft.model = Some(ModelSelection { instance_id: "codex".into(), model: "gpt-5".into(), options: None });
     draft.enabled = false;
-    let input = draft.upsert_input(true, |_| None).unwrap();
+    let input = draft.upsert_input(true, None, |_| None).unwrap();
     assert_eq!(input.get("id"), None);
     assert_eq!(input["enabled"], false);
     assert_eq!(input["schedule"], json!({ "type": "fixed_time", "timeOfDay": "09:00", "weekdays": [1, 2, 3, 4, 5] }));
@@ -94,24 +94,41 @@ fn a_draft_round_trips_a_task_and_validates_like_the_editor() {
 
     draft.schedule_mode = ScheduleMode::Interval;
     draft.interval_minutes = "0.5".into();
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap_err().title, "Invalid interval");
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap_err().title, "Invalid interval");
     draft.interval_minutes = "90".into();
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap()["schedule"], json!({ "type": "interval", "everyMs": 5_400_000 }));
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap()["schedule"], json!({ "type": "interval", "everyMs": 5_400_000 }));
 
     draft.choose_schedule(ScheduleMode::Once, || "2026-11-02T10:00".into());
     assert_eq!(draft.run_at, "2026-11-02T10:00");
-    assert_eq!(draft.upsert_input(false, |_| None).unwrap_err().title, "Once is not available here");
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap_err().description, "That time does not exist in your time zone.");
-    let input = draft.upsert_input(true, |_| Some("2026-11-02T18:00:00.000Z".into())).unwrap();
+    assert_eq!(draft.upsert_input(false, None, |_| None).unwrap_err().title, "Once is not available here");
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap_err().description, "That time does not exist in your time zone.");
+    let input = draft.upsert_input(true, None, |_| Some("2026-11-02T18:00:00.000Z".into())).unwrap();
     assert_eq!(input["schedule"], json!({ "type": "once", "runAt": "2026-11-02T18:00:00.000Z" }));
 
     draft.prompt.clear();
     draft.choose_schedule(ScheduleMode::Webhook, String::new);
     assert_eq!(draft.prompt, DEFAULT_WEBHOOK_PROMPT);
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap()["schedule"], json!({ "type": "webhook", "signature": null, "dedupe": {} }));
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap()["schedule"], json!({ "type": "webhook", "signature": null, "dedupe": {} }));
 
     draft.workspace_mode = WorkspaceMode::ExistingWorktree;
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap_err().title, "Checkout path is required");
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap_err().title, "Checkout path is required");
+}
+
+#[test]
+fn editing_a_task_keeps_what_the_editor_does_not_show() {
+    let mut raw = task(json!({ "type": "interval", "everyMs": 90_000 }));
+    raw["workspaceStrategy"] = json!({ "type": "worktree", "baseRef": "main" });
+    let stored = decode_task(&raw).unwrap();
+    let mut draft = Draft::from_task(&stored, |_| None);
+    draft.title = "Renamed".into();
+    let input = draft.upsert_input(true, None, |_| None).unwrap();
+    assert_eq!(input["schedule"], json!({ "type": "interval", "everyMs": 90_000 }), "a fractional minute interval survives");
+    assert_eq!(input["workspaceStrategy"]["startFromOrigin"], false, "an omitted startFromOrigin is local");
+    assert_eq!(draft.upsert_input(true, Some("auto-accept-edits"), |_| None).unwrap()["runtimeMode"], "auto-accept-edits");
+    assert_eq!(clamp_runtime_mode("full-access", Some("auto")), "auto");
+    assert_eq!(clamp_runtime_mode("approval-required", Some("auto")), "approval-required");
+    assert_eq!(clamp_runtime_mode("full-access", None), "full-access");
+    assert_eq!(max_runtime_mode(Some(&json!({ "limits": { "maxRuntimeMode": "auto" } }))), Some("auto"));
 }
 
 #[test]
@@ -121,7 +138,9 @@ fn webhook_tasks_keep_their_stored_schedule_and_show_their_address() {
     raw["webhook"] = json!({ "path": "/api/hooks/task-1/abc", "url": null, "hasSecret": true });
     let stored = decode_task(&raw).unwrap();
     let draft = Draft::from_task(&stored, |_| None);
-    assert_eq!(draft.upsert_input(true, |_| None).unwrap()["schedule"], schedule);
+    let mut kept = schedule.clone();
+    kept.as_object_mut().unwrap().remove("filters");
+    assert_eq!(draft.upsert_input(true, None, |_| None).unwrap()["schedule"], kept, "filters are left out so the server keeps its current ones");
 
     let hook = stored.webhook.unwrap();
     assert_eq!(

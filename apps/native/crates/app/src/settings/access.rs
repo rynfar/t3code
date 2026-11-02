@@ -4,7 +4,9 @@
 //! `subscribeAuthAccess` and the `/api/auth` access endpoints. Pairing links carry a QR code of
 //! the pairing URL. The network access, Tailscale, WSL and T3 Connect rows are not ported.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -54,6 +56,8 @@ pub(crate) struct AccessPageState {
     revoking: Option<String>,
     revoking_others: bool,
     permissions_open: bool,
+    /// The last QR encoded, by URL, so countdown ticks and hovers do not re-encode it.
+    qr: RefCell<Option<(String, Rc<QrMatrix>)>>,
     /// Ticks once a second while a pairing link counts down.
     ticker: Option<Task<()>>,
 }
@@ -71,6 +75,7 @@ impl AccessPageState {
             revoking: None,
             revoking_others: false,
             permissions_open: false,
+            qr: RefCell::new(None),
             ticker: None,
         }
     }
@@ -82,27 +87,36 @@ impl AccessPageState {
     }
 }
 
-/// The QR of `text` at ECC level M with a one-module margin on white, drawn as one quad per
-/// run of dark modules.
-fn qr_code(text: &str) -> Option<AnyElement> {
+/// A QR code's modules, row-major, `true` for dark.
+pub(crate) struct QrMatrix {
+    width: usize,
+    dark: Vec<bool>,
+}
+
+/// The QR of `text` at ECC level M.
+fn qr_matrix(text: &str) -> Option<QrMatrix> {
     let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M).ok()?;
-    let width = code.width();
-    let colors = code.to_colors();
+    Some(QrMatrix { width: code.width(), dark: code.to_colors().into_iter().map(|color| color == qrcode::Color::Dark).collect() })
+}
+
+/// The matrix with a one-module margin on white, drawn as one quad per run of dark modules.
+fn qr_element(matrix: Rc<QrMatrix>) -> AnyElement {
     let element = canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let modules = (width + 2) as f32;
-            let unit = f32::from(bounds.size.width) / modules;
+            let width = matrix.width;
+            let unit = f32::from(bounds.size.width) / (width + 2) as f32;
             window.paint_quad(fill(bounds, gpui::white()));
             for y in 0..width {
+                let row = &matrix.dark[y * width..(y + 1) * width];
                 let mut x = 0;
                 while x < width {
-                    if colors[y * width + x] != qrcode::Color::Dark {
+                    if !row[x] {
                         x += 1;
                         continue;
                     }
                     let start = x;
-                    while x < width && colors[y * width + x] == qrcode::Color::Dark {
+                    while x < width && row[x] {
                         x += 1;
                     }
                     let origin = point(bounds.origin.x + px(unit * (start + 1) as f32), bounds.origin.y + px(unit * (y + 1) as f32));
@@ -112,7 +126,7 @@ fn qr_code(text: &str) -> Option<AnyElement> {
         },
     )
     .size(r(QR_SIZE));
-    Some(div().flex_none().rounded(r(6.)).overflow_hidden().child(element).into_any_element())
+    div().flex_none().rounded(r(6.)).overflow_hidden().child(element).into_any_element()
 }
 
 impl SettingsView {
@@ -356,9 +370,9 @@ impl SettingsView {
         let allowed = move |scope: &str| grants.as_ref().is_none_or(|session| session.grants(scope));
         let preset = |id: &'static str, label: &'static str, scopes: Vec<String>, cx: &mut Context<Self>| {
             let selected = create.scopes == scopes;
-            Button::new(id, if selected { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Compact).label(label).on_click(cx.listener(
+            Button::new(id, if selected { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Compact).label(label).disabled(create.creating).on_click(cx.listener(
                 move |this, _, _, cx| {
-                    if let Some(create) = this.access.create.as_mut() {
+                    if let Some(create) = this.access.create.as_mut().filter(|create| !create.creating) {
                         create.scopes = scopes.clone();
                     }
                     cx.notify();
@@ -384,7 +398,7 @@ impl SettingsView {
                 v_flex()
                     .gap(r(6.))
                     .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("Client label (optional)"))
-                    .child(div().max_w(r(320.)).child(Input::new(&self.access.label).small())),
+                    .child(div().max_w(r(320.)).child(Input::new(&self.access.label).small().disabled(create.creating))),
             )
             .child(
                 h_flex()
@@ -403,7 +417,8 @@ impl SettingsView {
                     .id(scope)
                     .items_start()
                     .gap(r(8.))
-                    .cursor_pointer()
+                    .when(create.creating, |this| this.opacity(0.64))
+                    .when(!create.creating, |this| this.cursor_pointer())
                     .child(div().pt(r(2.)).child(checkbox(checked, cx)))
                     .child(
                         v_flex()
@@ -412,7 +427,7 @@ impl SettingsView {
                             .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(*description)),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(create) = this.access.create.as_mut() {
+                        if let Some(create) = this.access.create.as_mut().filter(|create| !create.creating) {
                             toggle_scope(&mut create.scopes, scope, !checked);
                         }
                         cx.notify();
@@ -494,6 +509,16 @@ impl SettingsView {
             .into_any_element()
     }
 
+    fn cached_qr(&self, url: &str) -> Option<Rc<QrMatrix>> {
+        let mut cache = self.access.qr.borrow_mut();
+        if let Some((_, matrix)) = cache.as_ref().filter(|(key, _)| key == url) {
+            return Some(matrix.clone());
+        }
+        let matrix = Rc::new(qr_matrix(url)?);
+        *cache = Some((url.to_owned(), matrix.clone()));
+        Some(matrix)
+    }
+
     /// The inline share panel: the URL, copy buttons and its QR, or the code alone for a
     /// loopback server another device cannot reach.
     fn share_panel(&self, address: &str, credential: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -540,7 +565,7 @@ impl SettingsView {
                             .child(copy_code),
                     ),
             )
-            .children(qr_code(&url))
+            .children(self.cached_qr(&url).map(qr_element))
             .into_any_element()
     }
 

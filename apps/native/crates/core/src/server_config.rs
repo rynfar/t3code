@@ -715,6 +715,9 @@ pub struct ServerConfig {
     /// Where `server.upsertKeybinding` writes; Settings opens it in an editor.
     #[serde(default)]
     pub keybindings_config_path: Option<String>,
+    /// `ManagedPolicySummary`, kept raw; scheduled tasks read its runtime mode ceiling.
+    #[serde(default)]
+    pub managed_policy: Option<Value>,
     /// The workspace "Start without a project" opens (`projects.ensureScratch`); absent on
     /// servers without scratch projects.
     #[serde(default)]
