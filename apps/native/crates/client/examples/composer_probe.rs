@@ -77,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
     println!("$: {}", dollar.iter().map(|item| item.label.as_str()).collect::<Vec<_>>().join("  "));
     assert_eq!(trigger.kind, TriggerKind::Path);
 
+    if let Some(thread_id) = flag("--queue") {
+        return queue_probe(&client, &mut events, &thread_id, provider).await;
+    }
     if !args.iter().any(|a| a == "--send") {
         return Ok(());
     }
@@ -153,3 +156,68 @@ async fn main() -> anyhow::Result<()> {
 fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+/// `--queue <thread>`: queues two messages behind a fresh turn, edits the first, cancels the
+/// second, and prints the queue as `queue_state` reads it after each step.
+async fn queue_probe(
+    client: &t3_client::supervisor::ClientHandle,
+    events: &mut tokio::sync::mpsc::Receiver<ClientEvent>,
+    thread_id: &str,
+    provider: &t3_core::server_config::ServerProvider,
+) -> anyhow::Result<()> {
+    use t3_core::composer::queue;
+    use t3_core::thread::ThreadState;
+    let model = provider.models.first().map(|model| model.slug.clone()).unwrap_or_default();
+    let selection = ModelSelection { instance_id: provider.instance_id.clone(), model, options: None };
+    let message = |text: &str, dispatch| {
+        let (command_id, message_id) = (uuid(), uuid());
+        commands::composer_message(&commands::ComposerMessage {
+            command_id: &command_id,
+            thread_id,
+            message_id: &message_id,
+            text,
+            title_seed: text,
+            model_selection: &selection,
+            dispatch,
+            context: None,
+            attachments: &[],
+        })
+    };
+    client.open_thread(thread_id);
+    let mut thread = ThreadState::default();
+    let steps = vec![
+        message("Probe turn", commands::ComposerDispatch::Auto),
+        message("Queued one", commands::ComposerDispatch::Queue),
+        message("Queued two", commands::ComposerDispatch::Queue),
+    ];
+    println!("dispatch: {:?}", client.dispatch_in_order(steps).await.map_err(|(index, error)| format!("{index}: {error}")));
+    let print_queue = |thread: &ThreadState, label: &str| -> Vec<String> {
+        let state = thread.projection.as_ref().map(queue::queue_state).unwrap_or_default();
+        let rows: Vec<String> = state.queued.iter().map(|run| format!("{}={:?}", &run.run_id[..8.min(run.run_id.len())], queue::preview_text(run))).collect();
+        println!("{label}: can_send={} held={} queued={rows:?}", state.can_send(), state.is_held);
+        state.queued.iter().map(|run| run.run_id.clone()).collect()
+    };
+    drain(events, &mut thread, 1500).await;
+    let queued = print_queue(&thread, "after queueing");
+    if let Some(first) = queued.first() {
+        let edit = queue::edit_queued_run(&uuid(), thread_id, first, "Queued one, edited");
+        println!("edit: {:?}", client.dispatch(edit).await.map(|_| "accepted"));
+    }
+    if let Some(second) = queued.get(1) {
+        let cancel = queue::cancel_queued_run(&uuid(), thread_id, second);
+        println!("cancel: {:?}", client.dispatch(cancel).await.map(|_| "accepted"));
+    }
+    drain(events, &mut thread, 1500).await;
+    print_queue(&thread, "after edit and cancel");
+    Ok(())
+}
+
+async fn drain(events: &mut tokio::sync::mpsc::Receiver<ClientEvent>, thread: &mut t3_core::thread::ThreadState, wait: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let ClientEvent::Thread { item, .. } = event {
+            thread.apply(*item);
+        }
+    }
+}
+

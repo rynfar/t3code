@@ -41,6 +41,10 @@ impl Composer {
             self.advance(window, cx);
             return;
         }
+        if self.editing_queued().is_some() {
+            self.save_queued_edit(window, cx);
+            return;
+        }
         let text = self.prompt(cx).trim().to_owned();
         let staged = self.staged_attachments();
         if text.is_empty() && staged.is_empty() {

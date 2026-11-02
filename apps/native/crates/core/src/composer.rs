@@ -10,6 +10,7 @@
 pub mod attachments;
 pub mod drafts;
 pub mod menu;
+pub mod queue;
 
 use serde::Deserialize;
 

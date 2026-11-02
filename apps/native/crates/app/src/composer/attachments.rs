@@ -53,7 +53,11 @@ fn image_format(mime_type: &str) -> Option<ImageFormat> {
 }
 
 impl Composer {
+    /// The open target's attachments; none while a queued message is open for editing.
     pub(super) fn staged(&self) -> &[Staged] {
+        if self.editing_queued().is_some() {
+            return &[];
+        }
         self.snapshot.target.as_ref().map(|target| self.staged_for(target)).unwrap_or_default()
     }
 
@@ -82,7 +86,10 @@ impl Composer {
 
     /// Attachments go with a message, not with an answer to the agent's question.
     fn can_attach(&self) -> bool {
-        self.snapshot.target.is_some() && self.answering.is_none() && self.snapshot.pending.user_inputs.is_empty()
+        self.snapshot.target.is_some()
+            && self.answering.is_none()
+            && self.snapshot.pending.user_inputs.is_empty()
+            && self.editing_queued().is_none()
     }
 
     /// `showComposerAttachAction`.

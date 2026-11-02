@@ -63,6 +63,9 @@ impl Composer {
 
     /// The prompt a target's draft holds: the text, unless the prompt shows a question's answer.
     fn draft_prompt(&self, cx: &gpui::App) -> String {
+        if let Some(editing) = self.editing_queued() {
+            return editing.stash.clone();
+        }
         match self.answering {
             Some(_) => self.stash.clone().unwrap_or_default(),
             None => self.prompt(cx),
@@ -98,9 +101,13 @@ impl Composer {
 
     /// Saves the target being left and shows the one being opened.
     pub(super) fn switch_draft(&mut self, from: Option<&Target>, to: Option<&Target>, window: &mut Window, cx: &mut Context<Self>) {
-        let leaving = match self.answering.take() {
-            Some(_) => self.stash.take().unwrap_or_default(),
-            None => self.prompt(cx),
+        // An open question's answer and a queued edit are not the draft; what they set aside is.
+        let answering = self.answering.take().is_some();
+        let stash = self.stash.take();
+        let leaving = match (self.queue.editing.take(), answering) {
+            (Some(editing), _) => editing.stash,
+            (None, true) => stash.unwrap_or_default(),
+            (None, false) => self.prompt(cx),
         };
         if let Some(from) = from {
             let draft = self.capture_draft(from, leaving);

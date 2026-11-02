@@ -321,6 +321,15 @@ pub fn next_pasted_text_name<'a>(existing: impl IntoIterator<Item = &'a str>) ->
     (2..).map(|sequence| format!("pasted-text-{sequence}.txt")).find(|name| !names.contains(name)).unwrap_or_default()
 }
 
+/// `isAttachmentOnlyBootstrapPrompt`: Claude's ultrathink effort prefixes `Ultrathink:`.
+pub fn is_attachment_only_prompt(text: &str) -> bool {
+    let rest = match text.get(..11) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("ultrathink:") => text[11..].trim_start(),
+        _ => text,
+    };
+    rest == ATTACHMENT_ONLY_PROMPT
+}
+
 /// `restoreAttachmentOnlyBootstrapPrompt`: a message with attachments and no words still asks.
 pub fn text_for_send(text: &str, has_attachments: bool) -> String {
     if !has_attachments {

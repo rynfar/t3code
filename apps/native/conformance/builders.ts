@@ -162,6 +162,7 @@ export function run(
     rootNodeId: null,
     activeAttemptId: null,
     queueHeld: status === "queued",
+    queuePosition: status === "queued" ? ordinal : null,
     status,
     requestedAt: NOW,
     startedAt: NOW,

@@ -11,6 +11,7 @@ mod drafts;
 mod menu;
 mod model_picker;
 mod pending;
+mod queue;
 mod send;
 pub(crate) use pending::banner_surface;
 mod view;
@@ -92,6 +93,8 @@ struct Snapshot {
     loaded: bool,
     pending_key: PendingKey,
     pending: PendingRequests,
+    /// Messages waiting behind the active turn.
+    queue: t3_core::composer::queue::QueueState,
 }
 
 /// Everything the footer and send read, resolved against the server config.
@@ -155,6 +158,7 @@ pub struct Composer {
     /// Staged images and files per target.
     attachments: attachments::Attachments,
     drafts: drafts::Drafts,
+    queue: queue::Queue,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -231,6 +235,7 @@ impl Composer {
             menu: Menu::default(),
             attachments: Default::default(),
             drafts: Default::default(),
+            queue: Default::default(),
             _subscriptions: subscriptions,
         };
         composer.load_drafts();
@@ -277,6 +282,7 @@ impl Composer {
             loaded: projection.is_some(),
             pending_key,
             pending,
+            queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
             target,
         }
     }
@@ -312,6 +318,7 @@ impl Composer {
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
+        self.sync_queued_edit(window, cx);
         self.sync_answering(window, cx);
         self.sync_menu(true, cx);
         // The provider, its skills or the compact rule may have changed under the open menu.

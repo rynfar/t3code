@@ -203,7 +203,8 @@ impl Composer {
                 .into_any_element();
         }
         let has_text = self.has_text || !self.staged().is_empty();
-        if running && !has_text {
+        let editing_queued = self.editing_queued().is_some();
+        if running && !has_text && !editing_queued {
             return stop().into_any_element();
         }
         let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
@@ -212,9 +213,10 @@ impl Composer {
         let can_steer = !self.snapshot.compacting;
         let dispatch = rules::dispatch_mode(running, false, follow_up, can_steer);
         let alternate = rules::dispatch_mode(running, true, follow_up, can_steer);
-        let (kind, label) = match (running, dispatch) {
-            (true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
-            (true, _) => (RoundKind::Steer, "Steer message"),
+        let (kind, label) = match (editing_queued, running, dispatch) {
+            (true, _, _) => (RoundKind::Send, "Update queued message"),
+            (false, true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
+            (false, true, _) => (RoundKind::Steer, "Steer message"),
             _ => (RoundKind::Send, "Submit message"),
         };
         let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some();
@@ -223,8 +225,8 @@ impl Composer {
         } else if let Some(reason) = attachment_block {
             reason.into()
         } else if self.sending {
-            "Submitting message".into()
-        } else if running && can_steer {
+            if editing_queued { "Updating queued message".into() } else { "Submitting message".into() }
+        } else if running && can_steer && !editing_queued {
             let action = |mode| if mode == ComposerDispatch::Queue { "queue" } else { "steer" };
             format!("Click to {}, ⌘-click to {}", action(dispatch), action(alternate)).into()
         } else {
@@ -313,6 +315,7 @@ impl Render for Composer {
                 }))
                 .w_full()
                 .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
+                .children(self.render_queue(cx))
                 .children(error.map(|error| {
                     div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))

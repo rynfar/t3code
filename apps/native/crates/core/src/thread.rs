@@ -106,6 +106,9 @@ pub struct Run {
     pub queue_held: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_preparation: Option<Value>,
+    /// Where a queued run waits; queued runs order by it, then by ordinal.
+    #[serde(default)]
+    pub queue_position: Option<u64>,
 }
 
 impl Run {
