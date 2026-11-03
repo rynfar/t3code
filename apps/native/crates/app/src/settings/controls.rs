@@ -65,6 +65,7 @@ pub(crate) fn activates(event: &KeyDownEvent) -> bool {
 pub enum ButtonVariant {
     /// `primary` fill: the screen's main action.
     Default,
+    Secondary,
     Ghost,
     GhostMuted,
     Outline,
@@ -177,6 +178,7 @@ impl RenderOnce for Button {
                 let text = hsla(p.primary_foreground);
                 (fill, fill, text, text, fill.opacity(0.9), text)
             }
+            ButtonVariant::Secondary => (hsla(p.secondary), transparent, hsla(p.secondary_foreground), hsla(p.secondary_foreground), hsla(p.secondary).opacity(0.9), hsla(p.secondary_foreground)),
             ButtonVariant::Ghost => (transparent, transparent, hsla(p.foreground), hsla(p.muted_foreground), hsla(p.accent), hsla(p.foreground)),
             ButtonVariant::GhostMuted => {
                 (transparent, transparent, hsla(p.muted_foreground), hsla(p.muted_foreground), hsla(p.accent), hsla(p.foreground))

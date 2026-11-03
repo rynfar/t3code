@@ -252,3 +252,147 @@ fn collection_use_assigns_first_variant_for_each_appearance_together() {
     doc.apply(&C::ThemePatch(select_collection(&doc, &[light])));
     assert_eq!(halves(&doc)["dark"], "night");
 }
+
+#[test]
+fn editor_defaults_seeds_and_single_appearance_locks_match_web() {
+    use editor::Session;
+    let doc=ClientSettingsDoc::default();
+    let s=Session::new(None,None,None,false);
+    assert_eq!(s.colors(),&standard(false)); assert!(!s.advanced);assert_eq!(s.name,"");
+    let mut imported=builtins()[0].clone(); imported.id="imported".into();imported.variants.clear();imported.managed=false;
+    let s=Session::new(Some(imported.clone()),None,None,true);
+    assert!(!s.dark);assert!(s.advanced);assert!(s.lock_reason(true,&doc).unwrap().contains("has no dark palette"));
+    let mut duplicate=Session::new(None,Some(&imported),Some("Imported copy".into()),true);
+    assert!(!duplicate.dark);duplicate.set_appearance(true,&doc);assert!(duplicate.dark);
+    assert_eq!(duplicate.colors(),&standard(true));
+}
+#[test]
+fn editor_guided_advanced_and_picker_cancel_restore_entire_draft() {
+    use editor::{Session,picker};
+    let mut s=Session::new(None,None,Some("Aurora".into()),false);
+    let original=s.colors().clone();s.start_color_edit();s.update_color("canvas","#203040".into());
+    assert_ne!(s.colors()["text"],original["text"]);s.end_color_edit(true);assert_eq!(s.colors(),&original);
+    s.set_advanced(true);s.update_color("surfaceRaised","#1234".into());assert_eq!(picker::hex(&s.colors()["surfaceRaised"]).unwrap(),"#11223344");
+    s.set_advanced(false);assert_ne!(s.colors()["surfaceRaised"],"#1234");
+    s.set_appearance(true,&ClientSettingsDoc::default());assert_eq!(s.colors(),&standard(true));
+    s.set_appearance(false,&ClientSettingsDoc::default());s.update_color("canvas","bad color".into());
+    assert_eq!(s.colors()["canvas"],"bad color");
+    assert!(s.prepare_save(&ClientSettingsDoc::default()).is_ok());
+}
+fn editor_doc(themes:&[ThemeDefinition])->ClientSettingsDoc { ClientSettingsDoc::from_json(&json!({LIBRARY_KEY:themes,crate::client_settings::THEME_KEY:"grove",HALVES_KEY:{"dark":"ocean"},"unrelated":42}).to_string()) }
+fn editor_theme(name:&str,dark:bool)->ThemeDefinition {
+    decode(&json!({"version":1,"name":name,"appearance":if dark{"dark"}else{"light"},"colors":standard(dark),"managed":true}),false).unwrap()
+}
+#[test]
+fn editor_save_is_one_transaction_and_edit_preserves_mix_collection_and_unknown_entries() {
+    use editor::Session;
+    let mut theme=editor_theme("Aurora",false);theme.variants.insert("dark".into(),standard(true));theme.collection=Some(Collection{id:"pack".into(),label:"Pack".into()});
+    let mut doc=editor_doc(std::slice::from_ref(&theme));
+    doc.apply_change(&crate::client_settings::ClientSettingChange::ThemePatch(serde_json::Map::from_iter([(LIBRARY_KEY.into(),json!([theme,{"future":true}]))])));
+    let mut s=Session::new(Some(theme.clone()),None,None,true);s.set_name("Renamed".into(),&doc);s.update_color("canvas","#102030".into());
+    let save=s.prepare_save(&doc).unwrap();assert!(!save.created);assert_eq!(save.theme.id,theme.id);assert_eq!(save.theme.collection,theme.collection);
+    assert_eq!(save.theme.appearance,"light");assert_eq!(save.theme.colors,theme.colors);assert!(save.theme.half(true).is_some());
+    assert!(!save.patch.contains_key(HALVES_KEY));assert!(!save.patch.contains_key(crate::client_settings::THEME_KEY));
+    assert_eq!(save.patch[LIBRARY_KEY][1],json!({"future":true}));
+    let created=Session::new(None,Some(&theme),Some("Another".into()),true).prepare_save(&doc).unwrap();
+    assert!(created.created);assert!(created.theme.variants.is_empty());assert_eq!(created.theme.appearance,"dark");assert_eq!(created.patch[HALVES_KEY],json!({}));
+    assert_eq!(created.patch[crate::client_settings::THEME_KEY],"another");
+}
+#[test]
+fn editor_names_merge_complementary_halves_and_retire_renamed_theme() {
+    use editor::Session;
+    let light=editor_theme("Aurora",false);let dark=editor_theme("Night",true);let doc=editor_doc(&[light.clone(),dark.clone()]);
+    let mut s=Session::new(None,None,None,false);s.set_name(" AURORA ".into(),&doc);
+    assert!(s.dark);assert!(s.lock_reason(false,&doc).unwrap().contains("already has a light palette"));
+    let save=s.prepare_save(&doc).unwrap();assert_eq!(save.theme.id,light.id);assert_eq!(save.theme.colors,light.colors);assert_eq!(save.merged_dark,Some(true));assert_eq!(save.theme.half(true),Some(&standard(true)));
+    let mut s=Session::new(Some(dark),None,None,true);s.set_name("Aurora".into(),&doc);
+    let save=s.prepare_save(&doc).unwrap();assert_eq!(save.patch[LIBRARY_KEY].as_array().unwrap().len(),1);
+    let mut s=Session::new(None,None,None,false);let merged_doc=editor_doc(&[save.theme]);s.set_name("Aurora".into(),&merged_doc);
+    assert_eq!(s.prepare_save(&merged_doc).unwrap_err(),"“Aurora” already has light and dark palettes. Pick another name.");
+    let mut edit=Session::new(Some(light.clone()),None,None,false);edit.set_name("Aurora".into(),&editor_doc(&[]));
+    assert!(edit.prepare_save(&editor_doc(&[])).unwrap_err().contains("not installed"));
+}
+#[test]
+fn editor_validates_name_colors_and_keeps_library_unchanged_until_commit() {
+    use editor::Session;
+    let doc=ClientSettingsDoc::default();let mut s=Session::new(None,None,None,false);
+    assert_eq!(s.prepare_save(&doc).unwrap_err(),"Name your theme first.");
+    s.set_name("x".repeat(49),&doc);assert!(s.prepare_save(&doc).unwrap_err().contains("48 characters"));
+    s.set_name("grove".into(),&doc);assert!(s.prepare_save(&doc).unwrap_err().contains("reserved"));
+    s.set_name("Valid".into(),&doc);s.set_advanced(true);s.update_color("border","var(--foo)".into());
+    assert!(s.prepare_save(&doc).unwrap_err().contains("literal CSS color"));assert!(library(&doc).is_empty());
+}
+#[test]
+fn editor_family_derives_linked_roles_readability_and_filter_aliases() {
+    for dark in [false,true] {
+        let original=standard(dark);
+        for f in editor::FAMILIES {
+            let colors=editor::update_family(dark,&original,f.role,"#734fa080");
+            assert_ne!(colors[f.role],original[f.role]);assert_eq!(colors.len(),original.len());
+            palette(Some(&colors),dark,100,80).unwrap();
+        }
+        let colors=editor::update_family(dark,&original,"text","red");assert_eq!(colors["text"],colors["toolbarControlForeground"]);
+        let colors=editor::update_family(dark,&original,"codeBackground","#f8f8f8");
+        assert!(color::contrast(color::parse(&colors["codeForeground"]).unwrap(),color::parse(&colors["codeBackground"]).unwrap())>=4.5);
+    }
+    assert!(editor::FAMILIES.iter().find(|f|f.role=="mutedForeground").unwrap().matches("sidebar muted foreground"));
+    for (role,alias) in [("error","error text"),("warning","warning background"),("accent","accent color"),("canvas","toolbar background")] {
+        assert!(editor::FAMILIES.iter().find(|f|f.role==role).unwrap().matches(alias),"{alias}");
+    }
+}
+#[test]
+fn editor_picker_rgb_hex_hsv_preserve_alpha_and_roundtrip() {
+    use editor::picker::*;
+    assert_eq!(from_rgb("rgb(1, 2, 255)","#1234"),Some("#0102ff44".into()));
+    for invalid in ["-1 2 3","1 2 256","1.1 2 3","1 2","1 2 3 4"] {assert!(from_rgb(invalid,"red").is_none());}
+    assert_eq!(from_hex("#ABCDEF","#1234"),Some("#abcdef44".into()));assert!(from_hex("#fff","red").is_none());
+    for value in ["#000000","#ffffff","#ff0000","#abcd0180","#173f9a"] {assert_eq!(from_hsv(hsv(value),value),value);}
+    assert!(hex("oklch(0.62 0.2 280 / 0.4)").unwrap().ends_with("66"));
+    let red=hsv("red");assert_eq!(key(red,Axis::Hue,"left",false).unwrap().h,359.);
+    assert_eq!(key(red,Axis::Hue,"end",false).unwrap().h,360.);
+    assert_eq!(key(red,Axis::Saturation,"left",true).unwrap().s,0.9);
+    assert_eq!(key(red,Axis::Brightness,"end",false).unwrap().v,1.);
+    assert!(key(red,Axis::Hue,"escape",false).is_none());
+}
+
+#[test]
+fn editor_families_match_web_color_fixtures() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {dark:bool,role:String,value:String,#[serde(default)]background:Colors,expected:std::collections::BTreeMap<String,String>}
+    let fixtures:Vec<Fixture>=serde_json::from_str(include_str!("editor/fixtures.json")).unwrap();
+    for f in fixtures {
+        let mut input=standard(f.dark);input.extend(f.background);
+        let colors=editor::update_family(f.dark,&input,&f.role,&f.value);
+        for (role,expected) in f.expected {
+            let actual=editor::picker::swatch(&colors[&role]).unwrap();let expected=editor::picker::swatch(&expected).unwrap();
+            for shift in [24,16,8,0] {assert!((((actual>>shift)&255) as i32-((expected>>shift)&255) as i32).abs()<=1,"{} {} dark={} input={} actual={} expected={expected:08x}",f.role,role,f.dark,f.value,colors[&role]);}
+        }
+    }
+}
+
+#[test]
+fn editor_picker_drags_have_one_owner_and_frame_commit_keeps_latest() {
+    use editor::picker::{Drag,Surface,Hsv,FrameCommit};
+    let initial=Hsv{h:120.,s:0.4,v:0.5};let mut drag=Drag::default();
+    assert!(drag.sample(initial,1.,1.).is_none());
+    drag.start(Surface::SaturationValue);
+    let next=drag.sample(initial,1.5,-0.2).unwrap();assert_eq!(next,Hsv{h:120.,s:1.,v:1.});
+    assert_eq!(drag.surface(),Some(Surface::SaturationValue));
+    drag.end();assert!(drag.sample(initial,0.,0.).is_none());
+    drag.start(Surface::Hue);assert_eq!(drag.sample(initial,-1.,0.).unwrap().h,0.);
+    let mut pending=FrameCommit::default();assert!(pending.schedule(initial));assert!(!pending.schedule(next));
+    assert_eq!(pending.take(),Some(next));assert_eq!(pending.take(),None);assert!(pending.schedule(initial));
+    assert_eq!(pending.take_if(false),None);assert_eq!(pending.take_if(true),None);
+}
+#[test]
+fn editor_preview_ignores_name_and_invalid_color_changes() {
+    let mut session=editor::Session::new(None,None,None,false);
+    let mut preview=editor::Preview::new(session.dark,session.colors());
+    session.set_name("Aurora".into(),&ClientSettingsDoc::default());
+    assert!(!preview.update(session.dark,session.colors()));
+    session.set_advanced(true);session.update_color("canvas","bad color".into());
+    assert!(!preview.update(session.dark,session.colors()));
+    session.update_color("canvas","#112233".into());assert!(preview.update(session.dark,session.colors()));
+    assert!(!preview.update(session.dark,session.colors()));
+    session.set_appearance(true,&ClientSettingsDoc::default());assert!(preview.update(session.dark,session.colors()));
+}

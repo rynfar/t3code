@@ -1,10 +1,10 @@
 //! `themePalette.ts` `createVividThemeColors` for environment canvas/accent seeds.
 use super::{Colors, color::*, defaults};
-fn quantize(c: Color) -> Color {
+pub(super) fn quantize(c: Color) -> Color {
     let n = packed(mapped(c, true));
     [f64::from(n >> 24) / 255., f64::from((n >> 16) & 255) / 255., f64::from((n >> 8) & 255) / 255., f64::from(n & 255) / 255.]
 }
-fn foreground(c: Color) -> Color {
+pub(super) fn foreground(c: Color) -> Color {
     let light = [1., 250. / 255., 1., 1.];
     let dark = [36. / 255., 21. / 255., 35. / 255., 1.];
     let a = contrast(c, light);

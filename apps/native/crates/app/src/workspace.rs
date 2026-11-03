@@ -360,6 +360,7 @@ impl Render for Workspace {
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::updates::overlay(cx))
             .children(crate::settings::overlay(window, cx))
+            .children(crate::theme_editor::overlay(window, cx))
             .children(crate::usage::overlay(window, cx))
             .children(crate::quit_hold::hint(cx))
             .into_any_element()

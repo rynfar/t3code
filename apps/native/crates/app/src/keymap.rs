@@ -42,6 +42,7 @@ actions!(
 
 pub fn action_for(command: &str) -> Box<dyn Action> {
     match command {
+        "themeEditor.toggle" => Box::new(crate::theme_editor::ToggleThemeEditor),
         "sidebar.toggle" => Box::new(ToggleSidebar),
         "thread.previous" => Box::new(PreviousThread),
         "thread.next" => Box::new(NextThread),

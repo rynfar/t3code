@@ -566,7 +566,30 @@ const usageTokens = (): ColorToken[] => {
 // lightness to read on the theme's surfaces at runtime, so this runs the same math per palette.
 // The default theme measures `getStandardPaintedThemeColors`; named themes their own roles.
 const CHIP_ACCENTS = "apps/web/src/lib/contextChipAccents.ts";
-const CHIP_KINDS = ["terminal", "thread", "environment", "citation", "review-comment"] as const;
+const CHIP_KINDS = [
+  "image",
+  "video",
+  "file",
+  "mention",
+  "terminal",
+  "element",
+  "preview-annotation",
+  "review-comment",
+  "pull-request",
+  "pr-open",
+  "pr-draft",
+  "pr-merged",
+  "pr-closed",
+  "skill",
+  "thread",
+  "environment",
+  "citation",
+  "doc-pdf",
+  "doc-word",
+  "doc-spreadsheet",
+  "doc-slides",
+  "doc-epub",
+] as const;
 const culoriPackage = require.resolve("culori/package.json");
 const culoriVersion = (
   JSON.parse(NodeFS.readFileSync(culoriPackage, "utf8")) as { version: string }
@@ -864,6 +887,7 @@ function composerTokens(): ColorToken[] {
 }
 
 const COLOR_TOKENS: readonly ColorToken[] = [
+  { name: "picker_thumb_border", web: "ui/color-picker.tsx border-white", css: v("--color-white") },
   ...composerTokens(),
   {
     name: "app_chrome_background",
