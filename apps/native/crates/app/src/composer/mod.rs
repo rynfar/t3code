@@ -612,6 +612,7 @@ impl Composer {
             self.draft_changed(cx);
         }
         let text = self.prompt(cx);
+        self.sync_citation_comment(&text, cx);
         self.sync_context_chips(&text, cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();

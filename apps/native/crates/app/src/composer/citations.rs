@@ -31,8 +31,13 @@ impl Composer {
             return;
         }
         let prompt = self.prompt(cx);
-        let selected = self.input.read(cx).selected_range();
-        let (edit, anchor) = rules::insert_citation(&prompt, selected, citation);
+        let (selected, reversed) = {
+            let input = self.input.read(cx);
+            let selected = input.selected_range();
+            let reversed = input.cursor() < selected.end;
+            (selected, reversed)
+        };
+        let (edit, anchor) = rules::insert_citation(&prompt, selected, reversed, citation);
         self.apply_citation_edit(edit, window, cx);
         self.open_citation_comment(anchor, window, cx);
     }
@@ -81,6 +86,17 @@ impl Composer {
         if reason == "save" || reason == "escape-key" { self.focus(window, cx); }
         cx.notify();
         true
+    }
+
+    pub(super) fn sync_citation_comment(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        let Some(editor) = self.citation_editor.as_mut() else { return };
+        let previous = editor.anchor.link.start;
+        if !editor.anchor.relocate(prompt) {
+            self.citation_editor = None;
+            cx.notify();
+        } else if editor.anchor.link.start != previous {
+            cx.notify();
+        }
     }
 
     pub(super) fn render_citation_chips(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

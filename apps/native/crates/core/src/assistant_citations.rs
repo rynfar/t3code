@@ -165,6 +165,11 @@ pub enum CommentSettlement {
     KeepOpen,
 }
 impl CommentAnchor {
+    pub fn relocate(&mut self, prompt: &str) -> bool {
+        let Some(start) = unique_occurrence(prompt, &self.link.source) else { return false };
+        self.link.start = start;
+        true
+    }
     pub fn dismiss(&self, prompt: &str, draft: &str, reason: &str) -> CommentSettlement {
         if reason == "prompt-replaced" { return CommentSettlement::Close(None); }
         if reason == "escape-key" && let Some(spaces) = self.inserted_spaces {
@@ -184,8 +189,8 @@ impl CommentAnchor {
     }
 }
 
-pub fn insert_citation(prompt: &str, selected: Range<usize>, citation: Citation) -> (PromptEdit, CommentAnchor) {
-    let cursor = selected.end;
+pub fn insert_citation(prompt: &str, selected: Range<usize>, selection_reversed: bool, citation: Citation) -> (PromptEdit, CommentAnchor) {
+    let cursor = if selection_reversed { selected.start } else { selected.end };
     let before = cursor > 0 && !prompt[..cursor].ends_with(char::is_whitespace);
     let after = !prompt[cursor..].starts_with(' ');
     let source = citation.serialize();
@@ -429,14 +434,19 @@ pub fn markdown_text(source: &str) -> String {
     out.trim_end().to_owned()
 }
 
+fn unique_occurrence(text: &str, needle: &str) -> Option<usize> {
+    let first_char = needle.chars().next()?;
+    let start = text.find(needle)?;
+    let next = start + first_char.len_utf8();
+    (!text[next..].contains(needle)).then_some(start)
+}
+
 /// Refuse ambiguous offsets rather than attach a quote to a different occurrence.
 pub fn unique_quote_range(source: &str, quote: &str) -> Option<Range<usize>> {
     let normalized = normalize(source);
     let quote = normalize(quote.trim_end());
     if quote.trim().is_empty() { return None; }
-    let mut matches = normalized.match_indices(&quote);
-    let (start, _) = matches.next()?;
-    if matches.next().is_some() { return None; }
+    let start = unique_occurrence(&normalized, &quote)?;
     let end = start + quote.len();
     let mut normalized_byte = 0;
     let mut space = false;
@@ -512,14 +522,22 @@ mod tests {
     fn rendered_text_omits_markup_destinations_and_controls() {
         assert_eq!(markdown_text("# Hello **world**\n\n[A link](https://example.com) and `code`\n\n```rs\nlet x = 1;\n```"), "Hello world\nA link and code\nlet x = 1;");
         assert_eq!(unique_quote_range("same same", "same"), None);
+        for (source, quote) in [("aaa", "aa\n"), ("ééé", "éé\n")] {
+            assert_eq!(unique_quote_range(source, quote), None);
+            assert!(Citation::from_rendered_selection("e".into(), "t".into(), "m".into(), source, quote).is_none());
+        }
         assert_eq!(unique_quote_range("first\nsecond", "first\n\nsecond"), Some(0..12));
     }
     #[test]
     fn cite_and_cancel_preserve_the_retained_prompt_selection() {
-        for (prompt, selected) in [("keep these words", 0..10), ("α selected tail", 3..11), ("before selected tail", 7..15)] {
-            let (edit, anchor) = insert_citation(prompt, selected.clone(), citation());
+        for (prompt, selected, reversed) in [("keep these words", 0..10, false), ("α selected tail", 3..11, false), ("before selected tail", 7..15, false),
+            ("before selected tail", 7..15, true), ("α selected tail", 3..11, true)] {
+            let (edit, anchor) = insert_citation(prompt, selected.clone(), reversed, citation());
+            let caret = if reversed { selected.start } else { selected.end };
+            assert_eq!(edit.range.start, caret);
             let inserted = edit.apply(prompt);
-            assert!(inserted.contains(&prompt[..selected.end]));
+            assert!(inserted.starts_with(&prompt[..caret]));
+            assert!(inserted.contains(&prompt[selected.clone()]));
             let CommentSettlement::Close(Some(cancel)) = anchor.dismiss(&inserted, "draft", "escape-key") else { panic!("cancel must remove the new citation") };
             assert_eq!(cancel.apply(&inserted), prompt);
         }
@@ -570,4 +588,20 @@ mod tests {
         assert_eq!(procedure.step(CitedMessage::Assistant, false, false), HistoryAction::Aborted);
         assert_eq!(CitationProcedure::default().step(CitedMessage::Assistant, false, false), HistoryAction::Found);
     }
+    #[test]
+    fn comment_anchor_follows_a_unique_raw_link_and_retires_when_lost_or_ambiguous() {
+        let source = citation().serialize();
+        let mut anchor = CommentAnchor { link: CitationLink { start: 0, source: source.clone(), citation: citation() }, inserted_spaces: None };
+        let moved = format!("prefix {source} suffix");
+        assert!(anchor.relocate(&moved));
+        assert_eq!(anchor.link.start, "prefix ".len());
+        assert_eq!(anchor.dismiss(&moved, &"x".repeat(MAX_COMMENT + 1), "outside-press"), CommentSettlement::KeepOpen);
+        let CommentSettlement::Close(Some(saved)) = anchor.dismiss(&moved, "shortened", "save") else { panic!("a moved draft must still save") };
+        let saved = saved.apply(&moved);
+        assert!(saved.starts_with("prefix ") && saved.ends_with(" suffix"));
+        assert_eq!(collect(&saved)[0].1.comment.as_deref(), Some("shortened"));
+        assert!(!anchor.relocate("the link was removed"));
+        assert!(!anchor.relocate(&format!("prefix {source} {source}")));
+    }
+
 }
