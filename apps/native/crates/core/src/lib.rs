@@ -19,6 +19,7 @@ pub mod lineage;
 pub mod lists;
 pub mod local_server;
 pub mod media;
+pub mod mcp_apps;
 pub mod model;
 pub mod notifications;
 pub mod onboarding;

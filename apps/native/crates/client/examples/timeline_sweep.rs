@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
                         RowKind::ProposedPlan(_) => "proposed-plan",
                         RowKind::WorktreeSetup { .. } => "worktree-setup",
                         RowKind::HtmlRender(_) => "html-render",
+                        RowKind::McpApp(_) => "mcp-app",
                     };
                     *kinds.entry(kind).or_default() += 1;
                 }

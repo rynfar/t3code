@@ -234,6 +234,13 @@ fn read_result(value: &Value, budget: &mut Budget, depth: usize) -> (Option<Valu
     }
 }
 
+/// The bounded envelope reader shared with MCP app reference extraction.
+pub(crate) fn compact_data(value: &Value) -> Option<Value> {
+    let mut budget = Budget { bytes: MAX_PARSED_BYTES, nodes: MAX_ENVELOPE_NODES, exceeded: false };
+    let (data, _) = read_result(value, &mut budget, 0);
+    if budget.exceeded { None } else { data }
+}
+
 /// The trailing `" complete"` some ACP providers append to a tool's title.
 fn normalize_tool_label(value: &str) -> &str {
     let trimmed = value.trim_end_matches(is_js_whitespace);

@@ -5,13 +5,14 @@ use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{Bounds, Pixels, Window};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{Message, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSEvent, NSEventMask, NSResponder, NSView, NSWindowOrderingMode,
 };
@@ -39,7 +40,7 @@ fn block_script_windows(page: &WryWebView) {
 /// What the server sends with agent HTML (`http.ts`), less downloads: an opaque origin with
 /// scripts and forms. Popups reach the app as link opens and never as windows.
 const CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-forms allow-popups";
-const MAX_MESSAGE_BYTES: usize = 4096;
+const MAX_MESSAGE_BYTES: usize = 2 * t3_core::mcp_apps::MAX_MESSAGE_BYTES;
 
 pub(super) struct NativeView {
     host: Retained<NSView>,
@@ -49,6 +50,7 @@ pub(super) struct NativeView {
     /// The page's navigation delegate; the web view holds it weakly.
     _policy: Retained<PagePolicy>,
     scroll: Option<Rc<ScrollTarget>>,
+    activation: Activation,
 }
 
 /// wry builds a child web view in the view a window handle names; this one names the container.
@@ -73,14 +75,14 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
 }
 
 /// Every response carries the sandbox, a 404 included.
-fn serve(html: &str, request: &Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
-    let sandboxed = Response::builder().header("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+fn serve(html: &str, policy: &str, request: &Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
+    let sandboxed = Response::builder().header("Content-Security-Policy", policy);
     let response = if request.uri() == super::PAGE_URL {
         sandboxed.header(CONTENT_TYPE, "text/html; charset=utf-8").body(Cow::Owned(html.as_bytes().to_vec()))
     } else {
         sandboxed.status(404).body(Cow::Borrowed(&[][..]))
     };
-    response.unwrap_or_else(|_| Response::builder().status(500).header("Content-Security-Policy", CONTENT_SECURITY_POLICY).body(Cow::Borrowed(&[][..])).unwrap_or_default())
+    response.unwrap_or_else(|_| Response::builder().status(500).header("Content-Security-Policy", policy).body(Cow::Borrowed(&[][..])).unwrap_or_default())
 }
 
 impl NativeView {
@@ -104,10 +106,11 @@ impl NativeView {
         host.addSubview_positioned_relativeTo(&container, NSWindowOrderingMode::Below, None);
 
         let html = page.html.clone();
+        let policy = page.content_security_policy.as_ref().map(|csp| format!("{CONTENT_SECURITY_POLICY}; {csp}")).unwrap_or_else(|| CONTENT_SECURITY_POLICY.into());
         let links = events.clone();
         let link_events = events.clone();
         let builder = WebViewBuilder::new()
-            .with_custom_protocol(super::PAGE_SCHEME.into(), move |_, request| serve(&html, &request))
+            .with_custom_protocol(super::PAGE_SCHEME.into(), move |_, request| serve(&html, &policy, &request))
             .with_url(super::PAGE_URL)
             .with_initialization_script_for_main_only(page.script.as_str(), true)
             .with_ipc_handler(move |request: Request<String>| {
@@ -147,7 +150,14 @@ impl NativeView {
             ScrollTarget::register(&target);
             target
         });
-        Some(NativeView { host, container, page: page_view, webview, _policy: policy, scroll })
+        let activation = Activation::new(&container);
+        Some(NativeView { host, container, page: page_view, webview, _policy: policy, scroll, activation })
+    }
+
+    pub(super) fn take_activation(&self) -> bool {
+        !self.container.isHidden()
+            && self.container.window().is_some_and(|window| window.isKeyWindow())
+            && self.activation.at.take().is_some_and(|at| at.elapsed() <= Duration::from_secs(5))
     }
 
     /// Shows the page at `frame`, cut to `visible`; both in window points from the top left.
@@ -328,5 +338,63 @@ impl ScrollTarget {
         let Some(target) = target else { return false };
         target.host.scrollWheel(event);
         true
+    }
+}
+
+/// User activation comes from AppKit events in this view, never from the document's IPC data.
+struct Activation {
+    at: Rc<Cell<Option<Instant>>>,
+    monitor: Option<Retained<AnyObject>>,
+}
+
+impl Activation {
+    fn new(container: &NSView) -> Self {
+        let at = Rc::new(Cell::new(None));
+        let noted = at.clone();
+        let container = container.retain();
+        let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            // SAFETY: AppKit passes the live event to its local monitor.
+            let event_ref = unsafe { event.as_ref() };
+            let inside = MainThreadMarker::new().and_then(|mtm| event_ref.window(mtm)).is_some_and(|window| {
+                if container.window().is_none_or(|host| Retained::as_ptr(&host) != Retained::as_ptr(&window)) { return false; }
+                if event_ref.r#type() == objc2_app_kit::NSEventType::KeyDown {
+                    return window.firstResponder().is_some_and(|r| r.downcast_ref::<NSView>().is_some_and(|v| v.isDescendantOf(&container)));
+                }
+                let p = container.convertPoint_fromView(event_ref.locationInWindow(), None);
+                let size = container.frame().size;
+                !container.isHidden() && p.x >= 0. && p.y >= 0. && p.x < size.width && p.y < size.height
+            });
+            noted.set(inside.then(Instant::now));
+            event.as_ptr()
+        });
+        let mask = NSEventMask::LeftMouseDown | NSEventMask::LeftMouseUp | NSEventMask::RightMouseDown | NSEventMask::RightMouseUp | NSEventMask::KeyDown;
+        // SAFETY: the block returns its input event unchanged.
+        let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) };
+        Self { at, monitor }
+    }
+}
+
+impl Drop for Activation {
+    fn drop(&mut self) {
+        if let Some(monitor) = &self.monitor {
+            // SAFETY: this is the monitor token returned by AppKit for this view.
+            unsafe { NSEvent::removeMonitor(monitor); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_page_response_keeps_sandbox_and_app_restrictions() {
+        let policy = format!("{CONTENT_SECURITY_POLICY}; default-src 'none'; connect-src https://api.example.test");
+        for (uri, status) in [(super::super::PAGE_URL, 200), ("t3-page://page/missing", 404)] {
+            let request = Request::builder().uri(uri).body(Vec::new()).unwrap();
+            let response = serve("<p>app</p>", &policy, &request);
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["Content-Security-Policy"], policy);
+        }
     }
 }

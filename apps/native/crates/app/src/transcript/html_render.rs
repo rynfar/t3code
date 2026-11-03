@@ -257,7 +257,7 @@ impl HtmlFrames {
             return Slot::Card;
         }
         let (events, mut received) = mpsc::unbounded();
-        let page = Page { html, dark, scroll_through: true, script: format!("{CONTENT_HEIGHT_SCRIPT}{}", canvas_script(canvas)) };
+        let page = Page { html, dark, content_security_policy: None, scroll_through: true, script: format!("{CONTENT_HEIGHT_SCRIPT}{}", canvas_script(canvas)) };
         let Some(view) = WebView::new(page, Layer::Transcript, events, window, cx) else { return Slot::Card };
         let event_key = key.clone();
         let pump = cx.spawn(async move |this, cx| {
@@ -479,7 +479,7 @@ impl HtmlFullscreen {
             return;
         }
         let (events, mut received) = mpsc::unbounded();
-        let page = Page { html: self.html.clone(), dark, scroll_through: false, script: canvas_script(canvas) };
+        let page = Page { html: self.html.clone(), dark, content_security_policy: None, scroll_through: false, script: canvas_script(canvas) };
         self.canvas = canvas;
         self.view = WebView::new(page, Layer::Modal, events, window, cx);
         self.unavailable = self.view.is_none();

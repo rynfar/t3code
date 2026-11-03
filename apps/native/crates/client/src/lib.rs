@@ -6,6 +6,7 @@ pub mod device_stream;
 pub mod favicon;
 pub mod history;
 pub mod local;
+pub mod mcp_apps;
 pub mod preview_stream;
 pub mod pull_requests;
 pub mod session;

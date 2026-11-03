@@ -81,6 +81,8 @@ pub struct Page {
     pub scroll_through: bool,
     /// Runs at document start in the main frame, after `window.ipc` exists.
     pub script: String,
+    /// Additional restrictions; the response always keeps its sandbox header.
+    pub content_security_policy: Option<String>,
 }
 
 /// What a page sends the app.
@@ -109,6 +111,7 @@ impl NativeView {
     fn set_zoom(&self, _: f64) {}
     fn evaluate(&self, _: &str) {}
     fn release_focus(&self) {}
+    fn take_activation(&self) -> bool { false }
 }
 
 pub struct WebView {
@@ -156,6 +159,8 @@ impl WebView {
     pub fn evaluate(&self, script: &str) {
         self.native.evaluate(script);
     }
+
+    pub fn take_activation(&self) -> bool { self.native.take_activation() }
 
     fn set_dark(&self, dark: bool) {
         if self.dark.replace(dark) != dark {

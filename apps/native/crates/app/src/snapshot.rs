@@ -153,6 +153,9 @@ impl Options {
         if let Some(page) = flag("--html-fixture") {
             crate::transcript::html_render::fixture::set(PathBuf::from(page));
         }
+        if let Some(page) = flag("--mcp-fixture") {
+            crate::transcript::mcp_app::fixture::set(PathBuf::from(page));
+        }
         Some(Options {
             out: PathBuf::from(out),
             thread: flag("--thread"),
