@@ -82,6 +82,7 @@ impl MinimapUi {
 impl ThreadView {
     /// `onSelect`: scrolls the message to just below the top and leaves follow-to-bottom.
     fn jump_to_minimap_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
         let Some(row_index) = self.minimap.items.get(index).map(|item| item.row_index) else { return };
         let list = self.list.clone();
         let target = self.header_count() + row_index;

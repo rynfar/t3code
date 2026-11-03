@@ -82,5 +82,55 @@ pub fn include_preceding_rows(mut top: ScrollTop, item_height: impl Fn(usize) ->
     top
 }
 
+/// Disclosure settling and the web's live-follow eligibility (`MessagesTimeline.tsx`).
+#[derive(Default)]
+pub struct DisclosureFollow {
+    anchor: Option<String>,
+    generation: u64,
+    following: bool,
+}
+
+impl DisclosureFollow {
+    pub fn toggle(&mut self, key: &str, at_end: bool) {
+        self.anchor = Some(key.to_owned());
+        self.following |= at_end;
+        self.changed();
+    }
+
+    pub fn anchor(&self) -> Option<&str> { self.anchor.as_deref() }
+
+    pub fn generation(&self) -> Option<u64> { self.anchor.as_ref().map(|_| self.generation) }
+
+    pub fn changed(&mut self) {
+        if self.anchor.is_some() { self.generation += 1; }
+    }
+
+    pub fn cancel(&mut self) { self.anchor = None; self.following = false; }
+
+    pub fn settle(&mut self, generation: u64, distance_from_end: f32, viewport: f32) -> bool {
+        if self.generation() != Some(generation) || viewport <= 0. { return false; }
+        self.anchor = None;
+        if at_end(distance_from_end, viewport) {
+            self.following = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn needs_follow_check(&self) -> bool { self.anchor.is_none() && self.following }
+
+    pub fn follow_change(&mut self, distance_from_end: f32, viewport: f32) -> bool {
+        let follow = self.needs_follow_check() && viewport > 0. && distance_from_end <= viewport;
+        if follow { self.following = false; }
+        follow
+    }
+}
+
+/// `resolveTimelineIsAtEnd` uses 40px; maintenance on the next change allows one viewport.
+pub fn at_end(distance_from_end: f32, viewport: f32) -> bool {
+    viewport > 0. && distance_from_end <= 40.
+}
+
 #[cfg(test)]
 mod tests;

@@ -72,6 +72,7 @@ fn row_entry(row: &TimelineRow) -> Option<&str> {
 impl ThreadView {
     /// Opens find, or refocuses it and restarts its search from the viewport.
     pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
         if self.thread_id.is_none() {
             return;
         }
@@ -231,6 +232,7 @@ impl ThreadView {
     /// Opens whatever hides `entry_id` (turn fold, superseded attempt, tool group), scrolls its
     /// row into view, or pages history in when the entry is older than the loaded window.
     pub(super) fn reveal_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
         for _ in 0..3 {
             if let Some(index) = self.rows.iter().position(|row| row_holds(row, entry_id)) {
                 let row = self.rows[index].clone();

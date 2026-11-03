@@ -97,7 +97,7 @@ fn a_disclosure_at_the_tail_anchors_its_row_instead_of_the_end() {
         let rows = ids(&["earlier", row_id, "later"]);
         // A footer follows the data rows; its end is item 5, at 220px.
         let tail = ScrollTop { item: 5, offset: 0. };
-        let visible = capture(&rows, id, 1, tail, 120., tops(1), Some(row_id)).expect("a disclosure releases tail following");
+        let visible = capture(&rows, id, 1, tail, 120., tops(1), Some(row_id)).expect("a disclosure captures its row while following");
         let expanded = ids(&["earlier", row_id, "detail", "later"]);
         assert_eq!(restore(&visible, &expanded, id, 1, ScrollTop { item: 6, offset: 0. }), Some(Anchor::At(ScrollTop { item: 2, offset: 0. })));
         // Expanding an entry remeasures without changing the data or logical scroll top.
@@ -123,4 +123,48 @@ fn a_disclosure_in_a_short_bottom_aligned_transcript_keeps_its_gap() {
     assert_eq!(include_preceding_rows(ScrollTop { item: 1, offset: -160. }, |_| 40.), ScrollTop { item: 0, offset: -120. });
     assert_eq!(capture(&rows, id, 0, tail, 0., tops(0), Some("group")), None);
     assert_eq!(capture(&rows, id, 0, tail, 200., tops(0), Some("missing")), None);
+}
+
+#[test]
+fn disclosure_settling_rearms_end_follow_and_preserves_append_eligibility() {
+    for distance in [-120., 0., 20., 40.] {
+        let mut follow = DisclosureFollow::default();
+        follow.toggle("group", true);
+        let generation = follow.generation().unwrap();
+        assert!(!follow.follow_change(distance, 200.), "hold the row through settling");
+        assert!(follow.settle(generation, distance, 200.), "rearm the tail sentinel at {distance}");
+        assert_eq!(follow.anchor(), None);
+    }
+    for distance in [41., 100., 200.] {
+        let mut follow = DisclosureFollow::default();
+        follow.toggle("group", true);
+        let generation = follow.generation().unwrap();
+        assert!(!follow.settle(generation, distance, 200.), "leave expanded details below their row");
+        assert_eq!(follow.anchor(), None);
+        assert!(follow.follow_change(distance, 200.), "the next data/item change can follow within one viewport");
+    }
+}
+
+#[test]
+fn disclosure_settling_cannot_override_navigation_or_a_newer_layout() {
+    let mut follow = DisclosureFollow::default();
+    follow.toggle("run", true);
+    let old = follow.generation().unwrap();
+    follow.changed();
+    assert!(!follow.settle(old, 0., 200.));
+    assert_eq!(follow.anchor(), Some("run"));
+    let current = follow.generation().unwrap();
+    assert!(!follow.settle(current, 201., 200.));
+    assert!(!follow.follow_change(201., 200.));
+    follow.cancel();
+    assert!(!follow.follow_change(0., 200.));
+    follow.toggle("mid-transcript", false);
+    let current = follow.generation().unwrap();
+    assert!(!follow.settle(current, 100., 200.));
+    assert!(!follow.follow_change(100., 200.));
+    follow.toggle("group", true);
+    let current = follow.generation().unwrap();
+    follow.cancel();
+    assert!(!follow.settle(current, 0., 200.));
+    assert!(!follow.follow_change(0., 200.));
 }
