@@ -132,8 +132,9 @@ fn disclosure_settling_rearms_end_follow_and_preserves_append_eligibility() {
         follow.toggle("group", true);
         let generation = follow.generation().unwrap();
         assert!(!follow.follow_change(distance, 200.), "hold the row through settling");
-        assert!(follow.settle(generation, distance, 200.), "rearm the tail sentinel at {distance}");
+        assert_eq!(follow.settle(generation, distance, 200.), distance == 0., "only rearm the sentinel without moving the viewport at {distance}");
         assert_eq!(follow.anchor(), None);
+        assert_eq!(follow.follow_change(distance, 200.), distance != 0., "near-end eligibility waits for the next change");
     }
     for distance in [41., 100., 200.] {
         let mut follow = DisclosureFollow::default();

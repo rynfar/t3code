@@ -127,14 +127,7 @@ impl ThreadView {
     /// `forwardWheelToTimeline`: the rail and its preview sit over the transcript, so a wheel
     /// there scrolls the transcript, never a scroller underneath (an open command's output).
     fn forward_minimap_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        // The list's own line height for line-based wheels.
-        let delta = event.delta.pixel_delta(px(20.)).y;
-        if event.modifiers.control || delta == px(0.) {
-            return;
-        }
-        // As the list's own wheel does: clamped, and back to following the end at the bottom.
-        let top = self.list.scroll_px_offset_for_scrollbar();
-        self.list.set_offset_from_scrollbar(point(px(0.), top.y + delta));
+        if !forward_wheel(&self.list, &mut self.disclosure, event) { return; }
         cx.stop_propagation();
         cx.notify();
     }
@@ -363,4 +356,17 @@ fn render_preview(index: usize, count: usize, rail_height: f32, preview: Minimap
         })
         .child(card)
         .into_any_element()
+}
+
+pub(super) fn forward_wheel(list: &gpui::ListState, disclosure: &mut t3_core::timeline::anchor::DisclosureFollow, event: &ScrollWheelEvent) -> bool {
+    // The list's own line height for line-based wheels.
+    let delta = event.delta.pixel_delta(px(20.)).y;
+    if event.modifiers.control || delta == px(0.) {
+        return false;
+    }
+    disclosure.cancel();
+    // As the list's own wheel does: clamped, and back to following the end at the bottom.
+    let top = list.scroll_px_offset_for_scrollbar();
+    list.set_offset_from_scrollbar(point(px(0.), top.y + delta));
+    true
 }

@@ -920,34 +920,51 @@ mod tests {
     #[gpui::test]
     fn settled_disclosures_resume_following_appends_and_growth(cx: &mut gpui::TestAppContext) {
         let cx = cx.add_empty_window();
-        struct TestList { list: ListState, heights: Vec<f32> }
+        struct TestList { list: ListState, heights: Vec<f32>, target: usize, header: Rc<std::cell::Cell<gpui::Pixels>> }
         impl Render for TestList {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let heights = self.heights.clone();
-                list(self.list.clone(), move |ix, _, _| div().h(px(heights[ix])).into_any_element()).size_full()
+                let target = self.target;
+                let header = self.header.clone();
+                list(self.list.clone(), move |ix, _, _| {
+                    let header = header.clone();
+                    div().h(px(heights[ix])).relative().when(ix == target, |row| {
+                        row.child(canvas(move |bounds, _, _| header.set(bounds.top()), |_, _, _, _| {}).absolute().size_full())
+                    }).into_any_element()
+                }).size_full()
             }
         }
         for count in [2, 5] {
-            for (extra, collapse) in [(20., false), (100., false), (100., true)] {
+            for (extra, collapse, wheel) in [(20., false, false), (100., false, false), (100., true, false), (100., false, true)] {
                 let list = ListState::new(count, ListAlignment::Bottom, px(600.));
-                let view = cx.update(|_, cx| cx.new(|_| TestList { list: list.clone(), heights: vec![40.; count] }));
+                let target = if count == 2 { 0 } else { 2 };
+                let header = Rc::new(std::cell::Cell::new(px(0.)));
+                let view = cx.update(|_, cx| cx.new(|_| TestList { list: list.clone(), heights: vec![40.; count], target, header: header.clone() }));
                 let draw = |cx: &mut gpui::VisualTestContext| {
                     cx.draw(point(px(0.), px(0.)), size(px(200.), px(120.)), |_, _| view.clone().into_any_element());
                 };
                 draw(cx);
                 let mut follow = anchor::DisclosureFollow::default();
                 follow.toggle("group", true);
-                cx.update(|_, cx| view.update(cx, |view, cx| { view.heights[0] += extra; cx.notify(); }));
-                list.remeasure_items(0..1);
+                cx.update(|_, cx| view.update(cx, |view, cx| { view.heights[target] += extra; cx.notify(); }));
+                list.remeasure_items(target..target + 1);
                 // The disclosure kept its old position, leaving the tail `extra` pixels below.
                 list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(count as f32 * 40. - 120.) });
                 draw(cx);
                 let generation = follow.generation().unwrap();
+                let before_settle = header.get();
                 let rearmed = settle_disclosure(&list, &mut follow, generation);
+                draw(cx);
+                assert_eq!(header.get(), before_settle, "settling alone must not move the toggled row: count={count}, extra={extra}");
+                if wheel {
+                    let event = gpui::ScrollWheelEvent { delta: gpui::ScrollDelta::Pixels(point(px(0.), px(20.))), ..Default::default() };
+                    assert!(minimap::forward_wheel(&list, &mut follow, &event));
+                    draw(cx);
+                }
                 if collapse {
                     follow.toggle("group", false);
-                    cx.update(|_, cx| view.update(cx, |view, cx| { view.heights[0] -= extra; cx.notify(); }));
-                    list.remeasure_items(0..1);
+                    cx.update(|_, cx| view.update(cx, |view, cx| { view.heights[target] -= extra; cx.notify(); }));
+                    list.remeasure_items(target..target + 1);
                     draw(cx);
                     let generation = follow.generation().unwrap();
                     settle_disclosure(&list, &mut follow, generation);
@@ -958,11 +975,19 @@ mod tests {
                 cx.update(|_, cx| view.update(cx, |view, cx| { view.heights.push(40.); cx.notify(); }));
                 list.splice(count..count, 1);
                 draw(cx);
-                assert_eq!(list.logical_scroll_top().item_ix, count + 1, "appends follow after settling: count={count}, extra={extra}, collapse={collapse}");
+                if wheel {
+                    assert!(list.logical_scroll_top().item_ix < count + 1, "minimap wheel navigation must survive an append: count={count}");
+                } else {
+                    assert_eq!(list.logical_scroll_top().item_ix, count + 1, "appends follow after settling: count={count}, extra={extra}, collapse={collapse}");
+                }
                 cx.update(|_, cx| view.update(cx, |view, cx| { *view.heights.last_mut().unwrap() += 20.; cx.notify(); }));
                 list.remeasure_items(count..count + 1);
                 draw(cx);
-                assert_eq!(list.logical_scroll_top().item_ix, count + 1, "growth keeps following too: count={count}, extra={extra}, collapse={collapse}");
+                if wheel {
+                    assert!(list.logical_scroll_top().item_ix < count + 1, "minimap wheel navigation must survive growth: count={count}");
+                } else {
+                    assert_eq!(list.logical_scroll_top().item_ix, count + 1, "growth keeps following too: count={count}, extra={extra}, collapse={collapse}");
+                }
             }
         }
     }

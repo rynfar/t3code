@@ -110,7 +110,8 @@ impl DisclosureFollow {
     pub fn settle(&mut self, generation: u64, distance_from_end: f32, viewport: f32) -> bool {
         if self.generation() != Some(generation) || viewport <= 0. { return false; }
         self.anchor = None;
-        if at_end(distance_from_end, viewport) {
+        self.following |= at_end(distance_from_end, viewport);
+        if distance_from_end == 0. {
             self.following = false;
             true
         } else {
