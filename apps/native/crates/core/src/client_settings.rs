@@ -50,6 +50,25 @@ macro_rules! literal_enum {
 }
 
 literal_enum!(
+    DiffColorScheme {
+        RedGreen => "red-green": "Red & green (default)",
+        BlueOrange => "blue-orange": "Blue & orange",
+    } default RedGreen
+);
+
+literal_enum!(
+    BrowserSearchEngine {
+        DuckDuckGo => "duckduckgo": "DuckDuckGo",
+        Google => "google": "Google",
+        Bing => "bing": "Bing",
+        Brave => "brave": "Brave Search",
+        Kagi => "kagi": "Kagi",
+        Ecosia => "ecosia": "Ecosia",
+        Custom => "custom": "Custom",
+    } default DuckDuckGo
+);
+
+literal_enum!(
     /// `SidebarProjectGroupingMode`. The switch shows on for both repository modes.
     ProjectGroupingMode {
         Repository => "repository": "Repository",
@@ -157,6 +176,12 @@ impl ThemePreference {
 /// One edit to the file, named by its `ClientSettingsSchema` key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientSettingChange {
+    DiffLayout(crate::diff::Layout),
+    DiffIgnoreWhitespace(bool),
+    DiffFilesCollapsed(bool),
+    DiffColorScheme(DiffColorScheme),
+    BrowserSearchEngine(BrowserSearchEngine),
+    BrowserCustomSearchUrl(String),
     NotificationMode(NotificationMode),
     InAppNotifications(bool),
     ProjectGrouping(ProjectGroupingMode),
@@ -189,6 +214,21 @@ impl ClientSettingChange {
         use crate::composer::{FollowUpBehavior, SendShortcut};
         let text = |value: &str| Value::String(value.to_owned());
         match self {
+            ClientSettingChange::DiffLayout(layout) => ("diffLayout", serde_json::json!(layout)),
+            ClientSettingChange::DiffIgnoreWhitespace(on) => {
+                ("diffIgnoreWhitespace", Value::Bool(*on))
+            }
+            ClientSettingChange::DiffFilesCollapsed(on) => ("diffFilesCollapsed", Value::Bool(*on)),
+            ClientSettingChange::DiffColorScheme(scheme) => {
+                ("diffColorScheme", text(scheme.as_str()))
+            }
+            ClientSettingChange::BrowserSearchEngine(engine) => {
+                ("browserSearchEngine", text(engine.as_str()))
+            }
+            ClientSettingChange::BrowserCustomSearchUrl(url) => (
+                "browserCustomSearchUrl",
+                text(&url.trim().chars().take(2048).collect::<String>()),
+            ),
             ClientSettingChange::NotificationMode(mode) => ("notificationMode", text(notification_mode_value(*mode))),
             ClientSettingChange::InAppNotifications(on) => ("inAppNotificationsEnabled", Value::Bool(*on)),
             ClientSettingChange::ProjectGrouping(mode) => ("sidebarProjectGroupingMode", text(mode.as_str())),
@@ -293,6 +333,52 @@ impl ClientSettingsDoc {
 
     fn literal<T: Default>(&self, key: &str, parse: fn(&str) -> Option<T>) -> T {
         self.text(key).and_then(parse).unwrap_or_default()
+    }
+
+    pub fn diff_layout(&self) -> crate::diff::Layout {
+        self.entries
+            .get("diffLayout")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn diff_ignore_whitespace(&self) -> bool {
+        self.flag("diffIgnoreWhitespace", true)
+    }
+
+    pub fn diff_files_collapsed(&self) -> bool {
+        self.flag("diffFilesCollapsed", true)
+    }
+
+    pub fn diff_color_scheme(&self) -> DiffColorScheme {
+        self.literal("diffColorScheme", DiffColorScheme::parse)
+    }
+
+    pub fn browser_search_engine(&self) -> BrowserSearchEngine {
+        self.literal("browserSearchEngine", BrowserSearchEngine::parse)
+    }
+
+    pub fn browser_custom_search_url(&self) -> &str {
+        self.text("browserCustomSearchUrl")
+            .filter(|url| url.chars().count() <= 2048)
+            .unwrap_or("")
+    }
+
+    pub fn browser_search_template(&self) -> &str {
+        match self.browser_search_engine() {
+            BrowserSearchEngine::DuckDuckGo => crate::preview::address::DEFAULT_SEARCH_TEMPLATE,
+            BrowserSearchEngine::Google => "https://www.google.com/search?q=%s",
+            BrowserSearchEngine::Bing => "https://www.bing.com/search?q=%s",
+            BrowserSearchEngine::Brave => "https://search.brave.com/search?q=%s",
+            BrowserSearchEngine::Kagi => "https://kagi.com/search?q=%s",
+            BrowserSearchEngine::Ecosia => "https://www.ecosia.org/search?q=%s",
+            BrowserSearchEngine::Custom
+                if valid_search_template(self.browser_custom_search_url()) =>
+            {
+                self.browser_custom_search_url().trim()
+            }
+            BrowserSearchEngine::Custom => crate::preview::address::DEFAULT_SEARCH_TEMPLATE,
+        }
     }
 
     pub fn notification_mode(&self) -> NotificationMode {
@@ -428,3 +514,22 @@ pub fn merge_patch(current: Option<&str>, patch: &Map<String, Value>) -> MergedS
 
 #[cfg(test)]
 mod tests;
+
+/// `isValidSearchUrlTemplate` from `shared/src/preview.ts`.
+pub fn valid_search_template(template: &str) -> bool {
+    let template = template.trim();
+    if !template.contains("%s") {
+        return false;
+    }
+    let (Ok(first), Ok(second)) = (
+        url::Url::parse(&template.replace("%s", "a")),
+        url::Url::parse(&template.replace("%s", "b")),
+    ) else {
+        return false;
+    };
+    matches!(first.scheme(), "http" | "https")
+        && first.username() == second.username()
+        && first.password() == second.password()
+        && first.host_str() == second.host_str()
+        && first.port() == second.port()
+}

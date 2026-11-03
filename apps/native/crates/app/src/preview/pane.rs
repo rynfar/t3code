@@ -15,7 +15,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 use t3_client::session::RpcError;
-use t3_core::preview::address::{DEFAULT_SEARCH_TEMPLATE, HistoryEntry, RECENT_SHOWN, UrlError, normalize_preview_url, resolve_address_bar_input};
+use t3_core::preview::address::{HistoryEntry, RECENT_SHOWN, UrlError, normalize_preview_url, resolve_address_bar_input};
 use t3_core::preview::stream::StreamInput;
 use t3_core::preview::{DiscoveredServer, NavStatus, SessionSnapshot, decode_discovered_servers, describe_error, error_label, host_label, method, shows_empty_state, step_zoom};
 
@@ -231,7 +231,7 @@ impl PreviewPane {
     /// `handleSubmitUrl`: a URL, or a search for the text.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed = self.url.read(cx).value().to_string();
-        match resolve_address_bar_input(&typed, DEFAULT_SEARCH_TEMPLATE) {
+        match resolve_address_bar_input(&typed, crate::settings::client_settings(cx).browser_search_template()) {
             Ok(url) => {
                 if self.navigate_to(url.clone(), cx) {
                     let thread = self.thread_id.clone();

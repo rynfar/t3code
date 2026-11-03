@@ -75,6 +75,9 @@ impl Section {
             Section::General
                 | Section::Appearance
                 | Section::Chat
+                | Section::Diffs
+                    | Section::Browser
+                    | Section::SnapShot
                 | Section::Keybindings
                 | Section::Providers
                 | Section::Threads
@@ -164,6 +167,30 @@ impl SearchItem {
 pub fn items(features: Features) -> Vec<SearchItem> {
     use Section::*;
     let mut items = vec![
+        SearchItem::new("diff-color-scheme", "Diff colors", Diffs, &["red green blue orange additions deletions changes counts palette colorblind"]),
+        SearchItem::new("hide-whitespace-changes", "Hide whitespace changes", Diffs, &["diff ignore spaces edits default"]),
+        SearchItem::new("default-diff-file-state", "Default diff file state", Diffs, &["collapsed expanded collapse expand files pull request pr code tab"]),
+        SearchItem::new("diff-layout", "Diff layout", Diffs, &["stacked split side by side unified inline view"]),
+        SearchItem::new("proactive-panels", "Open pull requests and changes panels proactively", Diffs, &["proactive automatically open diff pull request pr right panel agent completion"]),
+        SearchItem::new("pull-request-links-open-in-app", "Open pull requests in T3 Code", Diffs, &["pr commit links GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps browser external click default pull request view panel"]),
+        SearchItem::new("agent-browser-access", "Agent browser access", Browser, &["allow disable enable open drive preview tools sessions project override"]),
+        SearchItem::new("browser-profiles", "Browser profiles", Browser, &[""]).target("browser"),
+        SearchItem::new("browser-default-profile", "Default browser profile", Browser, &[""]).target("browser-profiles"),
+        SearchItem::new("browser-default-viewport", "Default browser viewport", Browser, &["preview size width height device desktop mobile rotate"]),
+        SearchItem::new("browser-default-zoom", "Default browser zoom", Browser, &["preview page scale tabs percent"]),
+        SearchItem::new("browser-default-appearance", "Default browser appearance", Browser, &["preview color scheme light dark system os"]),
+        SearchItem::new("browser-recording-frame-rate", "Browser recording frame rate", Browser, &[""]),
+        SearchItem::new("browser-recording-key-presses", "Show key presses in recordings", Browser, &["browser preview keyboard shortcuts keystrokes overlay capture"]),
+        SearchItem::new("browser-recording-mouse-presses", "Show mouse presses in recordings", Browser, &["browser preview clicks buttons drag overlay capture"]),
+        SearchItem::new("browser-link-target", "Open links in", Browser, &["links default browser in-app browser external open"]),
+        SearchItem::new("browser-search-engine", "Search engine", Browser, &["address bar duckduckgo google bing brave kagi ecosia custom url"]),
+        SearchItem::new("browser-auto-show-floating-preview", "Auto-show floating preview", Browser, &["agent opens browser device simulator pop into view hide"]),
+        SearchItem::new("snap-shot-enabled", "SnapShots", SnapShot, &["window capture screenshot"]),
+        SearchItem::new("snap-shot-accessibility", "Include app text", SnapShot, &["capture accessibility data text UI structure elements privacy omit agent context"]).target("snap-shot-enabled"),
+        SearchItem::new("snap-shot-shortcut", "Capture shortcut", SnapShot, &[""]).target("snap-shot-enabled"),
+        SearchItem::new("snap-shot-sound", "Capture sound", SnapShot, &[""]).target("snap-shot-enabled"),
+        SearchItem::new("snap-shot-flash", "Capture flash", SnapShot, &[""]).target("snap-shot-enabled"),
+        SearchItem::new("snap-shot-animations", "Capture animations", SnapShot, &[""]).target("snap-shot-enabled"),
         SearchItem::new("storage-worktree-keep-when", "Keep worktrees with local changes", Worktrees, &["any local files uncommitted changes edited tracked files ignored env build output cleanup"])
             .target("storage-worktrees"),
         SearchItem::new("storage-delete-now", "Delete now", Maintenance, &["storage cleanup run now results report removed kept failed"]),

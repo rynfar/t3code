@@ -122,3 +122,75 @@ fn grouping_toggle_restores_the_last_repository_mode() {
     doc.apply(&ClientSettingChange::LastEnabledProjectGrouping(ProjectGroupingMode::RepositoryPath));
     assert_eq!(doc.last_enabled_project_grouping(), ProjectGroupingMode::RepositoryPath);
 }
+
+#[test]
+fn diff_and_browser_settings_round_trip_and_default_per_key() {
+    use super::{BrowserSearchEngine, DiffColorScheme};
+    use crate::diff::Layout;
+    let doc = ClientSettingsDoc::from_json(
+        r#"{"diffLayout":"future","diffIgnoreWhitespace":0,"diffFilesCollapsed":null,"diffColorScheme":"unknown","browserSearchEngine":"future","browserCustomSearchUrl":4}"#,
+    );
+    assert_eq!(doc.diff_layout(), Layout::Stacked);
+    assert!(doc.diff_ignore_whitespace());
+    assert!(doc.diff_files_collapsed());
+    assert_eq!(doc.diff_color_scheme(), DiffColorScheme::RedGreen);
+    assert_eq!(doc.browser_search_engine(), BrowserSearchEngine::DuckDuckGo);
+    assert_eq!(doc.browser_custom_search_url(), "");
+    let mut doc = ClientSettingsDoc::from_json(r#"{"futureSetting":42}"#);
+    for change in [
+        ClientSettingChange::DiffLayout(Layout::Split),
+        ClientSettingChange::DiffIgnoreWhitespace(false),
+        ClientSettingChange::DiffFilesCollapsed(false),
+        ClientSettingChange::DiffColorScheme(DiffColorScheme::BlueOrange),
+        ClientSettingChange::BrowserSearchEngine(BrowserSearchEngine::Custom),
+        ClientSettingChange::BrowserCustomSearchUrl("  https://example.com/?q=%s  ".into()),
+    ] {
+        assert!(!doc.apply_change(&change).is_empty());
+        assert!(doc.apply_change(&change).is_empty());
+    }
+    let doc = ClientSettingsDoc::from_json(&doc.to_json());
+    assert_eq!(doc.diff_layout(), Layout::Split);
+    assert!(!doc.diff_ignore_whitespace());
+    assert!(!doc.diff_files_collapsed());
+    assert_eq!(doc.diff_color_scheme(), DiffColorScheme::BlueOrange);
+    assert_eq!(doc.browser_search_template(), "https://example.com/?q=%s");
+    assert_eq!(doc.entries()["futureSetting"], 42);
+}
+
+#[test]
+fn browser_custom_search_rejects_query_in_authority_and_falls_back() {
+    use super::{BrowserSearchEngine, valid_search_template};
+    let mut doc = ClientSettingsDoc::default();
+    doc.apply(&ClientSettingChange::BrowserSearchEngine(
+        BrowserSearchEngine::Custom,
+    ));
+    for invalid in [
+        "",
+        "https://example.com/",
+        "file:///tmp/%s",
+        "https://%s.example.com/",
+        "https://%s@example.com/",
+        "https://example.com:%s/",
+    ] {
+        assert!(!valid_search_template(invalid), "{invalid}");
+        doc.apply(&ClientSettingChange::BrowserCustomSearchUrl(invalid.into()));
+        assert_eq!(
+            doc.browser_search_template(),
+            crate::preview::address::DEFAULT_SEARCH_TEMPLATE
+        );
+    }
+    for valid in [
+        "https://example.com/search?q=%s",
+        "http://localhost:8080/%s",
+        "https://example.com/?q=%s&again=%s",
+    ] {
+        assert!(valid_search_template(valid), "{valid}");
+    }
+    for engine in BrowserSearchEngine::ALL
+        .iter()
+        .filter(|engine| **engine != BrowserSearchEngine::Custom)
+    {
+        doc.apply(&ClientSettingChange::BrowserSearchEngine(*engine));
+        assert!(valid_search_template(doc.browser_search_template()));
+    }
+}

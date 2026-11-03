@@ -264,9 +264,12 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
             Section::General,
             Section::Appearance,
             Section::Chat,
+            Section::Diffs,
             Section::Keybindings,
+            Section::SnapShot,
             Section::Providers,
             Section::Threads,
+            Section::Browser,
             Section::Devices,
             Section::ScheduledTasks,
             Section::Projects,
@@ -281,7 +284,12 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
         ]
     );
     assert_eq!(groups.iter().map(|(heading, _)| *heading).collect::<Vec<_>>(), vec![None, Some("Agents"), Some("Code"), Some("Connections"), None]);
-    assert!(search::items(search::Features::default()).iter().all(|item| item.section.is_available(search::Features::default())));
+    let items = search::items(search::Features::default());
+    assert!(items.iter().all(|item| item.section.is_available(search::Features::default())));
+    for (id, section, anchor) in [("diff-layout", Section::Diffs, "diff-layout"), ("browser-default-profile", Section::Browser, "browser-profiles"), ("snap-shot-shortcut", Section::SnapShot, "snap-shot-enabled")] {
+        let item = items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!((item.section, item.anchor()), (section, anchor));
+    }
 }
 
 #[test]
@@ -507,4 +515,22 @@ fn archive_groups_follow_snapshot_projects_newest_archive_first() {
     assert_eq!(archive::description(&groups[0].threads[0], now), "Archived 3h ago \u{00b7} Created 4d ago");
     assert_eq!(archive::relative_label("2026-10-05T02:59:30Z", now), "just now");
     assert!(archive::groups(&json!(null)).is_empty());
+}
+
+#[test]
+fn browser_access_defaults_and_patch_follow_the_contract() {
+    for value in [
+        serde_json::json!({}),
+        serde_json::json!({"enableAgentBrowserAccess": "invalid"}),
+    ] {
+        let settings: crate::server_config::ServerSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.enable_agent_browser_access.unwrap_or(true));
+    }
+    let settings: crate::server_config::ServerSettings =
+        serde_json::from_value(serde_json::json!({"enableAgentBrowserAccess": false})).unwrap();
+    assert_eq!(settings.enable_agent_browser_access, Some(false));
+    assert_eq!(
+        super::ServerSettingChange::AgentBrowserAccess(false).payload(),
+        serde_json::json!({"patch":{"enableAgentBrowserAccess":false}})
+    );
 }

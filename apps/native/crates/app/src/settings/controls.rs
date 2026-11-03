@@ -649,6 +649,34 @@ pub fn section_title(title: impl Into<SharedString>) -> gpui::Div {
     h_flex().min_h(r(28.)).px(r(16.)).text_base().font_weight(FontWeight::SEMIBOLD).child(title.into())
 }
 
+/// `SettingsUnavailableGroup`: a visible explanation above dimmed, inert rows.
+pub fn unavailable_group(message: &'static str, rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    v_flex()
+        .border_color(hsla(p.border).opacity(0.6))
+        .bg(hsla(p.muted).opacity(0.2))
+        .py(r(6.))
+        .child(
+            h_flex()
+                .items_start()
+                .gap(r(8.))
+                .px(r(16.))
+                .py(r(8.))
+                .child(icon(Icon::Info, 14., hsla(p.warning)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .text_xs()
+                        .line_height(r(18.))
+                        .text_color(hsla(p.muted_foreground))
+                        .child(message),
+                ),
+        )
+        .child(v_flex().opacity(0.64).children(rows))
+}
+
 /// `SettingsGroup`: radius 12, `border` at 60%, `card` at 40%, rows divided by `border` at 50%.
 pub fn group(rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
     let p = palette(cx);

@@ -42,7 +42,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
         }
         _ => None,
     };
-    let layout = panel.state.read(cx).panels.diff_layout;
+    let layout = crate::settings::client_settings(cx).diff_layout();
     let tree_open = panel.state.read(cx).panels.diff_file_tree_open;
     let all_collapsed = panel.all_collapsed();
 

@@ -7,11 +7,12 @@
 mod tokens;
 
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
 use serde_json::json;
-use t3_core::client_settings::{AppearanceMode, ChatWidth, ThemePreference};
+use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
 
@@ -29,6 +30,7 @@ pub struct Preferences {
     pub mode: AppearanceMode,
     pub interface_font_size: f32,
     pub chat_width: ChatWidth,
+    pub diff_color_scheme: DiffColorScheme,
 }
 
 impl Default for Preferences {
@@ -38,6 +40,7 @@ impl Default for Preferences {
             mode: AppearanceMode::System,
             interface_font_size: metrics::ROOT_FONT_SIZE,
             chat_width: ChatWidth::Comfortable,
+            diff_color_scheme: DiffColorScheme::default(),
         }
     }
 }
@@ -126,6 +129,45 @@ fn halves(theme: &ThemePreference) -> (&'static Palette, &'static Palette) {
     (light, dark)
 }
 
+fn blue_orange(mut palette: Palette) -> Palette {
+    palette.diff_addition = palette.blue_orange_diff_addition;
+    palette.diff_deletion = palette.blue_orange_diff_deletion;
+    palette.diff_addition_foreground = palette.blue_orange_diff_addition_foreground;
+    palette.diff_deletion_foreground = palette.blue_orange_diff_deletion_foreground;
+    palette.diff_modified_icon = palette.blue_orange_diff_modified_icon;
+    palette.diff_row_addition = palette.blue_orange_diff_row_addition;
+    palette.diff_row_addition_gutter = palette.blue_orange_diff_row_addition_gutter;
+    palette.diff_row_deletion = palette.blue_orange_diff_row_deletion;
+    palette.diff_row_deletion_gutter = palette.blue_orange_diff_row_deletion_gutter;
+    palette
+}
+
+fn diff_halves(preferences: &Preferences) -> (&'static Palette, &'static Palette) {
+    if preferences.diff_color_scheme == DiffColorScheme::RedGreen {
+        return halves(&preferences.theme);
+    }
+    static DEFAULT: LazyLock<(Palette, Palette)> =
+        LazyLock::new(|| (blue_orange(tokens::LIGHT), blue_orange(tokens::DARK)));
+    static NAMED: LazyLock<Vec<(Palette, Palette)>> = LazyLock::new(|| {
+        BUILT_IN_THEMES
+            .iter()
+            .map(|theme| {
+                (
+                    blue_orange(theme.light.unwrap_or(tokens::LIGHT)),
+                    blue_orange(theme.dark.unwrap_or(tokens::DARK)),
+                )
+            })
+            .collect()
+    });
+    let pair = preferences
+        .theme
+        .named_id()
+        .and_then(|id| BUILT_IN_THEMES.iter().position(|theme| theme.id == id))
+        .map(|index| &NAMED[index])
+        .unwrap_or(&DEFAULT);
+    (&pair.0, &pair.1)
+}
+
 /// The first installed family of the web's `--font-mono` stack (`index.css`): SF Mono is not an
 /// installed family on every Mac, and an unknown family falls back to the proportional UI font.
 const MONO_STACK: &[&str] = &["SF Mono", "SFMono-Regular", "Menlo", "Consolas", "Liberation Mono"];
@@ -139,7 +181,7 @@ fn install(cx: &mut App) {
     let dark = is_dark(cx);
     let mono = mono_family(cx);
     let preferences = preferences(cx).clone();
-    let (light_palette, dark_palette) = halves(&preferences.theme);
+    let (light_palette, dark_palette) = diff_halves(&preferences);
     cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }));
     let size = preferences.interface_font_size;
     let theme = Theme::global_mut(cx);

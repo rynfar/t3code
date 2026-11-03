@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use gpui::Context;
 use serde_json::json;
 use t3_client::store;
-use t3_core::diff::{DiffSelection, Layout, TurnDiffSummary};
+use t3_core::diff::{DiffSelection, TurnDiffSummary};
 use t3_core::right_panel::{RightPanels, Surface, SurfaceKind, decode_lenient_map};
 
 use crate::app_state::{AppEvent, AppState};
@@ -28,7 +28,6 @@ pub struct PanelState {
     pub diff_selections: HashMap<String, DiffSelection>,
     /// `branchBaseRefByThreadKey`.
     pub branch_base_refs: HashMap<String, String>,
-    pub diff_layout: Layout,
     /// `t3code.diffFileTreeOpen`.
     pub diff_file_tree_open: bool,
     /// The thread whose diff was opened by an explicit request (a turn's "files changed"), so
@@ -47,7 +46,6 @@ impl PanelState {
             panels: scoped.as_ref().and_then(|value| value.get("panels")).map(RightPanels::from_value).unwrap_or_default(),
             diff_selections: decode_lenient_map(scoped.as_ref().and_then(|value| value.get("diffSelections"))),
             branch_base_refs: decode_lenient_map(scoped.as_ref().and_then(|value| value.get("branchBaseRefs"))),
-            diff_layout: shared.as_ref().and_then(|value| value.get("diffLayout")).and_then(|layout| serde_json::from_value(layout.clone()).ok()).unwrap_or_default(),
             diff_file_tree_open: shared.as_ref().and_then(|value| value.get("diffFileTreeOpen")).and_then(serde_json::Value::as_bool).unwrap_or(false),
             explicit_diff_open: None,
             environment: environment.map(str::to_owned),
@@ -55,7 +53,7 @@ impl PanelState {
     }
 
     fn save(&self) {
-        store::save_ui_state(STORE, &json!({ "diffLayout": self.diff_layout, "diffFileTreeOpen": self.diff_file_tree_open }));
+        store::save_ui_state(STORE, &json!({ "diffFileTreeOpen": self.diff_file_tree_open }));
         if let Some(environment) = &self.environment {
             let scoped = json!({ "panels": self.panels, "diffSelections": self.diff_selections, "branchBaseRefs": self.branch_base_refs });
             store::save_ui_state(&environment_store(environment), &scoped);
@@ -252,13 +250,6 @@ impl AppState {
         let Some(thread_id) = self.panel_thread() else { return };
         let Some(selection) = self.panels.diff_selections.get_mut(&thread_id) else { return };
         if selection.reconcile(ordered) {
-            self.save_panels(cx);
-        }
-    }
-
-    pub fn set_diff_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
-        if self.panels.diff_layout != layout {
-            self.panels.diff_layout = layout;
             self.save_panels(cx);
         }
     }

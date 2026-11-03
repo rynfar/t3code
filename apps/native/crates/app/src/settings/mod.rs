@@ -11,6 +11,7 @@ mod archive;
 pub(crate) mod controls;
 mod devices;
 mod diagnostics;
+mod diffs_browser;
 mod general;
 mod keybindings;
 mod maintenance;
@@ -258,6 +259,7 @@ pub struct SettingsView {
     pub(crate) maintenance: maintenance::MaintenanceState,
     pub(crate) diagnostics: diagnostics::DiagnosticsState,
     pub(crate) devices: devices::DevicesState,
+    browser: diffs_browser::BrowserState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -308,6 +310,7 @@ impl SettingsView {
             maintenance: maintenance::MaintenanceState::new(window, cx),
             diagnostics: diagnostics::DiagnosticsState::new(window, cx),
             devices: devices::DevicesState::new(cx),
+            browser: diffs_browser::BrowserState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -421,6 +424,7 @@ impl SettingsView {
 
     /// Saves what a commit-on-blur field holds, before the modal unmounts it.
     fn commit_focused_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_browser_url(window, cx);
         self.commit_focused_thread_field(window, cx);
         self.commit_focused_provider_field(window, cx);
         self.commit_focused_worktree_field(window, cx);
@@ -724,6 +728,9 @@ impl SettingsView {
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         match self.section {
             Section::General => self.general(cx),
+            Section::Diffs => self.diffs_page(cx),
+            Section::Browser => self.browser_page(window, cx),
+            Section::SnapShot => self.snapshots_page(cx),
             Section::Appearance => self.appearance(cx),
             Section::Chat => self.chat(cx),
             Section::Labs => self.labs(cx),
@@ -742,7 +749,6 @@ impl SettingsView {
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
             Section::Devices => self.devices_page(cx),
-            _ => Vec::new(),
         }
     }
 
