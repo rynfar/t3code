@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -150,6 +150,7 @@ pub struct Options {
     connect_screen: bool,
     cloud_fixture: Option<String>,
     chatgpt_fixture: Option<PathBuf>,
+    provider_fixture: Option<PathBuf>,
     turn_items_fixture: Option<PathBuf>,
     updates_fixture: Option<String>,
     managed_policy_fixture: Option<String>,
@@ -212,6 +213,7 @@ impl Options {
             connect_screen: has("--connect"),
             cloud_fixture: flag("--cloud-fixture"),
             chatgpt_fixture: flag("--chatgpt-fixture").map(PathBuf::from),
+            provider_fixture: flag("--provider-fixture").map(PathBuf::from),
             turn_items_fixture: flag("--turn-items-fixture").map(PathBuf::from),
             updates_fixture: flag("--updates-fixture"),
             managed_policy_fixture: flag("--managed-policy-fixture"),
@@ -352,6 +354,24 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                 }
                 config.settings.provider_instances=instances.into_iter().collect();
                 config.providers.splice(0..0,std::iter::once(fixture.provider).chain(fixture.other_accounts));
+            }
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+        });
+    }
+
+    if let Some(path) = &options.provider_fixture {
+        let fixture: t3_core::server_config::ServerConfig =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let configured = state.clone();
+        pump(&mut cx, options.wait, move |cx| configured.read_with(cx, |state, _| state.server_config.config.is_some()));
+        state.update(&mut cx, |state, cx| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.providers.retain(|provider| !fixture.providers.iter().any(|replacement| replacement.instance_id == provider.instance_id));
+                config.providers.extend(fixture.providers);
+                config.settings.provider_instances = config.settings.provider_instances.iter()
+                    .filter(|(id, _)| fixture.settings.provider_instances.get(id).is_none())
+                    .chain(fixture.settings.provider_instances.iter())
+                    .map(|(id, instance)| (id.to_owned(), instance.clone())).collect();
             }
             cx.emit(crate::app_state::AppEvent::ServerConfig);
         });

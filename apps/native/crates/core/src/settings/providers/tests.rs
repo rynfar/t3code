@@ -511,6 +511,18 @@ fn add_provider_filters_featured_more_and_policy_changes() {
     assert_eq!(featured,["cursor"]);
     assert_eq!(more,["fx"]);
     assert!(offered_drivers(true,None).any(|d|d.kind=="codex"));
+    let more: Vec<_> = offered_drivers(false, None).map(|driver| driver.kind).collect();
+    assert_eq!(more, ["fx", "kiro"]);
+    let kiro = find_driver("kiro").expect("Kiro catalog entry");
+    assert_eq!(kiro.label, "Kiro");
+    assert_eq!(kiro.badge_label, Some("Early Access"));
+    assert!(kiro.has_default_instance);
+    let unconfigured = settings(json!({}));
+    assert!(!ids(&instance_rows(&unconfigured, &[], None)).contains(&"kiro"));
+    let rows = instance_rows(&unconfigured, &[], Some("kiro"));
+    let row = rows.iter().find(|row| row.instance_id == "kiro").expect("requested Kiro slot");
+    assert!(!row.enabled());
+    assert_eq!(instance_view(row, None, false, true).display_name, "Kiro");
     let none=json!({"limits":{"providers":{"allowedDrivers":["acpRegistry"]}}});
     assert!(offered_drivers(true,Some(&none)).next().is_none());
     assert!(offered_drivers(false,Some(&none)).next().is_none());

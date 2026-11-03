@@ -10,7 +10,7 @@ use crate::server_config::{ProviderInstanceConfig, ProviderModel, ServerConfig, 
 use crate::sidebar::time::parse_iso;
 
 /// Drivers whose instances are off until configured (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
-const DEFAULT_DISABLED_DRIVERS: [&str; 7] = ["cursor", "grok", "fx", "muse", "pi", "opencode", "antigravity"];
+const DEFAULT_DISABLED_DRIVERS: [&str; 8] = ["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"];
 /// Instances on without any config (`DEFAULT_ENABLED_DEFAULT_INSTANCES`).
 const DEFAULT_ENABLED_INSTANCES: [&str; 2] = ["codex", "claudeAgent"];
 
@@ -23,6 +23,7 @@ pub fn driver_label(driver: &str) -> String {
         "cursor" => "Cursor".into(),
         "grok" => "Grok".into(),
         "fx" => "fx".into(),
+        "kiro" => "Kiro".into(),
         "muse" => "Muse Code".into(),
         "acpRegistry" => "ACP Registry".into(),
         "pi" => "Pi".into(),
@@ -208,6 +209,7 @@ pub fn default_model(provider: &ServerProvider) -> Option<&str> {
         .or_else(|| provider.models.iter().find(|model| !model.is_custom))
         .or_else(|| provider.models.first())
         .map(|model| model.slug.as_str())
+        .or_else(|| (provider.driver == "kiro").then_some("default"))
 }
 
 /// `resolveProjectDefaultProviderModelSelection`: the first driver group's best instance wins.
