@@ -20,6 +20,8 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 
 pub use drawer::TerminalDrawer;
+pub use pane::{PaneEvent, TerminalPane};
+pub use session::Target;
 pub use element::{set_typography, typography};
 
 use crate::icons::Icon;

@@ -1,9 +1,8 @@
-//! `AgentsStep`, `ConnectedAgentsStep` and `AgentCard` of `WelcomeWizard.tsx`: Codex and Claude
-//! on the connected computer with their readiness, refreshed when the step opens. Install and
-//! Sign in show the command the web types into its setup terminal, to run on that computer;
-//! closing it checks the agents again, as closing the terminal does.
+//! `ConnectedAgentsStep` and `AgentCard` from `web/src/components/onboarding/WelcomeWizard.tsx`.
+//! The embedded setup pane is `agent_terminal`; commands and readiness come from core.
 
-use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
+use gpui::prelude::FluentBuilder;
+use gpui::{AppContext, AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
 use gpui_component::{h_flex, v_flex};
 use t3_core::onboarding::{AgentState, OnboardingAgent, agent_display_name, agent_state, install_command, login_command, onboarding_agents};
 use t3_core::providers::accent_color;
@@ -20,6 +19,7 @@ use crate::theme::{hsla, palette};
 /// One `AgentCard`, read from the server config before rendering.
 struct AgentRow {
     id: SharedString,
+    instance_id: Option<String>,
     driver: &'static str,
     name: String,
     mark: ProviderMark,
@@ -49,6 +49,7 @@ impl AgentRow {
             _ => None,
         };
         AgentRow {
+            instance_id: provider.map(|provider| provider.instance_id.clone()),
             id: format!("welcome-agent-setup-{}", provider.map_or(agent.driver, |provider| provider.instance_id.as_str())).into(),
             driver: agent.driver,
             mark: ProviderMark::configured(agent.driver, &name, provider.and_then(accent_color)),
@@ -111,15 +112,14 @@ impl WelcomeWizard {
             AgentState::Attention => quiet(row.headline),
             AgentState::Install | AgentState::SignIn => {
                 let open = self.setup.as_ref().is_some_and(|setup| setup.driver == row.driver);
-                let (driver, command) = (row.driver, row.command.clone());
+                let (driver, instance_id) = (row.driver, row.instance_id);
                 Button::new(row.id, ButtonVariant::Ghost, ButtonSize::Xs)
                     .icon(Icon::Terminal)
                     .label(if row.state == AgentState::SignIn { "Sign in" } else { "Install" })
-                    .disabled(open || command.is_none())
+                    .disabled(open || row.command.is_none() || !self.terminal_access)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(command) = command.clone() {
-                            this.setup = Some(AgentSetup { driver, command });
-                            cx.notify();
+                        if let Some(instance_id) = &instance_id {
+                            this.open_agent_terminal(driver, instance_id, cx);
                         }
                     }))
                     .into_any_element()
@@ -141,35 +141,94 @@ impl WelcomeWizard {
             .into_any_element()
     }
 
-    /// Where the web's setup terminal sits: the command and where to run it.
-    fn render_setup(&self, command: &str, machine: &str, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
-        v_flex()
-            .mt(r(16.))
-            .rounded(r(8.))
-            .border_1()
-            .border_color(hsla(p.border).opacity(0.7))
-            .bg(hsla(p.background))
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(r(12.))
-                    .px(r(12.))
-                    .py(r(6.))
-                    .border_b_1()
-                    .border_color(hsla(p.border).opacity(0.6))
-                    .rounded_t(r(7.))
-                    .bg(hsla(p.background).opacity(0.6))
-                    .child(div().text_size(r(11.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(format!("Run this command in a terminal on {machine}.")))
-                    .child(Button::new("welcome-agent-setup-close", ButtonVariant::GhostMuted, ButtonSize::Xs).label("Close").on_click(cx.listener(|this, _, _, cx| {
-                        this.setup = None;
-                        this.refresh_providers(cx);
-                        cx.notify();
-                    }))),
-            )
-            .child(div().p(r(12.)).child(self.command_block("welcome-copy-setup", command, cx)))
-            .into_any_element()
+    pub(super) fn watch_terminal_grants(&mut self, cx: &mut Context<Self>) {
+        let app = self.state.read(cx);
+        let connection = app.connection_id();
+        if self.terminal_grants.as_ref().map(|(id, _)| *id) == connection {
+            return;
+        }
+        self.setup = None;
+        self.terminal_grants = None;
+        self.terminal_access = false;
+        let (Some(connection), Some(client)) = (connection, app.client_handle()) else {
+            return;
+        };
+        let mut grants = client.session_state();
+        self.terminal_access =
+            t3_core::terminal::TerminalAccess::of(grants.borrow_and_update().as_ref()).operate;
+        self.terminal_grants = Some((
+            connection,
+            cx.spawn(async move |this, cx| {
+                while grants.changed().await.is_ok() {
+                    let access =
+                        t3_core::terminal::TerminalAccess::of(grants.borrow_and_update().as_ref())
+                            .operate;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.terminal_access = access;
+                            if let Some(setup) = &this.setup {
+                                setup.terminal.update(cx, |_, cx| cx.notify());
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }),
+        ));
+    }
+
+    fn open_agent_terminal(
+        &mut self,
+        driver: &'static str,
+        instance_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use super::agent_terminal::{AgentInstallTerminal, Closed, can_operate};
+        let app = self.state.read(cx);
+        let Some(client) = app.client_handle().filter(can_operate) else {
+            return;
+        };
+        let Some(config) = app.server_config.config.as_ref() else {
+            return;
+        };
+        let agent = onboarding_agents(&config.providers, config.managed_policy.as_ref())
+            .into_iter()
+            .find(|agent| {
+                agent.driver == driver
+                    && agent
+                        .provider
+                        .is_some_and(|provider| provider.instance_id == instance_id)
+            });
+        let Some(row) = agent.map(|agent| AgentRow::of(&agent, Some(config))) else {
+            return;
+        };
+        let Some(command) = row.command else { return };
+        let (cwd, runtime) = (config.cwd.clone(), app.runtime().clone());
+        let instance_id = instance_id.to_owned();
+        let session = t3_core::onboarding::terminal::Session {
+            driver: driver.to_owned(),
+            command,
+            cwd,
+            provider_instance_id: instance_id,
+        };
+        let terminal = cx.new(|cx| AgentInstallTerminal::new(session, client, runtime, cx));
+        let closed = cx.subscribe(&terminal, |this, _, _: &Closed, cx| {
+            this.setup = None;
+            this.refresh_providers(cx);
+            cx.notify();
+        });
+        // The deferred dialog must redraw its scene when the embedded pane publishes a frame.
+        let changed = cx.observe(&terminal, |_, _, cx| cx.notify());
+        self.setup = Some(AgentSetup {
+            driver,
+            terminal,
+            _closed: closed,
+            _changed: changed,
+        });
+        cx.notify();
     }
 
     pub(super) fn render_agents(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -186,13 +245,14 @@ impl WelcomeWizard {
         let rows: Vec<AgentRow> =
             onboarding_agents(providers, config.and_then(|config| config.managed_policy.as_ref())).iter().map(|agent| AgentRow::of(agent, config)).collect();
         let cards: Vec<AnyElement> = rows.into_iter().map(|row| self.render_agent(row, cx)).collect();
-        let setup = self.setup.as_ref().map(|setup| setup.command.clone()).map(|command| self.render_setup(&command, &machine, cx));
+        let setup = self.setup.as_ref().map(|setup| setup.terminal.clone());
         v_flex()
             .child(step_title("Connect your agents", "Choose an agent to start coding. You can add more later.", cx))
             .child(
                 v_flex()
                     .mt(r(20.))
                     .child(div().mb(r(8.)).text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(machine))
+                    .when(!self.terminal_access, |section| section.child(div().mb(r(8.)).text_sm().text_color(hsla(p.muted_foreground)).child(t3_core::onboarding::terminal::PERMISSION_MESSAGE)))
                     .child(v_flex().gap(r(6.)).children(cards))
                     .children(setup),
             )

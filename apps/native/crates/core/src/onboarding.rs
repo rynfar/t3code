@@ -12,6 +12,7 @@
 //! (`resolve_unpaired`).
 
 pub mod projects;
+pub mod terminal;
 
 use serde::Deserialize;
 use serde_json::Value;
