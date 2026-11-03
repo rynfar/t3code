@@ -7,11 +7,11 @@ use t3_core::resource_telemetry::{self as monitor, BooleanState, Category, Histo
 #[derive(Default)]
 pub(super) struct MonitorState {
     feed: Feed,
-    history: Query<Arc<History>>,
+    history: monitor::HistoryState,
+    history_task: Option<Task<()>>,
     retry: Query<()>,
     stream: Option<Task<()>>,
     connection: Option<u64>,
-    window: usize,
     collapsed: HashSet<Identity>,
     fixture: bool,
 }
@@ -21,9 +21,9 @@ impl MonitorState {
         self.fixture = false;
         self.connection = None;
         self.feed = Feed::default();
+        self.history_task = None;
         self.history.reset();
         self.retry.reset();
-        self.window = 1;
         self.collapsed.clear();
     }
 }
@@ -33,6 +33,10 @@ pub(crate) struct Fixture {
     pub snapshot: Option<Snapshot>,
     pub history: Option<History>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub history_error: Option<String>,
+    #[serde(default)]
+    pub history_pending: bool,
 }
 impl gpui::Global for Fixture {}
 
@@ -41,8 +45,7 @@ impl SettingsView {
         if let Some(fixture) = cx.try_global::<Fixture>() {
             if !self.diagnostics.monitor.fixture {
                 self.diagnostics.monitor.feed = Feed { snapshot: fixture.snapshot.clone().map(Arc::new), error: fixture.error.clone() };
-                self.diagnostics.monitor.history.data = fixture.history.clone().map(Arc::new);
-                self.diagnostics.monitor.window = 1;
+                self.diagnostics.monitor.history.query.data = fixture.history.clone().map(Arc::new);
                 self.diagnostics.monitor.fixture = true;
             }
             return;
@@ -81,17 +84,32 @@ impl SettingsView {
     }
 
     fn load_monitor_history(&mut self, cx: &mut Context<Self>) {
-        if self.diagnostics.monitor.fixture {
+        self.diagnostics.monitor.history_task = None;
+        let request = self.diagnostics.monitor.history.query.begin();
+        if let Some(fixture) = cx.try_global::<Fixture>() {
+            if !fixture.history_pending
+                && let Some(error) = &fixture.history_error
+            {
+                self.diagnostics.monitor.history.query.finish(request, Err(error.clone()));
+            }
             return;
         }
         let state = self.state.read(cx);
         let Some(handle) = state.client_handle() else {
+            self.diagnostics.monitor.history.query.finish(request, Err("The connection closed. Try again once it reconnects.".into()));
             return;
         };
-        let window = monitor::HISTORY_WINDOWS[self.diagnostics.monitor.window];
-        let task = state.runtime().spawn(async move { client::history(&handle, window).await.map(Arc::new) });
-        let request = self.diagnostics.monitor.history.begin();
-        self.finish_query(Some(task), request, |this| &mut this.diagnostics.monitor.history, cx);
+        let window = monitor::HISTORY_WINDOWS[self.diagnostics.monitor.history.selected];
+        let mut request_task = client::start_history(state.runtime(), handle, window);
+        self.diagnostics.monitor.history_task = Some(cx.spawn(async move |this, cx| {
+            let result = request_task.result().await;
+            let _ = this.update(cx, |this, cx| {
+                if this.diagnostics.monitor.history.query.finish(request, result) {
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
     }
 
     fn refresh_monitor(&mut self, cx: &mut Context<Self>) {
@@ -404,7 +422,7 @@ impl SettingsView {
 
     fn monitor_timeline(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let query = &self.diagnostics.monitor.history;
+        let query = &self.diagnostics.monitor.history.query;
         let data = query.data.clone();
         let buckets = data.as_ref().map(|h| h.buckets.as_slice()).unwrap_or_default();
         let max_cpu = monitor::history_cpu_scale_max(buckets);
@@ -458,13 +476,13 @@ impl SettingsView {
                     })),
             )
             .into_any_element();
-        let selected = self.diagnostics.monitor.window;
+        let selected = self.diagnostics.monitor.history.selected;
         let windows = h_flex().gap(r(2.)).children(monitor::HISTORY_WINDOWS.iter().enumerate().map(|(index, option)| {
             Button::new(("resource-window", index), if index == selected { ButtonVariant::Outline } else { ButtonVariant::GhostMuted }, ButtonSize::Xs)
                 .label(option.label)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.diagnostics.monitor.window != index {
-                        this.diagnostics.monitor.window = index;
+                    if this.diagnostics.monitor.history.selected != index {
+                        this.diagnostics.monitor.history.select(index);
                         this.load_monitor_history(cx);
                         cx.notify();
                     }
@@ -500,7 +518,7 @@ impl SettingsView {
         let visible = state.feed.snapshot.as_ref().map(|s| monitor::visible_processes(&s.processes, &state.collapsed)).unwrap_or_default();
         let count = match kind {
             MonitorTable::Live => visible.len(),
-            MonitorTable::History => state.history.data.as_ref().map_or(0, |h| h.top_processes.len()),
+            MonitorTable::History => state.history.query.data.as_ref().map_or(0, |h| h.top_processes.len()),
             MonitorTable::Attribution => state.feed.snapshot.as_ref().map_or(0, |s| s.attribution.entries.len()),
         };
         let header = h_flex()
@@ -565,7 +583,7 @@ impl SettingsView {
                 )
             }
             MonitorTable::History => {
-                let process = state.history.data.as_ref()?.top_processes.get(index)?;
+                let process = state.history.query.data.as_ref()?.top_processes.get(index)?;
                 (
                     vec![
                         if process.name.is_empty() { process.command.clone() } else { process.name.clone() },

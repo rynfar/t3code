@@ -93,6 +93,11 @@ pub struct StreamHandle {
     pending: PendingMap,
 }
 
+impl StreamHandle {
+    /// Connection-wide Defect/ClientProtocolError failures clear the session's pending map.
+    pub(crate) fn connection_closed(&self) -> bool { lock(&self.pending).is_none() }
+}
+
 impl Drop for StreamHandle {
     /// Later chunks for this id are dropped unread instead of buffering until the server exits.
     fn drop(&mut self) {
@@ -100,6 +105,18 @@ impl Drop for StreamHandle {
             map.remove(&self.id);
         }
         let _ = self.outbound.send(ClientMessage::Interrupt { request_id: self.id.clone() });
+    }
+}
+
+struct PendingRequest {
+    id: RequestId,
+    outbound: mpsc::UnboundedSender<ClientMessage>,
+    pending: PendingMap,
+}
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        let removed = lock(&self.pending).as_mut().and_then(|map| map.remove(&self.id)).is_some();
+        if removed { let _ = self.outbound.send(ClientMessage::Interrupt { request_id: self.id.clone() }); }
     }
 }
 
@@ -206,9 +223,9 @@ impl Session {
     /// Sends the request now and returns its reply, so requests keep their call order.
     pub fn send_request(&self, tag: &str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
         let (tx, rx) = oneshot::channel();
-        let started = self.start(tag, payload, Pending::Unary(tx));
+        let started = self.start(tag, payload, Pending::Unary(tx)).map(|id| PendingRequest { id, outbound: self.outbound.clone(), pending: self.pending.clone() });
         async move {
-            started?;
+            let _pending = started?;
             rx.await.unwrap_or(Err(RpcError::Closed))
         }
     }

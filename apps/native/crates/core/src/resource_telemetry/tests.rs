@@ -63,3 +63,31 @@ fn formats_web_units_and_process_name_fallback() {
     assert_eq!(attribution_time(1200.), "1.20s");
     assert_eq!(process_name(&Process { command: "'/usr/bin/node' app.js".into(), ..Default::default() }), "node");
 }
+
+#[test]
+fn a_period_change_never_retains_the_previous_period_on_loading_or_failure() {
+    let mut state = HistoryState::default();
+    state.select(1);
+    let loaded = state.query.begin();
+    state.query.finish(loaded, Ok(std::sync::Arc::new(History { window_ms: HISTORY_WINDOWS[1].window_ms, ..Default::default() })));
+    state.select(1);
+    assert!(state.query.data.is_some(), "same-period refresh may retain its data");
+    let stale = state.query.begin();
+    state.select(0);
+    assert_eq!(state.selected, 0);
+    let loading = state.query.begin();
+    assert!(state.query.initial_loading());
+    assert!(state.query.data.is_none(), "the selected 5m period must not show 15m data");
+    assert!(state.query.finish(loading, Err("history unavailable".into())));
+    assert!(state.query.data.is_none());
+    assert_eq!(state.query.error.as_deref(), Some("history unavailable"));
+    assert!(!state.query.finish(stale, Ok(std::sync::Arc::new(History::default()))));
+    state.select(2);
+    assert!(state.query.error.is_none());
+    assert!(!state.query.pending);
+    let old_visit = state.query.begin();
+    state.reset();
+    assert_eq!(state.selected, 1);
+    let _new_visit = state.query.begin();
+    assert!(!state.query.finish(old_visit, Ok(std::sync::Arc::new(History::default()))));
+}

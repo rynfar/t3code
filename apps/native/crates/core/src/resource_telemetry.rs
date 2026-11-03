@@ -246,6 +246,29 @@ impl HistoryWindow {
     }
 }
 
+#[derive(Debug)]
+pub struct HistoryState {
+    pub query: crate::settings::diagnostics::Query<std::sync::Arc<History>>,
+    pub selected: usize,
+}
+impl Default for HistoryState {
+    fn default() -> Self {
+        Self { query: Default::default(), selected: 1 }
+    }
+}
+impl HistoryState {
+    pub fn select(&mut self, selected: usize) {
+        if self.selected != selected {
+            self.query.reset();
+            self.selected = selected;
+        }
+    }
+    pub fn reset(&mut self) {
+        self.query.reset();
+        self.selected = 1;
+    }
+}
+
 pub fn visible_processes(processes: &[Process], collapsed: &HashSet<Identity>) -> Vec<usize> {
     let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, p) in processes.iter().enumerate() {

@@ -493,11 +493,16 @@ async fn run_session(
                 }
                 Some(Command::RefreshSessionState) => fetch.start(),
                 Some(Command::RetryNow) => {}
-                Some(Command::Request { method, payload, reply }) => {
-                    let response = session.send_request(method, payload);
-                    tokio::spawn(async move {
-                        let _ = reply.send(response.await);
-                    });
+                Some(Command::Request { method, payload, mut reply }) => {
+                    if !reply.is_closed() {
+                        let response = session.send_request(method, payload);
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = reply.closed() => {},
+                                result = response => { let _ = reply.send(result); }
+                            }
+                        });
+                    }
                 }
                 Some(Command::Stream { method, payload, reply }) => {
                     let _ = reply.send(session.stream(method, payload));

@@ -45,6 +45,9 @@ pub fn subscribe(runtime: &tokio::runtime::Handle, client: ClientHandle) -> Reso
                             },
                             Err(RpcError::Failure(failure)) => {
                                 tx.send_modify(|feed| feed.error = Some(failure.message));
+                                if stream.connection_closed() {
+                                    break;
+                                }
                                 return;
                             }
                             Err(RpcError::Closed) => break,
@@ -65,6 +68,23 @@ pub fn subscribe(runtime: &tokio::runtime::Handle, client: ClientHandle) -> Reso
         }
     });
     ResourceTelemetryStream { feed, task }
+}
+
+pub struct HistoryRequest {
+    task: JoinHandle<Result<Arc<History>, String>>,
+}
+impl Drop for HistoryRequest {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl HistoryRequest {
+    pub async fn result(&mut self) -> Result<Arc<History>, String> {
+        (&mut self.task).await.map_err(|error| error.to_string())?
+    }
+}
+pub fn start_history(runtime: &tokio::runtime::Handle, client: ClientHandle, window: HistoryWindow) -> HistoryRequest {
+    HistoryRequest { task: runtime.spawn(async move { history(&client, window).await.map(Arc::new) }) }
 }
 
 pub async fn history(client: &ClientHandle, window: HistoryWindow) -> Result<History, String> {
@@ -122,14 +142,77 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn connection_wide_failures_resume_on_the_next_session() {
+        let mut server = FakeServer::start().await;
+        let (client, _events) = crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut connection = connect(&mut server).await;
+        let mut stream = subscribe(&tokio::runtime::Handle::current(), client);
+        let request = connection.request(model::SUBSCRIBE).await;
+        connection.chunk(&request, json!([snapshot("before")])).await;
+        assert_eq!(next(&mut stream.feed).await.snapshot.unwrap().read_at, "before");
+        for failure in [json!({"_tag":"Defect","defect":{"message":"store unavailable"}}), json!({"_tag":"ClientProtocolError","error":{"message":"bad frame"}})] {
+            connection.send(failure).await;
+            assert!(next(&mut stream.feed).await.error.is_some());
+            connection.closed().await;
+            drop(connection);
+            connection = connect(&mut server).await;
+            let request = connection.request(model::SUBSCRIBE).await;
+            connection.chunk(&request, json!([snapshot("recovered")])).await;
+            let feed = next(&mut stream.feed).await;
+            assert_eq!(feed.snapshot.unwrap().read_at, "recovered");
+            assert!(feed.error.is_none());
+        }
+    }
+
+    async fn interrupted(connection: &mut Connection, request: &serde_json::Value) {
+        loop {
+            let message = connection.recv().await;
+            if message["_tag"] == "Interrupt" {
+                assert_eq!(message["requestId"], request["id"]);
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_and_dropping_history_demand_cancels_pending_rpcs() {
+        let mut server = FakeServer::start().await;
+        let (client, _events) = crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut connection = connect(&mut server).await;
+        let runtime = tokio::runtime::Handle::current();
+        let mut owner = Some(start_history(&runtime, client.clone(), model::HISTORY_WINDOWS[1]));
+        let request = connection.request(model::HISTORY).await;
+        // Period change: the same owner slot is replaced before the new request starts.
+        drop(owner.take());
+        interrupted(&mut connection, &request).await;
+        owner = Some(start_history(&runtime, client.clone(), model::HISTORY_WINDOWS[0]));
+        let request = connection.request(model::HISTORY).await;
+        assert_eq!(request["payload"]["windowMs"], 300000);
+        // Leave, permission loss, and environment change all drop this owner.
+        drop(owner.take());
+        interrupted(&mut connection, &request).await;
+        // The connection is still usable after cancellation.
+        let mut last = start_history(&runtime, client, model::HISTORY_WINDOWS[0]);
+        let request = connection.request(model::HISTORY).await;
+        connection.send(json!({"_tag":"Exit","requestId":request["id"],"exit":{"_tag":"Success","value":{"readAt":"now","windowMs":300000,"bucketMs":15000,"sampleIntervalMs":2000,"retainedSampleCount":0,"buckets":[],"topProcesses":[],"health":{}}}})).await;
+        assert_eq!(last.result().await.unwrap().window_ms, 300000);
+    }
+
+    #[tokio::test]
     async fn reports_terminal_errors_and_decodes_both_rpcs() {
         let mut server = FakeServer::start().await;
         let (client, _events) = crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
         let mut c = connect(&mut server).await;
-        let mut stream = subscribe(&tokio::runtime::Handle::current(), client.clone());
-        let request = c.request(model::SUBSCRIBE).await;
-        c.send(json!({"_tag":"Exit","requestId":request["id"],"exit":{"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"unsupported"}}]}})).await;
-        assert_eq!(next(&mut stream.feed).await.error.as_deref(), Some("unsupported"));
+        for (cause, expected) in [
+            (json!({"_tag":"Fail","error":{"_tag":"EnvironmentAuthorizationError","message":"not allowed"}}), "not allowed"),
+            (json!({"_tag":"Die","defect":{"message":"Unknown request tag: subscribeResourceTelemetry"}}), "Unknown request tag: subscribeResourceTelemetry"),
+        ] {
+            let mut stream = subscribe(&tokio::runtime::Handle::current(), client.clone());
+            let request = c.request(model::SUBSCRIBE).await;
+            c.send(json!({"_tag":"Exit","requestId":request["id"],"exit":{"_tag":"Failure","cause":[cause]}})).await;
+            assert_eq!(next(&mut stream.feed).await.error.as_deref(), Some(expected));
+            assert!(tokio::time::timeout(WAIT, stream.feed.changed()).await.unwrap().is_err(), "request-local failure must terminate demand");
+        }
         let handle = client.clone();
         let task = tokio::spawn(async move { history(&handle, model::HISTORY_WINDOWS[1]).await });
         let request = c.request(model::HISTORY).await;
