@@ -31,6 +31,7 @@ gpui-component = { workspace = true, features = [
   "tree-sitter-html",
   "tree-sitter-javascript",
   "tree-sitter-python",
+  "tree-sitter-ruby",
   "tree-sitter-rust",
   "tree-sitter-sql",
   "tree-sitter-toml",

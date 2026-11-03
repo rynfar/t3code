@@ -266,7 +266,15 @@ fn command_styles(
     depth: usize,
     budget: &mut usize,
 ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
-    use gpui_component::{Rope, highlighter::SyntaxHighlighter};
+    use gpui_component::{Rope, highlighter::{LanguageConfig, LanguageRegistry, SyntaxHighlighter}};
+    use t3_core::shell_command::grammars;
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        for name in grammars::LANGUAGES {
+            let grammar = grammars::grammar(name).expect("command grammar");
+            LanguageRegistry::singleton().register(name, &LanguageConfig::new(name, grammar.language, vec![], &grammar.highlights, "", ""));
+        }
+    });
     if *budget == 0 {
         return Vec::new();
     }
