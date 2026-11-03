@@ -348,10 +348,9 @@ impl Render for Composer {
                         .id("composer-card")
                         .rounded(px(16.))
                         .border_1()
-                        .border_color(outline)
+                        .border_color(outline.opacity(0.))
                         .relative()
-                        .child(crate::glass::backdrop(16., surface, outline, cx))
-                        .when(dark, |this| this.shadow(vec![gpui::BoxShadow { color:hsla(p.composer_highlight), offset:gpui::point(px(0.),px(1.)), blur_radius:px(0.),spread_radius:px(0.),inset:true }]))
+                        .child(crate::glass::backdrop_with_highlight(16., surface, outline, dark.then(||hsla(p.composer_highlight)), cx))
                         .when(!dark, |this| {
                             this.shadow(vec![gpui::BoxShadow {
                                 color: gpui::black().opacity(0.05),
