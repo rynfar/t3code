@@ -29,7 +29,8 @@ pub async fn fetch_diff(credentials: &Credentials, payload: Value) -> Result<Val
     let failure = |message: &str| HttpFailure { tag: None, error: Value::Null, message: message.to_owned() };
     let url = diff_url(&credentials.http_base).ok_or_else(|| failure(FALLBACK))?;
     let client = reqwest::Client::builder().timeout(TIMEOUT).build().map_err(|_| failure(FALLBACK))?;
-    let response = client.post(url).bearer_auth(&credentials.access_token).json(&payload).send().await.map_err(|error| {
+    let request = credentials.authorize(client.post(url.as_str()), "POST", url.as_str()).await.map_err(|message| failure(&message))?;
+    let response = request.json(&payload).send().await.map_err(|error| {
         if error.is_timeout() {
             failure(&format!("The server did not answer within {}s.", TIMEOUT.as_secs()))
         } else if error.is_connect() {

@@ -432,7 +432,7 @@ mod tests {
         }
 
         fn credentials(&self) -> Arc<Credentials> {
-            Arc::new(Credentials { http_base: format!("http://{}", self.addr), access_token: "token".into() })
+            Arc::new(Credentials { http_base: format!("http://{}", self.addr), access_token: "token".into(), relay: None })
         }
     }
 

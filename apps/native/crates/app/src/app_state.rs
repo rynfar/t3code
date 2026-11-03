@@ -66,6 +66,7 @@ pub struct AppState {
     /// `environments` as last handed to the store; saves send only the edits since.
     pub(crate) environments_saved: SavedEnvironments,
     pub connect: ConnectScreen,
+    pub cloud: crate::cloud::CloudState,
     pub shell: ShellState,
     pub sidebar: SidebarController,
     pub toasts: crate::toast::Toasts,
@@ -127,6 +128,7 @@ impl AppState {
             environments_saved: environments.clone(),
             environments,
             connect: ConnectScreen::default(),
+            cloud: Default::default(),
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
             toasts: Default::default(),
@@ -158,10 +160,11 @@ impl AppState {
         };
         // Quitting stops the tunnels this app started, by the PIDs it spawned.
         state._ssh_quit = Some(cx.on_app_quit(|state, _| state.ssh.shutdown()));
-        match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
+        match state.environments.active().filter(|environment| environment.credentials().is_some() || environment.relay.is_some()).map(|environment| environment.id.clone()) {
             Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
         }
+        state.refresh_cloud(cx);
         state
     }
 

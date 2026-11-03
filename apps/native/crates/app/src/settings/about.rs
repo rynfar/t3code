@@ -1,6 +1,6 @@
 //! Environments and About. Environments shows the connected environment (label, address, server
 //! and protocol versions, status) with Switch environment, Disconnect, and Remove; the saved list
-//! lives on the connect screen the switcher opens. Linked and relay environments are not ported.
+//! lives on the connect screen the switcher opens, alongside the T3 Connect account.
 //! About shows the app version (`AboutSettingsPanel` in `SettingsPanels.tsx`).
 
 use gpui::{Context, IntoElement, ParentElement, div};
@@ -29,6 +29,7 @@ impl SettingsView {
         let protocol = environment.orchestration_protocol_version.unwrap_or(ORCHESTRATION_PROTOCOL_VERSION);
         let value = |text: String| muted_text(text, cx);
         let (switch_state, disconnect_state, remove_state) = (self.state.clone(), self.state.clone(), self.state.clone());
+        let cloud_state = self.state.clone();
         let remove_id = saved.as_ref().map(|saved| saved.id.clone());
         let connection = section(
             "Environments",
@@ -42,6 +43,13 @@ impl SettingsView {
                     .control(value(if environment.server_version.is_empty() { "Unknown".to_owned() } else { environment.server_version.clone() }))
                     .into_any_element(),
                 Row::new("orchestration-protocol", "Orchestration protocol").control(value(protocol.to_string())).into_any_element(),
+                Row::new("cloud-account", "T3 Connect")
+                    .description("Sign in to connect to your environments from anywhere.")
+                    .control(Button::new("cloud-account-button", ButtonVariant::Outline, ButtonSize::Sm).label("Manage…").on_click(move |_, window, cx| {
+                        close(window, cx);
+                        cloud_state.update(cx, |state, cx| state.open_switcher(cx));
+                    }))
+                    .into_any_element(),
                 Row::new("switch-environment", "Switch environment")
                     .description("Connect to another saved environment, or pair a new one.")
                     .control(Button::new("switch-environment-button", ButtonVariant::Outline, ButtonSize::Sm).label("Switch\u{2026}").on_click(move |_, window, cx| {

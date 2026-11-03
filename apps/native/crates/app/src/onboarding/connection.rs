@@ -377,6 +377,7 @@ mod tests {
             server_version: Some("0.1.6".into()),
             local: id == "mac",
             ssh: None,
+            relay: None,
         }
     }
 

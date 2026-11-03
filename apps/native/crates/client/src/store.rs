@@ -24,7 +24,7 @@ pub fn use_home(home: PathBuf) {
     let _ = HOME_OVERRIDE.set(home);
 }
 
-fn base() -> Option<PathBuf> {
+pub(crate) fn base() -> Option<PathBuf> {
     HOME_OVERRIDE
         .get()
         .cloned()
@@ -60,12 +60,15 @@ pub struct SavedEnvironment {
     /// the tunnel's local address for the current session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<t3_core::ssh::SshTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<t3_core::relay::Environment>,
 }
 
 impl SavedEnvironment {
     /// How the environment is reached, as its row shows it: `SSH user@host` over SSH, else its
     /// address (`environmentTransportLabel`).
     pub fn address(&self) -> String {
+        if self.relay.is_some() { return "T3 Connect".into(); }
         match &self.ssh {
             Some(target) => format!("SSH {}", t3_core::ssh::format_target(target)),
             None => self.http_base.clone(),
@@ -74,7 +77,7 @@ impl SavedEnvironment {
 
     pub fn credentials(&self) -> Option<Credentials> {
         let access_token = self.access_token.clone()?;
-        Some(Credentials { http_base: self.http_base.clone(), access_token })
+        Some(Credentials { http_base: self.http_base.clone(), access_token, relay: None })
     }
 }
 
@@ -109,6 +112,7 @@ impl SavedEnvironments {
             server_version: None,
             local: false,
             ssh: None,
+            relay: None,
         };
         SavedEnvironments { active: Some(id), environments: vec![environment] }
     }
@@ -164,11 +168,20 @@ impl SavedEnvironments {
                 .or_else(|| previous.as_ref().and_then(|environment| environment.server_version.clone())),
             local: ssh.is_none() && (local || previous.is_some_and(|environment| environment.local)),
             ssh,
-        };
+            relay: None,        };
         match self.environments.iter_mut().find(|entry| entry.id == id) {
             Some(entry) => *entry = environment,
             None => self.environments.push(environment),
         }
+        self.active = Some(id.clone());
+        id
+    }
+
+    pub fn upsert_relay(&mut self, environment: t3_core::relay::Environment) -> String {
+        let existing = self.find(Some(&environment.environment_id), &environment.endpoint.http_base_url).map(|e| e.id.clone());
+        let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let saved = SavedEnvironment { id: id.clone(), environment_id: Some(environment.environment_id.clone()), label: environment.label.clone(), http_base: environment.endpoint.http_base_url.trim_end_matches('/').into(), access_token: None, server_version: None, local: false, ssh: None, relay: Some(environment) };
+        match self.environments.iter_mut().find(|e| e.id == id) { Some(entry) => *entry = saved, None => self.environments.push(saved) }
         self.active = Some(id.clone());
         id
     }
@@ -497,6 +510,21 @@ pub fn save(credentials: &Credentials) -> std::io::Result<()> {
     save_environments(&saved)
 }
 
+// Cloud OAuth credentials use the same owner-only, atomic secret storage as pairings.
+pub(crate) fn load_cloud_token(base: &Path) -> std::io::Result<Option<t3_core::connect::Token>> {
+    match std::fs::read(base.join("cloud-oauth.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+pub(crate) fn save_cloud_token(base: &Path, token: &t3_core::connect::Token) -> std::io::Result<()> {
+    write_private(base, "cloud-oauth.json", &serde_json::to_string(token).map_err(std::io::Error::other)?)
+}
+pub(crate) fn clear_cloud_token(base: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(base.join("cloud-oauth.json")) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), result => result }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,7 +582,7 @@ mod tests {
             server_version: "0.1.7".into(),
             ..Default::default()
         });
-        Paired { credentials: Credentials { http_base: http_base.into(), access_token: token.into() }, descriptor }
+        Paired { credentials: Credentials { http_base: http_base.into(), access_token: token.into(), relay: None }, descriptor }
     }
 
     #[test]
@@ -661,6 +689,15 @@ mod tests {
         // A pairing link for the same machine reaches it directly from now on.
         saved.upsert(&paired("https://devbox.ts.net", "t3", "env-devbox", "devbox"), false);
         assert_eq!(saved.get(&devbox).map(|e| (e.ssh.is_none(), e.http_base.as_str())), Some((true, "https://devbox.ts.net")));
+        let relay = t3_core::relay::Environment { environment_id: "env-devbox".into(), label: "devbox".into(), endpoint: t3_core::relay::Endpoint { http_base_url: "https://devbox.connect.test".into(), ws_base_url: "wss://devbox.connect.test/ws".into(), provider_kind: "cloudflare_tunnel".into() } };
+        assert_eq!(saved.upsert_relay(relay), devbox);
+        let text = serde_json::to_string(&saved).unwrap();
+        let restored = decode_environments(Some(&text), None);
+        let entry = restored.get(&devbox).unwrap();
+        assert_eq!(entry.address(), "T3 Connect");
+        assert!(entry.ssh.is_none() && entry.access_token.is_none() && entry.relay.is_some());
+        saved.upsert(&paired("https://devbox.ts.net", "direct", "env-devbox", "devbox"), false);
+        assert!(saved.get(&devbox).unwrap().relay.is_none());
         // Entries saved before SSH existed read as direct.
         assert_eq!(decode_environments(Some(r#"{"environments":[{"id":"a","label":"A","httpBase":"http://h"}]}"#), None).environments[0].ssh, None);
     }

@@ -15,10 +15,12 @@ const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 /// `WELL_KNOWN_ENVIRONMENT_PATH`: the unauthenticated descriptor every server answers.
 const DESCRIPTOR_PATH: &str = "/.well-known/t3/environment";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     pub http_base: String,
     pub access_token: String,
+    #[serde(skip)]
+    pub relay: Option<std::sync::Arc<crate::connect::RelayConnection>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,7 +120,7 @@ pub async fn redeem_pairing(link: &PairingLink) -> Result<Credentials, AuthError
         .json()
         .await
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
-    Ok(Credentials { http_base: link.http_base.clone(), access_token: token.access_token })
+    Ok(Credentials { http_base: link.http_base.clone(), access_token: token.access_token, relay: None })
 }
 
 /// Mints a single-use RPC ticket. Servers that predate ticket audiences answer 404 on the
@@ -143,9 +145,8 @@ pub async fn issue_media_ticket(credentials: &Credentials) -> Result<String, Aut
 
 async fn post_ticket(credentials: &Credentials, path: &str) -> Result<String, AuthError> {
     let host = credentials.http_base.clone();
-    let response = http()
-        .post(format!("{}{path}", credentials.http_base))
-        .bearer_auth(&credentials.access_token)
+    let url = format!("{}{path}", credentials.http_base);
+    let response = credentials.authorize(http().post(&url), "POST", &url).await.map_err(AuthError::Incompatible)?
         .send()
         .await
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
@@ -167,9 +168,8 @@ async fn post_ticket(credentials: &Credentials, path: &str) -> Result<String, Au
 /// `GET /api/auth/session`: what this device's credential may do now (`fetchEnvironmentSessionState`).
 pub async fn fetch_session_state(credentials: &Credentials) -> Result<AuthSessionState, AuthError> {
     let host = credentials.http_base.clone();
-    let response = http()
-        .get(format!("{}/api/auth/session", credentials.http_base))
-        .bearer_auth(&credentials.access_token)
+    let url = format!("{}/api/auth/session", credentials.http_base);
+    let response = credentials.authorize(http().get(&url), "GET", &url).await.map_err(AuthError::Incompatible)?
         .send()
         .await
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
@@ -184,7 +184,8 @@ pub async fn fetch_session_state(credentials: &Credentials) -> Result<AuthSessio
 /// An authenticated `POST` to an access endpoint (`/api/auth/pairing-token`,
 /// `/api/auth/clients/revoke`, …). A failure carries the server's `message` when it sends one.
 pub async fn post_access(credentials: &Credentials, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
-    let request = http().post(format!("{}{path}", credentials.http_base)).bearer_auth(&credentials.access_token);
+    let url = format!("{}{path}", credentials.http_base);
+    let request = credentials.authorize(http().post(&url), "POST", &url).await?;
     let request = match body {
         Some(body) => request.json(&body),
         None => request,
@@ -201,7 +202,9 @@ pub async fn post_access(credentials: &Credentials, path: &str, body: Option<ser
 }
 
 pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
-    let mut url = url::Url::parse(&websocket_base(&credentials.http_base)).expect("valid ws base");
+    let base = credentials.relay.as_ref().map(|r| r.environment.endpoint.ws_base_url.clone()).unwrap_or_else(|| websocket_base(&credentials.http_base));
+    let mut url = url::Url::parse(&base).expect("valid ws base");
+    if url.path() == "/" || url.path().is_empty() { url.set_path("/ws"); }
     url.query_pairs_mut()
         .append_pair("wsTicket", ticket)
         .append_pair("orchestrationProtocol", &ORCHESTRATION_PROTOCOL_VERSION.to_string())
@@ -209,16 +212,36 @@ pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
         .append_pair("clientAppVersion", env!("CARGO_PKG_VERSION"))
         .append_pair("clientDeviceType", "desktop")
         .append_pair("clientOs", client_os())
-        .append_pair("connectionMethod", "direct");
+        .append_pair("connectionMethod", if credentials.relay.is_some() { "relay" } else { "direct" });
+    if let Some(relay) = &credentials.relay {
+        let mut target = url.clone();
+        let _ = target.set_scheme(if target.scheme() == "wss" { "https" } else { "http" });
+        if let Ok(proof) = relay.cloud.proof("GET", target.as_str(), Some(ticket)) { url.query_pairs_mut().append_pair("dpop", &proof); }
+    }
     url.to_string()
 }
 
-fn client_os() -> &'static str {
+pub(crate) fn client_os() -> &'static str {
     if cfg!(target_os = "macos") {
         "macOS"
     } else if cfg!(target_os = "windows") {
         "Windows"
     } else {
         "Linux"
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("Credentials").field("http_base", &self.http_base).finish_non_exhaustive() }
+}
+impl Credentials {
+    pub async fn authorize(&self, request: reqwest::RequestBuilder, method: &str, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        match &self.relay {
+            None => Ok(request.bearer_auth(&self.access_token)),
+            Some(relay) => {
+                let token = relay.access().await?;
+                Ok(request.header("authorization", format!("DPoP {token}")).header("dpop", relay.cloud.proof(method, url, Some(&token))?))
+            }
+        }
     }
 }
