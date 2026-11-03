@@ -24,3 +24,5 @@ pub mod connect;
 pub mod updates;
 
 pub mod resource_telemetry;
+
+pub mod chatgpt;

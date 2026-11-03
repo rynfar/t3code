@@ -29,6 +29,8 @@ pub struct AuthMethod {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub account_email: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -332,6 +334,10 @@ pub struct InstallState {
     pub installed_version: Option<String>,
     #[serde(default)]
     pub can_remove: bool,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
 }

@@ -4,7 +4,7 @@
 //! reuses the connect screen's pairing (`environments.rs`). One environment is connected at a
 //! time, so the connection step picks the computer to set up. Pending evidence never blocks the
 //! app as the web's blank gate does: the wizard opens over it once a fresh workspace is confirmed.
-//! Not here yet: T3 Connect (CN-RELAY) and Codex's ChatGPT setup.
+//! Not here yet: T3 Connect (CN-RELAY) and simultaneous multi-computer selection.
 
 mod agents;
 mod agent_terminal;
@@ -116,6 +116,9 @@ struct AgentSetup {
 }
 
 pub struct WelcomeWizard {
+    chatgpt: std::collections::HashMap<String, Entity<crate::chatgpt_setup::ChatGptSetup>>,
+    created_chatgpt: Option<String>,
+    chatgpt_subscriptions: Vec<Subscription>,
     state: Entity<AppState>,
     open: bool,
     step: Step,
@@ -154,6 +157,7 @@ impl WelcomeWizard {
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| this.on_app_event(*event, window, cx)),
         ];
         let mut wizard = WelcomeWizard {
+            chatgpt: Default::default(),created_chatgpt:None,chatgpt_subscriptions:Vec::new(),
             state,
             open: false,
             step: Step::Connection,
@@ -173,8 +177,13 @@ impl WelcomeWizard {
         };
         wizard.watch_terminal_grants(cx);
         wizard.evaluate(cx);
-        #[cfg(feature = "snapshot")]
         cx.set_global(Host(cx.weak_entity()));
+        if !crate::chatgpt_setup::fixture_active(cx)
+            && let Some(environment)=t3_client::store::load_ui_state("welcome-resume").and_then(|v|v.as_str().map(str::to_owned))
+        {
+            let matches=wizard.state.read(cx).active_environment().is_some_and(|e|e.environment_id.as_deref()==Some(&environment)||e.id==environment);
+            if matches {wizard.show(Step::Agents,cx);}
+        }
         wizard
     }
 
@@ -203,6 +212,7 @@ impl WelcomeWizard {
             self.projects_changed(cx);
         }
         if event == AppEvent::Phase {
+            self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear();
             self.watch_terminal_grants(cx);
             let app = self.state.read(cx);
             let (pairing, failed, unpaired) = (app.connect.pairing.is_some(), app.connect.error.is_some(), app.phase == Phase::Unpaired);
@@ -325,6 +335,8 @@ impl WelcomeWizard {
 
     /// Closing or finishing the wizard: setup is done either way, as on the web.
     fn finish(&mut self, cx: &mut Context<Self>) {
+        self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear();
+        if !crate::chatgpt_setup::fixture_active(cx) {t3_client::store::save_ui_state("welcome-resume", &serde_json::Value::Null);}
         self.cancel_projects();
         self.open = false;
         self.setup = None;
@@ -339,6 +351,11 @@ impl WelcomeWizard {
             self.refresh_providers(cx);
         }
         self.step = step;
+        if !crate::chatgpt_setup::fixture_active(cx) {
+            let environment=(step==Step::Agents).then(||self.state.read(cx).active_environment().map(|e|e.environment_id.clone().unwrap_or_else(||e.id.clone()))).flatten();
+            t3_client::store::save_ui_state("welcome-resume", &environment);
+        }
+        if step != Step::Agents { self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear(); }
         if step == Step::Projects {
             self.enter_projects(cx);
         }
@@ -574,10 +591,8 @@ impl Render for WelcomeWizard {
     }
 }
 
-#[cfg(feature = "snapshot")]
 struct Host(gpui::WeakEntity<WelcomeWizard>);
 
-#[cfg(feature = "snapshot")]
 impl gpui::Global for Host {}
 
 /// Opens the wizard at `step` regardless of the gate, for offscreen captures.
@@ -625,4 +640,14 @@ pub fn terminal_fixture(fixture: TerminalFixture, window: &mut Window, cx: &mut 
         cx.notify();
         Ok(())
     })
+}
+
+/// Native has no browser route to unload; a return link or restart resumes its Agents step.
+pub fn resume(environment: String, cx: &mut App) {
+    if let Some(wizard)=cx.try_global::<Host>().and_then(|h|h.0.upgrade()) {
+        wizard.update(cx,|wizard,cx| {
+            let saved=wizard.state.read(cx).environments.environments.iter().find(|e|e.environment_id.as_deref()==Some(&environment)||e.id==environment).map(|e|e.id.clone());
+            if let Some(id)=saved {wizard.state.update(cx,|app,cx|app.connect_environment(&id,cx));wizard.show(Step::Agents,cx);}
+        });
+    }
 }

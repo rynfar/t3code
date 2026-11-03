@@ -225,6 +225,7 @@ icons! {
     AgentPointerFill => "icons/preview/mouse-pointer-2-fill.svg",
     PreviewError => "icons/preview/error.svg",
     OnePassword => "icons/providers/one-password.svg",
+    OpenAi => "icons/providers/codex.svg",
 }
 
 impl Icon {

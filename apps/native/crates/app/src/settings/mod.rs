@@ -339,6 +339,7 @@ impl SettingsView {
     }
 
     fn navigate(&mut self, section: Section, target: Option<String>, cx: &mut Context<Self>) {
+        if section != Section::Providers { self.providers.leave(); }
         let changed = self.section != section;
         self.section = section;
         self.scroll_to_target = target.is_some();

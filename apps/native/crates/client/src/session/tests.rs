@@ -110,3 +110,50 @@ async fn a_silent_server_times_out() {
     let _socket = server.connection().await;
     assert!(session.closed().await.starts_with("The server stopped responding"));
 }
+
+#[tokio::test]
+async fn chatgpt_reconnect_import_and_handoff_match_the_wire_contract() {
+    use t3_core::settings::providers::chatgpt as gpt;
+    let mut server = FakeServer::start().await;
+    let session = connect(&server, TIMING).await;
+    let mut socket = server.connection().await;
+    let profile =
+        json!({"clientId":"oaiapp_fixture","subject":"fake-subject","email":"fake@example.invalid","redirectUri":"http://127.0.0.1:14399/auth/callback","connectionLabel":"Fixture","sharingEnabled":true,"idTokenHint":"obviously-fake-hint"});
+    let transfer = json!({"registration":profile,"credentials":{"clientId":"oaiapp_fixture","accessToken":"obviously-fake-access","refreshToken":null,"idToken":"obviously-fake-id","issuer":"https://example.invalid","expiresAt":1234.5,"earliestRefreshAt":null,"scopes":["openid"],"subject":"fake-subject","email":"fake@example.invalid"}});
+    let request = tokio::spawn({
+        let session = session.clone();
+        async move { session.request(gpt::RECONNECT, gpt::reconnect_payload("codex_work", "chatgpt-profile:fake")).await }
+    });
+    let wire = socket.request(gpt::RECONNECT).await;
+    assert_eq!(wire["payload"], json!({"instanceId":"codex_work","methodId":"chatgpt-profile:fake"}));
+    socket.send(json!({"_tag":"Exit","requestId":wire["id"],"exit":{"_tag":"Success","value":profile}})).await;
+    let decoded: Option<gpt::ReconnectProfile> = serde_json::from_value(request.await.unwrap().unwrap()).unwrap();
+    assert_eq!(decoded.as_ref().unwrap().email.as_deref(), Some("fake@example.invalid"));
+    let mut stream = session.stream(gpt::HANDOFF, gpt::handoff_payload("codex_work", "remote-env", "attempt-1", "https://example.invalid/welcome#agents:remote-env", decoded.as_ref())).unwrap();
+    let wire = socket.request(gpt::HANDOFF).await;
+    assert_eq!(wire["payload"], json!({"instanceId":"codex_work","environmentId":"remote-env","attemptId":"attempt-1","returnUrl":"https://example.invalid/welcome#agents:remote-env","profile":profile}));
+    socket.chunk(&wire, json!([{"phase":"auth","state":{"phase":"waiting","flowId":"fake-flow","authorizationUrl":"https://example.invalid/fake","methods":[]}},{"phase":"finished","profile":transfer}])).await;
+    let gpt::HandoffState::Auth { state } = serde_json::from_value(next(&mut stream).await.unwrap().unwrap()).unwrap() else { panic!("auth state") };
+    assert_eq!(state.url(), Some("https://example.invalid/fake"));
+    let gpt::HandoffState::Finished { profile: transferred } = serde_json::from_value(next(&mut stream).await.unwrap().unwrap()).unwrap() else { panic!("finished profile") };
+    assert_eq!(transferred.credentials.access_token, "obviously-fake-access");
+    let import = gpt::import_payload("codex_work", &transferred);
+    assert_eq!(import, json!({"instanceId":"codex_work","profile":transfer}));
+    let request = tokio::spawn({
+        let session = session.clone();
+        async move { session.request(gpt::IMPORT, import).await }
+    });
+    let wire = socket.request(gpt::IMPORT).await;
+    assert_eq!(wire["payload"], json!({"instanceId":"codex_work","profile":transfer}));
+    socket.send(json!({"_tag":"Exit","requestId":wire["id"],"exit":{"_tag":"Success","value":null}})).await;
+    assert_eq!(request.await.unwrap().unwrap(), Value::Null);
+    let request = tokio::spawn({
+        let session = session.clone();
+        async move { session.request(gpt::RECONNECT, gpt::reconnect_payload("codex_work", "chatgpt-change-account")).await }
+    });
+    let wire = socket.request(gpt::RECONNECT).await;
+    socket.send(json!({"_tag":"Exit","requestId":wire["id"],"exit":{"_tag":"Success","value":null}})).await;
+    let absent: Option<gpt::ReconnectProfile> = serde_json::from_value(request.await.unwrap().unwrap()).unwrap();
+    assert!(absent.is_none());
+    assert_eq!(gpt::handoff_payload("codex_work", "remote-env", "attempt-2", "https://example.invalid", None)["profile"], Value::Null);
+}

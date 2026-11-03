@@ -1,7 +1,7 @@
 //! Add provider (`AddProviderInstanceDialog.tsx`, `AddProviderInstanceWizardSteps.tsx`): pick a
 //! built-in driver, then name the instance; its id follows the label until the user edits it.
-//! The driver configuration step, the ACP Registry search, and ChatGPT-managed Codex accounts are
-//! not ported: a new instance starts from the driver's defaults (Codex uses the installed CLI).
+//! The manual path starts from driver defaults; Codex also offers managed ChatGPT accounts.
+//! The driver configuration step and ACP Registry search are not ported.
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, FocusHandle, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div,
@@ -295,6 +295,16 @@ impl SettingsView {
                 .gap(r(8.))
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Provider"))
                 .child(self.render_driver_grid(&featured, driver, cx))
+                .when(driver.kind == "codex", |v| v.child(Button::new("add-provider-chatgpt",ButtonVariant::Default,ButtonSize::Sm).icon(Icon::OpenAi)
+                    .label("Continue with ChatGPT")
+                    .on_click(cx.listener(|this,_,window,cx| {
+                        let instance=this.state.read(cx).server_config.config.as_ref().and_then(|c|c.providers.iter().find(|p|p.driver=="codex")).map(|p|p.instance_id.clone()).unwrap_or_else(||"codex".into());
+                        let view=cx.new(|cx|crate::chatgpt_setup::ChatGptSetup::new(this.state.clone(),instance.clone(),false,window,cx));
+                        view.update(cx,|view,cx|view.open_add(cx));
+                        this.providers.selected=Some(instance);
+                        this.providers.chatgpt=Some((this.state.read(cx).connection_id(),view));
+                        this.close_add_dialog(window,cx);
+                    })) ))
                 .when(!more.is_empty(), |this| {
                     let show_more = dialog.show_more;
                     this.child(
