@@ -163,31 +163,12 @@ fn page_theme_roles_and_fonts() {
 }
 
 #[test]
-fn page_bridge_link_validation_and_routing() {
-    use super::host::{self, LinkTarget};
+fn page_bridge_validates_links() {
+    use super::host;
     let message = json!({"jsonrpc":"2.0","id":"link-1","method":"ui/open-link","params":{"url":"https://example.com/path","metaKey":true}});
-    let mut link = host::read_link(&message).unwrap();
-    assert_eq!(
-        host::link_target(&link, true, true, true),
-        LinkTarget::System
-    );
-    link.meta_key = false;
-    assert_eq!(
-        host::link_target(&link, true, true, true),
-        LinkTarget::ChangeRequest
-    );
-    assert_eq!(
-        host::link_target(&link, true, true, false),
-        LinkTarget::Preview
-    );
-    assert_eq!(
-        host::link_target(&link, true, false, false),
-        LinkTarget::System
-    );
-    assert_eq!(
-        host::link_target(&link, false, true, false),
-        LinkTarget::System
-    );
+    let link = host::read_link(&message).unwrap();
+    assert!(link.meta_key);
+    assert_eq!(link.url, "https://example.com/path");
     for url in [
         "javascript:alert(1)",
         "file:///etc/hosts",

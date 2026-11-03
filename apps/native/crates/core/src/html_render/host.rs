@@ -88,18 +88,18 @@ pub fn read_link(value: &Value) -> Option<LinkRequest> {
         return None;
     }
     let url = p.get("url")?.as_str()?;
-    if url.len() > 16384
-        || url.chars().any(char::is_whitespace)
-        || !(url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) || url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")))
-    {
-        return None;
-    }
-    let parsed = url::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+    if !web_url(url) {
         return None;
     }
     Some(LinkRequest { id, url: url.into(), meta_key: p.get("metaKey") == Some(&Value::Bool(true)), ctrl_key: p.get("ctrlKey") == Some(&Value::Bool(true)) })
 }
+pub fn web_url(url: &str) -> bool {
+    url.len() <= 16384
+        && !url.chars().any(char::is_whitespace)
+        && (url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) || url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")))
+        && url::Url::parse(url).ok().is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyDown {
     pub key: String,
@@ -162,21 +162,4 @@ pub fn shortcuts_message(rules: &[ResolvedKeybindingRule], mac: bool) -> Value {
     let blocked: Vec<_> = rules.iter().filter(|r| !shortcut_allowed(&r.command)).map(serialize).collect();
     let codes: std::collections::BTreeMap<_, _> = keybindings::EVENT_CODE_SHORTCUT_KEYS.into_iter().collect();
     json!({"jsonrpc":"2.0", "method":"t3/notifications/shortcuts", "params":{"shortcuts":shortcuts,"blocked":blocked,"codes":codes}})
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkTarget {
-    System,
-    Preview,
-    ChangeRequest,
-}
-pub fn link_target(link: &LinkRequest, prefer_app: bool, can_preview: bool, change_request: bool) -> LinkTarget {
-    if link.meta_key || link.ctrl_key {
-        LinkTarget::System
-    } else if change_request {
-        LinkTarget::ChangeRequest
-    } else if prefer_app && can_preview {
-        LinkTarget::Preview
-    } else {
-        LinkTarget::System
-    }
 }

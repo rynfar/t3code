@@ -15,11 +15,12 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext, AvailableSpace, Bounds, Context, Element, ElementId, Entity, EntityId, FocusHandle, Focusable, FontWeight, Global, GlobalElementId,
-    InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Task, Window, div, hsla as gpui_hsla,
+    InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window, div, hsla as gpui_hsla,
     prelude::*, px, relative,
 };
 use gpui_component::ActiveTheme;
 use t3_core::html_render::{self, HtmlRenderReference};
+use t3_core::html_render::routing::{self, Action, Event, PageOrigin};
 use t3_core::media::MediaSource;
 use t3_core::timeline::HtmlRenderEntry;
 
@@ -59,72 +60,52 @@ fn host_script(cx: &App) -> String {
     )
 }
 
-fn on_page_message(
-    state: &Entity<AppState>,
-    origin: &(Option<String>, Option<String>),
-    view: &WebView,
-    message: &serde_json::Value,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    use html_render::host;
-    let link = host::read_link(message);
-    let key = host::read_key(message);
-    if link.is_none() && key.is_none() { return; }
-    if (
-        state.read(cx).environment().map(str::to_owned),
-        state.read(cx).selected_thread.clone(),
-    ) != *origin
-        || !view.take_activation()
-    {
-        return;
+#[derive(Clone)]
+struct PageOwner {
+    origin: PageOrigin,
+    view: WeakEntity<ThreadView>,
+}
+
+fn on_page_event(state: &Entity<AppState>, owner: &PageOwner, view: &WebView, event: Event, window: &mut Window, cx: &mut App) -> bool {
+    let current = owner.view.upgrade().and_then(|view| view.read(cx).html_page_origin(cx));
+    let focused = view.is_focused();
+    let activated = !matches!(event, Event::RawNavigation(_)) && focused && view.take_activation();
+    let app = state.read(cx);
+    let settings = crate::settings::client_settings(cx);
+    let previews = crate::preview::previews(cx);
+    let projects = if matches!(event, Event::Link(_)) && activated { crate::pull_requests::link_projects(app) } else { Vec::new() };
+    // View shortcuts use workspace flags; link destinations use the page's scoped owner.
+    let panel_open = app.selected_thread.as_deref().is_some_and(|id| app.panels.panels.panel(id).is_open);
+    let shortcuts = t3_core::keybindings::ShortcutMatchContext::default().with("rightPanelOpen", panel_open).with("turnRunning", app.is_selected_thread_running());
+    let action = routing::route(&event, &routing::Context {
+        origin: &owner.origin, current_origin: current.as_ref(), active_environment: app.environment(), focused, activated,
+        prefer_app: settings.browser_link_target() == t3_core::client_settings::BrowserLinkTarget::App,
+        can_preview: previews.as_ref().is_some_and(|p| p.read(cx).availability() == crate::preview::Availability::Available),
+        open_change_requests: settings.pull_request_links_open_in_app(), projects: &projects,
+        keybindings: &cx.global::<crate::keymap::Keymap>().rules, shortcut_context: &shortcuts, mac: cfg!(target_os="macos"),
+    });
+    let Some(action) = action else { return false };
+    match action {
+        Action::External(url) => cx.open_url(&url),
+        Action::Preview { owner, url } => if let Some(previews) = previews {
+            previews.update(cx, |p, cx| p.open_link(owner.thread, url, cx));
+        },
+        Action::ChangeRequest { target, .. } => crate::pull_requests::open_resolved_link(state, target, cx),
+        Action::Shortcut(command) => window.dispatch_action(crate::keymap::action_for(&command), cx),
     }
-    if let Some(link) = link {
-        let state_ref = state.read(cx);
-        let thread = state_ref.selected_thread.clone();
-        let settings = crate::settings::client_settings(cx);
-        let prefer_app = settings.browser_link_target() == t3_core::client_settings::BrowserLinkTarget::App;
-        let change_request = settings.pull_request_links_open_in_app()
-            && thread.is_some()
-            && t3_core::pull_requests::link::parse_change_request_url(&link.url).is_some();
-        let previews = crate::preview::previews(cx);
-        let can_preview = thread.is_some()
-            && previews.as_ref().is_some_and(|p| {
-                p.read(cx).availability() == crate::preview::Availability::Available
-            });
-        match host::link_target(&link, prefer_app, can_preview, change_request) {
-            host::LinkTarget::System => cx.open_url(&link.url),
-            host::LinkTarget::ChangeRequest => {
-                crate::pull_requests::open_context_link(state, &link.url, cx)
-            }
-            host::LinkTarget::Preview => {
-                if let (Some(previews), Some(thread)) = (previews, thread) {
-                    previews.update(cx, |p, cx| p.open_link(thread, link.url.clone(), cx));
-                }
-            }
-        }
-        let result = serde_json::json!({"jsonrpc":"2.0","id":link.id,"result":{}});
-        view.evaluate(&format!(
-            "window.dispatchEvent(new MessageEvent('message',{{data:{result}}}));"
-        ));
-    } else if let Some(key) = key {
-        let state = state.read(cx);
-        let panel_open = state
-            .selected_thread
-            .as_deref()
-            .is_some_and(|id| state.panels.panels.panel(id).is_open);
-        let context = t3_core::keybindings::ShortcutMatchContext::default()
-            .with("rightPanelOpen", panel_open)
-            .with("turnRunning", state.is_selected_thread_running());
-        if let Some(command) = host::shortcut_command(
-            &key,
-            &cx.global::<crate::keymap::Keymap>().rules,
-            &context,
-            cfg!(target_os = "macos"),
-        ) {
-            let action = crate::keymap::action_for(command);
-            window.dispatch_action(action, cx);
-        }
+    true
+}
+
+fn on_page_message(state: &Entity<AppState>, owner: &PageOwner, view: &WebView, message: &serde_json::Value, window: &mut Window, cx: &mut App) {
+    let (event, id) = if let Some(link) = html_render::host::read_link(message) {
+        let id = link.id.clone();
+        (Event::Link(link), Some(id))
+    } else if let Some(key) = html_render::host::read_key(message) {
+        (Event::Key(key), None)
+    } else { return };
+    if on_page_event(state, owner, view, event, window, cx) && let Some(id) = id {
+        let result = serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}});
+        view.evaluate(&format!("window.dispatchEvent(new MessageEvent('message',{{data:{result}}}));"));
     }
 }
 
@@ -148,7 +129,7 @@ struct PageState {
 /// The frame drawing a view holds it (its lease and the presented frame), so a view goes as soon
 /// as no frame draws it: a row scrolled away, a thread switched, a transcript closed.
 struct InlineView {
-    origin: (Option<String>, Option<String>),
+    origin: PageOrigin,
     key: PageKey,
     owner: EntityId,
     view: Weak<WebView>,
@@ -284,7 +265,7 @@ impl HtmlFrames {
     fn on_event(
         &mut self,
         key: &PageKey,
-        origin: &(Option<String>, Option<String>),
+        owner: &PageOwner,
         view: &WebView,
         event: WebEvent,
         window: &mut Window,
@@ -296,7 +277,7 @@ impl HtmlFrames {
                     return;
                 };
                 let Some(height) = html_render::read_content_height(&message) else {
-                    on_page_message(&self.state, origin, view, &message, window, cx);
+                    on_page_message(&self.state, owner, view, &message, window, cx);
                     return;
                 };
                 let Some(page) = self.pages.get_mut(key) else {
@@ -311,7 +292,7 @@ impl HtmlFrames {
                     self.notify_owners(key, cx);
                 }
             }
-            WebEvent::OpenUrl(url) => cx.open_url(&url),
+            WebEvent::OpenUrl(url) => { on_page_event(&self.state, owner, view, Event::RawNavigation(url), window, cx); },
         }
     }
 
@@ -320,7 +301,7 @@ impl HtmlFrames {
     fn inline_view(
         &mut self,
         key: &PageKey,
-        owner: EntityId,
+        page_owner: PageOwner,
         html: Arc<str>,
         dark: bool,
         window: &mut Window,
@@ -328,7 +309,8 @@ impl HtmlFrames {
     ) -> Slot {
         let revision = crate::theme::revision(cx);
         let keymap_revision = cx.global::<crate::keymap::Keymap>().revision;
-        let origin = (self.state.read(cx).environment().map(str::to_owned), self.state.read(cx).selected_thread.clone());
+        let owner = page_owner.view.entity_id();
+        let origin = page_owner.origin.clone();
         self.views.retain(|inline| inline.view.strong_count() > 0);
         if let Some(inline) = self
             .views
@@ -356,6 +338,7 @@ impl HtmlFrames {
         let page = Page {
             html,
             dark,
+            allow_popups: false,
             content_security_policy: None,
             scroll_through: true,
             script: host_script(cx),
@@ -364,7 +347,7 @@ impl HtmlFrames {
             return Slot::Card;
         };
         let event_key = key.clone();
-        let event_origin = origin.clone();
+        let event_owner = page_owner;
         let event_view = Rc::downgrade(&view);
         let handle = window.window_handle();
         let pump = cx.spawn(async move |this, cx| {
@@ -375,7 +358,7 @@ impl HtmlFrames {
                 if cx
                     .update_window(handle, |_, window, cx| {
                         this.update(cx, |frames, cx| {
-                            frames.on_event(&event_key, &event_origin, &view, event, window, cx)
+                            frames.on_event(&event_key, &event_owner, &view, event, window, cx)
                         })
                     })
                     .is_err()
@@ -407,10 +390,12 @@ enum Slot {
 
 /// An `html-render` row: the page, or "Unable to load", at the frame's height, with the
 /// full-screen control under it.
-pub fn frame_row(row_id: &str, entry: &HtmlRenderEntry, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn frame_row(row_id: &str, entry: &HtmlRenderEntry, thread: Option<&str>, cx: &mut Context<ThreadView>) -> AnyElement {
     let owner = cx.entity_id();
     let reference = &entry.reference;
     let Some(store) = frames(cx) else { return div().into_any_element() };
+    let Some(origin) = PageOrigin::for_view(store.read(cx).state.read(cx).environment(), thread, None) else { return div().into_any_element() };
+    let page_owner = PageOwner { origin, view: cx.entity().downgrade() };
     let Some((key, frame)) = store.update(cx, |frames, cx| {
         let key = frames.key(&reference.attachment_id, cx)?;
         let frame = frames.frame(&key, reference, owner, cx);
@@ -425,7 +410,7 @@ pub fn frame_row(row_id: &str, entry: &HtmlRenderEntry, cx: &mut Context<ThreadV
             id: ElementId::Name(format!("html-render-{row_id}").into()),
             store: store.clone(),
             key: key.clone(),
-            owner,
+            page_owner: page_owner.clone(),
             html: html.clone(),
             reference: reference.clone(),
             width: frame.width,
@@ -445,7 +430,8 @@ pub fn frame_row(row_id: &str, entry: &HtmlRenderEntry, cx: &mut Context<ThreadV
     };
     let expand = frame.html.clone().map(|html| {
         let (store, title) = (store.clone(), SharedString::from(reference.title.clone()));
-        let open = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| open_fullscreen(&store, title.clone(), html.clone(), window, cx);
+        let page_owner = page_owner.clone();
+        let open = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| open_fullscreen(&store, page_owner.clone(), title.clone(), html.clone(), window, cx);
         div().flex().justify_end().pt(px(4.)).child(tooltip_icon_button(SharedString::from(format!("html-render-expand-{row_id}")), Icon::Maximize2, "Open full screen", false, open, cx))
     });
     div().w_full().min_w_0().child(div().w_full().h(px(height as f32)).relative().child(body)).children(expand).into_any_element()
@@ -457,7 +443,7 @@ struct InlineFrame {
     id: ElementId,
     store: Entity<HtmlFrames>,
     key: PageKey,
-    owner: EntityId,
+    page_owner: PageOwner,
     html: Arc<str>,
     reference: HtmlRenderReference,
     width: f32,
@@ -497,8 +483,8 @@ impl Element for InlineFrame {
             let (store, key) = (self.store.clone(), self.key.clone());
             cx.defer(move |cx| store.update(cx, |frames, cx| frames.set_width(&key, width, cx)));
         }
-        let (key, owner, html, dark) = (self.key.clone(), self.owner, self.html.clone(), self.dark);
-        let slot = self.store.update(cx, |frames, cx| frames.inline_view(&key, owner, html, dark, window, cx));
+        let (key, page_owner, html, dark) = (self.key.clone(), self.page_owner.clone(), self.html.clone(), self.dark);
+        let slot = self.store.update(cx, |frames, cx| frames.inline_view(&key, page_owner, html, dark, window, cx));
         let mut child = match slot {
             Slot::View(view) => webview::web_view("page", view, self.dark).into_any_element(),
             Slot::Card => page_card(&self.reference, cx),
@@ -539,19 +525,15 @@ fn page_card(reference: &HtmlRenderReference, cx: &App) -> AnyElement {
 
 fn open_fullscreen(
     store: &Entity<HtmlFrames>,
+    owner: PageOwner,
     title: SharedString,
     html: Arc<str>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let restore = window.focused(cx);
-    let state = store.read(cx).state.clone();
-    let origin = (
-        state.read(cx).environment().map(str::to_owned),
-        state.read(cx).selected_thread.clone(),
-    );
     let view = cx.new(|cx| HtmlFullscreen {
-        origin,
+        owner,
         title,
         html,
         zoom: 1.,
@@ -579,7 +561,7 @@ pub fn fullscreen(_: &mut Window, cx: &mut App) -> Option<AnyElement> {
 /// from 50% to 200%. Drawn in the base plane so the page's view can sit above it; the backdrop
 /// keeps inline pages out of sight while it is open.
 pub struct HtmlFullscreen {
-    origin: (Option<String>, Option<String>),
+    owner: PageOwner,
     state: Entity<AppState>,
     title: SharedString,
     html: Arc<str>,
@@ -636,6 +618,7 @@ impl HtmlFullscreen {
         let page = Page {
             html: self.html.clone(),
             dark,
+            allow_popups: false,
             content_security_policy: None,
             scroll_through: false,
             script: host_script(cx),
@@ -646,22 +629,15 @@ impl HtmlFullscreen {
         self.unavailable = self.view.is_none();
         let event_view = self.view.as_ref().map(Rc::downgrade);
         let state = self.state.clone();
-        let origin = self.origin.clone();
+        let owner = self.owner.clone();
         let handle = window.window_handle();
         self._events = Some(cx.spawn(async move |_, cx| {
             while let Some(event) = received.next().await {
-                match event {
-                    WebEvent::OpenUrl(url) => cx.update(|cx| cx.open_url(&url)),
-                    WebEvent::Message(text) => {
-                        if let Some(view) = event_view.as_ref().and_then(Weak::upgrade)
-                            && let Ok(message) = serde_json::from_str(&text)
-                        {
-                            let _ = cx.update_window(handle, |_, window, cx| {
-                                on_page_message(&state, &origin, &view, &message, window, cx)
-                            });
-                        }
-                    }
-                }
+                let Some(view) = event_view.as_ref().and_then(Weak::upgrade) else { return };
+                let _ = cx.update_window(handle, |_, window, cx| match event {
+                    WebEvent::OpenUrl(url) => { on_page_event(&state, &owner, &view, Event::RawNavigation(url), window, cx); },
+                    WebEvent::Message(text) => if let Ok(message) = serde_json::from_str(&text) { on_page_message(&state, &owner, &view, &message, window, cx); },
+                });
             }
         }));
     }

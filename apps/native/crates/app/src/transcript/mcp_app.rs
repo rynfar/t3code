@@ -347,6 +347,7 @@ impl McpFrame {
             dark,
             scroll_through: false,
             script: TRANSPORT.into(),
+            allow_popups: true,
             content_security_policy: Some(self.entry.reference.content_security_policy()),
         };
         let (events, mut received) = mpsc::unbounded();

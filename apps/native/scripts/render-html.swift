@@ -12,7 +12,7 @@ app.setActivationPolicy(.prohibited)
 final class Page: NSObject, WKURLSchemeHandler, WKNavigationDelegate {
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         let valid = task.request.url!.absoluteString == "t3-page://page/index.html"
-        let response = HTTPURLResponse(url: task.request.url!, statusCode: valid ? 200 : 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type":"text/html; charset=utf-8", "Content-Security-Policy":"sandbox allow-scripts allow-forms allow-popups"])!
+        let response = HTTPURLResponse(url: task.request.url!, statusCode: valid ? 200 : 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type":"text/html; charset=utf-8", "Content-Security-Policy":"sandbox allow-scripts allow-forms"])!
         task.didReceive(response)
         if valid { task.didReceive(html.data(using: .utf8)!) }
         task.didFinish()

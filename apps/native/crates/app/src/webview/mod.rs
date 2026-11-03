@@ -1,5 +1,5 @@
-//! Native web views inside a GPUI window, for pages the app cannot draw itself: agent HTML now,
-//! MCP app frames later. A page is loaded from memory through a private URL scheme into its own
+//! Native web views inside a GPUI window, for pages the app cannot draw itself: agent HTML and
+//! MCP app frames. A page is loaded from memory through a private URL scheme into its own
 //! non-persistent WebKit store, so it never sees the app's session, token or server credentials
 //! (the web's opaque-origin `sandbox="allow-scripts allow-forms"` frame, `BrowserDocumentFrame.tsx`).
 //!
@@ -76,6 +76,8 @@ pub enum Layer {
 pub struct Page {
     pub html: Arc<str>,
     pub dark: bool,
+    /// HTML forbids new browsing contexts; MCP preserves its previous native behavior.
+    pub allow_popups: bool,
     /// Vertical wheel scrolls go to the window instead of the page, so a frame sized to its page
     /// never takes the transcript's scroll.
     pub scroll_through: bool,
@@ -90,7 +92,7 @@ pub struct Page {
 pub enum WebEvent {
     /// A string the page posted with `window.ipc.postMessage`.
     Message(String),
-    /// An `http(s)` link the reader opened.
+    /// A raw new-window URL; the page host must decide whether to accept it.
     OpenUrl(String),
 }
 
@@ -112,6 +114,7 @@ impl NativeView {
     fn evaluate(&self, _: &str) {}
     fn release_focus(&self) {}
     fn take_activation(&self) -> bool { false }
+    fn is_focused(&self) -> bool { false }
 }
 
 pub struct WebView {
@@ -168,6 +171,8 @@ impl WebView {
     }
 
     pub fn take_activation(&self) -> bool { self.native.take_activation() }
+
+    pub fn is_focused(&self) -> bool { self.native.is_focused() }
 
     fn set_dark(&self, dark: bool) {
         if self.dark.replace(dark) != dark {

@@ -37,9 +37,11 @@ fn block_script_windows(page: &WryWebView) {
     }
 }
 
-/// What the server sends with agent HTML (`http.ts`), less downloads: an opaque origin with
-/// scripts and forms. Popups reach the app as link opens and never as windows.
-const CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-forms allow-popups";
+/// HTML matches `BrowserDocumentFrame`; MCP retains its existing native popup policy.
+fn content_policy(allow_popups: bool, additional: Option<&str>) -> String {
+    let sandbox = if allow_popups { "sandbox allow-scripts allow-forms allow-popups" } else { t3_core::html_render::routing::SANDBOX };
+    additional.map(|csp| format!("{sandbox}; {csp}")).unwrap_or_else(|| sandbox.into())
+}
 const MAX_MESSAGE_BYTES: usize = 2 * t3_core::mcp_apps::MAX_MESSAGE_BYTES;
 
 pub(super) struct NativeView {
@@ -106,7 +108,8 @@ impl NativeView {
         host.addSubview_positioned_relativeTo(&container, NSWindowOrderingMode::Below, None);
 
         let html = page.html.clone();
-        let policy = page.content_security_policy.as_ref().map(|csp| format!("{CONTENT_SECURITY_POLICY}; {csp}")).unwrap_or_else(|| CONTENT_SECURITY_POLICY.into());
+        let policy = content_policy(page.allow_popups, page.content_security_policy.as_deref());
+        let allow_popups = page.allow_popups;
         let links = events.clone();
         let link_events = events.clone();
         let builder = WebViewBuilder::new()
@@ -125,7 +128,7 @@ impl NativeView {
             })
             // `window.open` after a click (link clicks go through `PagePolicy`).
             .with_new_window_req_handler(move |url, _| {
-                if super::web_link(&url) {
+                if allow_popups && super::web_link(&url) {
                     let _ = links.unbounded_send(WebEvent::OpenUrl(url));
                 }
                 NewWindowResponse::Deny
@@ -144,7 +147,7 @@ impl NativeView {
         };
         let page_view = webview.webview();
         block_script_windows(&page_view);
-        let policy = PagePolicy::install(&page_view, link_events, mtm);
+        let policy = PagePolicy::install(&page_view, link_events, allow_popups, mtm);
         let scroll = page.scroll_through.then(|| {
             let target = Rc::new(ScrollTarget { host: host.clone(), frame: Cell::new(None) });
             ScrollTarget::register(&target);
@@ -152,6 +155,11 @@ impl NativeView {
         });
         let activation = Activation::new(&container);
         Some(NativeView { host, container, page: page_view, webview, _policy: policy, scroll, activation })
+    }
+
+    pub(super) fn is_focused(&self) -> bool {
+        !self.container.isHidden() && self.container.window().is_some_and(|window| window.isKeyWindow()
+            && window.firstResponder().is_some_and(|r| r.downcast_ref::<NSView>().is_some_and(|v| v.isDescendantOf(&self.container))))
     }
 
     pub(super) fn take_activation(&self) -> bool {
@@ -217,6 +225,7 @@ impl Drop for NativeView {
 }
 
 struct PolicyIvars {
+    allow_popups: bool,
     events: UnboundedSender<WebEvent>,
     /// wry's own delegate: it still runs scripts queued before the page committed and reports
     /// page loads.
@@ -225,9 +234,8 @@ struct PolicyIvars {
 
 define_class!(
     /// Decides navigations by frame, which wry's URL-only handler cannot: the main frame keeps
-    /// the page, subframes load what a sandboxed frame could, and a new-window request from a
-    /// link the reader clicked opens in the browser. WebKit asks here before `createWebView`, so
-    /// those links never reach wry's new-window handler.
+    /// the page and subframes inherit its sandbox. MCP may forward clicked new-window links;
+    /// HTML forbids them. WebKit asks here before `createWebView`.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[ivars = PolicyIvars]
@@ -261,10 +269,10 @@ define_class!(
 );
 
 impl PagePolicy {
-    fn install(page: &WryWebView, events: UnboundedSender<WebEvent>, mtm: MainThreadMarker) -> Retained<Self> {
+    fn install(page: &WryWebView, events: UnboundedSender<WebEvent>, allow_popups: bool, mtm: MainThreadMarker) -> Retained<Self> {
         // SAFETY: reading and replacing a live web view's delegate on the main thread.
         let wry = unsafe { page.navigationDelegate() };
-        let policy: Retained<Self> = unsafe { msg_send![super(mtm.alloc::<Self>().set_ivars(PolicyIvars { events, wry })), init] };
+        let policy: Retained<Self> = unsafe { msg_send![super(mtm.alloc::<Self>().set_ivars(PolicyIvars { events, wry, allow_popups })), init] };
         unsafe { page.setNavigationDelegate(Some(ProtocolObject::from_ref(&*policy))) };
         policy
     }
@@ -278,7 +286,7 @@ impl PagePolicy {
         match target {
             Some(frame) => super::navigable(&url, unsafe { frame.isMainFrame() }),
             None => {
-                if kind == WKNavigationType::LinkActivated && super::web_link(&url) {
+                if self.ivars().allow_popups && kind == WKNavigationType::LinkActivated && super::web_link(&url) {
                     let _ = self.ivars().events.unbounded_send(WebEvent::OpenUrl(url));
                 }
                 false
@@ -389,12 +397,16 @@ mod tests {
 
     #[test]
     fn every_page_response_keeps_sandbox_and_app_restrictions() {
-        let policy = format!("{CONTENT_SECURITY_POLICY}; default-src 'none'; connect-src https://api.example.test");
-        for (uri, status) in [(super::super::PAGE_URL, 200), ("t3-page://page/missing", 404)] {
-            let request = Request::builder().uri(uri).body(Vec::new()).unwrap();
-            let response = serve("<p>app</p>", &policy, &request);
-            assert_eq!(response.status(), status);
-            assert_eq!(response.headers()["Content-Security-Policy"], policy);
+        for allow_popups in [false, true] {
+            let expected = if allow_popups { "sandbox allow-scripts allow-forms allow-popups" } else { "sandbox allow-scripts allow-forms" };
+            let restrictions = "default-src 'none'; connect-src https://api.example.test";
+            let policy = content_policy(allow_popups, Some(restrictions));
+            for (uri, status) in [(super::super::PAGE_URL, 200), ("t3-page://page/missing", 404)] {
+                let request = Request::builder().uri(uri).body(Vec::new()).unwrap();
+                let response = serve("<p>app</p>", &policy, &request);
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()["Content-Security-Policy"], format!("{expected}; {restrictions}"));
+            }
         }
     }
 }

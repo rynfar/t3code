@@ -2,10 +2,11 @@
 //! state, and thread links. Ports `packages/client-runtime/src/pullRequestQuery.ts`,
 //! `apps/web/src/components/pullRequest/pullRequestList.logic.ts`,
 //! `pullRequestListPreferences.ts`, `pullRequestDetail.logic.ts` and
-//! `client-runtime/src/pullRequestLinkInput.ts`. One environment, so nothing is routed.
+//! `client-runtime/src/pullRequestLinkInput.ts` and `changeRequestLinks.ts`.
 
 pub mod detail;
 pub mod link;
+pub mod target;
 pub mod list;
 pub mod query;
 pub mod wire;
