@@ -15,6 +15,7 @@ use t3_core::settings::providers::{self as model, Driver};
 use super::super::SettingsView;
 use super::super::controls::{Button, ButtonSize, ButtonVariant, Row, icon, r};
 use super::{CloseProviderDialog, failure_text};
+use crate::components::badge::{BadgeKind, badge};
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette};
@@ -466,6 +467,7 @@ impl SettingsView {
                     .when(selected, |this| {
                         this.child(div().size(r(20.)).flex_none().flex().items_center().justify_center().rounded_full().bg(hsla(p.primary)).child(icon(Icon::Check, 14., hsla(p.primary_foreground))))
                     })
+                    .children(driver.badge_label.map(|label| badge(label, BadgeKind::Warning, false, cx)))
                     .into_any_element()
             })
             .collect();

@@ -28,6 +28,7 @@ pub const SERVER_UNINSTALL_ACP_REGISTRY_BINARY: &str = "server.uninstallAcpRegis
 pub struct Driver {
     pub kind: &'static str,
     pub label: &'static str,
+    pub badge_label: Option<&'static str>,
     /// `false` only for the ACP Registry, whose instances are always user-made.
     pub has_default_instance: bool,
     /// `false` lists the driver under Add provider's "Show more".
@@ -37,13 +38,13 @@ pub struct Driver {
 }
 
 const fn driver(kind: &'static str, label: &'static str, featured: bool, placeholder: &'static str) -> Driver {
-    Driver { kind, label, has_default_instance: true, featured, custom_model_placeholder: placeholder }
+    Driver { kind, label, badge_label: None, has_default_instance: true, featured, custom_model_placeholder: placeholder }
 }
 
 pub const ACP_REGISTRY: &str = "acpRegistry";
 
 /// `providerClients.definitions`, in the web's order.
-pub const DRIVERS: [Driver; 10] = [
+pub const DRIVERS: [Driver; 11] = [
     driver("codex", "Codex", true, "gpt-6.7-codex-ultra-preview"),
     driver("claudeAgent", "Claude", true, "claude-sonnet-5"),
     driver("cursor", "Cursor", true, "claude-sonnet-4-6"),
@@ -51,9 +52,10 @@ pub const DRIVERS: [Driver; 10] = [
     driver("fx", "fx", false, "model-slug"),
     driver("opencode", "OpenCode", true, "openai/gpt-5"),
     driver("antigravity", "Antigravity", true, "model-slug"),
+    Driver { badge_label: Some("Early Access"), ..driver("kiro", "Kiro", false, "model-slug") },
     driver("muse", "Muse Code", true, "model-slug"),
     driver("pi", "Pi", true, "anthropic/claude-sonnet-5"),
-    Driver { kind: ACP_REGISTRY, label: "ACP Registry", has_default_instance: false, featured: true, custom_model_placeholder: "model-slug" },
+    Driver { kind: ACP_REGISTRY, label: "ACP Registry", badge_label: None, has_default_instance: false, featured: true, custom_model_placeholder: "model-slug" },
 ];
 
 /// Drivers in the Add provider wizard, in catalog order.

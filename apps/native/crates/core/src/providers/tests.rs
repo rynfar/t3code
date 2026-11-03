@@ -46,11 +46,22 @@ fn enablement_follows_project_overrides_then_config_then_driver_defaults() {
     let settings: ServerSettings = serde_json::from_value(json!({
         "providerInstances": {
             "cursor": {"driver": "cursor"},
+            "kiro": {"driver": "kiro", "config": {}},
+            "kiro_work": {"driver": "kiro"},
+            "kiro_on": {"driver": "kiro", "enabled": true},
+            "kiro_config_on": {"driver": "kiro", "config": {"enabled": true}},
+            "kiro_off": {"driver": "kiro", "enabled": true, "config": {"enabled": false}},
             "off": {"driver": "codex", "enabled": true, "config": {"enabled": false}}
         },
         "projectSettingsOverrides": {"p1": {"providerInstances": {"cursor": {"enabled": true}}}}
     }))
     .unwrap();
+    for id in ["kiro", "kiro_work", "kiro_off"] {
+        assert!(!instance_enabled(&settings, None, id), "{id} should be disabled");
+    }
+    for id in ["kiro_on", "kiro_config_on"] {
+        assert!(instance_enabled(&settings, None, id), "{id} should be enabled");
+    }
     assert!(!instance_enabled(&settings, None, "cursor"));
     assert!(instance_enabled(&settings, Some("p1"), "cursor"));
     assert!(!instance_enabled(&settings, None, "off"));
@@ -72,6 +83,14 @@ fn default_selection_prefers_a_ready_instance_of_the_first_driver() {
     let selection = project_default_selection(&entries).unwrap();
     assert_eq!((selection.instance_id.as_str(), selection.model.as_str()), ("codex_two", "luna"));
     assert_eq!(selectable_entry(&entries, Some("codex")).map(ProviderEntry::instance_id), Some("codex"));
+}
+
+#[test]
+fn kiro_default_model_keeps_the_session_choice_until_models_arrive() {
+    let mut kiro: ServerProvider = serde_json::from_value(provider("kiro", "kiro", "ready", json!([]))).unwrap();
+    assert_eq!(default_model(&kiro), Some("default"));
+    kiro.models = serde_json::from_value(json!([model("live-model", json!({"isDefault": true}))])).unwrap();
+    assert_eq!(default_model(&kiro), Some("live-model"));
 }
 
 #[test]

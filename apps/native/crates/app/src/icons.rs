@@ -294,7 +294,7 @@ macro_rules! provider_logos {
 provider_logos! {
     mono: ["codex"],
     image: ["claudeAgent" => "claudeAgent.svg", "antigravity" => "antigravity.png"],
-    themed: ["cursor", "grok", "fx", "opencode", "muse", "pi"],
+    themed: ["cursor", "grok", "fx", "kiro", "opencode", "muse", "pi"],
 }
 
 /// Serves the vendored icons to GPUI.
