@@ -348,3 +348,31 @@ fn an_opened_device_takes_the_placeholder_tab_or_fronts_its_own() {
     assert!(panels.close_surface("t", "device") | panels.show("t"));
     assert!(panels.is_open("t") && panels.panel("t").surfaces.is_empty());
 }
+
+#[test]
+fn tool_diff_keeps_its_source_when_the_side_chat_pane_is_replaced() {
+    use crate::diff::{DiffSelection, ToolCallTarget};
+    let mut panels = RightPanels::default();
+    let target = ToolCallTarget { thread_id: "child".into(), item_id: "f1".into(), revision: "live".into() };
+    let selection = DiffSelection::ToolCall(target);
+    panels.open("parent", Surface::side_chat("child"));
+    assert_eq!(panels.active_thread_source("parent", &selection), Some("child"));
+    panels.open("parent", Surface::diff());
+    assert_eq!(panels.active_thread_source("parent", &selection), Some("child"), "replacing the child view must retain its stream");
+    assert_eq!(panels.active_surface("child"), None, "the diff belongs to the parent panel");
+    panels.close_surface("parent", "side-chat:child");
+    assert_eq!(panels.active_thread_source("parent", &selection), Some("child"), "the source outlives the child tab too");
+    assert_eq!(panels.active_thread_source("parent", &DiffSelection::Unstaged), None);
+    let other = DiffSelection::ToolCall(ToolCallTarget { thread_id: "other-child".into(), item_id: "f1".into(), revision: "live".into() });
+    assert_eq!(panels.active_thread_source("parent", &other), Some("other-child"));
+    assert_eq!(panels.active_thread_source("other", &selection), None);
+    panels.hide("parent");
+    assert_eq!(panels.active_thread_source("parent", &selection), None);
+    panels.show("parent");
+    assert_eq!(panels.active_thread_source("parent", &selection), Some("child"));
+    panels.close_surface("parent", "diff");
+    assert_eq!(panels.active_thread_source("parent", &selection), None);
+    panels.remove_thread("parent");
+    assert_eq!(panels.active_thread_source("parent", &selection), None);
+    assert_eq!(RightPanels::default().active_thread_source("parent", &selection), None);
+}

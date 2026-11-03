@@ -69,6 +69,8 @@ pub struct AppThread {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
     #[serde(default)]
     pub creation_source: Option<String>,
     /// The last rewind that failed, by the command that asked for it.
@@ -365,6 +367,11 @@ pub struct ThreadState {
 }
 
 impl ThreadState {
+    /// A diff source also respects deletion carried by a reconnect snapshot.
+    pub fn source_deleted(&self) -> bool {
+        self.deleted || self.projection.as_ref().is_some_and(|projection| projection.thread.deleted_at.is_some())
+    }
+
     /// A history page is merging off the UI thread. Views keep showing what they have.
     pub fn is_merging_history(&self) -> bool {
         self.merging.is_some()

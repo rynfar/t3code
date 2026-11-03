@@ -628,9 +628,73 @@ fn tool_call_target_follows_the_row_the_thread_shows() {
     let target = ToolCallTarget::of(&tool_item("f1", "file_change", "running"));
     assert_eq!(target, ToolCallTarget { thread_id: "t".into(), item_id: "f1".into(), revision: "live".into() });
     assert_eq!(target.resolve(&[row("completed", "file_change")]).revision, "2026-01-02T00:00:00Z");
+    let mut parent_row = row("completed", "file_change");
+    parent_row.source_thread_id = "parent".into();
+    assert_eq!(target.resolve(&[parent_row.clone()]), target, "an identical item id in the parent cannot settle the child");
+    let settled = target.resolve(&[parent_row, row("completed", "file_change")]);
+    assert_ne!(settled.request(), target.request(), "settlement must invalidate a live detail request");
+    assert_eq!(settled.thread_id, target.thread_id);
+    assert_eq!(settled.item_id, target.item_id);
     assert_eq!(target.resolve(&[row("completed", "command_execution")]), target);
     assert_eq!(target.resolve(&[]), target);
     assert_eq!(target.request(), json!({ "threadId": "t", "itemId": "f1", "revision": "live" }));
+
+    let fork: crate::shell::ThreadShell = serde_json::from_value(json!({
+        "id": "fork", "projectId": "p", "title": "Fork", "providerInstanceId": "codex",
+        "modelSelection": {"instanceId": "codex", "model": "gpt"}, "runtimeMode": "auto", "interactionMode": "default",
+        "branch": null, "worktreePath": null, "lineage": {"parentThreadId": "t", "relationshipToParent": "fork", "rootThreadId": "t"},
+        "latestRunId": null, "activeRunId": null, "status": "completed", "pendingRuntimeRequest": null,
+        "latestVisibleMessage": null, "latestUserMessageAt": null, "hasActionableProposedPlan": false,
+        "itemCount": 1, "visibleItemCount": 1, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+        "archivedAt": null, "settledOverride": null, "settledAt": null, "deletedAt": null
+    })).expect("fork shell");
+    let mut shell = crate::shell::ShellState::default();
+    shell.snapshot = Some(crate::shell::ShellSnapshot { snapshot_sequence: 1, threads: vec![fork], ..Default::default() });
+    let mut source = crate::thread::ThreadState::default();
+    assert!(shell.thread("fork").is_some());
+    assert!(shell.thread(&target.thread_id).is_none());
+    assert!(target.source_available(shell.thread(&target.thread_id), &source), "the inherited item's original source is unloaded, not deleted");
+    let mut original = shell.thread("fork").unwrap().clone();
+    original.id = target.thread_id.clone();
+    shell.snapshot.as_mut().unwrap().threads.push(original);
+    assert!(target.source_available(shell.thread(&target.thread_id), &source), "a loaded source remains readable");
+    shell.snapshot.as_mut().unwrap().threads.last_mut().unwrap().deleted_at = Some("2026-01-03T00:00:00Z".into());
+    assert!(!target.source_available(shell.thread(&target.thread_id), &source), "a loaded deletion marker also cancels the read");
+    shell.snapshot.as_mut().unwrap().threads.pop();
+    assert!(shell.apply(crate::shell::ShellStreamItem::ThreadRemoved { thread_id: target.thread_id.clone(), sequence: 2 }));
+    assert!(target.source_available(shell.thread(&target.thread_id), &source), "shell removal can be archival, so it cannot cancel an inherited detail read");
+    let mut deleted: crate::thread::AppThread = serde_json::from_value(serde_json::to_value(shell.thread("fork").unwrap()).unwrap()).unwrap();
+    deleted.id = target.thread_id.clone();
+    assert!(source.apply(crate::thread::ThreadStreamItem::Event {
+        sequence: 3,
+        event: Box::new(crate::thread::DomainEvent {
+            id: "deleted".into(), thread_id: target.thread_id.clone(), occurred_at: "2026-01-03T00:00:00Z".into(),
+            body: crate::thread::EventBody::ThreadDeleted(Box::new(deleted)),
+        }),
+    }));
+    let snapshot = shell.snapshot.clone().unwrap();
+    shell.apply(crate::shell::ShellStreamItem::Snapshot { snapshot: Box::new(snapshot), resolved_repository_identity_roots: None });
+    assert!(shell.removed_at.is_empty());
+    assert!(!target.source_available(shell.thread(&target.thread_id), &source), "the retained detail tombstone survives a fresh shell");
+
+    for (deleted_at, archived_at, readable) in [
+        (None, None, true),
+        (Some(serde_json::Value::Null), Some(json!("2026-01-03T00:00:00Z")), true),
+        (Some(json!("2026-01-03T00:00:00Z")), None, false),
+    ] {
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!("../timeline/fixtures/showcase.json")).unwrap();
+        let thread = snapshot["projection"]["thread"].as_object_mut().unwrap();
+        thread.insert("id".into(), json!(target.thread_id));
+        thread.insert("archivedAt".into(), archived_at.unwrap_or(serde_json::Value::Null));
+        match deleted_at {
+            Some(value) => { thread.insert("deletedAt".into(), value); }
+            None => { thread.remove("deletedAt"); }
+        }
+        let mut restored = crate::thread::ThreadState::default();
+        assert!(restored.apply(crate::thread::decode_thread_stream_item(snapshot).unwrap()));
+        assert!(!restored.deleted, "web snapshot installation keeps the main thread's state live");
+        assert_eq!(target.source_available(None, &restored), readable, "source eligibility must honor a snapshot-only deletion with no shell row");
+    }
 
     let selection = DiffSelection::ToolCall(target.clone());
     let text = serde_json::to_string(&selection).expect("encode");

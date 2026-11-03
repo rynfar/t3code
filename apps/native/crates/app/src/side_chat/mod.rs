@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{Context, Task};
+use t3_core::diff::DiffSelection;
 use t3_core::lineage::latest_merge_back_run;
 use t3_core::timeline::child_inputs;
-use t3_core::right_panel::Surface;
+use t3_core::right_panel::{Surface, SurfaceKind};
 use t3_core::side_chat::{self, Parent};
 use t3_core::thread::ThreadState;
 
@@ -53,6 +54,10 @@ impl SideThreads {
 }
 
 impl AppState {
+    pub(crate) fn can_read_threads(&self) -> bool {
+        self.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_none_or(|session| session.grants("orchestration:read")))
+    }
+
     /// The detail of the open thread or of a side subscription; empty while it loads.
     pub fn thread_state(&self, thread_id: &str) -> &ThreadState {
         if self.selected_thread.as_deref() == Some(thread_id) {
@@ -74,7 +79,17 @@ impl AppState {
 
     /// Routes one stream item to a side subscription. Returns whether it changed.
     pub(crate) fn apply_side_thread(&mut self, thread_id: &str, item: t3_core::thread::ThreadStreamItem) -> bool {
-        self.side_threads.threads.get_mut(thread_id).is_some_and(|state| state.apply(item))
+        let Some(state) = self.side_threads.threads.get_mut(thread_id) else { return false };
+        if state.deleted { return false; }
+        let changed = state.apply(item);
+        if state.source_deleted() {
+            if !state.deleted {
+                *state = ThreadState::default();
+                state.deleted = true;
+            }
+            if let Some(client) = self.client_handle() { client.close_thread(thread_id); }
+        }
+        changed
     }
 
     /// The open thread's selection moved onto a side subscription: it keeps its live state.
@@ -84,16 +99,20 @@ impl AppState {
         }
     }
 
-    /// The side threads the open thread needs: its showing side chat tab and the children that
-    /// ask for an approval. A side chat the shell does not list (deleted, or not yet loaded) has
-    /// no stream, as `SideChatPane` reads no projection without a shell.
+    /// The visible source and children asking for approval. Tool diffs can read an ancestor
+    /// the paged shell has not loaded; side chat panes still require their shell row.
     fn wanted_side_threads(&self) -> Vec<String> {
         let Some(selected) = self.selected_thread.as_deref() else { return Vec::new() };
         let mut wanted: Vec<String> = Vec::new();
-        if let Some(id) = self.panels.panels.active_surface(selected).and_then(Surface::side_chat_thread)
-            && self.thread_shell(id).is_some()
-        {
-            wanted.push(id.to_owned());
+        let selection = self.panels.diff_selection(selected);
+        if let Some(id) = self.panels.panels.active_thread_source(selected, &selection) {
+            let readable = match (&selection, self.panels.panels.active_surface(selected).map(|surface| &surface.kind)) {
+                (DiffSelection::ToolCall(target), Some(SurfaceKind::Diff)) => target.source_available(self.thread_shell(id), self.thread_state(id)),
+                _ => self.thread_shell(id).is_some() && !self.thread_state(id).deleted,
+            };
+            if readable && self.can_read_threads() {
+                wanted.push(id.to_owned());
+            }
         }
         if let Some(snapshot) = &self.shell.snapshot {
             for child in child_inputs(&snapshot.threads, selected, false).map(|inputs| inputs.children).unwrap_or_default() {
@@ -113,8 +132,27 @@ impl AppState {
         let wanted = self.wanted_side_threads();
         let client = self.client_handle();
         let selected = self.selected_thread.clone();
+        let diff_target = selected.as_deref().and_then(|thread| {
+            if self.panels.panels.active_surface(thread).is_none_or(|surface| surface.kind != SurfaceKind::Diff) {
+                return None;
+            }
+            match self.panels.diff_selection(thread) {
+                DiffSelection::ToolCall(target) => Some(target),
+                _ => None,
+            }
+        });
         let stale: Vec<String> = self.side_threads.threads.keys().filter(|id| !wanted.contains(id)).cloned().collect();
         for id in stale {
+            if diff_target.as_ref().is_some_and(|target| target.thread_id == id && !target.source_available(self.thread_shell(&id), self.thread_state(&id))) {
+                let state = self.side_threads.threads.get_mut(&id).expect("stale subscription");
+                // Keep one deletion tombstone while its diff is active, even across shell snapshots.
+                if !state.deleted {
+                    *state = ThreadState::default();
+                    state.deleted = true;
+                    if let Some(client) = &client { client.close_thread(&id); }
+                }
+                continue;
+            }
             self.side_threads.threads.remove(&id);
             if let Some(client) = &client
                 && selected.as_deref() != Some(id.as_str())

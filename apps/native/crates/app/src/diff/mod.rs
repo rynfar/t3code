@@ -21,9 +21,9 @@ use gpui::{
 use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::diff::{
-    DiffScope, DiffSelection, DiffSession, Layout, ParsedPatch, ToolCallTarget, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id,
+    DiffScope, DiffSelection, DiffSession, Layout, ParsedPatch, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id,
 };
-use t3_core::right_panel::{Surface, SurfaceKind};
+use t3_core::right_panel::SurfaceKind;
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::theme::{Palette, hsla, palette};
@@ -47,7 +47,10 @@ pub struct DiffPanel {
     cache: Vec<(RequestKey, Loaded)>,
     pending: bool,
     error: Option<String>,
-    _fetch: Option<Task<()>>,
+    _fetch: Option<Fetch>,
+    fetch_generation: u64,
+    connection: Option<u64>,
+    _grants: Option<Task<()>>,
     git_revision: u64,
     git_fetched_at: Option<Instant>,
     /// `deriveWorkspaceMutationId` as last seen: a change refetches git diffs mid-turn.
@@ -76,6 +79,17 @@ pub struct DiffPanel {
     _subscription: Subscription,
 }
 
+struct Fetch {
+    network: tokio::task::AbortHandle,
+    _completion: Task<()>,
+}
+
+impl Drop for Fetch {
+    fn drop(&mut self) {
+        self.network.abort();
+    }
+}
+
 /// What a detached panel shows: a key for its folds, and the patch or why there is none.
 pub struct External {
     pub key: String,
@@ -97,7 +111,7 @@ impl DiffPanel {
                 if let Some(view) = &this.view { let count = view.row_count(); this.list.splice(0..count, count); }
                 cx.notify();
             }
-            if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::RightPanel | AppEvent::Shell | AppEvent::Phase) {
+            if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::RightPanel | AppEvent::Shell | AppEvent::Phase | AppEvent::SideThread) {
                 this.sync(cx);
             }
         });
@@ -114,6 +128,9 @@ impl DiffPanel {
             pending: false,
             error: None,
             _fetch: None,
+            fetch_generation: 0,
+            connection: None,
+            _grants: None,
             git_revision: 0,
             git_fetched_at: None,
             workspace_mutation: None,
@@ -165,6 +182,31 @@ impl DiffPanel {
             }
             return;
         }
+        let connection = self.state.read(cx).connection_id();
+        let connection_changed = connection != self.connection;
+        if connection_changed {
+            self.connection = connection;
+            self.cancel_fetch();
+            self.request = None;
+            self.loaded = None;
+            self.cache.clear();
+            self.repositories.clear();
+            self.git_fetched_at = None;
+            self.connected = false;
+            self._grants = None;
+            if let Some(client) = self.state.read(cx).client_handle() {
+                let mut grants = client.session_state();
+                self._grants = Some(cx.spawn(async move |this, cx| {
+                    while grants.changed().await.is_ok() {
+                        grants.borrow_and_update();
+                        if this.update(cx, |this, cx| {
+                            this.state.update(cx, |state, cx| state.sync_side_threads(cx));
+                            this.sync(cx);
+                        }).is_err() { return; }
+                    }
+                }));
+            }
+        }
         let state = self.state.read(cx);
         let thread_id = state.selected_thread.clone();
         let thread_changed = thread_id != self.thread_id;
@@ -179,6 +221,7 @@ impl DiffPanel {
             self.tree_collapsed.clear();
         }
         let Some(thread_id) = thread_id else {
+            self.cancel_fetch();
             if self.request.take().is_some() | self.view.take().is_some() {
                 self.list.reset(0);
                 cx.notify();
@@ -218,7 +261,7 @@ impl DiffPanel {
         let visible = state.panels.panels.active_surface(&thread_id).is_some_and(|surface| surface.kind == SurfaceKind::Diff);
         let scope = match DiffScope::resolve(&selection, &self.summaries) {
             DiffScope::ToolCall(target) => {
-                let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == thread_id);
+                let projection = state.thread_state(&target.thread_id).projection.as_ref().filter(|projection| projection.thread.id == target.thread_id);
                 DiffScope::ToolCall(target.resolve(projection.map(|projection| projection.visible_turn_items.as_slice()).unwrap_or_default()))
             }
             scope => scope,
@@ -234,7 +277,12 @@ impl DiffPanel {
         }
         self.workspace_mutation = mutation;
         self.visible = visible;
-        let request = environment.and_then(|environment| match &scope {
+        let can_read = state.can_read_threads();
+        let source_exists = match &scope {
+            DiffScope::ToolCall(target) => target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)),
+            _ => true,
+        };
+        let request = environment.filter(|_| can_read && source_exists).and_then(|environment| match &scope {
             DiffScope::Branch { base_ref } => cwd.clone().map(|cwd| RequestKey::Git {
                 environment,
                 cwd,
@@ -260,7 +308,8 @@ impl DiffPanel {
             DiffScope::ToolCall(target) => Some(RequestKey::ToolCall { environment, target: target.clone() }),
         });
         let ui = (crate::settings::client_settings(cx).diff_layout(), state.panels.diff_file_tree_open, crate::settings::client_settings(cx).diff_files_collapsed());
-        let changed = thread_changed
+        let changed = connection_changed
+            || thread_changed
             || request != self.request
             || scope != self.scope
             || selection != self.selection
@@ -271,6 +320,17 @@ impl DiffPanel {
         self.ui = ui;
         self.selection = selection;
         self.scope = scope;
+        if !can_read || !source_exists {
+            self.loaded = None;
+            self.cache.clear();
+        }
+        if thread_changed || !visible || !connected || request != self.request {
+            self.cancel_fetch();
+        }
+        if reconnected {
+            self.cache.clear();
+            self.loaded = None;
+        }
         if request != self.request {
             self.request = request.clone();
             self.error = None;
@@ -295,6 +355,11 @@ impl DiffPanel {
         {
             self.fetch(key, cx);
         }
+        if !can_read {
+            self.error = Some("This device does not have orchestration:read permission.".into());
+        } else if !source_exists {
+            self.error = Some("The source thread is no longer available.".into());
+        }
         if changed {
             self.rebuild(cx);
             cx.notify();
@@ -310,16 +375,25 @@ impl DiffPanel {
         }
     }
 
+    fn cancel_fetch(&mut self) {
+        self.fetch_generation += 1;
+        self._fetch = None;
+        self.pending = false;
+    }
+
     fn fetch(&mut self, key: RequestKey, cx: &mut Context<Self>) {
         let Some(task) = source::fetch(self.state.read(cx), &key) else {
             self.error = Some("Not connected to the server.".to_owned());
             return;
         };
         self.pending = true;
-        self._fetch = Some(cx.spawn(async move |this, cx| {
+        let network = task.abort_handle();
+        let connection = self.connection;
+        let generation = self.fetch_generation;
+        let completion = cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
             let _ = this.update(cx, |this, cx| {
-                if this.request.as_ref() != Some(&key) {
+                if this.connection != connection || this.fetch_generation != generation || !this.visible || this.request.as_ref() != Some(&key) {
                     return;
                 }
                 this.pending = false;
@@ -341,7 +415,8 @@ impl DiffPanel {
                 this.rebuild(cx);
                 cx.notify();
             });
-        }));
+        });
+        self._fetch = Some(Fetch { network, _completion: completion });
     }
 
     /// The patch for the current scope: the loaded one, or the last one of the same source
@@ -687,17 +762,6 @@ fn error_line(error: String, p: &Palette) -> gpui::Div {
     div().px(px(12.)).mb(px(8.)).text_size(px(11.)).text_color(hsla(p.error).opacity(0.8)).child(error)
 }
 
-impl AppState {
-    /// `onOpenToolDiff`: a file change's "Open diff" shows that tool call's patch in the diff.
-    pub fn open_tool_call_diff(&mut self, target: ToolCallTarget, cx: &mut Context<Self>) {
-        // Opening resets a diff nobody asked for to the branch scope, so select after it.
-        self.mutate_panels(cx, |state, thread| {
-            state.panels.open(thread, Surface::diff());
-            true
-        });
-        self.select_diff(DiffSelection::ToolCall(target), cx);
-    }
-}
 
 impl Render for DiffPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

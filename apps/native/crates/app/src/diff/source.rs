@@ -73,6 +73,7 @@ impl ToolCall {
 }
 
 pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHandle<Result<Loaded, String>>> {
+    if !state.can_read_threads() { return None; }
     match key {
         RequestKey::Git { cwd, base_ref, ignore_whitespace, .. } => {
             let (method, payload) = diff_preview_request(cwd, base_ref.as_deref(), *ignore_whitespace);
@@ -94,6 +95,7 @@ pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHand
                 decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, false, None, None, None)))
             })
         }
+        RequestKey::ToolCall { target, .. } if !target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)) => None,
         RequestKey::ToolCall { target, .. } => state.request(GET_TURN_ITEM, target.request(), |value| {
             let item = decode_detail(value).map_err(|error| error.to_string())?;
             let mut diff = item.and_then(|item| tool_call_diff(&item.kind)).unwrap_or_default();
@@ -120,6 +122,19 @@ mod tests {
         assert!(needs_fetch(&settled, Some(&live)));
         assert!(!needs_fetch(&live, Some(&live)));
         assert!(needs_fetch(&live, None));
+        let other_thread = RequestKey::ToolCall {
+            environment: "e".into(),
+            target: ToolCallTarget { thread_id: "parent".into(), item_id: "f1".into(), revision: "live".into() },
+        };
+        assert!(!live.same_source(&other_thread));
+        assert!(needs_fetch(&live, Some(&other_thread)));
+        let other_environment = RequestKey::ToolCall {
+            environment: "other".into(),
+            target: ToolCallTarget { thread_id: "t".into(), item_id: "f1".into(), revision: "live".into() },
+        };
+        assert!(!live.same_source(&other_environment));
+        assert!(needs_fetch(&live, Some(&other_environment)));
+
         let git = |revision| RequestKey::Git { environment: "e".into(), cwd: "/r".into(), base_ref: None, ignore_whitespace: true, revision };
         assert!(git(2).same_source(&git(1)) && needs_fetch(&git(2), Some(&git(1))));
     }

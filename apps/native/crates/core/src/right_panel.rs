@@ -290,6 +290,18 @@ impl RightPanels {
         if panel.is_open { panel.active() } else { None }
     }
 
+    /// The thread the visible panel needs beside the selected thread.
+    pub fn active_thread_source<'a>(&'a self, thread_id: &str, selection: &'a crate::diff::DiffSelection) -> Option<&'a str> {
+        match &self.active_surface(thread_id)?.kind {
+            SurfaceKind::SideChat { thread_id } => Some(thread_id),
+            SurfaceKind::Diff => match selection {
+                crate::diff::DiffSelection::ToolCall(target) => Some(&target.thread_id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn is_open(&self, thread_id: &str) -> bool {
         self.panel(thread_id).is_open
     }

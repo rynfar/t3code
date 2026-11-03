@@ -270,7 +270,7 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
             {
                 inspector = inspector.output_slot(command_output::panel(&entry.id, outputs.get(&entry.id), cx));
             }
-            if env.tool_diffs && matches!(item.kind, TurnItemKind::FileChange { .. }) {
+            if matches!(item.kind, TurnItemKind::FileChange { .. }) {
                 let target = t3_core::diff::ToolCallTarget::of(&item);
                 let open = cx.listener(move |view, _, _, cx| view.open_tool_call_diff(target.clone(), cx));
                 inspector = inspector.open_diff(Some(outline_button(SharedString::from(format!("open-tool-diff:{}", item.id)), "Open diff", open, cx)));
