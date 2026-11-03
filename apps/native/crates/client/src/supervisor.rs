@@ -44,12 +44,15 @@ pub enum PrepareError {
     Transient(String),
     /// Waits for the user (`ConnectionBlockedError`).
     Blocked(String),
+    /// Readied, but at this other address.
+    Moved(String),
 }
 
 impl PrepareError {
     pub fn message(&self) -> &str {
         match self {
             PrepareError::Transient(message) | PrepareError::Blocked(message) => message,
+            PrepareError::Moved(_) => "The connection moved to another local address.",
         }
     }
 }
@@ -70,6 +73,9 @@ pub enum ClientEvent {
     Thread { thread_id: String, item: Box<ThreadStreamItem> },
     ServerConfig(Box<ServerConfigStreamEvent>),
     StreamError { context: String, message: String },
+    /// The prepared route now listens at another address (an SSH tunnel had to change ports).
+    /// The client stopped; the app starts one there.
+    Moved { http_base: String },
 }
 
 enum Command {
@@ -253,6 +259,10 @@ async fn supervise(
         };
         let outcome = match prepared {
             Ok(()) => connect(&credentials).await,
+            Err(PrepareError::Moved(http_base)) => {
+                let _ = events.send(ClientEvent::Moved { http_base }).await;
+                return;
+            }
             Err(PrepareError::Transient(reason)) => Err(ConnectError::Transient(reason)),
             Err(PrepareError::Blocked(reason)) => Err(ConnectError::Blocked(reason)),
         };

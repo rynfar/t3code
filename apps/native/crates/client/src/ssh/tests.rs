@@ -15,7 +15,7 @@ const FAKE_SSH: &str = r#"#!/bin/sh
 dir='@@DIR@@'
 printf '%s\n' "$*" >> "$dir/calls"
 case " $* " in
-  *" -G "*) printf 'hostname devbox.example.com\nuser julius\nport 2222\n'; exit 0 ;;
+  *" -G "*) printf 'hostname %s\nuser julius\nport 2222\n' "$(cat "$dir/hostname" 2>/dev/null || echo devbox.example.com)"; exit 0 ;;
 esac
 @@AUTH@@
 case " $* " in
@@ -27,9 +27,19 @@ input="$(cat)"
 case "$input" in
   *'auth pairing create'*) printf 'loaded nvm default\n{"credential":"pairing-secret"}\n' ;;
   *'"stopped":true'*) printf '%s\n' "$*" >> "$dir/stops"; printf '{"stopped":true}\n' ;;
-  *) printf '%s\n' "$*" >> "$dir/launches"; printf 'loaded nvm default\n{"remotePort":3774}\n' ;;
+  *) printf '%s\n' "$*" >> "$dir/launches"
+@@LAUNCH@@
+     printf 'loaded nvm default\n{"remotePort":3774}\n' ;;
 esac
 "#;
+
+/// A launch still downloading the release.
+const LAUNCH_HANGS: &str = r#"     printf '%s\n' "$$" > "$dir/launch.pid"
+     exec sleep 600"#;
+
+/// Another process holds the forwarded port.
+const TUNNEL_PORT_TAKEN: &str = r#"    printf 'bind [127.0.0.1]:x: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port\n' >&2
+    exit 255"#;
 
 /// A tunnel that stays up until it is signalled.
 const TUNNEL_SLEEPS: &str = r#"    printf '%s\n' "$$" > "$dir/tunnel.pid"
@@ -50,12 +60,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, auth: &str, tunnel: &str) -> Fixture {
+        Fixture::with_launch(name, auth, tunnel, "")
+    }
+
+    fn with_launch(name: &str, auth: &str, tunnel: &str, launch: &str) -> Fixture {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("t3-ssh-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let program = dir.join("ssh");
-        let script = FAKE_SSH.replace("@@DIR@@", &dir.display().to_string()).replace("@@AUTH@@", auth).replace("@@TUNNEL@@", tunnel);
+        let script = FAKE_SSH.replace("@@DIR@@", &dir.display().to_string()).replace("@@AUTH@@", auth).replace("@@TUNNEL@@", tunnel).replace("@@LAUNCH@@", launch);
         std::fs::write(&program, script).expect("writes the fake ssh");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         Fixture { dir, program }
@@ -65,8 +79,15 @@ impl Fixture {
         std::fs::read_to_string(self.dir.join(file)).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
-    fn tunnel_pid(&self) -> i32 {
-        std::fs::read_to_string(self.dir.join("tunnel.pid")).ok().and_then(|pid| pid.trim().parse().ok()).expect("the tunnel recorded its pid")
+    /// The PID a fake recorded once it started. Bounded, so a fake that never got there fails.
+    async fn recorded_pid(&self, file: &str) -> i32 {
+        for _ in 0..200 {
+            if let Some(pid) = std::fs::read_to_string(self.dir.join(file)).ok().and_then(|pid| pid.trim().parse().ok()) {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{file} was never recorded");
     }
 
     fn manager(&self, prompts: Option<mpsc::UnboundedSender<PasswordRequest>>) -> SshEnvironments {
@@ -93,6 +114,23 @@ fn forward_to(ssh: &SshEnvironments, target: &SshTarget, server: &FakeServer) ->
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 sends nothing; it only checks that the process exists.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Running, as opposed to gone or a zombie waiting to be reaped.
+fn running(pid: i32) -> bool {
+    let stat = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    alive(pid) && !stat.unwrap_or_default().contains('Z')
+}
+
+/// Whether the process stops within a few seconds; a killed child is reaped asynchronously.
+async fn stops(pid: i32) -> bool {
+    for _ in 0..100 {
+        if !running(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 async fn devbox_server() -> FakeServer {
@@ -122,26 +160,28 @@ async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
     assert!(tunnels[0].ends_with(&format!("-L {port}:127.0.0.1:3774 -- julius@devbox")), "{}", tunnels[0]);
 
     // The supervisor's step reuses the tunnel through the resolved target, and checks identity.
-    ssh.prepare(&pairing.target, Some("env-devbox")).await.expect("reuses the tunnel");
+    let address = format!("http://127.0.0.1:{port}");
+    ssh.prepare(&pairing.target, Some("env-devbox"), &address).await.expect("reuses the tunnel");
     assert_eq!(fixture.lines("calls").iter().filter(|call| call.contains(" -N ")).count(), 1);
     assert_eq!(
-        ssh.prepare(&pairing.target, Some("env-other")).await,
+        ssh.prepare(&pairing.target, Some("env-other"), &address).await,
         Err(PrepareError::Blocked("That host reaches devbox, a different machine. Add it as its own environment instead.".to_owned()))
     );
+    // A client still pointed at an older port learns where the tunnel is now.
+    assert_eq!(ssh.prepare(&pairing.target, Some("env-devbox"), "http://127.0.0.1:1").await, Err(PrepareError::Moved(address.clone())));
 
     // Disconnect stops the tunnel the app spawned and the remote server.
-    let pid = fixture.tunnel_pid();
+    let pid = fixture.recorded_pid("tunnel.pid").await;
     assert!(alive(pid));
     ssh.disconnect(&pairing.target).await.expect("disconnects");
     assert!(!alive(pid), "the tunnel is stopped and reaped");
     assert_eq!(fixture.lines("stops").len(), 1);
 
     // Quitting stops tunnels and leaves the remote server for the next launch.
+    let _ = std::fs::remove_file(fixture.dir.join("tunnel.pid"));
     ssh.ensure(&pairing.target, false).await.expect("connects again");
-    let pid = fixture.tunnel_pid();
-    for monitor in ssh.shutdown() {
-        monitor.await.expect("the monitor finishes");
-    }
+    let pid = fixture.recorded_pid("tunnel.pid").await;
+    ssh.shutdown().await;
     assert!(!alive(pid));
     assert_eq!(fixture.lines("stops").len(), 1);
 }
@@ -243,4 +283,98 @@ fn the_askpass_helper_prints_the_cached_answer() {
     };
     assert_eq!(String::from_utf8_lossy(&run(Some("pw")).stdout), "pw\n");
     assert!(!run(None).status.success(), "a missing secret fails loudly");
+}
+
+#[tokio::test]
+async fn quitting_stops_ssh_still_starting_the_server() {
+    let fixture = Fixture::with_launch("quit", "", TUNNEL_SLEEPS, LAUNCH_HANGS);
+    let ssh = fixture.manager(None);
+    let starting = tokio::spawn({
+        let ssh = ssh.clone();
+        async move { ssh.ensure(&devbox(), false).await }
+    });
+    let launch = fixture.recorded_pid("launch.pid").await;
+    ssh.shutdown().await;
+    assert!(stops(launch).await, "the launch that was still installing is stopped");
+    assert_eq!(starting.await.expect("joins").err(), Some(quitting()));
+
+    // A tunnel still waiting to answer stops too, and nothing new starts after the quit.
+    let fixture = Fixture::new("quit-tunnel", "", TUNNEL_SLEEPS);
+    let ssh = fixture.manager(None);
+    let starting = tokio::spawn({
+        let ssh = ssh.clone();
+        async move { ssh.ensure(&devbox(), false).await }
+    });
+    let tunnel = fixture.recorded_pid("tunnel.pid").await;
+    ssh.shutdown().await;
+    assert!(stops(tunnel).await, "the tunnel that never answered is stopped");
+    assert!(starting.await.expect("joins").is_err());
+    assert_eq!(ssh.ensure(&devbox(), false).await.err(), Some(quitting()));
+}
+
+#[tokio::test]
+async fn a_forwarded_port_another_process_took_is_replaced() {
+    let fixture = Fixture::new("port", "", TUNNEL_PORT_TAKEN);
+    let ssh = fixture.manager(None);
+    let taken = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("binds");
+    let busy = taken.local_addr().expect("address").port();
+    ssh.state().ports.insert(core::target_connection_key(&devbox()), busy);
+    let _ = ssh.ensure(&devbox(), false).await;
+    let tunnels: Vec<String> = fixture.lines("calls").into_iter().filter(|call| call.contains(" -N ")).collect();
+    assert_eq!(tunnels.len(), 2, "one retry on another port: {tunnels:?}");
+    assert!(tunnels[0].contains(&format!("-L {busy}:")) && !tunnels[1].contains(&format!("-L {busy}:")), "{tunnels:?}");
+    let moved = ssh.session_port(&devbox()).expect("a port");
+    assert!(moved != busy && tunnels[1].contains(&format!("-L {moved}:")), "the session moves to the new port");
+}
+
+#[tokio::test]
+async fn disconnect_stops_the_tunnel_it_started_after_the_config_moves_the_alias() {
+    let server = devbox_server().await;
+    let fixture = Fixture::new("moved", "", TUNNEL_SLEEPS);
+    let ssh = fixture.manager(None);
+    forward_to(&ssh, &devbox(), &server);
+    let bootstrap = ssh.ensure(&devbox(), false).await.expect("connects");
+    let pid = fixture.recorded_pid("tunnel.pid").await;
+    // The alias now resolves to another host.
+    std::fs::write(fixture.dir.join("hostname"), "devbox-new.example.com").expect("writes");
+    ssh.disconnect(&bootstrap.target).await.expect("disconnects");
+    assert!(!alive(pid), "the running tunnel is found and stopped");
+    let stops = fixture.lines("stops");
+    assert!(stops.len() == 1 && stops[0].contains("-o HostName=devbox.example.com"), "the stop reaches the host the server runs on: {stops:?}");
+}
+
+#[test]
+fn the_stop_script_signals_only_the_server_it_started() {
+    use std::io::Write;
+    let home = std::env::temp_dir().join(format!("t3-ssh-stop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let state = home.join(".t3/ssh-launch/native-k");
+    std::fs::create_dir_all(&state).expect("state dir");
+    // Detached, as the nohup'd remote server is, so it is reaped once it stops.
+    let spawned = std::process::Command::new("/bin/sh").args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"]).output().expect("sh runs");
+    let pid: i32 = String::from_utf8_lossy(&spawned.stdout).trim().parse().expect("a pid");
+    let started = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().expect("ps runs");
+    let started = String::from_utf8_lossy(&started.stdout).trim_end_matches('\n').to_owned();
+    let stop = |recorded_start: &str| {
+        std::fs::write(state.join("pid"), format!("{pid}\n")).expect("pid");
+        std::fs::write(state.join("managed"), "managed\n").expect("managed");
+        std::fs::write(state.join("started"), format!("{recorded_start}\n")).expect("started");
+        let mut sh = std::process::Command::new("/bin/sh").arg("-s").env("HOME", &home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("sh runs");
+        sh.stdin.take().expect("stdin").write_all(scripts::stop_script("native-k").as_bytes()).expect("writes");
+        sh.wait_with_output().expect("sh exits")
+    };
+    // The recorded PID now belongs to another process: it is left alone, and the files go.
+    let output = stop("Thu Jan  1 00:00:00 1970");
+    assert!(output.status.success() && running(pid), "a reused PID is not signalled");
+    assert!(!state.join("pid").exists() && !state.join("started").exists());
+    // The server it started, by PID and start time, is stopped.
+    let output = stop(&started);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!running(pid), "its own server is stopped");
+    let still_ours = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim_end_matches('\n') == started);
+    if still_ours {
+        // SAFETY: a plain syscall on the sleep this test started, identified by its start time.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(&home);
 }

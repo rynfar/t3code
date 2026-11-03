@@ -156,14 +156,7 @@ impl AppState {
             _ssh_quit: None,
         };
         // Quitting stops the tunnels this app started, by the PIDs it spawned.
-        state._ssh_quit = Some(cx.on_app_quit(|state, _| {
-            let stopping = state.ssh.shutdown();
-            async move {
-                for tunnel in stopping {
-                    let _ = tunnel.await;
-                }
-            }
-        }));
+        state._ssh_quit = Some(cx.on_app_quit(|state, _| state.ssh.shutdown()));
         match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
             Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
@@ -259,6 +252,7 @@ impl AppState {
                 ClientEvent::StreamError { context, message } => {
                     self.last_error = Some(format!("Could not read {context}: {message}"));
                 }
+                ClientEvent::Moved { http_base } => self.route_moved(http_base, cx),
             }
         }
         if side_changed {

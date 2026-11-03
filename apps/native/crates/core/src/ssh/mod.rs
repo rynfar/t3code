@@ -120,9 +120,15 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_owned()).collect()
 }
 
-/// `baseSshArgs`.
+/// `baseSshArgs`. A target `ssh -G` resolved to another host name keeps reaching that host
+/// (`-o HostName=`) while the app runs, even if the SSH config changes meanwhile; the desktop
+/// resolves the alias again for each command.
 pub fn base_ssh_args(target: &SshTarget, batch_mode: bool) -> Vec<String> {
     let mut args = strings(&["-o", if batch_mode { "BatchMode=yes" } else { "BatchMode=no" }, "-o", "ConnectTimeout=10"]);
+    let hostname = target.hostname.trim();
+    if !hostname.is_empty() && hostname != target.alias.trim() {
+        args.extend(["-o".to_owned(), format!("HostName={hostname}")]);
+    }
     if let Some(port) = target.port {
         args.extend(["-p".to_owned(), port.to_string()]);
     }
@@ -165,6 +171,11 @@ pub fn tunnel_args(target: &SshTarget, batch_mode: bool, local_port: u16, remote
     ]));
     args.extend([format!("{local_port}:127.0.0.1:{remote_port}"), "--".to_owned(), host]);
     Ok(args)
+}
+
+/// The tunnel's local port is taken (`ExitOnForwardFailure`): another port may work.
+pub fn is_forward_port_taken(message: &str) -> bool {
+    message.contains("Address already in use") || message.contains("cannot listen to port") || message.contains("Could not request local forwarding")
 }
 
 /// `getLastNonEmptyOutputLine`.
@@ -521,9 +532,13 @@ mod tests {
     #[test]
     fn tunnels_forward_the_local_port_to_the_remote_loopback() {
         let args = tunnel_args(&target("devbox", "devbox.example.com", Some("julius"), Some(2222)), false, 41773, 3774).unwrap();
-        assert_eq!(&args[..6], ["-o", "BatchMode=no", "-o", "ConnectTimeout=10", "-p", "2222"]);
+        assert_eq!(&args[..8], ["-o", "BatchMode=no", "-o", "ConnectTimeout=10", "-o", "HostName=devbox.example.com", "-p", "2222"]);
         assert_eq!(&args[args.len() - 5..], ["-N", "-L", "41773:127.0.0.1:3774", "--", "julius@devbox"]);
         assert!(args.windows(2).any(|pair| pair == ["-o", "ExitOnForwardFailure=yes"]));
+        // An alias `ssh -G` could not resolve further is left to ssh.
+        assert!(!base_ssh_args(&target("devbox", "devbox", None, None), true).iter().any(|arg| arg.starts_with("HostName=")));
+        assert!(is_forward_port_taken("bind [127.0.0.1]:41773: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port: 41773"));
+        assert!(!is_forward_port_taken("Permission denied (publickey)."));
     }
 
     #[test]

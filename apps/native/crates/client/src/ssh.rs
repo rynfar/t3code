@@ -6,8 +6,9 @@
 //! `prepareDesktopSshEnvironment`). The pure parts live in `t3_core::ssh`.
 //!
 //! Every `ssh` runs in a process group of its own and is stopped through the PID this module
-//! spawned, never by name. A target keeps one local port for the app session, so the
-//! supervisor's address stays valid while a tunnel is replaced underneath it.
+//! spawned, never by name; quitting stops all of them, tunnels and commands still running alike.
+//! A target keeps one local port for the app session, so the supervisor's address stays valid
+//! while a tunnel is replaced underneath it, unless another process took the port.
 //!
 //! The remote runs the T3 release of the `t3` CLI on this Mac (the desktop runs its own version),
 //! else the latest release. `T3_NATIVE_SSH_BIN` replaces the `ssh` executable.
@@ -100,6 +101,40 @@ impl PasswordRequest {
     }
 }
 
+/// Quitting stops every `ssh` this module started, and waits until each one is gone.
+#[derive(Clone)]
+struct Lifecycle {
+    stopping: watch::Receiver<bool>,
+    in_flight: Arc<watch::Sender<usize>>,
+}
+
+/// Counts one `ssh` until it is killed or reaped.
+struct InFlight(Arc<watch::Sender<usize>>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count = count.saturating_sub(1));
+    }
+}
+
+fn quitting() -> SshError {
+    SshError("T3 Code is quitting.".to_owned())
+}
+
+impl Lifecycle {
+    /// Counted before the check, so a quit that starts meanwhile still waits for it.
+    fn track(&self) -> Result<InFlight, SshError> {
+        self.in_flight.send_modify(|count| *count += 1);
+        let tracked = InFlight(self.in_flight.clone());
+        if *self.stopping.borrow() { Err(quitting()) } else { Ok(tracked) }
+    }
+
+    async fn stopped(&self) {
+        let mut stopping = self.stopping.clone();
+        let _ = stopping.wait_for(|stopping| *stopping).await;
+    }
+}
+
 /// How one `ssh` authenticates: batch mode, or the askpass helper with the cached answer.
 #[derive(Clone)]
 struct Auth {
@@ -169,11 +204,12 @@ impl Default for CommandSpec<'_> {
     }
 }
 
-/// `runSshCommand`: one `ssh`, its stdin written and closed, its stdout returned. A timeout, or
-/// dropping the future, kills its process group.
-async fn run_command(program: &Path, target: &SshTarget, spec: CommandSpec<'_>, auth: &Auth) -> Result<String, SshError> {
+/// `runSshCommand`: one `ssh`, its stdin written and closed, its stdout returned. A timeout, a
+/// quit, or dropping the future kills its process group.
+async fn run_command(program: &Path, life: &Lifecycle, target: &SshTarget, spec: CommandSpec<'_>, auth: &Auth) -> Result<String, SshError> {
     let host = core::host_spec(target).map_err(SshError)?;
     let args = core::command_args(target, auth.batch_mode, spec.pre_host, spec.remote).map_err(SshError)?;
+    let _in_flight = life.track()?;
     let mut command = tokio::process::Command::new(program);
     command
         .args(&args)
@@ -200,7 +236,12 @@ async fn run_command(program: &Path, target: &SshTarget, spec: CommandSpec<'_>, 
     tokio::pin!(output);
     // Declared after `output`, so it drops first: the group dies while its leader is unreaped.
     let mut group = ProcessGroup(pid);
-    let output = match tokio::time::timeout(spec.timeout, &mut output).await {
+    let finished = tokio::select! {
+        biased;
+        () = life.stopped() => return Err(quitting()),
+        finished = tokio::time::timeout(spec.timeout, &mut output) => finished,
+    };
+    let output = match finished {
         Ok(Ok(output)) => {
             group.0 = None;
             output
@@ -224,6 +265,8 @@ async fn run_command(program: &Path, target: &SshTarget, spec: CommandSpec<'_>, 
 
 /// A running `ssh -N -L` and what it forwards.
 struct Tunnel {
+    /// The target as resolved when it started: where its remote server runs.
+    target: SshTarget,
     local_port: u16,
     http_base: String,
     /// `Some(exit code)` once the `ssh` is gone.
@@ -300,8 +343,9 @@ fn tail_text(tail: &Mutex<Vec<u8>>) -> String {
 
 /// `startSshTunnel`: forwards `local_port` and waits until the remote server answers through it.
 /// An `ssh` that exits first fails with the tail of what it printed.
-async fn start_tunnel(program: &Path, target: &SshTarget, local_port: u16, remote_port: u16, auth: Auth) -> Result<Tunnel, SshError> {
+async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, local_port: u16, remote_port: u16, auth: Auth) -> Result<Tunnel, SshError> {
     let args = core::tunnel_args(target, auth.batch_mode, local_port, remote_port).map_err(SshError)?;
+    let in_flight = life.track()?;
     let mut command = tokio::process::Command::new(program);
     command.args(&args).envs(auth.environment()?).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(unix)]
@@ -328,11 +372,19 @@ async fn start_tunnel(program: &Path, target: &SshTarget, local_port: u16, remot
     });
     let (exit_tx, exit) = watch::channel(None);
     let (stop, stop_rx) = oneshot::channel::<()>();
+    let life = life.clone();
     let monitor = tokio::spawn(async move {
+        let _in_flight = in_flight;
+        let stop = async {
+            tokio::select! {
+                _ = stop_rx => {}
+                () = life.stopped() => {}
+            }
+        };
         let code = tokio::select! {
             biased;
             status = child.wait() => status.ok().and_then(|status| status.code()),
-            _ = stop_rx => stop_child(&mut child, pid).await,
+            () = stop => stop_child(&mut child, pid).await,
         };
         // Diagnostics drain until the tunnel closes, unless a helper it started holds stderr.
         if let Some(drain) = drain {
@@ -340,7 +392,7 @@ async fn start_tunnel(program: &Path, target: &SshTarget, local_port: u16, remot
         }
         let _ = exit_tx.send(Some(code));
     });
-    let tunnel = Tunnel { local_port, http_base: format!("http://127.0.0.1:{local_port}"), exit, stop: Some(stop), monitor: Some(monitor) };
+    let tunnel = Tunnel { target: target.clone(), local_port, http_base: format!("http://127.0.0.1:{local_port}"), exit, stop: Some(stop), monitor: Some(monitor) };
     let mut exit = tunnel.exit.clone();
     let exited = async move { exit.wait_for(Option::is_some).await.ok().and_then(|code| *code).flatten() };
     tokio::select! {
@@ -362,7 +414,7 @@ async fn start_tunnel(program: &Path, target: &SshTarget, local_port: u16, remot
 }
 
 /// `launchOrReuseRemoteServer`.
-async fn launch_remote(program: &Path, target: &SshTarget, auth: Auth, version: &str) -> Result<LaunchResult, SshError> {
+async fn launch_remote(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth, version: &str) -> Result<LaunchResult, SshError> {
     let state_key = core::native_state_key(target);
     let spec = CommandSpec {
         remote: &["sh", "-l", "-s", "--", state_key.as_str()],
@@ -370,14 +422,14 @@ async fn launch_remote(program: &Path, target: &SshTarget, auth: Auth, version: 
         timeout: millis(core::ARCHIVE_LAUNCH_TIMEOUT_MS),
         ..Default::default()
     };
-    let stdout = run_command(program, target, spec, &auth).await?;
+    let stdout = run_command(program, life, target, spec, &auth).await?;
     let launched = core::parse_launch_output(&stdout).map_err(SshError)?;
     tracing::info!(alias = %target.alias, remote_port = launched.remote_port, kind = ?launched.server_kind, "remote T3 server ready");
     Ok(launched)
 }
 
 /// `issueRemotePairingToken`.
-async fn issue_pairing_token(program: &Path, target: &SshTarget, auth: Auth, version: &str) -> Result<String, SshError> {
+async fn issue_pairing_token(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth, version: &str) -> Result<String, SshError> {
     let state_key = core::native_state_key(target);
     let spec = CommandSpec {
         remote: &["sh", "-s"],
@@ -385,13 +437,13 @@ async fn issue_pairing_token(program: &Path, target: &SshTarget, auth: Auth, ver
         timeout: millis(core::ARCHIVE_LAUNCH_TIMEOUT_MS),
         ..Default::default()
     };
-    core::parse_pairing_output(&run_command(program, target, spec, &auth).await?).map_err(SshError)
+    core::parse_pairing_output(&run_command(program, life, target, spec, &auth).await?).map_err(SshError)
 }
 
 /// `stopRemoteServer`: only a server this app started.
-async fn stop_remote(program: &Path, target: &SshTarget, auth: Auth) -> Result<(), SshError> {
+async fn stop_remote(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth) -> Result<(), SshError> {
     let spec = CommandSpec { remote: &["sh", "-s"], stdin: Some(scripts::stop_script(&core::native_state_key(target))), ..Default::default() };
-    run_command(program, target, spec, &auth).await.map(drop)
+    run_command(program, life, target, spec, &auth).await.map(drop)
 }
 
 /// The installed `t3` CLI's release, the one the desktop app on this Mac would run remotely.
@@ -432,7 +484,10 @@ pub struct SshPairing {
 
 #[derive(Default)]
 struct State {
+    /// By the key of the target as resolved when the tunnel started.
     tunnels: HashMap<String, Tunnel>,
+    /// The tunnel each caller's target reached last, by key.
+    routes: HashMap<String, String>,
     /// Each target's local port for the session.
     ports: HashMap<String, u16>,
     /// Answers from the password prompt, kept in memory for the session only.
@@ -442,6 +497,8 @@ struct State {
 struct Inner {
     program: PathBuf,
     prompts: Option<mpsc::UnboundedSender<PasswordRequest>>,
+    stopping: watch::Sender<bool>,
+    in_flight: Arc<watch::Sender<usize>>,
     version: Mutex<Option<String>>,
     state: Mutex<State>,
     /// One per target, so a reconnect never reuses a server while its stop is pending.
@@ -482,8 +539,20 @@ impl SshEnvironments {
     }
 
     fn with_program(program: PathBuf, prompts: Option<mpsc::UnboundedSender<PasswordRequest>>, version: Option<String>) -> Self {
-        let inner = Inner { program, prompts, version: Mutex::new(version), state: Mutex::default(), locks: Mutex::default() };
+        let inner = Inner {
+            program,
+            prompts,
+            stopping: watch::Sender::new(false),
+            in_flight: Arc::new(watch::Sender::new(0)),
+            version: Mutex::new(version),
+            state: Mutex::default(),
+            locks: Mutex::default(),
+        };
         SshEnvironments { inner: Arc::new(inner) }
+    }
+
+    fn life(&self) -> Lifecycle {
+        Lifecycle { stopping: self.inner.stopping.subscribe(), in_flight: self.inner.in_flight.clone() }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -496,12 +565,15 @@ impl SshEnvironments {
 
     /// The local port `target` is forwarded on for the rest of the session.
     pub fn session_port(&self, target: &SshTarget) -> std::io::Result<u16> {
-        let key = core::target_connection_key(target);
-        if let Some(port) = self.state().ports.get(&key) {
+        self.session_port_for(&core::target_connection_key(target))
+    }
+
+    fn session_port_for(&self, key: &str) -> std::io::Result<u16> {
+        if let Some(port) = self.state().ports.get(key) {
             return Ok(*port);
         }
         let port = reserve_loopback_port()?;
-        Ok(*self.state().ports.entry(key).or_insert(port))
+        Ok(*self.state().ports.entry(key.to_owned()).or_insert(port))
     }
 
     /// `resolveSshTarget`: `ssh -G`'s view of an alias, or the alias as typed when that fails.
@@ -511,7 +583,7 @@ impl SshEnvironments {
             return Err(SshError("SSH host alias is required.".to_owned()));
         }
         let raw = SshTarget { alias: alias.to_owned(), hostname: alias.to_owned(), username: None, port: None };
-        match run_command(&self.inner.program, &raw, CommandSpec { pre_host: &["-G"], ..Default::default() }, &Auth::BATCH).await {
+        match run_command(&self.inner.program, &self.life(), &raw, CommandSpec { pre_host: &["-G"], ..Default::default() }, &Auth::BATCH).await {
             Ok(stdout) => Ok(core::parse_ssh_resolve_output(alias, &stdout)),
             Err(error) => {
                 tracing::debug!(%alias, %error, "ssh -G failed; using the alias as typed");
@@ -597,25 +669,46 @@ impl SshEnvironments {
         }
     }
 
+    /// The tunnel `target` reached last, and the target as resolved when it started.
+    fn recorded_route(&self, target: &SshTarget) -> Option<(String, SshTarget)> {
+        let state = self.state();
+        let key = state.routes.get(&core::target_connection_key(target))?;
+        state.tunnels.get(key).map(|tunnel| (key.clone(), tunnel.target.clone()))
+    }
+
     /// `ensureEnvironment`: the remote server running and forwarded to this target's session
     /// port, reusing a tunnel that still answers; with `issue_pairing`, a fresh credential too.
+    /// A running tunnel keeps the resolution it started with.
     pub async fn ensure(&self, target: &SshTarget, issue_pairing: bool) -> Result<Bootstrap, SshError> {
-        let port = self.session_port(target).map_err(|error| SshError(format!("Could not reserve a local port for the SSH tunnel: {error}")))?;
-        let resolved = self.resolve_with_overrides(target).await?;
+        let caller = core::target_connection_key(target);
+        let recorded = self.recorded_route(target).filter(|(key, _)| self.state().tunnels.get(key).is_some_and(Tunnel::running));
+        let resolved = match recorded {
+            Some((_, resolved)) => resolved,
+            None => self.resolve_with_overrides(target).await?,
+        };
         let key = core::target_connection_key(&resolved);
-        // The resolved target shares the port, so a later call with it reaches the same tunnel.
-        self.state().ports.insert(key.clone(), port);
         let version = self.runner_version().await?;
         let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
-        let http_base = self.ensure_tunnel(&key, &resolved, port, &version).await?;
-        let program = &self.inner.program;
-        let pairing_token =
-            if issue_pairing { Some(self.with_auth(&key, &resolved, |auth| issue_pairing_token(program, &resolved, auth, &version)).await?) } else { None };
+        let http_base = self.ensure_tunnel(&caller, &key, &resolved, &version).await?;
+        {
+            // The caller's target and the resolved one, which the app saves, both lead here.
+            let mut state = self.state();
+            state.routes.insert(caller, key.clone());
+            state.routes.insert(key.clone(), key.clone());
+        }
+        let (program, life) = (&self.inner.program, self.life());
+        let pairing_token = if issue_pairing {
+            Some(self.with_auth(&key, &resolved, |auth| issue_pairing_token(program, &life, &resolved, auth, &version)).await?)
+        } else {
+            None
+        };
         Ok(Bootstrap { target: resolved, http_base, pairing_token })
     }
 
-    async fn ensure_tunnel(&self, key: &str, target: &SshTarget, port: u16, version: &str) -> Result<String, SshError> {
+    async fn ensure_tunnel(&self, caller: &str, key: &str, target: &SshTarget, version: &str) -> Result<String, SshError> {
+        let reserve_error = |error: std::io::Error| SshError(format!("Could not reserve a local port for the SSH tunnel: {error}"));
+        let mut port = self.session_port_for(caller).map_err(reserve_error)?;
         let reusable = self.state().tunnels.get(key).filter(|tunnel| tunnel.running() && tunnel.local_port == port).map(|tunnel| tunnel.http_base.clone());
         if let Some(http_base) = reusable {
             if wait_http_ready(&http_base, millis(core::TUNNEL_REUSE_TIMEOUT_MS)).await.is_ok() {
@@ -628,35 +721,62 @@ impl SshEnvironments {
         if let Some(monitor) = stale.and_then(Tunnel::stop) {
             let _ = monitor.await;
         }
-        let program = &self.inner.program;
-        let launched = self.with_auth(key, target, |auth| launch_remote(program, target, auth, version)).await?;
-        let tunnel = self.with_auth(key, target, |auth| start_tunnel(program, target, port, launched.remote_port, auth)).await?;
+        let (program, life) = (&self.inner.program, self.life());
+        let launched = self.with_auth(key, target, |auth| launch_remote(program, &life, target, auth, version)).await?;
+        let mut moved = false;
+        let tunnel = loop {
+            match self.with_auth(key, target, |auth| start_tunnel(program, &life, target, port, launched.remote_port, auth)).await {
+                // Another process took the port while no tunnel held it: move to a free one.
+                Err(error) if !moved && core::is_forward_port_taken(&error.0) => {
+                    port = reserve_loopback_port().map_err(reserve_error)?;
+                    tracing::warn!(alias = %target.alias, port, "the SSH tunnel's local port was taken; moving it");
+                    self.state().ports.insert(caller.to_owned(), port);
+                    moved = true;
+                }
+                result => break result?,
+            }
+        };
+        // The resolved target shares the port, so a later call with it reaches the same tunnel.
+        self.state().ports.insert(key.to_owned(), port);
         let http_base = tunnel.http_base.clone();
         self.state().tunnels.insert(key.to_owned(), tunnel);
         Ok(http_base)
     }
 
-    /// `disconnectEnvironment`: closes the tunnel and stops the remote server this app started.
+    /// `disconnectEnvironment`: closes the tunnel `target` reached and stops the remote server
+    /// this app started where that tunnel led, even if the SSH config has changed since.
     pub async fn disconnect(&self, target: &SshTarget) -> Result<(), SshError> {
-        let resolved = self.resolve_with_overrides(target).await?;
-        let key = core::target_connection_key(&resolved);
+        let (key, resolved) = match self.recorded_route(target) {
+            Some(route) => route,
+            None => {
+                let resolved = self.resolve_with_overrides(target).await?;
+                (core::target_connection_key(&resolved), resolved)
+            }
+        };
         let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
+        self.state().routes.remove(&core::target_connection_key(target));
         let tunnel = self.state().tunnels.remove(&key);
         if let Some(monitor) = tunnel.and_then(Tunnel::stop) {
             let _ = monitor.await;
         }
-        let program = &self.inner.program;
-        self.with_auth(&key, &resolved, |auth| stop_remote(program, &resolved, auth)).await?;
+        let (program, life) = (&self.inner.program, self.life());
+        self.with_auth(&key, &resolved, |auth| stop_remote(program, &life, &resolved, auth)).await?;
         tracing::info!(alias = %resolved.alias, "SSH environment disconnected");
         Ok(())
     }
 
-    /// Stops every tunnel (on quit). Remote servers keep running for the next launch to reuse.
-    /// Each handle finishes once its `ssh` is reaped.
-    pub fn shutdown(&self) -> Vec<JoinHandle<()>> {
+    /// Quitting: stops every `ssh` this app started, tunnels and commands still running alike,
+    /// and refuses new ones. Remote servers keep running for the next launch to reuse. The future
+    /// finishes once each `ssh` is signalled and gone.
+    pub fn shutdown(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.inner.stopping.send_replace(true);
         let tunnels: Vec<Tunnel> = self.state().tunnels.drain().map(|(_, tunnel)| tunnel).collect();
-        tunnels.into_iter().filter_map(Tunnel::stop).collect()
+        drop(tunnels);
+        let mut in_flight = self.inner.in_flight.subscribe();
+        async move {
+            let _ = in_flight.wait_for(|count| *count == 0).await;
+        }
     }
 
     /// `provisionDesktopSshEnvironment`: readies the target, checks who answers, and redeems a
@@ -676,10 +796,14 @@ impl SshEnvironments {
         Ok(SshPairing { paired: Paired { credentials, descriptor: Some(descriptor) }, target: bootstrap.target })
     }
 
-    /// The step before each connection attempt (`prepareDesktopSshEnvironment`): the tunnel is up,
-    /// and it still reaches the saved environment before the saved credential is sent.
-    pub async fn prepare(&self, target: &SshTarget, expected_environment_id: Option<&str>) -> Result<(), PrepareError> {
+    /// The step before each connection attempt (`prepareDesktopSshEnvironment`): the tunnel is up
+    /// at `http_base`, and it still reaches the saved environment before the saved credential is
+    /// sent. A tunnel that had to move to another port reports where.
+    pub async fn prepare(&self, target: &SshTarget, expected_environment_id: Option<&str>, http_base: &str) -> Result<(), PrepareError> {
         let bootstrap = self.ensure(target, false).await.map_err(preparation_error)?;
+        if bootstrap.http_base != http_base {
+            return Err(PrepareError::Moved(bootstrap.http_base));
+        }
         let descriptor = auth::fetch_descriptor(&bootstrap.http_base).await.map_err(|error| preparation_error(SshError(error.to_string())))?;
         check_identity(&descriptor, expected_environment_id)
     }

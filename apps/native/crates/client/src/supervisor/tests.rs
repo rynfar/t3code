@@ -291,3 +291,14 @@ async fn a_prepared_route_is_readied_before_every_attempt_and_a_blocked_one_wait
     server.connection().await;
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
+
+#[tokio::test]
+async fn a_route_that_moved_stops_the_client_and_says_where() {
+    let server = FakeServer::start().await;
+    let prepare: Prepare = Arc::new(|| Box::pin(async { Err(PrepareError::Moved("http://127.0.0.1:52002".to_owned())) }));
+    let (_client, mut events) = start_prepared(&tokio::runtime::Handle::current(), server.credentials(), Some(prepare));
+    assert_eq!(next_status(&mut events).await, ConnectionStatus::Connecting);
+    let moved = tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("an event arrives");
+    assert!(matches!(moved, Some(ClientEvent::Moved { ref http_base }) if http_base == "http://127.0.0.1:52002"), "{moved:?}");
+    assert!(tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("ends").is_none(), "the client stopped");
+}

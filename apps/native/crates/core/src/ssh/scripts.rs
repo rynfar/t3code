@@ -121,6 +121,7 @@ PORT_FILE="$STATE_DIR/port"
 PID_FILE="$STATE_DIR/pid"
 MANAGED_FILE="$STATE_DIR/managed"
 LOG_FILE="$STATE_DIR/server.log"
+STARTED_FILE="$STATE_DIR/started"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
 RUNNER_NEXT="$STATE_DIR/run-t3.next.$$"
 mkdir -p "$STATE_DIR"
@@ -163,6 +164,15 @@ server_running() {
     *Z*) return 1 ;;
   esac
 }
+# A recorded PID is the server this launcher started only while the process
+# also has the start time recorded with it: once that server exits, its PID
+# may belong to anything. Without ps to tell, trust kill -0.
+process_started() {
+  ps -o lstart= -p "$1" 2>/dev/null || true
+}
+owns_server() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null && [ "$(process_started "$1")" = "$(cat "$STARTED_FILE" 2>/dev/null || true)" ]
+}
 resolve_default_runtime_port() {
   "$RUNNER_FILE" __ssh-helper runtime-port "$DEFAULT_RUNTIME_FILE"
 }
@@ -188,14 +198,14 @@ elif [ -n "$DEFAULT_REMOTE_PORT" ]; then
   if wait_ready "2000"; then
     ADOPTED_PID="$DEFAULT_RUNTIME_PID"
     if [ "$REMOTE_MANAGED" = "managed" ]; then
-      if [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
+      if owns_server "$REMOTE_PID"; then
         kill "$REMOTE_PID" 2>/dev/null || true
         wait_for_pid_exit "$REMOTE_PID"
       fi
       REMOTE_PID=""
       REMOTE_PORT="$DEFAULT_REMOTE_PORT"
       REMOTE_MANAGED="external"
-      rm -f "$PID_FILE"
+      rm -f "$PID_FILE" "$STARTED_FILE"
       printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
       printf 'external\n' >"$MANAGED_FILE"
     else
@@ -220,7 +230,7 @@ if [ "$REMOTE_MANAGED" = "external" ]; then
     REMOTE_PORT=""
     REMOTE_MANAGED=""
   fi
-elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && server_running "$REMOTE_PID"; then
+elif [ -n "$REMOTE_PORT" ] && server_running "$REMOTE_PID" && owns_server "$REMOTE_PID"; then
   # Reconnect owns the local tunnel, not the lifetime of an already running
   # server. A changed runner is the update path and still replaces it.
   if [ "$RUNNER_CHANGED" -eq 1 ]; then
@@ -247,6 +257,7 @@ if [ -z "$REMOTE_PORT" ]; then
   nohup env T3CODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$DEFAULT_SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
   REMOTE_PID="$!"
   printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
+  printf '%s\n' "$(process_started "$REMOTE_PID")" >"$STARTED_FILE"
   printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
   printf 'managed\n' >"$MANAGED_FILE"
   if ! wait_ready "60000"; then
@@ -258,7 +269,7 @@ if [ -z "$REMOTE_PORT" ]; then
     fi
     kill "$REMOTE_PID" 2>/dev/null || true
     wait_for_pid_exit "$REMOTE_PID"
-    rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
+    rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE" "$STARTED_FILE"
     exit 1
   fi
 fi
@@ -279,15 +290,19 @@ PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
 "$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json
 "#;
 
-/// Stops the server this app started; an adopted (external) one is left running.
+/// Stops the server this app started, identified by its PID and start time; an adopted
+/// (external) one, or a reused PID, is left alone.
 const STOP_SCRIPT: &str = r#"set -eu
 STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 PID_FILE="$STATE_DIR/pid"
 PORT_FILE="$STATE_DIR/port"
 MANAGED_FILE="$STATE_DIR/managed"
+STARTED_FILE="$STATE_DIR/started"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
+REMOTE_STARTED="$(cat "$STARTED_FILE" 2>/dev/null || true)"
+if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null \
+  && [ "$(ps -o lstart= -p "$REMOTE_PID" 2>/dev/null || true)" = "$REMOTE_STARTED" ]; then
   kill "$REMOTE_PID" 2>/dev/null || true
   WAIT_COUNT=0
   while kill -0 "$REMOTE_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 20 ]; do
@@ -299,7 +314,7 @@ if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMO
     exit 1
   fi
 fi
-rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
+rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE" "$STARTED_FILE"
 printf '{"stopped":true}\n'
 "#;
 

@@ -271,12 +271,29 @@ impl AppState {
         if self.environments.relocate(id, &http_base) {
             self.persist_environments();
         }
-        let (ssh, expected) = (self.ssh.clone(), environment.environment_id);
+        let (ssh, expected, address) = (self.ssh.clone(), environment.environment_id, http_base.clone());
         let prepare: Prepare = Arc::new(move || {
-            let (ssh, target, expected) = (ssh.clone(), target.clone(), expected.clone());
-            Box::pin(async move { ssh.prepare(&target, expected.as_deref()).await })
+            let (ssh, target, expected, address) = (ssh.clone(), target.clone(), expected.clone(), address.clone());
+            Box::pin(async move { ssh.prepare(&target, expected.as_deref(), &address).await })
         });
         self.start_client(Credentials { http_base, access_token }, Some(prepare), cx);
+    }
+
+    /// The SSH tunnel had to move to another local port, and its client stopped. Reconnects
+    /// there once the event pump that reported it has returned.
+    pub(crate) fn route_moved(&mut self, http_base: String, cx: &mut Context<Self>) {
+        let Some(id) = self.environments.active.clone() else { return };
+        tracing::info!(%http_base, "the SSH tunnel moved to another local port");
+        let connection = self.connection_id();
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |state, cx| {
+                if state.connection_id() == connection && state.environments.active.as_deref() == Some(id.as_str()) {
+                    state.reset_connection(cx);
+                    state.start_environment(&id, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Connects a saved environment, or asks to pair it again when its credential was rejected.
