@@ -20,6 +20,7 @@ pub struct VisibleRows {
     scroll_top: ScrollTop,
     header: usize,
     rows: Vec<(String, usize, f32)>,
+    disclosure: bool,
 }
 
 /// Where to put the scroll top after a change.
@@ -31,19 +32,26 @@ pub enum Anchor {
 }
 
 /// The rows in view, measured with `item_top` (an item's top in the list's content). `None` while
-/// the list follows its tail or has not laid out, when there is no place to keep.
-pub fn capture<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top: ScrollTop, viewport: f32, item_top: impl Fn(usize) -> f32) -> Option<VisibleRows> {
-    if viewport <= 0. || scroll_top.item >= header + rows.len() {
+/// the list follows its tail or has not laid out, unless a disclosure anchors its own row.
+pub fn capture<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top: ScrollTop, viewport: f32, item_top: impl Fn(usize) -> f32, disclosure: Option<&str>) -> Option<VisibleRows> {
+    let at_tail = scroll_top.item >= header + rows.len();
+    if viewport <= 0. || (at_tail && disclosure.is_none()) {
         return None;
     }
-    let scrolled = item_top(scroll_top.item) + scroll_top.offset;
+    // At the tail GPUI reports the end of all items (including the footer), not the viewport top.
+    let scrolled = item_top(scroll_top.item) + scroll_top.offset - if at_tail { viewport } else { 0. };
+    if let Some(key) = disclosure {
+        let index = rows.iter().position(|row| id(row) == key)?;
+        let top = item_top(header + index) - scrolled;
+        return (top < viewport).then(|| VisibleRows { scroll_top, header, rows: vec![(key.to_owned(), index, top)], disclosure: true });
+    }
     let first = scroll_top.item.max(header) - header;
     let rows: Vec<(String, usize, f32)> = (first..rows.len())
         .map(|index| (index, item_top(header + index) - scrolled))
         .take_while(|(_, top)| *top < viewport)
         .map(|(index, top)| (id(&rows[index]).to_owned(), index, top))
         .collect();
-    (!rows.is_empty()).then_some(VisibleRows { scroll_top, header, rows })
+    (!rows.is_empty()).then_some(VisibleRows { scroll_top, header, rows, disclosure: false })
 }
 
 /// Puts the first captured row that is still there back where it was. `None` when the list
@@ -57,11 +65,21 @@ pub fn restore<T>(visible: &VisibleRows, rows: &[T], id: impl Fn(&T) -> &str, he
     let item = header + index;
     // Unmoved only when the first row in view kept its place: a row in view above the anchor that
     // went may have taken a different height with it.
-    if candidate == 0 && item == visible.header + old_index && current == visible.scroll_top {
+    if !visible.disclosure && candidate == 0 && item == visible.header + old_index && current == visible.scroll_top {
         return None;
     }
-    let anchor = if top <= 0. { Anchor::At(ScrollTop { item, offset: -top }) } else { Anchor::Below { item, gap: top } };
+    let anchor = if visible.disclosure || top <= 0. { Anchor::At(ScrollTop { item, offset: -top }) } else { Anchor::Below { item, gap: top } };
     (anchor != Anchor::At(current)).then_some(anchor)
+}
+
+/// Includes rows above a negatively offset anchor in the paint range, preserving any remaining
+/// bottom-alignment space above the first item instead of clamping it away.
+pub fn include_preceding_rows(mut top: ScrollTop, item_height: impl Fn(usize) -> f32) -> ScrollTop {
+    while top.offset < 0. && top.item > 0 {
+        top.item -= 1;
+        top.offset += item_height(top.item);
+    }
+    top
 }
 
 #[cfg(test)]

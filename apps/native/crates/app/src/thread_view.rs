@@ -277,12 +277,16 @@ impl ThreadView {
     /// The rows in view and where they sit, before a change. A gap not yet scrolled into still
     /// counts: that row sits below the viewport's top.
     fn visible_rows(&self) -> Option<VisibleRows> {
+        self.visible_rows_for(None)
+    }
+
+    fn visible_rows_for(&self, disclosure: Option<&str>) -> Option<VisibleRows> {
         let top = self.list.logical_scroll_top();
         let row = top.item_ix.checked_sub(self.header_count()).and_then(|index| self.rows.get(index));
         let pending = self.anchor_gap.borrow().as_ref().filter(|(id, _)| row.is_some_and(|row| row.id == *id)).map_or(0., |(_, gap)| *gap);
         let top = ScrollTop { item: top.item_ix, offset: f32::from(top.offset_in_item) - pending };
         let viewport = f32::from(self.list.viewport_bounds().size.height);
-        anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)))
+        anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)), disclosure)
     }
 
     /// Puts the first row that was in view back where it was, as the web list's
@@ -294,6 +298,7 @@ impl ThreadView {
         match anchor::restore(&visible, &self.rows, |row| row.id.as_str(), self.header_count(), current) {
             Some(Anchor::At(top)) => {
                 self.anchor_gap.borrow_mut().take();
+                let top = anchor::include_preceding_rows(top, |ix| f32::from(self.list.offset_for_item(ix + 1) - self.list.offset_for_item(ix)));
                 self.list.scroll_to(ListOffset { item_ix: top.item, offset_in_item: px(top.offset) });
             }
             Some(Anchor::Below { item, gap }) => {
@@ -406,23 +411,32 @@ impl ThreadView {
     }
 
     pub fn toggle_run(&mut self, run_id: &str, cx: &mut Context<Self>) {
+        let visible = self.visible_rows_for(Some(&format!("turn-fold:{run_id}")));
         toggle(&mut self.ui.expanded_runs, run_id);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
     }
 
     pub fn toggle_attempt(&mut self, attempt_id: &str, cx: &mut Context<Self>) {
+        let visible = self.visible_rows_for(Some(&format!("attempt-fold:{attempt_id}")));
         toggle(&mut self.ui.expanded_attempts, attempt_id);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
     }
 
-    pub fn toggle_group(&mut self, group_id: &str, _row_id: &str, cx: &mut Context<Self>) {
+    pub fn toggle_group(&mut self, group_id: &str, row_id: &str, cx: &mut Context<Self>) {
+        let visible = self.visible_rows_for(Some(row_id));
         toggle(&mut self.ui.expanded_groups, group_id);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
     }
 
     /// Opening one entry changes only its own row's height, and fetches withheld output or
     /// subscribes to a command's; closing it lets the subscription go.
     pub fn toggle_entry(&mut self, key: &str, cx: &mut Context<Self>) {
+        let row = self.rows.iter().find(|row| matches!(&row.kind, RowKind::Work { entries, .. } if entries.iter().any(|e| e.id == key)))
+            .or_else(|| self.rows.iter().find(|row| row.id.ends_with(key)));
+        let visible = self.visible_rows_for(row.map(|row| row.id.as_str()));
         if toggle(&mut self.ui.expanded_entries, key)
             && let Some(entry) = self.find_entry(key)
         {
@@ -430,6 +444,7 @@ impl ThreadView {
         }
         self.sync_command_outputs(cx);
         self.remeasure_entry(key);
+        self.keep_place(visible);
         cx.notify();
     }
 
