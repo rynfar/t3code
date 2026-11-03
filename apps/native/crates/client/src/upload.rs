@@ -39,3 +39,46 @@ pub async fn upload_attachment_owned(client: ClientHandle, request: serde_json::
     }
     Ok(owned)
 }
+
+/// Clipboard attachments are copied into a fresh upload; the source upload is never adopted.
+pub async fn copy_attachment_owned(client: ClientHandle, attachment: &t3_core::composer::attachments::Attachment, source_id: &str) -> Result<UploadedAttachment,String> {
+    let resource=t3_core::media::AssetResource::Attachment{attachment_id:source_id.to_owned()};
+    let minted=client.request(t3_core::media::CREATE_ASSET_URL,resource.create_url_request()).await.map_err(|_|"The original attachment is no longer available.".to_owned())?;
+    let asset=t3_core::media::decode_asset_url(&minted)?;
+    let limit=match attachment.kind {attachments::AttachmentKind::Image=>attachments::MAX_IMAGE_BYTES,attachments::AttachmentKind::File=>attachments::MAX_FILE_BYTES};
+    let bytes=crate::asset::fetch_asset(client.environment(),&asset.relative_url,limit as usize).await?;
+    let mut request=attachment.upload_request(); request["sizeBytes"]=serde_json::json!(bytes.len());
+    upload_attachment_owned(client,request,&attachment.mime_type,bytes).await
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use serde_json::json;
+    #[tokio::test]
+    async fn attachment_copies_upload_the_bytes_and_release_only_their_own_asset() {
+        let mut server=crate::test_server::FakeServer::start().await;
+        let (client,_events)=crate::supervisor::start(&tokio::runtime::Handle::current(),server.credentials());
+        let mut connection=server.connection().await;
+        let config=connection.request(t3_core::commands::method::SUBSCRIBE_SERVER_CONFIG).await;
+        connection.send(json!({"_tag":"Exit","requestId":config["id"],"exit":{"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"no config"}}]}})).await;
+        for id in ["copy-one","copy-two"] {
+            let client=client.clone();
+            let task=tokio::spawn(async move {
+                let attachment=attachments::Attachment {id:"local".into(),kind:attachments::AttachmentKind::File,name:"a.txt".into(),mime_type:"text/plain".into(),size_bytes:12,pasted_text:false,upload:attachments::Upload::Uploading};
+                copy_attachment_owned(client,&attachment,"source").await.unwrap()
+            });
+            let asset=connection.request(t3_core::media::CREATE_ASSET_URL).await;
+            assert_eq!(asset["payload"]["resource"]["attachmentId"],"source");
+            connection.send(json!({"_tag":"Exit","requestId":asset["id"],"exit":{"_tag":"Success","value":{"relativeUrl":"/test-copy-source"}}})).await;
+            let upload=connection.request(CREATE_UPLOAD_URL).await;
+            assert_eq!(upload["payload"]["sizeBytes"],12);
+            connection.send(json!({"_tag":"Exit","requestId":upload["id"],"exit":{"_tag":"Success","value":{"attachmentId":id,"relativeUrl":"/test-copy-destination"}}})).await;
+            drop(task.await.unwrap());
+            let deleted=connection.request(attachments::DELETE).await;
+            assert_eq!(deleted["payload"]["attachmentId"],id);
+            connection.send(json!({"_tag":"Exit","requestId":deleted["id"],"exit":{"_tag":"Success","value":null}})).await;
+        }
+        assert_eq!(server.http_requests(),[("/test-copy-source".into(),vec![]),("/test-copy-destination".into(),b"source bytes".to_vec()),("/test-copy-source".into(),vec![]),("/test-copy-destination".into(),b"source bytes".to_vec())]);
+    }
+}

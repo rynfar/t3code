@@ -85,3 +85,20 @@ pub(crate) const NOT_CONNECTED: &str = "Not connected to the server.";
 pub fn open_link_dialog(dialog: &Entity<LinkPullRequestDialog>, window: &mut Window, cx: &mut App) {
     dialog.update(cx, |dialog, cx| dialog.open(window, cx));
 }
+
+/// Context chips use the same detail selection as linked pull requests.
+pub(crate) fn open_context_link(state: &Entity<AppState>, url: &str, cx: &mut App) {
+    let link = t3_core::pull_requests::link::parse_change_request_url(url);
+    let project = {
+        let state = state.read(cx);
+        state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)).map(|t| t.project_id.clone()).or_else(|| state.draft_project.clone())
+    };
+    let (Some(link), Some(project_id)) = (link, project) else { cx.open_url(url); return };
+    cx.set_global(thread_panel::PendingSelection(Some(t3_core::pull_requests::PrRef {
+        project_id, host: Some(link.host), repository: link.repository, number: link.number,
+    })));
+    state.update(cx, |state, cx| {
+        state.set_pull_requests_open(true, cx);
+        cx.emit(AppEvent::Selection);
+    });
+}

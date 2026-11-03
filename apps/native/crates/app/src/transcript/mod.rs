@@ -2,6 +2,7 @@
 //! row spacing of `TimelineRowContent` and `WorkLogBlock` (`MessagesTimeline.tsx`, `WorkLog.tsx`).
 
 mod changed_files;
+mod context;
 mod command_output;
 pub mod html_render;
 pub mod mcp_app;
@@ -35,6 +36,8 @@ pub use worktree_setup::SetupEnv;
 /// change how a row draws.
 #[derive(Default)]
 pub struct TranscriptUi {
+    pub open_context: Option<String>,
+    pub thread_chip_titles: RefCell<HashMap<String, String>>,
     pub expanded_runs: HashSet<String>,
     pub expanded_attempts: HashSet<String>,
     pub expanded_groups: HashSet<String>,
@@ -64,6 +67,7 @@ impl Detail {
 }
 
 pub struct RowEnv<'a> {
+    pub state: &'a Entity<crate::app_state::AppState>,
     pub clock: Clock,
     pub workspace_root: Option<&'a str>,
     pub ui: &'a TranscriptUi,

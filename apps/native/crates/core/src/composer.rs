@@ -9,6 +9,7 @@
 
 pub mod attachments;
 pub mod context;
+pub mod records;
 pub mod review;
 pub mod drafts;
 pub mod menu;

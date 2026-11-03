@@ -46,7 +46,7 @@ pub struct ThreadView {
     entries_cache: EntriesCache,
     rows_cache: RowsCache,
     activity: ThreadActivity,
-    ui: TranscriptUi,
+    pub(crate) ui: TranscriptUi,
     markdown: MarkdownStore,
     thread_id: Option<String>,
     workspace_root: Option<String>,
@@ -109,7 +109,17 @@ impl ThreadView {
                 this.sync_history(cx);
                 this.advance_citation_source(cx);
             }
-            AppEvent::Shell => this.sync_status(cx),
+            AppEvent::Shell => {
+                this.sync_status(cx);
+                let state=this.state.read(cx);
+                let mut changed=false;
+                for (id,previous) in this.ui.thread_chip_titles.borrow_mut().iter_mut() {
+                    let title=state.thread_shell(id).map(|t|t.title.clone()).unwrap_or_default();
+                    if *previous!=title {*previous=title;changed=true;}
+                }
+                if changed {cx.notify();}
+            },
+            AppEvent::SidebarSelection if !this.ui.thread_chip_titles.borrow().is_empty() => cx.notify(),
             AppEvent::ServerConfig => {
                 this.sync_status(cx);
                 this.sync_command_outputs(cx);
@@ -665,6 +675,7 @@ impl ThreadView {
     /// The pieces a row draws from, borrowed apart from the markdown states it may create.
     fn with_env<R>(&mut self, render: impl FnOnce(&RowEnv, &mut MarkdownStore) -> R) -> R {
         let env = RowEnv {
+            state: &self.state,
             clock: self.clock,
             workspace_root: self.workspace_root.as_deref(),
             ui: &self.ui,

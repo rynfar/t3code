@@ -556,6 +556,8 @@ pub struct EnvironmentDescriptor {
 /// `ExecutionEnvironmentPlatform`: which shell the server's commands are written for.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct EnvironmentPlatform {
+    #[serde(default)]
+    pub machine: String,
     /// `darwin`, `linux`, `windows`, or `unknown`.
     #[serde(default)]
     pub os: String,
@@ -632,6 +634,8 @@ pub struct ProjectSettingsOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub environment_icon: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub enable_agent_browser_access: Option<bool>,
     /// Missing on older hosts; the Maintenance UI default does not prove restart continuation.
