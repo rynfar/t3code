@@ -52,17 +52,20 @@ pub fn capability_denial(policy: Option<&Value>, capability: Capability) -> Opti
     denied.then(|| format!("{}'s policy does not allow {label}.", organization(p)))
 }
 
+pub fn driver_allowed(policy: Option<&Value>, driver: &str) -> bool {
+    policy
+        .and_then(|p| p["limits"]["providers"]["allowedDrivers"].as_array())
+        .is_none_or(|drivers| drivers.iter().any(|v| v == driver))
+}
+
 pub fn driver_denial(policy: Option<&Value>, driver: &str, label: &str) -> Option<String> {
     let p = policy?;
-    p["limits"]["providers"]["allowedDrivers"]
-        .as_array()
-        .filter(|drivers| !drivers.iter().any(|v| v == driver))
-        .map(|_| {
-            format!(
-                "{}'s policy does not allow the {label} provider.",
-                organization(p)
-            )
-        })
+    (!driver_allowed(Some(p), driver)).then(|| {
+        format!(
+            "{}'s policy does not allow the {label} provider.",
+            organization(p)
+        )
+    })
 }
 
 pub fn instance_field_locked(policy: Option<&Value>, driver: &str, path: &str) -> bool {

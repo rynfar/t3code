@@ -1,13 +1,11 @@
 //! Accessibility delivery for `web/src/lib/announce.ts` and the two thread announcers.
 use crate::app_state::{AppEvent, AppState, Phase};
-use gpui::{App, Context, Subscription, Task};
+use gpui::{Context, Entity, FocusHandle, Subscription, Task, Window};
 use std::time::{Duration, Instant};
-use t3_core::announcements::{
-    self, Activity, Announcer, Background, Priority, Status, ThreadMemory,
-};
+use t3_core::announcements::{self, Activity, Announcer, Background, Priority, ThreadMemory};
 
 pub struct Announcements {
-    queue: Announcer,
+    queue: Announcer<FocusHandle>,
     clock: Instant,
     timer: Option<Task<()>>,
     background: Background,
@@ -41,12 +39,23 @@ impl Announcements {
 impl AppState {
     pub(crate) fn announce_undo_notice(&mut self, cx: &mut Context<Self>) {
         let notice = self.sidebar.undo.notice();
-        if notice == self.announcements.undo_notice { return; }
+        if notice == self.announcements.undo_notice {
+            return;
+        }
         self.announcements.undo_notice = notice.clone();
         if let Some(notice) = notice {
-            let label = crate::keymap::label("thread.undo", cx).map_or_else(|| "Undo".to_owned(), |shortcut| format!("{shortcut} to undo"));
-            self.announce(format!("{}, {label}", notice.announcement_summary()), Some("thread-undo-notice"), cx);
-        } else { self.cancel_announcement("thread-undo-notice"); }
+            let label = crate::keymap::label("thread.undo", cx).map_or_else(
+                || "Undo".to_owned(),
+                |shortcut| format!("{shortcut} to undo"),
+            );
+            self.announce(
+                format!("{}, {label}", notice.announcement_summary()),
+                Some("thread-undo-notice"),
+                cx,
+            );
+        } else {
+            self.cancel_announcement("thread-undo-notice");
+        }
     }
     pub fn announce(
         &mut self,
@@ -75,24 +84,25 @@ impl AppState {
     pub fn cancel_announcement(&mut self, source: &str) {
         self.announcements.queue.cancel(source);
     }
+    fn announcement_focus_changed(&mut self, focus: Option<FocusHandle>, cx: &mut Context<Self>) {
+        let now = self.announcements.clock.elapsed().as_millis() as u64;
+        if self.announcements.queue.focus_changed(focus, now) {
+            self.schedule_announcement(cx);
+        }
+    }
     fn schedule_announcement(&mut self, cx: &mut Context<Self>) {
         let Some(due) = self.announcements.queue.due() else {
             self.announcements.timer = None;
             return;
         };
         let wait = due.saturating_sub(self.announcements.clock.elapsed().as_millis() as u64);
-        let focus = focused(cx);
         self.announcements.timer = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(wait))
                 .await;
             let _ = this.update(cx, |state, cx| {
                 let now = state.announcements.clock.elapsed().as_millis() as u64;
-                // GPUI exposes focus per window, but no app-wide focus-change subscription.
-                if focused(cx) != focus {
-                    state.announcements.queue.focus_changed(now);
-                    state.schedule_announcement(cx);
-                } else if let Some(message) = state.announcements.queue.flush(now) {
+                if let Some(message) = state.announcements.queue.flush(now) {
                     post(&message);
                 } else if state.announcements.queue.due().is_some() {
                     state.schedule_announcement(cx);
@@ -151,42 +161,22 @@ impl AppState {
         else {
             return;
         };
-        let activity_run = p
-            .runs
-            .iter()
-            .filter(|r| {
-                ["preparing", "starting", "running", "waiting"].contains(&r.status.as_str())
-            })
-            .max_by_key(|r| r.ordinal)
-            .or_else(|| p.runs.iter().max_by_key(|r| r.ordinal));
-        let latest = p.runs.iter().max_by_key(|r| r.ordinal);
-        let shell_run = self.shell.thread(id).and_then(|s| s.latest_run_id.as_deref().map(|id| (id, if s.status == "idle" { "completed" } else { s.status.as_str() })));
-        if announcements::detail_behind(latest.map(|r| (r.id.as_str(), r.status.as_str())), shell_run) { return; }
-        let run = if activity_run.is_some_and(|r| r.status == "cancelled" && r.started_at.is_none())
-        {
-            t3_core::announcements::latest_executed_run(&p.runs)
-        } else {
-            activity_run
+        let child = self
+            .sidebar
+            .model
+            .thread(id)
+            .and_then(|t| t.pending_subagent_request);
+        let Some(announcements::ActivityRef {
+            status,
+            request_id,
+            run_id,
+            run_status,
+        }) = announcements::open_activity(p, self.shell.thread(id), child)
+        else {
+            return;
         };
-        let pending = |r: &&t3_core::thread::Entity| r.value["status"] == "pending";
-        let approval = p.runtime_requests.iter().filter(pending).find(|r| !matches!(r.value["kind"].as_str(), Some("user_input" | "auth_refresh" | "dynamic_tool_call")));
-        let input = p.runtime_requests.iter().filter(pending).find(|r| r.value["kind"] == "user_input");
-        let child = self.sidebar.model.thread(id).and_then(|t| t.pending_subagent_request);
-        use t3_core::sidebar::thread::SubagentRequest;
-        let (status, request) = if approval.is_some() { (Status::Approval, approval) }
-            else if child == Some(SubagentRequest::Approval) { (Status::Approval, None) }
-            else if input.is_some() { (Status::Input, input) }
-            else if child == Some(SubagentRequest::UserInput) { (Status::Input, None) }
-            else {
-                let runless = p.thread.lineage.relationship_to_parent.as_deref() == Some("subagent") && p.nodes.iter().rev().find(|n| n.value["kind"] == "root_turn" && n.value["runId"].is_null()).is_some_and(|n| matches!(n.value["status"].as_str(), Some("pending" | "running" | "waiting")));
-                let working = runless || activity_run.is_some_and(|r| ["preparing", "starting", "running", "waiting"].contains(&r.status.as_str()));
-                (if working { Status::Working } else { Status::Idle }, None)
-            };
         let a = &mut self.announcements;
         let switched = a.thread.as_ref().is_none_or(|(key, _)| key != id);
-        let request_id = request.map(|r| r.id.as_str());
-        let run_id = run.map(|r| r.id.as_str());
-        let run_status = run.map_or("", |r| r.status.as_str());
         if !switched
             && a.activity.status == status
             && a.activity.request_id.as_deref() == request_id
@@ -217,11 +207,50 @@ impl AppState {
         }
     }
 }
-fn focused(cx: &mut App) -> Vec<Option<gpui::FocusHandle>> {
-    cx.windows()
-        .into_iter()
-        .filter_map(|w| w.update(cx, |_, window, cx| window.focused(cx)).ok())
-        .collect()
+/// GPUI reports changes through each focus handle's blur event; rearm on its successor.
+pub(crate) struct FocusObserver {
+    pub root: FocusHandle,
+    state: Entity<AppState>,
+    watched: Option<(FocusHandle, Subscription)>,
+    _entry: Subscription,
+    _exit: Subscription,
+}
+impl FocusObserver {
+    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let root = cx.focus_handle();
+        let entry = cx.on_focus_in(&root, window, |this, window, cx| this.observe(window, cx));
+        let exit = cx.on_focus_out(&root, window, |this, _, _, cx| {
+            this.watched = None;
+            this.state
+                .update(cx, |state, cx| state.announcement_focus_changed(None, cx));
+        });
+        let mut observer = Self {
+            root,
+            state,
+            watched: None,
+            _entry: entry,
+            _exit: exit,
+        };
+        observer.observe(window, cx);
+        observer
+    }
+    fn observe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = window
+            .is_window_active()
+            .then(|| window.focused(cx))
+            .flatten();
+        self.state.update(cx, |state, cx| {
+            state.announcement_focus_changed(focus.clone(), cx)
+        });
+        if self.watched.as_ref().map(|(handle, _)| handle) == focus.as_ref() {
+            return;
+        }
+        self.watched = focus.map(|handle| {
+            let subscription =
+                cx.on_blur(&handle, window, |this, window, cx| this.observe(window, cx));
+            (handle, subscription)
+        });
+    }
 }
 #[cfg(target_os = "macos")]
 fn post(message: &announcements::Announcement) {

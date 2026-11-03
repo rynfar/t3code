@@ -32,6 +32,7 @@ pub const SIDEBAR_WIDTH: f32 = 256.;
 
 pub struct Workspace {
     state: Entity<AppState>,
+    focus_observer: Entity<crate::announcements::FocusObserver>,
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
@@ -82,6 +83,7 @@ impl Workspace {
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
         let ssh_prompt = cx.new(|cx| crate::ssh_prompt::SshPromptDialog::new(state.clone(), window, cx));
+        let focus_observer = cx.new(|cx| crate::announcements::FocusObserver::new(state.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
@@ -107,6 +109,7 @@ impl Workspace {
         ];
         Workspace {
             state,
+            focus_observer,
             sidebar,
             thread,
             composer,
@@ -194,12 +197,14 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus_observer.read(cx).root.clone();
         let paired = matches!(self.state.read(cx).phase, Phase::Online(_));
         let theme = cx.theme();
         if !paired || self.state.read(cx).connect.switching {
             // First run shows the welcome wizard where the connect screen would be.
             let screen = if self.welcome.read(cx).is_open() { self.welcome.clone().into_any_element() } else { self.connect.clone().into_any_element() };
             return div()
+                .track_focus(&focus)
                 .relative()
                 .size_full()
                 .bg(theme.background)
@@ -222,6 +227,7 @@ impl Render for Workspace {
         let on_pull_requests = state.pull_requests_open;
         let composer_replaced = self.composer_replaced;
         h_flex()
+            .track_focus(&focus)
             .relative()
             .size_full()
             .map(crate::quit_hold::listen)
