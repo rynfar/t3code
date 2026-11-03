@@ -58,6 +58,7 @@ pub struct ThreadView {
     /// A row whose top must sit this far below the viewport's top; its next prepaint asks the
     /// list to scroll up into the rows above it, which only then have heights.
     anchor_gap: Rc<RefCell<Option<(String, f32)>>>,
+    disclosure: anchor::DisclosureFollow,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
     citation_ui: citations::CitationUi,
@@ -145,6 +146,7 @@ impl ThreadView {
             streams_output: false,
             group_lists: RefCell::new(HashMap::new()),
             anchor_gap: Rc::default(),
+            disclosure: anchor::DisclosureFollow::default(),
             working_timer: None,
             find: None,
             citation_ui: citations::CitationUi::new(cx),
@@ -187,6 +189,7 @@ impl ThreadView {
             return;
         }
         if selected != self.thread_id {
+            self.disclosure.cancel();
             self.dismiss_citation_selection(cx);
             self.thread_id = selected;
             self.ui = TranscriptUi::default();
@@ -232,10 +235,13 @@ impl ThreadView {
                 self.activity = ThreadActivity::default();
             }
         }
+        let follow = self.disclosure.needs_follow_check().then(|| disclosure_end_distance(&self.list));
         let visible = self.visible_rows();
         self.sync_history(cx);
-        self.rederive_rows(cx);
-        self.keep_place(visible);
+        let changed = self.rederive_rows(cx);
+        let follow = changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
+        if follow { self.list.scroll_to_end(); } else { self.keep_place(visible); }
+        if changed { self.disclosure.changed(); }
         self.sync_revert_counts(cx);
         self.check_rewind(cx);
         self.sync_turn_diffs(cx);
@@ -262,6 +268,7 @@ impl ThreadView {
     }
 
     pub fn load_earlier(&mut self, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
         match self.fixed.clone() {
             Some(id) => self.state.update(cx, |state, cx| state.load_older_side_history(&id, cx)),
             None => self.state.update(cx, |state, cx| state.load_older_history(cx)),
@@ -277,12 +284,16 @@ impl ThreadView {
     /// The rows in view and where they sit, before a change. A gap not yet scrolled into still
     /// counts: that row sits below the viewport's top.
     fn visible_rows(&self) -> Option<VisibleRows> {
+        self.visible_rows_for(self.disclosure.anchor())
+    }
+
+    fn visible_rows_for(&self, disclosure: Option<&str>) -> Option<VisibleRows> {
         let top = self.list.logical_scroll_top();
         let row = top.item_ix.checked_sub(self.header_count()).and_then(|index| self.rows.get(index));
         let pending = self.anchor_gap.borrow().as_ref().filter(|(id, _)| row.is_some_and(|row| row.id == *id)).map_or(0., |(_, gap)| *gap);
         let top = ScrollTop { item: top.item_ix, offset: f32::from(top.offset_in_item) - pending };
         let viewport = f32::from(self.list.viewport_bounds().size.height);
-        anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)))
+        anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)), disclosure)
     }
 
     /// Puts the first row that was in view back where it was, as the web list's
@@ -294,6 +305,7 @@ impl ThreadView {
         match anchor::restore(&visible, &self.rows, |row| row.id.as_str(), self.header_count(), current) {
             Some(Anchor::At(top)) => {
                 self.anchor_gap.borrow_mut().take();
+                let top = anchor::include_preceding_rows(top, |ix| f32::from(self.list.offset_for_item(ix + 1) - self.list.offset_for_item(ix)));
                 self.list.scroll_to(ListOffset { item_ix: top.item, offset_in_item: px(top.offset) });
             }
             Some(Anchor::Below { item, gap }) => {
@@ -305,7 +317,7 @@ impl ThreadView {
         }
     }
 
-    fn rederive_rows(&mut self, cx: &mut Context<Self>) {
+    fn rederive_rows(&mut self, cx: &mut Context<Self>) -> bool {
         let input = RowsInput {
             entries: self.entries_cache.entries(),
             activity: &self.activity,
@@ -319,7 +331,7 @@ impl ThreadView {
         let same = |a: &Arc<TimelineRow>, b: &Arc<TimelineRow>| Arc::ptr_eq(a, b) || rows_equal(a, b);
         let prefix = self.rows.iter().zip(&next).take_while(|(a, b)| same(a, b)).count();
         if prefix == self.rows.len() && prefix == next.len() {
-            return;
+            return false;
         }
         let max_suffix = self.rows.len().min(next.len()) - prefix;
         let suffix = self.rows.iter().rev().zip(next.iter().rev()).take(max_suffix).take_while(|(a, b)| same(a, b)).count();
@@ -335,6 +347,7 @@ impl ThreadView {
         // Folding or opening a group or turn changes which open commands are drawn.
         self.sync_command_outputs(cx);
         cx.notify();
+        true
     }
 
     /// One timer view per working stretch, none while the row says the worktree is being set
@@ -405,24 +418,47 @@ impl ThreadView {
         }
     }
 
+    fn begin_disclosure(&mut self, row_id: &str) {
+        let (distance, viewport) = disclosure_end_distance(&self.list);
+        self.disclosure.toggle(row_id, anchor::at_end(distance, viewport));
+    }
+
+    fn follow_disclosure_change(&mut self) -> bool {
+        if !self.disclosure.needs_follow_check() { return false; }
+        let (distance, viewport) = disclosure_end_distance(&self.list);
+        self.disclosure.follow_change(distance, viewport)
+    }
+
     pub fn toggle_run(&mut self, run_id: &str, cx: &mut Context<Self>) {
+        self.begin_disclosure(&format!("turn-fold:{run_id}"));
+        let visible = self.visible_rows();
         toggle(&mut self.ui.expanded_runs, run_id);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
     }
 
     pub fn toggle_attempt(&mut self, attempt_id: &str, cx: &mut Context<Self>) {
+        self.begin_disclosure(&format!("attempt-fold:{attempt_id}"));
+        let visible = self.visible_rows();
         toggle(&mut self.ui.expanded_attempts, attempt_id);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
     }
 
-    pub fn toggle_group(&mut self, group_id: &str, _row_id: &str, cx: &mut Context<Self>) {
+    pub fn toggle_group(&mut self, group_id: &str, row_id: &str, cx: &mut Context<Self>) {
+        self.begin_disclosure(row_id);
+        let visible = self.visible_rows();
         toggle(&mut self.ui.expanded_groups, group_id);
-        self.rederive(cx);
+        self.rederive_rows(cx);
+        self.keep_place(visible);
     }
 
     /// Opening one entry changes only its own row's height, and fetches withheld output or
     /// subscribes to a command's; closing it lets the subscription go.
     pub fn toggle_entry(&mut self, key: &str, cx: &mut Context<Self>) {
+        let row = self.rows.iter().find(|row| matches!(&row.kind, RowKind::Work { entries, .. } if entries.iter().any(|e| e.id == key)))
+            .or_else(|| self.rows.iter().find(|row| row.id.ends_with(key))).map(|row| row.id.clone());
+        if let Some(row) = row { self.begin_disclosure(&row); }
         if toggle(&mut self.ui.expanded_entries, key)
             && let Some(entry) = self.find_entry(key)
         {
@@ -485,7 +521,9 @@ impl ThreadView {
     }
 
     /// Remeasures the row that draws `key`, and only the open group list holding it.
-    fn remeasure_entry(&self, key: &str) {
+    fn remeasure_entry(&mut self, key: &str) {
+        let follow = self.follow_disclosure_change();
+        let visible = self.disclosure.anchor().and_then(|_| self.visible_rows());
         let offset = self.header_count();
         let lists = self.group_lists.borrow();
         for (index, row) in self.rows.iter().enumerate() {
@@ -496,6 +534,9 @@ impl ThreadView {
                 }
             }
         }
+        drop(lists);
+        if follow { self.list.scroll_to_end(); } else { self.keep_place(visible); }
+        self.disclosure.changed();
     }
 
     pub fn toggle_message(&mut self, row_id: &str, cx: &mut Context<Self>) {
@@ -771,6 +812,14 @@ impl Render for ThreadView {
         let find_bar = self.render_find_bar(cx);
         let banners = self.render_banners(cx);
         let minimap = self.render_minimap(window, cx);
+        if let Some(generation) = self.disclosure.generation() {
+            // Match the web's two-frame disclosure settle; newer layouts invalidate this ticket.
+            cx.on_next_frame(window, move |_, window, cx| {
+                cx.on_next_frame(window, move |view, _, cx| {
+                    if settle_disclosure(&view.list, &mut view.disclosure, generation) { cx.notify(); }
+                });
+            });
+        }
         let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, _window, cx| {
@@ -811,9 +860,28 @@ impl Render for ThreadView {
         div().id("citation-viewport")
             .track_focus(&self.citation_ui.selection_focus)
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.disclosure.cancel();
+                this.dismiss_citation_selection(cx);
+            }))
             .relative().size_full().child(transcript).children(minimap).children(banners).children(find_bar).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
+}
+
+fn disclosure_end_distance(list: &ListState) -> (f32, f32) {
+    let viewport = f32::from(list.viewport_bounds().size.height);
+    let top = list.logical_scroll_top();
+    let distance = if top.item_ix >= list.item_count() { 0. } else {
+        f32::from(list.offset_for_item(list.item_count()) - list.offset_for_item(top.item_ix) - top.offset_in_item) - viewport
+    };
+    (distance, viewport)
+}
+
+fn settle_disclosure(list: &ListState, follow: &mut anchor::DisclosureFollow, generation: u64) -> bool {
+    let (distance, viewport) = disclosure_end_distance(list);
+    if !follow.settle(generation, distance, viewport) { return false; }
+    list.scroll_to_end();
+    true
 }
 
 #[derive(Clone, PartialEq)]
@@ -848,6 +916,81 @@ fn remeasure_for_typography(key: TranscriptTypography, previous: &mut Transcript
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn settled_disclosures_resume_following_appends_and_growth(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        struct TestList { list: ListState, heights: Vec<f32>, target: usize, header: Rc<std::cell::Cell<gpui::Pixels>> }
+        impl Render for TestList {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let heights = self.heights.clone();
+                let target = self.target;
+                let header = self.header.clone();
+                list(self.list.clone(), move |ix, _, _| {
+                    let header = header.clone();
+                    div().h(px(heights[ix])).relative().when(ix == target, |row| {
+                        row.child(canvas(move |bounds, _, _| header.set(bounds.top()), |_, _, _, _| {}).absolute().size_full())
+                    }).into_any_element()
+                }).size_full()
+            }
+        }
+        for count in [2, 5] {
+            for (extra, collapse, wheel) in [(20., false, false), (100., false, false), (100., true, false), (100., false, true)] {
+                let list = ListState::new(count, ListAlignment::Bottom, px(600.));
+                let target = if count == 2 { 0 } else { 2 };
+                let header = Rc::new(std::cell::Cell::new(px(0.)));
+                let view = cx.update(|_, cx| cx.new(|_| TestList { list: list.clone(), heights: vec![40.; count], target, header: header.clone() }));
+                let draw = |cx: &mut gpui::VisualTestContext| {
+                    cx.draw(point(px(0.), px(0.)), size(px(200.), px(120.)), |_, _| view.clone().into_any_element());
+                };
+                draw(cx);
+                let mut follow = anchor::DisclosureFollow::default();
+                follow.toggle("group", true);
+                cx.update(|_, cx| view.update(cx, |view, cx| { view.heights[target] += extra; cx.notify(); }));
+                list.remeasure_items(target..target + 1);
+                // The disclosure kept its old position, leaving the tail `extra` pixels below.
+                list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(count as f32 * 40. - 120.) });
+                draw(cx);
+                let generation = follow.generation().unwrap();
+                let before_settle = header.get();
+                let rearmed = settle_disclosure(&list, &mut follow, generation);
+                draw(cx);
+                assert_eq!(header.get(), before_settle, "settling alone must not move the toggled row: count={count}, extra={extra}");
+                if wheel {
+                    let event = gpui::ScrollWheelEvent { delta: gpui::ScrollDelta::Pixels(point(px(0.), px(20.))), ..Default::default() };
+                    assert!(minimap::forward_wheel(&list, &mut follow, &event));
+                    draw(cx);
+                }
+                if collapse {
+                    follow.toggle("group", false);
+                    cx.update(|_, cx| view.update(cx, |view, cx| { view.heights[target] -= extra; cx.notify(); }));
+                    list.remeasure_items(target..target + 1);
+                    draw(cx);
+                    let generation = follow.generation().unwrap();
+                    settle_disclosure(&list, &mut follow, generation);
+                } else if !rearmed {
+                    let (distance, viewport) = disclosure_end_distance(&list);
+                    if follow.follow_change(distance, viewport) { list.scroll_to_end(); }
+                }
+                cx.update(|_, cx| view.update(cx, |view, cx| { view.heights.push(40.); cx.notify(); }));
+                list.splice(count..count, 1);
+                draw(cx);
+                if wheel {
+                    assert!(list.logical_scroll_top().item_ix < count + 1, "minimap wheel navigation must survive an append: count={count}");
+                } else {
+                    assert_eq!(list.logical_scroll_top().item_ix, count + 1, "appends follow after settling: count={count}, extra={extra}, collapse={collapse}");
+                }
+                cx.update(|_, cx| view.update(cx, |view, cx| { *view.heights.last_mut().unwrap() += 20.; cx.notify(); }));
+                list.remeasure_items(count..count + 1);
+                draw(cx);
+                if wheel {
+                    assert!(list.logical_scroll_top().item_ix < count + 1, "minimap wheel navigation must survive growth: count={count}");
+                } else {
+                    assert_eq!(list.logical_scroll_top().item_ix, count + 1, "growth keeps following too: count={count}, extra={extra}, collapse={collapse}");
+                }
+            }
+        }
+    }
 
     #[gpui::test]
     fn font_resize_invalidates_offscreen_transcript_and_group_measurements(cx: &mut gpui::TestAppContext) {

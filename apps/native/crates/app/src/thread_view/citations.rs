@@ -126,6 +126,7 @@ impl ThreadView {
     pub(super) fn open_citation_source(&mut self, cx: &mut Context<Self>) {
         let request = self.state.read(cx).citation_source.clone();
         if let Some(citation) = request.filter(|c| self.thread_id.as_deref() == Some(&c.thread_id)) {
+            self.disclosure.cancel();
             self.state.update(cx, |state, _| state.citation_source = None);
             self.citation_ui.pending = Some((citation, rules::CitationProcedure::default()));
             self.advance_citation_source(cx);
