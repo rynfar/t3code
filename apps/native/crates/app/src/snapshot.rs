@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--chatgpt-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -145,6 +145,7 @@ pub struct Options {
     connect_screen: bool,
     cloud_fixture: Option<String>,
     chatgpt_fixture: Option<PathBuf>,
+    turn_items_fixture: Option<PathBuf>,
     updates_fixture: Option<String>,
     managed_policy_fixture: Option<String>,
     announcement_fixture: Option<String>,
@@ -206,6 +207,7 @@ impl Options {
             connect_screen: has("--connect"),
             cloud_fixture: flag("--cloud-fixture"),
             chatgpt_fixture: flag("--chatgpt-fixture").map(PathBuf::from),
+            turn_items_fixture: flag("--turn-items-fixture").map(PathBuf::from),
             updates_fixture: flag("--updates-fixture"),
             managed_policy_fixture: flag("--managed-policy-fixture"),
             announcement_fixture: flag("--announcement-fixture"),
@@ -389,6 +391,25 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         state.update(&mut cx, |state, cx| state.select_thread(thread, cx));
         let loaded = state.clone();
         pump(&mut cx, options.wait, move |cx| loaded.read_with(cx, |state, _| state.thread.projection.is_some()));
+    }
+    if std::env::args().any(|arg| arg == "--no-command-output-streaming") {
+        state.update(&mut cx, |state, _| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.environment.capabilities.command_output_streaming = Some(false);
+            }
+        });
+    }
+    if let Some(path) = &options.turn_items_fixture {
+        let items: Vec<t3_core::thread::ProjectedTurnItem> = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        state.update(&mut cx, |state, cx| {
+            // Freeze only this renderer's projection; fixture items never reach the server.
+            state.stop_pump();
+            if let Some(projection) = state.thread.projection.as_mut() {
+                projection.turn_items = items.iter().map(|row| row.item.clone()).collect();
+                projection.visible_turn_items = items;
+                cx.emit(crate::app_state::AppEvent::Thread);
+            }
+        });
     }
     if let Some(path) = &options.prompt_link_fixture {
         let configured = state.clone();

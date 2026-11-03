@@ -552,3 +552,21 @@ pub fn verify_preview_source(colors:&themes::Colors,dark:bool,cx:&App)->Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) fn test_syntax_theme(dark: bool) -> std::sync::Arc<gpui_component::highlighter::HighlightTheme> {
+    let palette = if dark { tokens::DARK } else { tokens::LIGHT };
+    let config = config("test", &palette, dark, 16., "Menlo", "System", 13.);
+    std::sync::Arc::new(gpui_component::highlighter::HighlightTheme { name: "test".into(), appearance: config.mode, style: config.highlight.unwrap() })
+}
+
+// Command queries retain roles (such as variable.parameter) absent from gpui-component's SyntaxColors.
+pub(crate) fn syntax_style(capture: &str, dark: bool) -> Option<gpui::HighlightStyle> {
+    let styles = if dark { tokens::SYNTAX_DARK } else { tokens::SYNTAX_LIGHT };
+    styles.iter().find(|style| style.capture == capture).map(|style| gpui::HighlightStyle {
+        color: style.color.map(hsla),
+        font_style: style.italic.then_some(gpui::FontStyle::Italic),
+        font_weight: style.bold.then_some(gpui::FontWeight::BOLD),
+        ..Default::default()
+    })
+}

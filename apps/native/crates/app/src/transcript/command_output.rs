@@ -259,6 +259,13 @@ fn cached_command(
     styles
 }
 
+struct CommandStyleResolver<'a>(&'a gpui_component::highlighter::HighlightTheme);
+impl gpui_base::input::HighlightStyleResolver for CommandStyleResolver<'_> {
+    fn style(&self, name: &str) -> Option<HighlightStyle> {
+        crate::theme::syntax_style(name, self.0.appearance.is_dark()).or_else(|| self.0.style(name))
+    }
+}
+
 fn command_styles(
     code: &str,
     language: &str,
@@ -266,16 +273,32 @@ fn command_styles(
     depth: usize,
     budget: &mut usize,
 ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
-    use gpui_component::{Rope, highlighter::SyntaxHighlighter};
+    use gpui_component::{Rope, highlighter::{LanguageConfig, LanguageRegistry, SyntaxHighlighter}};
+    use t3_core::shell_command::grammars;
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        for name in grammars::LANGUAGES {
+            let grammar = grammars::grammar(name).expect("command grammar");
+            LanguageRegistry::singleton().register(name, &LanguageConfig::new(name, grammar.language, vec![], &grammar.highlights, "", ""));
+        }
+        let mut ruby = LanguageRegistry::singleton().language("ruby").expect("Ruby feature");
+        ruby.highlights = grammars::ruby_highlights(&ruby.highlights).into();
+        // This highlighter emits local.* captures as colors; explicit syntax captures keep identifiers styled.
+        ruby.locals = "".into();
+        LanguageRegistry::singleton().register("ruby", &ruby);
+        for name in ["fish", "applescript", "prolog"] {
+            LanguageRegistry::singleton().register(name, &LanguageConfig::plain(name));
+        }
+    });
     if *budget == 0 {
         return Vec::new();
     }
     *budget -= 1;
     let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &Rope::from_str(code), None);
-    if highlighter.tree().is_none() { return Vec::new(); }
+    if highlighter.tree().is_none() { return vec![(0..code.len(), HighlightStyle::default())]; }
     let mut styles = vec![HighlightStyle::default(); code.len()];
-    for (range, style) in highlighter.styles(&(0..code.len()), theme) {
+    for (range, style) in highlighter.styles(&(0..code.len()), &CommandStyleResolver(theme)) {
         styles[range].fill(style);
     }
     if language == "bash"
@@ -307,4 +330,78 @@ fn command_styles(
         start = end;
     }
     runs
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+
+    fn assert_colors(command: &str, dark: bool, expected: &[(&str, Option<u32>)]) {
+        let runs = cached_command(command, crate::theme::test_syntax_theme(dark));
+        for (token, expected) in expected {
+            let start = command.find(token).unwrap();
+            let expected = expected.map(hsla);
+            for offset in start..start + token.len() {
+                let actual = runs.iter().find(|(range, _)| range.contains(&offset)).and_then(|(_, style)| style.color);
+                assert_eq!(actual, expected, "{command}: {token} at {offset}, dark={dark}");
+            }
+        }
+    }
+
+    #[test]
+    fn shell_selection_ignores_heredoc_bodies_comments_and_substitutions() {
+        for command in [
+            "perl <<'EOF'\n$n = 2; print $n;\nEOF",
+            "cat > app.ps1 <<'EOF'\nGet-Item .\nEOF",
+            "echo ok # ignored; Get-Item .\necho done",
+            "echo $(printf 'x'; Get-Item .)",
+        ] {
+            assert_eq!(t3_core::shell_command::highlight_language(command), "bash", "{command}");
+        }
+        assert_colors("perl <<'EOF'\n$n = 2; print $n;\nEOF", true, &[("$n", Some(0xFFA359FF)), ("2", Some(0x68CDF2FF)), ("print", Some(0x9D6AFBFF))]);
+        assert_colors("cat > app.ps1 <<'EOF'\nGet-Item .\nEOF", true, &[("Get-Item", Some(0x9D6AFBFF))]);
+    }
+
+    #[test]
+    fn ruby_uses_web_roles_after_production_locals_and_overlapping_captures() {
+        let command = r#"ruby -e 'x = true; y = false; @n = true; if n == 2; puts "hi\n"; end'"#;
+        for (dark, variable, special, operator, boolean, escape) in [
+            (true, 0xFFA359FF, 0xFFAB16FF, 0x08C0EFFF, 0x68CDF2FF, 0x61D5C0FF),
+            (false, 0x8F4E17FF, 0x7E540EFF, 0x006781FF, 0x0B5267FF, 0x0B685BFF),
+        ] {
+            assert_colors(command, dark, &[("x", Some(variable)), ("@n", Some(special)), ("true", Some(boolean)), ("false", Some(boolean)), ("==", Some(operator)), (r"\n", Some(escape))]);
+        }
+    }
+
+    #[test]
+    fn powershell_parameters_keep_the_web_parameter_color() {
+        for (dark, color) in [(true, 0xA3A3A3FF), (false, 0x4B4B4BFF)] {
+            assert_colors("Get-Item -Path $env:HOME", dark, &[("-Path", Some(color))]);
+        }
+    }
+
+    #[test]
+    fn xml_quotes_equals_and_entities_use_the_winning_web_styles() {
+        for (dark, punctuation, string, escape) in [
+            (true, 0x636363FF, 0x5ECC71FF, 0x61D5C0FF),
+            (false, 0x4B4B4BFF, 0x106A2BFF, 0x0B685BFF),
+        ] {
+            assert_colors("cat <<'XML'\n<item n=\"2\">&amp;</item>\nXML", dark, &[("=", Some(punctuation)), ("\"2\"", Some(string)), ("&amp;", Some(escape))]);
+        }
+    }
+
+    #[test]
+    fn filename_detection_matches_the_web_supported_and_plain_languages() {
+        assert_colors("cat > app.pl <<'EOF'\nmy $n = 2;\nEOF", true, &[("my $n = 2;", None)]);
+        assert_colors("cat > app.pm <<'EOF'\nmy $n = 2;\nEOF", true, &[("$n", Some(0xFFA359FF))]);
+        for path in ["app.rake", "app.gemspec", "Rakefile"] {
+            assert_colors(&format!("cat > {path} <<'EOF'\nx = true\nEOF"), true, &[("x", Some(0xFFA359FF)), ("true", Some(0x68CDF2FF))]);
+        }
+    }
+
+    #[test]
+    fn unsupported_web_languages_clear_the_surrounding_shell_string_color() {
+        assert_colors("fish -c 'set n 2'", true, &[("set n 2", None)]);
+        assert_colors("osascript -e 'set n to 2'", true, &[("set n to 2", None)]);
+    }
 }

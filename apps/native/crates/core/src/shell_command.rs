@@ -1,5 +1,8 @@
 //! Embedded script byte mappings from `apps/web/src/lib/embeddedScripts.ts`.
 
+pub mod grammars;
+mod statements;
+
 use std::ops::Range;
 
 pub struct EmbeddedScript {
@@ -11,7 +14,7 @@ pub struct EmbeddedScript {
 /// `commandHighlightLanguage` from `work-log/commandLabel.ts`.
 pub fn highlight_language(command: &str) -> &'static str {
     let command = command.trim();
-    if command.strip_prefix('&').is_some_and(|tail| tail.starts_with(char::is_whitespace) && !tail.trim().is_empty()) {
+    if command.strip_prefix('&').is_some_and(|tail| !tail.trim().is_empty()) {
         return "powershell";
     }
     let program = if let Some(quote @ ('\"' | '\'')) = command.chars().next() {
@@ -43,38 +46,7 @@ pub fn highlight_language(command: &str) -> &'static str {
             verbs.split_whitespace().any(|known| known == verb) && noun.starts_with(|ch: char| ch.is_ascii_uppercase()) && noun.chars().all(|ch| ch.is_ascii_alphabetic())
         })
     };
-    let mut quote = None;
-    let mut escaped = false;
-    let mut start = 0;
-    let mut segments = 0;
-    for (index, ch) in command.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if matches!(ch, '\'' | '\"' | '`') {
-            if quote == Some(ch) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(ch);
-            }
-        }
-        if quote.is_none() && matches!(ch, ';' | '&' | '|' | '\n') {
-            if is_powershell(&command[start..index]) {
-                return "powershell";
-            }
-            start = index + ch.len_utf8();
-            segments += 1;
-            if segments >= 64 {
-                return "bash";
-            }
-        }
-    }
-    if is_powershell(&command[start..]) { "powershell" } else { "bash" }
+    if statements::statements(command).iter().any(|statement| is_powershell(statement)) { "powershell" } else { "bash" }
 }
 
 pub fn embedded_scripts(source: &str, tree: &tree_sitter::Tree) -> Vec<EmbeddedScript> {
@@ -285,6 +257,7 @@ fn command_scripts(node: tree_sitter::Node<'_>, source: &str, found: &mut Vec<Em
                 "javascript" => ["-r", "--require", "--import", "--loader", "-C", "--conditions"].contains(&name),
                 "typescript" if program == "deno" => ["-c", "--config", "--import-map", "--ext"].contains(&name),
                 "ruby" => ["-r", "-I", "-C"].contains(&name),
+                "applescript" => ["-l", "-s"].contains(&name),
                 "powershell" => ["-executionpolicy", "-workingdirectory", "-windowstyle"].contains(&name),
                 "sql" => ["-d", "-h", "-u", "-U", "--dbname", "--host", "--user", "--username", "-separator", "-nullvalue", "-init"].contains(&name),
                 _ => false,
@@ -316,7 +289,7 @@ fn command_scripts(node: tree_sitter::Node<'_>, source: &str, found: &mut Vec<Em
         positionals += 1;
         arg += 1;
     }
-    let stdin = language.filter(|language| !["powershell", "applescript"].contains(language) && !["bun", "deno"].contains(&program.as_str()) && inlines == 0 && !from_file);
+    let stdin = language.filter(|language| *language != "powershell" && !["bun", "deno"].contains(&program.as_str()) && inlines == 0 && !from_file);
     let mut redirects: Vec<_> = node.children_by_field_name("redirect", &mut node.walk()).collect();
     if let Some(parent) = node.parent().filter(|parent| parent.kind() == "redirected_statement") {
         redirects.extend(parent.children_by_field_name("redirect", &mut parent.walk()));
@@ -385,7 +358,22 @@ fn delimiter_language(name: &str) -> Option<&'static str> {
 
 fn file_language(path: &str) -> Option<&'static str> {
     let path = path.trim_matches(['\'', '"']);
-    crate::files::syntax_language(path).or_else(|| delimiter_language(path.rsplit('.').next()?))
+    if matches!(path.rsplit(['/', '\\']).next()?, "Gemfile" | "Rakefile" | "Guardfile" | "Capfile" | "Berksfile" | "Brewfile" | "Vagrantfile" | "Thorfile" | "Appraisals" | "Dangerfile") {
+        return Some("ruby");
+    }
+    crate::files::syntax_language(path).or_else(|| {
+        let extension = path.rsplit('.').next()?.to_ascii_lowercase();
+        match extension.as_str() {
+            "ps1" | "psm1" | "psd1" => Some("powershell"),
+            "pl" => Some("prolog"),
+            "pm" => Some("perl"),
+            "rake" | "gemspec" | "jbuilder" | "builder" | "rabl" | "arb" | "ru" | "podspec" => Some("ruby"),
+            "fish" => Some("fish"),
+            "applescript" | "scpt" => Some("applescript"),
+            "xsl" | "xslt" => Some("xml"),
+            _ => delimiter_language(&extension),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -404,14 +392,28 @@ mod tests {
             ("pwsh -Command 'Get-Item .'", "powershell"),
             ("Get-ChildItem .", "powershell"),
             ("$env:PATH = 'x'", "powershell"),
+            ("&'C:\\Tools\\pwsh.exe' -c Get-Item", "powershell"),
             ("cd src; Get-Item .", "powershell"),
             ("echo 'Get-Item .; hi'", "bash"),
             ("node -e 'console.log(1)'", "bash"),
+            ("perl <<'EOF'\n$n = 2; print $n;\nEOF", "bash"),
+            ("cat > app.ps1 <<'EOF'\nGet-Item .\nEOF", "bash"),
+            ("echo ok # ignored; Get-Item .\necho done", "bash"),
+            ("echo $(printf 'x'; Get-Item .)", "bash"),
+            ("cat <<-'EOF' <<NEXT\n\tGet-Item .\n\tEOF\n$n = 2\nNEXT\nGet-Item .", "powershell"),
+            ("cat <<EOF; Get-Item .\n$n = 2\nEOF", "powershell"),
         ] {
             assert_eq!(highlight_language(command), language, "{command}");
         }
         for (source, language, expected) in [
             ("python3 -c 'print(\"hé\")'", "python", "print(\"hé\")"),
+            ("fish --command='set n 2; echo $n'", "fish", "set n 2; echo $n"),
+            ("ruby -r json -e 'puts JSON.generate(2)'", "ruby", "puts JSON.generate(2)"),
+            ("perl -E 'my $n = 2; say $n'", "perl", "my $n = 2; say $n"),
+            ("osascript -l AppleScript -e 'set n to 2'", "applescript", "set n to 2"),
+            ("osascript <<'EOF'\nset n to 2\nEOF", "applescript", "set n to 2\n"),
+            ("env pwsh -COMMAND 'Get-Item .'", "powershell", "Get-Item ."),
+            ("cat > config.xml <<'EOF'\n<item n=\"2\"/>\nEOF", "xml", "<item n=\"2\"/>\n"),
             (r#"C:\Python312\python.exe -c 'print(1)'"#, "python", "print(1)"),
             (r#"node -e "console.log($(echo 'x'))""#, "javascript", "console.log($(echo 'x'))"),
             ("node --eval=\"process.exit(0)\"", "javascript", "process.exit(0)"),
@@ -426,6 +428,10 @@ mod tests {
             ("cat > main.go <<'EOF'\npackage main\nEOF", "go", "package main\n"),
             ("tee app.tsx <<'EOF'\nconst app = <div />;\nEOF", "tsx", "const app = <div />;\n"),
             ("cat > readme.md <<'EOF'\n# Title\nEOF", "markdown", "# Title\n"),
+            ("cat > app.ps1 <<'EOF'\nGet-Item .\nEOF", "powershell", "Get-Item .\n"),
+            ("tee app.fish <<'EOF'\nset n 2\nEOF", "fish", "set n 2\n"),
+            ("cat > app.pl <<'EOF'\nmy $n = 2;\nEOF", "prolog", "my $n = 2;\n"),
+            ("cat > app.applescript <<'EOF'\nset n to 2\nEOF", "applescript", "set n to 2\n"),
             ("kubectl apply -f - <<'YAML'\nkind: Pod\nYAML", "yaml", "kind: Pod\n"),
             ("echo \"$(node -e 'console.log(1)')\"", "javascript", "console.log(1)"),
         ] {
