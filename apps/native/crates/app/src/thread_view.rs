@@ -192,6 +192,11 @@ impl ThreadView {
         }
     }
 
+    pub(crate) fn html_page_origin(&self, cx: &gpui::App) -> Option<t3_core::html_render::routing::PageOrigin> {
+        let state = self.state.read(cx);
+        t3_core::html_render::routing::PageOrigin::for_view(state.environment(), state.selected_thread.as_deref(), self.fixed.as_deref())
+    }
+
     fn header_count(&self) -> usize {
         usize::from(self.history.is_some())
     }
@@ -676,6 +681,7 @@ impl ThreadView {
     fn with_env<R>(&mut self, render: impl FnOnce(&RowEnv, &mut MarkdownStore) -> R) -> R {
         let env = RowEnv {
             state: &self.state,
+            thread_id: self.thread_id.as_deref(),
             clock: self.clock,
             workspace_root: self.workspace_root.as_deref(),
             ui: &self.ui,

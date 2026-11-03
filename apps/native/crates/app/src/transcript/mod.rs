@@ -67,6 +67,7 @@ impl Detail {
 }
 
 pub struct RowEnv<'a> {
+    pub thread_id: Option<&'a str>,
     pub state: &'a Entity<crate::app_state::AppState>,
     pub clock: Clock,
     pub workspace_root: Option<&'a str>,
@@ -138,7 +139,7 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         RowKind::Event { item, subagents, resource_summary } => notices::event_row(id, item, subagents, *resource_summary, env, cx),
         RowKind::ProposedPlan(plan) => messages::plan_card(id, plan, env, markdown, cx),
         RowKind::McpApp(entry) => mcp_app::frame_row(id, entry, cx),
-        RowKind::HtmlRender(entry) => html_render::frame_row(id, entry, cx),
+        RowKind::HtmlRender(entry) => html_render::frame_row(id, entry, env.thread_id, cx),
     };
     let found = env.find_target.is_some_and(|target| holds(row, target));
     div()

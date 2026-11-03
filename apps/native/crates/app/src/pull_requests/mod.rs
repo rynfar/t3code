@@ -86,19 +86,30 @@ pub fn open_link_dialog(dialog: &Entity<LinkPullRequestDialog>, window: &mut Win
     dialog.update(cx, |dialog, cx| dialog.open(window, cx));
 }
 
-/// Context chips use the same detail selection as linked pull requests.
-pub(crate) fn open_context_link(state: &Entity<AppState>, url: &str, cx: &mut App) {
-    let link = t3_core::pull_requests::link::parse_change_request_url(url);
-    let project = {
-        let state = state.read(cx);
-        state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)).map(|t| t.project_id.clone()).or_else(|| state.draft_project.clone())
-    };
-    let (Some(link), Some(project_id)) = (link, project) else { cx.open_url(url); return };
-    cx.set_global(thread_panel::PendingSelection(Some(t3_core::pull_requests::PrRef {
-        project_id, host: Some(link.host), repository: link.repository, number: link.number,
-    })));
+pub(crate) fn link_projects(state: &AppState) -> Vec<t3_core::pull_requests::target::Project<'_>> {
+    let Some(environment) = state.environment() else { return Vec::new() };
+    state.shell.snapshot.as_ref().into_iter().flat_map(|s| &s.projects).map(|project| t3_core::pull_requests::target::Project {
+        id: &project.id, environment, identity: project.repository_identity.as_ref(), config_loaded: state.server_config.config.is_some(),
+    }).collect()
+}
+
+pub(crate) fn open_resolved_link(state: &Entity<AppState>, target: t3_core::pull_requests::target::Target, cx: &mut App) {
+    if state.read(cx).environment() != Some(target.environment.as_str()) { return; }
+    cx.set_global(thread_panel::PendingSelection(Some(target.reference)));
     state.update(cx, |state, cx| {
         state.set_pull_requests_open(true, cx);
         cx.emit(AppEvent::Selection);
     });
+}
+
+/// Context chips use the same readable-project resolver as HTML page links.
+pub(crate) fn open_context_link(state: &Entity<AppState>, url: &str, cx: &mut App) {
+    let app = state.read(cx);
+    let environment = app.environment();
+    let project = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id)).map(|t| t.project_id.as_str()).or(app.draft_project.as_deref());
+    let target = t3_core::pull_requests::target::resolve(url, &link_projects(app), environment, project, environment, true);
+    match target {
+        Some(target) => open_resolved_link(state, target, cx),
+        None => cx.open_url(url),
+    }
 }

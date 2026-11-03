@@ -5,6 +5,7 @@
 //! client settings (`web/src/hooks/useTheme.ts`, `appearanceFonts.ts`), and switch atomically.
 
 mod tokens;
+pub mod html_render;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;

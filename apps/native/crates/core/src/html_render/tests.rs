@@ -125,3 +125,113 @@ fn pages_load_inline_by_their_file_name() {
         json!({ "resource": { "_tag": "attachment", "attachmentId": "thread-abc-123.html", "fileName": "Chart.html", "mimeType": "text/html", "disposition": "inline" } })
     );
 }
+
+#[test]
+fn page_theme_roles_and_fonts() {
+    use super::host;
+    for dark in [false, true] {
+        let colors = crate::themes::builtins()
+            .iter()
+            .find(|t| t.id == "ocean")
+            .unwrap()
+            .half(dark)
+            .unwrap();
+        let theme = host::theme(colors, dark, "Georgia", "Courier New");
+        assert_eq!(theme["appearance"], if dark { "dark" } else { "light" });
+        let vars = &theme["variables"];
+        for (variable, role) in [
+            ("--background", "canvas"),
+            ("--accent", "accent"),
+            ("--primary", "messageAction"),
+            ("--accent-surface", "accentSurface"),
+        ] {
+            assert_eq!(vars[variable], crate::themes::editor::picker::hex(&colors[role]).unwrap());
+        }
+        assert_eq!(
+            vars["--font-sans"],
+            format!("Georgia, {}", host::DEFAULT_SANS)
+        );
+        assert_eq!(
+            vars["--font-mono"],
+            format!("\"Courier New\", {}", host::DEFAULT_MONO)
+        );
+        assert_eq!(
+            host::theme(colors, dark, "", "")["variables"]["--font-sans"],
+            host::DEFAULT_SANS
+        );
+    }
+}
+
+#[test]
+fn page_bridge_validates_links() {
+    use super::host;
+    let message = json!({"jsonrpc":"2.0","id":"link-1","method":"ui/open-link","params":{"url":"https://example.com/path","metaKey":true}});
+    let link = host::read_link(&message).unwrap();
+    assert!(link.meta_key);
+    assert_eq!(link.url, "https://example.com/path");
+    for url in [
+        "javascript:alert(1)",
+        "file:///etc/hosts",
+        "data:text/html,hi",
+        "t3-page://page/index.html",
+        "https://",
+        "https://bad host/",
+        "https:example.com",
+        r"https:\example.com",
+    ] {
+        let mut bad = message.clone();
+        bad["params"]["url"] = url.into();
+        assert!(host::read_link(&bad).is_none(), "{url}");
+    }
+    for (field, value) in [
+        ("id", Value::Null),
+        ("id", json!({})),
+        ("jsonrpc", json!("1.0")),
+        ("method", json!("tools/call")),
+    ] {
+        let mut bad = message.clone();
+        bad[field] = value;
+        assert!(host::read_link(&bad).is_none());
+    }
+}
+
+#[test]
+fn page_keys_reject_mutations_conflicts_and_forged_codes() {
+    use super::host;
+    use crate::keybindings::{self, ShortcutMatchContext};
+    let rules = keybindings::default_resolved_keybindings();
+    let context = ShortcutMatchContext::default();
+    let message = json!({"jsonrpc":"2.0","method":"t3/notifications/keydown","params":{"key":"k","code":"KeyK","metaKey":true}});
+    let mut key = host::read_key(&message).unwrap();
+    assert_eq!(
+        host::shortcut_command(&key, rules, &context, true),
+        Some("commandPalette.toggle")
+    );
+    key.key = "Enter".into();
+    assert_eq!(host::shortcut_command(&key, rules, &context, true), None);
+    key.key = "k".into();
+    key.meta_key = false;
+    assert_eq!(host::shortcut_command(&key, rules, &context, true), None);
+    for command in [
+        "thread.stop",
+        "thread.settle",
+        "composer.sendAlternate",
+        "script.build.run",
+        "chat.new",
+    ] {
+        assert!(!host::shortcut_allowed(command));
+    }
+    let mut custom = rules.to_vec();
+    let mut conflict = rules
+        .iter()
+        .find(|r| r.command == "commandPalette.toggle")
+        .unwrap()
+        .clone();
+    conflict.command = "composer.sendAlternate".into();
+    custom.push(conflict);
+    key.meta_key = true;
+    assert_eq!(host::shortcut_command(&key, &custom, &context, true), None);
+    let mut bad = message.clone();
+    bad["params"]["code"] = json!(42);
+    assert!(host::read_key(&bad).is_none());
+}
