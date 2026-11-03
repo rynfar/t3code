@@ -3,7 +3,10 @@
 
 use std::collections::HashSet;
 
-use gpui::{AnyElement, Context, Div, Entity, IntoElement, MouseButton, ParentElement, Styled, Subscription, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Div, Entity, IntoElement, MouseButton, MouseMoveEvent, ParentElement, Pixels, Point, Styled, Subscription, Window,
+    div, prelude::*, px,
+};
 use gpui_component::{
     h_flex,
     input::{Enter, Escape, InputEvent, Textarea, TextareaState},
@@ -28,6 +31,7 @@ pub(super) struct Comments {
     selected: Option<(String, Selection)>,
     dragging: bool,
     utility: bool,
+    utility_range: Option<Selection>,
     highlight: HashSet<(Side, u32)>,
     pub editor: Option<Editor>,
 }
@@ -59,6 +63,9 @@ impl DiffPanel {
         let Some(number) = number else { return gutter.into_any_element() };
         let p = palette(cx);
         let selected = self.selected_range(file).is_some() && self.comments.highlight.contains(&(side, number));
+        let pinned = self.selected_range(file).is_some()
+            && self.comments.utility_range.is_some_and(|range| range.end == number && range.end_side == side);
+        let show_utility = self.selected_range(file).is_none() || pinned;
         let group = format!("diff-gutter-{file}-{new_side}-{number}");
         gutter
             .id(group.clone())
@@ -71,7 +78,8 @@ impl DiffPanel {
                     let previous = this.selected_range(file);
                     let selection = if event.modifiers.shift {
                         previous.and_then(|range| {
-                            this.view.as_ref()?.parsed.files().get(file).map(|diff| review::extend_selection(diff, range, number, side))
+                            let view = this.view.as_ref()?;
+                            view.parsed.files().get(file).map(|diff| review::extend_selection(diff, range, number, side, view.layout))
                         })
                     } else {
                         None
@@ -84,48 +92,42 @@ impl DiffPanel {
                     cx.notify();
                 }),
             )
-            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
-                if !this.comments.dragging || event.pressed_button != Some(MouseButton::Left) {
-                    return;
-                }
-                if let Some(mut range) = this.selected_range(file)
-                    && (range.end != number || range.end_side != side)
-                {
-                    range.end = number;
-                    range.end_side = side;
-                    this.select_range(file, range);
-                    cx.notify();
-                }
-            }))
-            .child(
-                div()
-                    .id(format!("diff-comment-add-{file}-{new_side}-{number}"))
-                    .absolute()
-                    .left(px(4.))
-                    .top_0()
-                    .size(px(20.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(3.))
-                    .bg(hsla(p.primary))
-                    .text_color(hsla(p.primary_foreground))
-                    .invisible()
-                    .group_hover(group, |style| style.visible())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if this.selected_range(file).is_none() {
-                                this.select_range(file, Selection { start: number, side, end: number, end_side: side });
-                            }
-                            this.comments.dragging = true;
-                            this.comments.utility = true;
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    )
-                    .child(Icon::Plus.render(px(14.), hsla(p.primary_foreground))),
-            )
+            .when(show_utility, |gutter| {
+                gutter.child(
+                    div()
+                        .id(format!("diff-comment-add-{file}-{new_side}-{number}"))
+                        .absolute()
+                        .left(px(4.))
+                        .top_0()
+                        .size(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.))
+                        .bg(hsla(p.primary))
+                        .text_color(hsla(p.primary_foreground))
+                        .invisible()
+                        .when(pinned, |utility| utility.visible())
+                        .group_hover(group, |style| style.visible())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let range = this.selected_range(file).and(this.comments.utility_range).unwrap_or(Selection {
+                                    start: number,
+                                    side,
+                                    end: number,
+                                    end_side: side,
+                                });
+                                this.select_range(file, range);
+                                this.comments.dragging = true;
+                                this.comments.utility = true;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .child(Icon::Plus.render(px(14.), hsla(p.primary_foreground))),
+                )
+            })
             .into_any_element()
     }
 
@@ -137,6 +139,8 @@ impl DiffPanel {
     fn select_range(&mut self, file: usize, range: Selection) {
         let Some(key) = self.view.as_ref().and_then(|view| view.key(file)) else { return };
         self.comments.selected = Some((key.to_owned(), range));
+        self.comments.utility_range =
+            self.view.as_ref().and_then(|view| review::gutter_selection(view.parsed.files().get(file)?, range, view.layout));
         self.comments.highlight.clear();
         if let Some(diff) = self.view.as_ref().and_then(|view| view.parsed.files().get(file))
             && let Some((start, end)) = review::selection_indexes(diff, range)
@@ -149,6 +153,45 @@ impl DiffPanel {
                     self.comments.highlight.insert((Side::Additions, n));
                 }
             }
+        }
+    }
+
+    pub(super) fn drag_comment_selection(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.track_comment_pointer(event.position, cx);
+        }
+    }
+
+    pub(super) fn track_comment_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.comments.dragging {
+            return;
+        }
+        let viewport = self.list.viewport_bounds();
+        if !viewport.contains(&position) || position.y < viewport.top() + px(32.) {
+            return;
+        }
+        let Some(view) = &self.view else { return };
+        for index in self.list.logical_scroll_top().item_ix..view.row_count() {
+            let Some(bounds) = self.list.bounds_for_item(index) else { break };
+            if bounds.top() > viewport.bottom() {
+                break;
+            }
+            if !bounds.contains(&position) {
+                continue;
+            }
+            let Some(row) = view.row(index) else { return };
+            let file = row.file();
+            let Some(diff) = view.parsed.files().get(file) else { return };
+            let Some((number, side)) = review::row_selection_target(diff, row, position.x >= bounds.center().x) else { return };
+            if let Some(mut range) = self.selected_range(file)
+                && (range.end != number || range.end_side != side)
+            {
+                range.end = number;
+                range.end_side = side;
+                self.select_range(file, range);
+                cx.notify();
+            }
+            return;
         }
     }
 

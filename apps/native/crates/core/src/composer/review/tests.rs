@@ -58,6 +58,27 @@ fn original_tabs_and_crlf_reach_excerpt() {
     .unwrap();
     assert_eq!(&*comment.diff, "@@ -0,0 +1,1 @@\n+\tnew\r");
     assert_eq!(comment.label(), "x L1");
+    for (patch, selection, expected) in [
+        (
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\told\r\n\\ No newline at end of file\n+\tnew\r\n\\ No newline at end of file\n",
+            Selection { start: 1, side: Side::Deletions, end: 1, end_side: Side::Additions },
+            "@@ -1,1 +1,1 @@\n-\told\n+\tnew",
+        ),
+        (
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\told\r\n\\ No newline at end of file\n+\tnew\r\n",
+            Selection { start: 1, side: Side::Deletions, end: 1, end_side: Side::Additions },
+            "@@ -1,1 +1,1 @@\n-\told\n+\tnew\r",
+        ),
+        (
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n same\r\n\\ No newline at end of file\n",
+            Selection { start: 1, side: Side::Additions, end: 1, end_side: Side::Additions },
+            "@@ -1,1 +1,1 @@\n same",
+        ),
+    ] {
+        let ParsedPatch::Files(files) = parse_patch(patch) else { panic!() };
+        let comment = build_diff_comment("a".into(), "unstaged".into(), "Uncommitted".into(), &files[0], selection, "x").unwrap();
+        assert_eq!(&*comment.diff, expected);
+    }
 }
 #[test]
 fn closing_blocks_remain_data_and_fences_grow() {
@@ -120,10 +141,20 @@ fn shift_extends_from_the_opposite_edge_in_diff_order() {
     let file = file();
     let previous = Selection { start: 2, side: Side::Deletions, end: 3, end_side: Side::Additions };
     assert_eq!(
-        extend_selection(&file, previous, 1, Side::Additions),
+        extend_selection(&file, previous, 1, Side::Additions, crate::diff::Layout::Stacked),
         Selection { start: 3, side: Side::Additions, end: 1, end_side: Side::Additions }
     );
-    assert_eq!(extend_selection(&file, previous, 4, Side::Additions), Selection { end: 4, end_side: Side::Additions, ..previous });
+    assert_eq!(
+        extend_selection(&file, previous, 4, Side::Additions, crate::diff::Layout::Stacked),
+        Selection { end: 4, end_side: Side::Additions, ..previous }
+    );
+    let reversed = Selection { start: 4, side: Side::Additions, end: 1, end_side: Side::Additions };
+    for (target, anchor) in [(3, 1), (1, 4), (4, 1)] {
+        assert_eq!(
+            extend_selection(&file, reversed, target, Side::Additions, crate::diff::Layout::Stacked),
+            Selection { start: anchor, side: Side::Additions, end: target, end_side: Side::Additions }
+        );
+    }
 }
 #[test]
 fn message_context_matches_web_record_and_keeps_only_linked_comments() {
@@ -137,4 +168,37 @@ fn message_context_matches_web_record_and_keeps_only_linked_comments() {
         json!({"version":1,"records":[{"version":1,"contextId":"review-comment_comment-2","kind":"review-comment","label":"app.ts 2","sectionId":"turn:2","sectionTitle":"Turn 2","filePath":"src/app.ts","startIndex":1,"endIndex":2,"rangeLabel":"2","text":"Keep this compatible.","diff":"@@ -2,1 +2,1 @@\n-two\n+TWO","fenceLanguage":"diff"}]})
     );
     assert!(crate::composer::attachments::message_context_with_reviews("plain", &[], &[], &[comment], &[]).is_none());
+}
+
+#[test]
+fn gutter_utility_follows_the_bottom_endpoint_in_visual_diff_order() {
+    let file = file();
+    let forward = Selection { start: 1, side: Side::Additions, end: 4, end_side: Side::Additions };
+    let reversed = Selection { start: 4, side: Side::Additions, end: 1, end_side: Side::Additions };
+    for layout in [Layout::Stacked, Layout::Split] {
+        assert_eq!(gutter_selection(&file, forward, layout), Some(forward));
+        assert_eq!(gutter_selection(&file, reversed, layout), Some(forward));
+    }
+    let mixed = Selection { start: 2, side: Side::Additions, end: 2, end_side: Side::Deletions };
+    assert_eq!(gutter_selection(&file, mixed, Layout::Split), Some(mixed));
+    assert_eq!(
+        gutter_selection(&file, mixed, Layout::Stacked),
+        Some(Selection { start: 2, side: Side::Deletions, end: 2, end_side: Side::Additions })
+    );
+    // Both endpoints share a split row, so Shift uses the original start as Pierre does.
+    assert_eq!(
+        extend_selection(&file, mixed, 2, Side::Additions, Layout::Split),
+        Selection { start: 2, side: Side::Additions, end: 2, end_side: Side::Additions }
+    );
+}
+#[test]
+fn drag_targets_use_the_code_row_and_the_pointed_split_half() {
+    let file = file();
+    assert_eq!(row_selection_target(&file, DiffRow::Line { file: 0, hunk: 0, line: 1 }, true), Some((2, Side::Deletions)));
+    let split = DiffRow::Split { file: 0, hunk: 0, left: Some(1), right: Some(2) };
+    assert_eq!(row_selection_target(&file, split, false), Some((2, Side::Deletions)));
+    assert_eq!(row_selection_target(&file, split, true), Some((2, Side::Additions)));
+    assert_eq!(row_selection_target(&file, DiffRow::Split { file: 0, hunk: 0, left: None, right: Some(2) }, false), None);
+    assert_eq!(row_selection_target(&file, DiffRow::FileHeader { file: 0 }, true), None);
+    assert_eq!(row_selection_target(&file, DiffRow::NoNewline { file: 0, hunk: 0, line: 1 }, true), None);
 }

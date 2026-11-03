@@ -78,7 +78,11 @@ impl DiffPanel {
             .h_full()
             .bg(hsla(p.background))
             .on_scroll_wheel(cx.listener(Self::scroll_horizontally))
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| this.finish_selection(window, cx)))
+            .on_mouse_move(cx.listener(Self::drag_comment_selection))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                this.track_comment_pointer(event.position, cx);
+                this.finish_selection(window, cx);
+            }))
             .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| this.finish_selection(window, cx)))
             .child(list(self.list.clone(), cx.processor(|this, ix: usize, _, cx| this.render_row(ix, cx))).size_full())
             .children(sticky.map(|file| div().absolute().top_0().left_0().right_0().child(self.render_file_header(file, cx))))

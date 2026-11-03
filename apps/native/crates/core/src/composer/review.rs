@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::context::{Linked, format_reference};
 use super::menu::{context_references, kind_scoped_context_id, sanitize_context_label};
-use crate::diff::{DiffLine, FileDiff, LineKind};
+use crate::diff::{DiffLine, DiffRow, FileDiff, Layout, LineKind};
 
 pub const KIND: &str = "review-comment";
 
@@ -79,11 +79,76 @@ pub fn selection_indexes(file: &FileDiff, selection: Selection) -> Option<(usize
     Some((index(selection.start, selection.side)?, index(selection.end, selection.end_side)?))
 }
 
-pub fn extend_selection(file: &FileDiff, previous: Selection, end: u32, end_side: Side) -> Selection {
+fn visual_selection_indexes(file: &FileDiff, selection: Selection, layout: Layout) -> Option<(usize, usize)> {
+    let (start, end) = selection_indexes(file, selection)?;
+    if layout == Layout::Stacked {
+        return Some((start, end));
+    }
+    let (mut stacked, mut split) = (0, 0);
+    let (mut mapped_start, mut mapped_end) = (None, None);
+    for hunk in &file.hunks {
+        let mut index = 0;
+        while index < hunk.lines.len() {
+            let first = index;
+            let deletions;
+            let rows;
+            if hunk.lines[index].kind == LineKind::Context {
+                index += 1;
+                deletions = 1;
+                rows = 1;
+            } else {
+                while index < hunk.lines.len() && hunk.lines[index].kind == LineKind::Deletion {
+                    index += 1;
+                }
+                deletions = index - first;
+                let additions_start = index;
+                while index < hunk.lines.len() && hunk.lines[index].kind == LineKind::Addition {
+                    index += 1;
+                }
+                rows = deletions.max(index - additions_start);
+            }
+            let map = |target: usize| {
+                let offset = target.checked_sub(stacked)?;
+                (offset < index - first).then(|| split + if offset < deletions { offset } else { offset - deletions })
+            };
+            mapped_start = mapped_start.or_else(|| map(start));
+            mapped_end = mapped_end.or_else(|| map(end));
+            if let (Some(start), Some(end)) = (mapped_start, mapped_end) {
+                return Some((start, end));
+            }
+            stacked += index - first;
+            split += rows;
+        }
+    }
+    None
+}
+
+/// Pierre pins the gutter utility to the bottom endpoint and drags from the top endpoint.
+pub fn gutter_selection(file: &FileDiff, selection: Selection, layout: Layout) -> Option<Selection> {
+    let (start, end) = visual_selection_indexes(file, selection, layout)?;
+    Some(if start > end {
+        Selection { start: selection.end, side: selection.end_side, end: selection.start, end_side: selection.side }
+    } else {
+        selection
+    })
+}
+
+pub fn row_selection_target(file: &FileDiff, row: DiffRow, right_half: bool) -> Option<(u32, Side)> {
+    let (hunk, line, new_side) = match row {
+        DiffRow::Line { hunk, line, .. } => (hunk, line, true),
+        DiffRow::Split { hunk, left, right, .. } => (hunk, if right_half { right } else { left }?, right_half),
+        _ => return None,
+    };
+    let line = file.hunks.get(hunk)?.lines.get(line)?;
+    let side = if line.kind == LineKind::Deletion || !new_side { Side::Deletions } else { Side::Additions };
+    Some((number(line, side)?, side))
+}
+
+pub fn extend_selection(file: &FileDiff, previous: Selection, end: u32, end_side: Side, layout: Layout) -> Selection {
     let target = Selection { start: end, side: end_side, end, end_side };
-    let Some((start_index, end_index)) = selection_indexes(file, previous) else { return target };
-    let Some((target_index, _)) = selection_indexes(file, target) else { return previous };
-    let use_start = if start_index <= end_index { target_index >= start_index } else { target_index <= start_index };
+    let Some((start_index, end_index)) = visual_selection_indexes(file, previous, layout) else { return target };
+    let Some((target_index, _)) = visual_selection_indexes(file, target, layout) else { return previous };
+    let use_start = if start_index <= end_index { target_index >= start_index } else { target_index <= end_index };
     let (start, side) = if use_start { (previous.start, previous.side) } else { (previous.end, previous.end_side) };
     Selection { start, side, end, end_side }
 }
@@ -122,7 +187,9 @@ pub fn build_diff_comment(
     for line in selected {
         diff.push('\n');
         diff.push(marker(line));
-        diff.push_str(&line.source_text);
+        let text =
+            if line.no_newline_at_eof { line.source_text.strip_suffix('\r').unwrap_or(&line.source_text) } else { &line.source_text };
+        diff.push_str(text);
     }
     Some(ReviewComment {
         id,
