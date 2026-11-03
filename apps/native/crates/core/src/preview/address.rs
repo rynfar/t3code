@@ -18,7 +18,7 @@ impl UrlError {
     pub const MESSAGE: &'static str = "Enter an http or https URL.";
 }
 
-/// DuckDuckGo, the web's default engine. Native has no search engine setting yet.
+/// DuckDuckGo, the web's default engine and fallback for an invalid custom template.
 pub const DEFAULT_SEARCH_TEMPLATE: &str = "https://duckduckgo.com/?q=%s";
 
 const NON_WEB_SCHEMES: &[&str] =

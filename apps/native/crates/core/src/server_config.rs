@@ -626,6 +626,8 @@ pub struct ProjectSettingsOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub enable_agent_browser_access: Option<bool>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub hidden_thread_tags: Vec<String>,
     #[serde(default, deserialize_with = "lenient")]

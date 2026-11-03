@@ -131,6 +131,15 @@ pub struct Palette {
     pub sidebar_row_selected: u32,
     pub sidebar_border: u32,
     pub sidebar_edge: u32,
+    pub blue_orange_diff_addition: u32,
+    pub blue_orange_diff_deletion: u32,
+    pub blue_orange_diff_addition_foreground: u32,
+    pub blue_orange_diff_deletion_foreground: u32,
+    pub blue_orange_diff_modified_icon: u32,
+    pub blue_orange_diff_row_addition: u32,
+    pub blue_orange_diff_row_addition_gutter: u32,
+    pub blue_orange_diff_row_deletion: u32,
+    pub blue_orange_diff_row_deletion_gutter: u32,
 }
 
 pub const LIGHT: Palette = Palette {
@@ -262,6 +271,15 @@ pub const LIGHT: Palette = Palette {
     sidebar_row_selected: 0xFFFFFFFF,
     sidebar_border: 0xE4E4E7FF,
     sidebar_edge: 0xE4E4E7FF,
+    blue_orange_diff_addition: 0x155DFCFF,
+    blue_orange_diff_deletion: 0xF54900FF,
+    blue_orange_diff_addition_foreground: 0x155DFCFF,
+    blue_orange_diff_deletion_foreground: 0xF54900FF,
+    blue_orange_diff_modified_icon: 0x71717BFF,
+    blue_orange_diff_row_addition: 0xEFF2FDFF,
+    blue_orange_diff_row_addition_gutter: 0xF0F2FDFF,
+    blue_orange_diff_row_deletion: 0xFEF2EAFF,
+    blue_orange_diff_row_deletion_gutter: 0xFFF2EBFF,
 };
 
 pub const DARK: Palette = Palette {
@@ -393,6 +411,15 @@ pub const DARK: Palette = Palette {
     sidebar_row_selected: 0xF1F3F712,
     sidebar_border: 0xFFFFFF14,
     sidebar_edge: 0xFFFFFF14,
+    blue_orange_diff_addition: 0x51A2FFFF,
+    blue_orange_diff_deletion: 0xFF8904FF,
+    blue_orange_diff_addition_foreground: 0x51A2FFFF,
+    blue_orange_diff_deletion_foreground: 0xFF8904FF,
+    blue_orange_diff_modified_icon: 0xA1A1A1A6,
+    blue_orange_diff_row_addition: 0x0A0E15FF,
+    blue_orange_diff_row_addition_gutter: 0x0A0E15FF,
+    blue_orange_diff_row_deletion: 0x170C01FF,
+    blue_orange_diff_row_deletion_gutter: 0x170D02FF,
 };
 
 pub const T3_CHAT_LIGHT: Palette = Palette {
@@ -524,6 +551,15 @@ pub const T3_CHAT_LIGHT: Palette = Palette {
     sidebar_row_selected: 0xF8F8F7FF,
     sidebar_border: 0xECEAE9FF,
     sidebar_edge: 0x4545541A,
+    blue_orange_diff_addition: 0x155DFCFF,
+    blue_orange_diff_deletion: 0xF54900FF,
+    blue_orange_diff_addition_foreground: 0x155DFCFF,
+    blue_orange_diff_deletion_foreground: 0xF54900FF,
+    blue_orange_diff_modified_icon: 0x8D1255FF,
+    blue_orange_diff_row_addition: 0xF0EDFDFF,
+    blue_orange_diff_row_addition_gutter: 0xF1EEFDFF,
+    blue_orange_diff_row_deletion: 0xFFEDEBFF,
+    blue_orange_diff_row_deletion_gutter: 0xFFEDEBFF,
 };
 
 pub const T3_CHAT_DARK: Palette = Palette {
@@ -655,6 +691,15 @@ pub const T3_CHAT_DARK: Palette = Palette {
     sidebar_row_selected: 0x261922FF,
     sidebar_border: 0x322028FF,
     sidebar_edge: 0x322028FF,
+    blue_orange_diff_addition: 0x51A2FFFF,
+    blue_orange_diff_deletion: 0xFF8904FF,
+    blue_orange_diff_addition_foreground: 0x51A2FFFF,
+    blue_orange_diff_deletion_foreground: 0xFF8904FF,
+    blue_orange_diff_modified_icon: 0xE7D0DDA6,
+    blue_orange_diff_row_addition: 0x232231FF,
+    blue_orange_diff_row_addition_gutter: 0x232230FF,
+    blue_orange_diff_row_deletion: 0x2D2023FF,
+    blue_orange_diff_row_deletion_gutter: 0x2D2023FF,
 };
 
 pub const GROVE_LIGHT: Palette = Palette {
@@ -786,6 +831,15 @@ pub const GROVE_LIGHT: Palette = Palette {
     sidebar_row_selected: 0xB2D2C3FF,
     sidebar_border: 0xCBD3D0FF,
     sidebar_edge: 0x2415231A,
+    blue_orange_diff_addition: 0x155DFCFF,
+    blue_orange_diff_deletion: 0xF54900FF,
+    blue_orange_diff_addition_foreground: 0x155DFCFF,
+    blue_orange_diff_deletion_foreground: 0xF54900FF,
+    blue_orange_diff_modified_icon: 0x6E696FFF,
+    blue_orange_diff_row_addition: 0xE7EDF5FF,
+    blue_orange_diff_row_addition_gutter: 0xE8EEF5FF,
+    blue_orange_diff_row_deletion: 0xF5EDE3FF,
+    blue_orange_diff_row_deletion_gutter: 0xF6EDE3FF,
 };
 
 pub const GROVE_DARK: Palette = Palette {
@@ -917,6 +971,15 @@ pub const GROVE_DARK: Palette = Palette {
     sidebar_row_selected: 0x325C46FF,
     sidebar_border: 0x6F7A75FF,
     sidebar_edge: 0xFFFAFF14,
+    blue_orange_diff_addition: 0x51A2FFFF,
+    blue_orange_diff_deletion: 0xFF8904FF,
+    blue_orange_diff_addition_foreground: 0x51A2FFFF,
+    blue_orange_diff_deletion_foreground: 0xFF8904FF,
+    blue_orange_diff_modified_icon: 0x9DA5A2A6,
+    blue_orange_diff_row_addition: 0x1F2F2EFF,
+    blue_orange_diff_row_addition_gutter: 0x1F2E2EFF,
+    blue_orange_diff_row_deletion: 0x2A2D20FF,
+    blue_orange_diff_row_deletion_gutter: 0x2A2D20FF,
 };
 
 pub const OCEAN_LIGHT: Palette = Palette {
@@ -1048,6 +1111,15 @@ pub const OCEAN_LIGHT: Palette = Palette {
     sidebar_row_selected: 0xB7CFE2FF,
     sidebar_border: 0xCDD2D9FF,
     sidebar_edge: 0x2415231A,
+    blue_orange_diff_addition: 0x155DFCFF,
+    blue_orange_diff_deletion: 0xF54900FF,
+    blue_orange_diff_addition_foreground: 0x155DFCFF,
+    blue_orange_diff_deletion_foreground: 0xF54900FF,
+    blue_orange_diff_modified_icon: 0x6F6873FF,
+    blue_orange_diff_row_addition: 0xE8EDF9FF,
+    blue_orange_diff_row_addition_gutter: 0xE9EDF9FF,
+    blue_orange_diff_row_deletion: 0xF7ECE6FF,
+    blue_orange_diff_row_deletion_gutter: 0xF8EDE7FF,
 };
 
 pub const OCEAN_DARK: Palette = Palette {
@@ -1179,6 +1251,15 @@ pub const OCEAN_DARK: Palette = Palette {
     sidebar_row_selected: 0x324F66FF,
     sidebar_border: 0x6D757FFF,
     sidebar_edge: 0xFFFAFF14,
+    blue_orange_diff_addition: 0x51A2FFFF,
+    blue_orange_diff_deletion: 0xFF8904FF,
+    blue_orange_diff_addition_foreground: 0x51A2FFFF,
+    blue_orange_diff_deletion_foreground: 0xFF8904FF,
+    blue_orange_diff_modified_icon: 0x969CA6A6,
+    blue_orange_diff_row_addition: 0x1B2837FF,
+    blue_orange_diff_row_addition_gutter: 0x1B2837FF,
+    blue_orange_diff_row_deletion: 0x272729FF,
+    blue_orange_diff_row_deletion_gutter: 0x27272AFF,
 };
 
 pub const EMBER_LIGHT: Palette = Palette {
@@ -1310,6 +1391,15 @@ pub const EMBER_LIGHT: Palette = Palette {
     sidebar_row_selected: 0xE2C6B8FF,
     sidebar_border: 0xDAD0CEFF,
     sidebar_edge: 0x2415231A,
+    blue_orange_diff_addition: 0x155DFCFF,
+    blue_orange_diff_deletion: 0xF54900FF,
+    blue_orange_diff_addition_foreground: 0x155DFCFF,
+    blue_orange_diff_deletion_foreground: 0xF54900FF,
+    blue_orange_diff_modified_icon: 0x74686FFF,
+    blue_orange_diff_row_addition: 0xECEDF6FF,
+    blue_orange_diff_row_addition_gutter: 0xEDEDF6FF,
+    blue_orange_diff_row_deletion: 0xFBECE4FF,
+    blue_orange_diff_row_deletion_gutter: 0xFBEDE4FF,
 };
 
 pub const EMBER_DARK: Palette = Palette {
@@ -1441,6 +1531,15 @@ pub const EMBER_DARK: Palette = Palette {
     sidebar_row_selected: 0x654330FF,
     sidebar_border: 0x7E716EFF,
     sidebar_edge: 0xFFFAFF14,
+    blue_orange_diff_addition: 0x51A2FFFF,
+    blue_orange_diff_deletion: 0xFF8904FF,
+    blue_orange_diff_addition_foreground: 0x51A2FFFF,
+    blue_orange_diff_deletion_foreground: 0xFF8904FF,
+    blue_orange_diff_modified_icon: 0xA59996A6,
+    blue_orange_diff_row_addition: 0x2D2527FF,
+    blue_orange_diff_row_addition_gutter: 0x2D2526FF,
+    blue_orange_diff_row_deletion: 0x362419FF,
+    blue_orange_diff_row_deletion_gutter: 0x352419FF,
 };
 
 pub const IRIS_LIGHT: Palette = Palette {
@@ -1572,6 +1671,15 @@ pub const IRIS_LIGHT: Palette = Palette {
     sidebar_row_selected: 0xCFC6E6FF,
     sidebar_border: 0xD5D0DBFF,
     sidebar_edge: 0x2415231A,
+    blue_orange_diff_addition: 0x155DFCFF,
+    blue_orange_diff_deletion: 0xF54900FF,
+    blue_orange_diff_addition_foreground: 0x155DFCFF,
+    blue_orange_diff_deletion_foreground: 0xF54900FF,
+    blue_orange_diff_modified_icon: 0x726874FF,
+    blue_orange_diff_row_addition: 0xEBEDFAFF,
+    blue_orange_diff_row_addition_gutter: 0xECEDFAFF,
+    blue_orange_diff_row_deletion: 0xFAECE7FF,
+    blue_orange_diff_row_deletion_gutter: 0xFAEDE8FF,
 };
 
 pub const IRIS_DARK: Palette = Palette {
@@ -1703,6 +1811,15 @@ pub const IRIS_DARK: Palette = Palette {
     sidebar_row_selected: 0x433766FF,
     sidebar_border: 0x736D7EFF,
     sidebar_edge: 0xFFFAFF14,
+    blue_orange_diff_addition: 0x51A2FFFF,
+    blue_orange_diff_deletion: 0xFF8904FF,
+    blue_orange_diff_addition_foreground: 0x51A2FFFF,
+    blue_orange_diff_deletion_foreground: 0xFF8904FF,
+    blue_orange_diff_modified_icon: 0x9690A1A6,
+    blue_orange_diff_row_addition: 0x202135FF,
+    blue_orange_diff_row_addition_gutter: 0x212135FF,
+    blue_orange_diff_row_deletion: 0x2B1F28FF,
+    blue_orange_diff_row_deletion_gutter: 0x2B1F28FF,
 };
 
 #[derive(Clone, Copy, Debug)]

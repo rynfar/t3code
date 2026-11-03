@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use t3_core::diff::{DiffRow, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_tree_rows, parse_patch};
+use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_tree_rows, parse_patch};
 
 /// One fetched patch, parsed off the UI thread.
 pub struct Parsed {
@@ -46,6 +46,7 @@ pub struct View {
     pub parsed: Arc<Parsed>,
     pub scope_key: String,
     pub layout: Layout,
+    pub files_collapsed_default: bool,
     pub tree: Vec<TreeRow>,
     /// Line-number digits per file: each file sizes its own gutter, as Pierre does.
     pub digits: Vec<usize>,
@@ -58,11 +59,10 @@ pub struct View {
 }
 
 impl View {
-    /// `folds` are the scope's remembered folds; `None` folds every file (`diffFilesCollapsed`).
-    pub fn new(parsed: Arc<Parsed>, scope_key: String, layout: Layout, folds: Option<&HashSet<String>>, tree_collapsed: &HashSet<String>) -> View {
+    pub fn new(parsed: Arc<Parsed>, scope_key: String, layout: Layout, session: &DiffSession, files_collapsed_default: bool, tree_collapsed: &HashSet<String>) -> View {
         let files = parsed.files();
         let keys: Vec<String> = files.iter().map(FileDiff::key).collect();
-        let folded: Vec<bool> = keys.iter().map(|key| folds.is_none_or(|folds| folds.contains(key))).collect();
+        let folded = session.resolve_folds(&scope_key, &keys, files_collapsed_default);
         let rows: Vec<Vec<DiffRow>> =
             files.iter().enumerate().map(|(index, file)| file_rows(index, file, folded[index], layout)).collect();
         let mut view = View {
@@ -76,6 +76,7 @@ impl View {
             parsed,
             scope_key,
             layout,
+            files_collapsed_default,
         };
         view.recount(0);
         view

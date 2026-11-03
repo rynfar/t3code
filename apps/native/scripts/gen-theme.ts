@@ -1117,6 +1117,25 @@ const COLOR_TOKENS: readonly ColorToken[] = [
   },
 ];
 
+const DIFF_SCHEME_TOKENS = [
+  "diff_addition",
+  "diff_deletion",
+  "diff_addition_foreground",
+  "diff_deletion_foreground",
+  "diff_modified_icon",
+  "diff_row_addition",
+  "diff_row_addition_gutter",
+  "diff_row_deletion",
+  "diff_row_deletion_gutter",
+];
+const ALL_COLOR_TOKENS = [
+  ...COLOR_TOKENS,
+  ...COLOR_TOKENS.filter((token) => DIFF_SCHEME_TOKENS.includes(token.name)).map((token) => ({
+    ...token,
+    name: `blue_orange_${token.name}`,
+  })),
+];
+
 function exactRule(path: readonly string[], prop: string): string | undefined {
   let value: string | undefined;
   for (const decl of cssDecls) if (decl.prop === prop && pathIs(decl, ...path)) value = decl.value;
@@ -1134,13 +1153,23 @@ type Palette = ReadonlyMap<string, number>;
 
 function palette(variant: Variant): Palette {
   const root = rootScope(variant);
+  const blueOrangeRoot = rootScope(variant, [
+    [':root[data-diff-color-scheme="blue-orange"]'],
+    ...(variant.appearance === "dark"
+      ? [[':root[data-diff-color-scheme="blue-orange"]', "@variant dark"]]
+      : []),
+  ]);
   const sidebar = sidebarScope(variant, root);
   const context: TokenContext = { variant, rule: ruleValue(variant) };
   const out = new Map<string, number>();
-  for (const token of COLOR_TOKENS) {
+  for (const token of ALL_COLOR_TOKENS) {
     const css = typeof token.css === "string" ? token.css : token.css(context);
     if (!css) throw new Error(`Token ${token.name} has no source value`);
-    const scope = token.scope === "sidebar" ? sidebar : root;
+    const scope = token.name.startsWith("blue_orange_")
+      ? blueOrangeRoot
+      : token.scope === "sidebar"
+        ? sidebar
+        : root;
     try {
       out.set(token.name, toU32(parseColor(substitute(scope, css), variant.appearance)));
     } catch (cause) {
@@ -1457,14 +1486,14 @@ function renderRust(): string {
   );
   lines.push("#![allow(dead_code)]", "");
   lines.push("#[derive(Clone, Copy, Debug)]", "pub struct Palette {");
-  for (const token of COLOR_TOKENS) lines.push(`    pub ${token.name}: u32,`);
+  for (const token of ALL_COLOR_TOKENS) lines.push(`    pub ${token.name}: u32,`);
   lines.push("}", "");
 
   const all = variants();
   for (const [name, variant] of all) {
     const values = palette(variant);
     lines.push(`pub const ${name}: Palette = Palette {`);
-    for (const token of COLOR_TOKENS)
+    for (const token of ALL_COLOR_TOKENS)
       lines.push(`    ${token.name}: ${hex32(values.get(token.name)!)},`);
     lines.push("};", "");
   }
@@ -1535,7 +1564,7 @@ function renderMarkdown(): string {
   const dark = palette({ appearance: "dark", theme: null });
   const cell = (value: number) => `\`#${value.toString(16).padStart(8, "0").replace(/ff$/, "")}\``;
   const rows = ["| Native token | Web source | LIGHT | DARK |", "| --- | --- | --- | --- |"];
-  for (const token of COLOR_TOKENS) {
+  for (const token of ALL_COLOR_TOKENS) {
     const scope = token.scope === "sidebar" ? " (sidebar scope)" : "";
     rows.push(
       `| \`${token.name}\` | \`${token.web}\`${scope} | ${cell(light.get(token.name)!)} | ${cell(dark.get(token.name)!)} |`,

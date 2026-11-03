@@ -113,6 +113,7 @@ pub enum ServerSettingChange {
     DefaultModelSelection(Option<ModelSelection>),
     FallbackModelSelection(Option<ModelSelection>),
     DefaultRuntimeMode(RuntimeMode),
+    AgentBrowserAccess(bool),
     DefaultThreadEnvMode(Option<ThreadEnvMode>),
     AutoSettleAfterDays(Option<u32>),
     AutoSettleOnMerge(bool),
@@ -139,6 +140,7 @@ impl ServerSettingChange {
         match self {
             ServerSettingChange::DefaultModelSelection(_) => "defaultModelSelection",
             ServerSettingChange::FallbackModelSelection(_) => "fallbackModelSelection",
+            ServerSettingChange::AgentBrowserAccess(_) => "enableAgentBrowserAccess",
             ServerSettingChange::DefaultRuntimeMode(_) => "defaultRuntimeMode",
             ServerSettingChange::DefaultThreadEnvMode(_) => "defaultThreadEnvMode",
             ServerSettingChange::AutoSettleAfterDays(_) => "sidebarAutoSettleAfterDays",
@@ -161,6 +163,7 @@ impl ServerSettingChange {
             ServerSettingChange::DefaultModelSelection(selection) | ServerSettingChange::FallbackModelSelection(selection) => {
                 json!(selection)
             }
+            ServerSettingChange::AgentBrowserAccess(on) => json!(on),
             ServerSettingChange::DefaultRuntimeMode(mode) => json!(mode),
             ServerSettingChange::DefaultThreadEnvMode(mode) => json!(mode),
             ServerSettingChange::AutoSettleAfterDays(days) => {

@@ -38,7 +38,11 @@ struct ClientPrefs {
 impl Global for ClientPrefs {}
 
 pub fn init(cx: &mut App) {
-    let doc = ClientSettingsDoc::from_json(&store::load_client_settings().unwrap_or_default());
+    let mut doc = ClientSettingsDoc::from_json(&store::load_client_settings().unwrap_or_default());
+    if let Some(legacy_panels) = store::load_ui_state("panels") {
+        let patch = doc.migrate_diff_layout(&legacy_panels);
+        if !patch.is_empty() { store::patch_client_settings(patch); }
+    }
     theme::set_preferences(preferences(&doc), cx);
     terminal::set_typography(terminal::typography(doc.entries()), cx);
     cx.set_global(ClientPrefs { doc, error: None, saving: false, queue: VecDeque::new() });
@@ -50,6 +54,7 @@ fn preferences(doc: &ClientSettingsDoc) -> Preferences {
         mode: doc.appearance_mode(),
         interface_font_size: doc.interface_font_size() as f32,
         chat_width: doc.chat_width(),
+        diff_color_scheme: doc.diff_color_scheme(),
     }
 }
 
@@ -81,7 +86,12 @@ pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: 
     store::patch_client_settings(patch);
     let (composer, next) = (prefs.doc.composer(), preferences(&prefs.doc));
     let typography = terminal::typography(prefs.doc.entries());
-    state.update(cx, |state, _| state.client_settings = composer);
+    state.update(cx, |state, cx| {
+        state.client_settings = composer;
+        if matches!(change, ClientSettingChange::DiffLayout(_) | ClientSettingChange::DiffFilesCollapsed(_) | ClientSettingChange::DiffIgnoreWhitespace(_)) {
+            cx.emit(AppEvent::RightPanel);
+        }
+    });
     theme::set_preferences(next, cx);
     terminal::set_typography(typography, cx);
     cx.refresh_windows();
