@@ -130,7 +130,11 @@ fn overrides(v: &Value, strict: bool) -> Result<Colors, String> {
     }
     Ok(colors)
 }
+#[cfg(test)]
+thread_local! { static STORED_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
+    #[cfg(test)]
+    if stored { STORED_DECODES.with(|n|n.set(n.get()+1)); }
     let v = value.as_object().ok_or("Theme files must contain a JSON object.")?;
     if !stored && v.get("version").and_then(Value::as_u64) != Some(1) {
         return Err("This theme file uses an unsupported version. Expected 1.".into());

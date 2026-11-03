@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -43,6 +43,7 @@ enum Gesture {
     Scroll(Point<Pixels>, f32),
     /// Space-separated keystrokes, as `cmd-a escape`.
     Keys(String),
+    KeyUp(String),
     Focus(String),
     Text(String),
     FontSize(f32),
@@ -65,6 +66,7 @@ fn gestures(args: &[String]) -> Vec<Gesture> {
                 ("--scroll", Some(n @ [_, _, dy])) => Gesture::Scroll(at(n), *dy),
                 ("--resize-font", Some([size])) => Gesture::FontSize(*size),
                 ("--keys", _) => Gesture::Keys(pair[1].clone()),
+                ("--key-up", _) => Gesture::KeyUp(pair[1].clone()),
                 ("--focus", _) => Gesture::Focus(pair[1].clone()),
                 ("--type", _) => Gesture::Text(pair[1].clone()),
                 _ => return None,
@@ -106,6 +108,9 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
             cx.simulate_event(window, ScrollWheelEvent { position: *at, delta, modifiers: none, touch_phase: TouchPhase::Moved });
         }
         Gesture::Keys(keys) => cx.simulate_keystrokes(window, keys),
+        Gesture::KeyUp(keys) => {
+            for key in keys.split_whitespace() {cx.simulate_event(window,gpui::KeyUpEvent {keystroke:gpui::Keystroke::parse(key).expect("snapshot key")});}
+        }
         Gesture::Focus(id) => {
             cx.update_window(window, |_, window, cx| {
                 let focus = cx.global::<FocusTargets>().0.get(id.as_str()).expect("unknown snapshot focus target").clone();
@@ -298,6 +303,11 @@ fn isolated_home() -> Result<PathBuf, String> {
 
 pub fn run(options: Options, runtime: tokio::runtime::Handle) {
     let result = isolated_home().and_then(|home| {
+        if std::env::var_os("T3_NATIVE_THEME_IMPORT_WRITE_FAILURE").is_some() {
+            let path=home.join("settings.json");
+            let _=std::fs::remove_file(&path);
+            std::fs::create_dir(&path).map_err(|e|e.to_string())?;
+        }
         t3_client::store::use_home(home.clone());
         let result = capture(&options, runtime);
         let _ = std::fs::remove_dir_all(home);

@@ -162,7 +162,7 @@ pub fn parse_batch(files: Vec<(String, Result<String, String>)>) -> Batch {
         failures,
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ImportSession {
     pub json: String,
     pub file_name: Option<String>,
@@ -219,27 +219,32 @@ impl ImportSession {
             return None;
         }
         self.reading = false;
-        let mut doc = doc.clone();
+        let mut mutation = LibraryMutation::new(doc);
         let mut failures = batch.failures;
         let mut installed = Vec::new();
-        let mut value = None;
         self.conflicts.clear();
         for theme in batch.themes {
-            if library(&doc).iter().any(|t| t.id == theme.id) {
+            if mutation
+                .as_ref()
+                .is_ok_and(|m| m.existing.contains_key(&theme.id))
+            {
                 self.conflicts.push(theme);
                 continue;
             }
-            match install(&doc, &theme) {
-                Ok(v) => {
-                    doc.apply_change(&crate::client_settings::ClientSettingChange::ThemeLibrary(
-                        v.clone(),
-                    ));
-                    value = Some(v);
-                    installed.push(theme);
-                }
+            match mutation
+                .as_mut()
+                .map_err(|e| e.clone())
+                .and_then(|m| m.add(theme.clone()))
+            {
+                Ok(()) => installed.push(theme),
                 Err(e) => failures.push(format!("{}: {e}", theme.label)),
             }
         }
+        let value = if installed.is_empty() {
+            None
+        } else {
+            mutation.ok().map(LibraryMutation::finish)
+        };
         self.error = (!failures.is_empty()).then(|| failures.join("; "));
         let close = self.conflicts.is_empty() && !installed.is_empty() && self.error.is_none();
         Some(Installed {
@@ -260,37 +265,33 @@ impl ImportSession {
                     .map(|name| humanize(name.rsplit_once('.').map_or(name, |(stem, _)| stem)))
             })
             .flatten();
-        let mut doc = doc.clone();
-        let mut value = None;
+        let mut mutation = LibraryMutation::new(doc);
         let mut installed = Vec::new();
         let mut failures = Vec::new();
         for theme in self.conflicts.drain(..) {
-            let result = match choice {
-                ImportChoice::Update => resolve_import(&doc, &theme, choice),
-                ImportChoice::KeepBoth => versioned_copy(&doc, &theme, preferred.as_deref())
-                    .and_then(|t| install(&doc, &t)),
-            };
-            match result {
-                Ok(v) => {
-                    let id = if matches!(choice, ImportChoice::Update) {
-                        theme.id.clone()
-                    } else {
-                        v.as_array().unwrap().last().unwrap()["id"]
-                            .as_str()
-                            .unwrap()
-                            .to_owned()
-                    };
-                    doc.apply_change(&crate::client_settings::ClientSettingChange::ThemeLibrary(
-                        v.clone(),
-                    ));
-                    value = Some(v);
-                    if let Some(t) = library(&doc).into_iter().find(|t| t.id == id) {
-                        installed.push(t);
+            let resolved = mutation
+                .as_mut()
+                .map_err(|e| e.clone())
+                .and_then(|m| match choice {
+                    ImportChoice::Update => m.update(theme.clone()),
+                    ImportChoice::KeepBoth => {
+                        let candidate = copy_with_ids(&theme, preferred.as_deref(), |id| {
+                            m.existing.contains_key(id)
+                        })?;
+                        m.add(candidate.clone())?;
+                        Ok(candidate)
                     }
-                }
+                });
+            match resolved {
+                Ok(t) => installed.push(t),
                 Err(e) => failures.push(format!("{}: {e}", theme.label)),
             }
         }
+        let value = if installed.is_empty() {
+            None
+        } else {
+            mutation.ok().map(LibraryMutation::finish)
+        };
         if !failures.is_empty() {
             let mut errors = self.error.take().into_iter().collect::<Vec<_>>();
             errors.extend(failures);
@@ -303,16 +304,100 @@ impl ImportSession {
         }
     }
 }
+struct LibraryMutation {
+    stored: Vec<Value>,
+    existing: BTreeMap<String, ThemeDefinition>,
+    ids: std::collections::BTreeSet<String>,
+    added: Vec<ThemeDefinition>,
+    updated: BTreeMap<String, ThemeDefinition>,
+}
+impl LibraryMutation {
+    fn new(doc: &ClientSettingsDoc) -> Result<Self, String> {
+        let stored = match doc.entries().get(LIBRARY_KEY) {
+            None => Vec::new(),
+            Some(v) => v
+                .as_array()
+                .cloned()
+                .ok_or("Couldn’t read the theme library. Try again.")?,
+        };
+        let ids = stored
+            .iter()
+            .filter_map(|v| v["id"].as_str().map(str::to_owned))
+            .collect();
+        let existing = library(doc)
+            .into_iter()
+            .map(|t| (t.id.clone(), t))
+            .collect();
+        Ok(Self {
+            stored,
+            existing,
+            ids,
+            added: Vec::new(),
+            updated: BTreeMap::new(),
+        })
+    }
+    fn add(&mut self, theme: ThemeDefinition) -> Result<(), String> {
+        if reserved(&theme.id) || !self.ids.insert(theme.id.clone()) {
+            return Err(format!(
+                "A theme named \"{}\" is already installed.",
+                theme.label
+            ));
+        }
+        self.existing.insert(theme.id.clone(), theme.clone());
+        self.added.push(theme);
+        Ok(())
+    }
+    fn update(&mut self, theme: ThemeDefinition) -> Result<ThemeDefinition, String> {
+        let previous = self
+            .existing
+            .get(&theme.id)
+            .ok_or("The theme is no longer installed.")?;
+        let theme = ThemeDefinition {
+            collection: previous.collection.clone().or(theme.collection.clone()),
+            ..theme
+        };
+        self.existing.insert(theme.id.clone(), theme.clone());
+        self.updated.insert(theme.id.clone(), theme.clone());
+        Ok(theme)
+    }
+    fn finish(mut self) -> Value {
+        let mut replaced = std::collections::BTreeSet::new();
+        self.stored.retain_mut(|v| {
+            let Some(t) = v["id"].as_str().and_then(|id| self.updated.get(id)) else {
+                return true;
+            };
+            if !replaced.insert(t.id.clone()) {
+                return false;
+            }
+            *v = serde_json::to_value(t).expect("serializable theme");
+            true
+        });
+        self.stored.extend(
+            self.added
+                .iter()
+                .map(|t| serde_json::to_value(t).expect("serializable theme")),
+        );
+        Value::Array(self.stored)
+    }
+}
 pub(super) fn versioned_copy(
     doc: &ClientSettingsDoc,
     theme: &ThemeDefinition,
     preferred: Option<&str>,
 ) -> Result<ThemeDefinition, String> {
     let existing = library(doc);
-    let available = |t: &ThemeDefinition| !existing.iter().any(|e| e.id == t.id);
-    if let Some(name) = preferred.filter(|n| n.to_lowercase() != theme.label.to_lowercase()) {
+    copy_with_ids(theme, preferred, |id| existing.iter().any(|t| t.id == id))
+}
+fn copy_with_ids(
+    theme: &ThemeDefinition,
+    preferred: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<ThemeDefinition, String> {
+    if let Some(name) =
+        preferred.filter(|n| !n.is_empty() && n.to_lowercase() != theme.label.to_lowercase())
+    {
         let candidate = rename(theme, name)?;
-        if available(&candidate) {
+        if !exists(&candidate.id) {
             return Ok(candidate);
         }
     }
@@ -330,7 +415,7 @@ pub(super) fn versioned_copy(
                 suffix
             ),
         )?;
-        if available(&candidate) {
+        if !exists(&candidate.id) {
             return Ok(candidate);
         }
     }
@@ -479,14 +564,26 @@ mod session_tests {
                 ("Dusk.json".into(), Ok(source("Dusk"))),
                 ("broken.json".into(), Ok("{".into())),
             ]);
+            let existing_count = library(&doc).len();
+            super::super::STORED_DECODES.with(|n| n.set(0));
             let result = state.finish_batch(request, batch, &doc).unwrap();
+            assert!(
+                super::super::STORED_DECODES.with(|n| n.get()) <= existing_count,
+                "decode the existing library once per batch"
+            );
             assert!(!result.close);
             assert_eq!(result.installed.len(), 1);
             assert_eq!(state.conflicts.len(), 1);
             doc.apply_change(&crate::client_settings::ClientSettingChange::ThemeLibrary(
                 result.library.unwrap(),
             ));
+            let existing_count = library(&doc).len();
+            super::super::STORED_DECODES.with(|n| n.set(0));
             let resolved = state.resolve_conflicts(&doc, choice);
+            assert!(
+                super::super::STORED_DECODES.with(|n| n.get()) <= existing_count,
+                "decode the existing library once per conflict set"
+            );
             assert!(!resolved.close);
             assert_eq!(resolved.installed.len(), 1);
             assert!(state.error.as_ref().unwrap().starts_with("broken.json:"));
@@ -523,6 +620,11 @@ mod session_tests {
         let result = state.resolve_conflicts(&doc, ImportChoice::KeepBoth);
         assert!(result.close);
         assert_eq!(result.installed[0].label, "Night Soft");
+        state.file_name = Some(".json".into());
+        state.conflicts = vec![import(&source("Night")).unwrap()];
+        let result = state.resolve_conflicts(&doc, ImportChoice::KeepBoth);
+        assert!(result.close);
+        assert_eq!(result.installed[0].label, "Night (1)");
     }
     #[test]
     fn batch_collisions_pair_after_filename_resolution_and_stale_batch_cannot_install() {

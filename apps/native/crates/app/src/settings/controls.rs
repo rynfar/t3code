@@ -98,6 +98,7 @@ pub enum ButtonSize {
 #[derive(IntoElement)]
 pub struct Button {
     id: ElementId,
+    focus: Option<FocusHandle>,
     variant: ButtonVariant,
     size: ButtonSize,
     icon: Option<Icon>,
@@ -111,7 +112,12 @@ pub struct Button {
 
 impl Button {
     pub fn new(id: impl Into<ElementId>, variant: ButtonVariant, size: ButtonSize) -> Self {
-        Button { id: id.into(), variant, size, icon: None, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, on_click: None }
+        Button { id: id.into(), focus: None, variant, size, icon: None, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, on_click: None }
+    }
+
+    pub fn focus_handle(mut self, focus: FocusHandle) -> Self {
+        self.focus = Some(focus);
+        self
     }
 
     /// Spans the parent's width with its content centered (`w-full`), which a parent cannot set
@@ -158,7 +164,7 @@ impl RenderOnce for Button {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         // Focusable like a web button; GPUI turns Enter and Space on a focused element into a click.
-        let focus = (!self.disabled).then(|| focus_handle(&self.id, window, cx));
+        let focus = (!self.disabled).then(|| self.focus.unwrap_or_else(|| focus_handle(&self.id, window, cx)));
         let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         let (height, pad, radius, icon_size, square) = match self.size {
             ButtonSize::IconMicro => (20., 0., 4., 12., true),
