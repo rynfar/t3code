@@ -2,6 +2,7 @@
 //! `ThemeSettings.tsx`, `appearanceContrast.ts` and `index.css`.
 mod color;
 pub mod editor;
+pub mod importer;
 #[cfg(test)]
 mod tests;
 mod vivid;
@@ -487,23 +488,7 @@ pub fn resolve_import(doc: &ClientSettingsDoc, theme: &ThemeDefinition, choice: 
             });
             Ok(Value::Array(stored))
         }
-        ImportChoice::KeepBoth => {
-            for copy in 1..100 {
-                let suffix = format!(" ({copy})");
-                let label = format!("{}{}", theme.label.chars().take(48 - suffix.len()).collect::<String>(), suffix);
-                let candidate = ThemeDefinition { id: id_from_name(&label), label, collection: None, ..theme.clone() };
-                if !reserved(&candidate.id)
-                    && !doc
-                        .entries()
-                        .get(LIBRARY_KEY)
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| a.iter().any(|v| v.get("id").and_then(Value::as_str) == Some(&candidate.id)))
-                {
-                    return install(doc, &candidate);
-                }
-            }
-            Err(format!("Too many copies of \"{}\".", theme.label))
-        }
+        ImportChoice::KeepBoth => install(doc, &importer::versioned_copy(doc, theme, None)?),
     }
 }
 pub fn select_collection(doc: &ClientSettingsDoc, themes: &[ThemeDefinition]) -> serde_json::Map<String, Value> {

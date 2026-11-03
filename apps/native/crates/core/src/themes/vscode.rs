@@ -72,19 +72,7 @@ fn readable(colors: &Value, surface: &str, fallback: &str, keys: &[&str]) -> Str
 fn name(value: &Value) -> String {
     let s =
         ["displayName", "name"].iter().find_map(|k| value[*k].as_str().filter(|s| !s.trim().is_empty())).unwrap_or("VS Code theme").trim();
-    let human = if !s.contains(char::is_whitespace) && s.contains(['-', '_', '.']) {
-        s.split(['-', '_', '.'])
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let mut cs = s.chars();
-                cs.next().unwrap().to_uppercase().chain(cs).collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        s.into()
-    };
-    human.chars().take(48).collect()
+    super::importer::humanize(s).chars().take(48).collect()
 }
 pub(super) fn convert(v: &Value) -> Result<ThemeDefinition, String> {
     let colors = &v["colors"];

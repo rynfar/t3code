@@ -554,9 +554,24 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             cx.update(|cx|crate::theme_editor::verify_pending_exit_retired(&exit,cx))?;
         }
     }
+    if let Some(path)=std::env::var_os("T3_NATIVE_THEME_IMPORT_FIXTURE") {
+        pump(&mut cx,1.,|_|false);
+        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        cx.update_window(window,|_,window,cx|crate::settings::theme_import::fixture(value.clone(),window,cx)).map_err(|e|e.to_string())??;
+        pump(&mut cx,options.wait,|_|false);
+        if let Some(paths)=value["dropPaths"].as_array() {
+            let paths=gpui::ExternalPaths(paths.iter().filter_map(|p|p.as_str().map(PathBuf::from)).collect());
+            let position=point(px(value["dropPosition"][0].as_f64().unwrap_or(720.) as f32),px(value["dropPosition"][1].as_f64().unwrap_or(330.) as f32));
+            cx.simulate_event(window,gpui::FileDropEvent::Entered {position,paths});
+            cx.simulate_event(window,gpui::FileDropEvent::Submit {position});
+            pump(&mut cx,options.wait,|_|false);
+        }
+    }
     if let Some(path)=std::env::var_os("T3_NATIVE_THEME_REIMPORT_FIXTURE") {
         pump(&mut cx,1.,|_|false);
-        cx.update(|cx|crate::settings::reimport_theme_fixture(std::path::Path::new(&path),cx))?;
+        let json=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
+        cx.update_window(window,|_,window,cx|crate::settings::theme_import::fixture(serde_json::json!({"json":json,"submit":true}),window,cx)).map_err(|e|e.to_string())??;
+        pump(&mut cx,options.wait,|_|false);
     }
     if options.pull_requests || options.pull_request.is_some() {
         if let Some(number) = options.pull_request {

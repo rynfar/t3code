@@ -3,7 +3,7 @@
 //! Choices apply live through `crate::theme`; editing is hosted by `crate::theme_editor`.
 
 use gpui::{
-    App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, IntoElement, ParentElement, PathPromptOptions, Styled, Subscription,
+    App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, IntoElement, ParentElement, Styled, Subscription,
     Window, div, prelude::*, px,
 };
 use gpui_component::{h_flex, v_flex};
@@ -19,7 +19,7 @@ pub(super) struct AppearanceState {
     sliders: [Entity<SliderState>; 2],
     _subscriptions: Vec<Subscription>,
     removal: Option<ThemeDefinition>,
-    pending_import: Option<ThemeDefinition>,
+    pub(super) import: Option<Entity<super::theme_import::ThemeImportDialog>>,
     removal_ids: Vec<String>,
     variants: std::collections::BTreeMap<String, String>,
 }
@@ -55,7 +55,7 @@ impl AppearanceState {
             sliders,
             _subscriptions: subscriptions,
             removal: None,
-            pending_import: None,
+            import: None,
             removal_ids: Vec::new(),
             variants: std::collections::BTreeMap::new(),
         }
@@ -339,41 +339,10 @@ impl SettingsView {
                 ).child(
                     Button::new("import-theme", ButtonVariant::Outline, ButtonSize::Xs)
                         .label("Add theme")
-                        .on_click(cx.listener(|this, _, window, cx| this.pick_theme(window, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.open_theme_import(window, cx))),
                 )),
             )
             .child(grid)
-            .when_some(self.appearance_ui.pending_import.clone(), |this, pending| {
-                this.child(
-                    v_flex()
-                        .p(r(16.))
-                        .gap(r(12.))
-                        .child(section_title("Already installed"))
-                        .child(super::controls::muted_text(pending.label, cx))
-                        .child(
-                            h_flex()
-                                .gap(r(8.))
-                                .child(
-                                    Button::new("theme-update-existing", ButtonVariant::Default, ButtonSize::Sm)
-                                        .label("Update existing")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.resolve_theme_import(themes::ImportChoice::Update, cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("theme-keep-both", ButtonVariant::Outline, ButtonSize::Sm).label("Keep both").on_click(
-                                        cx.listener(|this, _, _, cx| this.resolve_theme_import(themes::ImportChoice::KeepBoth, cx)),
-                                    ),
-                                )
-                                .child(Button::new("theme-cancel-import", ButtonVariant::Ghost, ButtonSize::Sm).label("Cancel").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.appearance_ui.pending_import = None;
-                                        cx.notify();
-                                    }),
-                                )),
-                        ),
-                )
-            })
             .when_some(self.appearance_ui.removal.clone(), |this, target| {
                 let variants = custom
                     .iter()
@@ -553,59 +522,7 @@ impl SettingsView {
         })
         .detach();
     }
-    fn pick_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths =
-            cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Add theme".into()) });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    std::fs::metadata(&path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|m| {
-                            if m.len() > 256 * 1024 {
-                                Err("Theme files are only a few KB, so this one was not read (limit 256 KB).".to_owned())
-                            } else {
-                                std::fs::read_to_string(path).map_err(|e| e.to_string())
-                            }
-                        })
-                        .map_err(|e| e.to_string())
-                        .and_then(|s| themes::import(&s))
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(t) => this.install_theme(t, true, cx),
-                Err(e) => store::show_error(e, cx),
-            });
-        })
-        .detach();
-    }
-    pub(super) fn install_theme(&mut self, theme: ThemeDefinition, activate: bool, cx: &mut Context<Self>) {
-        if activate && theme::preferences(cx).custom.iter().any(|t| t.id == theme.id) {
-            self.appearance_ui.pending_import = Some(theme);
-            cx.notify();
-        } else {
-            import_theme(&self.state, theme, activate, cx);
-        }
-    }
-    fn resolve_theme_import(&mut self, choice: themes::ImportChoice, cx: &mut Context<Self>) {
-        if let Some(pending) = self.appearance_ui.pending_import.as_ref() {
-            match themes::resolve_import(store::client(cx), pending, choice) {
-                Ok(library) => {
-                    store::update_client(&self.state, ClientSettingChange::ThemeLibrary(library), cx);
-                    self.appearance_ui.pending_import = None;
-                }
-                Err(e) => store::show_error(e, cx),
-            }
-            cx.notify();
-        }
-    }
+
 }
 
 fn ring(color: Hsla) -> Vec<gpui::BoxShadow> {
@@ -672,6 +589,7 @@ fn wireframe(theme: &ThemePreference, mode: AppearanceMode, cx: &App) -> impl In
     }
 }
 
+#[cfg(feature="snapshot")]
 pub(super) fn import_theme(state: &Entity<crate::app_state::AppState>, theme: ThemeDefinition, activate: bool, cx: &mut App) {
     match themes::install(store::client(cx), &theme) {
         Ok(library) => {

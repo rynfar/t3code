@@ -26,3 +26,5 @@ pub mod updates;
 pub mod resource_telemetry;
 
 pub mod chatgpt;
+
+pub mod theme_import;
