@@ -1,6 +1,6 @@
 //! Thread notifications: `createThreadNotificationGate` from
 //! `apps/web/src/components/ThreadNotificationCoordinator.logic.ts`, the per-thread observation
-//! and titles of `ThreadNotificationCoordinator.tsx`, and the mode helpers and tag of
+//! and pending badge set of `ThreadNotificationCoordinator.tsx`, and the sound gate and tag of
 //! `apps/web/src/threadNotifications.ts`. The app presents what this decides.
 
 use std::collections::HashMap;
@@ -41,6 +41,56 @@ impl NotificationMode {
 
     pub fn has_desktop_notifications(self) -> bool {
         matches!(self, NotificationMode::Notifications | NotificationMode::NotificationsAndSound)
+    }
+}
+
+/// Rechecked after the sound loads; each sound has its own playback slot.
+pub fn should_play_notification_sound(mode: NotificationMode, is_playing: bool) -> bool {
+    mode.has_sound() && !is_playing
+}
+
+/// The coordinator's delivered OS notifications, keyed by tag so a thread counts once.
+#[derive(Debug, Default)]
+pub struct PendingNotifications {
+    pending: HashMap<String, String>,
+    applied_mode: Option<NotificationMode>,
+}
+
+impl PendingNotifications {
+    pub fn badge_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn track(&mut self, tag: String, thread_id: String) {
+        self.pending.insert(tag, thread_id);
+    }
+
+    /// Mode listeners are rebuilt on every mode change; focus and disconnect retire pending.
+    pub fn sync(&mut self, mode: NotificationMode, connected: bool, focused: bool) -> Vec<String> {
+        let changed = self.applied_mode != Some(mode);
+        self.applied_mode = Some(mode);
+        if changed || !connected || focused || !mode.has_desktop_notifications() {
+            self.clear()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn visit(&mut self, thread_id: &str) -> Vec<String> {
+        let mut retired = Vec::new();
+        self.pending.retain(|tag, thread| {
+            if thread == thread_id {
+                retired.push(tag.clone());
+                false
+            } else {
+                true
+            }
+        });
+        retired
+    }
+
+    pub fn clear(&mut self) -> Vec<String> {
+        self.pending.drain().map(|(tag, _)| tag).collect()
     }
 }
 
