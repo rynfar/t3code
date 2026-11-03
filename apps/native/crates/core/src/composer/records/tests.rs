@@ -256,17 +256,14 @@ fn media_only_message_copy_synthesizes_references_for_its_attachments() {
     let attachments = [
         json!({"type":"image","id":"server-a","name":"shot.png","mimeType":"image/png","sizeBytes":8}),
     ];
-    let (text, fragment) = copy_message(
-        "",
-        &[image.clone(), stale],
-        &attachments,
-        "env",
-        Some("thread"),
-        "message",
-    );
-    assert_eq!(text, reference(&image).unwrap());
-    assert_eq!(
-        decode_fragment(&fragment.unwrap()).unwrap()["records"],
-        json!([image])
-    );
+    for source in [String::new(), super::super::attachments::text_for_send("", true), super::super::attachments::text_for_send("Ultrathink:", true)] {
+        let (text, fragment) = copy_message(&source, &[image.clone(), stale.clone()], &attachments, "env", Some("thread"), "message");
+        assert_eq!(text, reference(&image).unwrap());
+        assert_eq!(decode_fragment(&fragment.unwrap()).unwrap()["records"], json!([image.clone()]));
+    }
+}
+
+#[test]
+fn ordinary_sent_text_bypasses_the_markdown_parser() {
+    assert!(sent_references_with("Ordinary user text without references", |_| panic!("plain text must bypass GFM")).is_empty());
 }

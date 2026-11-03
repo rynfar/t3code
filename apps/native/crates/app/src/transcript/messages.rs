@@ -81,16 +81,17 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         Some(t3_core::turn_item::TurnItemKind::UserMessage { context: Some(context), .. }) => context["records"].as_array().map(Vec::as_slice).unwrap_or_default(),
         _ => &[],
     };
-    let context_chips = super::context::chips(id, &text, records, context_item.as_ref(), env.state, env.ui, cx);
-    let display_text = if context_chips.is_some() { t3_core::composer::records::display_text(&text) } else { text.to_string() };
-    let collapsible = should_collapse_user_message(&display_text);
+    let presentation = markdown.user_context(id, &text);
+    let context_chips = super::context::chips(id, &presentation, records, context_item.as_ref(), env.state, env.ui, cx);
+    let display_text = presentation.display_text.as_ref();
+    let collapsible = should_collapse_user_message(display_text);
     let expanded = env.ui.expanded_messages.contains(id);
     let collapsed = collapsible && !expanded;
     let surface = hsla(if attribution == Some(Attribution::Guest) { p.guest_surface } else { p.message_surface });
     let body = if display_text.trim().is_empty() {
         None
     } else {
-        let source: Arc<str> = Arc::from(with_line_breaks(&display_text));
+        let source: Arc<str> = Arc::from(with_line_breaks(display_text));
         let state = markdown.state(&format!("user:{id}"), &source, cx);
         Some(markdown_view(&state, cx))
     };

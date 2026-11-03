@@ -219,10 +219,32 @@ pub fn import_fragment(
 
 pub fn import_records(
     markdown: &str,
+    selected: Vec<Value>,
+    held: &mut Vec<Value>,
+    environment: &str,
+    source: &str,
+    fresh: impl FnMut() -> String,
+) -> Option<String> {
+    import_records_with(markdown, selected, held, environment, source, false, fresh)
+}
+
+pub fn import_copied_records(
+    markdown: &str,
+    selected: Vec<Value>,
+    held: &mut Vec<Value>,
+    environment: &str,
+    fresh: impl FnMut() -> String,
+) -> Option<String> {
+    import_records_with(markdown, selected, held, environment, environment, true, fresh)
+}
+
+fn import_records_with(
+    markdown: &str,
     mut selected: Vec<Value>,
     held: &mut Vec<Value>,
     environment: &str,
     source: &str,
+    copy_attachments: bool,
     mut fresh: impl FnMut() -> String,
 ) -> Option<String> {
     selected.sort_by_key(|r| field(r, "kind") != "preview-annotation");
@@ -249,6 +271,7 @@ pub fn import_records(
             .find(|r| field(r, "contextId") == canonical || field(r, "contextId") == original);
         if let Some(existing) = existing
             && same_payload(existing, &record)
+            && !(copy_attachments && matches!(kind.as_str(), "image" | "file"))
         {
             if kind == "preview-annotation"
                 && let Some(screenshot) = record.get("screenshotContextId").and_then(Value::as_str)
@@ -258,7 +281,8 @@ pub fn import_records(
             rewrites.insert(original, field(existing, "contextId").to_owned());
             continue;
         }
-        let reminted = existing.is_some() && !matches!(kind.as_str(), "thread" | "environment");
+        let reminted = (copy_attachments && matches!(kind.as_str(), "image" | "file"))
+            || (existing.is_some() && !matches!(kind.as_str(), "thread" | "environment"));
         let id = if reminted {
             kind_scoped_context_id(&kind, &fresh())
         } else {
@@ -389,6 +413,11 @@ pub fn environment_items<'a>(
 }
 
 pub fn sent_references(text: &str) -> Vec<super::menu::ContextReference<'_>> {
+    sent_references_with(text, |text| markdown::to_mdast(text, &markdown::ParseOptions::gfm()).ok())
+}
+
+fn sent_references_with<'a>(text: &'a str, parse: impl FnOnce(&str) -> Option<markdown::mdast::Node>) -> Vec<super::menu::ContextReference<'a>> {
+    if !text.contains("](t3-context://v1/") { return Vec::new(); }
     fn visit<'a>(
         node: &markdown::mdast::Node,
         text: &'a str,
@@ -415,34 +444,53 @@ pub fn sent_references(text: &str) -> Vec<super::menu::ContextReference<'_>> {
         }
     }
     let mut found = Vec::new();
-    if let Ok(root) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
+    if let Some(root) = parse(text) {
         visit(&root, text, &mut found);
     }
     found.sort_by_key(|r| r.start);
     found
 }
 
-pub fn presentation_records<'a>(
-    text: &str,
-    records: &'a [Value],
-) -> Vec<std::borrow::Cow<'a, Value>> {
-    use std::borrow::Cow;
-    let mut linked: Vec<Cow<'a, Value>> = Vec::new();
-    for r in sent_references(text) {
-        if linked.iter().any(|v| field(v, "contextId") == r.context_id) {
-            continue;
-        }
-        linked.push(records.iter().find(|v|field(v,"contextId")==r.context_id && field(v,"kind")==r.kind).map(Cow::Borrowed).unwrap_or_else(||Cow::Owned(json!({"version":1,"kind":"unresolved","contextId":r.context_id,"label":r.label}))));
+pub struct SentPresentation {
+    pub display_text: std::sync::Arc<str>,
+    references: Vec<SentReference>,
+}
+struct SentReference {
+    kind: String,
+    context_id: String,
+    label: String,
+}
+impl SentPresentation {
+    pub fn new(text: &std::sync::Arc<str>) -> Self {
+        let occurrences = sent_references(text);
+        let display_text = if occurrences.is_empty() {
+            text.clone()
+        } else {
+            let mut display = text.to_string();
+            for r in occurrences.iter().rev() {
+                display.replace_range(r.start..r.end, if r.kind == "image" { "" } else { r.label });
+            }
+            display.into()
+        };
+        Self { display_text, references: occurrences.into_iter().map(|r| SentReference {kind:r.kind.into(),context_id:r.context_id.into(),label:r.label.into()}).collect() }
     }
-    linked
+    pub fn records<'a>(&self, records: &'a [Value]) -> Vec<std::borrow::Cow<'a, Value>> {
+        use std::borrow::Cow;
+        let mut linked:Vec<Cow<'a,Value>>=Vec::new();
+        for r in &self.references {
+            if linked.iter().any(|v| field(v,"contextId")==r.context_id) {continue;}
+            linked.push(records.iter().find(|v|field(v,"contextId")==r.context_id && field(v,"kind")==r.kind).map(Cow::Borrowed).unwrap_or_else(||Cow::Owned(json!({"version":1,"kind":"unresolved","contextId":r.context_id,"label":r.label}))));
+        }
+        linked
+    }
+}
+
+pub fn presentation_records<'a>(text: &str, records: &'a [Value]) -> Vec<std::borrow::Cow<'a, Value>> {
+    SentPresentation::new(&std::sync::Arc::from(text)).records(records)
 }
 
 pub fn display_text(text: &str) -> String {
-    let mut display = text.to_owned();
-    for r in sent_references(text).into_iter().rev() {
-        display.replace_range(r.start..r.end, if r.kind == "image" { "" } else { r.label });
-    }
-    display
+    SentPresentation::new(&std::sync::Arc::from(text)).display_text.to_string()
 }
 
 fn uri_component(text: &str) -> String {
@@ -501,6 +549,11 @@ pub fn copy_message(
     thread: Option<&str>,
     message: &str,
 ) -> (String, Option<String>) {
+    let text = if !attachments.is_empty() && super::attachments::is_attachment_only_prompt(text) {
+        ""
+    } else {
+        text
+    };
     let media: Vec<Value> = if text.is_empty() {
         records
             .iter()

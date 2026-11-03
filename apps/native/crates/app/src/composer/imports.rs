@@ -30,7 +30,14 @@ pub(super) fn prepare(
     fresh: impl FnMut() -> String,
 ) -> Option<ImportPlan> {
     let mut held = existing.to_vec();
-    let text = records::import_records(text, incoming, &mut held, environment, environment, fresh)?;
+    let text = match mode {
+        ImportMode::Copy => {
+            records::import_copied_records(text, incoming, &mut held, environment, fresh)
+        }
+        ImportMode::Move => {
+            records::import_records(text, incoming, &mut held, environment, environment, fresh)
+        }
+    }?;
     let mut records = Vec::new();
     let mut reviews = Vec::new();
     let mut attachments = Vec::new();
@@ -87,6 +94,52 @@ mod tests {
         assert_eq!(plan.attachments[0].attachment.upload, Upload::Uploading);
         assert!(plan.attachments[0].attachment.attachment_id().is_none());
         assert_eq!(plan.attachments[0].source.as_deref(), Some("source-upload"));
+    }
+    #[test]
+    fn overlapping_attachment_copies_have_independent_local_ids() {
+        let record = image();
+        let text = records::reference(&record).unwrap();
+        let mut staged: Vec<ImportedAttachment> = Vec::new();
+        for id in ["copy-one", "copy-two"] {
+            let held = staged
+                .iter()
+                .filter_map(|a| a.attachment.context_record())
+                .collect::<Vec<_>>();
+            let plan = prepare(
+                &text,
+                vec![record.clone()],
+                &held,
+                "env",
+                ImportMode::Copy,
+                || id.into(),
+            )
+            .unwrap();
+            let attachment = &plan.attachments[0].attachment;
+            assert!(!staged.iter().any(|a| a.attachment.id == attachment.id));
+            assert_eq!(
+                plan.text,
+                format!(
+                    "![shot.png](t3-context://v1/image/{})",
+                    attachment.context_id()
+                )
+            );
+            staged.extend(plan.attachments);
+        }
+        for id in ["copy-one", "copy-two"] {
+            staged
+                .iter_mut()
+                .find(|a| a.attachment.id == id)
+                .unwrap()
+                .attachment
+                .upload = Upload::Ready {
+                attachment_id: format!("upload-{id}"),
+            };
+        }
+        assert!(
+            staged
+                .iter()
+                .all(|a| a.attachment.attachment_id().is_some())
+        );
     }
     #[test]
     fn stash_restore_preserves_both_colliding_payloads_and_rewrites_the_prompt() {

@@ -52,9 +52,16 @@ fn has_image_syntax(text: &str) -> bool {
     text.contains("![")
 }
 
+struct CachedContext {
+    text: Arc<str>,
+    presentation: Arc<t3_core::composer::records::SentPresentation>,
+    drawn: u64,
+}
+
 /// Markdown states keyed by the row that shows them, created lazily when a row renders.
 pub struct MarkdownStore {
     states: HashMap<String, Cached>,
+    contexts: HashMap<String, CachedContext>,
     frame: u64,
     owner: EntityId,
 }
@@ -63,7 +70,7 @@ impl MarkdownStore {
     /// `owner` is the view rendering these states. It is drawn `.cached()`, and a state's
     /// background reparse notifies only the state, so each state re-notifies the owner.
     pub fn new(owner: EntityId) -> Self {
-        Self { states: HashMap::new(), frame: 0, owner }
+        Self { states: HashMap::new(), contexts: HashMap::new(), frame: 0, owner }
     }
 
     /// Called once per transcript render, before rows draw.
@@ -72,6 +79,10 @@ impl MarkdownStore {
         if self.states.len() > SOFT_LIMIT {
             let frame = self.frame;
             self.states.retain(|_, cached| cached.drawn + KEEP_FRAMES >= frame);
+        }
+        if self.contexts.len() > SOFT_LIMIT {
+            let frame = self.frame;
+            self.contexts.retain(|_, cached| cached.drawn + KEEP_FRAMES >= frame);
         }
     }
 
@@ -98,8 +109,21 @@ impl MarkdownStore {
         MarkdownState { entity: state, media }
     }
 
+    pub fn user_context(&mut self, key: &str, text: &Arc<str>) -> Arc<t3_core::composer::records::SentPresentation> {
+        if let Some(cached) = self.contexts.get_mut(key)
+            && (Arc::ptr_eq(&cached.text, text) || *cached.text == **text)
+        {
+            cached.drawn = self.frame;
+            return cached.presentation.clone();
+        }
+        let presentation = Arc::new(t3_core::composer::records::SentPresentation::new(text));
+        self.contexts.insert(key.into(), CachedContext { text: text.clone(), presentation: presentation.clone(), drawn: self.frame });
+        presentation
+    }
+
     pub fn clear(&mut self) {
         self.states.clear();
+        self.contexts.clear();
     }
 }
 
@@ -181,4 +205,34 @@ pub fn prose(state: &MarkdownState, cx: &App) -> impl IntoElement {
         .font_weight(FontWeight::NORMAL)
         .text_color(hsla(palette(cx).foreground).opacity(0.9))
         .child(markdown_view(state, cx))
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    #[test]
+    fn user_rows_reuse_context_parsing_across_renders_and_refresh_record_payloads() {
+        let mut store=MarkdownStore::new(EntityId::from(1u64));
+        let source:Arc<str>="Use [Mac](t3-context://v1/environment/environment_mac) and `[Mac](t3-context://v1/environment/environment_mac)`".into();
+        let first=store.user_context("user:1",&source);
+        store.begin_frame();
+        let same_text:Arc<str>=source.to_string().into();
+        let again=store.user_context("user:1",&same_text);
+        assert!(Arc::ptr_eq(&first,&again));
+        assert_eq!(&*first.display_text,"Use Mac and `[Mac](t3-context://v1/environment/environment_mac)`");
+        let record=t3_core::composer::records::environment_record("mac","New title");
+        assert_eq!(again.records(&[record])[0]["label"],"New title");
+        let changed:Arc<str>="Plain message".into();
+        let replaced=store.user_context("user:1",&changed);
+        assert!(!Arc::ptr_eq(&first,&replaced));
+        assert!(Arc::ptr_eq(&changed,&replaced.display_text));
+        store.clear();
+        let reset=store.user_context("user:1",&changed);
+        assert!(!Arc::ptr_eq(&replaced,&reset));
+        let kept=store.user_context("keep",&changed);
+        for n in 0..SOFT_LIMIT { store.user_context(&n.to_string(),&changed); }
+        for _ in 0..=KEEP_FRAMES { store.begin_frame(); store.user_context("keep",&changed); }
+        assert!(Arc::ptr_eq(&kept,&store.user_context("keep",&changed)));
+        assert!(!Arc::ptr_eq(&reset,&store.user_context("user:1",&changed)));
+    }
 }

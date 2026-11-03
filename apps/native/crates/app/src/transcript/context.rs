@@ -9,14 +9,14 @@ use t3_core::composer::records;
 
 pub(super) fn chips(
     message_id: &str,
-    text: &str,
+    presentation: &records::SentPresentation,
     all: &[Value],
     source: Option<&std::sync::Arc<t3_core::turn_item::TurnItem>>,
     state: &gpui::Entity<crate::app_state::AppState>,
     ui: &super::TranscriptUi,
     cx: &mut Context<ThreadView>,
 ) -> Option<AnyElement> {
-    let linked = records::presentation_records(text, all);
+    let linked = presentation.records(all);
     if linked.is_empty() {
         return None;
     }
