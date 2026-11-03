@@ -46,6 +46,43 @@ fn kinds(notifications: &[ThreadNotification]) -> Vec<(&str, &str)> {
 }
 
 #[test]
+fn sound_modes_recheck_the_current_mode_and_coalesce_playback() {
+    for mode in [NotificationMode::Off, NotificationMode::Notifications, NotificationMode::Sound, NotificationMode::NotificationsAndSound] {
+        assert_eq!(should_play_notification_sound(mode, false), mode.has_sound());
+        assert!(!should_play_notification_sound(mode, true));
+    }
+}
+
+#[test]
+fn badge_counts_pending_threads_and_retires_on_visit_focus_mode_or_disconnect() {
+    let mut pending = PendingNotifications::default();
+    let mode = NotificationMode::NotificationsAndSound;
+    assert!(pending.sync(mode, true, false).is_empty());
+    pending.track("tag-a".into(), "a".into());
+    pending.track("tag-a".into(), "a".into());
+    pending.track("tag-b".into(), "b".into());
+    assert_eq!(pending.badge_count(), 2, "replacing a thread's notification does not increment");
+    assert!(pending.sync(mode, true, false).is_empty());
+    assert!(pending.visit("unrelated").is_empty());
+    assert_eq!(pending.visit("a"), ["tag-a"]);
+    assert_eq!(pending.badge_count(), 1);
+    assert_eq!(pending.sync(mode, true, true), ["tag-b"]);
+    assert_eq!(pending.badge_count(), 0);
+
+    for (next_mode, connected) in [(NotificationMode::Off, true), (NotificationMode::Sound, true), (NotificationMode::Notifications, true), (mode, false)] {
+        pending.sync(mode, true, false);
+        pending.track("tag-a".into(), "a".into());
+        assert_eq!(pending.sync(next_mode, connected, false), ["tag-a"]);
+        assert_eq!(pending.badge_count(), 0);
+        assert!(pending.sync(next_mode, connected, false).is_empty());
+    }
+    pending.sync(mode, true, false);
+    pending.track("tag-a".into(), "a".into());
+    assert_eq!(pending.clear(), ["tag-a"]);
+    assert_eq!(pending.badge_count(), 0);
+}
+
+#[test]
 fn transitions_notify_and_first_sightings_do_not() {
     let mut watcher = Watched::default();
     let completed = json!({"latestRunCompletedAt": "2026-11-01T00:05:00.000Z"});

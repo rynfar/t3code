@@ -88,6 +88,9 @@ pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: 
     let typography = terminal::typography(prefs.doc.entries());
     state.update(cx, |state, cx| {
         state.client_settings = composer;
+        if matches!(change, ClientSettingChange::NotificationMode(_) | ClientSettingChange::InAppNotifications(_)) {
+            state.observe_notifications(cx);
+        }
         if matches!(change, ClientSettingChange::DiffLayout(_) | ClientSettingChange::DiffFilesCollapsed(_) | ClientSettingChange::DiffIgnoreWhitespace(_)) {
             cx.emit(AppEvent::RightPanel);
         }

@@ -179,7 +179,10 @@ impl AppState {
             _ssh_quit: None,
         };
         // Quitting stops the tunnels this app started, by the PIDs it spawned.
-        state._ssh_quit = Some(cx.on_app_quit(|state, _| state.ssh.shutdown()));
+        state._ssh_quit = Some(cx.on_app_quit(|state, cx| {
+            state.clear_pending_notifications(cx);
+            state.ssh.shutdown()
+        }));
         match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
             Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
@@ -196,6 +199,7 @@ impl AppState {
 
     /// Drops the client and everything that belonged to its environment.
     pub(crate) fn clear_connection_state(&mut self, cx: &mut Context<Self>) {
+        self.clear_pending_notifications(cx);
         self.client = None;
         self.shell = ShellState::default();
         let collapsed = self.sidebar.collapsed;
@@ -361,6 +365,7 @@ impl AppState {
     pub(crate) fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
         if self.phase != phase {
             self.phase = phase;
+            self.sync_notification_state(cx);
             cx.emit(AppEvent::Phase);
             // Connection state places threads on the Working shelf.
             if self.shell.snapshot.is_some() {
@@ -376,6 +381,7 @@ impl AppState {
             self.clear_selection(cx);
             return;
         }
+        self.retire_thread_notifications(thread_id, cx);
         if self.selected_thread.as_deref() == Some(thread_id) {
             return self.set_pull_requests_open(false, cx);
         }
