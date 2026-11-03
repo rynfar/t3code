@@ -117,7 +117,9 @@ impl ThreadView {
         let viewer = cx.new(crate::media::MediaViewer::new);
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
         let owner = cx.entity().downgrade();
+        let citation_window = _window.window_handle().window_id();
         let citation_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle().window_id() != citation_window { return; }
             let _ = owner.update(cx, |this, cx| this.citation_key(&event.keystroke, window, cx));
         });
         let mut subscriptions = vec![subscription, citation_keys];

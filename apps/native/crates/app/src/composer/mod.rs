@@ -574,6 +574,7 @@ impl Composer {
     }
 
     fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_citation_comment("prompt-replaced", window, cx);
         self.has_text = !text.trim().is_empty();
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
     }

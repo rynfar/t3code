@@ -14,14 +14,11 @@ use crate::{
 use gpui::{AnyElement, Context, Entity, IntoElement, ParentElement, Styled, Subscription, Window, div, prelude::*, px};
 use gpui_component::input::{Escape, InputEvent, Textarea, TextareaState};
 use gpui_component::{h_flex, v_flex};
-use t3_core::assistant_citations::{self as rules, Citation, CommentDismissal};
+use t3_core::assistant_citations::{self as rules, Citation, CommentAnchor, CommentSettlement};
 
 pub(super) struct CommentEditor {
-    source: String,
-    start: usize,
-    citation: Citation,
+    anchor: CommentAnchor,
     input: Entity<TextareaState>,
-    remove_on_cancel: Option<bool>,
     _subscription: Subscription,
 }
 
@@ -34,24 +31,27 @@ impl Composer {
             return;
         }
         let prompt = self.prompt(cx);
-        let cursor = self.input.read(cx).selected_range();
-        let leading = if cursor.start > 0 && !prompt[..cursor.start].ends_with(char::is_whitespace) { " " } else { "" };
-        let source = citation.serialize();
-        self.input.update(cx, |input, cx| input.replace(format!("{leading}{source} "), window, cx));
-        self.draft_changed(cx);
-        self.open_citation_comment(citation, cursor.start + leading.len(), window, cx);
-        if let Some(editor) = self.citation_editor.as_mut() {
-            editor.remove_on_cancel = Some(!leading.is_empty());
-        }
+        let selected = self.input.read(cx).selected_range();
+        let (edit, anchor) = rules::insert_citation(&prompt, selected, citation);
+        self.apply_citation_edit(edit, window, cx);
+        self.open_citation_comment(anchor, window, cx);
     }
 
-    fn open_citation_comment(&mut self, citation: Citation, start: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.close_citation_comment("outside-press", window, cx) {
+    fn apply_citation_edit(&mut self, edit: rules::PromptEdit, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_selected_range(edit.range, cx);
+            input.replace(edit.text, window, cx);
+        });
+        self.draft_changed(cx);
+    }
+
+    fn open_citation_comment(&mut self, anchor: CommentAnchor, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.close_citation_comment("outside-press", window, cx) || anchor.link.replace(&self.prompt(cx), String::new()).is_none() {
             return;
         }
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Add an optional comment...").submit_on_enter(true));
         input.update(cx, |input, cx| {
-            input.set_value(citation.comment.as_deref().unwrap_or_default(), window, cx);
+            input.set_value(anchor.link.citation.comment.as_deref().unwrap_or_default(), window, cx);
             input.focus(window, cx);
         });
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
@@ -64,52 +64,20 @@ impl Composer {
             InputEvent::Blur => { this.close_citation_comment("focus-out", window, cx); },
             _ => {}
         });
-        self.citation_editor = Some(CommentEditor { source: citation.serialize(), start, citation, input, remove_on_cancel: None, _subscription: subscription });
+        self.citation_editor = Some(CommentEditor { anchor, input, _subscription: subscription });
         cx.notify();
     }
 
     pub(super) fn close_citation_comment(&mut self, reason: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(editor) = &self.citation_editor else {
-            return true;
-        };
-        if reason == "escape-key"
-            && let Some(before) = editor.remove_on_cancel
-        {
-            let prompt = self.prompt(cx);
-            if prompt.get(editor.start..editor.start + editor.source.len()) == Some(editor.source.as_str()) {
-                let start = editor.start;
-                let end = start + editor.source.len();
-                let from = if before && prompt[..start].ends_with(' ') { start - 1 } else { start };
-                let to = if prompt[end..].starts_with(' ') { end + 1 } else { end };
-                self.input.update(cx, |input, cx| {
-                    input.set_selected_range(from..to, cx);
-                    input.replace("", window, cx);
-                });
-                self.draft_changed(cx);
-            }
-            self.citation_editor = None;
-            self.focus(window, cx);
-            cx.notify();
-            return true;
-        }
+        let Some(editor) = &self.citation_editor else { return true };
         let draft = editor.input.read(cx).value().to_string();
-        match rules::dismiss_comment(reason, Some(&draft), editor.citation.comment.as_deref()) {
-            CommentDismissal::KeepOpen => return false,
-            CommentDismissal::Commit(comment) => {
-                let source = editor.source.clone();
-                let replacement = editor.citation.with_comment(&comment).serialize();
-                let prompt = self.prompt(cx);
-                let start = editor.start;
-                if prompt.get(start..start + source.len()) != Some(source.as_str()) { return false; }
-                self.input.update(cx, |input, cx| {
-                    input.set_selected_range(start..start + source.len(), cx);
-                    input.replace(replacement, window, cx);
-                });
-                self.draft_changed(cx);
+        match editor.anchor.dismiss(&self.prompt(cx), &draft, reason) {
+            CommentSettlement::KeepOpen => return false,
+            CommentSettlement::Close(edit) => {
+                self.citation_editor = None;
+                if let Some(edit) = edit { self.apply_citation_edit(edit, window, cx); }
             }
-            CommentDismissal::Close => {}
         }
-        self.citation_editor = None;
         if reason == "save" || reason == "escape-key" { self.focus(window, cx); }
         cx.notify();
         true
@@ -119,7 +87,8 @@ impl Composer {
         if self.answering.is_some() || self.editing_queued().is_some() {
             return None;
         }
-        let citations = rules::collect(&self.prompt(cx));
+        let prompt = self.prompt(cx);
+        let citations = rules::collect(&prompt);
         if citations.is_empty() {
             return None;
         }
@@ -132,12 +101,11 @@ impl Composer {
                 .gap(px(12.))
                 .mb(px(8.))
                 .children(citations.into_iter().enumerate().map(|(i, (range, citation))| {
-                    let start = range.start;
-                    let source = citation.serialize();
+                    let link = rules::CitationLink::from_match(&prompt, range, citation.clone());
                     let go = citation.clone();
-                    let edit = citation.clone();
-                    let remove = source.clone();
-                    let open = self.citation_editor.as_ref().is_some_and(|editor| editor.source == source && editor.start == start);
+                    let edit = CommentAnchor { link: link.clone(), inserted_spaces: None };
+                    let remove = link.clone();
+                    let open = self.citation_editor.as_ref().is_some_and(|editor| editor.anchor.link == link);
                     div()
                         .relative()
                         .child(
@@ -163,7 +131,7 @@ impl Composer {
                                         .cursor_pointer()
                                         .rounded(px(4.))
                                         .hover(|s| s.bg(color.opacity(0.17)))
-                                        .on_click(cx.listener(move |this, _, window, cx| this.open_citation_comment(edit.clone(), start, window, cx)))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.open_citation_comment(edit.clone(), window, cx)))
                                         .child(Icon::Pencil.render(px(12.), color)),
                                 )
                                 .child(
@@ -176,12 +144,8 @@ impl Composer {
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.citation_editor = None;
                                             let prompt = this.prompt(cx);
-                                            if prompt.get(start..start + remove.len()) == Some(remove.as_str()) {
-                                                this.input.update(cx, |input, cx| {
-                                                    input.set_selected_range(start..start + remove.len(), cx);
-                                                    input.replace("", window, cx);
-                                                });
-                                                this.draft_changed(cx);
+                                            if let Some(edit) = remove.replace(&prompt, String::new()) {
+                                                this.apply_citation_edit(edit, window, cx);
                                                 this.focus(window, cx);
                                                 cx.notify();
                                             }

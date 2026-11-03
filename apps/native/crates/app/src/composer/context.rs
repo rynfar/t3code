@@ -172,7 +172,7 @@ impl Composer {
     /// Repaints only when the prompt's links change; called on every edit.
     pub(super) fn sync_context_chips(&mut self, text: &str, cx: &mut Context<Self>) {
         let linked: Vec<String> = context_references(text).into_iter().map(|reference| reference.context_id.to_owned())
-            .chain(t3_core::assistant_citations::collect(text).into_iter().map(|(_, citation)| citation.serialize())).collect();
+            .chain(t3_core::assistant_citations::collect(text).into_iter().map(|(range, _)| format!("{}:{}", range.start, &text[range.clone()]))).collect();
         if linked != self.context.linked {
             if self.context.open.as_ref().is_some_and(|open| !linked.contains(open)) {
                 self.context.open = None;

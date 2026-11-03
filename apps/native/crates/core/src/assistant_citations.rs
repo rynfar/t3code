@@ -1,5 +1,6 @@
 //! Assistant quotes: `shared/assistantCitations.ts`, `lib/assistantTextSelection.ts`,
-//! `chat/citationProcedure.ts` and `chat/assistantCitationCommentDismissal.ts`.
+//! `chat/citationProcedure.ts`, `chat/assistantCitationCommentDismissal.ts`, and the composer
+//! edits/lifetimes in `ChatComposer.tsx` and `ComposerPromptEditorTiptap.tsx`.
 
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -110,6 +111,87 @@ impl Citation {
             comment: None,
         })
     }
+
+    pub fn from_rendered_selection(environment: String, thread: String, message: String, source: &str, quote: &str) -> Option<Self> {
+        let quote = quote.trim_end();
+        let range = unique_quote_range(source, quote)?;
+        let mut citation = Self::from_selection(environment, thread, message, source, range)?;
+        citation.text = quote.chars().take(MAX_TEXT + 1).collect();
+        Some(citation)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptEdit {
+    pub range: Range<usize>,
+    pub text: String,
+}
+#[cfg(test)]
+impl PromptEdit {
+    fn apply(&self, prompt: &str) -> String {
+        format!("{}{}{}", &prompt[..self.range.start], self.text, &prompt[self.range.end..])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitationLink {
+    pub start: usize,
+    pub source: String,
+    pub citation: Citation,
+}
+impl CitationLink {
+    pub fn from_match(prompt: &str, range: Range<usize>, citation: Citation) -> Self {
+        Self { start: range.start, source: prompt[range].to_owned(), citation }
+    }
+    pub fn replace(&self, prompt: &str, text: String) -> Option<PromptEdit> {
+        let range = self.start..self.start + self.source.len();
+        (prompt.get(range.clone()) == Some(self.source.as_str())).then_some(PromptEdit { range, text })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertedSpaces {
+    pub before: bool,
+    pub after: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentAnchor {
+    pub link: CitationLink,
+    pub inserted_spaces: Option<InsertedSpaces>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommentSettlement {
+    Close(Option<PromptEdit>),
+    KeepOpen,
+}
+impl CommentAnchor {
+    pub fn dismiss(&self, prompt: &str, draft: &str, reason: &str) -> CommentSettlement {
+        if reason == "prompt-replaced" { return CommentSettlement::Close(None); }
+        if reason == "escape-key" && let Some(spaces) = self.inserted_spaces {
+            let edit = self.link.replace(prompt, String::new()).map(|mut edit| {
+                if spaces.before && prompt[..edit.range.start].ends_with(' ') { edit.range.start -= 1; }
+                if spaces.after && prompt[edit.range.end..].starts_with(' ') { edit.range.end += 1; }
+                edit
+            });
+            return CommentSettlement::Close(edit);
+        }
+        match dismiss_comment(reason, Some(draft), self.link.citation.comment.as_deref()) {
+            CommentDismissal::KeepOpen => CommentSettlement::KeepOpen,
+            CommentDismissal::Close => CommentSettlement::Close(None),
+            CommentDismissal::Commit(comment) => self.link.replace(prompt, self.link.citation.with_comment(&comment).serialize())
+                .map_or(CommentSettlement::KeepOpen, |edit| CommentSettlement::Close(Some(edit))),
+        }
+    }
+}
+
+pub fn insert_citation(prompt: &str, selected: Range<usize>, citation: Citation) -> (PromptEdit, CommentAnchor) {
+    let cursor = selected.end;
+    let before = cursor > 0 && !prompt[..cursor].ends_with(char::is_whitespace);
+    let after = !prompt[cursor..].starts_with(' ');
+    let source = citation.serialize();
+    let link = CitationLink { start: cursor + usize::from(before), source: source.clone(), citation };
+    (PromptEdit { range: cursor..cursor + usize::from(!after), text: format!("{}{source} ", if before { " " } else { "" }) },
+     CommentAnchor { link, inserted_spaces: Some(InsertedSpaces { before, after }) })
 }
 
 fn take_units(text: &str, limit: usize, tail: bool) -> String {
@@ -264,20 +346,38 @@ impl Failure {
     }
 }
 pub fn history_step(message: CitedMessage, more: bool, failed: bool, pages: usize, aborted: bool) -> HistoryAction {
-    if aborted {
-        HistoryAction::Aborted
-    } else if failed {
-        HistoryAction::Failed(Failure::Load)
-    } else {
-        match message {
-            CitedMessage::Assistant => HistoryAction::Found,
-            CitedMessage::Other => HistoryAction::Failed(Failure::NotAssistant),
-            CitedMessage::Missing if !more => HistoryAction::Failed(Failure::Unavailable),
-            CitedMessage::Missing if pages >= 20 => HistoryAction::Failed(Failure::Load),
-            _ => HistoryAction::Load,
-        }
+    if aborted { return HistoryAction::Aborted; }
+    match message {
+        CitedMessage::Assistant => HistoryAction::Found,
+        CitedMessage::Other => HistoryAction::Failed(Failure::NotAssistant),
+        CitedMessage::Missing if failed && pages > 0 => HistoryAction::Failed(Failure::Load),
+        CitedMessage::Missing if !more => HistoryAction::Failed(Failure::Unavailable),
+        CitedMessage::Missing if pages >= 20 => HistoryAction::Failed(Failure::Load),
+        CitedMessage::Missing => HistoryAction::Load,
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct CitationProcedure {
+    pages: usize,
+    active: bool,
+}
+impl Default for CitationProcedure {
+    fn default() -> Self { Self { pages: 0, active: true } }
+}
+impl CitationProcedure {
+    pub fn step(&mut self, message: CitedMessage, more: bool, failed: bool) -> HistoryAction {
+        let action = history_step(message, more, failed, self.pages, !self.active);
+        if action == HistoryAction::Load { self.pages += 1; } else { self.active = false; }
+        action
+    }
+    pub fn escape(&mut self, toolbar: bool) -> bool {
+        let dismissed = self.active || toolbar;
+        self.active = false;
+        dismissed
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CitationPhase {
     Loading,
@@ -332,7 +432,7 @@ pub fn markdown_text(source: &str) -> String {
 /// Refuse ambiguous offsets rather than attach a quote to a different occurrence.
 pub fn unique_quote_range(source: &str, quote: &str) -> Option<Range<usize>> {
     let normalized = normalize(source);
-    let quote = normalize(quote);
+    let quote = normalize(quote.trim_end());
     if quote.trim().is_empty() { return None; }
     let mut matches = normalized.match_indices(&quote);
     let (start, _) = matches.next()?;
@@ -413,5 +513,61 @@ mod tests {
         assert_eq!(markdown_text("# Hello **world**\n\n[A link](https://example.com) and `code`\n\n```rs\nlet x = 1;\n```"), "Hello world\nA link and code\nlet x = 1;");
         assert_eq!(unique_quote_range("same same", "same"), None);
         assert_eq!(unique_quote_range("first\nsecond", "first\n\nsecond"), Some(0..12));
+    }
+    #[test]
+    fn cite_and_cancel_preserve_the_retained_prompt_selection() {
+        for (prompt, selected) in [("keep these words", 0..10), ("α selected tail", 3..11), ("before selected tail", 7..15)] {
+            let (edit, anchor) = insert_citation(prompt, selected.clone(), citation());
+            let inserted = edit.apply(prompt);
+            assert!(inserted.contains(&prompt[..selected.end]));
+            let CommentSettlement::Close(Some(cancel)) = anchor.dismiss(&inserted, "draft", "escape-key") else { panic!("cancel must remove the new citation") };
+            assert_eq!(cancel.apply(&inserted), prompt);
+        }
+    }
+    #[test]
+    fn rendered_paragraph_newlines_do_not_hide_partial_or_final_selections() {
+        let source = markdown_text("An assistant says hello world");
+        for (quote, expected, range) in [("world\n", "world", 24..29), ("hel\n", "hel", 18..21), ("hello world\n ", "hello world", 18..29)] {
+            let c = Citation::from_rendered_selection("e".into(), "t".into(), "m".into(), &source, quote).unwrap();
+            assert_eq!((c.text.as_str(), c.start..c.end), (expected, range));
+            assert!(c.valid());
+        }
+    }
+    #[test]
+    fn prompt_replacement_retires_changed_or_overlength_comments() {
+        let link = CitationLink { start: 0, source: citation().serialize(), citation: citation() };
+        let anchor = CommentAnchor { link, inserted_spaces: None };
+        for draft in ["edited comment".to_owned(), "x".repeat(MAX_COMMENT + 1)] {
+            assert_eq!(anchor.dismiss("answer to the provider question", &draft, "prompt-replaced"), CommentSettlement::Close(None));
+        }
+    }
+    #[test]
+    fn loaded_citations_and_new_activations_ignore_an_old_page_error() {
+        let mut loaded = CitationProcedure::default();
+        assert_eq!(loaded.step(CitedMessage::Assistant, true, true), HistoryAction::Found);
+        let mut retry = CitationProcedure::default();
+        assert_eq!(retry.step(CitedMessage::Missing, true, true), HistoryAction::Load);
+        assert_eq!(retry.step(CitedMessage::Missing, true, true), HistoryAction::Failed(Failure::Load));
+    }
+    #[test]
+    fn noncanonical_links_keep_their_original_bytes_for_edits_and_removal() {
+        let raw = "[Assistant quote](t3-citation://v1/env/thread/message?suffix=&prefix=&end=11&start=0&text=hello%20world)";
+        let prompt = format!("before {raw} after {raw}");
+        let (range, citation) = collect(&prompt).pop().unwrap();
+        let link = CitationLink::from_match(&prompt, range.clone(), citation);
+        assert_eq!(link.source, raw);
+        let saved = link.replace(&prompt, link.citation.with_comment("updated").serialize()).unwrap().apply(&prompt);
+        assert!(saved.starts_with(&format!("before {raw} after ")));
+        assert_eq!(collect(&saved).last().unwrap().1.comment.as_deref(), Some("updated"));
+        assert_eq!(link.replace(&prompt, String::new()).unwrap().apply(&prompt), format!("before {raw} after "));
+        assert!(link.replace("a replaced prompt", String::new()).is_none());
+    }
+    #[test]
+    fn escape_cancels_paging_without_a_selection_toolbar() {
+        let mut procedure = CitationProcedure::default();
+        assert_eq!(procedure.step(CitedMessage::Missing, true, false), HistoryAction::Load);
+        assert!(procedure.escape(false));
+        assert_eq!(procedure.step(CitedMessage::Assistant, false, false), HistoryAction::Aborted);
+        assert_eq!(CitationProcedure::default().step(CitedMessage::Assistant, false, false), HistoryAction::Found);
     }
 }

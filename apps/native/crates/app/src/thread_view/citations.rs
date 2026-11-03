@@ -17,7 +17,7 @@ pub(super) struct CitationUi {
     selection: Option<(Citation, Point<Pixels>)>,
     focus: FocusHandle,
     pub(super) selection_focus: FocusHandle,
-    pending: Option<(Citation, usize)>,
+    pending: Option<(Citation, rules::CitationProcedure)>,
     pub(super) highlighted: Option<String>,
 }
 impl CitationUi {
@@ -49,14 +49,8 @@ impl ThreadView {
                     return;
                 }
                 let rendered = rules::markdown_text(&source);
-                let Some(range) = rules::unique_quote_range(&rendered, &quote) else {
-                    return;
-                };
                 let environment = this.state.read(cx).server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).unwrap_or_default();
-                let Some(mut citation) = Citation::from_selection(environment, thread.unwrap_or_default(), message, &rendered, range) else {
-                    return;
-                };
-                citation.text = quote.chars().take(rules::MAX_TEXT + 1).collect();
+                let Some(citation) = Citation::from_rendered_selection(environment, thread.unwrap_or_default(), message, &rendered, &quote) else { return };
                 this.citation_ui.selection = Some((citation, pointer));
                 window.focus(&this.citation_ui.selection_focus, cx);
                 cx.notify();
@@ -133,13 +127,13 @@ impl ThreadView {
         let request = self.state.read(cx).citation_source.clone();
         if let Some(citation) = request.filter(|c| self.thread_id.as_deref() == Some(&c.thread_id)) {
             self.state.update(cx, |state, _| state.citation_source = None);
-            self.citation_ui.pending = Some((citation, 0));
+            self.citation_ui.pending = Some((citation, rules::CitationProcedure::default()));
             self.advance_citation_source(cx);
         }
     }
 
     pub(super) fn advance_citation_source(&mut self, cx: &mut Context<Self>) {
-        let Some((citation, pages)) = self.citation_ui.pending.clone() else {
+        let Some((citation, mut procedure)) = self.citation_ui.pending.clone() else {
             return;
         };
         if self.thread_id.as_deref() != Some(&citation.thread_id) {
@@ -159,9 +153,9 @@ impl ThreadView {
             Some(_) => CitedMessage::Other,
             None => CitedMessage::Missing,
         };
-        match rules::history_step(message, thread.history.has_more_history && thread.history.history_cursor.is_some(), thread.history.error.is_some(), pages, false) {
+        match procedure.step(message, thread.history.has_more_history && thread.history.history_cursor.is_some(), thread.history.error.is_some()) {
             HistoryAction::Load => {
-                self.citation_ui.pending = Some((citation, pages + 1));
+                self.citation_ui.pending = Some((citation, procedure));
                 self.load_earlier(cx);
             }
             HistoryAction::Found => {
@@ -186,6 +180,11 @@ impl ThreadView {
     }
 
     pub(super) fn citation_key(&mut self, event: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        if event.key == "escape" && (self.citation_ui.pending.as_mut().is_some_and(|(_, procedure)| procedure.escape(false))
+            || self.citation_ui.highlighted.is_some()) {
+            self.dismiss_citation_selection(cx);
+            return;
+        }
         if self.citation_ui.selection.is_none()
             || !(self.citation_ui.selection_focus.is_focused(window) || self.citation_ui.focus.is_focused(window)) {
             return;
