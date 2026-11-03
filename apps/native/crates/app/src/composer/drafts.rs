@@ -132,6 +132,9 @@ impl Composer {
 
     fn schedule_draft_save(&mut self, target: &Target, cx: &mut Context<Self>) {
         if let Target::Draft(project_id) = target { cx.emit(DraftsChanged { project_id: project_id.clone() }); }
+        for key in self.drafts.store.take_pruned_keys() {
+            if let Some(project_id) = key.strip_prefix("draft:") { cx.emit(DraftsChanged { project_id: project_id.to_owned() }); }
+        }
         self.drafts.save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(rules::PERSIST_DEBOUNCE_MS)).await;
             let _ = this.update(cx, |this, _| store::save_ui_state(rules::STORE_NAME, &this.drafts.store.to_value()));

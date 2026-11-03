@@ -1,4 +1,5 @@
-//! Parent-aware tag visibility from `packages/client-runtime/src/state/threadTagFilter.ts`.
+//! Parent-aware tag visibility from `packages/client-runtime/src/state/threadTagFilter.ts`,
+//! with route guards from `apps/web/src/components/ThreadRouteView.tsx`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -98,9 +99,26 @@ pub fn visible_linked_threads<'a, Row>(
         .collect()
 }
 
-/// `ThreadRouteView.tsx`: hidden routes redirect home, including unknown off-shell threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteVisibility {
+    Visible,
+    Hidden,
+    Loading,
+}
+
+pub fn route_visibility(id: &str, loaded: bool, hidden: &HashSet<String>, hiding: bool) -> RouteVisibility {
+    if hidden.contains(id) {
+        RouteVisibility::Hidden
+    } else if hiding && !loaded {
+        RouteVisibility::Loading
+    } else {
+        RouteVisibility::Visible
+    }
+}
+
+/// Only a known visible thread can open a new route; an existing route waits while loading.
 pub fn route_visible(id: &str, loaded: bool, hidden: &HashSet<String>, hiding: bool) -> bool {
-    !hidden.contains(id) && (!hiding || loaded)
+    route_visibility(id, loaded, hidden, hiding) == RouteVisibility::Visible
 }
 
 #[cfg(test)]

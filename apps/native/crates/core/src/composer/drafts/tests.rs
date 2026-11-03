@@ -100,4 +100,24 @@ fn the_oldest_drafts_go_first() {
     assert_eq!(store.keys().count(), MAX_DRAFTS);
     assert!(store.get(&thread_key("0")).is_none());
     assert!(store.get(&thread_key(&MAX_DRAFTS.to_string())).is_some());
+    assert_eq!(store.take_pruned_keys(), [thread_key("0")]);
+    assert!(store.take_pruned_keys().is_empty());
+    for saved_key in [thread_key("fresh-thread"), new_thread_key("fresh-project")] {
+        let mut store = DraftStore::default();
+        store.set(&new_thread_key("old-project"), draft("old sidebar row", 1));
+        for index in 1..MAX_DRAFTS { store.set(&thread_key(&index.to_string()), draft("x", index as i64 + 1)); }
+        let mut rows = crate::sidebar::drafts::DraftRows::default();
+        rows.update(&store, None, None);
+        assert_eq!(rows.rows.len(), 1);
+        store.set(&saved_key, draft("new", MAX_DRAFTS as i64 + 1));
+        if let Some(project) = saved_key.strip_prefix("draft:") { rows.update_draft(&store, project, None); }
+        for key in store.take_pruned_keys() {
+            if let Some(project) = key.strip_prefix("draft:") { rows.update_draft(&store, project, None); }
+        }
+        assert!(!rows.rows.iter().any(|row| row.project_id == "old-project"), "pruning must invalidate a row even when another thread or project was saved");
+    }
+    let oversized = (0..MAX_DRAFTS + 2).map(|index| (new_thread_key(&index.to_string()), serde_json::to_value(draft("x", index as i64)).unwrap())).collect::<serde_json::Map<_, _>>();
+    let mut store = DraftStore::from_value(Some(&json!({"version":1,"drafts":oversized})));
+    store.set(&thread_key("new"), draft("new", MAX_DRAFTS as i64 + 2));
+    assert_eq!(store.take_pruned_keys(), [new_thread_key("0"), new_thread_key("1"), new_thread_key("2")]);
 }

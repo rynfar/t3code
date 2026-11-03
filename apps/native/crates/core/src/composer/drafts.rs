@@ -143,6 +143,7 @@ impl Draft {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftStore {
     drafts: BTreeMap<String, Draft>,
+    pruned_keys: Vec<String>,
 }
 
 impl DraftStore {
@@ -160,7 +161,7 @@ impl DraftStore {
                     .collect()
             })
             .unwrap_or_default();
-        DraftStore { drafts }
+        DraftStore { drafts, pruned_keys: Vec::new() }
     }
 
     pub fn to_value(&self) -> Value {
@@ -196,6 +197,8 @@ impl DraftStore {
         true
     }
 
+    pub fn take_pruned_keys(&mut self) -> Vec<String> { std::mem::take(&mut self.pruned_keys) }
+
     pub fn remove(&mut self, key: &str) -> bool {
         self.drafts.remove(key).is_some()
     }
@@ -204,6 +207,7 @@ impl DraftStore {
         while self.drafts.len() > MAX_DRAFTS {
             let Some(oldest) = self.drafts.iter().min_by_key(|(_, draft)| draft.updated_at).map(|(key, _)| key.clone()) else { break };
             self.drafts.remove(&oldest);
+            self.pruned_keys.push(oldest);
         }
     }
 }
