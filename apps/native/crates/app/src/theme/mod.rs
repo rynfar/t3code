@@ -64,6 +64,7 @@ struct ThemeState {
     preferences: Preferences,
     system_dark: bool,
     environment: Vec<ThemeDefinition>,
+    preview: Option<(bool, Palette)>,
 }
 
 impl Global for ThemeState {}
@@ -77,7 +78,7 @@ pub fn hsla(color: u32) -> Hsla {
 }
 
 pub fn init(cx: &mut App) {
-    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false, environment: Vec::new() });
+    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false, environment: Vec::new(), preview: None });
     cache_font_inventory(cx);
     install(cx);
 }
@@ -133,6 +134,7 @@ fn apply(appearance: WindowAppearance, window: &mut Window, cx: &mut App) {
 
 fn is_dark(cx: &App) -> bool {
     let state = cx.global::<ThemeState>();
+    if let Some((dark, _)) = state.preview { return dark; }
     let prefs = &state.preferences;
     themes::resolved_dark(&prefs.theme, &prefs.halves, themes::mode_dark(prefs.mode, state.system_dark), &prefs.custom, &state.environment)
 }
@@ -258,6 +260,9 @@ fn install(cx: &mut App) {
     let environment = &cx.global::<ThemeState>().environment;
     let light_palette = derived(&preferences.theme, false, &preferences, environment);
     let dark_palette = derived(&preferences.theme, true, &preferences, environment);
+    let (light_palette, dark_palette) = match cx.global::<ThemeState>().preview {
+        Some((true, p)) => (light_palette, p), Some((false, p)) => (p, dark_palette), None => (light_palette, dark_palette),
+    };
     let revision = cx.try_global::<ActivePalette>().map_or(0, |p| p.1.wrapping_add(1));
     cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }, revision));
     let size = preferences.interface_font_size;
@@ -390,4 +395,29 @@ fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str, sans:
 
 pub fn revision(cx: &App) -> usize {
     cx.global::<ActivePalette>().1
+}
+
+/// Prepared once per editor change; rendering only reads the installed palette.
+pub fn preview(colors: Option<(&themes::Colors, bool)>, cx: &mut App) {
+    let prepared = colors.and_then(|(roles,dark)| {
+        let prefs=preferences(cx);
+        let values=themes::palette(Some(roles),dark,prefs.contrast,prefs.glass).ok()?;
+        let base=if dark {tokens::DARK}else{tokens::LIGHT};
+        let mut value=serde_json::to_value(base).ok()?;
+        value.as_object_mut()?.extend(values.into_iter().map(|(k,v)|(k,v.into())));
+        let p=serde_json::from_value(value).ok()?;
+        Some((dark,if prefs.diff_color_scheme==DiffColorScheme::BlueOrange {blue_orange(p)}else{p}))
+    });
+    cx.global_mut::<ThemeState>().preview=prepared;
+    install(cx);
+    let mode=if is_dark(cx) {ThemeMode::Dark}else{ThemeMode::Light};
+    Theme::change(mode,None,cx); cx.refresh_windows();
+}
+
+pub fn wireframe(theme:&ThemePreference,dark:bool,cx:&App)->[u32;7] {
+    let prefs=preferences(cx);
+    let roles=themes::half_theme(theme,&prefs.halves,dark,&prefs.custom,environment_themes(cx)).and_then(|t|t.half(dark));
+    if let Some(roles)=roles {return themes::wireframe(roles);}
+    let p=if dark {tokens::DARK}else{tokens::LIGHT};
+    [p.background,p.sidebar,p.card,p.accent,p.message_surface,p.message_action,p.foreground]
 }

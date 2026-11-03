@@ -519,6 +519,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             None => cx.update(|cx| crate::settings::open(section, cx)),
         }
     }
+    if let Some(path)=std::env::var_os("T3_NATIVE_THEME_EDITOR_FIXTURE") {
+        let value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        cx.update_window(window,|_,window,cx|crate::theme_editor::fixture(value,window,cx)).map_err(|e|e.to_string())?;
+    }
     if let Some(path)=std::env::var_os("T3_NATIVE_THEME_REIMPORT_FIXTURE") {
         pump(&mut cx,1.,|_|false);
         cx.update(|cx|crate::settings::reimport_theme_fixture(std::path::Path::new(&path),cx))?;

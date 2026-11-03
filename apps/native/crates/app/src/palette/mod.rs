@@ -117,6 +117,7 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     }
     items.push(action("action:previous-thread", "Previous thread", &["navigate"], Some("thread.previous")));
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
+    items.push(action("action:theme-editor", "Toggle theme editor", &["theme", "appearance", "colors", "palette", "customize"], Some("themeEditor.toggle")));
     items.push(action("action:settings", "Open settings", &["settings", "preferences", "configuration", "keybindings"], None));
     items.push(action("action:usage", "Open usage", &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"], Some("usage.open")));
     items.push(action("action:switch-environment", "Switch environment...", &["environment", "server", "connect", "pair", "machine", "disconnect"], None));
@@ -424,6 +425,7 @@ impl CommandPalette {
                 "pull-requests" => Box::new(crate::pull_requests::OpenPullRequests),
                 "switch-environment" => Box::new(crate::menus::SwitchEnvironment),
                 "usage" => keymap::action_for("usage.open"),
+                "theme-editor" => keymap::action_for("themeEditor.toggle"),
                 "settings" => {
                     crate::settings::open(t3_core::settings::search::Section::General, cx);
                     return;

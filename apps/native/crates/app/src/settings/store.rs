@@ -86,12 +86,18 @@ pub fn show_error(message: impl Into<SharedString>, cx: &mut App) {
 
 /// Applies a client setting everywhere at once and saves the changed keys in the background.
 pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: &mut App) {
+    apply_client(state, change, true, cx);
+}
+pub fn install_committed_client(state: &Entity<AppState>, patch: serde_json::Map<String, serde_json::Value>, cx: &mut App) {
+    apply_client(state, ClientSettingChange::ThemePatch(patch), false, cx);
+}
+fn apply_client(state: &Entity<AppState>, change: ClientSettingChange, persist: bool, cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
     let patch = prefs.doc.apply_change(&change);
     if patch.is_empty() {
         return;
     }
-    store::patch_client_settings(patch);
+    if persist { store::patch_client_settings(patch); }
     let (composer, next) = (prefs.doc.composer(), preferences(&prefs.doc));
     let typography = terminal::typography(prefs.doc.entries());
     state.update(cx, |state, cx| {

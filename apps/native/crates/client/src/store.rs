@@ -398,33 +398,54 @@ enum Save {
     Environments(Vec<EnvironmentChange>),
 }
 
-fn queue(name: &str, save: Save) {
-    static WRITER: OnceLock<Option<mpsc::Sender<(String, Save)>>> = OnceLock::new();
-    let writer = WRITER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(String, Save)>();
+type SaveReply = mpsc::Sender<Result<(), String>>;
+type WriteRequest = (String, Save, Option<SaveReply>);
+fn writer() -> Option<&'static mpsc::Sender<WriteRequest>> {
+    static WRITER: OnceLock<Option<mpsc::Sender<WriteRequest>>> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<WriteRequest>();
         let spawned = std::thread::Builder::new().name("t3-ui-state".into()).spawn(move || {
             while let Ok(first) = rx.recv() {
-                let pending = coalesce(std::iter::once(first).chain(rx.try_iter()));
-                if let Some(base) = base() {
-                    for (name, save) in pending {
-                        match save {
-                            Save::Replace(text) => write_atomically(&base, &name, &text),
-                            Save::Patch(patch) => write_patch(&base, &name, &patch),
-                            Save::Environments(changes) => {
-                                if let Err(error) = write_environment_changes(&base, changes) {
-                                    tracing::warn!(%error, "could not save environments");
-                                }
+                let mut pending = Vec::new();
+                for (name, save, reply) in std::iter::once(first).chain(rx.try_iter()) {
+                    if let Some(reply) = reply {
+                        write_pending(std::mem::take(&mut pending));
+                        let result = base().ok_or_else(|| "Native home is unavailable.".to_owned()).and_then(|base| {
+                            match save {
+                                Save::Patch(patch) => write_patch_result(&base, &name, &patch).map_err(|e|e.to_string()),
+                                _ => unreachable!("only settings patches request confirmation"),
                             }
-                        }
-                    }
+                        });
+                        let _ = reply.send(result);
+                    } else { pending.push((name, save)); }
                 }
+                write_pending(pending);
             }
         });
         spawned.ok().map(|_| tx)
-    });
-    if let Some(writer) = writer {
-        let _ = writer.send((name.to_owned(), save));
+    }).as_ref()
+}
+fn write_pending(pending: Vec<(String, Save)>) {
+    if let Some(base) = base() {
+        for (name, save) in coalesce(pending.into_iter()) {
+            match save {
+                Save::Replace(text) => write_atomically(&base, &name, &text),
+                Save::Patch(patch) => write_patch(&base, &name, &patch),
+                Save::Environments(changes) => {
+                    if let Err(error) = write_environment_changes(&base, changes) { tracing::warn!(%error, "could not save environments"); }
+                }
+            }
+        }
     }
+}
+fn queue(name: &str, save: Save) {
+    if let Some(writer) = writer() { let _ = writer.send((name.to_owned(), save, None)); }
+}
+/// Commits a theme-library/selection transaction in writer order. Call off the UI thread.
+pub fn commit_client_settings(patch: serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    writer().ok_or("Settings writer is unavailable.")?.send((CLIENT_SETTINGS.into(), Save::Patch(patch), Some(tx))).map_err(|e|e.to_string())?;
+    rx.recv().map_err(|e|e.to_string())?
 }
 
 /// Keeps one save per file, in the order files were first saved: the newest replacement, with
@@ -455,13 +476,16 @@ fn coalesce(saves: impl Iterator<Item = (String, Save)>) -> Vec<(String, Save)> 
 }
 
 fn write_patch(base: &Path, name: &str, patch: &serde_json::Map<String, serde_json::Value>) {
+    if let Err(error) = write_patch_result(base, name, patch) { tracing::warn!(%error, "settings not saved"); }
+}
+fn write_patch_result(base: &Path, name: &str, patch: &serde_json::Map<String, serde_json::Value>) -> std::io::Result<()> {
     let path = base.join(format!("{name}.json"));
     let current = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             tracing::warn!(%error, file = %path.display(), "settings not saved: the file exists but cannot be read");
-            return;
+            return Err(error);
         }
     };
     let merged = t3_core::client_settings::merge_patch(current.as_deref(), patch);
@@ -470,24 +494,28 @@ fn write_patch(base: &Path, name: &str, patch: &serde_json::Map<String, serde_js
         let backup = base.join(format!("{name}.json.corrupt-{stamp}"));
         if let Err(error) = std::fs::copy(&path, &backup) {
             tracing::warn!(%error, file = %path.display(), "settings not saved: could not back up the unreadable file");
-            return;
+            return Err(error);
         }
         tracing::warn!(backup = %backup.display(), "settings file was not valid JSON; kept a copy and started fresh");
     }
-    write_atomically(base, name, &merged.text);
+    write_atomically_result(base, name, &merged.text)
 }
 
 /// A uniquely named temporary file renamed over the target: a crash or a second app instance
 /// never leaves half a file or clobbers another writer's temporary.
 fn write_atomically(base: &Path, name: &str, text: &str) {
+    let _ = write_atomically_result(base, name, text);
+}
+fn write_atomically_result(base: &Path, name: &str, text: &str) -> std::io::Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let _ = std::fs::create_dir_all(base);
+    std::fs::create_dir_all(base)?;
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = base.join(format!(".{name}.json.{}.{sequence}.tmp", std::process::id()));
     let written = std::fs::write(&temporary, text).and_then(|()| std::fs::rename(&temporary, base.join(format!("{name}.json"))));
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
+    written
 }
 
 /// The active environment's credentials (the probes and examples connect with these).
@@ -715,6 +743,25 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirmed_theme_patch_reports_failure_and_keeps_the_prior_settings() {
+        let dir=std::env::temp_dir().join(format!("t3-theme-commit-test-{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&dir);std::fs::create_dir_all(&dir).unwrap();
+        let patch=serde_json::json!({"t3code:themes:v1":[{"id":"aurora"}],"t3code:theme":"aurora"}).as_object().unwrap().clone();
+        write_atomically_result(&dir,"settings","{\"other\":42}").unwrap();
+        write_patch_result(&dir,"settings",&patch).unwrap();
+        let saved=std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        let value:serde_json::Value=serde_json::from_str(&saved).unwrap();assert_eq!(value["other"],42);assert_eq!(value["t3code:theme"],"aurora");
+        std::fs::remove_file(dir.join("settings.json")).unwrap();std::fs::create_dir(dir.join("settings.json")).unwrap();
+        assert!(write_patch_result(&dir,"settings",&patch).is_err());assert!(dir.join("settings.json").is_dir());
+        std::fs::remove_dir_all(dir.join("settings.json")).unwrap();
+        std::fs::write(dir.join("settings.json"),&saved).unwrap();
+        std::fs::create_dir(dir.join("blocked.json")).unwrap();
+        assert!(write_atomically_result(&dir,"blocked","replacement").is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("settings.json")).unwrap(),saved);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

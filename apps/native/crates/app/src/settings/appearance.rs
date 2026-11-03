@@ -1,6 +1,6 @@
 //! Appearance: color scheme tiles and the theme library (`ThemeSettings.tsx` `ThemeLibrary`), chat
 //! width (`AppearanceSettingsPanel.tsx`) and typography (`TypographySettings.tsx`).
-//! Choices apply live through `crate::theme`. Theme editing is a separate parity slice.
+//! Choices apply live through `crate::theme`; editing is hosted by `crate::theme_editor`.
 
 use gpui::{
     App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, IntoElement, ParentElement, PathPromptOptions, Styled, Subscription,
@@ -264,12 +264,14 @@ impl SettingsView {
                         )
                         .icon(crate::icons::Icon::Copy)
                         .tooltip("Duplicate")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let copy = themes::duplicate(store::client(cx), &duplicate);
-                            this.install_theme(copy, false, cx);
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            crate::theme_editor::open(None, Some(duplicate.clone()), Some(format!("{} copy", duplicate.label)), cx);
                         })),
                     );
                     if custom.iter().any(|t| t.id == definition.id) {
+                        let editing=definition.clone();
+                        actions=actions.child(Button::new(ElementId::Name(format!("edit-{}",definition.id).into()),ButtonVariant::GhostMuted,ButtonSize::IconXs)
+                            .icon(crate::icons::Icon::Pencil).tooltip("Edit theme").on_click(move |_,_,cx|crate::theme_editor::open(Some(editing.clone()),None,None,cx)));
                         let export = definition.clone();
                         actions = actions.child(
                             Button::new(
@@ -311,17 +313,8 @@ impl SettingsView {
                         Button::new("duplicate-default", ButtonVariant::GhostMuted, ButtonSize::IconXs)
                             .icon(crate::icons::Icon::Copy)
                             .tooltip("Duplicate")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let seed = ThemeDefinition {
-                                    id: "t3-code".into(),
-                                    label: "T3 Code".into(),
-                                    appearance: "light".into(),
-                                    colors: themes::standard(false),
-                                    variants: std::collections::BTreeMap::from([("dark".into(), themes::standard(true))]),
-                                    collection: None,
-                                    managed: false,
-                                };
-                                this.install_theme(themes::duplicate(store::client(cx), &seed), false, cx);
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                crate::theme_editor::open(None, None, Some("T3 Code copy".into()), cx);
                             })),
                     );
                 }
@@ -340,11 +333,14 @@ impl SettingsView {
             .child(section_title("Color scheme"))
             .child(tiles)
             .child(
-                h_flex().pt(r(20.)).justify_between().child(section_title("Themes")).child(
+                h_flex().pt(r(20.)).justify_between().child(section_title("Themes")).child(h_flex().gap(r(8.)).child(
+                    Button::new("create-theme",ButtonVariant::Outline,ButtonSize::Xs).label("Create theme")
+                        .on_click(|_,_,cx|crate::theme_editor::open(None,None,None,cx)),
+                ).child(
                     Button::new("import-theme", ButtonVariant::Outline, ButtonSize::Xs)
                         .label("Add theme")
                         .on_click(cx.listener(|this, _, window, cx| this.pick_theme(window, cx))),
-                ),
+                )),
             )
             .child(grid)
             .when_some(self.appearance_ui.pending_import.clone(), |this, pending| {
@@ -646,20 +642,23 @@ fn preview_circle(theme: &ThemePreference, dark: bool, active: bool, cx: &App) -
 /// shows the light half beside the dark half.
 fn wireframe(theme: &ThemePreference, mode: AppearanceMode, cx: &App) -> impl IntoElement {
     let half = |dark: bool| {
-        let prefs = theme::preferences(cx);
-        let owner = themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, theme::environment_themes(cx))
-            .map(|t| ThemePreference::Named(t.id.clone()))
-            .unwrap_or_else(|| theme.clone());
-        let [background, card, primary, foreground] = swatch(&owner, dark, cx);
-        h_flex().flex_1().h_full().bg(hsla(background)).child(div().w(r(28.)).h_full().bg(hsla(card))).child(
-            v_flex()
-                .flex_1()
-                .p(r(10.))
-                .gap(r(6.))
-                .child(div().h(r(6.)).w(r(56.)).rounded_full().bg(hsla(foreground).opacity(0.35)))
-                .child(div().h(r(6.)).w(r(40.)).rounded_full().bg(hsla(foreground).opacity(0.2)))
-                .child(div().mt(r(8.)).h(r(14.)).w(r(48.)).rounded(r(4.)).bg(hsla(primary))),
-        )
+        let [canvas,sidebar,surface,accent,message,action,text]=theme::wireframe(theme,dark,cx);
+        let line=hsla(text).opacity(0.25);
+        let rect=|x,y,w,h,color|div().absolute().left(gpui::relative(x)).top(gpui::relative(y)).w(gpui::relative(w)).h(gpui::relative(h)).rounded(r(4.)).bg(color);
+        div().relative().flex_1().h_full().overflow_hidden().bg(hsla(canvas))
+            .child(rect(0.,0.,0.22,1.,hsla(sidebar)))
+            .child(rect(0.03,0.08,0.16,0.08,hsla(surface)).border_1().border_color(line))
+            .child(rect(0.03,0.22,0.16,0.07,hsla(accent)))
+            .child(rect(0.03,0.32,0.16,0.07,hsla(message).opacity(0.7)))
+            .child(rect(0.03,0.42,0.16,0.07,hsla(message).opacity(0.5)))
+            .child(rect(0.48,0.11,0.24,0.09,hsla(message)))
+            .child(rect(0.27,0.28,0.34,0.05,line))
+            .child(rect(0.27,0.38,0.26,0.05,line))
+            .child(rect(0.26,0.77,0.68,0.15,hsla(surface)).border_1().border_color(line)
+                .child(rect(0.05,0.37,0.34,0.26,line))
+                .child(rect(0.86,0.21,0.08,0.58,hsla(action)).rounded_full()))
+            .child(rect(0.75,0.08,0.2,0.46,hsla(surface)).border_1().border_color(line)
+                .children([0,1,2].map(|i|rect(0.12,0.1+i as f32*0.3,0.76,0.2,line.opacity(0.55)))))
     };
     let frame = h_flex().h(r(112.)).w_full().rounded(r(8.)).overflow_hidden();
     match mode {

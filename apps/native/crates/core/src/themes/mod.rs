@@ -1,6 +1,7 @@
 //! Theme library, decoding and palette application from `web/src/themePalette.ts`,
 //! `ThemeSettings.tsx`, `appearanceContrast.ts` and `index.css`.
 mod color;
+pub mod editor;
 #[cfg(test)]
 mod tests;
 mod vivid;
@@ -520,4 +521,8 @@ pub fn select_collection(doc: &ClientSettingsDoc, themes: &[ThemeDefinition]) ->
         }
     }
     serde_json::Map::from_iter([(HALVES_KEY.into(), serde_json::json!(selected))])
+}
+
+pub fn wireframe(colors:&Colors)->[u32;7] {
+    ["canvas","sidebar","surface","accentSurface","messageSurface","messageAction","text"].map(|role|color::packed(color::parse(&colors[role]).unwrap_or([0.;4])))
 }
