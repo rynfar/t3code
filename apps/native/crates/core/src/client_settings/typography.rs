@@ -84,6 +84,29 @@ impl FontRole {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct FontDefaults<'a> {
+    pub sans: &'a str,
+    pub mono: &'a str,
+    pub serif: &'a str,
+}
+
+pub fn resolve_font_stack<'a>(stack: &str, installed: &'a [String], defaults: FontDefaults<'a>, fallback: &'a str) -> &'a str {
+    stack
+        .split(',')
+        .map(|name| name.trim().trim_matches(['\"', '\'']).trim())
+        .find_map(|name| match name.to_ascii_lowercase().as_str() {
+            "system-ui" | "sans-serif" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont" => Some(defaults.sans),
+            "monospace" | "ui-monospace" => Some(defaults.mono),
+            "serif" | "ui-serif" => Some(defaults.serif),
+            _ => installed
+                .iter()
+                .find(|installed| installed.eq_ignore_ascii_case(name))
+                .map(String::as_str),
+        })
+        .unwrap_or(fallback)
+}
+
 /// Installed families, already classified by the platform's glyph metrics.
 pub fn family_options(families: impl IntoIterator<Item = (String, bool)>, monospace: bool) -> Vec<String> {
     let mut names: Vec<_> = families
@@ -169,6 +192,35 @@ impl Typography {
 mod tests {
     use super::*;
     use crate::client_settings::ClientSettingChange;
+
+    #[test]
+    fn web_font_stacks_resolve_case_generics_and_order() {
+        let installed = ["Courier New", "Menlo", "Times", "Arial"].map(str::to_owned);
+        let defaults = FontDefaults {
+            sans: ".SystemUIFont",
+            mono: "Menlo",
+            serif: "Times",
+        };
+        for (stack, expected) in [
+            ("courier new", "Courier New"),
+            ("missing, \"cOuRiEr NeW\", serif", "Courier New"),
+            ("serif, Courier New", "Times"),
+            ("SERIF", "Times"),
+            ("ui-serif", "Times"),
+            ("sans-serif", ".SystemUIFont"),
+            ("ui-sans-serif", ".SystemUIFont"),
+            ("system-ui", ".SystemUIFont"),
+            ("-apple-system", ".SystemUIFont"),
+            ("BlinkMacSystemFont", ".SystemUIFont"),
+            ("monospace", "Menlo"),
+            ("ui-monospace", "Menlo"),
+            ("'arial', monospace", "Arial"),
+            ("", "fallback"),
+            ("missing", "fallback"),
+        ] {
+            assert_eq!(resolve_font_stack(stack, &installed, defaults, "fallback"), expected, "{stack}");
+        }
+    }
 
     #[test]
     fn defaults_ranges_and_clamping_match_contracts() {

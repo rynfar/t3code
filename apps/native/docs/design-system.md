@@ -279,13 +279,13 @@ Sources: `index.css:170–190, 1714–1720, 1787–1801, 1893–2137`, `appearan
 | Composer (`--font-composer`) | Custom family only when advanced typography is on; otherwise the UI font                   | Same                                                                         |
 | Terminal                     | Code family unless advanced typography is on                                               | Same                                                                         |
 
-| Setting        | Default                          | Range  | Applies to                                                                                                       |
-| -------------- | -------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------- |
-| Interface size | 16px (`metrics::ROOT_FONT_SIZE`) | 12–20  | rem base. Scales every rem metric                                                                                |
-| Prompt size    | 14px (`text-sm`)                 | 12–20  | Composer. Only honored with advanced typography; otherwise `text-sm`, which still scales with the interface size |
-| Code size      | 13px                             | 10–18  | Code blocks, tool output, diffs. Fixed px                                                                        |
-| Terminal size  | 12px                             | 8–20   | Terminal                                                                                                         |
-| Font smoothing | on                               | toggle | Web: `-webkit-font-smoothing: antialiased`; native: n/a (GPUI exposes no override)                               |
+| Setting        | Default                          | Range  | Applies to                                                                                                                      |
+| -------------- | -------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| Interface size | 16px (`metrics::ROOT_FONT_SIZE`) | 12–20  | rem base. Scales every rem metric                                                                                               |
+| Prompt size    | 14px (`text-sm`)                 | 12–20  | Composer. Only honored with advanced typography; otherwise `text-sm`, which still scales with the interface size                |
+| Code size      | 13px                             | 10–18  | Code blocks, tool output, diffs. Fixed px                                                                                       |
+| Terminal size  | 12px                             | 8–20   | Terminal                                                                                                                        |
+| Font smoothing | on                               | toggle | Web: `-webkit-font-smoothing: antialiased`; native: n/a (GPUI has no live macOS smoothing override matching the web preference) |
 
 ### 3.2 Scale
 

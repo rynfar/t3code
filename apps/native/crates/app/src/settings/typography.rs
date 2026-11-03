@@ -121,7 +121,7 @@ impl SettingsView {
                 Row::new("font-smoothing", "Font smoothing")
                     .description("Use thinner grayscale text smoothing instead of the macOS default.")
                     .highlighted(self.is_target("font-smoothing"))
-                    .status("Not applicable: GPUI rasterizes glyphs itself and exposes no WebKit font-smoothing override.")
+                    .status("GPUI has no live macOS smoothing override matching the web preference.")
                     .control(muted_text("n/a", cx))
                     .into_any_element(),
             );
@@ -210,7 +210,8 @@ impl SettingsView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 if this.typography.fonts.is_empty() && this.typography.font_task.is_none() {
                     let text = cx.text_system().clone();
-                    let task = cx.background_executor().spawn(async move { installed_fonts(text) });
+                    let names = theme::installed_font_families(cx).to_vec();
+                    let task = cx.background_executor().spawn(async move { installed_fonts(text, names) });
                     this.typography.font_task = Some(cx.spawn(async move |view, cx| {
                         let fonts = task.await;
                         let _ = view.update(cx, |view, cx| {
@@ -291,14 +292,9 @@ impl SettingsView {
         )
         .track_scroll(&self.typography.scroll)
         .h(r((count.clamp(1, 9) * 28) as f32));
-        let popup = div()
+        let popup = crate::composer::controls::popup_surface(cx)
             .id("font-picker-popup")
             .w(r(320.))
-            .p(r(4.))
-            .rounded(r(8.))
-            .border_1()
-            .border_color(hsla(p.dropdown_border))
-            .bg(hsla(p.popover))
             .occlude()
             .key_context("FontFamilyPicker")
             .on_action(cx.listener(|this, _: &CloseFontPicker, window, cx| {
@@ -387,8 +383,8 @@ fn font_preview(role: FontRole, cx: &App) -> impl IntoElement {
         .child(text)
 }
 
-fn installed_fonts(text: std::sync::Arc<gpui::TextSystem>) -> Vec<(String, bool)> {
-    text.all_font_names()
+fn installed_fonts(text: std::sync::Arc<gpui::TextSystem>, names: Vec<String>) -> Vec<(String, bool)> {
+    names
         .into_iter()
         .map(|family| {
             let mono = [FontWeight::NORMAL, FontWeight::BOLD].into_iter().all(|weight| {

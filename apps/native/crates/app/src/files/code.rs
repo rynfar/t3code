@@ -117,7 +117,7 @@ impl CodeView {
     /// Wrapped lines have unknown heights until drawn, so the line first scrolls to the top and
     /// then, a frame later, into the middle by its measured bounds. Returns whether another
     /// frame is needed.
-    fn scroll_pending_reveal(&mut self) -> bool {
+    fn scroll_pending_reveal(&mut self, line_height: f32) -> bool {
         let viewport = self.list.viewport_bounds();
         if viewport.size.height <= px(0.) {
             return self.pending_reveal.is_some();
@@ -134,8 +134,8 @@ impl CodeView {
             self.centering = Some(line);
             return true;
         }
-        let above = ((f32::from(viewport.size.height) / LINE_HEIGHT - 1.) / 2.).floor().max(0.) as usize;
-        self.list.scroll_to(ListOffset { item_ix: line.saturating_sub(above), offset_in_item: px(0.) });
+        let top = t3_core::files::reveal_top_line(line, f32::from(viewport.size.height), line_height);
+        self.list.scroll_to(ListOffset { item_ix: top, offset_in_item: px(0.) });
         false
     }
 
@@ -200,7 +200,7 @@ impl Preview {
             let frame = code.frame;
             code.lines.retain(|_, line| line.drawn + KEEP_FRAMES >= frame);
         }
-        if code.scroll_pending_reveal() {
+        if code.scroll_pending_reveal(crate::theme::code_line_height(cx)) {
             window.request_animation_frame();
         }
         div()

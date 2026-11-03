@@ -323,6 +323,9 @@ fn search_ranks_titles_before_terms_and_keybindings_last() {
     assert!(titles("worktree").contains(&"New threads".to_owned()));
     assert!(titles("").is_empty());
     assert!(titles("zzzz").is_empty());
+    for (query, id) in [("input", "prompt-font"), ("output", "terminal-font"), ("thin", "font-smoothing"), ("long", "word-wrap")] {
+        assert!(search::search(query, &items).iter().any(|item| item.id == id), "{query} must find {id}");
+    }
     let days = search::search("days of inactivity", &items);
     assert_eq!(days[0].anchor(), "auto-settle-inactive-threads");
     assert_eq!(search::normalize("Caf\u{0065}\u{0301}  Mode"), "cafe mode");

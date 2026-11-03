@@ -73,7 +73,7 @@ pub struct ThreadView {
     local_error: Option<String>,
     clock: Clock,
     window_height: f32,
-    measured_font_size: gpui::Pixels,
+    measured_typography: TranscriptTypography,
     rewind: rewind::RewindUi,
     media: Entity<crate::media::MediaCache>,
     viewer: Entity<crate::media::MediaViewer>,
@@ -158,7 +158,7 @@ impl ThreadView {
             local_error: None,
             clock: Clock::now(),
             window_height: 0.,
-            measured_font_size: _window.rem_size(),
+            measured_typography: TranscriptTypography::of(_window, cx),
             rewind: rewind::RewindUi::default(),
             media,
             viewer,
@@ -736,7 +736,7 @@ fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>, g
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        remeasure_for_font_size(window.rem_size(), &mut self.measured_font_size, &self.list, &self.group_lists.borrow());
+        remeasure_for_typography(TranscriptTypography::of(window, cx), &mut self.measured_typography, &self.list, &self.group_lists.borrow());
         let thread = self.thread_state(self.state.read(cx));
         let loading = thread.projection.is_none() && !thread.is_merging_history();
         let muted = hsla(palette(cx).muted_foreground);
@@ -816,10 +816,31 @@ impl Render for ThreadView {
     }
 }
 
-fn remeasure_for_font_size(size: gpui::Pixels, previous: &mut gpui::Pixels, list: &ListState, groups: &HashMap<String, ListState>) {
-    if *previous == size { return; }
-    *previous = size;
-    // GPUI invalidates cached heights for width changes; rem changes need the same treatment.
+#[derive(Clone, PartialEq)]
+struct TranscriptTypography {
+    rem_size: gpui::Pixels,
+    interface_family: gpui::SharedString,
+    code_family: gpui::SharedString,
+    code_size: gpui::Pixels,
+    word_wrap: bool,
+}
+
+impl TranscriptTypography {
+    fn of(window: &Window, cx: &gpui::App) -> Self {
+        use t3_core::client_settings::typography::FontRole;
+        Self {
+            rem_size: window.rem_size(),
+            interface_family: crate::theme::font_family(FontRole::Interface, cx),
+            code_family: crate::theme::font_family(FontRole::Code, cx),
+            code_size: px(crate::theme::font_size(FontRole::Code, cx)),
+            word_wrap: crate::theme::preferences(cx).typography.word_wrap,
+        }
+    }
+}
+
+fn remeasure_for_typography(key: TranscriptTypography, previous: &mut TranscriptTypography, list: &ListState, groups: &HashMap<String, ListState>) {
+    if *previous == key { return; }
+    *previous = key;
     list.remeasure();
     for group in groups.values() { group.remeasure(); }
 }
@@ -848,20 +869,39 @@ mod tests {
         };
         draw(2400., cx);
         draw(100., cx);
-        let mut previous = px(16.);
-        remeasure_for_font_size(px(16.), &mut previous, &main_list, &groups);
+        let baseline = TranscriptTypography { rem_size: px(16.), interface_family: "System".into(), code_family: "Menlo".into(), code_size: px(13.), word_wrap: true };
+        let mut previous = baseline.clone();
+        remeasure_for_typography(baseline.clone(), &mut previous, &main_list, &groups);
         assert_eq!(main_list.bounds_for_item(99).unwrap().size.height, px(24.));
         assert_eq!(groups["group"].bounds_for_item(99).unwrap().size.height, px(24.));
-        remeasure_for_font_size(px(20.), &mut previous, &main_list, &groups);
+        remeasure_for_typography(TranscriptTypography { rem_size: px(20.), ..baseline.clone() }, &mut previous, &main_list, &groups);
         assert!(main_list.bounds_for_item(99).is_none(), "offscreen main rows must be measured again");
         assert!(groups["group"].bounds_for_item(99).is_none(), "offscreen group members must be measured again");
-        assert_eq!(previous, px(20.));
+        assert_eq!(previous.rem_size, px(20.));
         cx.update(|_, cx| view.update(cx, |view, cx| { view.height = 30.; cx.notify(); }));
         draw(100., cx);
-        remeasure_for_font_size(px(20.), &mut previous, &main_list, &groups);
+        remeasure_for_typography(TranscriptTypography { rem_size: px(20.), ..baseline.clone() }, &mut previous, &main_list, &groups);
         assert_eq!(main_list.bounds_for_item(0).unwrap().size.height, px(30.));
-        remeasure_for_font_size(px(16.), &mut previous, &main_list, &groups);
+        remeasure_for_typography(baseline.clone(), &mut previous, &main_list, &groups);
         assert!(main_list.bounds_for_item(0).is_none());
         assert!(groups["group"].bounds_for_item(0).is_none());
+        for key in [
+            TranscriptTypography { code_size: px(18.), ..baseline.clone() },
+            TranscriptTypography { code_family: "Courier New".into(), ..baseline.clone() },
+            TranscriptTypography { interface_family: "Arial".into(), ..baseline.clone() },
+            TranscriptTypography { word_wrap: false, ..baseline.clone() },
+        ] {
+            remeasure_for_typography(baseline.clone(), &mut previous, &main_list, &groups);
+            draw(4000., cx);
+            draw(100., cx);
+            assert!(main_list.bounds_for_item(99).is_some());
+            remeasure_for_typography(key.clone(), &mut previous, &main_list, &groups);
+            assert!(main_list.bounds_for_item(99).is_none(), "typography changes invalidate offscreen rows");
+            assert!(groups["group"].bounds_for_item(99).is_none(), "typography changes invalidate offscreen group members");
+            draw(100., cx);
+            remeasure_for_typography(key, &mut previous, &main_list, &groups);
+            assert!(main_list.bounds_for_item(0).is_some(), "unchanged typography keeps cached measurements");
+            assert!(groups["group"].bounds_for_item(0).is_some(), "unchanged typography keeps group measurements");
+        }
     }
 }

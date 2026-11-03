@@ -10,7 +10,7 @@ mod tree;
 
 use serde_json::{Value, json};
 
-pub use text::{LineIndex, MAX_LINE_CHARS, expand_tabs};
+pub use text::{reveal_top_line, LineIndex, MAX_LINE_CHARS, expand_tabs};
 pub use tree::{FileTree, TreeRow};
 
 pub const LIST_ENTRIES: &str = "projects.listEntries";

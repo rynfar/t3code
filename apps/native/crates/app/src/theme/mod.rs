@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
 use serde_json::json;
-use t3_core::client_settings::typography::{FontRole, Typography, MONO_STACK};
+use t3_core::client_settings::typography::{FontDefaults, FontRole, Typography, MONO_STACK, resolve_font_stack};
 use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
@@ -68,6 +68,7 @@ pub fn hsla(color: u32) -> Hsla {
 
 pub fn init(cx: &mut App) {
     cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false });
+    cache_font_inventory(cx);
     install(cx);
 }
 
@@ -81,7 +82,9 @@ pub fn set_preferences(preferences: Preferences, cx: &mut App) {
     if state.preferences == preferences {
         return;
     }
+    let families_changed = state.preferences.typography.families != preferences.typography.families;
     state.preferences = preferences;
+    if families_changed { cache_font_inventory(cx); }
     install(cx);
     let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);
@@ -174,19 +177,40 @@ fn diff_halves(preferences: &Preferences) -> (&'static Palette, &'static Palette
     (&pair.0, &pair.1)
 }
 
-/// The first installed family of the web's `--font-mono` stack (`index.css`): SF Mono is not an
-/// installed family on every Mac, and an unknown family falls back to the proportional UI font.
-pub fn default_mono_family(cx: &App) -> &'static str {
-    let installed = cx.text_system().all_font_names();
-    MONO_STACK.iter().copied().find(|family| installed.iter().any(|name| name == family)).unwrap_or(MONO_STACK[0])
+struct FontInventory {
+    names: Vec<String>,
+    mono: String,
+    serif: String,
+}
+impl Global for FontInventory {}
+
+fn cache_font_inventory(cx: &mut App) {
+    let names = cx.text_system().all_font_names();
+    let first_installed = |stack: &[&str]| {
+        stack.iter().find_map(|family| names.iter().find(|name| name.eq_ignore_ascii_case(family)))
+            .map(String::to_owned).unwrap_or_else(|| stack[0].to_owned())
+    };
+    let mono = first_installed(MONO_STACK);
+    let serif = first_installed(&["Times", "Times New Roman", "Georgia"]);
+    cx.set_global(FontInventory { names, mono, serif });
+}
+
+pub fn installed_font_families(cx: &App) -> &[String] {
+    &cx.global::<FontInventory>().names
+}
+
+pub fn default_mono_family(cx: &App) -> &str {
+    &cx.global::<FontInventory>().mono
 }
 
 fn resolve_family(role: FontRole, cx: &App) -> gpui::SharedString {
+    let inventory = cx.global::<FontInventory>();
     let family = preferences(cx).typography.family(role);
-    let installed = cx.text_system().all_font_names();
-    family.split(',').map(|name| name.trim().trim_matches(['\"', '\''])).find(|name| installed.iter().any(|installed| installed == name))
-        .map(|name| name.to_owned().into())
-        .unwrap_or_else(|| if role.monospace() { default_mono_family(cx).into() } else if role == FontRole::Prompt { resolve_family(FontRole::Interface, cx) } else { ".SystemUIFont".into() })
+    let fallback = if role.monospace() { inventory.mono.clone().into() }
+        else if role == FontRole::Prompt { resolve_family(FontRole::Interface, cx) }
+        else { gpui::SharedString::from(".SystemUIFont") };
+    resolve_font_stack(family, &inventory.names,
+        FontDefaults { sans: ".SystemUIFont", mono: &inventory.mono, serif: &inventory.serif }, &fallback).to_owned().into()
 }
 
 pub fn font_family(role: FontRole, cx: &App) -> gpui::SharedString {
