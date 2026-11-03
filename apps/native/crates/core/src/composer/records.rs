@@ -271,7 +271,6 @@ fn import_records_with(
             .find(|r| field(r, "contextId") == canonical || field(r, "contextId") == original);
         if let Some(existing) = existing
             && same_payload(existing, &record)
-            && !(copy_attachments && matches!(kind.as_str(), "image" | "file"))
         {
             if kind == "preview-annotation"
                 && let Some(screenshot) = record.get("screenshotContextId").and_then(Value::as_str)

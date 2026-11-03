@@ -96,6 +96,32 @@ mod tests {
         assert_eq!(plan.attachments[0].source.as_deref(), Some("source-upload"));
     }
     #[test]
+    fn pasting_a_ready_attachments_own_fragment_does_not_stage_another_copy() {
+        for (kind, name, mime) in [
+            ("image", "shot.png", "image/png"),
+            ("file", "notes.txt", "text/plain"),
+        ] {
+            let record = json!({"version":1,"kind":kind,"contextId":format!("{kind}_a"),"label":name,"attachmentId":"source-upload","name":name,"mimeType":mime,"sizeBytes":8});
+            let ready = records::attachment_from_record(&record).unwrap();
+            let existing = vec![ready.context_record().unwrap()];
+            let (text, fragment) = copy_chip(&ready.context_id(), &existing, "env").unwrap();
+            let fragment = records::decode_fragment(&fragment).unwrap();
+            let incoming =
+                records::clipboard_records(&text, fragment["records"].as_array().unwrap());
+            let plan = prepare(&text, incoming, &existing, "env", ImportMode::Copy, || {
+                "duplicate".into()
+            })
+            .unwrap();
+            assert!(
+                plan.attachments.is_empty(),
+                "an identical Ready attachment must not queue a copy"
+            );
+            assert!(plan.records.is_empty());
+            assert!(plan.reviews.is_empty());
+            assert_eq!(plan.text, text);
+        }
+    }
+    #[test]
     fn overlapping_attachment_copies_have_independent_local_ids() {
         let record = image();
         let text = records::reference(&record).unwrap();
