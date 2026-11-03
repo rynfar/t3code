@@ -123,6 +123,10 @@ fn line_index_splits_every_terminator_and_clamps_reveals() {
     assert_eq!(index.reveal_index(0), 0);
     assert_eq!(index.reveal_index(2), 1);
     assert_eq!(index.reveal_index(99), 2);
+    for (height, expected) in [(20., 91), (10., 81), (30., 94)] {
+        assert_eq!(reveal_top_line(100, 400., height), expected);
+    }
+    assert_eq!(reveal_top_line(2, 400., 10.), 0);
     assert_eq!(LineIndex::new("").len(), 1);
     assert_eq!(LineIndex::new("x\n\n").len(), 2);
     assert_eq!(LineIndex::new(&"0123456789\n".repeat(120)).digits(), 3);

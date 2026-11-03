@@ -441,6 +441,24 @@ pub fn menu_surface(cx: &App) -> gpui::Div {
         .shadow(floating_shadow(cx.theme().is_dark()))
 }
 
+/// The dropdown glass, floating shadow and control bevel of `popover.tsx` (§6.5).
+pub fn popup_surface(cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    let dark = cx.theme().is_dark();
+    let mut shadows = floating_shadow(dark);
+    shadows.push(BoxShadow {
+        color: if dark { gpui::white().opacity(0.06) } else { gpui::black().opacity(0.04) },
+        offset: point(px(0.), px(if dark { -1. } else { 1. })),
+        blur_radius: px(0.),
+        spread_radius: px(0.),
+        inset: true,
+    });
+    div().relative().flex().flex_col().p(crate::theme::rem(4.)).rounded(crate::theme::rem(8.))
+        .text_color(hsla(p.popover_foreground))
+        .shadow(shadows)
+        .child(crate::glass::backdrop(8. * f32::from(cx.theme().font_size) / 16., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+}
+
 /// A menu item: min 28, pad 8 / 4, radius 4, highlighted `accent`.
 #[derive(IntoElement)]
 pub struct MenuItem {

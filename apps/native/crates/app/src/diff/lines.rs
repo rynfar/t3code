@@ -18,7 +18,6 @@ use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{Palette, hsla, palette};
 
 pub const LINE_HEIGHT: f32 = 20.;
-const CODE_FONT_SIZE: f32 = 13.;
 const HEADER_HEIGHT: f32 = 32.;
 const SEPARATOR_HEIGHT: f32 = 24.;
 const CODE_PADDING: f32 = 8.;
@@ -61,10 +60,17 @@ fn gutter_width(digits: usize, char_width: Pixels) -> Pixels {
 impl DiffPanel {
     pub(super) fn render_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let font = (cx.theme().mono_font_family.clone(), cx.theme().mono_font_size);
+        if self.measured_font.as_ref() != Some(&font) {
+            self.measured_font = Some(font);
+            self.char_width = None;
+            self.h_offset = px(0.);
+            self.list.remeasure();
+        }
         if self.char_width.is_none() {
             let family = cx.theme().mono_font_family.clone();
             let font_id = window.text_system().resolve_font(&gpui::font(family));
-            let advance = window.text_system().advance(font_id, px(CODE_FONT_SIZE), 'm').map(|size| size.width);
+            let advance = window.text_system().advance(font_id, cx.theme().mono_font_size, 'm').map(|size| size.width);
             self.char_width = Some(advance.unwrap_or(px(7.8)));
         }
         let top = self.list.logical_scroll_top().item_ix;
@@ -182,12 +188,12 @@ impl DiffPanel {
         div()
             .flex()
             .w_full()
-            .when(!self.wrap, |this| this.h(px(LINE_HEIGHT)))
-            .when(self.wrap, |this| this.min_h(px(LINE_HEIGHT)))
+            .when(!self.wrap, |this| this.h(px(crate::theme::code_line_height(cx))))
+            .when(self.wrap, |this| this.min_h(px(crate::theme::code_line_height(cx))))
             .bg(fill)
             .font_family(family)
-            .text_size(px(CODE_FONT_SIZE))
-            .line_height(px(LINE_HEIGHT))
+            .text_size(cx.theme().mono_font_size)
+            .line_height(px(crate::theme::code_line_height(cx)))
     }
 
     /// One side of a row: a gutter with the line number and change bar, then the code. In the

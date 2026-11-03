@@ -5,6 +5,9 @@
 //! contract's default without dropping the rest. Edits are saved as patches over the file as it
 //! is at write time, never as this instance's whole copy.
 
+pub mod typography;
+
+use typography::{FontRole, ADVANCED_KEY};
 use serde_json::{Map, Value};
 
 use crate::composer::ClientSettings;
@@ -194,6 +197,11 @@ pub enum ClientSettingChange {
     TimestampFormat(TimestampFormat),
     ChatWidth(ChatWidth),
     InterfaceFontSize(u32),
+    FontSize(FontRole, u32),
+    FontFamily(FontRole, String),
+    ResetFont(FontRole),
+    SeparateFonts(bool),
+    WordWrap(bool),
     ComposerRichText(bool),
     SendShortcut(crate::composer::SendShortcut),
     FollowUpBehavior(crate::composer::FollowUpBehavior),
@@ -214,6 +222,11 @@ impl ClientSettingChange {
         use crate::composer::{FollowUpBehavior, SendShortcut};
         let text = |value: &str| Value::String(value.to_owned());
         match self {
+            ClientSettingChange::FontSize(role, size) => (role.size_key(), Value::from(role.clamp(*size as f64))),
+            ClientSettingChange::FontFamily(role, family) => (role.family_key(), text(&family.trim().chars().take(200).collect::<String>())),
+            ClientSettingChange::ResetFont(role) => (role.family_key(), text("")),
+            ClientSettingChange::SeparateFonts(on) => (ADVANCED_KEY, Value::Bool(*on)),
+            ClientSettingChange::WordWrap(on) => ("wordWrap", Value::Bool(*on)),
             ClientSettingChange::DiffLayout(layout) => ("diffLayout", serde_json::json!(layout)),
             ClientSettingChange::DiffIgnoreWhitespace(on) => {
                 ("diffIgnoreWhitespace", Value::Bool(*on))
@@ -304,7 +317,13 @@ impl ClientSettingsDoc {
     pub fn apply_change(&mut self, change: &ClientSettingChange) -> Map<String, Value> {
         let mut patch = Map::new();
         let (key, value) = change.entry();
-        if self.entries.get(key) == Some(&value) {
+        if let ClientSettingChange::ResetFont(role) = change {
+            let size = Value::from(role.default_size());
+            if self.entries.get(role.size_key()) != Some(&size) {
+                patch.insert(role.size_key().to_owned(), size);
+            }
+        }
+        if self.entries.get(key) == Some(&value) && patch.is_empty() {
             return patch;
         }
         if let ClientSettingChange::Theme(_) = change {

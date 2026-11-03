@@ -12,12 +12,16 @@ use std::sync::LazyLock;
 use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
 use serde_json::json;
+use t3_core::client_settings::typography::{FontDefaults, FontRole, Typography, MONO_STACK, resolve_font_stack};
 use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
 
 /// The web's `text-white` on solid destructive buttons (design-system §6.1); not a theme role.
 pub const WHITE: u32 = 0xffff_ffff;
+
+struct ActiveFonts([gpui::SharedString; 4]);
+impl Global for ActiveFonts {}
 
 struct ActivePalette(&'static Palette);
 
@@ -29,6 +33,7 @@ pub struct Preferences {
     pub theme: ThemePreference,
     pub mode: AppearanceMode,
     pub interface_font_size: f32,
+    pub typography: Typography,
     pub chat_width: ChatWidth,
     pub diff_color_scheme: DiffColorScheme,
 }
@@ -39,6 +44,7 @@ impl Default for Preferences {
             theme: ThemePreference::Default(AppearanceMode::System),
             mode: AppearanceMode::System,
             interface_font_size: metrics::ROOT_FONT_SIZE,
+            typography: Typography::default(),
             chat_width: ChatWidth::Comfortable,
             diff_color_scheme: DiffColorScheme::default(),
         }
@@ -62,6 +68,7 @@ pub fn hsla(color: u32) -> Hsla {
 
 pub fn init(cx: &mut App) {
     cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false });
+    cache_font_inventory(cx);
     install(cx);
 }
 
@@ -75,7 +82,9 @@ pub fn set_preferences(preferences: Preferences, cx: &mut App) {
     if state.preferences == preferences {
         return;
     }
+    let families_changed = state.preferences.typography.families != preferences.typography.families;
     state.preferences = preferences;
+    if families_changed { cache_font_inventory(cx); }
     install(cx);
     let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);
@@ -168,26 +177,71 @@ fn diff_halves(preferences: &Preferences) -> (&'static Palette, &'static Palette
     (&pair.0, &pair.1)
 }
 
-/// The first installed family of the web's `--font-mono` stack (`index.css`): SF Mono is not an
-/// installed family on every Mac, and an unknown family falls back to the proportional UI font.
-const MONO_STACK: &[&str] = &["SF Mono", "SFMono-Regular", "Menlo", "Consolas", "Liberation Mono"];
-
-fn mono_family(cx: &App) -> &'static str {
-    let installed = cx.text_system().all_font_names();
-    MONO_STACK.iter().copied().find(|family| installed.iter().any(|name| name == family)).unwrap_or(MONO_STACK[0])
+struct FontInventory {
+    names: Vec<String>,
+    mono: String,
+    serif: String,
 }
+impl Global for FontInventory {}
+
+fn cache_font_inventory(cx: &mut App) {
+    let names = cx.text_system().all_font_names();
+    let first_installed = |stack: &[&str]| {
+        stack.iter().find_map(|family| names.iter().find(|name| name.eq_ignore_ascii_case(family)))
+            .map(String::to_owned).unwrap_or_else(|| stack[0].to_owned())
+    };
+    let mono = first_installed(MONO_STACK);
+    let serif = first_installed(&["Times", "Times New Roman", "Georgia"]);
+    cx.set_global(FontInventory { names, mono, serif });
+}
+
+pub fn installed_font_families(cx: &App) -> &[String] {
+    &cx.global::<FontInventory>().names
+}
+
+pub fn default_mono_family(cx: &App) -> &str {
+    &cx.global::<FontInventory>().mono
+}
+
+fn resolve_family(role: FontRole, cx: &App) -> gpui::SharedString {
+    let inventory = cx.global::<FontInventory>();
+    let family = preferences(cx).typography.family(role);
+    let fallback = if role.monospace() { inventory.mono.clone().into() }
+        else if role == FontRole::Prompt { resolve_family(FontRole::Interface, cx) }
+        else { gpui::SharedString::from(".SystemUIFont") };
+    resolve_font_stack(family, &inventory.names,
+        FontDefaults { sans: ".SystemUIFont", mono: &inventory.mono, serif: &inventory.serif }, &fallback).to_owned().into()
+}
+
+pub fn font_family(role: FontRole, cx: &App) -> gpui::SharedString {
+    cx.global::<ActiveFonts>().0[role as usize].clone()
+}
+
+pub fn font_size(role: FontRole, cx: &App) -> f32 {
+    let prefs = preferences(cx);
+    if role == FontRole::Prompt && !prefs.typography.separate { return prefs.interface_font_size * 14. / 16.; }
+    prefs.typography.size(role)
+}
+
+pub fn code_line_height(cx: &App) -> f32 { font_size(FontRole::Code, cx) * 20. / 13. }
 
 fn install(cx: &mut App) {
     let dark = is_dark(cx);
-    let mono = mono_family(cx);
+    let fonts = FontRole::ALL.map(|role| resolve_family(role, cx));
+    cx.set_global(ActiveFonts(fonts));
+    let mono = font_family(FontRole::Code, cx);
+    let sans = font_family(FontRole::Interface, cx);
     let preferences = preferences(cx).clone();
     let (light_palette, dark_palette) = diff_halves(&preferences);
     cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }));
     let size = preferences.interface_font_size;
     let theme = Theme::global_mut(cx);
-    theme.light_theme = Rc::new(config("T3 Code Light", light_palette, false, size, mono));
-    theme.dark_theme = Rc::new(config("T3 Code Dark", dark_palette, true, size, mono));
+    theme.light_theme = Rc::new(config("T3 Code Light", light_palette, false, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
+    theme.dark_theme = Rc::new(config("T3 Code Dark", dark_palette, true, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
     theme.font_size = px(size);
+    theme.font_family = sans;
+    theme.mono_font_family = mono;
+    theme.mono_font_size = px(preferences.typography.size(FontRole::Code));
 }
 
 /// A theme's swatch colors for the theme cards: (background, card, primary, foreground).
@@ -224,7 +278,7 @@ fn highlight(p: &Palette, dark: bool) -> serde_json::Value {
     json!({ "editor.background": hex(p.code_background), "editor.foreground": hex(p.code_foreground), "syntax": syntax })
 }
 
-fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str) -> ThemeConfig {
+fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str, sans: &str, code_size: f32) -> ThemeConfig {
     let colors: serde_json::Map<String, serde_json::Value> = [
         ("background", hex(p.background)),
         ("foreground", hex(p.foreground)),
@@ -281,10 +335,10 @@ fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str) -> Th
     let value = json!({
         "name": name,
         "mode": if dark { "dark" } else { "light" },
-        "font.family": ".SystemUIFont",
+        "font.family": sans,
         "font.size": font_size,
         "mono_font.family": mono,
-        "mono_font.size": metrics::DEFAULT_CODE_FONT_SIZE,
+        "mono_font.size": code_size,
         "radius": metrics::CONTROL_RADIUS as usize,
         "radius.lg": metrics::RADIUS_XL as usize,
         "colors": colors,

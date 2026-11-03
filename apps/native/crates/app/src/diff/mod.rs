@@ -67,6 +67,8 @@ pub struct DiffPanel {
     list: ListState,
     tree_scroll: UniformListScrollHandle,
     wrap: bool,
+    wrap_override: Option<bool>,
+    measured_font: Option<(gpui::SharedString, Pixels)>,
     ignore_whitespace: bool,
     h_offset: Pixels,
     char_width: Option<Pixels>,
@@ -144,6 +146,8 @@ impl DiffPanel {
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             tree_scroll: UniformListScrollHandle::new(),
             wrap: true,
+            wrap_override: None,
+            measured_font: None,
             ignore_whitespace: crate::settings::client_settings(cx).diff_ignore_whitespace(),
             h_offset: px(0.),
             char_width: None,
@@ -588,6 +592,7 @@ impl DiffPanel {
 
     pub fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
         self.wrap = !self.wrap;
+        self.wrap_override = Some(self.wrap);
         self.h_offset = px(0.);
         self.list.remeasure();
         cx.notify();
@@ -765,6 +770,12 @@ fn error_line(error: String, p: &Palette) -> gpui::Div {
 
 impl Render for DiffPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let wrap = self.wrap_override.unwrap_or(crate::theme::preferences(cx).typography.word_wrap);
+        if self.wrap != wrap {
+            self.wrap = wrap;
+            self.h_offset = px(0.);
+            self.list.remeasure();
+        }
         let p = palette(cx);
         v_flex()
             .size_full()

@@ -131,3 +131,9 @@ pub fn expand_tabs<T: Clone>(line: &str, runs: &[(Range<usize>, T)]) -> (String,
     }
     (text, mapped)
 }
+
+/// The unwrapped source viewport's top row when centering a reveal.
+pub fn reveal_top_line(line: usize, viewport_height: f32, line_height: f32) -> usize {
+    let above = ((viewport_height / line_height - 1.) / 2.).floor().max(0.) as usize;
+    line.saturating_sub(above)
+}

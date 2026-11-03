@@ -39,6 +39,10 @@ impl Global for ClientPrefs {}
 
 pub fn init(cx: &mut App) {
     let mut doc = ClientSettingsDoc::from_json(&store::load_client_settings().unwrap_or_default());
+    if !doc.entries().contains_key(t3_core::client_settings::typography::ADVANCED_KEY)
+        && let Some(advanced) = store::load_ui_state("typography-advanced").and_then(|value| value.as_bool()) {
+        store::patch_client_settings(doc.apply_change(&ClientSettingChange::SeparateFonts(advanced)));
+    }
     if let Some(legacy_panels) = store::load_ui_state("panels") {
         let patch = doc.migrate_diff_layout(&legacy_panels);
         if !patch.is_empty() { store::patch_client_settings(patch); }
@@ -54,6 +58,7 @@ fn preferences(doc: &ClientSettingsDoc) -> Preferences {
         theme: doc.theme(),
         mode: doc.appearance_mode(),
         interface_font_size: doc.interface_font_size() as f32,
+        typography: doc.typography(),
         chat_width: doc.chat_width(),
         diff_color_scheme: doc.diff_color_scheme(),
     }

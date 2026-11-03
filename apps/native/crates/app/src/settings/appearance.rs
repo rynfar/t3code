@@ -1,12 +1,12 @@
 //! Appearance: color scheme tiles and the theme library (`ThemeSettings.tsx` `ThemeLibrary`), chat
-//! width (`AppearanceSettingsPanel.tsx`) and the interface font size (`TypographySettings.tsx`).
+//! width (`AppearanceSettingsPanel.tsx`) and typography (`TypographySettings.tsx`).
 //! Choices apply live through `crate::theme`. Custom, imported and environment themes, contrast,
-//! glass opacity and font families are not ported yet.
+//! glass opacity are not ported yet.
 
 use gpui::{App, Context, ElementId, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use t3_core::client_settings::{
-    AppearanceMode, ChatWidth, ClientSettingChange, DEFAULT_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE, MIN_INTERFACE_FONT_SIZE,
+    AppearanceMode, ChatWidth, ClientSettingChange,
     ThemePreference,
 };
 
@@ -125,40 +125,12 @@ impl SettingsView {
             cx,
         );
 
-        let size = doc.interface_font_size();
-        let size_state = self.state.clone();
-        let typography = section(
-            "Typography",
-            vec![
-                Row::new("interface-font", "Interface font")
-                    .description("Everything outside code blocks and the terminal.")
-                    .highlighted(self.is_target("interface-font"))
-                    .reset(size != DEFAULT_INTERFACE_FONT_SIZE, {
-                        let state = self.state.clone();
-                        move |_, _, cx| store::update_client(&state, ClientSettingChange::InterfaceFontSize(DEFAULT_INTERFACE_FONT_SIZE), cx)
-                    })
-                    .control(
-                        Select::new(
-                            "interface-font-size",
-                            (MIN_INTERFACE_FONT_SIZE..=MAX_INTERFACE_FONT_SIZE).map(|size| SelectOption::new(size.to_string(), format!("{size} px"))).collect(),
-                        )
-                        .selected(size.to_string())
-                        .width(88.)
-                        .on_change(move |value, _, cx| {
-                            if let Ok(size) = value.parse::<u32>() {
-                                store::update_client(&size_state, ClientSettingChange::InterfaceFontSize(size), cx);
-                            }
-                        }),
-                    )
-                    .into_any_element(),
-            ],
-            cx,
-        );
+        let typography = self.typography_rows(cx);
 
         vec![
             Block::new(&["appearance", "color-scheme", "theme"], colors),
             Block::new(&["appearance-interface", "chat-width"], interface),
-            Block::new(&["typography", "interface-font"], typography),
+            Block::new(&["typography", "interface-font", "prompt-font", "code-font", "terminal-font", "word-wrap", "separate-fonts", "font-smoothing"], typography),
         ]
     }
 }
