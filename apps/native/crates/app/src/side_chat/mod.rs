@@ -53,6 +53,10 @@ impl SideThreads {
 }
 
 impl AppState {
+    pub(crate) fn can_read_threads(&self) -> bool {
+        self.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_none_or(|session| session.grants("orchestration:read")))
+    }
+
     /// The detail of the open thread or of a side subscription; empty while it loads.
     pub fn thread_state(&self, thread_id: &str) -> &ThreadState {
         if self.selected_thread.as_deref() == Some(thread_id) {
@@ -84,14 +88,16 @@ impl AppState {
         }
     }
 
-    /// The side threads the open thread needs: its showing side chat tab and the children that
-    /// ask for an approval. A side chat the shell does not list (deleted, or not yet loaded) has
+    /// The side threads the open thread needs: its showing side chat or tool diff and
+    /// the children that ask for an approval. A side chat the shell does not list (deleted, or not yet loaded) has
     /// no stream, as `SideChatPane` reads no projection without a shell.
     fn wanted_side_threads(&self) -> Vec<String> {
         let Some(selected) = self.selected_thread.as_deref() else { return Vec::new() };
         let mut wanted: Vec<String> = Vec::new();
-        if let Some(id) = self.panels.panels.active_surface(selected).and_then(Surface::side_chat_thread)
+        if let Some(id) = self.panels.panels.active_thread_source(selected, &self.panels.diff_selection(selected))
             && self.thread_shell(id).is_some()
+            && !self.thread_state(id).deleted
+            && self.can_read_threads()
         {
             wanted.push(id.to_owned());
         }

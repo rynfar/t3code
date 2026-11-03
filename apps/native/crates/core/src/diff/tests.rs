@@ -628,6 +628,13 @@ fn tool_call_target_follows_the_row_the_thread_shows() {
     let target = ToolCallTarget::of(&tool_item("f1", "file_change", "running"));
     assert_eq!(target, ToolCallTarget { thread_id: "t".into(), item_id: "f1".into(), revision: "live".into() });
     assert_eq!(target.resolve(&[row("completed", "file_change")]).revision, "2026-01-02T00:00:00Z");
+    let mut parent_row = row("completed", "file_change");
+    parent_row.source_thread_id = "parent".into();
+    assert_eq!(target.resolve(&[parent_row.clone()]), target, "an identical item id in the parent cannot settle the child");
+    let settled = target.resolve(&[parent_row, row("completed", "file_change")]);
+    assert_ne!(settled.request(), target.request(), "settlement must invalidate a live detail request");
+    assert_eq!(settled.thread_id, target.thread_id);
+    assert_eq!(settled.item_id, target.item_id);
     assert_eq!(target.resolve(&[row("completed", "command_execution")]), target);
     assert_eq!(target.resolve(&[]), target);
     assert_eq!(target.request(), json!({ "threadId": "t", "itemId": "f1", "revision": "live" }));

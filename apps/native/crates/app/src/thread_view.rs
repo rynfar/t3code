@@ -627,7 +627,6 @@ impl ThreadView {
             forking: &self.forking,
             revert_counts: &self.rewind.counts,
             rewind_disabled: self.rewind.busy() || self.activity.is_working,
-            tool_diffs: self.fixed.is_none(),
             command_outputs: self.streams_output.then_some(&self.command_outputs),
             setup: &self.setup_env,
         };

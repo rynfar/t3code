@@ -84,9 +84,6 @@ pub struct RowEnv<'a> {
     pub revert_counts: &'a HashMap<String, u64>,
     /// A rewind is out or a turn is running.
     pub rewind_disabled: bool,
-    /// File changes offer their diff. Not in a side chat: the diff panel follows only the open
-    /// thread's items, so a side chat's running change would never refetch once it settles.
-    pub tool_diffs: bool,
     /// Open command rows' streamed output, by entry; `None` when the server does not stream it
     /// (`commandOutputStreaming`), so rows show the item's own output instead.
     pub command_outputs: Option<&'a HashMap<String, CommandOutputSlot>>,

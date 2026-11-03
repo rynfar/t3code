@@ -161,6 +161,21 @@ impl AppState {
         });
     }
 
+    /// `parentPanel.openToolDiff`: keep the panel owner selected, even for a side chat's tool.
+    pub fn open_tool_call_diff(&mut self, target: t3_core::diff::ToolCallTarget, cx: &mut Context<Self>) {
+        if !self.can_read_threads() || self.thread_shell(&target.thread_id).is_none() {
+            return;
+        }
+        let Some(thread_id) = self.panel_thread() else { return };
+        // Select before replacing the side chat so its existing subscription is retained.
+        self.panels.diff_selections.insert(thread_id.clone(), DiffSelection::ToolCall(target));
+        self.panels.explicit_diff_open = Some(thread_id);
+        self.mutate_panels(cx, |state, thread| {
+            state.panels.open(thread, Surface::diff());
+            true
+        });
+    }
+
     /// Clicking a tab. Activating the diff counts as an explicit open: it keeps its selection.
     pub fn activate_surface(&mut self, surface_id: &str, cx: &mut Context<Self>) {
         if let Some(thread_id) = self.panel_thread()
