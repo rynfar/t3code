@@ -85,7 +85,7 @@ fn fixture() -> crate::thread::ThreadProjection {
 }
 
 #[test]
-fn only_the_terminal_assistant_message_gets_copy() {
+fn only_the_terminal_assistant_message_gets_meta_and_copy() {
     let entries = vec![
         message("user-1", Role::User, "Write a poem", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
         message("assistant-thought", Role::Assistant, "Ground it.", Some("turn-1"), "2026-01-01T00:00:10Z", "2026-01-01T00:00:11Z"),
@@ -93,15 +93,51 @@ fn only_the_terminal_assistant_message_gets_copy() {
     ];
     let mut input = Input::idle();
     input.runs.insert("turn-1".into());
-    let copies: Vec<bool> = input
+    let controls: Vec<(bool, bool)> = input
         .rows(&entries)
         .iter()
         .filter_map(|row| match &row.kind {
-            RowKind::Message { message, show_copy, .. } if message.role == Role::Assistant => Some(*show_copy),
+            RowKind::Message { message, show_assistant_meta, show_copy, .. } if message.role == Role::Assistant => Some((*show_assistant_meta, *show_copy)),
             _ => None,
         })
         .collect();
-    assert_eq!(copies, vec![false, true]);
+    assert_eq!(controls, vec![(false, false), (true, true)]);
+}
+
+#[test]
+fn a_running_responses_terminal_reply_has_no_meta_until_it_settles() {
+    for streaming in [false, true] {
+        let mut reply = message("assistant-reply", Role::Assistant, "Training finished, checking memory next.", Some("turn-1"), "2026-01-01T00:00:10Z", "2026-01-01T00:00:12Z");
+        if let EntryKind::Message(message) = &mut Arc::make_mut(&mut reply).kind {
+            Arc::make_mut(message).streaming = streaming;
+        }
+        let entries = vec![
+            reply,
+            work("command-entry", "turn-1", "2026-01-01T00:00:15Z", |w| {
+                w.command = Some("nvidia-smi".into());
+                w.status = Some(ToolStatus::InProgress);
+            }),
+        ];
+        let mut input = Input::idle();
+        input.activity = running("turn-1");
+        let rows = input.rows(&entries);
+        let reply = rows.iter().find(|row| row.id == "assistant-reply-entry").expect("terminal reply");
+        assert_eq!(reply.kind, RowKind::Message {
+            message: entries[0].message().expect("assistant message").clone(),
+            show_assistant_meta: false,
+            show_copy: false,
+            copy_streaming: true,
+            grouped_with_next: false,
+            grouped_with_previous: false,
+            continues_steer: false,
+        });
+        assert!(!rows.iter().any(|row| matches!(row.kind, RowKind::AssistantMeta { .. })));
+
+        input.activity = ThreadActivity::default();
+        let rows = input.rows(&entries[..1]);
+        let reply = rows.iter().find(|row| row.id == "assistant-reply-entry").expect("settled terminal reply");
+        assert!(matches!(reply.kind, RowKind::Message { show_assistant_meta: true, show_copy: true, copy_streaming, .. } if copy_streaming == streaming));
+    }
 }
 
 #[test]

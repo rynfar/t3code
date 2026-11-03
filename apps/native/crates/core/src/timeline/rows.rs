@@ -517,15 +517,13 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                     continue;
                 }
                 let in_progress = message.role == Role::Assistant && run_is_active(message.run_id.as_deref());
-                let terminal = message.role == Role::Assistant && terminal_ids.contains(&message.id);
-                let show_meta = terminal && !in_progress;
+                let show_meta = message.role == Role::Assistant && terminal_ids.contains(&message.id) && !in_progress;
                 rows.push(row(
                     entry.id.clone(),
                     Some(entry.created_at.clone()),
                     RowKind::Message {
                         message: message.clone(),
                         show_assistant_meta: show_meta,
-                        show_assistant_timestamp: terminal && in_progress && !message.streaming,
                         show_copy: show_meta,
                         copy_streaming: message.streaming || in_progress,
                         grouped_with_next: false,
