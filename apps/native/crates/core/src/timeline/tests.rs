@@ -1491,9 +1491,9 @@ fn mcp_apps_keep_source_identity_and_stay_outside_work_folds() {
 }
 
 #[test]
-fn provider_refresh_reply_updates_the_instance_banner_and_models() {
+fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
     use crate::server_config::{ServerConfig, ServerConfigState, ServerProvider};
-    use crate::settings::providers::decode_providers_reply;
+    use crate::providers::StatusRefresh;
     use serde_json::json;
     let original = json!({
         "instanceId":"work-codex", "driver":"codex", "displayName":"Work Codex", "enabled":true,
@@ -1505,19 +1505,32 @@ fn provider_refresh_reply_updates_the_instance_banner_and_models() {
     let before = provider_banner(&provider).unwrap();
     assert_eq!(before.instance_id, "work-codex");
     assert_eq!(before.refresh_tooltip, "Refresh Work Codex provider status");
+    let read = serde_json::from_value(json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap();
+    let mut refresh = StatusRefresh::default();
+    refresh.set_target(Some(1), Some("thread-a"), Some("work-codex"));
+    let ticket = refresh.start(Some(&read)).unwrap();
     let mut refreshed = original;
     refreshed["status"] = json!("warning");
     refreshed["message"] = json!("New diagnostic from refresh");
     refreshed["models"] = json!([{"slug":"new-model","name":"New model","isCustom":false}]);
-    assert!(config.apply_providers(decode_providers_reply(json!({"providers":[refreshed.clone()]})).unwrap()));
+    assert!(config.apply(serde_json::from_value(json!({"type":"providerStatuses","payload":{"providers":[refreshed.clone()]}})).unwrap()));
     let current = &config.config.as_ref().unwrap().providers[0];
     assert_eq!(current.models.len(), 1);
     let banner = provider_banner(current).unwrap();
     assert_ne!(before.key, banner.key);
     assert_eq!(banner.message, "New diagnostic from refresh");
+    assert!(refresh.finish(&ticket));
+    assert_eq!(provider_banner(&config.config.as_ref().unwrap().providers[0]).unwrap(), banner);
+    assert_eq!(config.config.as_ref().unwrap().providers[0].models.len(), 1);
+    let old = refresh.start(Some(&read)).unwrap();
+    refresh.set_target(Some(2), Some("thread-a"), Some("work-codex"));
+    let current = refresh.start(Some(&read)).unwrap();
+    assert!(!refresh.finish(&old));
+    assert!(refresh.pending());
     refreshed["status"] = json!("ready");
     refreshed["auth"] = json!({"status":"authenticated"});
-    assert!(config.apply_providers(decode_providers_reply(json!({"providers":[refreshed]})).unwrap()));
+    assert!(config.apply(serde_json::from_value(json!({"type":"providerStatuses","payload":{"providers":[refreshed]}})).unwrap()));
     assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
-    assert!(decode_providers_reply(json!({"providers":"invalid"})).is_none());
+    assert!(refresh.finish(&current));
+    assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
 }

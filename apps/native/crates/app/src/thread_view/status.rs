@@ -16,7 +16,7 @@ use t3_core::timeline::{
 };
 
 use super::ThreadView;
-use crate::app_state::{AppEvent, uuid_v4};
+use crate::app_state::uuid_v4;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::glass;
 use crate::icons::{Icon, ProviderLogo, provider_logo};
@@ -78,7 +78,7 @@ pub struct Banners {
     dismissed_errors: HashSet<String>,
     dismissed_provider: Option<String>,
     error_expanded: bool,
-    refreshing: bool,
+    refresh: t3_core::providers::StatusRefresh,
     can_refresh: bool,
     grants: Option<(u64, Task<()>)>,
 }
@@ -97,6 +97,7 @@ impl ThreadView {
             return;
         }
         self.banners.grants = None;
+        self.banners.refresh.reset();
         self.banners.can_refresh = false;
         cx.notify();
         let (Some(connection), Some(client)) = (connection, client) else { return };
@@ -116,32 +117,20 @@ impl ThreadView {
     }
 
     fn refresh_banner_provider(&mut self, cx: &mut Context<Self>) {
-        if self.banners.refreshing { return; }
-        let Some(banner) = &self.banners.lines.provider else { return };
+        self.sync_banners(cx);
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else { return };
-        if !t3_core::providers::can_refresh(client.session_state().borrow().as_ref()) { return; }
-        let asked_on = state.connection_id();
-        let request = state.rpc(t3_core::settings::providers::SERVER_REFRESH_PROVIDERS, t3_core::providers::RefreshProviders::Status(&banner.instance_id).payload());
-        let state = self.state.clone();
-        self.banners.refreshing = true;
+        let Some(ticket) = self.banners.refresh.start(client.session_state().borrow().as_ref()) else { return };
+        let request = state.rpc(t3_core::settings::providers::SERVER_REFRESH_PROVIDERS, ticket.payload());
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let reply = request.await;
-            state.update(cx, |state, cx| {
-                if asked_on.is_none() || asked_on != state.connection_id() { return; }
-                match reply {
-                    Ok(reply) => {
-                        if t3_core::settings::providers::decode_providers_reply(reply).is_some_and(|providers| state.server_config.apply_providers(providers)) {
-                            cx.emit(AppEvent::ServerConfig);
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "Refresh provider status failed"),
-                }
-            });
+            // The stream owns provider status; a unary reply may predate a newer push.
+            let result = request.await.map(|_| ());
             let _ = this.update(cx, |view, cx| {
-                view.banners.refreshing = false;
-                view.sync_banners(cx);
+                if !view.banners.refresh.finish(&ticket) { return; }
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Refresh provider status failed");
+                }
                 cx.notify();
             });
         }).detach();
@@ -165,7 +154,10 @@ impl ThreadView {
             Some(banner) if self.banners.dismissed_provider.as_deref() == Some(banner.key.as_str()) => next.provider = None,
             Some(_) => {}
         }
+        let was_pending = self.banners.refresh.pending();
+        self.banners.refresh.set_target(state.connection_id(), self.thread_id.as_deref(), next.provider.as_ref().map(|banner| banner.instance_id.as_str()));
         if next == self.banners.lines {
+            if was_pending != self.banners.refresh.pending() { cx.notify(); }
             return;
         }
         if next.error.as_ref().map(|error| &error.message) != self.banners.lines.error.as_ref().map(|error| &error.message) {
@@ -266,6 +258,7 @@ impl ThreadView {
 
     /// Forgets the footer and the thread's local error when another thread opens; the list was reset.
     pub(super) fn reset_status(&mut self) {
+        self.banners.refresh.reset();
         self.footer = ThreadFooter::default();
         self.local_error = None;
         self.banners.error_expanded = false;
@@ -595,7 +588,7 @@ impl ThreadView {
                 }),
                 cx,
             );
-            let refreshing = self.banners.refreshing;
+            let refreshing = self.banners.refresh.pending();
             #[cfg(feature = "snapshot")]
             let refreshing = refreshing || cx.try_global::<crate::snapshot::ProviderRefreshPending>().is_some();
             let refresh = Button::new("refresh-provider-status", ButtonVariant::Outline, ButtonSize::Xs)

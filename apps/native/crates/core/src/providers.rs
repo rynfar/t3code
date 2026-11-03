@@ -11,6 +11,7 @@ use crate::sidebar::time::parse_iso;
 
 /// Refresh inputs from `ProviderStatusBanner.tsx`, provider settings, Usage and composer menus.
 /// `client-runtime/src/state/server.ts` adds on-demand workspace snapshots to every request.
+/// Native does not opt into `/usage-limits` until the composer can intercept that command.
 pub enum RefreshProviders<'a> {
     Status(&'a str),
     Settings,
@@ -44,6 +45,67 @@ impl RefreshProviders<'_> {
 /// `CLIENT_GUARDED_RPC_SCOPES[serverRefreshProviders]` / its `permissionAtom`.
 pub fn can_refresh(session: Option<&crate::auth::AuthSessionState>) -> bool {
     session.is_some_and(|session| session.grants(crate::auth::ORCHESTRATION_READ_SCOPE))
+}
+
+/// `ProviderStatusBanner.tsx`: a refresh belongs to one visible thread/provider/connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshTarget {
+    connection: u64,
+    thread_id: String,
+    instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshTicket {
+    target: RefreshTarget,
+    serial: u64,
+}
+
+impl RefreshTicket {
+    pub fn payload(&self) -> serde_json::Value {
+        RefreshProviders::Status(&self.target.instance_id).payload()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct StatusRefresh {
+    target: Option<RefreshTarget>,
+    pending: Option<RefreshTicket>,
+    serial: u64,
+}
+
+impl StatusRefresh {
+    pub fn set_target(&mut self, connection: Option<u64>, thread_id: Option<&str>, instance_id: Option<&str>) {
+        let next = connection.zip(thread_id).zip(instance_id).map(|((connection, thread_id), instance_id)| (connection, thread_id, instance_id));
+        if self.target.as_ref().map(|target| (target.connection, target.thread_id.as_str(), target.instance_id.as_str())) != next {
+            self.pending = None;
+            self.target = next.map(|(connection, thread_id, instance_id)| RefreshTarget { connection, thread_id: thread_id.into(), instance_id: instance_id.into() });
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.target = None;
+        self.pending = None;
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn start(&mut self, session: Option<&crate::auth::AuthSessionState>) -> Option<RefreshTicket> {
+        if self.pending() || !can_refresh(session) { return None; }
+        let target = self.target.clone()?;
+        self.serial += 1;
+        let ticket = RefreshTicket { target, serial: self.serial };
+        self.pending = Some(ticket.clone());
+        Some(ticket)
+    }
+
+    pub fn finish(&mut self, ticket: &RefreshTicket) -> bool {
+        if self.pending.as_ref() != Some(ticket) { return false; }
+        self.pending = None;
+        true
+    }
 }
 
 /// Drivers whose instances are off until configured (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
