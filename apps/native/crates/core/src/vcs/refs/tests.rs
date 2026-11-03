@@ -253,3 +253,45 @@ fn automatic_highlight_follows_pending_create_into_the_existing_search_result() 
         "a provisional Create also follows later-arriving exact matches"
     );
 }
+
+#[test]
+fn hover_pins_enter_target_across_results_and_pointer_leave_respects_keyboard_navigation() {
+    let mut list = RefListing::default();
+    let initial = list.begin("", false).unwrap();
+    assert!(list.finish(&initial, Ok(vec![page(&["main", "other"], None)])));
+    let main = RefChoice::Ref("main".into());
+    let other = RefChoice::Ref("other".into());
+    let mut highlight = RefHighlight::default();
+    highlight.update(&list, &[0, 1], None, "");
+    assert_eq!(highlight.choice, Some(main.clone()));
+    highlight.hover(&other);
+    assert_eq!(highlight.choice, Some(other.clone()), "hover must change the same identity Enter resolves");
+    assert_eq!(highlight.choice.as_ref().unwrap().index_in(&list.refs, &[0, 1], None), Some(1));
+    assert!(!highlight.hover(&other), "stationary selection does not request another repaint");
+    assert!(highlight.leave_pointer());
+    assert!(highlight.choice.is_none(), "leaving a pointer-selected row clears Enter's target");
+    highlight.update(&list, &[0, 1], None, "");
+    assert!(highlight.choice.is_none(), "pointer leave does not restore the automatic first item");
+    highlight.select(other.clone());
+    assert!(!highlight.leave_pointer(), "keyboard navigation owns the highlight until pointer movement resumes");
+    assert_eq!(highlight.choice, Some(other.clone()));
+    highlight.hover(&other);
+    highlight.keyboard();
+    assert!(!highlight.leave_pointer(), "non-navigation keys also end pointer modality");
+    assert_eq!(highlight.choice, Some(other.clone()));
+    assert!(highlight.hover(&main));
+    assert!(highlight.hover(&other));
+    assert_eq!(highlight.choice, Some(other.clone()));
+
+    highlight.reset();
+    highlight.update(&list, &[1], Some("oth"), "oth");
+    assert_eq!(highlight.choice, Some(other.clone()));
+    assert!(!highlight.hover(&other), "hover must pin an already automatic highlight too");
+    let search = list.begin("oth", false).unwrap();
+    assert!(list.finish(&search, Ok(vec![page(&["other-new", "other"], None)])));
+    highlight.update(&list, &[0, 1], Some("oth"), "oth");
+    assert_eq!(highlight.choice, Some(other.clone()), "arriving results cannot replace a pointer selection");
+    assert_eq!(highlight.choice.as_ref().unwrap().index_in(&list.refs, &[0, 1], None), Some(1));
+    assert!(highlight.leave_pointer());
+    assert!(highlight.choice.is_none());
+}

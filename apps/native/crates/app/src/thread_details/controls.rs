@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement,
+    AnyElement, App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, MouseMoveEvent, ParentElement,
     RenderOnce, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use gpui_component::menu::DropdownMenu;
@@ -16,6 +16,7 @@ use crate::right_panel::{focusable, tooltip_view};
 use crate::theme::{hsla, metrics, palette};
 
 type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+type MouseMoveHandler = Rc<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)>;
 
 pub const ROW_HEIGHT: f32 = 32.;
 /// Sections pad 8px on each side, so a popup anchored to a row is the card minus 16.
@@ -289,16 +290,29 @@ pub struct MenuRow {
     label: SharedString,
     trailing: Option<AnyElement>,
     on_click: Option<Handler>,
+    highlighted: Option<bool>,
+    on_mouse_move: Option<MouseMoveHandler>,
 }
 
 impl MenuRow {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
-        MenuRow { id: id.into(), label: label.into(), trailing: None, on_click: None }
+        MenuRow { id: id.into(), label: label.into(), trailing: None, on_click: None, highlighted: None, on_mouse_move: None }
     }
 
     /// End-aligned content: a shortcut, a badge, a running indicator.
     pub fn trailing(mut self, element: impl IntoElement) -> Self {
         self.trailing = Some(element.into_any_element());
+        self
+    }
+
+    pub fn highlighted(mut self, highlighted: bool) -> Self {
+        self.highlighted = Some(highlighted);
+        self
+    }
+
+    /// Movement, rather than entry, restores pointer selection after keyboard navigation.
+    pub fn on_mouse_move(mut self, handler: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_mouse_move = Some(Rc::new(handler));
         self
     }
 
@@ -322,7 +336,12 @@ impl RenderOnce for MenuRow {
             .rounded(px(4.))
             .text_sm()
             .text_color(hsla(p.foreground))
-            .when(enabled, |this| this.cursor_pointer().hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground))))
+            .when(enabled, |this| this.cursor_pointer())
+            .when(self.highlighted.is_none() && enabled, |this| this.hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground))))
+            .when(self.highlighted == Some(true), |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+            .when_some(self.on_mouse_move.filter(|_| enabled), |this, handler| {
+                this.on_mouse_move(move |event, window, cx| handler(event, window, cx))
+            })
             .child(div().flex_1().min_w_0().truncate().child(self.label))
             .children(self.trailing)
             .when_some(self.on_click.filter(|_| enabled), |this, handler| {

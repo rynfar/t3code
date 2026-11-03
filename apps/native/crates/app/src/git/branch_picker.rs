@@ -195,8 +195,13 @@ impl BranchPicker {
         };
         let choice = match &item { Item::Ref(item) => RefChoice::Ref(item.name.clone()), Item::Create(name) => RefChoice::Create(name.clone()) };
         let highlighted = self.highlighted.choice.as_ref() == Some(&choice);
+        let hover_choice = choice.clone();
+        let row = row.highlighted(highlighted).on_mouse_move(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            if this.highlighted.hover(&hover_choice) { cx.notify(); }
+        }));
         let row = if enabled { row.on_click(cx.listener(move |this, _, window, cx| this.activate(choice.clone(), window, cx))) } else { row };
-        div().rounded(px(4.)).when(highlighted, |this| this.bg(hsla(p.accent))).child(row).into_any_element()
+        div().w_full().child(row).into_any_element()
     }
 }
 
@@ -227,6 +232,13 @@ impl Render for BranchPicker {
             .w(px(ROW_WIDTH))
             .max_h(px(360.))
             .occlude()
+            .capture_key_down(cx.listener(|this, _, _, _| this.highlighted.keyboard()))
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                if this.highlighted.leave_pointer() { cx.notify(); }
+            }))
+            .on_hover(cx.listener(|this, inside: &bool, _, cx| {
+                if !inside && this.highlighted.leave_pointer() { cx.notify(); }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
             .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {

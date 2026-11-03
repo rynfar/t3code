@@ -207,11 +207,16 @@ impl RefChoice {
 pub struct RefHighlight {
     pub choice: Option<RefChoice>,
     automatic: bool,
+    pointer_selected: bool,
 }
 
 impl Default for RefHighlight {
     fn default() -> Self {
-        Self { choice: None, automatic: true }
+        Self {
+            choice: None,
+            automatic: true,
+            pointer_selected: false,
+        }
     }
 }
 
@@ -220,9 +225,33 @@ impl RefHighlight {
         *self = Self::default();
     }
 
+    pub fn hover(&mut self, choice: &RefChoice) -> bool {
+        let changed = self.choice.as_ref() != Some(choice);
+        if changed {
+            self.choice = Some(choice.clone());
+        }
+        self.automatic = false;
+        self.pointer_selected = true;
+        changed
+    }
+
+    pub fn leave_pointer(&mut self) -> bool {
+        if !self.pointer_selected {
+            return false;
+        }
+        self.choice = None;
+        self.pointer_selected = false;
+        true
+    }
+
+    pub fn keyboard(&mut self) {
+        self.pointer_selected = false;
+    }
+
     pub fn select(&mut self, choice: RefChoice) {
         self.choice = Some(choice);
         self.automatic = false;
+        self.keyboard();
     }
 
     pub fn update(&mut self, listing: &RefListing, indices: &[usize], create: Option<&str>, query: &str) {
