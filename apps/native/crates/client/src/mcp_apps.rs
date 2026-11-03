@@ -7,6 +7,23 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use t3_core::mcp_apps::{MAX_HTML_BYTES, Operation, Reference};
 
+/// A cached app keeps its environment identity, never an authenticated supervisor handle.
+pub struct AppConnection {
+    environment: String,
+}
+
+impl AppConnection {
+    pub fn new(client: &ClientHandle) -> Self {
+        Self {
+            environment: client.environment().into(),
+        }
+    }
+
+    pub fn resolve(&self, current: Option<ClientHandle>) -> Option<ClientHandle> {
+        current.filter(|client| client.environment() == self.environment)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Target {
     pub thread_id: String,
@@ -180,6 +197,40 @@ mod tests {
                 .await;
             assert!(job.await.unwrap().is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn cached_app_uses_replacement_connection_and_refuses_other_or_missing_environments() {
+        let mut server = FakeServer::start().await;
+        let (old, _old_events) = supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut old_socket = server.connection().await;
+        let app = AppConnection::new(&old);
+        let mut credentials = server.credentials();
+        credentials.access_token = "replacement-token".into();
+        let (replacement, _replacement_events) = supervisor::start(&tokio::runtime::Handle::current(), credentials);
+        let mut replacement_socket = server.connection().await;
+        let target = Target {
+            thread_id: "source-thread".into(),
+            item_id: "source-item".into(),
+        };
+        let current = app.resolve(Some(replacement.clone())).unwrap();
+        let request = tokio::spawn(async move { read_resource(&current, &target, "ui://weather/dashboard").await });
+        let (is_replacement, frame) = tokio::select! {
+            frame = old_socket.request("mcpApps.readResource") => (false, frame),
+            frame = replacement_socket.request("mcpApps.readResource") => (true, frame),
+        };
+        assert!(is_replacement, "cached app used its original authenticated connection");
+        replacement_socket
+            .send(json!({"_tag":"Exit","requestId":frame["id"],"exit":{"_tag":"Success","value":{"contents":[]}}}))
+            .await;
+        assert!(request.await.unwrap().is_ok());
+        drop(old);
+        old_socket.closed().await;
+        assert!(app.resolve(None).is_none());
+        let other = FakeServer::start().await;
+        let (unrelated, _events) = supervisor::start(&tokio::runtime::Handle::current(), other.credentials());
+        assert!(app.resolve(Some(unrelated)).is_none());
+        assert!(app.resolve(Some(replacement)).is_some());
     }
 
     #[test]

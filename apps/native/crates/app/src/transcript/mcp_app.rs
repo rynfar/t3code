@@ -23,7 +23,7 @@ use crate::webview::{self, Layer, Page, WebEvent, WebView};
 
 const MAX_PAGES: usize = 24;
 const MAX_VIEWS: usize = 6;
-const TRANSPORT: &str = r#"(()=>{let delivering=false;window.__t3McpReceive=(data)=>{delivering=true;try{window.dispatchEvent(new MessageEvent('message',{data,source:window}));}finally{delivering=false;}};window.addEventListener('message',e=>{if(!delivering&&e.source===window&&e.data&&e.data.jsonrpc==='2.0')window.ipc.postMessage(JSON.stringify(e.data));});})();"#;
+const TRANSPORT: &str = include_str!("mcp_app_transport.js");
 type Key = (String, String, String, String, gpui::EntityId);
 
 struct Frames {
@@ -64,7 +64,10 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
         frame.clone()
     } else {
         let entry = entry.clone();
-        let frame = cx.new(|cx| McpFrame::new(state, entry, cx));
+        let Some(client) = state.read(cx).client_handle() else {
+            return div().into_any_element();
+        };
+        let frame = cx.new(|cx| McpFrame::new(state, &client, entry, cx));
         cx.global_mut::<Frames>().pages.insert(key.clone(), (0, frame.clone()));
         frame
     };
@@ -90,7 +93,8 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
 }
 
 struct McpFrame {
-    client: Option<t3_client::supervisor::ClientHandle>,
+    connection: t3_client::mcp_apps::AppConnection,
+    state: Entity<AppState>,
     runtime: tokio::runtime::Handle,
     entry: Arc<McpAppEntry>,
     html: Option<Arc<str>>,
@@ -110,11 +114,11 @@ struct McpFrame {
 }
 
 impl McpFrame {
-    fn new(state: Entity<AppState>, entry: Arc<McpAppEntry>, cx: &mut Context<Self>) -> Self {
-        let client = state.read(cx).client_handle();
+    fn new(state: Entity<AppState>, client: &t3_client::supervisor::ClientHandle, entry: Arc<McpAppEntry>, cx: &mut Context<Self>) -> Self {
         let runtime = state.read(cx).runtime().clone();
         let mut frame = Self {
-            client,
+            connection: t3_client::mcp_apps::AppConnection::new(client),
+            state,
             runtime,
             entry,
             html: None,
@@ -137,6 +141,14 @@ impl McpFrame {
         frame
     }
 
+    fn client(&self, cx: &App) -> Option<t3_client::supervisor::ClientHandle> {
+        let state = self.state.read(cx);
+        let current = matches!(state.phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected))
+            .then(|| state.client_handle())
+            .flatten();
+        self.connection.resolve(current)
+    }
+
     fn target(&self) -> t3_client::mcp_apps::Target {
         t3_client::mcp_apps::Target {
             thread_id: self.entry.source_thread_id.clone(),
@@ -151,7 +163,7 @@ impl McpFrame {
             self.failed = self.html.is_none();
             return;
         }
-        let Some(client) = self.client.clone() else {
+        let Some(client) = self.client(cx) else {
             self.failed = true;
             return;
         };
@@ -193,7 +205,7 @@ impl McpFrame {
         if fixture::page(&self.entry.reference.attachment_id).is_some() {
             return;
         }
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client(cx) else { return };
         let target = self.target();
         let revision = t3_core::timeline::detail_revision(&self.entry.item);
         let job = self.runtime.spawn(async move {
@@ -281,9 +293,9 @@ impl McpFrame {
                     }
                 }
                 Action::Request { token, operation } => {
-                    let Some(client) = self.client.clone() else {
+                    let Some(client) = self.client(cx) else {
                         if let Some(host) = &mut self.host {
-                            let actions = host.complete(token, Err("The app's thread is not running.".into()));
+                            let actions = host.complete(token, Err("The app's environment is not connected.".into()));
                             self.actions(actions, cx);
                         }
                         continue;

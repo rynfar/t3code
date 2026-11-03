@@ -188,6 +188,14 @@ impl Connection {
         }
     }
 
+    pub async fn closed(&mut self) {
+        tokio::time::timeout(WAIT, async {
+            while let Some(frame) = self.socket.next().await {
+                if matches!(frame, Ok(Message::Close(_)) | Err(_)) { return; }
+            }
+        }).await.expect("dropping the last handle closes the connection");
+    }
+
     /// Requests in arrival order until one has this tag.
     pub async fn request(&mut self, tag: &str) -> Value {
         loop {
