@@ -396,7 +396,7 @@ async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, loca
     let (stop, stop_rx) = oneshot::channel::<()>();
     let life = life.clone();
     let monitor = tokio::spawn(async move {
-        let (_in_flight, _registered) = (in_flight, registered);
+        let _in_flight = in_flight;
         let stop = async {
             tokio::select! {
                 _ = stop_rx => {}
@@ -408,6 +408,8 @@ async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, loca
             status = child.wait() => status.ok().and_then(|status| status.code()),
             () = stop => stop_child(&mut child, pid).await,
         };
+        // The leader is reaped now, so its group ID may be reused: quit must no longer signal it.
+        drop(registered);
         // Diagnostics drain until the tunnel closes, unless a helper it started holds stderr.
         if let Some(drain) = drain {
             let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;

@@ -269,9 +269,10 @@ if [ -z "$REMOTE_PORT" ]; then
     else
       printf 'It wrote nothing to %s, so it exited before producing any output.\n' "$LOG_FILE" >&2
     fi
-    # REMOTE_PID is this shell's own `$!` from just above, not a recorded PID.
-    kill "$REMOTE_PID" 2>/dev/null || true
-    wait_for_pid_exit "$REMOTE_PID"
+    if owns_server "$REMOTE_PID"; then
+      kill "$REMOTE_PID" 2>/dev/null || true
+      wait_for_pid_exit "$REMOTE_PID"
+    fi
     rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE" "$STARTED_FILE"
     exit 1
   fi
