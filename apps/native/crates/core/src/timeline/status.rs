@@ -416,9 +416,11 @@ pub fn status_line(thread: &SidebarThread, now: i64) -> Option<StatusLine> {
 }
 
 /// `ProviderStatusBanner`: the banner for the thread's provider when it is not ready. Version
-/// compatibility advisories and provider setup are not on the native wire model yet.
+/// compatibility advisories and provider setup actions are not presented here yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderBanner {
+    pub instance_id: String,
+    pub refresh_tooltip: String,
     pub key: String,
     pub title: String,
     pub message: String,
@@ -449,6 +451,8 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
         format!("{name} provider has limited availability.")
     };
     Some(ProviderBanner {
+        instance_id: provider.instance_id.clone(),
+        refresh_tooltip: format!("Refresh {name} provider status"),
         key,
         title: if unauthenticated { format!("{name} is unauthenticated") } else { format!("{name} provider status") },
         message,

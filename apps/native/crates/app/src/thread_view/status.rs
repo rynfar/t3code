@@ -20,7 +20,7 @@ use crate::app_state::uuid_v4;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::glass;
 use crate::icons::{Icon, ProviderLogo, provider_logo};
-use crate::theme::{hsla, metrics, palette};
+use crate::theme::{hsla, metrics, palette, rem};
 use crate::toast::{Toast, ToastKind};
 use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, ghost_text_button, inline_button};
 
@@ -78,12 +78,62 @@ pub struct Banners {
     dismissed_errors: HashSet<String>,
     dismissed_provider: Option<String>,
     error_expanded: bool,
+    refresh: t3_core::providers::StatusRefresh,
+    can_refresh: bool,
+    grants: Option<(u64, Task<()>)>,
 }
 
 impl ThreadView {
     pub(super) fn sync_status(&mut self, cx: &mut Context<Self>) {
+        self.watch_banner_grants(cx);
         self.sync_banners(cx);
         self.sync_footer(cx);
+    }
+
+    pub(super) fn watch_banner_grants(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let (connection, client) = (state.connection_id(), state.client_handle());
+        if self.banners.grants.as_ref().map(|(id, _)| *id) == connection {
+            return;
+        }
+        self.banners.grants = None;
+        self.banners.refresh.reset();
+        self.banners.can_refresh = false;
+        cx.notify();
+        let (Some(connection), Some(client)) = (connection, client) else { return };
+        let mut grants = client.session_state();
+        self.banners.can_refresh = t3_core::providers::can_refresh(grants.borrow_and_update().as_ref());
+        self.banners.grants = Some((connection, cx.spawn(async move |this, cx| {
+            while grants.changed().await.is_ok() {
+                let allowed = t3_core::providers::can_refresh(grants.borrow_and_update().as_ref());
+                if this.update(cx, |view, cx| {
+                    if view.banners.can_refresh != allowed {
+                        view.banners.can_refresh = allowed;
+                        cx.notify();
+                    }
+                }).is_err() { return; }
+            }
+        })));
+    }
+
+    fn refresh_banner_provider(&mut self, cx: &mut Context<Self>) {
+        self.sync_banners(cx);
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let Some(ticket) = self.banners.refresh.start(client.session_state().borrow().as_ref()) else { return };
+        let request = state.rpc(t3_core::settings::providers::SERVER_REFRESH_PROVIDERS, ticket.payload());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // The stream owns provider status; a unary reply may predate a newer push.
+            let result = request.await.map(|_| ());
+            let _ = this.update(cx, |view, cx| {
+                if !view.banners.refresh.finish(&ticket) { return; }
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Refresh provider status failed");
+                }
+                cx.notify();
+            });
+        }).detach();
     }
 
     fn sync_banners(&mut self, cx: &mut Context<Self>) {
@@ -104,7 +154,10 @@ impl ThreadView {
             Some(banner) if self.banners.dismissed_provider.as_deref() == Some(banner.key.as_str()) => next.provider = None,
             Some(_) => {}
         }
+        let was_pending = self.banners.refresh.pending();
+        self.banners.refresh.set_target(state.connection_id(), self.thread_id.as_deref(), next.provider.as_ref().map(|banner| banner.instance_id.as_str()));
         if next == self.banners.lines {
+            if was_pending != self.banners.refresh.pending() { cx.notify(); }
             return;
         }
         if next.error.as_ref().map(|error| &error.message) != self.banners.lines.error.as_ref().map(|error| &error.message) {
@@ -205,6 +258,7 @@ impl ThreadView {
 
     /// Forgets the footer and the thread's local error when another thread opens; the list was reset.
     pub(super) fn reset_status(&mut self) {
+        self.banners.refresh.reset();
         self.footer = ThreadFooter::default();
         self.local_error = None;
         self.banners.error_expanded = false;
@@ -534,6 +588,16 @@ impl ThreadView {
                 }),
                 cx,
             );
+            let refreshing = self.banners.refresh.pending();
+            #[cfg(feature = "snapshot")]
+            let refreshing = refreshing || cx.try_global::<crate::snapshot::ProviderRefreshPending>().is_some();
+            let refresh = Button::new("refresh-provider-status", ButtonVariant::Outline, ButtonSize::Xs)
+                .icon(Icon::RefreshCw)
+                .label(if refreshing { "Refreshing..." } else { "Refresh" })
+                .tooltip(banner.refresh_tooltip.clone())
+                .disabled(!self.banners.can_refresh || refreshing)
+                .on_click(cx.listener(|view, _, _, cx| view.refresh_banner_provider(cx)));
+            let body = v_flex().gap(rem(8.)).child(body).child(h_flex().flex_wrap().justify_end().gap(rem(12.)).child(refresh)).into_any_element();
             banners.push(alert(banner.warning, AlertIcon::Lucide(Icon::Info), Some(banner.title.clone()), vec![body], vec![dismiss], f32::INFINITY, cx));
         }
         if let (Some(error), Some(thread_id)) = (&lines.error, self.thread_id.as_deref()) {

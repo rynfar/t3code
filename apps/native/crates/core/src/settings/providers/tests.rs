@@ -292,6 +292,7 @@ fn add_dialog_ids_follow_the_web() {
 
 #[test]
 fn refresh_and_update_payloads_and_replies() {
+    assert!(decode_providers_reply(json!({"providers":"invalid"})).is_none());
     assert_eq!(refresh_payload(), json!({ "refreshModels": true, "reloadSecrets": true, "workspaceSnapshotsOnDemand": true }));
     assert_eq!(update_payload("codex", "codex_work", None), json!({ "provider": "codex", "instanceId": "codex_work" }));
     assert_eq!(update_payload("codex", "codex", Some("0.49.0"))["targetVersion"], "0.49.0");

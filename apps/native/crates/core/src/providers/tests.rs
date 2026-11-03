@@ -184,3 +184,64 @@ fn accents_and_badges_mark_instances_apart() {
     assert!(shows_instance_badge(&entries[0], &entries));
     assert!(!shows_instance_badge(&entries[2], &entries));
 }
+
+#[test]
+fn status_refresh_matches_the_native_subscription_capabilities() {
+    assert_eq!(super::RefreshProviders::Status("work-codex").payload(), serde_json::json!({
+        "instanceId": "work-codex", "refreshModels": true, "workspaceSnapshotsOnDemand": true
+    }));
+    assert_eq!(super::RefreshProviders::Status("work-codex").payload().get("usageLimitsCommand"), crate::commands::subscribe_server_config().get("usageLimitsCommand"));
+}
+
+#[test]
+fn status_refresh_requires_this_environments_authenticated_read_grant() {
+    use crate::auth::AuthSessionState;
+    let session = |value| serde_json::from_value::<AuthSessionState>(value).unwrap();
+    let read = session(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]}));
+    let operate = session(serde_json::json!({"authenticated":true,"permissions":["orchestration:operate","providers:manage"]}));
+    let revoked = session(serde_json::json!({"authenticated":true,"permissions":[],"scopes":["orchestration:read"]}));
+    let legacy = session(serde_json::json!({"authenticated":true,"scopes":["orchestration:read"]}));
+    let signed_out = session(serde_json::json!({"authenticated":false,"permissions":["orchestration:read"]}));
+    for (grants, expected) in [(None,false),(Some(&read),true),(Some(&operate),false),(Some(&revoked),false),(Some(&legacy),true),(Some(&signed_out),false)] {
+        assert_eq!(super::can_refresh(grants), expected);
+    }
+}
+
+
+#[test]
+fn status_refresh_invalidates_pending_when_its_context_changes() {
+    let read = serde_json::from_value(json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap();
+    for (connection, thread, instance) in [(Some(2),Some("thread-a"),Some("codex")), (Some(1),Some("thread-b"),Some("codex")), (Some(1),Some("thread-a"),Some("claudeAgent")), (None,None,None)] {
+        let mut refresh = StatusRefresh::default();
+        refresh.set_target(Some(1), Some("thread-a"), Some("codex"));
+        let old = refresh.start(Some(&read)).unwrap();
+        assert!(refresh.pending());
+        assert!(refresh.start(Some(&read)).is_none());
+        refresh.set_target(Some(1), Some("thread-a"), Some("codex"));
+        assert!(refresh.pending(), "unchanged context preserves the request");
+        refresh.set_target(connection, thread, instance);
+        assert!(!refresh.pending(), "a different context must not inherit Refreshing...");
+        assert!(!refresh.finish(&old));
+    }
+}
+
+#[test]
+fn status_refresh_ignores_old_completions_even_after_returning_to_the_same_target() {
+    let read = serde_json::from_value(json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap();
+    let mut refresh = StatusRefresh::default();
+    refresh.set_target(Some(1), Some("thread-a"), Some("codex"));
+    assert!(refresh.start(None).is_none());
+    let old = refresh.start(Some(&read)).unwrap();
+    refresh.reset();
+    assert!(!refresh.pending());
+    refresh.set_target(Some(1), Some("thread-a"), Some("codex"));
+    let current = refresh.start(Some(&read)).unwrap();
+    assert_eq!(old.payload(), current.payload());
+    assert_ne!(old, current);
+    assert!(!refresh.finish(&old));
+    assert!(refresh.pending(), "a stale completion cannot release a newer request");
+    assert!(refresh.finish(&current));
+    assert!(!refresh.pending());
+    assert!(!refresh.finish(&current));
+    assert!(refresh.start(Some(&read)).is_some(), "success or failure may be retried");
+}

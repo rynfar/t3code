@@ -367,7 +367,7 @@ pub fn enable_cursor_keychain_patch() -> Value {
 
 /// `server.refreshProviders` as the web sends it for Limits.
 pub fn refresh_providers_payload() -> Value {
-    json!({ "workspaceSnapshotsOnDemand": true })
+    crate::providers::RefreshProviders::Limits.payload()
 }
 
 /// Where the connection stands, as `EnvironmentConnectionPhase` names it.
