@@ -25,7 +25,7 @@ use crate::app_state::AppState;
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
-[--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
+[--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
@@ -142,6 +142,7 @@ pub struct Options {
     context_meter: bool,
     /// Opens the welcome wizard at a step whatever the first-run gate decides.
     welcome: Option<crate::onboarding::Step>,
+    welcome_terminal_fixture: Option<PathBuf>,
     /// A `WorktreeSetupSnapshot` file shown for `--thread` instead of the server's.
     worktree_setup: Option<PathBuf>,
     resource_telemetry_fixture: Option<PathBuf>,
@@ -198,6 +199,7 @@ impl Options {
                 Some("agents") => crate::onboarding::Step::Agents,
                 _ => crate::onboarding::Step::Connection,
             }),
+            welcome_terminal_fixture: flag("--welcome-terminal-fixture").map(PathBuf::from),
             worktree_setup: flag("--worktree-setup").map(PathBuf::from),
             resource_telemetry_fixture: flag("--resource-telemetry-fixture").map(PathBuf::from),
             gestures: gestures(&args),
@@ -463,6 +465,11 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     if let Some(step) = options.welcome {
         cx.update(|cx| crate::onboarding::open(step, cx));
+        pump(&mut cx, options.wait.min(3.), |_| false);
+    }
+    if let Some(path) = &options.welcome_terminal_fixture {
+        let fixture = serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        cx.update_window(window, |_, window, cx| crate::onboarding::terminal_fixture(fixture, window, cx)).map_err(|error| error.to_string())??;
         pump(&mut cx, options.wait.min(3.), |_| false);
     }
     if options.new_thread {

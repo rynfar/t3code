@@ -244,6 +244,14 @@ fn payloads_match_the_contract() {
     assert_eq!(attach["resume"], true);
     assert_eq!(attach_input("t1", "term-1", &root, None, false).get("resume"), None);
     assert_eq!(attach_input("t1", "term-1", &root, None, false)["worktreePath"], json!(null));
+    assert_eq!(attach.get("providerInstanceId"), None);
+    let setup = LaunchLocation { provider_instance_id: Some("codex-work".to_owned()), ..LaunchLocation::new("/setup", None) };
+    for resume in [false, true] {
+        let attach = attach_input("onboarding-agent-setup", "onboarding-codex-uuid", &setup, None, resume);
+        assert_eq!(attach["providerInstanceId"], "codex-work");
+        assert_eq!(attach["cwd"], "/setup");
+    }
+    assert_eq!(open_input("onboarding-agent-setup", "onboarding-codex-uuid", &setup, None)["providerInstanceId"], "codex-work");
     assert_eq!(close_input("t1", "term-1", true)["deleteHistory"], true);
     assert_eq!(close_input("t1", "term-1", false).get("deleteHistory"), None);
     assert_eq!(resize_input("t1", "term-1", Grid::new(0, 9999)), json!({ "threadId": "t1", "terminalId": "term-1", "cols": 1, "rows": 500 }));

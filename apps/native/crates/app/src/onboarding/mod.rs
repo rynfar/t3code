@@ -4,10 +4,10 @@
 //! reuses the connect screen's pairing (`environments.rs`). One environment is connected at a
 //! time, so the connection step picks the computer to set up. Pending evidence never blocks the
 //! app as the web's blank gate does: the wizard opens over it once a fresh workspace is confirmed.
-//! Not here yet: T3 Connect (CN-RELAY), Codex's ChatGPT setup, and the setup
-//! terminal (the agents step shows the command to run instead).
+//! Not here yet: T3 Connect (CN-RELAY) and Codex's ChatGPT setup.
 
 mod agents;
+mod agent_terminal;
 mod connection;
 mod projects;
 #[cfg(test)]
@@ -111,7 +111,8 @@ struct WelcomeFetch {
 /// The agent whose setup command shows below the cards (`AgentInstallTerminal`'s session).
 struct AgentSetup {
     driver: &'static str,
-    command: String,
+    terminal: Entity<agent_terminal::AgentInstallTerminal>,
+    _closed: Subscription,
 }
 
 pub struct WelcomeWizard {
@@ -128,6 +129,8 @@ pub struct WelcomeWizard {
     /// A pasted link is pairing; the field clears once it succeeds.
     submitted: bool,
     setup: Option<AgentSetup>,
+    terminal_access: bool,
+    terminal_grants: Option<(u64, Task<()>)>,
     copied: Option<(String, Task<()>)>,
     projects: projects::Projects,
     _subscriptions: Vec<Subscription>,
@@ -162,10 +165,13 @@ impl WelcomeWizard {
             pairing_help_open: false,
             submitted: false,
             setup: None,
+            terminal_access: false,
+            terminal_grants: None,
             copied: None,
             projects: projects::Projects::default(),
             _subscriptions: subscriptions,
         };
+        wizard.watch_terminal_grants(cx);
         wizard.evaluate(cx);
         #[cfg(feature = "snapshot")]
         cx.set_global(Host(cx.weak_entity()));
@@ -197,6 +203,7 @@ impl WelcomeWizard {
             self.projects_changed(cx);
         }
         if event == AppEvent::Phase {
+            self.watch_terminal_grants(cx);
             let app = self.state.read(cx);
             let (pairing, failed, unpaired) = (app.connect.pairing.is_some(), app.connect.error.is_some(), app.phase == Phase::Unpaired);
             if self.submitted && !pairing {
@@ -584,4 +591,38 @@ pub fn open(step: Step, cx: &mut App) {
             }
         });
     }
+}
+
+#[cfg(feature = "snapshot")]
+pub use agent_terminal::Fixture as TerminalFixture;
+
+#[cfg(feature = "snapshot")]
+pub fn terminal_fixture(fixture: TerminalFixture, window: &mut Window, cx: &mut App) -> Result<(), String> {
+    let wizard = cx
+        .try_global::<Host>()
+        .and_then(|host| host.0.upgrade())
+        .ok_or("no welcome wizard")?;
+    wizard.update(cx, |wizard, cx| {
+        let app = wizard.state.read(cx);
+        let client = app
+            .client_handle()
+            .ok_or("no connection for terminal fixture")?;
+        wizard.terminal_access = fixture.can_operate;
+        let terminal =
+            agent_terminal::AgentInstallTerminal::fixture(fixture, client, app.runtime().clone())?;
+        let terminal = cx.new(|_| terminal);
+        terminal.update(cx, |terminal, cx| terminal.prepare_pane(window, cx));
+        let closed = cx.subscribe(&terminal, |this, _, _: &agent_terminal::Closed, cx| {
+            this.setup = None;
+            this.refresh_providers(cx);
+            cx.notify();
+        });
+        wizard.setup = Some(AgentSetup {
+            driver: "codex",
+            terminal,
+            _closed: closed,
+        });
+        cx.notify();
+        Ok(())
+    })
 }
