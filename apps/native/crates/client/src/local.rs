@@ -282,17 +282,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct SpawningCli {
         script: PathBuf,
         status: tokio::net::TcpListener,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl SpawningCli {
+        async fn require_bash_tcp() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds preflight listener");
+            let port = listener.local_addr().expect("preflight address").port();
+            let mut child = tokio::process::Command::new("/bin/bash")
+                .args(["-c", &format!("exec 3<>/dev/tcp/127.0.0.1/{port}")])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("bash /dev/tcp is unavailable");
+            tokio::select! {
+                biased;
+                connection = listener.accept() => {
+                    connection.expect("bash /dev/tcp is unavailable");
+                }
+                status = child.wait() => {
+                    status.expect("bash /dev/tcp is unavailable");
+                    // A successful probe may exit before Tokio delivers the queued connection.
+                    listener.into_std().expect("preflight listener").accept().expect("bash /dev/tcp is unavailable");
+                }
+            }
+            let status = child.wait().await.expect("bash /dev/tcp is unavailable");
+            assert!(status.success(), "bash /dev/tcp is unavailable: {status}");
+        }
+
         async fn new(dir: &Path) -> Self {
             use std::os::unix::fs::PermissionsExt;
 
+            Self::require_bash_tcp().await;
             // Socket EOF readiness works on macOS, where named FIFOs can miss that event.
             let status = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds status listener");
             let port = status.local_addr().expect("status address").port();
@@ -313,13 +340,19 @@ wait
 
         async fn grandchild(&self) -> tokio::io::BufReader<tokio::net::TcpStream> {
             use tokio::io::AsyncBufReadExt;
-            let (stream, _) = self.status.accept().await.expect("accepts grandchild");
-            let mut events = tokio::io::BufReader::new(stream);
-            let mut line = String::new();
-            events.read_line(&mut line).await.expect("reads PID");
-            let pid = line.trim().parse().expect("grandchild PID");
-            assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
-            events
+            loop {
+                let (stream, _) = self.status.accept().await.expect("accepts grandchild");
+                let mut events = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                events.read_line(&mut line).await.expect("reads PID");
+                // HTTP probes can reach this ephemeral listener before the grandchild.
+                if line.starts_with("HEAD ") {
+                    continue;
+                }
+                let pid = line.trim().parse().expect("grandchild PID");
+                assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
+                return events;
+            }
         }
 
         async fn exits(mut events: tokio::io::BufReader<tokio::net::TcpStream>) {
@@ -333,7 +366,7 @@ wait
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn a_timed_out_cli_takes_everything_it_started_with_it() {
         let dir = scratch("timeout");
@@ -349,7 +382,7 @@ wait
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cancelling_a_running_cli_kills_its_process_group() {
         let dir = scratch("cancel");
