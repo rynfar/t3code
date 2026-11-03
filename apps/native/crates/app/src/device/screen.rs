@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Context, Corners, DispatchPhase, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, SharedString, Styled, Task,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, RenderOnce, SharedString, Styled, Task,
     Window, canvas, div, point, prelude::*, px, size,
 };
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::v_flex;
+use gpui_component::{Selectable, v_flex};
 use t3_client::device_stream::{DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender};
 use t3_core::device::stream::{
     CONNECTING_VIDEO, HardwareButton, KeyPhase, Screen, StreamStatus, TouchPhase, fit_frame, input_disconnected_label, screen_aspect, screen_rotation,
@@ -33,6 +33,41 @@ use crate::theme::{hsla, palette};
 
 /// `CONTROLS_RAIL_WIDTH`: the screen keeps clear of the rail.
 const RAIL_WIDTH: f32 = 56.;
+
+// DropdownMenu forwards its open state through Selectable before rendering the trigger.
+#[derive(IntoElement)]
+struct MoreButton(Button);
+
+impl Selectable for MoreButton {
+    fn selected(self, selected: bool) -> Self {
+        Self(self.0.selected(selected))
+    }
+
+    fn is_selected(&self) -> bool {
+        self.0.is_selected()
+    }
+}
+
+impl Styled for MoreButton {
+    fn style(&mut self) -> &mut gpui::StyleRefinement {
+        self.0.style()
+    }
+}
+
+impl InteractiveElement for MoreButton {
+    fn interactivity(&mut self) -> &mut gpui::Interactivity {
+        self.0.interactivity()
+    }
+}
+
+impl DropdownMenu for MoreButton {}
+
+impl RenderOnce for MoreButton {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let open = self.is_selected();
+        self.0.when(!open, |button| button.tooltip("More device actions"))
+    }
+}
 
 struct Decoded {
     image: Arc<RenderImage>,
@@ -331,7 +366,7 @@ impl DeviceScreen {
         let simlock = self.host_kind(cx) == Some(HostKind::Simlock);
         let (devices, thread, surface) = (self.devices.clone(), self.thread_id.clone(), self.surface_id.clone());
         let session = (self.device.host_id.clone(), self.device.id.clone());
-        let more = Button::new("device-more").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Ellipsis).tooltip("More device actions").dropdown_menu(move |menu, _, _| {
+        let more = MoreButton(Button::new("device-more").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Ellipsis)).dropdown_menu(move |menu, _, _| {
             let (close_devices, close_thread, close_surface) = (devices.clone(), thread.clone(), surface.clone());
             let (power_devices, power_thread, power_surface, power_session) = (devices.clone(), thread.clone(), surface.clone(), session.clone());
             menu.item(PopupMenuItem::new("Close device panel").on_click(move |_, _, cx| {

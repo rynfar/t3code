@@ -133,7 +133,7 @@ impl RenderOnce for ComposerControl {
                 div().min_w_0().truncate().when_some(self.max_label_width, |this, width| this.max_w(px(width))).child(label)
             }))
             .children(self.suffix)
-            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
+            .when_some(self.tooltip.filter(|_| !self.pressed), |this, text| this.tooltip(tooltip(text)))
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| handler(event, window, cx))
             })
