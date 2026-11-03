@@ -6,14 +6,23 @@
 use std::path::PathBuf;
 
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use super::*;
 use crate::test_server::FakeServer;
 
-const FAKE_SSH: &str = r#"#!/bin/sh
+const FAKE_SSH: &str = r#"#!/bin/bash
 dir='@@DIR@@'
 printf '%s\n' "$*" >> "$dir/calls"
+started() {
+  exec 3<>/dev/tcp/127.0.0.1/@@STATUS_PORT@@ || exit 1
+  printf '%s %s %s\n' '@@NONCE@@' "$1" "$$" >&3
+  read -r release <&3
+  printf 'survived\n' >&3
+  exit 1
+}
 case " $* " in
   *" -G "*) printf 'hostname %s\nuser julius\nport 2222\n' "$(cat "$dir/hostname" 2>/dev/null || echo devbox.example.com)"; exit 0 ;;
 esac
@@ -34,21 +43,17 @@ esac
 "#;
 
 /// A launch still downloading the release.
-const LAUNCH_HANGS: &str = r#"     printf '%s\n' "$$" > "$dir/launch.pid"
-     exec sleep 600"#;
+const LAUNCH_HANGS: &str = "     started launch";
 
 /// A tunnel that ignores SIGTERM, as a hung `ssh` can.
-const TUNNEL_IGNORES_TERM: &str = r#"    trap '' TERM
-    printf '%s\n' "$$" > "$dir/tunnel.pid"
-    while :; do sleep 1; done"#;
+const TUNNEL_IGNORES_TERM: &str = "    trap '' TERM\n    started tunnel";
 
 /// Another process holds the forwarded port.
 const TUNNEL_PORT_TAKEN: &str = r#"    printf 'bind [127.0.0.1]:x: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port\n' >&2
     exit 255"#;
 
 /// A tunnel that stays up until it is signalled.
-const TUNNEL_SLEEPS: &str = r#"    printf '%s\n' "$$" > "$dir/tunnel.pid"
-    exec sleep 600"#;
+const TUNNEL_WAITS: &str = "    started tunnel";
 
 /// Only the askpass helper's `hunter2` gets in.
 const AUTH_PASSWORD: &str = r#"if [ "$("${SSH_ASKPASS:-false}" 2>/dev/null)" != 'hunter2' ]; then
@@ -61,6 +66,34 @@ const AGENT_FAILURE: &str = "sign_and_send_pubkey: signing failed for ED25519 \"
 struct Fixture {
     dir: PathBuf,
     program: PathBuf,
+    status: TcpListener,
+    nonce: String,
+}
+
+struct FakeProcess {
+    pid: i32,
+    events: BufReader<TcpStream>,
+}
+
+impl FakeProcess {
+    async fn stopped(mut self) {
+        // A survivor reports itself when released; natural expiry cannot masquerade as a kill.
+        self.events.get_mut().shutdown().await.expect("releases fake ssh");
+        let mut remaining = String::new();
+        self.events.read_to_string(&mut remaining).await.expect("reads fake ssh EOF");
+        assert!(remaining.is_empty(), "fake ssh survived: {remaining}");
+    }
+
+    fn stopped_without_runtime(self) {
+        use std::io::Read;
+        let mut stream = self.events.into_inner().into_std().expect("status socket");
+        stream.set_nonblocking(false).expect("blocking status socket");
+        stream.shutdown(std::net::Shutdown::Write).expect("releases fake ssh");
+        let mut remaining = String::new();
+        // Keep Tokio's monitor unpolled: only shutdown's synchronous signal can kill this fake.
+        stream.read_to_string(&mut remaining).expect("reads fake ssh EOF");
+        assert!(remaining.is_empty(), "fake ssh survived synchronous shutdown: {remaining}");
+    }
 }
 
 impl Fixture {
@@ -73,26 +106,52 @@ impl Fixture {
         let dir = std::env::temp_dir().join(format!("t3-ssh-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
+        let status = std::net::TcpListener::bind("127.0.0.1:0").expect("binds fake ssh status");
+        let port = status.local_addr().expect("status address").port();
+        status.set_nonblocking(true).expect("nonblocking listener");
+        let status = TcpListener::from_std(status).expect("status listener");
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
         let program = dir.join("ssh");
-        let script = FAKE_SSH.replace("@@DIR@@", &dir.display().to_string()).replace("@@AUTH@@", auth).replace("@@TUNNEL@@", tunnel).replace("@@LAUNCH@@", launch);
+        let script = FAKE_SSH
+            .replace("@@DIR@@", &dir.display().to_string())
+            .replace("@@STATUS_PORT@@", &port.to_string())
+            .replace("@@NONCE@@", &nonce)
+            .replace("@@AUTH@@", auth)
+            .replace("@@TUNNEL@@", tunnel)
+            .replace("@@LAUNCH@@", launch);
         std::fs::write(&program, script).expect("writes the fake ssh");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        Fixture { dir, program }
+        Fixture { dir, program, status, nonce }
     }
 
     fn lines(&self, file: &str) -> Vec<String> {
         std::fs::read_to_string(self.dir.join(file)).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
-    /// The PID a fake recorded once it started. Bounded, so a fake that never got there fails.
-    async fn recorded_pid(&self, file: &str) -> i32 {
-        for _ in 0..200 {
-            if let Some(pid) = std::fs::read_to_string(self.dir.join(file)).ok().and_then(|pid| pid.trim().parse().ok()) {
-                return pid;
+    async fn started(&self, role: &str) -> FakeProcess {
+        let mut readers = tokio::task::JoinSet::new();
+        let prefix = format!("{} {role} ", self.nonce);
+        loop {
+            tokio::select! {
+                connection = self.status.accept() => {
+                    let (stream, _) = connection.expect("accepts fake ssh");
+                    readers.spawn(async move {
+                        let mut events = BufReader::new(stream);
+                        let mut line = String::new();
+                        if events.read_line(&mut line).await.ok()? == 0 {
+                            return None;
+                        }
+                        Some((events, line))
+                    });
+                }
+                finished = readers.join_next(), if !readers.is_empty() => {
+                    let Some(Ok(Some((events, line)))) = finished else { continue };
+                    let Some(pid) = line.strip_prefix(&prefix).and_then(|line| line.strip_suffix('\n')).and_then(|pid| pid.parse().ok()) else { continue };
+                    assert!(alive(pid), "fake ssh is alive before stopping it");
+                    return FakeProcess { pid, events };
+                }
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("{file} was never recorded");
     }
 
     fn manager(&self, prompts: Option<mpsc::UnboundedSender<PasswordRequest>>) -> SshEnvironments {
@@ -127,17 +186,6 @@ fn running(pid: i32) -> bool {
     alive(pid) && !stat.unwrap_or_default().contains('Z')
 }
 
-/// Whether the process stops within a few seconds; a killed child is reaped asynchronously.
-async fn stops(pid: i32) -> bool {
-    for _ in 0..100 {
-        if !running(pid) {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    false
-}
-
 async fn devbox_server() -> FakeServer {
     let server = FakeServer::start().await;
     server.set_descriptor(Some(json!({ "environmentId": "env-devbox", "label": "devbox", "serverVersion": "0.1.7", "orchestrationProtocolVersion": 2 })));
@@ -147,7 +195,7 @@ async fn devbox_server() -> FakeServer {
 #[tokio::test]
 async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
     let server = devbox_server().await;
-    let fixture = Fixture::new("provision", "", TUNNEL_SLEEPS);
+    let fixture = Fixture::new("provision", "", TUNNEL_WAITS);
     let ssh = fixture.manager(None);
     let port = forward_to(&ssh, &devbox(), &server);
 
@@ -176,17 +224,20 @@ async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
     assert_eq!(ssh.prepare(&pairing.target, Some("env-devbox"), "http://127.0.0.1:1").await, Err(PrepareError::Moved(address.clone())));
 
     // Disconnect stops the tunnel the app spawned and the remote server.
-    let pid = fixture.recorded_pid("tunnel.pid").await;
+    let tunnel = fixture.started("tunnel").await;
+    let pid = tunnel.pid;
     assert!(alive(pid));
     ssh.disconnect(&pairing.target).await.expect("disconnects");
+    tunnel.stopped().await;
     assert!(!alive(pid), "the tunnel is stopped and reaped");
     assert_eq!(fixture.lines("stops").len(), 1);
 
     // Quitting stops tunnels and leaves the remote server for the next launch.
-    let _ = std::fs::remove_file(fixture.dir.join("tunnel.pid"));
     ssh.ensure(&pairing.target, false).await.expect("connects again");
-    let pid = fixture.recorded_pid("tunnel.pid").await;
+    let tunnel = fixture.started("tunnel").await;
+    let pid = tunnel.pid;
     ssh.shutdown().await;
+    tunnel.stopped().await;
     assert!(!alive(pid));
     assert_eq!(fixture.lines("stops").len(), 1);
 }
@@ -194,7 +245,7 @@ async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
 #[tokio::test]
 async fn a_password_host_asks_in_the_app_and_retries_through_askpass() {
     let server = devbox_server().await;
-    let fixture = Fixture::new("password", AUTH_PASSWORD, TUNNEL_SLEEPS);
+    let fixture = Fixture::new("password", AUTH_PASSWORD, TUNNEL_WAITS);
     let (prompts, mut requests) = mpsc::unbounded_channel();
     let ssh = fixture.manager(Some(prompts));
     forward_to(&ssh, &devbox(), &server);
@@ -225,7 +276,7 @@ async fn a_password_host_asks_in_the_app_and_retries_through_askpass() {
 #[tokio::test]
 async fn auth_failures_a_password_cannot_fix_or_a_cancelled_prompt_stop_the_attempt() {
     // The local agent could not sign: no prompt, and the failure is ssh's own words.
-    let fixture = Fixture::new("agent", &format!("printf '%s\\n' '{}' >&2\nexit 255", AGENT_FAILURE.replace('\n', "' '")), TUNNEL_SLEEPS);
+    let fixture = Fixture::new("agent", &format!("printf '%s\\n' '{}' >&2\nexit 255", AGENT_FAILURE.replace('\n', "' '")), TUNNEL_WAITS);
     let (prompts, mut requests) = mpsc::unbounded_channel();
     let ssh = fixture.manager(Some(prompts));
     let Err(PrepareError::Transient(message)) = ssh.provision(&devbox(), None).await else { panic!("fails without asking") };
@@ -233,7 +284,7 @@ async fn auth_failures_a_password_cannot_fix_or_a_cancelled_prompt_stop_the_atte
     assert!(requests.try_recv().is_err(), "no prompt for an agent failure");
 
     // A cancelled prompt waits for the user instead of retrying.
-    let fixture = Fixture::new("cancel", AUTH_PASSWORD, TUNNEL_SLEEPS);
+    let fixture = Fixture::new("cancel", AUTH_PASSWORD, TUNNEL_WAITS);
     let (prompts, mut requests) = mpsc::unbounded_channel::<PasswordRequest>();
     let ssh = fixture.manager(Some(prompts));
     tokio::spawn(async move {
@@ -292,27 +343,31 @@ fn the_askpass_helper_prints_the_cached_answer() {
 
 #[tokio::test]
 async fn quitting_stops_ssh_still_starting_the_server() {
-    let fixture = Fixture::with_launch("quit", "", TUNNEL_SLEEPS, LAUNCH_HANGS);
+    let fixture = Fixture::with_launch("quit", "", TUNNEL_WAITS, LAUNCH_HANGS);
+    let address = fixture.status.local_addr().expect("status address");
+    let mut unrelated = TcpStream::connect(address).await.expect("unrelated peer");
+    unrelated.write_all(b"HEAD / HTTP/1.1\r\n").await.expect("unrelated request");
+    let _silent = TcpStream::connect(address).await.expect("silent peer");
     let ssh = fixture.manager(None);
     let starting = tokio::spawn({
         let ssh = ssh.clone();
         async move { ssh.ensure(&devbox(), false).await }
     });
-    let launch = fixture.recorded_pid("launch.pid").await;
+    let launch = fixture.started("launch").await;
     ssh.shutdown().await;
-    assert!(stops(launch).await, "the launch that was still installing is stopped");
+    launch.stopped().await;
     assert_eq!(starting.await.expect("joins").err(), Some(quitting()));
 
     // A tunnel still waiting to answer stops too, and nothing new starts after the quit.
-    let fixture = Fixture::new("quit-tunnel", "", TUNNEL_SLEEPS);
+    let fixture = Fixture::new("quit-tunnel", "", TUNNEL_WAITS);
     let ssh = fixture.manager(None);
     let starting = tokio::spawn({
         let ssh = ssh.clone();
         async move { ssh.ensure(&devbox(), false).await }
     });
-    let tunnel = fixture.recorded_pid("tunnel.pid").await;
+    let tunnel = fixture.started("tunnel").await;
     ssh.shutdown().await;
-    assert!(stops(tunnel).await, "the tunnel that never answered is stopped");
+    tunnel.stopped().await;
     assert!(starting.await.expect("joins").is_err());
     assert_eq!(ssh.ensure(&devbox(), false).await.err(), Some(quitting()));
 }
@@ -337,14 +392,16 @@ async fn disconnect_stops_the_tunnel_it_started_after_the_config_moves_the_alias
     // The config gains or changes a HostName while connected.
     for (name, original) in [("moved", "devbox.example.com"), ("moved-plain", "devbox")] {
         let server = devbox_server().await;
-        let fixture = Fixture::new(name, "", TUNNEL_SLEEPS);
+        let fixture = Fixture::new(name, "", TUNNEL_WAITS);
         std::fs::write(fixture.dir.join("hostname"), original).expect("writes");
         let ssh = fixture.manager(None);
         forward_to(&ssh, &devbox(), &server);
         let bootstrap = ssh.ensure(&devbox(), false).await.expect("connects");
-        let pid = fixture.recorded_pid("tunnel.pid").await;
+        let tunnel = fixture.started("tunnel").await;
+        let pid = tunnel.pid;
         std::fs::write(fixture.dir.join("hostname"), "devbox-new.example.com").expect("writes");
         ssh.disconnect(&bootstrap.target).await.expect("disconnects");
+        tunnel.stopped().await;
         assert!(!alive(pid), "the running tunnel is found and stopped");
         let stops = fixture.lines("stops");
         assert!(stops.len() == 1 && stops[0].contains(&format!("-o HostName={original} ")), "the stop reaches the host the server runs on: {stops:?}");
@@ -354,24 +411,15 @@ async fn disconnect_stops_the_tunnel_it_started_after_the_config_moves_the_alias
 }
 
 #[tokio::test]
-async fn quitting_kills_a_tunnel_that_ignores_sigterm_within_the_quit_budget() {
+async fn quitting_kills_a_tunnel_that_ignores_sigterm_before_returning() {
     let server = devbox_server().await;
     let fixture = Fixture::new("quit-term", "", TUNNEL_IGNORES_TERM);
     let ssh = fixture.manager(None);
     forward_to(&ssh, &devbox(), &server);
     ssh.ensure(&devbox(), false).await.expect("connects");
-    let pid = fixture.recorded_pid("tunnel.pid").await;
-    // GPUI gives quit handlers 200 ms; the kill must not wait for the SIGTERM grace period.
+    let tunnel = fixture.started("tunnel").await;
     drop(ssh.shutdown());
-    let mut gone = false;
-    for _ in 0..20 {
-        if !running(pid) {
-            gone = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(gone, "killed at once, not after the 2 s SIGTERM grace");
+    tunnel.stopped_without_runtime();
 }
 
 #[test]
@@ -381,9 +429,11 @@ fn the_stop_script_signals_only_the_server_it_started() {
     let _ = std::fs::remove_dir_all(&home);
     let state = home.join(".t3/ssh-launch/native-k");
     std::fs::create_dir_all(&state).expect("state dir");
-    // Detached, as the nohup'd remote server is, so it is reaped once it stops.
-    let spawned = std::process::Command::new("/bin/sh").args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"]).output().expect("sh runs");
-    let pid: i32 = String::from_utf8_lossy(&spawned.stdout).trim().parse().expect("a pid");
+    let mut server = std::process::Command::new("/bin/sh").args(["-c", "read -r release"]).stdin(Stdio::piped()).spawn().expect("server runs");
+    let pid = i32::try_from(server.id()).expect("server pid");
+    let _input = server.stdin.take().expect("server stdin");
+    // Reap concurrently, as the remote server's parent would while the stop script runs.
+    let reaped = std::thread::spawn(move || server.wait().expect("server exits"));
     let started = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().expect("ps runs");
     let started = String::from_utf8_lossy(&started.stdout).trim_end_matches('\n').to_owned();
     // A `ps` that cannot tell, as on a host without one.
@@ -415,10 +465,7 @@ fn the_stop_script_signals_only_the_server_it_started() {
     let output = stop(&started);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(!running(pid), "its own server is stopped");
-    let still_ours = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim_end_matches('\n') == started);
-    if still_ours {
-        // SAFETY: a plain syscall on the sleep this test started, identified by its start time.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(reaped.join().expect("reaps server").signal(), Some(libc::SIGTERM));
     let _ = std::fs::remove_dir_all(&home);
 }
