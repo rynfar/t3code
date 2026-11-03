@@ -107,7 +107,7 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
 
 async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, oneshot::Sender<Result<Value, RpcError>>) {
     match rx.recv().await {
-        Some(Command::Request { method: method::DISPATCH_COMMAND, payload, reply }) => (payload, reply),
+        Some(Command::Request { method: method::DISPATCH_COMMAND, payload, reply, .. }) => (payload, reply),
         _ => panic!("expected a dispatch"),
     }
 }
@@ -116,7 +116,7 @@ async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, one
 async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
     let (commands, mut rx) = mpsc::unbounded_channel();
     let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() });
-    let handle = ClientHandle { commands, credentials, session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 };
+    let handle = ClientHandle { refs: Default::default(), commands, credentials, session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 };
     let sends = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
     let run = tokio::spawn(async move { handle.dispatch_in_order(sends).await });
 
@@ -352,4 +352,106 @@ async fn published_themes_arrive_prepared_from_the_network_worker() {
         }
     }
     assert!(state.config.as_ref().unwrap().environment_theme_definitions.is_empty());
+}
+
+#[tokio::test]
+async fn ref_commands_settle_before_the_picker_refreshes_and_stale_results_are_discarded() {
+    use t3_core::vcs::{self, method as vcs_method};
+
+    let mut server = FakeServer::start().await;
+    let (client, _events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut connection = server.connection().await;
+    answer_config(&mut connection, None).await;
+    let input = vcs::list_refs("/repo", None, None, 100);
+    let pending = tokio::spawn({
+        let client = client.clone();
+        let input = input.clone();
+        async move { client.list_refs(input).await }
+    });
+    let old = connection.request(vcs_method::VCS_LIST_REFS).await;
+    assert_eq!(old["payload"], input);
+
+    let mut revision = client.refs_revision();
+    for rpc in [
+        vcs_method::VCS_PULL,
+        vcs_method::VCS_REFRESH_STATUS,
+        "git.preparePullRequestThread",
+    ] {
+        let payload = if rpc == "git.preparePullRequestThread" {
+            json!({"cwd":"/repo","reference":"42","mode":"local"})
+        } else { json!({"cwd":"/repo"}) };
+        let response = client.request(rpc, payload);
+        let request = connection.request(rpc).await;
+        let exit = if rpc == vcs_method::VCS_PULL {
+            json!({"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"fetch completed but pull failed"}}]})
+        } else {
+            json!({"_tag":"Success","value":null})
+        };
+        connection
+            .send(json!({"_tag":"Exit","requestId":request["id"],"exit":exit}))
+            .await;
+        assert_eq!(response.await.is_ok(), rpc != vcs_method::VCS_PULL);
+        revision.changed().await.unwrap();
+    }
+    assert_eq!(*revision.borrow(), 3);
+    connection.send(json!({"_tag":"Exit","requestId":old["id"],"exit":{"_tag":"Success","value":{"refs":[{"name":"stale"}]}}})).await;
+    assert!(pending.await.unwrap().unwrap().is_none());
+
+    let canceled = client.request(vcs_method::VCS_REFRESH_STATUS, json!({"cwd":"/repo"}));
+    connection.request(vcs_method::VCS_REFRESH_STATUS).await;
+    drop(canceled);
+    revision.changed().await.unwrap();
+    assert_eq!(*revision.borrow(), 4);
+
+    let refreshed = tokio::spawn({
+        let client = client.clone();
+        async move { client.list_refs(input).await }
+    });
+    let request = connection.request(vcs_method::VCS_LIST_REFS).await;
+    assert_eq!(
+        request["payload"],
+        json!({"cwd":"/repo","limit":100,"refresh":true})
+    );
+    connection.send(json!({"_tag":"Exit","requestId":request["id"],"exit":{"_tag":"Success","value":{"refs":[{"name":"release"}]}}})).await;
+    assert_eq!(
+        refreshed.await.unwrap().unwrap().unwrap().refs[0].name,
+        "release"
+    );
+}
+
+#[tokio::test]
+async fn stacked_action_exits_invalidate_refs_on_success_failure_and_interruption() {
+    use t3_core::vcs::{self, method as vcs_method};
+
+    let mut server = FakeServer::start().await;
+    let (client, _events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut connection = server.connection().await;
+    answer_config(&mut connection, None).await;
+    let mut revision = client.refs_revision();
+    for (index, outcome) in ["success", "failure", "interruption"].iter().enumerate() {
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move { client.list_refs(vcs::list_refs("/repo", None, None, 100)).await }
+        });
+        let refs = connection.request(vcs_method::VCS_LIST_REFS).await;
+        let opening = client.stream(vcs_method::GIT_RUN_STACKED_ACTION, json!({"cwd":"/repo","actionId":"action","action":"commit","featureBranch":true}));
+        let action = connection.request(vcs_method::GIT_RUN_STACKED_ACTION).await;
+        let mut stream = opening.await.unwrap();
+        assert_eq!(*revision.borrow(), index as u64, "opening a stream does not settle it");
+        if *outcome != "interruption" {
+            let exit = if *outcome == "success" {
+                json!({"_tag":"Success","value":null})
+            } else {
+                json!({"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"failed after creating a feature branch"}}]})
+            };
+            connection.send(json!({"_tag":"Exit","requestId":action["id"],"exit":exit})).await;
+            let result = stream.receiver.recv().await;
+            if *outcome == "success" { assert!(result.is_none()); } else { assert!(matches!(result, Some(Err(_)))); }
+        }
+        drop(stream);
+        revision.changed().await.unwrap();
+        assert_eq!(*revision.borrow(), index as u64 + 1);
+        connection.send(json!({"_tag":"Exit","requestId":refs["id"],"exit":{"_tag":"Success","value":{"refs":[{"name":"stale"}]}}})).await;
+        assert!(pending.await.unwrap().unwrap().is_none());
+    }
 }

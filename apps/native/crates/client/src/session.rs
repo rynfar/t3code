@@ -87,6 +87,7 @@ pub struct Session {
 }
 
 pub struct StreamHandle {
+    pub(crate) settled: Option<crate::vcs::OnSettled>,
     pub receiver: mpsc::Receiver<Result<Value, RpcError>>,
     id: RequestId,
     outbound: mpsc::UnboundedSender<ClientMessage>,
@@ -257,7 +258,7 @@ impl Session {
                 }
             }
         });
-        Ok(StreamHandle { receiver, id, outbound: self.outbound.clone(), pending: self.pending.clone() })
+        Ok(StreamHandle { settled: None, receiver, id, outbound: self.outbound.clone(), pending: self.pending.clone() })
     }
 
     /// Resolves with the close reason once the socket is gone.

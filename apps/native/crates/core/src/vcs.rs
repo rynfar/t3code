@@ -9,6 +9,8 @@ use serde_json::{Map, Value, json};
 
 use crate::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE, SOURCE_CONTROL_WRITE_SCOPE};
 
+pub mod refs;
+
 pub mod method {
     pub const SUBSCRIBE_VCS_STATUS: &str = "subscribeVcsStatus";
     pub const VCS_PULL: &str = "vcs.pull";
