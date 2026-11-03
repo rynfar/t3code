@@ -39,6 +39,7 @@ pub struct Workspace {
     lineage: Entity<crate::lineage::ComposerLineage>,
     composer_replaced: bool,
     draft: Entity<DraftHero>,
+    prompt_links: Entity<crate::prompt_links::PromptLinks>,
     home: Entity<crate::home::HomeView>,
     connect: Entity<ConnectView>,
     welcome: Entity<crate::onboarding::WelcomeWizard>,
@@ -62,10 +63,11 @@ impl Workspace {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
         let dialog = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
-        let palette = cx.new(|cx| CommandPalette::new(state.clone(), window, cx));
         let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+        let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer.clone(), window, cx));
+        let prompt_links = cx.new(|cx| crate::prompt_links::PromptLinks::new(state.clone(), composer.clone(), window, cx));
         let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
         let lineage = cx.new(|cx| crate::lineage::ComposerLineage::new(state.clone(), cx));
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
@@ -116,6 +118,7 @@ impl Workspace {
             lineage,
             composer_replaced: false,
             draft,
+            prompt_links,
             home,
             connect,
             welcome,
@@ -262,6 +265,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleProjectSearch, window, cx| {
                 this.palette.update(cx, |palette, cx| palette.toggle_mode(PaletteMode::Content, window, cx));
             }))
+            .on_action(cx.listener(|this, _: &crate::composer::prompt_links::CopyPromptLink, _, cx| this.composer.update(cx, |composer, cx| composer.copy_prompt_link(false, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::prompt_links::CopyPromptLinkWithContext, _, cx| this.composer.update(cx, |composer, cx| composer.copy_prompt_link(true, cx))))
+            .on_action(cx.listener(|this, action: &crate::composer::prompt_links::ReplaceLinkedPrompt, window, cx| this.composer.update(cx, |composer, cx| composer.replace_linked_prompt(action, window, cx))))
             .on_action(|_: &Unimplemented, _, cx| cx.propagate())
             .on_action(cx.listener(|this, _: &crate::thread_view::FindInThread, window, cx| this.thread.update(cx, |view, cx| view.open_find(window, cx))))
             .on_action(cx.listener(|this, _: &LinkPullRequest, window, cx| crate::pull_requests::open_link_dialog(&this.link_dialog, window, cx)))
@@ -341,6 +347,7 @@ impl Render for Workspace {
             .when(!on_pull_requests, |this| this.child(self.right_panel.clone()))
             .child(self.render_sidebar_toggle(cx))
             .children(crate::transcript::html_render::fullscreen(window, cx))
+            .child(self.prompt_links.clone())
             .child(self.menu.clone())
             .child(self.dialog.clone())
             .child(self.git_dialogs.clone())

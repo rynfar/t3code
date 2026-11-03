@@ -146,6 +146,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
             )))
         });
     let copy_text = text.to_string();
+    let prompt_link = t3_core::prompt_links::prompt_link_for(&text, None, None, None);
     let actions = h_flex()
         .justify_end()
         .gap(px(8.))
@@ -165,6 +166,10 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                 cx,
             )
         }))
+        .children(prompt_link.map(|link| tooltip_icon_button(
+            SharedString::from(format!("copy-prompt-link:{id}")), Icon::Link, "Copy prompt link", false,
+            cx.listener(move |view, _, _, cx| crate::composer::prompt_links::copy(&view.state, link.clone(), cx)), cx,
+        )))
         .child(ghost_icon_button(
             SharedString::from(format!("copy-user:{id}")),
             Icon::Copy,

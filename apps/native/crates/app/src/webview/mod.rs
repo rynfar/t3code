@@ -133,6 +133,13 @@ pub fn set_offscreen() {
     OFFSCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn is_offscreen() -> bool {
+    #[cfg(feature = "snapshot")]
+    return OFFSCREEN.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "snapshot"))]
+    false
+}
+
 /// Whether the window can host native views: not on other platforms or the offscreen renderer.
 pub fn available(window: &Window) -> bool {
     #[cfg(feature = "snapshot")]

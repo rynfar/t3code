@@ -58,6 +58,7 @@ impl Mode {
 
 pub struct CommandPalette {
     state: Entity<AppState>,
+    composer: Entity<crate::composer::Composer>,
     input: Entity<InputState>,
     open: bool,
     mode: Mode,
@@ -123,7 +124,7 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
 }
 
 impl CommandPalette {
-    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, composer: Entity<crate::composer::Composer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands, projects, and threads..."));
         let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
@@ -155,6 +156,7 @@ impl CommandPalette {
         });
         CommandPalette {
             state,
+            composer,
             input,
             open: false,
             mode: Mode::Command,
@@ -332,7 +334,13 @@ impl CommandPalette {
             })
             .unwrap_or_default();
         self.projects = build_project_action_items(&projects, "project", |_| Vec::new(), None);
-        self.root = build_root_groups(action_items(state), recent);
+        let mut actions = action_items(state);
+        for (context, value, title) in [(false,"action:copy-prompt-link","Copy prompt link"),(true,"action:copy-prompt-link-context","Copy prompt link with repo and model")] {
+            if self.composer.read(cx).prompt_link(context,cx).is_some() {
+                actions.push(CommandPaletteItem { value: value.into(), title: title.into(), search_terms: vec!["copy prompt link share repo model".into()], ..Default::default() });
+            }
+        }
+        self.root = build_root_groups(actions, recent);
         self.threads = items;
     }
 
@@ -403,6 +411,8 @@ impl CommandPalette {
         self.close(window, cx);
         if let Some(command) = value.strip_prefix("action:") {
             let action: Box<dyn gpui::Action> = match command {
+                "copy-prompt-link" => Box::new(crate::composer::prompt_links::CopyPromptLink),
+                "copy-prompt-link-context" => Box::new(crate::composer::prompt_links::CopyPromptLinkWithContext),
                 "toggle-sidebar" => keymap::action_for("sidebar.toggle"),
                 "pin" => keymap::action_for("thread.pin"),
                 "settle" => keymap::action_for("thread.settle"),

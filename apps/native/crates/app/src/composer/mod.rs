@@ -13,6 +13,7 @@ pub(crate) mod drafts;
 mod menu;
 mod model_picker;
 mod pending;
+pub(crate) mod prompt_links;
 mod queue;
 mod send;
 mod stash;

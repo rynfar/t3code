@@ -35,11 +35,13 @@ pub struct Toast {
     pub description: Option<SharedString>,
     /// Clicking the toast opens this thread ("Open thread" on the web's thread notifications).
     pub open_thread: Option<String>,
+    persistent: bool,
+    replace_linked_prompt: Option<crate::composer::prompt_links::ReplaceLinkedPrompt>,
 }
 
 impl Toast {
     pub fn new(kind: ToastKind, title: impl Into<SharedString>) -> Toast {
-        Toast { kind, title: title.into(), description: None, open_thread: None }
+        Toast { kind, title: title.into(), description: None, open_thread: None, persistent: false, replace_linked_prompt: None }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Toast {
@@ -50,6 +52,15 @@ impl Toast {
     pub fn open_thread(mut self, thread_id: String) -> Toast {
         self.open_thread = Some(thread_id);
         self
+    }
+
+    pub fn persistent(mut self) -> Self {
+        self.persistent = true;
+        self
+    }
+    pub fn replace_linked_prompt(mut self, replacement: crate::composer::prompt_links::ReplaceLinkedPrompt) -> Self {
+        self.replace_linked_prompt = Some(replacement);
+        self.persistent()
     }
 
     fn render_content(&self, cx: &App) -> AnyElement {
@@ -87,7 +98,7 @@ impl Toast {
 struct Entry {
     id: u64,
     toast: Toast,
-    _timer: Task<()>,
+    _timer: Option<Task<()>>,
 }
 
 /// Newest first.
@@ -102,7 +113,7 @@ impl AppState {
     pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
         self.toasts.next_id += 1;
         let id = self.toasts.next_id;
-        self.toasts.entries.insert(0, Entry { id, toast, _timer: toast_timer(id, cx) });
+        self.toasts.entries.insert(0, Entry { id, _timer: (!toast.persistent).then(|| toast_timer(id, cx)), toast });
         cx.emit(AppEvent::Notice);
     }
 
@@ -123,7 +134,7 @@ impl AppState {
         if !self.toasts.hovered {
             self.dismiss_toast(id, cx);
         } else if let Some(entry) = self.toasts.entries.iter_mut().find(|entry| entry.id == id) {
-            entry._timer = toast_timer(id, cx);
+            entry._timer = Some(toast_timer(id, cx));
         }
     }
 
@@ -192,6 +203,17 @@ fn close_orb(id: u64, state: Entity<AppState>, cx: &App) -> AnyElement {
 fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement {
     let id = entry.id;
     let toast = surface(cx).w_full().id(SharedString::from(format!("toast-{id}"))).child(entry.toast.render_content(cx));
+    let toast = if let Some(action) = entry.toast.replace_linked_prompt.clone() {
+        toast.child(div().px(px(14.)).pb(px(12.)).child(
+            div().id(SharedString::from(format!("replace-linked-{id}"))).cursor_pointer().text_sm().text_color(hsla(palette(cx).primary)).child("Replace draft").on_click({
+                let state = state.clone();
+                move |_, window, cx| {
+                    state.update(cx, |state, cx| state.dismiss_toast(id, cx));
+                    window.dispatch_action(Box::new(action.clone()), cx);
+                }
+            })
+        ))
+    } else { toast };
     let toast = match entry.toast.open_thread.clone() {
         Some(thread_id) => {
             let state = state.clone();
