@@ -20,3 +20,4 @@ pub mod worktree_setup;
 mod test_server;
 
 pub mod connect;
+pub mod updates;

@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
-[--worktree-setup <snapshot.json>] \
+[--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
 
@@ -113,6 +113,7 @@ pub struct Options {
     settings: Option<String>,
     connect_screen: bool,
     cloud_fixture: Option<String>,
+    updates_fixture: Option<String>,
     palette: bool,
     /// Opens the new-thread draft, as `chat.new` does.
     new_thread: bool,
@@ -159,6 +160,7 @@ impl Options {
             settings: flag("--settings"),
             connect_screen: has("--connect"),
             cloud_fixture: flag("--cloud-fixture"),
+            updates_fixture: flag("--updates-fixture"),
             palette: has("--palette"),
             new_thread: has("--new-thread"),
             attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
@@ -292,6 +294,11 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         if !opened {
             return Err(format!("unknown right panel surface {surface:?}: use a launcher entry such as \"diff\""));
         }
+    }
+    if let Some(path) = &options.updates_fixture {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        cx.update_window(window, |_, window, cx| crate::updates::show_fixture(value, window, cx)).map_err(|e| e.to_string())?;
     }
     if let Some(name) = &options.settings {
         // `projects:<project id>` opens a project's page; `:add-action` opens its action editor.

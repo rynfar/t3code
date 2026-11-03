@@ -92,6 +92,7 @@ pub struct ClientHandle {
     commands: mpsc::UnboundedSender<Command>,
     credentials: Arc<Credentials>,
     session_state: watch::Receiver<Option<AuthSessionState>>,
+    connection_generation: watch::Receiver<u64>,
 }
 
 impl ClientHandle {
@@ -107,6 +108,9 @@ impl ClientHandle {
     pub fn close_thread(&self, thread_id: &str) {
         let _ = self.commands.send(Command::CloseThread(thread_id.to_owned()));
     }
+
+    /// Advances only after a new WebSocket connects; update handoffs must outlive the old one.
+    pub(crate) fn connection_generation(&self) -> watch::Receiver<u64> { self.connection_generation.clone() }
 
     /// This device's grants, `None` until the first fetch answers. The last answer stays while
     /// reconnecting; every connection fetches anew.
@@ -221,8 +225,9 @@ pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     let (grants, session_state) = watch::channel(None);
-    let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()), session_state };
-    runtime.spawn(supervise(credentials, prepare, command_rx, events, grants));
+    let (generations, connection_generation) = watch::channel(0);
+    let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()), session_state, connection_generation };
+    runtime.spawn(supervise(credentials, prepare, command_rx, events, grants, generations));
     (handle, event_rx)
 }
 
@@ -239,6 +244,7 @@ async fn supervise(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: Events,
     grants: watch::Sender<Option<AuthSessionState>>,
+    generations: watch::Sender<u64>,
 ) {
     let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
@@ -268,6 +274,7 @@ async fn supervise(
         };
         let reason = match outcome {
             Ok(session) => {
+                generations.send_modify(|generation| *generation += 1);
                 attempt = 0;
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
                 let mut fetch = SessionStateFetch { credentials: &credentials, grants: &grants, task: None };

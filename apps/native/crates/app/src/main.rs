@@ -44,6 +44,7 @@ mod thread_view;
 mod toast;
 mod transcript;
 mod usage;
+mod updates;
 mod webview;
 mod workspace;
 mod worktree_setup;
@@ -125,6 +126,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     files::init(cx);
     selectable_text::init(cx);
     onboarding::init(cx);
+    updates::init(cx);
     state
 }
 
