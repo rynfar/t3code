@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             ClientEvent::StreamError { context, message } => println!("stream error in {context}: {}", message.chars().take(160).collect::<String>()),
-            ClientEvent::Status(_) | ClientEvent::ServerConfig(_) => {}
+            ClientEvent::Status(_) | ClientEvent::ServerConfig(_) | ClientEvent::Moved { .. } => {}
         }
         let total = shell.snapshot.as_ref().map(|s| s.threads.len()).unwrap_or(usize::MAX);
         if opened && done.len() >= total {

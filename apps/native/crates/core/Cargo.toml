@@ -11,6 +11,7 @@ alacritty_terminal.workspace = true
 markdown = "1"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true
 url.workspace = true
 unicode-normalization = "0.1"

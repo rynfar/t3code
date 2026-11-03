@@ -30,16 +30,17 @@ impl ConnectionStatus {
             ConnectionStatus::Reconnecting { .. } => ConnectionPhase::Reconnecting,
             ConnectionStatus::Connected => ConnectionPhase::Connected,
             ConnectionStatus::Unsupported { .. } => ConnectionPhase::Unsupported,
-            ConnectionStatus::NeedsPairing { .. } => ConnectionPhase::Error,
+            ConnectionStatus::NeedsPairing { .. } | ConnectionStatus::Blocked { .. } => ConnectionPhase::Error,
         }
     }
 
     /// The last failure, if the state carries one.
     pub fn error(&self) -> Option<&str> {
         let reason = match self {
-            ConnectionStatus::Reconnecting { reason, .. } | ConnectionStatus::Unsupported { reason, .. } | ConnectionStatus::NeedsPairing { reason } => {
-                reason.as_str()
-            }
+            ConnectionStatus::Reconnecting { reason, .. }
+            | ConnectionStatus::Unsupported { reason, .. }
+            | ConnectionStatus::NeedsPairing { reason }
+            | ConnectionStatus::Blocked { reason } => reason.as_str(),
             ConnectionStatus::Connecting | ConnectionStatus::Connected => "",
         };
         Some(reason.trim()).filter(|reason| !reason.is_empty())
@@ -92,7 +93,7 @@ impl ConnectionStatus {
 
     /// Whether "Retry" can do anything: skip a reconnect wait, or check a blocked server again.
     pub fn can_retry(&self) -> bool {
-        matches!(self, ConnectionStatus::Reconnecting { .. } | ConnectionStatus::Unsupported { .. })
+        matches!(self, ConnectionStatus::Reconnecting { .. } | ConnectionStatus::Unsupported { .. } | ConnectionStatus::Blocked { .. })
     }
 
     /// The tooltip: what failed, why, and what to do (`presentConnectionDiagnosis` for a direct
@@ -120,6 +121,8 @@ pub fn diagnose(status: &ConnectionStatus, host: &str) -> Option<Diagnosis> {
         ConnectionStatus::Unsupported { server_outdated: true, .. } => (format!("{host} runs an older T3 Code"), vec![format!("Update T3 Code on {host}.")]),
         ConnectionStatus::Unsupported { reason, .. } => ("Client not supported".to_owned(), vec![reason.clone()]),
         ConnectionStatus::NeedsPairing { .. } => (format!("T3 Code on {host} did not accept this device"), vec!["Pair again to reconnect.".to_owned()]),
+        // The device hop: this device could not ready the route (an SSH tunnel) to the server.
+        ConnectionStatus::Blocked { reason } => ("This device could not prepare the connection".to_owned(), vec![reason.clone()]),
     };
     Some(Diagnosis { headline, steps })
 }
@@ -158,5 +161,8 @@ mod tests {
         let newer = ConnectionStatus::Unsupported { reason: "Update your app.".into(), server_outdated: false };
         assert_eq!(newer.details("Studio"), "Client not supported\nUpdate your app.");
         assert_eq!(ConnectionStatus::Connecting.details("Studio"), "Connecting...");
+        let blocked = ConnectionStatus::Blocked { reason: "SSH authentication cancelled for devbox.".into() };
+        assert_eq!(blocked.details("devbox"), "This device could not prepare the connection\nSSH authentication cancelled for devbox.");
+        assert_eq!((blocked.title(), blocked.can_retry(), blocked.dot()), ("Connection failed".to_owned(), true, DotTone::Destructive));
     }
 }

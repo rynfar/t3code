@@ -56,6 +56,7 @@ icons! {
     ChevronRight => "icons/lucide/chevron-right.svg",
     ChevronUp => "icons/lucide/chevron-up.svg",
     ChevronsDownUp => "icons/lucide/chevrons-down-up.svg",
+    ChevronsLeftRightEllipsis => "icons/lucide/chevrons-left-right-ellipsis.svg",
     ChevronsUpDown => "icons/lucide/chevrons-up-down.svg",
     CircleAlert => "icons/lucide/circle-alert.svg",
     CircleArrowUp => "icons/lucide/circle-arrow-up.svg",

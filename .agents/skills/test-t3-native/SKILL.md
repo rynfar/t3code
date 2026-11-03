@@ -109,6 +109,22 @@ cargo run -p t3-native --features snapshot -- --snapshot /path/to/out.png \
 - One PNG per run at 2x. The first build with the feature compiles GPUI's test support once.
 - Backdrop blur (dialogs, menus, the composer) may render without blur offscreen.
 
+## SSH environments without a real host
+
+Never connect to a host you weren't given, and never edit `~/.ssh`. Drive the SSH flow with
+fakes instead:
+
+- `HOME=<scratch home>` points host discovery at a scratch `.ssh/config` and `known_hosts`, so
+  screenshots never show the developer's hosts. Unset `T3CODE_HOME` with it.
+- `T3_NATIVE_SSH_BIN=<script>` replaces `ssh`. The app passes `-G` to resolve, `sh -l -s --
+  <state key>` for the launch script (print `{"remotePort":N}`), `sh -s` for the pairing script
+  (print `{"credential":"…"}`) and the stop script, and `-N -L local:127.0.0.1:remote` for the
+  tunnel. A tunnel stand-in must answer `GET /` with 2xx, as a release `t3 serve` does; a dev
+  server redirects its root to Vite.
+- `T3_NATIVE_T3_BIN=<script printing "t3 v<version>">` pins the release the remote would run.
+- The snapshot renderer never quits the app, so tunnels it started outlive it: have the fake
+  record `$$` at spawn and stop exactly those PIDs afterwards.
+
 ## 4. Clean up
 
 Stop the app and dev server by the PIDs you captured. Never kill by name or pattern.

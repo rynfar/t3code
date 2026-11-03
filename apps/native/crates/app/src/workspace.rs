@@ -53,6 +53,7 @@ pub struct Workspace {
     pull_requests: Entity<PullRequestsPage>,
     link_dialog: Entity<LinkPullRequestDialog>,
     device_setup: Entity<crate::device::DeviceSetupDialog>,
+    ssh_prompt: Entity<crate::ssh_prompt::SshPromptDialog>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -80,6 +81,7 @@ impl Workspace {
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
+        let ssh_prompt = cx.new(|cx| crate::ssh_prompt::SshPromptDialog::new(state.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
@@ -126,6 +128,7 @@ impl Workspace {
             pull_requests,
             link_dialog,
             device_setup,
+            ssh_prompt,
             _subscriptions: subscriptions,
         }
     }
@@ -196,7 +199,15 @@ impl Render for Workspace {
         if !paired || self.state.read(cx).connect.switching {
             // First run shows the welcome wizard where the connect screen would be.
             let screen = if self.welcome.read(cx).is_open() { self.welcome.clone().into_any_element() } else { self.connect.clone().into_any_element() };
-            return div().size_full().bg(theme.background).map(crate::quit_hold::listen).child(screen).children(crate::quit_hold::hint(cx)).into_any_element();
+            return div()
+                .relative()
+                .size_full()
+                .bg(theme.background)
+                .map(crate::quit_hold::listen)
+                .child(screen)
+                .child(self.ssh_prompt.clone())
+                .children(crate::quit_hold::hint(cx))
+                .into_any_element();
         }
         let state = self.state.read(cx);
         let has_thread = state.selected_thread.is_some();
@@ -331,6 +342,7 @@ impl Render for Workspace {
             .child(self.palette.clone())
             .child(self.link_dialog.clone())
             .child(self.device_setup.clone())
+            .child(self.ssh_prompt.clone())
             .child(self.welcome.clone())
             .children(crate::toast::stack(&self.state, cx))
             .children(crate::settings::overlay(window, cx))

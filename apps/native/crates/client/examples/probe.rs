@@ -257,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
             event = events.recv() => match event {
                 None => break,
                 Some(ClientEvent::Status(status)) => println!("status: {status:?}"),
+                Some(ClientEvent::Moved { http_base }) => println!("moved: {http_base}"),
                 Some(ClientEvent::ServerConfig(event)) => {
                     let label: String = format!("{event:?}").chars().take(48).collect();
                     if config.apply(*event) {

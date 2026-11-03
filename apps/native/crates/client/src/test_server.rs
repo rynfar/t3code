@@ -1,6 +1,6 @@
-//! An in-process fake T3 server for session and supervisor tests: answers the RPC ticket POST and
-//! the session state GET, and upgrades `/ws` to a WebSocket that speaks Effect RPC JSON frames,
-//! on one port.
+//! An in-process fake T3 server for session, supervisor and SSH tests: answers the RPC ticket
+//! POST, the token exchange, the session state GET and the root page, and upgrades `/ws` to a
+//! WebSocket that speaks Effect RPC JSON frames, on one port.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -76,6 +76,10 @@ impl FakeServer {
         *self.session.lock().expect("session") = state;
     }
 
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
     pub fn credentials(&self) -> Credentials {
         Credentials { http_base: format!("http://{}", self.addr), access_token: "token".into() }
     }
@@ -137,6 +141,15 @@ async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Ar
                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
             }
         }
+        return None;
+    }
+    if head.starts_with("POST /oauth/token") {
+        respond_json(stream, json!({ "access_token": "ssh-access", "token_type": "Bearer" })).await;
+        return None;
+    }
+    // The page a readiness probe asks for.
+    if head.starts_with("GET / ") {
+        respond_json(stream, json!({})).await;
         return None;
     }
     if head.starts_with("GET /api/auth/session") {

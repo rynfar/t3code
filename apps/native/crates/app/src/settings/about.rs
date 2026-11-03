@@ -5,6 +5,7 @@
 
 use gpui::{Context, IntoElement, ParentElement, div};
 use t3_client::auth::ORCHESTRATION_PROTOCOL_VERSION;
+use t3_client::store::SavedEnvironment;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, muted_text, section};
 use super::{Block, SettingsView, close};
@@ -15,7 +16,7 @@ impl SettingsView {
         let state = self.state.read(cx);
         let environment = state.server_config.config.as_ref().map(|config| config.environment.clone()).unwrap_or_default();
         let saved = state.active_environment().cloned();
-        let address = saved.as_ref().map(|saved| saved.http_base.clone()).unwrap_or_default();
+        let address = saved.as_ref().map(SavedEnvironment::address).unwrap_or_default();
         let status = match &state.phase {
             Phase::Online(status) => status.summary().0,
             Phase::Unpaired => "Not connected".to_owned(),

@@ -2,6 +2,8 @@
 //! every open thread, and on disconnect reconnects with backoff, resuming each stream from the
 //! last sequence it saw. Each connection also fetches the device's grants
 //! (`client-runtime/src/state/session.ts`). Frames are decoded here, off the UI thread.
+//! A route that must be readied first, as an SSH tunnel is, passes a `Prepare` step that runs
+//! before every attempt, as the web's connection resolver authorizes each one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +32,39 @@ pub enum ConnectionStatus {
     /// The server speaks another orchestration protocol. Nothing retries until `retry_now`.
     Unsupported { reason: String, server_outdated: bool },
     NeedsPairing { reason: String },
+    /// Preparing the route failed in a way retrying cannot fix, such as a cancelled SSH password
+    /// prompt. Nothing retries until `retry_now`.
+    Blocked { reason: String },
 }
+
+/// Why preparing a route failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareError {
+    /// Worth retrying with backoff.
+    Transient(String),
+    /// Waits for the user (`ConnectionBlockedError`).
+    Blocked(String),
+    /// Readied, but at this other address.
+    Moved(String),
+}
+
+impl PrepareError {
+    pub fn message(&self) -> &str {
+        match self {
+            PrepareError::Transient(message) | PrepareError::Blocked(message) => message,
+            PrepareError::Moved(_) => "The connection moved to another local address.",
+        }
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Readies the route before each connection attempt.
+pub type Prepare = Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<(), PrepareError>> + Send + Sync>;
 
 #[derive(Debug)]
 pub enum ClientEvent {
@@ -39,6 +73,9 @@ pub enum ClientEvent {
     Thread { thread_id: String, item: Box<ThreadStreamItem> },
     ServerConfig(Box<ServerConfigStreamEvent>),
     StreamError { context: String, message: String },
+    /// The prepared route now listens at another address (an SSH tunnel had to change ports).
+    /// The client stopped; the app starts one there.
+    Moved { http_base: String },
 }
 
 enum Command {
@@ -176,11 +213,16 @@ const SESSION_STATE_RETRY_MAX: Duration = Duration::from_secs(60);
 type Events = mpsc::Sender<ClientEvent>;
 
 pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
+    start_prepared(runtime, credentials, None)
+}
+
+/// `start`, running `prepare` before every connection attempt.
+pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials, prepare: Option<Prepare>) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     let (grants, session_state) = watch::channel(None);
     let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()), session_state };
-    runtime.spawn(supervise(credentials, command_rx, events, grants));
+    runtime.spawn(supervise(credentials, prepare, command_rx, events, grants));
     (handle, event_rx)
 }
 
@@ -193,6 +235,7 @@ struct Resume {
 
 async fn supervise(
     credentials: Credentials,
+    prepare: Option<Prepare>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: Events,
     grants: watch::Sender<Option<AuthSessionState>>,
@@ -207,7 +250,23 @@ async fn supervise(
         } else {
             ConnectionStatus::Reconnecting { reason: last_failure.clone(), attempt }
         })).await;
-        let reason = match connect(&credentials).await {
+        let prepared = match &prepare {
+            Some(prepare) => match prepare_draining(prepare, &mut commands, &mut resume).await {
+                Some(prepared) => prepared,
+                None => return,
+            },
+            None => Ok(()),
+        };
+        let outcome = match prepared {
+            Ok(()) => connect(&credentials).await,
+            Err(PrepareError::Moved(http_base)) => {
+                let _ = events.send(ClientEvent::Moved { http_base }).await;
+                return;
+            }
+            Err(PrepareError::Transient(reason)) => Err(ConnectError::Transient(reason)),
+            Err(PrepareError::Blocked(reason)) => Err(ConnectError::Blocked(reason)),
+        };
+        let reason = match outcome {
             Ok(session) => {
                 attempt = 0;
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
@@ -233,6 +292,15 @@ async fn supervise(
                 last_failure = reason;
                 continue;
             }
+            Err(ConnectError::Blocked(reason)) => {
+                let _ = events.send(ClientEvent::Status(ConnectionStatus::Blocked { reason: reason.clone() })).await;
+                if !wait_draining(None, &mut commands, &mut resume).await {
+                    return;
+                }
+                attempt += 1;
+                last_failure = reason;
+                continue;
+            }
             Err(ConnectError::Transient(reason)) => reason,
         };
         attempt += 1;
@@ -248,7 +316,43 @@ async fn supervise(
 enum ConnectError {
     Unauthorized(String),
     Unsupported { reason: String, server_outdated: bool },
+    Blocked(String),
     Transient(String),
+}
+
+/// Runs `prepare` while keeping track of threads opened or closed and failing dispatches. `None`
+/// when the handle was dropped, which also drops the preparation.
+async fn prepare_draining(prepare: &Prepare, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> Option<Result<(), PrepareError>> {
+    let preparation = prepare();
+    tokio::pin!(preparation);
+    loop {
+        tokio::select! {
+            prepared = &mut preparation => return Some(prepared),
+            command = commands.recv() => match command {
+                None => return None,
+                Some(command) => drain_command(command, resume),
+            }
+        }
+    }
+}
+
+/// A command that arrives while there is no session.
+fn drain_command(command: Command, resume: &mut Resume) {
+    match command {
+        Command::OpenThread(id) => {
+            resume.threads.entry(id).or_insert(None);
+        }
+        Command::CloseThread(id) => {
+            resume.threads.remove(&id);
+        }
+        Command::RefreshSessionState | Command::RetryNow => {}
+        Command::Request { reply, .. } => {
+            let _ = reply.send(Err(RpcError::Closed));
+        }
+        Command::Stream { reply, .. } => {
+            let _ = reply.send(Err(RpcError::Closed));
+        }
+    }
 }
 
 async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
@@ -291,15 +395,7 @@ async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedRe
             command = commands.recv() => match command {
                 None => return false,
                 Some(Command::RetryNow) => return true,
-                Some(Command::OpenThread(id)) => { resume.threads.entry(id).or_insert(None); }
-                Some(Command::CloseThread(id)) => { resume.threads.remove(&id); }
-                Some(Command::RefreshSessionState) => {}
-                Some(Command::Request { reply, .. }) => {
-                    let _ = reply.send(Err(RpcError::Closed));
-                }
-                Some(Command::Stream { reply, .. }) => {
-                    let _ = reply.send(Err(RpcError::Closed));
-                }
+                Some(command) => drain_command(command, resume),
             }
         }
     }

@@ -23,7 +23,7 @@ use crate::auth::{self, AuthError, Paired};
 /// Booting the CLI and opening the server's database takes a few seconds; a hung one gives up.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(45);
 /// `t3 --version` answers before loading the server.
-const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalServer {
@@ -183,7 +183,7 @@ async fn run_pair(cli: &Path, home: &Path) -> Result<String, LocalPairError> {
 /// Runs the CLI from the user's home (from a linked worktree it would pair with that worktree's
 /// server) with the absolute T3 home, in a process group of its own. A timeout, or dropping the
 /// future, kills the whole group, so nothing the CLI started outlives it.
-async fn run_cli(cli: &Path, args: &[String], home: &Path, limit: Duration) -> Result<std::process::Output, LocalPairError> {
+pub(crate) async fn run_cli(cli: &Path, args: &[String], home: &Path, limit: Duration) -> Result<std::process::Output, LocalPairError> {
     let mut command = tokio::process::Command::new(cli);
     command
         .args(args)
@@ -215,7 +215,7 @@ async fn run_cli(cli: &Path, args: &[String], home: &Path, limit: Duration) -> R
 }
 
 /// Kills a CLI's process group when dropped, unless the CLI already exited.
-struct ProcessGroup(Option<u32>);
+pub(crate) struct ProcessGroup(pub(crate) Option<u32>);
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
