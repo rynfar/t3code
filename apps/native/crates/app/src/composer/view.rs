@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, Context, ExternalPaths, Focusable, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
-use gpui_component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Paste, Textarea};
+use gpui_component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Copy, Paste, Textarea};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
@@ -311,6 +311,9 @@ impl Render for Composer {
                     }
                 }))
                 .on_action(cx.listener(|this, _: &StashPrompt, window, cx| this.stash_prompt(window, cx)))
+                .capture_action(cx.listener(|this, _: &Copy, _, cx| {
+                    if this.copy_context_selection(cx) { cx.stop_propagation(); }
+                }))
                 .capture_action(cx.listener(|this, _: &Paste, window, cx| {
                     if this.input.read(cx).focus_handle(cx).is_focused(window) && this.paste(window, cx) {
                         cx.stop_propagation();

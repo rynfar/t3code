@@ -157,6 +157,11 @@ impl Composer {
             let threads = palette_threads(self.state.read(cx));
             rules::thread_items(&threads, &environment, self.thread_id().as_deref(), &trigger.query, now_ms())
         };
+        let environment_id = self.environment_id(cx);
+        items.extend(t3_core::composer::records::environment_items(
+            self.state.read(cx).environments.environments.iter().filter_map(|e| Some((e.environment_id.as_deref()?, e.label.as_str()))),
+            &environment_id, &query,
+        ));
         let Some(cwd) = cwd.filter(|_| !query.is_empty()) else {
             self.menu.path_search = None;
             return (items, false);
@@ -394,6 +399,12 @@ impl Composer {
             }
             MenuAction::ProviderCommand { name } => self.replace_trigger(&text, &trigger, &format!("/{name} "), window, cx),
             MenuAction::Skill { name, .. } => self.replace_trigger(&text, &trigger, &format!("${name} "), window, cx),
+            MenuAction::Environment {environment_id,label} => {
+                let record=t3_core::composer::records::environment_record(&environment_id,&label);
+                self.replace_trigger(&text,&trigger,&format!("{} ",t3_core::composer::records::reference(&record).unwrap_or_default()),window,cx);
+                if let Some(target)=self.snapshot.target.clone(){self.seed_records(&target,vec![record]);}
+                self.draft_changed(cx);
+            }
             MenuAction::Thread { thread_id, title } => {
                 if trigger.kind != TriggerKind::Path {
                     return;
@@ -434,14 +445,17 @@ impl Composer {
     /// its text still links, then its attachments.
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
-        t3_core::composer::attachments::message_context_with_reviews(text, threads, self.current_terminals(), self.current_reviews(), attachments)
+        let base = t3_core::composer::attachments::message_context_with_reviews(text, threads, self.current_terminals(), self.current_reviews(), attachments);
+        let mut records = base.and_then(|value| value["records"].as_array().cloned()).unwrap_or_default();
+        if let Some(target) = &self.snapshot.target { records.extend_from_slice(self.records_for(target)); }
+        t3_core::composer::records::message_context(text, &records)
     }
 
     /// How many mentioned threads `text` links, which make a message sendable on their own.
     pub(super) fn linked_threads(&self, text: &str) -> usize {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
         let linked = rules::referenced_context_ids(text);
-        threads.iter().filter(|thread| linked.contains(&thread.context_id.as_str())).count()
+        threads.iter().filter(|thread| linked.contains(&thread.context_id.as_str())).count() + self.snapshot.target.as_ref().map(|target| t3_core::composer::records::referenced(text, self.records_for(target)).len()).unwrap_or(0)
     }
 
     pub(super) fn mentions(&self, target: &Target) -> &[ThreadContext] {
@@ -459,6 +473,7 @@ impl Composer {
         self.menu.threads.remove(target);
         self.clear_terminals(target);
         self.context.reviews.remove(target);
+        self.context.records.remove(target);
     }
 
     /// The threads a send's `prompt` links; the rest go with the prompt's history.
@@ -524,6 +539,7 @@ impl Composer {
         let icon = match &item.action {
             MenuAction::Path { kind: PathKind::Directory, .. } => Some(Icon::Folder.render(px(16.), hsla(p.muted_foreground))),
             MenuAction::Path { .. } => Some(Icon::File.render(px(16.), hsla(p.muted_foreground))),
+            MenuAction::Environment { .. } => Some(Icon::Server.render(px(16.),muted)),
             MenuAction::Thread { .. } => Some(Icon::MessagesSquare.render(px(16.), muted)),
             _ => None,
         };

@@ -42,6 +42,7 @@ impl Composer {
                 target.clone(),
                 Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode },
             );
+            self.seed_records(&target, draft.context_records.clone());
             self.seed_mentions(&target, draft.thread_contexts());
             self.seed_terminals(&target, draft.terminals.clone());
         self.seed_reviews(&target, draft.review_comments.clone());
@@ -61,6 +62,7 @@ impl Composer {
     fn capture_draft(&self, target: &Target, prompt: String) -> Draft {
         let choices = self.choices.get(target).cloned().unwrap_or_default();
         Draft {
+            context_records: t3_core::composer::records::referenced(&prompt, self.records_for(target)),
             threads: Draft::saved_threads(self.mentions(target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(target), &prompt),
             review_comments: t3_core::composer::review::referenced(&prompt, self.reviews_for(target)).into_iter().cloned().collect(),
@@ -188,7 +190,8 @@ impl Composer {
             return;
         }
         self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
-        self.seed_mentions(&target, draft.thread_contexts());
+        self.seed_records(&target, draft.context_records.clone());
+            self.seed_mentions(&target, draft.thread_contexts());
         self.seed_terminals(&target, draft.terminals.clone());
         self.seed_reviews(&target, draft.review_comments.clone());
         self.restore_draft_attachments(&target, attachments, cx);

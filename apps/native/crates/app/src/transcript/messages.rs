@@ -76,14 +76,21 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         Some(text) => Arc::from(text.as_str()),
         None => message.text.clone(),
     };
-    let collapsible = should_collapse_user_message(&text);
+    let context_item = message.item.clone();
+    let records: &[Value] = match context_item.as_ref().map(|item| &item.kind) {
+        Some(t3_core::turn_item::TurnItemKind::UserMessage { context: Some(context), .. }) => context["records"].as_array().map(Vec::as_slice).unwrap_or_default(),
+        _ => &[],
+    };
+    let context_chips = super::context::chips(id, &text, records, context_item.as_ref(), env.state, env.ui, cx);
+    let display_text = if context_chips.is_some() { t3_core::composer::records::display_text(&text) } else { text.to_string() };
+    let collapsible = should_collapse_user_message(&display_text);
     let expanded = env.ui.expanded_messages.contains(id);
     let collapsed = collapsible && !expanded;
     let surface = hsla(if attribution == Some(Attribution::Guest) { p.guest_surface } else { p.message_surface });
-    let body = if text.trim().is_empty() {
+    let body = if display_text.trim().is_empty() {
         None
     } else {
-        let source: Arc<str> = Arc::from(with_line_breaks(&text));
+        let source: Arc<str> = Arc::from(with_line_breaks(&display_text));
         let state = markdown.state(&format!("user:{id}"), &source, cx);
         Some(markdown_view(&state, cx))
     };
@@ -115,6 +122,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .text_size(px(14.))
         .line_height(px(22.75))
         .text_color(hsla(p.message_foreground))
+        .children(context_chips)
         .children(media_in_bubble)
         .children(super::media::other_files(&other_files, cx))
         .children(body.map(|body| {
@@ -146,6 +154,8 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
             )))
         });
     let copy_text = text.to_string();
+    let copy_message_id = message.id.clone();
+    let copy_item = context_item.clone();
     let prompt_link = t3_core::prompt_links::user_message_prompt_link(&text);
     let actions = h_flex()
         .justify_end()
@@ -173,7 +183,16 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .child(ghost_icon_button(
             SharedString::from(format!("copy-user:{id}")),
             Icon::Copy,
-            move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone())),
+            cx.listener(move |view, _, _, cx| {
+                let environment = view.state.read(cx).server_config.config.as_ref().map(|c|c.environment.environment_id.clone()).unwrap_or_default();
+                let records = match copy_item.as_ref().map(|item|&item.kind) {
+                    Some(t3_core::turn_item::TurnItemKind::UserMessage { context:Some(context), .. }) => context["records"].as_array().map(Vec::as_slice).unwrap_or_default(),
+                    _ => &[],
+                };
+                if let Some(fragment)=t3_core::composer::records::copy_fragment(&copy_text,records,&environment,view.state.read(cx).selected_thread.as_deref(),Some(&copy_message_id)) {
+                    crate::composer::clipboard::write(copy_text.clone(),fragment,cx);
+                } else { crate::composer::clipboard::write(copy_text.clone(),String::new(),cx); }
+            }),
             cx,
         ));
     let model_switch = message.meta.model_switch.as_ref().and_then(|value| model_switch(value, cx));

@@ -421,6 +421,8 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             hidden: bool,
             pull_request: Option<String>,
             message: Option<String>,
+            context: Option<serde_json::Value>,
+            environment_id: Option<String>,
         }
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         // Mutates only this renderer's in-memory projection, never the server or saved settings.
@@ -439,6 +441,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         state.update(&mut cx, |state, cx| {
             // Hold this snapshot fixture against later repository-enrichment frames.
             state.stop_pump();
+            if let Some(id) = fixture.environment_id { if let Some(config) = state.server_config.config.as_mut() { config.environment.environment_id=id; } }
             if let Some(thread) = state
                 .shell
                 .snapshot
@@ -465,9 +468,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                     .iter_mut()
                     .rev()
                     .find(|i| matches!(i.item.kind, t3_core::turn_item::TurnItemKind::UserMessage { .. }))
-                && let t3_core::turn_item::TurnItemKind::UserMessage { text, .. } = &mut Arc::make_mut(&mut item.item).kind
+                && let t3_core::turn_item::TurnItemKind::UserMessage { text, context, .. } = &mut Arc::make_mut(&mut item.item).kind
             {
                 *text = message;
+                *context = fixture.context;
             }
             state.rebuild_sidebar(cx);
             cx.emit(crate::app_state::AppEvent::Shell);

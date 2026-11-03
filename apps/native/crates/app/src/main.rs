@@ -5,6 +5,7 @@ mod chat_header;
 mod composer;
 mod connect;
 mod context_menu;
+mod context_chip;
 mod device;
 mod dialog;
 mod diff;

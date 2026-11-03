@@ -274,6 +274,10 @@ impl Composer {
             return false;
         }
         let Some(target) = self.snapshot.target.clone() else { return false };
+        if let (Some(text), Some(fragment)) = (item.text(), item.metadata())
+            && self.paste_context(&text, fragment, window, cx) { return true; }
+        if let (Some(text), Some(fragment)) = (item.text(), super::clipboard::read_html_fragment())
+            && self.paste_context(&text, &fragment, window, cx) { return true; }
         for entry in item.entries() {
             match entry {
                 ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => {

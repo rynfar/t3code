@@ -86,6 +86,7 @@ impl Composer {
             return;
         }
         let entry = StashEntry {
+            context_records: t3_core::composer::records::referenced(&prompt,self.records_for(&target)),
             id: uuid_v4(),
             created_at: now_ms(),
             threads: Draft::saved_threads(self.mentions(&target), &prompt),
@@ -135,6 +136,7 @@ impl Composer {
         self.seed_mentions(&target, threads);
         self.seed_terminals(&target, entry.terminals.clone());
         self.seed_reviews(&target, entry.review_comments.clone());
+        self.seed_records(&target, entry.context_records.clone());
         let prompt = rules::merge_prompt(&self.prompt(cx), &entry.prompt);
         self.set_prompt(&prompt, window, cx);
         let end = prompt.len();

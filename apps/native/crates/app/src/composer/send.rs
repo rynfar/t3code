@@ -26,6 +26,7 @@ const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
 pub(super) struct Taken {
     attachments: Vec<super::attachments::Staged>,
     threads: Vec<ThreadContext>,
+    records: Vec<Value>,
     terminals: Vec<TerminalContext>,
     reviews: Vec<t3_core::composer::review::ReviewComment>,
 }
@@ -324,6 +325,7 @@ impl Composer {
         Taken {
             attachments: self.take_attachments(target),
             threads: self.take_threads(target, prompt),
+            records: self.take_records(target, prompt),
             terminals: self.take_terminals(target, prompt),
             reviews: self.take_reviews(target, prompt),
         }
@@ -345,6 +347,7 @@ impl Composer {
         }
         self.restore_attachments(target, taken.attachments);
         self.restore_threads(target, taken.threads);
+        self.seed_records(target, taken.records);
         self.restore_terminals(target, taken.terminals);
         self.seed_reviews(target, taken.reviews);
         self.error = Some(error);

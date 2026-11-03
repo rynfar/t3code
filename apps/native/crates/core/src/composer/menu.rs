@@ -526,6 +526,7 @@ pub enum MenuAction {
     ProviderCommand { name: String },
     Skill { name: String, source: SkillSource },
     Thread { thread_id: String, title: String },
+    Environment { environment_id: String, label: String },
 }
 
 /// `ComposerCommandItem`: one row.
@@ -786,7 +787,7 @@ fn fnv1a64(value: &str) -> String {
     format!("{forward:08x}{reverse:08x}")
 }
 
-fn is_context_id(id: &str) -> bool {
+pub fn is_context_id(id: &str) -> bool {
     (1..=128).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 

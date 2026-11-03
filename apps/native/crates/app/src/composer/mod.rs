@@ -7,7 +7,8 @@
 
 mod attachments;
 mod citations;
-mod context;
+pub(crate) mod context;
+pub(crate) mod clipboard;
 pub(crate) mod controls;
 pub(crate) mod drafts;
 mod menu;
@@ -46,6 +47,7 @@ actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsT
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
     cx.bind_keys([
+        KeyBinding::new("cmd-c", gpui_component::input::Copy, Some("ContextChip")),
         KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input")),
         // Keeps a large paste inline instead of attaching it (`isPasteAsTextShortcut`).
         KeyBinding::new("cmd-shift-v", PasteAsText, Some("Composer > Input")),
@@ -205,6 +207,7 @@ impl Composer {
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
+                if matches!(event, AppEvent::SidebarSelection | AppEvent::Shell | AppEvent::Phase) && !this.context.linked.is_empty() { cx.notify(); }
                 if *event == AppEvent::ComposerMention {
                     let mentions = this.state.update(cx, |state, _| std::mem::take(&mut state.composer_mentions));
                     for mention in mentions {

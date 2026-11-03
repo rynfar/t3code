@@ -217,6 +217,15 @@ fn a_send_in_flight_keeps_records_added_meanwhile() {
     assert_eq!(held, [added, sent]);
     let mut threads = vec![thread.clone()];
     assert_eq!(take_for_send(&mut threads, &prompt), [thread]);
+    let machine = super::super::records::environment_record("build", "Build Mac");
+    let text = super::super::records::reference(&machine).unwrap();
+    let mut records = vec![machine.clone()];
+    let sent = take_for_send(&mut records, &text);
+    assert!(records.is_empty());
+    restore_unsent(&mut records, sent);
+    assert_eq!(records, [machine]);
+    reset_history(&mut records, "no links");
+    assert!(records.is_empty());
     assert!(threads.is_empty());
 }
 
