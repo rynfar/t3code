@@ -44,6 +44,7 @@ mod thread_view;
 mod toast;
 mod transcript;
 mod usage;
+mod updates;
 mod webview;
 mod workspace;
 mod worktree_setup;

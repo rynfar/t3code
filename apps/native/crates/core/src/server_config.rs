@@ -259,6 +259,8 @@ pub struct CompatibilityAdvisory {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateState {
     #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub message: Option<String>,
@@ -487,6 +489,10 @@ impl ServerProvider {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentCapabilities {
+    #[serde(default)]
+    pub server_self_update: Option<String>,
+    #[serde(default)]
+    pub desktop_app_update: Option<bool>,
     /// File attachments and the largest upload the server takes; absent when it takes none.
     #[serde(default, deserialize_with = "lenient_option")]
     pub file_attachments: Option<FileAttachmentsCapability>,
@@ -628,6 +634,9 @@ pub struct ProjectSettingsOverrides {
 pub struct ServerSettings {
     #[serde(default, deserialize_with = "lenient_option")]
     pub enable_agent_browser_access: Option<bool>,
+    /// Missing on older hosts; the Maintenance UI default does not prove restart continuation.
+    #[serde(skip)]
+    pub update_continuation_advertised: bool,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub hidden_thread_tags: Vec<String>,
     #[serde(default, deserialize_with = "lenient")]
@@ -679,6 +688,14 @@ pub struct ServerSettings {
     pub secret_providers: crate::settings::secrets::SecretProviders,
     #[serde(default, deserialize_with = "lenient")]
     pub observability: crate::settings::diagnostics::ObservabilitySettings,
+}
+
+fn update_settings<'de, D: Deserializer<'de>>(d: D) -> Result<ServerSettings, D::Error> {
+    let value = Value::deserialize(d)?;
+    let advertised = value.get("continueThreadsAfterServerUpdate").and_then(Value::as_bool) == Some(true);
+    let mut settings: ServerSettings = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+    settings.update_continuation_advertised = advertised;
+    Ok(settings)
 }
 
 impl ServerSettings {
@@ -741,7 +758,7 @@ pub struct ServerConfig {
     pub keybindings: Value,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub providers: Vec<ServerProvider>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "update_settings")]
     pub settings: ServerSettings,
     #[serde(default)]
     pub new_projects_root: Option<String>,
@@ -795,6 +812,7 @@ pub struct ProvidersPayload {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SettingsPayload {
+    #[serde(deserialize_with = "update_settings")]
     pub settings: ServerSettings,
 }
 

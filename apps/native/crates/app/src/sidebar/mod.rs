@@ -54,6 +54,7 @@ enum ClockRate {
 enum PaneRowKey { Draft(String), Divider, Thread(RowKey) }
 
 pub struct SidebarPane {
+    updates: Entity<crate::updates::UpdateControl>,
     composer: Entity<crate::composer::Composer>,
     drafts: t3_core::sidebar::drafts::DraftRows,
     discarded: std::collections::HashMap<String, (t3_core::thread_actions::Claim, crate::composer::drafts::DiscardedDraft)>,
@@ -178,7 +179,9 @@ impl SidebarPane {
                 }
             }),
         ];
+        let updates = cx.new(|cx| crate::updates::UpdateControl::new(state.clone(), cx));
         let mut pane = SidebarPane {
+            updates,
             composer,
             drafts: Default::default(),
             discarded: Default::default(),
@@ -667,6 +670,7 @@ impl Render for SidebarPane {
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .child(self.updates.clone())
             .child(self.render_footer(cx))
             .children(self.render_project_filter(cx))
     }
