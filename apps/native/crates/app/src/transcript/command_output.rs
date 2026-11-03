@@ -144,3 +144,167 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
         );
     Some(v_flex().w_full().min_w_0().when(output.truncated, |this| this.child(note(TRUNCATED, cx))).child(scroller).into_any_element())
 }
+
+/// `ShellCommandBlock.tsx` and `HighlightedTokens.tsx`, shared by streamed command rows and
+/// tool inspectors. The keyed state lives while drawn; the bounded cache survives scrolling.
+#[derive(gpui::IntoElement)]
+pub struct ShellCommandBlock {
+    id: SharedString,
+    command: SharedString,
+}
+
+impl ShellCommandBlock {
+    pub fn new(id: &str, command: SharedString) -> Self {
+        Self {
+            id: SharedString::from(format!("shell-command:{id}")),
+            command,
+        }
+    }
+}
+
+struct CommandSyntax {
+    command: SharedString,
+    theme: std::sync::Arc<gpui_component::highlighter::HighlightTheme>,
+    highlights: Option<Highlights>,
+    _task: Task<()>,
+}
+
+impl CommandSyntax {
+    fn new(
+        command: SharedString,
+        theme: std::sync::Arc<gpui_component::highlighter::HighlightTheme>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        let source = command.clone();
+        let colors = theme.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let highlights = cx
+                .background_executor()
+                .spawn(async move { cached_command(&source, colors) })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.highlights = Some(highlights);
+                cx.notify();
+            });
+        });
+        Self {
+            command,
+            theme,
+            highlights: None,
+            _task: task,
+        }
+    }
+}
+
+impl gpui::RenderOnce for ShellCommandBlock {
+    fn render(self, window: &mut gpui::Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().highlight_theme.clone();
+        let command = self.command;
+        let state = window.use_keyed_state(gpui::ElementId::NamedInteger(self.id.clone(), 0), cx, |_, cx| {
+            CommandSyntax::new(command.clone(), theme.clone(), cx)
+        });
+        let highlights = state.update(cx, |state, cx| {
+            if state.command != command || !std::sync::Arc::ptr_eq(&state.theme, &theme) {
+                *state = CommandSyntax::new(command.clone(), theme, cx);
+            }
+            state.highlights.clone()
+        });
+        let mut text = SelectableText::new(self.id, command);
+        if let Some(highlights) = highlights {
+            text = text.highlights(highlights);
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .text_color(hsla(palette(cx).foreground).opacity(0.85))
+            .child(text)
+    }
+}
+
+fn cached_command(
+    command: &str,
+    theme: std::sync::Arc<gpui_component::highlighter::HighlightTheme>,
+) -> Highlights {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, LazyLock, Mutex};
+    type Cached = (
+        String,
+        Arc<gpui_component::highlighter::HighlightTheme>,
+        Highlights,
+    );
+    static CACHE: LazyLock<Mutex<VecDeque<Cached>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+    const LIMIT: usize = 64;
+    const MAX_BYTES: usize = 64 * 1024;
+    if command.len() > MAX_BYTES {
+        return Arc::from([]);
+    }
+    // Only background workers take this lock, so concurrent requests parse a command once.
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = cache
+        .iter()
+        .position(|(text, colors, _)| text == command && colors.style.syntax == theme.style.syntax)
+    {
+        let hit = cache.remove(index).expect("cached index");
+        let result = hit.2.clone();
+        cache.push_back(hit);
+        return result;
+    }
+    let mut budget = 64;
+    let styles = command_styles(command, t3_core::shell_command::highlight_language(command), &theme, 0, &mut budget);
+    let styles: Highlights = styles.into();
+    if cache.len() == LIMIT {
+        cache.pop_front();
+    }
+    cache.push_back((command.to_owned(), theme, styles.clone()));
+    styles
+}
+
+fn command_styles(
+    code: &str,
+    language: &str,
+    theme: &gpui_component::highlighter::HighlightTheme,
+    depth: usize,
+    budget: &mut usize,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    use gpui_component::{Rope, highlighter::SyntaxHighlighter};
+    if *budget == 0 {
+        return Vec::new();
+    }
+    *budget -= 1;
+    let mut highlighter = SyntaxHighlighter::new(language);
+    highlighter.update(None, &Rope::from_str(code), None);
+    if highlighter.tree().is_none() { return Vec::new(); }
+    let mut styles = vec![HighlightStyle::default(); code.len()];
+    for (range, style) in highlighter.styles(&(0..code.len()), theme) {
+        styles[range].fill(style);
+    }
+    if language == "bash"
+        && depth < 4
+        && let Some(tree) = highlighter.tree()
+    {
+        for script in t3_core::shell_command::embedded_scripts(code, tree) {
+            let embedded = command_styles(&script.text, script.language, theme, depth + 1, budget);
+            for (range, style) in embedded {
+                if let (Some(first), Some(last)) = (
+                    script.spans.get(range.start),
+                    script.spans.get(range.end - 1),
+                ) {
+                    styles[first.start..last.end].fill(style);
+                }
+            }
+        }
+    }
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < styles.len() {
+        let style = styles[start];
+        let end = styles[start..]
+            .iter()
+            .position(|next| *next != style)
+            .map_or(styles.len(), |length| start + length);
+        // Embedded languages also clear the shell string's color on their unstyled tokens.
+        runs.push((start..end, style));
+        start = end;
+    }
+    runs
+}

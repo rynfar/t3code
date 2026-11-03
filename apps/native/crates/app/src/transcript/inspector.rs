@@ -188,7 +188,7 @@ enum Block {
 }
 
 enum CallPart {
-    /// `ShellCommandBlock`, not highlighted yet.
+    /// `ShellCommandBlock`, including embedded scripts.
     Command(SharedString),
     /// `key value` lines: keys muted, values at 85%.
     Args(Text),
@@ -614,7 +614,7 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
 fn call_parts(call: ToolCallLines, tool_name: Option<&str>) -> Vec<CallPart> {
     let mut parts = Vec::new();
     if let Some(command) = call.command {
-        parts.push(CallPart::Command(with_visible_control_characters(&command).into()));
+        parts.push(CallPart::Command(with_visible_control_characters(js_trim(&command)).into()));
     }
     let mut lines = String::new();
     let mut keys: Vec<Range<usize>> = Vec::new();
@@ -783,7 +783,7 @@ fn structured(id: &str, text: &Text, cx: &App) -> AnyElement {
 fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyElement>>, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     match part {
-        CallPart::Command(command) => div().text_color(hsla(p.foreground).opacity(0.85)).child(selectable(id, command.clone())).into_any_element(),
+        CallPart::Command(command) => super::command_output::ShellCommandBlock::new(id, command.clone()).into_any_element(),
         CallPart::Args(text) => {
             let mut lines = selectable(id, text.text.clone());
             if let Some(highlights) = text.highlights(cx) {
@@ -838,13 +838,13 @@ pub fn question_history(entry_id: &str, questions: &[AnsweredQuestion], cx: &mut
             .collect();
         rows.push(
             v_flex()
-                .gap(px(4.))
+                .gap(rem(4.))
                 .children(question.question.as_ref().map(|text| div().text_color(muted).child(selectable(&format!("{id}:q"), text.clone()))))
-                .children(question.answer.as_ref().map(|text| div().ml(px(12.)).text_color(muted).child(selectable(&format!("{id}:a"), text.clone()))))
-                .when(!files.is_empty(), |this| this.child(h_flex().flex_wrap().gap(px(8.)).children(files))),
+                .children(question.answer.as_ref().map(|text| div().ml(rem(12.)).text_color(muted).child(selectable(&format!("{id}:a"), text.clone()))))
+                .when(!files.is_empty(), |this| this.child(h_flex().flex_wrap().gap(rem(8.)).children(files))),
         );
     }
-    v_flex().ml(px(28.)).mt(px(8.)).gap(px(8.)).text_size(px(14.)).line_height(px(20.)).children(rows).into_any_element()
+    v_flex().ml(rem(28.)).mt(rem(8.)).gap(rem(8.)).text_size(rem(14.)).line_height(rem(20.)).children(rows).into_any_element()
 }
 
 #[cfg(test)]

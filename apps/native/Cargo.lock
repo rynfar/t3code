@@ -6846,6 +6846,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "tree-sitter",
+ "tree-sitter-bash",
  "unicode-normalization",
  "unicode-segmentation",
  "url",

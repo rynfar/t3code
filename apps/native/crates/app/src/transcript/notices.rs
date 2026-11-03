@@ -14,7 +14,7 @@ use t3_core::turn_item::{TurnItem, TurnItemKind};
 use super::parts::{ROW_GROUP, DividerTone, focusable, icon_slot, system_divider, timestamp, work_line, work_row_frame};
 use super::RowEnv;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 
 pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at: Option<&str>, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
@@ -409,7 +409,7 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
             let target = target_thread_id.clone();
             let open = focusable(div().id(SharedString::from(format!("open-thread:{id}"))), cx)
                 .flex_none()
-                .text_size(px(14.))
+                .text_size(rem(14.))
                 .text_color(hsla(p.primary))
                 .cursor_pointer()
                 .hover(|style| style.underline())
