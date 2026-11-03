@@ -22,3 +22,5 @@ mod test_server;
 
 pub mod connect;
 pub mod updates;
+
+pub mod resource_telemetry;

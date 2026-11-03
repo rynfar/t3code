@@ -10,7 +10,7 @@ mod appearance;
 mod archive;
 pub(crate) mod controls;
 mod devices;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod diffs_browser;
 mod general;
 mod keybindings;

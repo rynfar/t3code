@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
-[--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -140,6 +140,7 @@ pub struct Options {
     welcome: Option<crate::onboarding::Step>,
     /// A `WorktreeSetupSnapshot` file shown for `--thread` instead of the server's.
     worktree_setup: Option<PathBuf>,
+    resource_telemetry_fixture: Option<PathBuf>,
     gestures: Vec<Gesture>,
     width: f32,
     height: f32,
@@ -190,6 +191,7 @@ impl Options {
                 _ => crate::onboarding::Step::Connection,
             }),
             worktree_setup: flag("--worktree-setup").map(PathBuf::from),
+            resource_telemetry_fixture: flag("--resource-telemetry-fixture").map(PathBuf::from),
             gestures: gestures(&args),
             width: number("--width", 1440.),
             height: number("--height", 900.),
@@ -341,6 +343,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         cx.update_window(window, |_, window, cx| crate::updates::show_fixture(value, window, cx)).map_err(|e| e.to_string())?;
+    }
+    if let Some(path) = &options.resource_telemetry_fixture {
+        let fixture: crate::settings::diagnostics::resource_monitor::Fixture = serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        cx.update(|cx| cx.set_global(fixture));
     }
     if let Some(name) = &options.settings {
         // `projects:<project id>` opens a project's page; `:add-action` opens its action editor.

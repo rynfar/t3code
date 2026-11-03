@@ -1,7 +1,7 @@
 //! Diagnostics: `DiagnosticsSettingsPanel` in `web/src/components/settings/DiagnosticsSettings.tsx`
 //! for the connected environment (live processes with INT and KILL, resource history, trace
 //! diagnostics and its tables, the logs folder) and `TelemetryExportSettings.tsx`. The resource
-//! monitor of `ResourceTelemetryDiagnostics.tsx` is not ported. Rules and formatting live in
+//! monitor ports `ResourceTelemetryDiagnostics.tsx`. Rules and formatting live in
 //! `t3_core::settings::diagnostics`; process tables are virtualized.
 
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,8 @@ use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
+pub(crate) mod resource_monitor;
+
 const PROCESS_ROW: f32 = 36.;
 /// `max-h-[min(64vh,44rem)]`.
 const TABLE_MAX: f32 = 704.;
@@ -52,6 +54,7 @@ struct Telemetry {
 }
 
 pub(crate) struct DiagnosticsState {
+    monitor: resource_monitor::MonitorState,
     processes: Query<ProcessDiagnostics>,
     history: Query<ResourceHistory>,
     trace: Query<TraceDiagnostics>,
@@ -89,6 +92,7 @@ impl DiagnosticsState {
             })
             .collect();
         DiagnosticsState {
+            monitor: resource_monitor::MonitorState::default(),
             processes: Query::default(),
             history: Query::default(),
             trace: Query::default(),
@@ -136,6 +140,7 @@ impl DiagnosticsState {
 
     /// Off the page: clocks and watchers stop, and nothing reloads until it shows again.
     pub(super) fn leave(&mut self) {
+        self.monitor.leave();
         self.loaded_for = None;
         self.ticker = None;
         self.grants = None;
@@ -366,6 +371,7 @@ impl SettingsView {
             } else {
                 access.error.unwrap_or_default()
             };
+            self.diagnostics.monitor.leave();
             self.watch_diagnostics(cx);
             return vec![Block::new(&[], div().px(r(16.)).text_sm().text_color(hsla(p.muted_foreground)).child(text))];
         }
@@ -388,9 +394,11 @@ impl SettingsView {
             self.diagnostics.pending_scroll = true;
             self.scroll_to_target = false;
         }
+        self.watch_resource_monitor(cx);
         let now = now_ms();
         let mut blocks =
             vec![Block::new(&[], self.live_processes(window, now, cx)), Block::new(&[], self.resource_history(window, now, cx)), Block::new(&[], self.trace_section(now, cx))];
+        blocks.splice(0..0, self.resource_monitor_blocks(window, cx));
         blocks.extend(self.trace_tables(now, cx));
         if self.diagnostics.form_ready {
             blocks.push(Block::new(&["telemetry-export"], self.telemetry_form(window, cx)));
