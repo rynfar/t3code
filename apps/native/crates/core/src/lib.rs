@@ -62,3 +62,5 @@ pub mod relay;
 pub mod updates;
 pub mod announcements;
 pub mod managed_policy;
+
+pub mod resource_telemetry;
