@@ -178,3 +178,78 @@ fn stacked_actions_and_publishing_invalidate_ref_snapshots() {
         assert_eq!(cache.begin(list_refs("/repo", None, None, 100)).input["refresh"], true);
     }
 }
+
+#[test]
+fn automatic_highlight_follows_pending_create_into_the_existing_search_result() {
+    let mut list = RefListing::default();
+    let initial = list.begin("", false).unwrap();
+    assert!(list.finish(&initial, Ok(vec![page(&["main", "first-page"], Some(100))])));
+    let mut opening = RefHighlight::default();
+    let refresh = list.begin("", false).unwrap();
+    opening.update(&list, &[0, 1], None, "");
+    assert!(list.finish(&refresh, Ok(vec![page(&["new-first", "main"], Some(100))])));
+    opening.update(&list, &[0, 1], None, "");
+    assert_eq!(
+        opening.choice,
+        Some(RefChoice::Ref("new-first".into())),
+        "automatic opening waits for the retained listing's pending refresh"
+    );
+
+    let name = "release/late";
+    let mut highlight = RefHighlight::default();
+    highlight.update(&list, &[], Some(name), name);
+    assert_eq!(highlight.choice, Some(RefChoice::Create(name.into())));
+    let search = list.begin(name, false).unwrap();
+    highlight.update(&list, &[], Some(name), name);
+    assert_eq!(highlight.choice, Some(RefChoice::Create(name.into())));
+    assert!(list.finish(&search, Ok(vec![page(&[name], None)])));
+    highlight.update(&list, &[0], None, name);
+    assert_eq!(
+        highlight.choice,
+        Some(RefChoice::Ref(name.into())),
+        "the provisional Create must yield to the arriving exact match"
+    );
+    assert_eq!(
+        highlight.choice.as_ref().unwrap().index_in(&list.refs, &[0], None),
+        Some(0),
+        "Enter resolves the existing ref"
+    );
+
+    let refresh = list.begin(name, false).unwrap();
+    highlight.update(&list, &[0], None, name);
+    assert!(list.finish(&refresh, Ok(vec![page(&["release/late-secondary", name], None)])));
+    highlight.update(&list, &[0, 1], None, name);
+    assert_eq!(
+        highlight.choice,
+        Some(RefChoice::Ref(name.into())),
+        "background refresh keeps the completed search's identity"
+    );
+    assert_eq!(highlight.choice.as_ref().unwrap().index_in(&list.refs, &[0, 1], None), Some(1));
+
+    highlight.reset();
+    highlight.update(&list, &[], Some("next-query"), "next-query");
+    let search = list.begin("next-query", false).unwrap();
+    highlight.select(RefChoice::Create("next-query".into()));
+    assert!(list.finish(&search, Ok(vec![page(&["next-query"], None)])));
+    highlight.update(&list, &[0], None, "next-query");
+    assert_eq!(
+        highlight.choice,
+        Some(RefChoice::Create("next-query".into())),
+        "explicit navigation keeps identity protection"
+    );
+    assert_eq!(highlight.choice.as_ref().unwrap().index_in(&list.refs, &[0], None), None);
+
+    highlight.reset();
+    let search = list.begin("eventual", false).unwrap();
+    assert!(list.finish(&search, Ok(vec![page(&[], None)])));
+    highlight.update(&list, &[], Some("eventual"), "eventual");
+    assert_eq!(highlight.choice, Some(RefChoice::Create("eventual".into())));
+    let refresh = list.begin("eventual", false).unwrap();
+    assert!(list.finish(&refresh, Ok(vec![page(&["eventual"], None)])));
+    highlight.update(&list, &[0], None, "eventual");
+    assert_eq!(
+        highlight.choice,
+        Some(RefChoice::Ref("eventual".into())),
+        "a provisional Create also follows later-arriving exact matches"
+    );
+}

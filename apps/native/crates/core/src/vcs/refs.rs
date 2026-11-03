@@ -203,5 +203,36 @@ impl RefChoice {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RefHighlight {
+    pub choice: Option<RefChoice>,
+    automatic: bool,
+}
+
+impl Default for RefHighlight {
+    fn default() -> Self {
+        Self { choice: None, automatic: true }
+    }
+}
+
+impl RefHighlight {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn select(&mut self, choice: RefChoice) {
+        self.choice = Some(choice);
+        self.automatic = false;
+    }
+
+    pub fn update(&mut self, listing: &RefListing, indices: &[usize], create: Option<&str>, query: &str) {
+        if self.automatic {
+            self.choice = RefChoice::at(&listing.refs, indices, create, 0);
+            let search_pending = listing.query != super::sanitize_new_ref_name(query) || !listing.loaded || listing.loading;
+            self.automatic = search_pending || !matches!(self.choice.as_ref(), Some(RefChoice::Ref(_)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

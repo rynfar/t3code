@@ -10,7 +10,7 @@ use gpui::{
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
-use t3_core::vcs::refs::RefChoice;
+use t3_core::vcs::refs::{RefChoice, RefHighlight};
 use t3_core::vcs::{RefFilter, VcsRef, branch_selection_target, ref_badge, sanitize_new_ref_name};
 
 use super::{GitEvent, GitStore};
@@ -30,8 +30,7 @@ pub struct BranchPicker {
     git: Entity<GitStore>,
     input: Entity<InputState>,
     open: bool,
-    highlighted: Option<RefChoice>,
-    auto_highlight: bool,
+    highlighted: RefHighlight,
     closed_at: Option<Instant>,
     debounce: Option<Task<()>>,
     filter: RefFilter,
@@ -53,8 +52,7 @@ impl BranchPicker {
         let subscriptions = vec![
             cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
-                    this.highlighted = None;
-                    this.auto_highlight = true;
+                    this.highlighted.reset();
                     this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                     let query = input.read(cx).value().to_string();
                     this.debounce = Some(cx.spawn(async move |this, cx| {
@@ -65,7 +63,7 @@ impl BranchPicker {
                 }
                 InputEvent::PressEnter { .. } => {
                     this.refresh_items(cx);
-                    if let Some(choice) = this.highlighted.clone() { this.activate(choice, window, cx); }
+                    if let Some(choice) = this.highlighted.choice.clone() { this.activate(choice, window, cx); }
                 },
                 _ => {}
             }),
@@ -79,8 +77,7 @@ impl BranchPicker {
             git,
             input,
             open: false,
-            highlighted: None,
-            auto_highlight: true,
+            highlighted: RefHighlight::default(),
             closed_at: None,
             debounce: None,
             filter: RefFilter::default(),
@@ -103,8 +100,7 @@ impl BranchPicker {
             return;
         }
         self.open = true;
-        self.highlighted = None;
-        self.auto_highlight = true;
+        self.highlighted.reset();
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -136,10 +132,7 @@ impl BranchPicker {
         // An exact match also matches the query, so the filtered rows are enough to rule it out.
         let exists = self.filter.indices().iter().any(|&index| git.refs.refs[index].name == name);
         self.create = (!query.is_empty() && !exists && git.can_change_branch()).then_some(name);
-        if self.auto_highlight {
-            self.highlighted = RefChoice::at(&git.refs.refs, self.filter.indices(), self.create.as_deref(), 0);
-            self.auto_highlight = self.highlighted.is_none();
-        }
+        self.highlighted.update(&git.refs, self.filter.indices(), self.create.as_deref(), &query);
     }
 
     fn item_count(&self) -> usize {
@@ -169,14 +162,15 @@ impl BranchPicker {
         let count = self.item_count();
         if count > 0 {
             let refs = &self.git.read(cx).refs.refs;
-            let current = self.highlighted.as_ref().and_then(|choice| choice.index_in(refs, self.filter.indices(), self.create.as_deref()));
+            let current = self.highlighted.choice.as_ref().and_then(|choice| choice.index_in(refs, self.filter.indices(), self.create.as_deref()));
             let index = match current {
                 Some(index) => (index as isize + delta).rem_euclid(count as isize) as usize,
                 None if delta < 0 => count - 1,
                 None => 0,
             };
-            self.highlighted = RefChoice::at(refs, self.filter.indices(), self.create.as_deref(), index);
-            self.auto_highlight = false;
+            if let Some(choice) = RefChoice::at(refs, self.filter.indices(), self.create.as_deref(), index) {
+                self.highlighted.select(choice);
+            }
             self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
             cx.notify();
         }
@@ -200,7 +194,7 @@ impl BranchPicker {
             Item::Create(name) => (MenuRow::new(id, SharedString::from(format!("Create new ref \"{name}\""))), true),
         };
         let choice = match &item { Item::Ref(item) => RefChoice::Ref(item.name.clone()), Item::Create(name) => RefChoice::Create(name.clone()) };
-        let highlighted = self.highlighted.as_ref() == Some(&choice);
+        let highlighted = self.highlighted.choice.as_ref() == Some(&choice);
         let row = if enabled { row.on_click(cx.listener(move |this, _, window, cx| this.activate(choice.clone(), window, cx))) } else { row };
         div().rounded(px(4.)).when(highlighted, |this| this.bg(hsla(p.accent))).child(row).into_any_element()
     }
