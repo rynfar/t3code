@@ -565,7 +565,7 @@ const usageTokens = (): ColorToken[] => {
 // lightness to read on the theme's surfaces at runtime, so this runs the same math per palette.
 // The default theme measures `getStandardPaintedThemeColors`; named themes their own roles.
 const CHIP_ACCENTS = "apps/web/src/lib/contextChipAccents.ts";
-const CHIP_KINDS = ["terminal", "thread", "environment", "citation"] as const;
+const CHIP_KINDS = ["terminal", "thread", "environment", "citation", "review-comment"] as const;
 const culoriPackage = require.resolve("culori/package.json");
 const culoriVersion = (
   JSON.parse(NodeFS.readFileSync(culoriPackage, "utf8")) as { version: string }
@@ -779,7 +779,7 @@ function chipInks(variant: Variant): ReadonlyMap<string, string> {
 
 const chipTokens = (): ColorToken[] =>
   [...CHIP_KINDS, "invalid" as const].map((kind) => ({
-    name: `context_chip_${kind}`,
+    name: `context_chip_${kind.replaceAll("-", "_")}`,
     web: `--context-chip-${kind}`,
     css: ({ variant }) => chipInks(variant).get(kind)!,
   }));

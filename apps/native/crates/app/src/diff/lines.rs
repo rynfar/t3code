@@ -78,6 +78,12 @@ impl DiffPanel {
             .h_full()
             .bg(hsla(p.background))
             .on_scroll_wheel(cx.listener(Self::scroll_horizontally))
+            .on_mouse_move(cx.listener(Self::drag_comment_selection))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                this.track_comment_pointer(event.position, cx);
+                this.finish_selection(window, cx);
+            }))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| this.finish_selection(window, cx)))
             .child(list(self.list.clone(), cx.processor(|this, ix: usize, _, cx| this.render_row(ix, cx))).size_full())
             .children(sticky.map(|file| div().absolute().top_0().left_0().right_0().child(self.render_file_header(file, cx))))
             .vertical_scrollbar(&self.list)
@@ -108,6 +114,12 @@ impl DiffPanel {
     }
 
     fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let row = self.view.as_ref().and_then(|view| view.row(ix));
+        let code = self.render_code_row(ix, cx);
+        self.with_comment_editor(row, code, cx)
+    }
+
+    fn render_code_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.view.as_ref().and_then(|view| view.row(ix)) else {
             return div().into_any_element();
         };
@@ -115,18 +127,18 @@ impl DiffPanel {
             DiffRow::FileHeader { file } => self.render_file_header(file, cx),
             DiffRow::Separator { file, hidden, .. } => self.render_separator(file, hidden, cx),
             DiffRow::Line { file, hunk, line } => {
-                let Some((line, digits)) = self.line(file, hunk, line) else { return div().into_any_element() };
+                let Some((line, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
                 let p = palette(cx);
-                self.code_row(line_colors(line.kind, p).row, cx).child(self.half(Some(line), digits, true, cx)).into_any_element()
+                self.code_row(line_colors(line.kind, p).row, cx).child(self.half(file, Some(&line), digits, true, cx)).into_any_element()
             }
             DiffRow::Split { file, hunk, left, right } => {
-                let left = left.and_then(|line| self.line(file, hunk, line));
-                let right = right.and_then(|line| self.line(file, hunk, line));
-                let digits = left.or(right).map_or(3, |(_, digits)| digits);
+                let left = left.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
+                let right = right.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
+                let digits = left.as_ref().or(right.as_ref()).map_or(3, |(_, digits)| *digits);
                 let p = palette(cx);
                 self.code_row(hsla(p.background), cx)
-                    .child(self.half(left.map(|(line, _)| line), digits, false, cx))
-                    .child(self.half(right.map(|(line, _)| line), digits, true, cx))
+                    .child(self.half(file, left.as_ref().map(|(line, _)| line), digits, false, cx))
+                    .child(self.half(file, right.as_ref().map(|(line, _)| line), digits, true, cx))
                     .into_any_element()
             }
             DiffRow::NoNewline { file, hunk, line } => {
@@ -180,7 +192,7 @@ impl DiffPanel {
 
     /// One side of a row: a gutter with the line number and change bar, then the code. In the
     /// stacked layout deletions show their old number and everything else its new one.
-    fn half(&self, line: Option<&DiffLine>, digits: usize, new_side: bool, cx: &App) -> Div {
+    fn half(&self, file: usize, line: Option<&DiffLine>, digits: usize, new_side: bool, cx: &mut Context<Self>) -> Div {
         let p = palette(cx);
         let char_width = self.char_width.unwrap_or(px(7.8));
         let colors = line.map_or_else(|| line_colors(LineKind::Context, p), |line| line_colors(line.kind, p));
@@ -205,7 +217,8 @@ impl DiffPanel {
                     .text_color(colors.number)
                     .text_right()
                     .children(colors.bar.filter(|_| line.is_some()).map(|bar| div().absolute().top_0().bottom_0().left_0().w(px(4.)).bg(bar)))
-                    .children(number.map(|number| SharedString::from(number.to_string()))),
+                    .children(number.map(|number| SharedString::from(number.to_string())))
+                    .map(|gutter| self.comment_gutter(gutter, file, line, new_side, cx)),
             )
             .child(
                 div()

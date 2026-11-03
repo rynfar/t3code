@@ -15,6 +15,7 @@ use gpui::{
 };
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::composer::review::ReviewComment;
 use t3_core::composer::context::{self as rules, TerminalContext, TerminalSelection};
 use t3_core::composer::menu::{ThreadContext, context_references, sanitize_context_label};
 
@@ -33,6 +34,7 @@ pub(super) struct ContextChips {
     /// Terminal excerpts per target. A send carries those the prompt still links; unlinked ones
     /// stay so an undo that brings a link back brings its chip back.
     terminals: HashMap<Target, Vec<TerminalContext>>,
+    pub(super) reviews: HashMap<Target, Vec<ReviewComment>>,
     /// The chip whose details popover is open, by context id.
     open: Option<String>,
     dismissed: Option<Instant>,
@@ -43,6 +45,7 @@ pub(super) struct ContextChips {
 /// One chip in the row, resolved against what the composer holds.
 enum Chip {
     Terminal(TerminalContext),
+    Review(ReviewComment),
     Thread(ThreadContext),
     /// A link whose context this composer does not have (`UnresolvedContextChip`).
     Unresolved { context_id: String, label: String },
@@ -52,6 +55,7 @@ impl Chip {
     fn context_id(&self) -> String {
         match self {
             Chip::Terminal(context) => context.context_id(),
+            Chip::Review(context) => context.context_id(),
             Chip::Thread(thread) => thread.context_id.clone(),
             Chip::Unresolved { context_id, .. } => context_id.clone(),
         }
@@ -68,6 +72,56 @@ pub(super) enum Ink {
 }
 
 impl Composer {
+    pub(super) fn reviews_for(&self, target: &Target) -> &[ReviewComment] {
+        self.context.reviews.get(target).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    pub(super) fn current_reviews(&self) -> &[ReviewComment] {
+        self.snapshot.target.as_ref().map(|target| self.reviews_for(target)).unwrap_or_default()
+    }
+
+    pub(super) fn seed_reviews(&mut self, target: &Target, comments: Vec<ReviewComment>) {
+        rules::restore_unsent(self.context.reviews.entry(target.clone()).or_default(), comments);
+    }
+
+    pub(super) fn take_reviews(&mut self, target: &Target, prompt: &str) -> Vec<ReviewComment> {
+        self.context.reviews.get_mut(target).map(|held| rules::take_for_send(held, prompt)).unwrap_or_default()
+    }
+
+    pub(super) fn add_review_comment(&mut self, comment: ReviewComment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        let reference = comment.reference();
+        self.seed_reviews(&target, vec![comment]);
+        if let Some(editing) = self.queue.editing.as_mut() {
+            editing.stash = rules::insert_reference(&editing.stash, editing.stash.len(), &reference).0;
+        } else if let Some(stash) = self.stash.as_mut().filter(|_| self.answering.is_some()) {
+            *stash = rules::insert_reference(stash, stash.len(), &reference).0;
+        } else {
+            let prompt = self.prompt(cx);
+            let edit = rules::reference_edit(&prompt, self.input.read(cx).selected_range().end, &reference);
+            self.input.update(cx, |input, cx| {
+                input.set_selected_range(edit.start..edit.end, cx);
+                input.replace(edit.text.clone(), window, cx);
+                input.set_selected_range(edit.cursor()..edit.cursor(), cx);
+            });
+            self.focus(window, cx);
+        }
+        self.draft_changed(cx);
+        cx.notify();
+    }
+
+    pub(super) fn remove_review_comment(&mut self, context_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editing) = self.queue.editing.as_mut() {
+            editing.stash = rules::remove_reference(&editing.stash, context_id).0;
+        } else if let Some(stash) = self.stash.as_mut().filter(|_| self.answering.is_some()) {
+            *stash = rules::remove_reference(stash, context_id).0;
+        } else {
+            self.remove_context(context_id, window, cx);
+        }
+        self.draft_changed(cx);
+        cx.notify();
+    }
+
     pub(super) fn terminals_for(&self, target: &Target) -> &[TerminalContext] {
         self.context.terminals.get(target).map(Vec::as_slice).unwrap_or_default()
     }
@@ -105,6 +159,7 @@ impl Composer {
     /// and excerpts its draft no longer links go.
     pub(super) fn reset_context_history(&mut self, target: &Target, prompt: &str) {
         self.reset_thread_history(target, prompt);
+        if let Some(held) = self.context.reviews.get_mut(target) { rules::reset_history(held, prompt); }
         if let Some(held) = self.context.terminals.get_mut(target) {
             rules::reset_history(held, prompt);
         }
@@ -197,9 +252,11 @@ impl Composer {
             let thread = (reference.kind == "thread")
                 .then(|| self.mentions(target).iter().find(|thread| thread.context_id == reference.context_id))
                 .flatten();
-            chips.push(match (terminal, thread) {
-                (Some(terminal), _) => Chip::Terminal(terminal.clone()),
-                (_, Some(thread)) => Chip::Thread(thread.clone()),
+            let review = self.reviews_for(target).iter().find(|comment| comment.context_id() == reference.context_id);
+            chips.push(match (terminal, thread, review) {
+                (Some(terminal), _, _) => Chip::Terminal(terminal.clone()),
+                (_, Some(thread), _) => Chip::Thread(thread.clone()),
+                (_, _, Some(comment)) => Chip::Review(comment.clone()),
                 _ => Chip::Unresolved {
                     context_id: reference.context_id.to_owned(),
                     label: sanitize_context_label(reference.label, reference.kind),
@@ -240,6 +297,19 @@ impl Composer {
         let p = palette(cx);
         let context_id = chip.context_id();
         match chip {
+            Chip::Review(comment) => {
+                let ink = Ink::Accent(p.context_chip_review_comment);
+                let open = self.context.open.as_deref() == Some(context_id.as_str());
+                let toggle_id = context_id.clone();
+                let shell = chip_shell(&context_id, Icon::MessageCircle, comment.label(), ink, true, cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.context.open = if this.context.open.as_deref() == Some(&toggle_id) { None } else { Some(toggle_id.clone()) };
+                        cx.notify();
+                    }));
+                div().relative().child(self.with_remove(shell, &context_id, ink, cx))
+                    .when(open, |this| this.child(floating(Float::AboveStart, self.review_popover(&comment, cx))))
+                    .into_any_element()
+            }
             Chip::Terminal(context) if !context.is_expired() => {
                 let open = self.context.open.as_deref() == Some(context_id.as_str());
                 let toggle_id = context_id.clone();
@@ -317,6 +387,18 @@ impl Composer {
                 .on_click(cx.listener(move |this, _, window, cx| this.remove_context(&remove_id, window, cx)))
                 .child(Icon::X.render(px(CHIP_TEXT * 0.85), color)),
         )
+    }
+
+    fn review_popover(&self, comment: &ReviewComment, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        v_flex().id("review-comment-details").w(px(384.)).max_w_full().p(px(12.)).gap(px(8.))
+            .rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.popover))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.context.open = None; cx.notify(); }))
+            .child(div().text_size(px(12.)).child(comment.file_path.clone()))
+            .child(div().text_size(px(11.)).text_color(hsla(p.secondary_label)).child(format!("{} · {}", comment.section_title, comment.range_label)))
+            .child(div().text_size(px(14.)).child(SharedString::from(comment.text.clone())))
+            .child(div().id("review-comment-excerpt").max_h(px(256.)).overflow_y_scroll().font_family(cx.theme().mono_font_family.clone()).text_size(px(11.)).child(SharedString::from(comment.diff.clone())))
+            .into_any_element()
     }
 
     /// `TerminalContextInlineChip`'s popover: the terminal and its lines over the captured text.

@@ -64,6 +64,8 @@ pub struct DiffLine {
     pub new_line: Option<u32>,
     /// Without the `+`/`-`/` ` marker, tabs expanded to Pierre's tab size.
     pub text: Arc<str>,
+    /// Original patch content, before display-only tab expansion.
+    pub source_text: Arc<str>,
     pub no_newline_at_eof: bool,
 }
 

@@ -175,11 +175,13 @@ impl<'a> Parser<'a> {
                     (Some(old_line - 1), Some(new_line - 1))
                 }
             };
+            let source_text: Arc<str> = Arc::from(text);
             hunk.lines.push(DiffLine {
                 kind,
                 old_line: old,
                 new_line: new,
-                text: expand_tabs(text),
+                text: if text.contains('\t') { expand_tabs(text) } else { source_text.clone() },
+                source_text,
                 no_newline_at_eof: false,
             });
             self.at += 1;

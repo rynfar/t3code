@@ -27,6 +27,7 @@ pub(super) struct Taken {
     attachments: Vec<super::attachments::Staged>,
     threads: Vec<ThreadContext>,
     terminals: Vec<TerminalContext>,
+    reviews: Vec<t3_core::composer::review::ReviewComment>,
 }
 
 /// What one send carries, resolved before the prompt clears.
@@ -73,7 +74,7 @@ impl Composer {
         let staged = self.staged_attachments();
         // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
         let terminals = TerminalSend::of(&prompt, self.current_terminals());
-        if !terminals.has_content(staged.len(), self.linked_threads(&prompt)) {
+        if !terminals.has_content(staged.len(), self.linked_threads(&prompt) + t3_core::composer::review::referenced(&prompt, self.current_reviews()).len()) {
             if terminals.expired > 0 {
                 self.expired_toast(terminals.expired, ExpiredNotice::Empty, cx);
             }
@@ -324,6 +325,7 @@ impl Composer {
             attachments: self.take_attachments(target),
             threads: self.take_threads(target, prompt),
             terminals: self.take_terminals(target, prompt),
+            reviews: self.take_reviews(target, prompt),
         }
     }
 
@@ -344,6 +346,7 @@ impl Composer {
         self.restore_attachments(target, taken.attachments);
         self.restore_threads(target, taken.threads);
         self.restore_terminals(target, taken.terminals);
+        self.seed_reviews(target, taken.reviews);
         self.error = Some(error);
     }
 
