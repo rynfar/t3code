@@ -23,9 +23,11 @@ pub enum MenuAction {
     Thread(ThreadAction),
     Project(ProjectAction),
     Bulk(BulkAction),
+    DiscardDraft,
 }
 
 pub enum ContextMenuEvent {
+    DiscardDraft(String),
     Rename(String),
     Delete(String),
     CustomSnooze(Vec<String>),
@@ -95,6 +97,23 @@ impl ContextMenu {
         cx.notify();
     }
 
+    pub fn open_for_draft(&mut self, project: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut copy = MenuItem::new(MenuAction::Project(ProjectAction::CopyPath), "Copy", Some("copy"));
+        copy.disabled = self.state.read(cx).shell.project(project).is_none();
+        if !copy.disabled { copy.children.push(MenuItem::new(MenuAction::Project(ProjectAction::CopyPath), "Path", Some("folder"))); }
+        let mut discard = MenuItem::new(MenuAction::DiscardDraft, "Discard draft", Some("trash"));
+        discard.destructive = true;
+        discard.separator_before = true;
+        let mut items = vec![copy];
+        if self.state.read(cx).shell.project(project).is_some() {
+            items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
+        }
+        items.push(discard);
+        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new()});
+        window.focus(&self.focus,cx);
+        cx.notify();
+    }
+
     /// The multi-select menu (`handleMultiSelectContextMenu`).
     pub fn open_for_selection(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
@@ -156,6 +175,7 @@ impl ContextMenu {
         cx.emit(DismissEvent);
         cx.notify();
         match action {
+            MenuAction::DiscardDraft => cx.emit(ContextMenuEvent::DiscardDraft(open.target_id)),
             MenuAction::Thread(ThreadAction::Rename) => cx.emit(ContextMenuEvent::Rename(open.target_id)),
             MenuAction::Thread(ThreadAction::Delete) => cx.emit(ContextMenuEvent::Delete(open.target_id)),
             MenuAction::Thread(ThreadAction::SnoozeCustom) => cx.emit(ContextMenuEvent::CustomSnooze(vec![open.target_id])),

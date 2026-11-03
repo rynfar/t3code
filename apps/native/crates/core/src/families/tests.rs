@@ -83,4 +83,11 @@ fn the_open_thread_reads_its_family_whenever_the_shell_leaves_it_out() {
     apply(&mut shell, snapshot(30, &[]));
     assert!(mounts.thread(&shell, "a").is_none());
     assert!(family_read_due(&shell, &mounts, "a", Some(shell.generation - 1)), "each snapshot reads it again");
+    use crate::sidebar::tag_filter::{RouteVisibility, route_visibility};
+    let hidden = HashSet::new();
+    assert_eq!(route_visibility("a", mounts.thread(&shell, "a").is_some(), &hidden, true), RouteVisibility::Loading,
+        "the selected thread must not redirect while its new-generation family is pending");
+    mounts.mount(&family_key("a"), shell.generation, vec![read(30, &["a"])]);
+    assert_eq!(route_visibility("a", mounts.thread(&shell, "a").is_some(), &hidden, true), RouteVisibility::Visible);
+    assert_eq!(route_visibility("a", true, &HashSet::from(["a".into()]), true), RouteVisibility::Hidden);
 }

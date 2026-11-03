@@ -111,6 +111,8 @@ pub struct ThreadShell {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    #[serde(default, deserialize_with = "stored_tags", skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub provider_instance_id: String,
     pub model_selection: ModelSelection,
     pub runtime_mode: String,
@@ -457,3 +459,9 @@ fn upsert<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {
 
 #[cfg(test)]
 mod tests;
+
+/// `StoredThreadTags`: a future malformed list must not fail the shell frame.
+fn stored_tags<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}

@@ -14,6 +14,17 @@ fn empty_drafts_are_dropped_and_unchanged_ones_not_rewritten() {
     assert!(store.set(&thread_key("t1"), draft("  ", 4)), "clearing the prompt drops the draft");
     assert!(store.get(&thread_key("t1")).is_none());
     assert!(!store.set(&thread_key("t1"), draft("", 5)));
+    let discarded = draft("original", 6);
+    assert!(store.restore(&new_thread_key("p1"), discarded.clone(), &Draft::default()));
+    assert!(!store.restore(&new_thread_key("p1"), draft("replacement", 7), &Draft::default()));
+    assert_eq!(store.get(&new_thread_key("p1")).unwrap().prompt, "original");
+    store.remove(&new_thread_key("p1"));
+    let pending = Draft { pending_attachment_count: 2, ..Draft::default() };
+    assert!(!store.restore(&new_thread_key("upload"), discarded, &pending), "Undo must refuse newly staged attachments even before persistence records them");
+    assert!(store.get(&new_thread_key("upload")).is_none());
+    assert!(store.set(&new_thread_key("upload"), pending));
+    assert!(store.get(&new_thread_key("upload")).unwrap().has_user_content());
+    assert!(DraftStore::from_value(Some(&store.to_value())).get(&new_thread_key("upload")).is_none(), "unuploaded bytes do not persist");
     let choice = Draft { interaction_mode: Some(InteractionMode::Plan), ..Draft::default() };
     assert!(store.set(&new_thread_key("p1"), choice), "a choice alone is worth keeping");
 }
@@ -51,6 +62,8 @@ fn the_store_round_trips_and_skips_bad_entries() {
         threads: Draft::saved_threads(&[thread.clone(), ThreadContext::new("env", "t3", "Unlinked")], &prompt),
         terminals: Draft::saved_terminals(&[unlinked, excerpt.clone()], &prompt),
         attachments: vec![SavedAttachment::of(&attachment).unwrap()],
+        pending_attachment_count: 0,
+        created_at: Some(7),
         updated_at: 7,
     };
     store.set(&thread_key("t1"), full.clone());
@@ -87,4 +100,24 @@ fn the_oldest_drafts_go_first() {
     assert_eq!(store.keys().count(), MAX_DRAFTS);
     assert!(store.get(&thread_key("0")).is_none());
     assert!(store.get(&thread_key(&MAX_DRAFTS.to_string())).is_some());
+    assert_eq!(store.take_pruned_keys(), [thread_key("0")]);
+    assert!(store.take_pruned_keys().is_empty());
+    for saved_key in [thread_key("fresh-thread"), new_thread_key("fresh-project")] {
+        let mut store = DraftStore::default();
+        store.set(&new_thread_key("old-project"), draft("old sidebar row", 1));
+        for index in 1..MAX_DRAFTS { store.set(&thread_key(&index.to_string()), draft("x", index as i64 + 1)); }
+        let mut rows = crate::sidebar::drafts::DraftRows::default();
+        rows.update(&store, None, None);
+        assert_eq!(rows.rows.len(), 1);
+        store.set(&saved_key, draft("new", MAX_DRAFTS as i64 + 1));
+        if let Some(project) = saved_key.strip_prefix("draft:") { rows.update_draft(&store, project, None); }
+        for key in store.take_pruned_keys() {
+            if let Some(project) = key.strip_prefix("draft:") { rows.update_draft(&store, project, None); }
+        }
+        assert!(!rows.rows.iter().any(|row| row.project_id == "old-project"), "pruning must invalidate a row even when another thread or project was saved");
+    }
+    let oversized = (0..MAX_DRAFTS + 2).map(|index| (new_thread_key(&index.to_string()), serde_json::to_value(draft("x", index as i64)).unwrap())).collect::<serde_json::Map<_, _>>();
+    let mut store = DraftStore::from_value(Some(&json!({"version":1,"drafts":oversized})));
+    store.set(&thread_key("new"), draft("new", MAX_DRAFTS as i64 + 2));
+    assert_eq!(store.take_pruned_keys(), [new_thread_key("0"), new_thread_key("1"), new_thread_key("2")]);
 }

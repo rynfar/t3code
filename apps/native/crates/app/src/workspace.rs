@@ -63,9 +63,9 @@ impl Workspace {
         let dialog = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
         let palette = cx.new(|cx| CommandPalette::new(state.clone(), window, cx));
         let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
-        let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+        let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
         let lineage = cx.new(|cx| crate::lineage::ComposerLineage::new(state.clone(), cx));
         let draft = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
         let home = cx.new(|cx| crate::home::HomeView::new(state.clone(), cx));

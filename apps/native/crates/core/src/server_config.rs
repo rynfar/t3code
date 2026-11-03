@@ -626,6 +626,10 @@ pub struct ProjectSettingsOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub hidden_thread_tags: Vec<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub hide_tagged_threads: bool,
     /// Null means unmigrated; the web then falls back to its client-side favorites.
     #[serde(default, deserialize_with = "lenient_option_vec")]
     pub favorites: Option<Vec<ModelFavorite>>,
@@ -673,6 +677,14 @@ pub struct ServerSettings {
     pub secret_providers: crate::settings::secrets::SecretProviders,
     #[serde(default, deserialize_with = "lenient")]
     pub observability: crate::settings::diagnostics::ObservabilitySettings,
+}
+
+impl ServerSettings {
+    /// `hiddenThreadTagsAtom` in `client-runtime/src/state/server.ts`.
+    pub fn hidden_tags(&self) -> Option<Vec<String>> {
+        let tags: Vec<String> = self.hidden_thread_tags.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()).map(str::to_owned).collect();
+        (self.hide_tagged_threads && !tags.is_empty()).then_some(tags)
+    }
 }
 
 /// `providerInstances` in the server's order, which is the order the provider settings list

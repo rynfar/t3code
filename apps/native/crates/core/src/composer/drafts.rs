@@ -92,14 +92,23 @@ pub struct Draft {
     /// Terminal excerpts the prompt links, with their text (`PersistedTerminalContextDraft`).
     pub terminals: Vec<TerminalContext>,
     pub attachments: Vec<SavedAttachment>,
+    #[serde(skip)]
+    pub pending_attachment_count: usize,
     pub updated_at: i64,
+    pub created_at: Option<i64>,
 }
 
 impl Draft {
+    pub fn has_user_content(&self) -> bool {
+        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || self.pending_attachment_count > 0
+    }
+
     /// Nothing worth keeping: `composerDraftHasUserContent` plus the choices.
     pub fn is_empty(&self) -> bool {
         self.prompt.trim().is_empty()
             && self.attachments.is_empty()
+            && self.pending_attachment_count == 0
+            && self.terminals.is_empty()
             && self.model_selection.is_none()
             && self.runtime_mode.is_none()
             && self.interaction_mode.is_none()
@@ -134,6 +143,7 @@ impl Draft {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftStore {
     drafts: BTreeMap<String, Draft>,
+    pruned_keys: Vec<String>,
 }
 
 impl DraftStore {
@@ -151,7 +161,7 @@ impl DraftStore {
                     .collect()
             })
             .unwrap_or_default();
-        DraftStore { drafts }
+        DraftStore { drafts, pruned_keys: Vec::new() }
     }
 
     pub fn to_value(&self) -> Value {
@@ -167,7 +177,8 @@ impl DraftStore {
     }
 
     /// Stores a draft, or drops it when empty. Returns whether anything changed.
-    pub fn set(&mut self, key: &str, draft: Draft) -> bool {
+    pub fn set(&mut self, key: &str, mut draft: Draft) -> bool {
+        draft.created_at = self.drafts.get(key).and_then(|held| held.created_at).or(draft.created_at).or(Some(draft.updated_at));
         if draft.is_empty() {
             return self.drafts.remove(key).is_some();
         }
@@ -179,6 +190,15 @@ impl DraftStore {
         changed
     }
 
+    pub fn restore(&mut self, key: &str, draft: Draft, live: &Draft) -> bool {
+        if live.has_user_content() || self.get(key).is_some_and(Draft::has_user_content) { return false; }
+        self.drafts.remove(key);
+        self.set(key, draft);
+        true
+    }
+
+    pub fn take_pruned_keys(&mut self) -> Vec<String> { std::mem::take(&mut self.pruned_keys) }
+
     pub fn remove(&mut self, key: &str) -> bool {
         self.drafts.remove(key).is_some()
     }
@@ -187,6 +207,7 @@ impl DraftStore {
         while self.drafts.len() > MAX_DRAFTS {
             let Some(oldest) = self.drafts.iter().min_by_key(|(_, draft)| draft.updated_at).map(|(key, _)| key.clone()) else { break };
             self.drafts.remove(&oldest);
+            self.pruned_keys.push(oldest);
         }
     }
 }

@@ -3,6 +3,7 @@
 //! with the helpers in `apps/web/src/components/Sidebar.logic.ts`.
 
 pub mod drag;
+pub mod drafts;
 pub mod favicon;
 pub mod grouping;
 pub mod history;
@@ -13,6 +14,7 @@ pub mod settled;
 pub mod sort;
 pub mod status;
 pub mod thread;
+pub mod tag_filter;
 pub mod time;
 pub mod visits;
 
@@ -210,6 +212,7 @@ pub struct ModelInput<'a> {
     pub selected_thread_id: Option<&'a str>,
     /// Scoped project ids, or `None` for every project.
     pub project_scope: Option<&'a HashSet<String>>,
+    pub hidden_thread_ids: Option<&'a HashSet<String>>,
     pub connected: bool,
     pub now: Ms,
     /// The section a thread is being dragged out of, which shows the drop markers.
@@ -243,6 +246,7 @@ impl SidebarModel {
             .iter()
             .chain(input.extra_threads.iter().copied())
             .filter(|thread| thread.archived_at.is_none() && thread.deleted_at.is_none() && thread.lineage.is_listed())
+            .filter(|thread| input.hidden_thread_ids.is_none_or(|hidden| !hidden.contains(&thread.id)))
             .filter(|thread| input.project_scope.is_none_or(|scope| scope.contains(&thread.project_id)))
             .collect();
         let unloaded_settled = input

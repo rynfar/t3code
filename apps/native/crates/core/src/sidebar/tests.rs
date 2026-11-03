@@ -525,7 +525,7 @@ fn older_settled_listing_and_counts() {
             settings: &SidebarSettings::default(),
             shelves: &ShelfState::default(),
             selected_thread_id: None,
-            project_scope: None,
+            project_scope: None, hidden_thread_ids: None,
             connected: true,
             now: iso(NOW),
             dragging: None,
@@ -568,7 +568,7 @@ fn snapshot(threads: Vec<Value>) -> ShellSnapshot {
 
 fn build(snapshot: &ShellSnapshot, shelves: &ShelfState, selected: Option<&str>) -> SidebarModel {
     SidebarModel::build(
-        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, connected: true, now: iso(NOW), dragging: None },
+        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, hidden_thread_ids: None, connected: true, now: iso(NOW), dragging: None },
         &mut InboxReturnTracker::default(),
     )
 }
@@ -621,7 +621,7 @@ fn dragging_adds_drop_markers_and_slots_resolve_through_them() {
         wire_thread("done-1", json!({"settledOverride": "settled", "settledAt": "2026-04-03T00:00:00.000Z"})),
     ]);
     let model = SidebarModel::build(
-        &ModelInput { snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, connected: true, now: iso(NOW), dragging: Some(Section::Active) },
+        &ModelInput { snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, hidden_thread_ids: None, connected: true, now: iso(NOW), dragging: Some(Section::Active) },
         &mut InboxReturnTracker::default(),
     );
     assert_eq!(labels(&model), ["<PinnedHeader>", "Pinned:pinned", "<PinnedDivider>", "Active:active", "[Settled 1]", "<SettledPlaceholder>"]);
@@ -739,4 +739,18 @@ fn streaming_ticks_are_quiet_but_real_changes_are_not() {
     let mut idle_tick = idle.clone();
     idle_tick.updated_at = "2026-04-01T00:00:05.000Z".into();
     assert!(!same_apart_from_streaming(&idle, &idle_tick));
+}
+
+#[test]
+fn tag_visibility_applies_before_sidebar_partition_and_search() {
+    let snapshot = snapshot(vec![wire_thread("private",json!({"tags":["private"]})),wire_thread("plain",json!({})),
+        wire_thread("delegated",json!({"delegatedFrom":{"environmentId":"env","threadId":"private","title":"Private"}}))]);
+    let refs: Vec<_> = snapshot.threads.iter().collect();
+    let tags = vec!["private".into()];
+    let hidden = tag_filter::hidden_thread_keys(&[tag_filter::Environment{environment_id:"env",threads:&refs,hidden_tags:Some(&tags)}],&HashSet::new(),&HashSet::new(),true)
+        .into_iter().map(|key|key.thread_id).collect();
+    let model = SidebarModel::build(&ModelInput {snapshot:&snapshot,extra_threads:&[],older_settled:None,settings:&Default::default(),shelves:&Default::default(),selected_thread_id:Some("private"),project_scope:None,hidden_thread_ids:Some(&hidden),connected:true,now:iso(NOW),dragging:None},&mut Default::default());
+    assert_eq!(model.threads.iter().map(|thread|thread.id.as_str()).collect::<Vec<_>>(),["plain"]);
+    assert!(search_titles(&model,"private",iso(NOW)).is_empty());
+    assert_eq!(model.jump_target(0),Some("plain"));
 }

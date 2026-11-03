@@ -8,7 +8,7 @@
 mod attachments;
 mod context;
 pub(crate) mod controls;
-mod drafts;
+pub(crate) mod drafts;
 mod menu;
 mod model_picker;
 mod pending;

@@ -96,6 +96,9 @@ pub struct SidebarController {
     /// The thread being dragged and the section it left.
     pub drag: Option<(String, t3_core::sidebar::Section)>,
     pub favicons: super::favicons::FaviconStore,
+    pub drafts_to_restore: Vec<String>,
+    pub hidden_thread_ids: std::collections::HashSet<String>,
+    hiding_tags: bool,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
     wake_timer: Option<Task<()>>,
@@ -103,9 +106,12 @@ pub struct SidebarController {
     undo_timer: Option<Task<()>>,
 }
 
-fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, entry: &NavEntry) -> bool {
+fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, hidden: &std::collections::HashSet<String>, hiding: bool, entry: &NavEntry) -> bool {
     match entry {
-        NavEntry::Thread(id) => mounts.thread(shell, id).is_some(),
+        NavEntry::Thread(id) => {
+            let loaded = mounts.thread(shell, id).is_some();
+            loaded && t3_core::sidebar::tag_filter::route_visible(id, loaded, hidden, hiding)
+        }
         NavEntry::Draft(project_id) => shell.project(project_id).is_some(),
     }
 }
@@ -119,6 +125,14 @@ impl AppState {
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
         let now = now_ms();
         let extras = self.omitted.mounts.extras(&self.shell);
+        let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
+        self.sidebar.hiding_tags = tags.is_some();
+        let environment_id = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or("local");
+        let threads: Vec<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter()).chain(extras.iter().copied()).collect();
+        self.sidebar.hidden_thread_ids = t3_core::sidebar::tag_filter::hidden_thread_keys(
+            &[t3_core::sidebar::tag_filter::Environment { environment_id, threads: &threads, hidden_tags: tags.as_deref() }],
+            &Default::default(), &Default::default(), tags.is_some(),
+        ).into_iter().map(|key| key.thread_id).collect();
         let older = self.omitted.older();
         let frontier = self.omitted.pages.listing_frontier(older.as_ref());
         let older_settled = older.as_ref().map(|older| OlderSettledShelf { older, frontier });
@@ -132,6 +146,7 @@ impl AppState {
                     shelves: &self.sidebar.shelves,
                     selected_thread_id: self.selected_thread.as_deref(),
                     project_scope: self.sidebar.project_scope.as_ref(),
+                    hidden_thread_ids: Some(&self.sidebar.hidden_thread_ids),
                     connected: connected(&self.phase),
                     now,
                     dragging: self.sidebar.drag.as_ref().map(|(_, from)| *from),
@@ -143,6 +158,13 @@ impl AppState {
         let next = model.next_change_at;
         let listed_settled = model.listed_settled_count;
         self.sidebar.model = Arc::new(model);
+        if self.selected_thread.as_deref().is_some_and(|id| {
+            t3_core::sidebar::tag_filter::route_visibility(id, self.thread_shell(id).is_some(), &self.sidebar.hidden_thread_ids, self.hiding_thread_tags())
+                == t3_core::sidebar::tag_filter::RouteVisibility::Hidden
+        }) {
+            self.clear_selection(cx);
+            return;
+        }
         self.grow_settled_shelf(listed_settled, cx);
         self.sidebar.wake_timer = next.map(|at| {
             cx.spawn(async move |this, cx| {
@@ -165,6 +187,8 @@ impl AppState {
         self.sidebar.capabilities.auto_settle_opt_out = config.environment.capabilities.thread_auto_settle_opt_out == Some(true);
         let keybindings = config.keybindings.clone();
         crate::keymap::install(&keybindings, cx);
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Shell);
     }
 
     pub fn toggle_shelf(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
@@ -180,15 +204,25 @@ impl AppState {
         cx.emit(AppEvent::Shell);
     }
 
+    fn hiding_thread_tags(&self) -> bool {
+        self.sidebar.hiding_tags
+    }
+
+    pub(crate) fn thread_route_visible(&self, id: &str) -> bool {
+        t3_core::sidebar::tag_filter::route_visible(id, self.thread_shell(id).is_some(), &self.sidebar.hidden_thread_ids, self.hiding_thread_tags())
+    }
+
     pub fn can_navigate(&self, back: bool) -> bool {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        self.sidebar.history.can_go(back, |entry| history_entry_exists(shell, mounts, entry))
+        self.sidebar.history.can_go(back, |entry| history_entry_exists(shell, mounts, &self.sidebar.hidden_thread_ids, self.hiding_thread_tags(), entry))
     }
 
     /// `navigation.back` / `navigation.forward`.
     pub fn navigate_history(&mut self, back: bool, cx: &mut Context<Self>) {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        match self.sidebar.history.go(back, |entry| history_entry_exists(shell, mounts, entry)).cloned() {
+        let hiding = self.hiding_thread_tags();
+        let hidden = &self.sidebar.hidden_thread_ids;
+        match self.sidebar.history.go(back, |entry| history_entry_exists(shell, mounts, hidden, hiding, entry)).cloned() {
             Some(NavEntry::Thread(id)) => self.select_thread(&id, cx),
             Some(NavEntry::Draft(project_id)) => self.start_draft(&project_id, cx),
             None => {}
@@ -273,7 +307,7 @@ impl AppState {
         .detach();
     }
 
-    fn after_undo_change(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn after_undo_change(&mut self, cx: &mut Context<Self>) {
         cx.emit(AppEvent::Notice);
         let Some(at) = self.sidebar.undo.expires_at() else {
             self.sidebar.undo_timer = None;
@@ -528,10 +562,10 @@ impl AppState {
         if group.is_empty() {
             return false;
         }
-        self.after_undo_change(cx);
         for (thread_id, plan) in group {
             self.run_undo_steps(thread_id, plan, cx);
         }
+        self.after_undo_change(cx);
         true
     }
 
@@ -544,6 +578,11 @@ impl AppState {
         let step = steps.remove(0);
         // Each step goes through its action's claim invalidation, as `runUndoPlan` calls the actions.
         let command = match &step {
+            UndoStep::RestoreDraft => {
+                self.sidebar.drafts_to_restore.push(thread_id);
+                cx.emit(AppEvent::RestoreDraft);
+                return;
+            }
             UndoStep::Unsettle => {
                 self.sidebar.undo.invalidate(UndoKind::Settle, &thread_id);
                 actions::unsettle(&uuid(), &thread_id)
