@@ -124,7 +124,7 @@ struct ThemeKey(usize, usize);
 
 impl ThemeKey {
     fn of(cx: &App) -> Self {
-        ThemeKey(std::ptr::from_ref(palette(cx)) as usize, Arc::as_ptr(&cx.theme().highlight_theme) as usize)
+        ThemeKey(crate::theme::revision(cx), Arc::as_ptr(&cx.theme().highlight_theme) as usize)
     }
 }
 

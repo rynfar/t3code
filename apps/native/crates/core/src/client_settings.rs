@@ -211,6 +211,11 @@ pub enum ClientSettingChange {
     /// `setTheme`: replaces the theme and keeps the current appearance mode.
     Theme(ThemePreference),
     AppearanceMode(AppearanceMode),
+    AppearanceContrast(u32),
+    GlassOpacity(u32),
+    ThemeLibrary(Value),
+    ThemePatch(Map<String,Value>),
+    ThemeHalves(std::collections::BTreeMap<String, String>),
     /// The last repository mode the grouping switch turned off, restored when it turns back on.
     LastEnabledProjectGrouping(ProjectGroupingMode),
     /// `completeOnboarding`: when the welcome wizard finished, as an ISO timestamp.
@@ -276,6 +281,11 @@ impl ClientSettingChange {
             ClientSettingChange::PlanMode(on) => ("planModeEnabled", Value::Bool(*on)),
             ClientSettingChange::ContextWindowMeter(on) => ("contextWindowMeterEnabled", Value::Bool(*on)),
             ClientSettingChange::Theme(theme) => (THEME_KEY, text(theme.as_str())),
+            ClientSettingChange::AppearanceContrast(value) => ("appearanceContrast", Value::from((*value).clamp(50,200))),
+            ClientSettingChange::GlassOpacity(value) => ("glassOpacity", Value::from((*value).clamp(40,100))),
+            ClientSettingChange::ThemePatch(_) => unreachable!("theme patches apply atomically"),
+            ClientSettingChange::ThemeLibrary(value) => (crate::themes::LIBRARY_KEY, value.clone()),
+            ClientSettingChange::ThemeHalves(value) => (crate::themes::HALVES_KEY, serde_json::json!(value)),
             ClientSettingChange::AppearanceMode(mode) => (THEME_APPEARANCE_MODE_KEY, text(mode.as_str())),
             ClientSettingChange::LastEnabledProjectGrouping(mode) => {
                 ("t3code:last-enabled-project-grouping-mode", text(mode.as_str()))
@@ -315,6 +325,10 @@ impl ClientSettingsDoc {
 
     /// Applies one edit and returns the keys it changed: the patch to save onto the file.
     pub fn apply_change(&mut self, change: &ClientSettingChange) -> Map<String, Value> {
+        if let ClientSettingChange::ThemePatch(patch) = change {
+            let patch: Map<String, Value> = patch.iter().filter(|(k,v)|self.entries.get(*k)!=Some(*v)).map(|(k,v)|(k.clone(),v.clone())).collect();
+            self.entries.extend(patch.clone()); return patch;
+        }
         let mut patch = Map::new();
         let (key, value) = change.entry();
         if let ClientSettingChange::ResetFont(role) = change {
@@ -323,14 +337,15 @@ impl ClientSettingsDoc {
                 patch.insert(role.size_key().to_owned(), size);
             }
         }
-        if self.entries.get(key) == Some(&value) && patch.is_empty() {
-            return patch;
-        }
         if let ClientSettingChange::Theme(_) = change {
+            patch.insert(crate::themes::HALVES_KEY.to_owned(), serde_json::json!({}));
             let mode = Value::String(self.appearance_mode().as_str().to_owned());
             if self.entries.get(THEME_APPEARANCE_MODE_KEY) != Some(&mode) {
                 patch.insert(THEME_APPEARANCE_MODE_KEY.to_owned(), mode);
             }
+        }
+        if self.entries.get(key) == Some(&value) && patch.is_empty() {
+            return patch;
         }
         patch.insert(key.to_owned(), value);
         self.entries.extend(patch.clone());
@@ -482,6 +497,9 @@ impl ClientSettingsDoc {
     pub fn show_skills_in_slash_menu(&self) -> bool {
         self.flag("showSkillsInSlashMenu", true)
     }
+
+    pub fn appearance_contrast(&self) -> u32 { self.entries.get("appearanceContrast").and_then(Value::as_u64).filter(|n| (50..=200).contains(n)).unwrap_or(100) as u32 }
+    pub fn glass_opacity(&self) -> u32 { self.entries.get("glassOpacity").and_then(Value::as_u64).filter(|n| (40..=100).contains(n)).unwrap_or(80) as u32 }
 
     /// `readThemePreference`: unknown ids are kept, so a theme this build lacks is not lost.
     pub fn theme(&self) -> ThemePreference {

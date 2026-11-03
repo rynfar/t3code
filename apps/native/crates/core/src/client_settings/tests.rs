@@ -111,6 +111,9 @@ fn choosing_a_theme_pins_the_current_appearance_mode() {
     doc.apply(&ClientSettingChange::AppearanceMode(AppearanceMode::System));
     assert_eq!(doc.theme().named_id(), Some("grove"));
     assert_eq!(doc.appearance_mode(), AppearanceMode::System);
+    doc.apply(&ClientSettingChange::ThemeHalves(std::collections::BTreeMap::from([("dark".into(),"iris".into())])));
+    doc.apply(&ClientSettingChange::Theme(ThemePreference::Named("grove".into())));
+    assert!(crate::themes::halves(&doc).is_empty());
 }
 
 #[test]

@@ -65,3 +65,5 @@ pub mod announcements;
 pub mod managed_policy;
 
 pub mod resource_telemetry;
+
+pub mod themes;

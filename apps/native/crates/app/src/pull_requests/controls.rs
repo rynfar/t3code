@@ -150,7 +150,7 @@ struct Look {
     hover_text: Hsla,
 }
 
-fn look(variant: Variant, p: &Palette, dark: bool) -> Look {
+fn look(variant: Variant, p: Palette, dark: bool) -> Look {
     let outline_fill = if dark { hsla(p.input).opacity(0.32) } else { hsla(p.popover) };
     let outline_hover = if dark { hsla(p.input).opacity(0.64) } else { hsla(p.accent).opacity(0.5) };
     match variant {

@@ -349,7 +349,8 @@ impl Render for Composer {
                         .rounded(px(16.))
                         .border_1()
                         .border_color(outline)
-                        .bg(surface)
+                        .relative()
+                        .child(crate::glass::backdrop(16., surface.opacity(crate::theme::glass_opacity(cx)), outline, cx))
                         .when(!dark, |this| {
                             this.shadow(vec![gpui::BoxShadow {
                                 color: gpui::black().opacity(0.05),

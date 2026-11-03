@@ -31,7 +31,7 @@ fn fade<E: Styled>(element: E, loading: bool) -> E {
     if loading { element.opacity(LOADING_OPACITY) } else { element }
 }
 
-pub(super) fn ink(ink: Ink, p: &Palette) -> Hsla {
+pub(super) fn ink(ink: Ink, p: Palette) -> Hsla {
     hsla(match ink {
         Ink::P30 => p.usage_ink_30,
         Ink::P34 => p.usage_ink_34,

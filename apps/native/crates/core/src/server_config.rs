@@ -750,6 +750,8 @@ impl<'de> Deserialize<'de> for ProviderInstances {
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     #[serde(default)]
+    pub environment_themes: Vec<Value>,
+    #[serde(default)]
     pub environment: EnvironmentDescriptor,
     #[serde(default)]
     pub cwd: String,
@@ -835,8 +837,16 @@ pub enum ServerConfigStreamEvent {
     SettingsUpdated { payload: Box<SettingsPayload> },
     #[serde(rename = "usageLimitSourcesUpdated")]
     UsageLimitSourcesUpdated { payload: UsageLimitSourcesPayload },
+    #[serde(rename = "environmentThemesUpdated")]
+    EnvironmentThemesUpdated { payload: EnvironmentThemesPayload },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvironmentThemesPayload {
+    #[serde(default)]
+    pub themes: Vec<Value>,
 }
 
 /// Client-side config. Events before the first snapshot are dropped, as `Option.map` drops them.
@@ -862,6 +872,7 @@ impl ServerConfigState {
                 if let Some(current) = self.config.as_ref().filter(|current| !current.usage_limit_sources.is_empty()) {
                     config.usage_limit_sources = current.usage_limit_sources.clone();
                 }
+                if let Some(current) = self.config.as_ref() { config.environment_themes = current.environment_themes.clone(); }
                 if self.config.as_ref() == Some(&*config) {
                     return false;
                 }
@@ -880,6 +891,7 @@ impl ServerConfigState {
             ServerConfigStreamEvent::UsageLimitSourcesUpdated { payload } => {
                 self.update(|config| replace(&mut config.usage_limit_sources, payload.sources))
             }
+            ServerConfigStreamEvent::EnvironmentThemesUpdated { payload } => self.update(|config| replace(&mut config.environment_themes, payload.themes)),
             ServerConfigStreamEvent::Unknown => false,
         }
     }
