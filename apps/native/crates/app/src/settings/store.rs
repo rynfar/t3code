@@ -39,13 +39,9 @@ impl Global for ClientPrefs {}
 
 pub fn init(cx: &mut App) {
     let mut doc = ClientSettingsDoc::from_json(&store::load_client_settings().unwrap_or_default());
-    if !doc.entries().contains_key("diffLayout")
-        && let Some(layout) = store::load_ui_state("panels")
-            .and_then(|value| value.get("diffLayout").cloned())
-            .and_then(|value| serde_json::from_value(value).ok())
-    {
-        let patch = doc.apply_change(&ClientSettingChange::DiffLayout(layout));
-        store::patch_client_settings(patch);
+    if let Some(legacy_panels) = store::load_ui_state("panels") {
+        let patch = doc.migrate_diff_layout(&legacy_panels);
+        if !patch.is_empty() { store::patch_client_settings(patch); }
     }
     theme::set_preferences(preferences(&doc), cx);
     terminal::set_typography(terminal::typography(doc.entries()), cx);

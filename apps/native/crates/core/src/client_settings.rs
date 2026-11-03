@@ -335,6 +335,13 @@ impl ClientSettingsDoc {
         self.text(key).and_then(parse).unwrap_or_default()
     }
 
+    /// Keeps the layout saved by native builds that stored it with panel state.
+    pub fn migrate_diff_layout(&mut self, legacy_panels: &Value) -> Map<String, Value> {
+        if self.entries.contains_key("diffLayout") { return Map::new(); }
+        let layout = legacy_panels.get("diffLayout").and_then(|value| serde_json::from_value(value.clone()).ok());
+        layout.map(|layout| self.apply_change(&ClientSettingChange::DiffLayout(layout))).unwrap_or_default()
+    }
+
     pub fn diff_layout(&self) -> crate::diff::Layout {
         self.entries
             .get("diffLayout")

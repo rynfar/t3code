@@ -136,6 +136,14 @@ fn diff_and_browser_settings_round_trip_and_default_per_key() {
     assert_eq!(doc.diff_color_scheme(), DiffColorScheme::RedGreen);
     assert_eq!(doc.browser_search_engine(), BrowserSearchEngine::DuckDuckGo);
     assert_eq!(doc.browser_custom_search_url(), "");
+    let legacy = serde_json::json!({ "diffLayout": "split" });
+    let mut migrated = ClientSettingsDoc::default();
+    assert!(migrated.migrate_diff_layout(&serde_json::json!({ "diffLayout": "future" })).is_empty());
+    assert_eq!(serde_json::Value::Object(migrated.migrate_diff_layout(&legacy)), serde_json::json!({ "diffLayout": "split" }));
+    assert_eq!(migrated.diff_layout(), Layout::Split);
+    migrated.apply(&ClientSettingChange::DiffLayout(Layout::Stacked));
+    assert!(migrated.migrate_diff_layout(&legacy).is_empty());
+    assert_eq!(migrated.diff_layout(), Layout::Stacked);
     let mut doc = ClientSettingsDoc::from_json(r#"{"futureSetting":42}"#);
     for change in [
         ClientSettingChange::DiffLayout(Layout::Split),
