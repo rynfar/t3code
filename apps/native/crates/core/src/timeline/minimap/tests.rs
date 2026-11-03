@@ -22,7 +22,6 @@ fn message(id: &str, role: Role, text: &str) -> TimelineRow {
                 item: None,
             }),
             show_assistant_meta: false,
-            show_assistant_timestamp: false,
             show_copy: false,
             copy_streaming: false,
             grouped_with_next: false,

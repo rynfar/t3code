@@ -304,7 +304,6 @@ pub enum RowKind {
     Message {
         message: Arc<ChatMessage>,
         show_assistant_meta: bool,
-        show_assistant_timestamp: bool,
         show_copy: bool,
         copy_streaming: bool,
         grouped_with_next: bool,
@@ -366,9 +365,9 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
                 }
         }
         (
-            RowKind::Message { message: ma, show_assistant_meta: a1, show_assistant_timestamp: a2, show_copy: a3, copy_streaming: a4, grouped_with_next: a5, grouped_with_previous: a6, continues_steer: a7 },
-            RowKind::Message { message: mb, show_assistant_meta: b1, show_assistant_timestamp: b2, show_copy: b3, copy_streaming: b4, grouped_with_next: b5, grouped_with_previous: b6, continues_steer: b7 },
-        ) => Arc::ptr_eq(ma, mb) && (a1, a2, a3, a4, a5, a6, a7) == (b1, b2, b3, b4, b5, b6, b7),
+            RowKind::Message { message: ma, show_assistant_meta: a1, show_copy: a2, copy_streaming: a3, grouped_with_next: a4, grouped_with_previous: a5, continues_steer: a6 },
+            RowKind::Message { message: mb, show_assistant_meta: b1, show_copy: b2, copy_streaming: b3, grouped_with_next: b4, grouped_with_previous: b5, continues_steer: b6 },
+        ) => Arc::ptr_eq(ma, mb) && (a1, a2, a3, a4, a5, a6) == (b1, b2, b3, b4, b5, b6),
         (
             RowKind::AssistantMeta { message: ma, show_copy: a1, copy_streaming: a2 },
             RowKind::AssistantMeta { message: mb, show_copy: b1, copy_streaming: b2 },

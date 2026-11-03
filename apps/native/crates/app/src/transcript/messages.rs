@@ -272,11 +272,10 @@ fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, 
 }
 
 pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
-    let RowKind::Message { message, show_assistant_meta, show_assistant_timestamp, show_copy, copy_streaming, .. } = &row.kind else {
+    let RowKind::Message { message, show_assistant_meta, show_copy, copy_streaming, .. } = &row.kind else {
         return div().into_any_element();
     };
-    let (id, show_meta, show_timestamp, show_copy, copy_streaming) =
-        (row.id.as_str(), *show_assistant_meta, *show_assistant_timestamp, *show_copy, *copy_streaming);
+    let (id, show_meta, show_copy, copy_streaming) = (row.id.as_str(), *show_assistant_meta, *show_copy, *copy_streaming);
     let text: Arc<str> = if message.text.is_empty() && !message.streaming { Arc::from("(empty response)") } else { message.text.clone() };
     let state = markdown.state(&format!("assistant:{id}"), &text, cx);
     let selection_state = state.entity.clone();
@@ -292,9 +291,9 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
                 view.capture_citation_selection(selection_state.clone(), message_id.clone(), text.clone(), event.position, window, cx);
             })).child(prose(&state, cx)))
         .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
-        .when(show_meta || show_timestamp, |this| {
-            let fork = if show_meta { fork_button(message, env, cx) } else { None };
-            this.child(div().mt(px(6.)).child(assistant_meta(message, show_meta && show_copy, copy_streaming, false, fork, &env.clock, cx)))
+        .when(show_meta, |this| {
+            let fork = fork_button(message, env, cx);
+            this.child(div().mt(px(6.)).child(assistant_meta(message, show_copy, copy_streaming, false, fork, &env.clock, cx)))
         })
         .into_any_element()
 }
