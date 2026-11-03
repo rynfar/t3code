@@ -677,6 +677,25 @@ fn tool_call_target_follows_the_row_the_thread_shows() {
     assert!(shell.removed_at.is_empty());
     assert!(!target.source_available(shell.thread(&target.thread_id), &source), "the retained detail tombstone survives a fresh shell");
 
+    for (deleted_at, archived_at, readable) in [
+        (None, None, true),
+        (Some(serde_json::Value::Null), Some(json!("2026-01-03T00:00:00Z")), true),
+        (Some(json!("2026-01-03T00:00:00Z")), None, false),
+    ] {
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!("../timeline/fixtures/showcase.json")).unwrap();
+        let thread = snapshot["projection"]["thread"].as_object_mut().unwrap();
+        thread.insert("id".into(), json!(target.thread_id));
+        thread.insert("archivedAt".into(), archived_at.unwrap_or(serde_json::Value::Null));
+        match deleted_at {
+            Some(value) => { thread.insert("deletedAt".into(), value); }
+            None => { thread.remove("deletedAt"); }
+        }
+        let mut restored = crate::thread::ThreadState::default();
+        assert!(restored.apply(crate::thread::decode_thread_stream_item(snapshot).unwrap()));
+        assert!(!restored.deleted, "web snapshot installation keeps the main thread's state live");
+        assert_eq!(target.source_available(None, &restored), readable, "source eligibility must honor a snapshot-only deletion with no shell row");
+    }
+
     let selection = DiffSelection::ToolCall(target.clone());
     let text = serde_json::to_string(&selection).expect("encode");
     assert_eq!(text, r#"{"kind":"tool-call","threadId":"t","itemId":"f1","revision":"live"}"#);

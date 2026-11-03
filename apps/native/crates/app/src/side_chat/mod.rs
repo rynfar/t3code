@@ -82,8 +82,12 @@ impl AppState {
         let Some(state) = self.side_threads.threads.get_mut(thread_id) else { return false };
         if state.deleted { return false; }
         let changed = state.apply(item);
-        if state.deleted && let Some(client) = self.client_handle() {
-            client.close_thread(thread_id);
+        if state.source_deleted() {
+            if !state.deleted {
+                *state = ThreadState::default();
+                state.deleted = true;
+            }
+            if let Some(client) = self.client_handle() { client.close_thread(thread_id); }
         }
         changed
     }
