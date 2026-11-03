@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::html_render::HtmlRenderReference;
 use crate::thread::Visibility;
 use crate::turn_item::TurnItem;
 
@@ -198,12 +199,21 @@ pub struct TimelineAttempt {
     pub completed_at: Option<String>,
 }
 
+/// A completed `html_render` tool result, drawn as a frame (`kind: "html-render"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HtmlRenderEntry {
+    pub run_id: Option<String>,
+    pub reference: HtmlRenderReference,
+    pub item: Arc<TurnItem>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     Message(Arc<ChatMessage>),
     ProposedPlan(Arc<ProposedPlan>),
     Work(Arc<WorkLogEntry>),
     Event(Arc<TurnItem>),
+    HtmlRender(Arc<HtmlRenderEntry>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -307,6 +317,7 @@ pub enum RowKind {
         snapshot: Arc<crate::worktree_setup::Snapshot>,
         embedded: bool,
     },
+    HtmlRender(Arc<HtmlRenderEntry>),
 }
 
 impl RowKind {
@@ -356,6 +367,7 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
         }
         (RowKind::ProposedPlan(pa), RowKind::ProposedPlan(pb)) => Arc::ptr_eq(pa, pb),
         (RowKind::WorktreeSetup { snapshot: sa, embedded: ea }, RowKind::WorktreeSetup { snapshot: sb, embedded: eb }) => Arc::ptr_eq(sa, sb) && ea == eb,
+        (RowKind::HtmlRender(a), RowKind::HtmlRender(b)) => a.reference == b.reference,
         (
             RowKind::WorkToggle { run_id: ra, group_id: ga, entries: ea, hidden_count: ha, expanded: xa, summary: sa, summary_kind: ka, tool_surface: ta, has_failure: fa },
             RowKind::WorkToggle { run_id: rb, group_id: gb, entries: eb, hidden_count: hb, expanded: xb, summary: sb, summary_kind: kb, tool_surface: tb, has_failure: fb },

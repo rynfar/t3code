@@ -1,7 +1,7 @@
 //! Visible turn items to timeline entries: `deriveTimelineEntriesFromVisibleTurnItems` and
 //! `projectedWorkEntry` (`apps/web/src/session-logic.ts`), `extractToolActivityPresentation`
-//! (`packages/client-runtime/src/work-log/toolPresentation.ts`). HTML-render and MCP-app tool
-//! results stay work entries until the native client renders frames.
+//! (`packages/client-runtime/src/work-log/toolPresentation.ts`). MCP-app tool results stay work
+//! entries until the native client renders their frames.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::presentation::context_compaction_label;
 use super::tool_activity::{ToolActivityAction, classify_tool_activity, collect_tool_file_paths, dynamic_tool_surface, format_read_tool_label, format_search_tool_label};
-use super::{ChatMessage, EntryKind, MessageMeta, ProposedPlan, Role, SourceActivity, TimelineAttempt, TimelineEntry, Tone, ToolSource, ToolStatus, WorkLogEntry};
+use super::{ChatMessage, EntryKind, HtmlRenderEntry, MessageMeta, ProposedPlan, Role, SourceActivity, TimelineAttempt, TimelineEntry, Tone, ToolSource, ToolStatus, WorkLogEntry};
 use crate::thread::{Entity, ProjectedTurnItem, RunAttempt};
 use crate::turn_item::{TurnItem, TurnItemKind};
 
@@ -408,6 +408,8 @@ fn build_entry(row: &ProjectedTurnItem, lookups: &Lookups, plans: &[Entity]) -> 
             status: plan_status(plans, plan_id).to_owned(),
             updated_at: item.updated_at.clone(),
         }))
+    } else if let Some(reference) = html_render_reference(item) {
+        EntryKind::HtmlRender(Arc::new(HtmlRenderEntry { run_id: item.run_id.clone(), reference, item: item.clone() }))
     } else if is_standalone(&item.kind) {
         EntryKind::Event(item.clone())
     } else {
@@ -425,8 +427,18 @@ fn entry_item(entry: &TimelineEntry) -> Option<&Arc<TurnItem>> {
         EntryKind::Message(message) => message.item.as_ref(),
         EntryKind::Work(work) => work.item.as_ref(),
         EntryKind::Event(item) => Some(item),
+        EntryKind::HtmlRender(render) => Some(&render.item),
         EntryKind::ProposedPlan(_) => None,
     }
+}
+
+/// A completed `html_render` call's page (`htmlRenderFromToolItem`).
+fn html_render_reference(item: &TurnItem) -> Option<crate::html_render::HtmlRenderReference> {
+    let TurnItemKind::DynamicTool { tool_name, output, .. } = &item.kind else { return None };
+    if item.status != "completed" {
+        return None;
+    }
+    crate::html_render::from_tool_item(tool_name.as_deref(), output.as_ref())
 }
 
 /// An item that changed in place maps to the same single entry, unless it takes part in

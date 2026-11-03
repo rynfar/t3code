@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
                         RowKind::Event { .. } => "event",
                         RowKind::ProposedPlan(_) => "proposed-plan",
                         RowKind::WorktreeSetup { .. } => "worktree-setup",
+                        RowKind::HtmlRender(_) => "html-render",
                     };
                     *kinds.entry(kind).or_default() += 1;
                 }

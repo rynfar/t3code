@@ -573,7 +573,8 @@ impl ThreadView {
             };
             banners.push(alert(error.is_usage_limit(), icon, None, body, actions, 768., cx));
         }
-        Some(v_flex().absolute().top_0().left_0().right_0().items_center().px(px(16.)).children(banners).into_any_element())
+        let cover = crate::webview::occluder("thread-banners-cover", crate::webview::Layer::TranscriptChrome);
+        Some(v_flex().absolute().top_0().left_0().right_0().items_center().px(px(16.)).child(cover).children(banners).into_any_element())
     }
 }
 

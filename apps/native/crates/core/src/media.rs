@@ -18,6 +18,9 @@ pub enum AssetResource {
     MediaFile { thread_id: String, path: String },
     /// An image a tool returned, by its position among the item's output images.
     ToolOutputImage { thread_id: String, item_id: String, index: usize },
+    /// An attachment served inline under its own name and type, as an HTML render frame loads
+    /// its page.
+    InlineAttachment { attachment_id: String, file_name: String, mime_type: String },
 }
 
 impl AssetResource {
@@ -28,6 +31,13 @@ impl AssetResource {
             AssetResource::ToolOutputImage { thread_id, item_id, index } => {
                 json!({ "_tag": "tool-output-image", "threadId": thread_id, "itemId": item_id, "index": index })
             }
+            AssetResource::InlineAttachment { attachment_id, file_name, mime_type } => json!({
+                "_tag": "attachment",
+                "attachmentId": attachment_id,
+                "fileName": file_name,
+                "mimeType": mime_type,
+                "disposition": "inline",
+            }),
         }
     }
 

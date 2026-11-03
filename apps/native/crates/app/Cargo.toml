@@ -63,6 +63,27 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
+# Native web views for agent HTML (`webview/`): WKWebView through wry, hosted in a clipping
+# AppKit view beneath GPUI's overlay plane.
+wry = { version = "0.54", default-features = false, features = ["protocol", "transparent"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSGeometry",
+  "NSString",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "objc2-core-foundation",
+  "NSAppearance",
+  "NSEvent",
+  "NSGraphics",
+  "NSResponder",
+  "NSView",
+  "NSWindow",
+] }
+block2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

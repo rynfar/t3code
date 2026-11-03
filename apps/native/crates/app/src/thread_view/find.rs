@@ -298,6 +298,7 @@ impl ThreadView {
                 .border_color(hsla(p.dropdown_border))
                 .bg(hsla(p.popover))
                 .shadow_md()
+                .child(crate::webview::occluder("thread-find-bar-cover", crate::webview::Layer::TranscriptChrome))
                 .child(div().flex_1().min_w_0().text_size(px(14.)).child(Input::new(&find.input).appearance(false).bordered(false)))
                 .child(
                     div()

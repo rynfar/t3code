@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
 [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -143,6 +143,10 @@ impl Options {
         let has = |name: &str| args.iter().any(|arg| arg == name);
         let number = |name: &str, default: f32| flag(name).and_then(|value| value.parse().ok()).unwrap_or(default);
         let out = flag("--snapshot")?;
+        crate::webview::set_offscreen();
+        if let Some(page) = flag("--html-fixture") {
+            crate::transcript::html_render::fixture::set(PathBuf::from(page));
+        }
         Some(Options {
             out: PathBuf::from(out),
             thread: flag("--thread"),
