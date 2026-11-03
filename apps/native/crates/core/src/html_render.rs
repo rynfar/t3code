@@ -12,6 +12,7 @@ use crate::media::AssetResource;
 
 #[cfg(test)]
 mod tests;
+pub mod host;
 
 pub const TOOL_NAME: &str = "html_render";
 pub const MIN_HEIGHT: u32 = 80;

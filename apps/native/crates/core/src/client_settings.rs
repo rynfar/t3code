@@ -60,6 +60,13 @@ literal_enum!(
 );
 
 literal_enum!(
+    BrowserLinkTarget {
+        System => "system": "Your default browser",
+        App => "app": "T3 Code",
+    } default System
+);
+
+literal_enum!(
     BrowserSearchEngine {
         DuckDuckGo => "duckduckgo": "DuckDuckGo",
         Google => "google": "Google",
@@ -184,6 +191,8 @@ pub enum ClientSettingChange {
     DiffFilesCollapsed(bool),
     DiffColorScheme(DiffColorScheme),
     BrowserSearchEngine(BrowserSearchEngine),
+    BrowserLinkTarget(BrowserLinkTarget),
+    PullRequestLinksOpenInApp(bool),
     BrowserCustomSearchUrl(String),
     NotificationMode(NotificationMode),
     InAppNotifications(bool),
@@ -240,6 +249,8 @@ impl ClientSettingChange {
             ClientSettingChange::DiffColorScheme(scheme) => {
                 ("diffColorScheme", text(scheme.as_str()))
             }
+            ClientSettingChange::BrowserLinkTarget(target) => ("browserLinkTarget", text(target.as_str())),
+            ClientSettingChange::PullRequestLinksOpenInApp(on) => ("pullRequestLinksOpenInApp", Value::Bool(*on)),
             ClientSettingChange::BrowserSearchEngine(engine) => {
                 ("browserSearchEngine", text(engine.as_str()))
             }
@@ -394,6 +405,9 @@ impl ClientSettingsDoc {
     pub fn diff_color_scheme(&self) -> DiffColorScheme {
         self.literal("diffColorScheme", DiffColorScheme::parse)
     }
+
+    pub fn browser_link_target(&self) -> BrowserLinkTarget { self.literal("browserLinkTarget", BrowserLinkTarget::parse) }
+    pub fn pull_request_links_open_in_app(&self) -> bool { self.flag("pullRequestLinksOpenInApp", true) }
 
     pub fn browser_search_engine(&self) -> BrowserSearchEngine {
         self.literal("browserSearchEngine", BrowserSearchEngine::parse)

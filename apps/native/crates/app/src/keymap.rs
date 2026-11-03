@@ -128,6 +128,7 @@ fn rename(node: &KeybindingWhenNode) -> KeybindingWhenNode {
 /// The resolved rules in effect: defaults merged with the server's user keybindings.
 pub struct Keymap {
     pub rules: Vec<ResolvedKeybindingRule>,
+    pub revision: usize,
     source: serde_json::Value,
     installed: HashSet<BindingKey>,
 }
@@ -185,7 +186,8 @@ pub fn install(server_keybindings: &serde_json::Value, cx: &mut App) {
     let shadows = dropped.iter().filter_map(|key| load(key, Box::new(Unimplemented)));
     let bindings: Vec<KeyBinding> = shadows.chain(keys.iter().filter_map(|key| load(key, action_for(&key.2)))).collect();
     cx.bind_keys(bindings);
-    cx.set_global(Keymap { rules, source: server_keybindings.clone(), installed });
+    let revision = cx.try_global::<Keymap>().map_or(0, |map| map.revision.wrapping_add(1));
+    cx.set_global(Keymap { rules, revision, source: server_keybindings.clone(), installed });
 }
 
 /// The display label for a command's effective shortcut, such as `⌘B`.

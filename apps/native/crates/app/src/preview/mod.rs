@@ -420,14 +420,26 @@ impl Previews {
 
     /// `openPreviewSession` on the server's browser, then its tab in front.
     pub fn open_session(&mut self, thread_id: String, url: Option<String>, cx: &mut Context<Self>) {
+        self.open_session_inner(thread_id, url, false, cx);
+    }
+
+    pub fn open_link(&mut self, thread_id: String, url: String, cx: &mut Context<Self>) {
+        self.open_session_inner(thread_id, Some(url), true, cx);
+    }
+
+    fn open_session_inner(&mut self, thread_id: String, url: Option<String>, external_fallback: bool, cx: &mut Context<Self>) {
         if self.availability() != Availability::Available {
+            if external_fallback && let Some(url) = &url { cx.open_url(url); }
             return;
         }
         let mut payload = json!({ "threadId": thread_id, "runtime": "server" });
         if let Some(url) = &url {
             payload["url"] = Value::String(url.clone());
         }
-        let Some(task) = self.state.read(cx).request(method::OPEN, payload, SessionSnapshot::decode) else { return };
+        let Some(task) = self.state.read(cx).request(method::OPEN, payload, SessionSnapshot::decode) else {
+            if external_fallback && let Some(url) = &url { cx.open_url(url); }
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
             let _ = this.update(cx, |this, cx| match result {
@@ -441,7 +453,10 @@ impl Previews {
                     cx.emit(PreviewsEvent::Thread(thread_id.clone()));
                     this.apply_edit(Some(&thread_id), Some(TabsEdit { tabs: None, fronted: vec![tab] }), cx);
                 }
-                Err(error) => this.toast("Unable to open browser", error, cx),
+                Err(error) => {
+                    if external_fallback && let Some(url) = &url { cx.open_url(url); }
+                    else { this.toast("Unable to open browser", error, cx); }
+                },
             });
         })
         .detach();

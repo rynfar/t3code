@@ -128,10 +128,10 @@ fn grouping_toggle_restores_the_last_repository_mode() {
 
 #[test]
 fn diff_and_browser_settings_round_trip_and_default_per_key() {
-    use super::{BrowserSearchEngine, DiffColorScheme};
+    use super::{BrowserLinkTarget, BrowserSearchEngine, DiffColorScheme};
     use crate::diff::Layout;
     let doc = ClientSettingsDoc::from_json(
-        r#"{"diffLayout":"future","diffIgnoreWhitespace":0,"diffFilesCollapsed":null,"diffColorScheme":"unknown","browserSearchEngine":"future","browserCustomSearchUrl":4}"#,
+        r#"{"diffLayout":"future","diffIgnoreWhitespace":0,"diffFilesCollapsed":null,"diffColorScheme":"unknown","browserSearchEngine":"future","browserCustomSearchUrl":4,"browserLinkTarget":"future","pullRequestLinksOpenInApp":0}"#,
     );
     assert_eq!(doc.diff_layout(), Layout::Stacked);
     assert!(doc.diff_ignore_whitespace());
@@ -139,6 +139,8 @@ fn diff_and_browser_settings_round_trip_and_default_per_key() {
     assert_eq!(doc.diff_color_scheme(), DiffColorScheme::RedGreen);
     assert_eq!(doc.browser_search_engine(), BrowserSearchEngine::DuckDuckGo);
     assert_eq!(doc.browser_custom_search_url(), "");
+    assert_eq!(doc.browser_link_target(), BrowserLinkTarget::System);
+    assert!(doc.pull_request_links_open_in_app());
     let legacy = serde_json::json!({ "diffLayout": "split" });
     let mut migrated = ClientSettingsDoc::default();
     assert!(migrated.migrate_diff_layout(&serde_json::json!({ "diffLayout": "future" })).is_empty());
@@ -154,6 +156,8 @@ fn diff_and_browser_settings_round_trip_and_default_per_key() {
         ClientSettingChange::DiffFilesCollapsed(false),
         ClientSettingChange::DiffColorScheme(DiffColorScheme::BlueOrange),
         ClientSettingChange::BrowserSearchEngine(BrowserSearchEngine::Custom),
+        ClientSettingChange::BrowserLinkTarget(BrowserLinkTarget::App),
+        ClientSettingChange::PullRequestLinksOpenInApp(false),
         ClientSettingChange::BrowserCustomSearchUrl("  https://example.com/?q=%s  ".into()),
     ] {
         assert!(!doc.apply_change(&change).is_empty());
@@ -165,6 +169,8 @@ fn diff_and_browser_settings_round_trip_and_default_per_key() {
     assert!(!doc.diff_files_collapsed());
     assert_eq!(doc.diff_color_scheme(), DiffColorScheme::BlueOrange);
     assert_eq!(doc.browser_search_template(), "https://example.com/?q=%s");
+    assert_eq!(doc.browser_link_target(), BrowserLinkTarget::App);
+    assert!(!doc.pull_request_links_open_in_app());
     assert_eq!(doc.entries()["futureSetting"], 42);
 }
 

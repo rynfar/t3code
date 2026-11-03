@@ -3,12 +3,8 @@
 //! as an inline attachment on the network runtime and shown in a [`WebView`] while its row is on
 //! screen; the frame fits the page's reported height (`htmlRenderFrameHeight`).
 //!
-//! The page's own bootstrap only reports its height to a parent frame, so the view adds a
-//! document-start script that reports it the same way through `window.ipc`. The bootstrap's
-//! default theme is the shared T3 palette, which the web overrides with the app's canvas
-//! (`getStandardThemeColors`); the script sets the canvas the same way, and the view's appearance
-//! picks light or dark. A view's control cannot draw over the page, so "Open full screen" sits
-//! under the frame instead of on it.
+//! Live theme variables and reader fonts follow `useHtmlRenderTheme.ts`; only the web host's
+//! view-command allowlist and validated links cross the page bridge.
 
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -45,26 +41,91 @@ const ZOOM_RANGE: (f32, f32) = (0.5, 2.);
 /// The bootstrap's height report (`injectHtmlRenderBootstrap`), for a page with no parent frame.
 const CONTENT_HEIGHT_SCRIPT: &str = r#"(function(){if(window.parent!==window||!window.ipc)return;var h,o,z=function(){var r=document.documentElement;if(!r)return;var v=Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height);if(v===h)return;h=v;window.ipc.postMessage(JSON.stringify({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height:v}}));};if(window.ResizeObserver){o=new ResizeObserver(z);if(document.documentElement)o.observe(document.documentElement);}document.addEventListener("DOMContentLoaded",function(){if(o){o.observe(document.documentElement);if(document.body)o.observe(document.body);}z();});window.addEventListener("load",z);})();"#;
 
-/// Puts `--background` right after the bootstrap's theme sheet, so the page's own rules still win.
-fn canvas_script(canvas: u32) -> String {
-    let canvas = serde_json::to_string(&css(canvas)).unwrap_or_default();
+fn host_update(cx: &App) -> String {
+    let theme = crate::theme::html_render::context(cx);
+    let rules = &cx.global::<crate::keymap::Keymap>().rules;
+    let theme = serde_json::json!({"jsonrpc":"2.0","method":"ui/notifications/host-context-changed","params":{"theme":theme["appearance"],"styles":{"variables":theme["variables"]}}});
+    let shortcuts = html_render::host::shortcuts_message(rules, cfg!(target_os = "macos"));
     format!(
-        r#"(function(){{var c={canvas};function p(){{var s=document.getElementById("t3-theme");if(!s)return false;var e=document.createElement("style");e.id="t3-host-canvas";e.textContent=":root{{--background:"+c+"}}";s.after(e);return true;}}if(p())return;var o=new MutationObserver(function(){{if(p())o.disconnect();}});o.observe(document,{{childList:true,subtree:true}});document.addEventListener("DOMContentLoaded",function(){{o.disconnect();}});}})();"#
+        "window.dispatchEvent(new MessageEvent('message',{{data:{theme}}}));window.dispatchEvent(new MessageEvent('message',{{data:{shortcuts}}}));"
     )
 }
 
-fn canvas_update(canvas: u32) -> String {
-    let canvas = serde_json::to_string(&css(canvas)).unwrap_or_default();
-    format!(r#"(function(){{var e=document.getElementById("t3-host-canvas");if(e)e.textContent=":root{{--background:"+{canvas}+"}}";}})();"#)
+fn host_script(cx: &App) -> String {
+    format!(
+        "{CONTENT_HEIGHT_SCRIPT}{}{}",
+        include_str!("html_host.js"),
+        host_update(cx)
+    )
 }
 
-/// The theme's canvas: `background` (design system §2.6).
-fn canvas(cx: &App) -> u32 {
-    palette(cx).background
-}
-
-fn css(color: u32) -> String {
-    if color & 0xff == 0xff { format!("#{:06x}", color >> 8) } else { format!("#{color:08x}") }
+fn on_page_message(
+    state: &Entity<AppState>,
+    origin: &(Option<String>, Option<String>),
+    view: &WebView,
+    message: &serde_json::Value,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use html_render::host;
+    let link = host::read_link(message);
+    let key = host::read_key(message);
+    if link.is_none() && key.is_none() { return; }
+    if (
+        state.read(cx).environment().map(str::to_owned),
+        state.read(cx).selected_thread.clone(),
+    ) != *origin
+        || !view.take_activation()
+    {
+        return;
+    }
+    if let Some(link) = link {
+        let state_ref = state.read(cx);
+        let thread = state_ref.selected_thread.clone();
+        let settings = crate::settings::client_settings(cx);
+        let prefer_app = settings.browser_link_target() == t3_core::client_settings::BrowserLinkTarget::App;
+        let change_request = settings.pull_request_links_open_in_app()
+            && thread.is_some()
+            && t3_core::pull_requests::link::parse_change_request_url(&link.url).is_some();
+        let previews = crate::preview::previews(cx);
+        let can_preview = thread.is_some()
+            && previews.as_ref().is_some_and(|p| {
+                p.read(cx).availability() == crate::preview::Availability::Available
+            });
+        match host::link_target(&link, prefer_app, can_preview, change_request) {
+            host::LinkTarget::System => cx.open_url(&link.url),
+            host::LinkTarget::ChangeRequest => {
+                crate::pull_requests::open_context_link(state, &link.url, cx)
+            }
+            host::LinkTarget::Preview => {
+                if let (Some(previews), Some(thread)) = (previews, thread) {
+                    previews.update(cx, |p, cx| p.open_link(thread, link.url.clone(), cx));
+                }
+            }
+        }
+        let result = serde_json::json!({"jsonrpc":"2.0","id":link.id,"result":{}});
+        view.evaluate(&format!(
+            "window.dispatchEvent(new MessageEvent('message',{{data:{result}}}));"
+        ));
+    } else if let Some(key) = key {
+        let state = state.read(cx);
+        let panel_open = state
+            .selected_thread
+            .as_deref()
+            .is_some_and(|id| state.panels.panels.panel(id).is_open);
+        let context = t3_core::keybindings::ShortcutMatchContext::default()
+            .with("rightPanelOpen", panel_open)
+            .with("turnRunning", state.is_selected_thread_running());
+        if let Some(command) = host::shortcut_command(
+            &key,
+            &cx.global::<crate::keymap::Keymap>().rules,
+            &context,
+            cfg!(target_os = "macos"),
+        ) {
+            let action = crate::keymap::action_for(command);
+            window.dispatch_action(action, cx);
+        }
+    }
 }
 
 type PageKey = (Arc<str>, String);
@@ -87,10 +148,12 @@ struct PageState {
 /// The frame drawing a view holds it (its lease and the presented frame), so a view goes as soon
 /// as no frame draws it: a row scrolled away, a thread switched, a transcript closed.
 struct InlineView {
+    origin: (Option<String>, Option<String>),
     key: PageKey,
     owner: EntityId,
     view: Weak<WebView>,
-    canvas: u32,
+    revision: usize,
+    keymap_revision: usize,
     _events: Task<()>,
 }
 
@@ -218,13 +281,32 @@ impl HtmlFrames {
         }
     }
 
-    fn on_event(&mut self, key: &PageKey, event: WebEvent, cx: &mut Context<Self>) {
+    fn on_event(
+        &mut self,
+        key: &PageKey,
+        origin: &(Option<String>, Option<String>),
+        view: &WebView,
+        event: WebEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             WebEvent::Message(text) => {
-                let Some(height) = serde_json::from_str(&text).ok().and_then(|message| html_render::read_content_height(&message)) else { return };
-                let Some(page) = self.pages.get_mut(key) else { return };
+                let Ok(message) = serde_json::from_str(&text) else {
+                    return;
+                };
+                let Some(height) = html_render::read_content_height(&message) else {
+                    on_page_message(&self.state, origin, view, &message, window, cx);
+                    return;
+                };
+                let Some(page) = self.pages.get_mut(key) else {
+                    return;
+                };
                 let height = height as f32;
-                if page.content_height.is_none_or(|current| (current - height).abs() >= 0.5) {
+                if page
+                    .content_height
+                    .is_none_or(|current| (current - height).abs() >= 0.5)
+                {
                     page.content_height = Some(height);
                     self.notify_owners(key, cx);
                 }
@@ -235,15 +317,29 @@ impl HtmlFrames {
 
     /// The view showing `key` for `owner`, made when there is room and the window is in front.
     /// Making one in a background window would bring the app forward on macOS 13.
-    fn inline_view(&mut self, key: &PageKey, owner: EntityId, html: Arc<str>, dark: bool, window: &mut Window, cx: &mut Context<Self>) -> Slot {
-        let canvas = canvas(cx);
+    fn inline_view(
+        &mut self,
+        key: &PageKey,
+        owner: EntityId,
+        html: Arc<str>,
+        dark: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Slot {
+        let revision = crate::theme::revision(cx);
+        let keymap_revision = cx.global::<crate::keymap::Keymap>().revision;
+        let origin = (self.state.read(cx).environment().map(str::to_owned), self.state.read(cx).selected_thread.clone());
         self.views.retain(|inline| inline.view.strong_count() > 0);
-        if let Some(inline) = self.views.iter_mut().find(|inline| &inline.key == key && inline.owner == owner)
+        if let Some(inline) = self
+            .views
+            .iter_mut()
+            .find(|inline| &inline.key == key && inline.owner == owner && inline.origin == origin)
             && let Some(view) = inline.view.upgrade()
         {
-            if inline.canvas != canvas {
-                view.evaluate(&canvas_update(canvas));
-                inline.canvas = canvas;
+            if inline.revision != revision || inline.keymap_revision != keymap_revision {
+                view.evaluate(&host_update(cx));
+                inline.revision = revision;
+                inline.keymap_revision = keymap_revision;
             }
             return Slot::View(view);
         }
@@ -257,17 +353,46 @@ impl HtmlFrames {
             return Slot::Card;
         }
         let (events, mut received) = mpsc::unbounded();
-        let page = Page { html, dark, content_security_policy: None, scroll_through: true, script: format!("{CONTENT_HEIGHT_SCRIPT}{}", canvas_script(canvas)) };
-        let Some(view) = WebView::new(page, Layer::Transcript, events, window, cx) else { return Slot::Card };
+        let page = Page {
+            html,
+            dark,
+            content_security_policy: None,
+            scroll_through: true,
+            script: host_script(cx),
+        };
+        let Some(view) = WebView::new(page, Layer::Transcript, events, window, cx) else {
+            return Slot::Card;
+        };
         let event_key = key.clone();
+        let event_origin = origin.clone();
+        let event_view = Rc::downgrade(&view);
+        let handle = window.window_handle();
         let pump = cx.spawn(async move |this, cx| {
             while let Some(event) = received.next().await {
-                if this.update(cx, |frames, cx| frames.on_event(&event_key, event, cx)).is_err() {
+                let Some(view) = event_view.upgrade() else {
+                    return;
+                };
+                if cx
+                    .update_window(handle, |_, window, cx| {
+                        this.update(cx, |frames, cx| {
+                            frames.on_event(&event_key, &event_origin, &view, event, window, cx)
+                        })
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
         });
-        self.views.push(InlineView { key: key.clone(), owner, view: Rc::downgrade(&view), canvas, _events: pump });
+        self.views.push(InlineView {
+            origin,
+            key: key.clone(),
+            owner,
+            view: Rc::downgrade(&view),
+            revision,
+            keymap_revision,
+            _events: pump,
+        });
         Slot::View(view)
     }
 }
@@ -412,9 +537,33 @@ fn page_card(reference: &HtmlRenderReference, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn open_fullscreen(store: &Entity<HtmlFrames>, title: SharedString, html: Arc<str>, window: &mut Window, cx: &mut App) {
+fn open_fullscreen(
+    store: &Entity<HtmlFrames>,
+    title: SharedString,
+    html: Arc<str>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let restore = window.focused(cx);
-    let view = cx.new(|cx| HtmlFullscreen { title, html, zoom: 1., view: None, canvas: 0, unavailable: false, focus: cx.focus_handle(), restore, _events: None });
+    let state = store.read(cx).state.clone();
+    let origin = (
+        state.read(cx).environment().map(str::to_owned),
+        state.read(cx).selected_thread.clone(),
+    );
+    let view = cx.new(|cx| HtmlFullscreen {
+        origin,
+        title,
+        html,
+        zoom: 1.,
+        view: None,
+        revision: 0,
+        keymap_revision: 0,
+        state: store.read(cx).state.clone(),
+        unavailable: false,
+        focus: cx.focus_handle(),
+        restore,
+        _events: None,
+    });
     view.read(cx).focus.clone().focus(window, cx);
     store.update(cx, |frames, _| frames.fullscreen = Some(view));
     window.refresh();
@@ -430,11 +579,14 @@ pub fn fullscreen(_: &mut Window, cx: &mut App) -> Option<AnyElement> {
 /// from 50% to 200%. Drawn in the base plane so the page's view can sit above it; the backdrop
 /// keeps inline pages out of sight while it is open.
 pub struct HtmlFullscreen {
+    origin: (Option<String>, Option<String>),
+    state: Entity<AppState>,
     title: SharedString,
     html: Arc<str>,
     zoom: f32,
     view: Option<Rc<WebView>>,
-    canvas: u32,
+    revision: usize,
+    keymap_revision: usize,
     unavailable: bool,
     focus: FocusHandle,
     restore: Option<FocusHandle>,
@@ -468,25 +620,47 @@ impl HtmlFullscreen {
     }
 
     fn ensure_view(&mut self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let canvas = canvas(cx);
+        let revision = crate::theme::revision(cx);
+        let keymap_revision = cx.global::<crate::keymap::Keymap>().revision;
         if let Some(view) = &self.view
-            && self.canvas != canvas
+            && (self.revision != revision || self.keymap_revision != keymap_revision)
         {
-            view.evaluate(&canvas_update(canvas));
-            self.canvas = canvas;
+            view.evaluate(&host_update(cx));
+            self.revision = revision;
+            self.keymap_revision = keymap_revision;
         }
         if self.view.is_some() || self.unavailable {
             return;
         }
         let (events, mut received) = mpsc::unbounded();
-        let page = Page { html: self.html.clone(), dark, content_security_policy: None, scroll_through: false, script: canvas_script(canvas) };
-        self.canvas = canvas;
+        let page = Page {
+            html: self.html.clone(),
+            dark,
+            content_security_policy: None,
+            scroll_through: false,
+            script: host_script(cx),
+        };
+        self.revision = revision;
+        self.keymap_revision = keymap_revision;
         self.view = WebView::new(page, Layer::Modal, events, window, cx);
         self.unavailable = self.view.is_none();
+        let event_view = self.view.as_ref().map(Rc::downgrade);
+        let state = self.state.clone();
+        let origin = self.origin.clone();
+        let handle = window.window_handle();
         self._events = Some(cx.spawn(async move |_, cx| {
             while let Some(event) = received.next().await {
-                if let WebEvent::OpenUrl(url) = event {
-                    cx.update(|cx| cx.open_url(&url));
+                match event {
+                    WebEvent::OpenUrl(url) => cx.update(|cx| cx.open_url(&url)),
+                    WebEvent::Message(text) => {
+                        if let Some(view) = event_view.as_ref().and_then(Weak::upgrade)
+                            && let Ok(message) = serde_json::from_str(&text)
+                        {
+                            let _ = cx.update_window(handle, |_, window, cx| {
+                                on_page_message(&state, &origin, &view, &message, window, cx)
+                            });
+                        }
+                    }
                 }
             }
         }));
@@ -670,6 +844,32 @@ pub mod fixture {
 
     pub(super) fn page(attachment_id: &str) -> Option<&'static PathBuf> {
         path().filter(|_| attachment_id == ATTACHMENT_ID)
+    }
+
+    pub fn capture(out: &std::path::Path, cx: &gpui::App) -> Result<(), String> {
+        use gpui_component::ActiveTheme;
+        let Some(path) = path() else { return Ok(()) };
+        let input = out.with_extension("html.json");
+        let value = serde_json::json!({"html":std::fs::read_to_string(path).map_err(|e| e.to_string())?, "script":super::host_script(cx), "dark":cx.theme().is_dark()});
+        std::fs::write(
+            &input,
+            serde_json::to_vec(&value).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let status = std::process::Command::new("swift")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/render-html.swift"
+            ))
+            .arg(&input)
+            .arg(out.with_extension("html.png"))
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("hidden HTML capture failed".into())
+        }
     }
 
     fn item() -> Option<Arc<TurnItem>> {

@@ -717,6 +717,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let link = cx.update(|cx| cx.try_global::<crate::composer::prompt_links::SnapshotClipboard>().and_then(|s| s.0.clone())).ok_or("no prompt link was copied")?;
         std::fs::write(path, link).map_err(|e| e.to_string())?;
     }
+    cx.update(|cx| crate::transcript::html_render::fixture::capture(&options.out, cx))?;
     image.save(&options.out).map_err(|error| error.to_string())
 
 }

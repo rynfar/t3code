@@ -9,7 +9,7 @@ use gpui::{
 use gpui_component::Sizable;
 use gpui_component::input::{Input, InputEvent, InputState};
 use t3_core::client_settings::{
-    BrowserSearchEngine, ClientSettingChange, DiffColorScheme, valid_search_template,
+    BrowserLinkTarget, BrowserSearchEngine, ClientSettingChange, DiffColorScheme, valid_search_template,
 };
 use t3_core::diff::Layout;
 use t3_core::settings::ServerSettingChange;
@@ -22,8 +22,8 @@ use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
 use crate::icons::Icon;
 
-const BROWSER_UNAVAILABLE: &str = "Browser profiles and cookie import, link targets, floating previews, viewport, zoom, appearance, and recordings require the Electron desktop app. They aren't available in the native client yet.";
-const PR_UNAVAILABLE: &str = "Proactive panels and opening pull request links in T3 Code aren't available in the native client yet.";
+const BROWSER_UNAVAILABLE: &str = "Browser profiles and cookie import, floating previews, viewport, zoom, appearance, and recordings require the Electron desktop app. They aren't available in the native client yet.";
+const PR_UNAVAILABLE: &str = "Proactive panels aren't available in the native client yet.";
 const SNAPSHOTS_UNAVAILABLE: &str = "SnapShots capture requires the Electron desktop app. The native client doesn't have window capture or global capture shortcuts yet.";
 const ADVANCED: &[&str] = &[
     "browser-default-viewport",
@@ -155,10 +155,17 @@ impl SettingsView {
                 .reset(doc.diff_color_scheme() != DiffColorScheme::default(), reset(&state, ClientSettingChange::DiffColorScheme(DiffColorScheme::default())))
                 .control(select(&state, "diff-colors-select", DiffColorScheme::ALL, doc.diff_color_scheme(), DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme).label(if doc.diff_color_scheme() == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" }).popup_width(208.)).into_any_element(),
         ], cx);
-        let prs = section("Pull requests", vec![unavailable_group(PR_UNAVAILABLE, vec![
-            unavailable("proactive-panels", "Open pull requests and changes panels proactively", "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.", "Unavailable", self.is_target("proactive-panels"), cx),
-            unavailable("pull-request-links-open-in-app", "Open pull requests in T3 Code", "Clicking a pull request link opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.", "Unavailable", self.is_target("pull-request-links-open-in-app"), cx),
-        ], cx).into_any_element()], cx);
+        let pr_links_state = state.clone();
+        let prs = section("Pull requests", vec![
+            unavailable_group(PR_UNAVAILABLE, vec![
+                unavailable("proactive-panels", "Open pull requests and changes panels proactively", "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.", "Unavailable", self.is_target("proactive-panels"), cx),
+            ], cx).into_any_element(),
+            Row::new("pull-request-links-open-in-app", "Open pull requests in T3 Code")
+                .description("Clicking a pull request link in an HTML page opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.")
+                .highlighted(self.is_target("pull-request-links-open-in-app"))
+                .reset(!doc.pull_request_links_open_in_app(), reset(&state, ClientSettingChange::PullRequestLinksOpenInApp(true)))
+                .control(Switch::new("pull-request-links-open-in-app-switch", doc.pull_request_links_open_in_app()).on_change(move |on, _, cx| store::update_client(&pr_links_state, ClientSettingChange::PullRequestLinksOpenInApp(on), cx))).into_any_element(),
+        ], cx);
         vec![
             Block::new(
                 &[
@@ -233,9 +240,13 @@ impl SettingsView {
         let weak = cx.entity().downgrade();
         let mut browsing = vec![unavailable_group(BROWSER_UNAVAILABLE, vec![
             unavailable("browser-profiles", "Browser profiles", "Profiles separate cookies and logins. Incognito data is cleared when the app closes.", "Unavailable", self.is_target("browser") || self.is_target("browser-profiles"), cx),
-            unavailable("browser-link-target", "Open links in", "Where links in the chat and terminal open. Hold ⌘ or Ctrl while clicking a link to open it in your default browser either way.", "Your default browser", self.is_target("browser-link-target"), cx),
             unavailable("browser-auto-show-floating-preview", "Auto-show floating preview", "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.", "Unavailable", self.is_target("browser-auto-show-floating-preview"), cx),
         ], cx).into_any_element(),
+            Row::new("browser-link-target", "Open links in")
+                .description("Where links in HTML pages open. Hold ⌘ or Ctrl while clicking a link to open it in your default browser either way.")
+                .highlighted(self.is_target("browser-link-target"))
+                .reset(doc.browser_link_target() != BrowserLinkTarget::default(), reset(&state, ClientSettingChange::BrowserLinkTarget(BrowserLinkTarget::default())))
+                .control(select(&state, "browser-link-target-select", BrowserLinkTarget::ALL, doc.browser_link_target(), BrowserLinkTarget::as_str, BrowserLinkTarget::label, ClientSettingChange::BrowserLinkTarget)).into_any_element(),
             Row::new("browser-search-engine", "Search engine")
                 .description("What the address bar searches when you type something that isn't a URL.")
                 .highlighted(self.is_target("browser-search-engine"))
