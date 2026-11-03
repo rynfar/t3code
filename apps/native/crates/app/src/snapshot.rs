@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
-[--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
 
@@ -114,6 +114,8 @@ pub struct Options {
     connect_screen: bool,
     cloud_fixture: Option<String>,
     updates_fixture: Option<String>,
+    managed_policy_fixture: Option<String>,
+    announcement_fixture: Option<String>,
     palette: bool,
     /// Opens the new-thread draft, as `chat.new` does.
     new_thread: bool,
@@ -164,6 +166,8 @@ impl Options {
             connect_screen: has("--connect"),
             cloud_fixture: flag("--cloud-fixture"),
             updates_fixture: flag("--updates-fixture"),
+            managed_policy_fixture: flag("--managed-policy-fixture"),
+            announcement_fixture: flag("--announcement-fixture"),
             palette: has("--palette"),
             new_thread: has("--new-thread"),
             attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
@@ -269,6 +273,35 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         move |cx: &mut VisualTestAppContext| state.read_with(cx, |state, _| state.shell.synchronized)
     };
     pump(&mut cx, options.wait, synchronized(&state));
+    if let Some(path) = &options.managed_policy_fixture {
+        let policy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        state.update(&mut cx, |state, cx| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.managed_policy = Some(policy);
+            }
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+        });
+    }
+    if let Some(path) = &options.announcement_fixture {
+        let messages: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        state.update(&mut cx, |state, cx| {
+            for message in messages {
+                if let Some(text) = message["text"].as_str() {
+                    let priority = if message["assertive"] == true {
+                        t3_core::announcements::Priority::Assertive
+                    } else {
+                        t3_core::announcements::Priority::Polite
+                    };
+                    state.announce_priority(text.into(), None, priority, cx);
+                }
+            }
+        });
+        pump(&mut cx, 1., |_| false);
+    }
     if options.context_meter {
         state.update(&mut cx, |state, _| state.client_settings.context_window_meter = true);
     }

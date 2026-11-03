@@ -497,6 +497,11 @@ pub struct UndoNotice {
 }
 
 impl UndoNotice {
+    pub fn announcement_summary(&self) -> String {
+        let noun = if self.action == UndoAction::Discarded { "draft" } else { "thread" };
+        format!("{} {} {noun}{}", self.action.label(), self.count, if self.count == 1 { "" } else { "s" })
+    }
+
     /// The compact footer text: "Settled" or "Settled 3".
     pub fn summary(&self) -> String {
         if self.count == 1 { self.action.label().to_owned() } else { format!("{} {}", self.action.label(), self.count) }
@@ -692,6 +697,7 @@ mod tests {
         }
         assert_eq!(store.notice(), Some(UndoNotice { action: UndoAction::Settled, count: 2 }));
         assert_eq!(store.notice().unwrap().summary(), "Settled 2");
+        assert_eq!(store.notice().unwrap().announcement_summary(), "Settled 2 threads");
         store.invalidate(UndoKind::Settle, "a");
         assert_eq!(store.notice().map(|notice| notice.count), Some(1));
         let group = store.take_latest_group();

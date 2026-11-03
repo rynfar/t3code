@@ -502,3 +502,16 @@ fn runtime_rows_follow_install_progress() {
     let view = auth::runtime_view(&antigravity, Some(&outdated), None, true);
     assert_eq!((view.status.as_str(), view.install_label.as_deref(), view.can_remove), ("Installed.", Some("Update Antigravity"), true));
 }
+
+#[test]
+fn add_provider_filters_featured_more_and_policy_changes() {
+    let p=json!({"organization":"Example Corp","limits":{"providers":{"allowedDrivers":["cursor","fx","acpRegistry"]}}});
+    let featured:Vec<_>=offered_drivers(true,Some(&p)).map(|d|d.kind).collect();
+    let more:Vec<_>=offered_drivers(false,Some(&p)).map(|d|d.kind).collect();
+    assert_eq!(featured,["cursor"]);
+    assert_eq!(more,["fx"]);
+    assert!(offered_drivers(true,None).any(|d|d.kind=="codex"));
+    let none=json!({"limits":{"providers":{"allowedDrivers":["acpRegistry"]}}});
+    assert!(offered_drivers(true,Some(&none)).next().is_none());
+    assert!(offered_drivers(false,Some(&none)).next().is_none());
+}

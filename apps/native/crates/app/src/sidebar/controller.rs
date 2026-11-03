@@ -308,6 +308,7 @@ impl AppState {
     }
 
     pub(crate) fn after_undo_change(&mut self, cx: &mut Context<Self>) {
+        self.announce_undo_notice(cx);
         cx.emit(AppEvent::Notice);
         let Some(at) = self.sidebar.undo.expires_at() else {
             self.sidebar.undo_timer = None;
@@ -318,6 +319,7 @@ impl AppState {
             cx.background_executor().timer(Duration::from_millis(wait)).await;
             let _ = this.update(cx, |state, cx| {
                 if state.sidebar.undo.expire(now_ms()) {
+                    state.announce_undo_notice(cx);
                     cx.emit(AppEvent::Notice);
                 }
             });

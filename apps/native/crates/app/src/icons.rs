@@ -32,6 +32,7 @@ macro_rules! icons {
 }
 
 icons! {
+    Building => "icons/lucide/building.svg",
     AlarmClock => "icons/lucide/alarm-clock.svg",
     AlarmClockOff => "icons/lucide/alarm-clock-off.svg",
     Archive => "icons/lucide/archive.svg",

@@ -66,6 +66,7 @@ pub enum AppEvent {
 }
 
 pub struct AppState {
+    pub(crate) announcements: crate::announcements::Announcements,
     pub phase: Phase,
     pub environments: SavedEnvironments,
     /// `environments` as last handed to the store; saves send only the edits since.
@@ -134,6 +135,7 @@ impl AppState {
         })
         .detach();
         let mut state = AppState {
+            announcements: crate::announcements::Announcements::new(cx),
             phase: Phase::Unpaired,
             environments_saved: environments.clone(),
             environments,
@@ -286,6 +288,7 @@ impl AppState {
             // Transitions a disconnect held back are compared once the shell is live again.
             self.observe_notifications(cx);
         }
+        if sidebar_changed || resynchronized { self.observe_background_announcements(cx); }
         if shell_changed {
             self.sync_omitted_rows(cx);
             self.sync_side_threads(cx);

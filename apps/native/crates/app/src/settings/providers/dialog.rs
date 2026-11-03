@@ -10,7 +10,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use t3_core::commands::method;
-use t3_core::settings::providers::{self as model, ACP_REGISTRY, DRIVERS, Driver};
+use t3_core::settings::providers::{self as model, Driver};
 
 use super::super::SettingsView;
 use super::super::controls::{Button, ButtonSize, ButtonVariant, Row, icon, r};
@@ -43,14 +43,29 @@ impl AddDialog {
     }
 }
 
-/// Drivers Add provider offers: everything but the ACP Registry, featured ones up front.
-fn offered(featured: bool) -> impl Iterator<Item = &'static Driver> {
-    DRIVERS.iter().filter(move |driver| driver.kind != ACP_REGISTRY && driver.featured == featured)
-}
-
 impl SettingsView {
+    fn add_driver_denial(&self, driver: &Driver, cx: &gpui::App) -> Option<String> {
+        let app = self.state.read(cx);
+        t3_core::managed_policy::driver_denial(app.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), driver.kind, driver.label)
+    }
+
+    fn check_dialog_policy(&mut self, cx: &mut Context<Self>) -> bool {
+        let denial = self.providers.dialog.as_ref().and_then(|dialog| self.add_driver_denial(dialog.driver, cx));
+        if let Some(denial) = denial {
+            if let Some(dialog) = self.providers.dialog.as_mut() { dialog.error = Some(denial); }
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     pub(super) fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let driver = offered(true).next().unwrap_or(&DRIVERS[0]);
+        let driver = {
+            let app = self.state.read(cx);
+            let policy = app.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref());
+            model::offered_drivers(true, policy).next().or_else(|| model::offered_drivers(false, policy).next())
+        };
+        let Some(driver) = driver else { return; };
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Work"));
         let instance_id = cx.new(|cx| InputState::new(window, cx));
         let accent = cx.new(|cx| InputState::new(window, cx).placeholder("#2563eb"));
@@ -107,6 +122,7 @@ impl SettingsView {
 
     /// Each driver starts from its own label, as the web keeps one identity draft per driver.
     fn select_dialog_driver(&mut self, driver: &'static Driver, window: &mut Window, cx: &mut Context<Self>) {
+        if self.add_driver_denial(driver, cx).is_some() { return; }
         let Some(dialog) = self.providers.dialog.as_mut() else { return };
         dialog.driver = driver;
         dialog.id_overridden = false;
@@ -155,6 +171,7 @@ impl SettingsView {
     /// Next, or Add instance on the last step. Moving past the identity step needs a valid id
     /// (`resolveWizardNavigation`).
     fn advance_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.check_dialog_policy(cx) { return; }
         let Some(step) = self.providers.dialog.as_ref().filter(|dialog| !dialog.saving).map(|dialog| dialog.step) else { return };
         if step + 1 < STEPS.len() {
             if let Some(dialog) = self.providers.dialog.as_mut() {
@@ -171,6 +188,7 @@ impl SettingsView {
     }
 
     fn save_dialog(&mut self, cx: &mut Context<Self>) {
+        if !self.check_dialog_policy(cx) { return; }
         let error = self.dialog_id_error(cx);
         let Some(dialog) = self.providers.dialog.as_mut() else { return };
         if dialog.saving {
@@ -224,6 +242,7 @@ impl SettingsView {
         let driver = dialog.driver;
         let saving = dialog.saving;
         let id_error = self.dialog_id_error(cx).filter(|_| dialog.attempted);
+        let denial = self.add_driver_denial(driver, cx);
 
         let steps = h_flex().gap(r(4.)).p(r(4.)).rounded(r(12.)).bg(if dark { gpui::white().opacity(0.04) } else { hsla(p.background) }).children(STEPS.iter().enumerate().map(|(index, name)| {
             let current = index == step;
@@ -268,8 +287,10 @@ impl SettingsView {
         }));
 
         let body = if step == 0 {
-            let featured: Vec<&'static Driver> = offered(true).collect();
-            let more: Vec<&'static Driver> = offered(false).collect();
+            let app = self.state.read(cx);
+            let policy = app.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref());
+            let featured: Vec<&'static Driver> = model::offered_drivers(true, policy).collect();
+            let more: Vec<&'static Driver> = model::offered_drivers(false, policy).collect();
             v_flex()
                 .gap(r(8.))
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Provider"))
@@ -347,7 +368,7 @@ impl SettingsView {
             .child(
                 Button::new("add-provider-primary", if step == 0 && driver.kind == "codex" { ButtonVariant::Outline } else { ButtonVariant::Default }, ButtonSize::Sm)
                     .label(primary)
-                    .disabled(saving)
+                    .disabled(saving || denial.is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.advance_dialog(window, cx))),
             );
 
@@ -381,7 +402,7 @@ impl SettingsView {
                     .child(div().pt(r(8.)).child(steps)),
             )
             .child(div().id("add-provider-panel").flex_1().min_h_0().overflow_y_scroll().px(r(24.)).pt(r(4.)).pb(r(24.)).child(body))
-            .children(dialog.error.clone().map(|error| div().px(r(24.)).pb(r(8.)).text_xs().text_color(hsla(p.destructive_foreground)).child(error)))
+            .children(denial.or_else(|| dialog.error.clone()).map(|error| div().px(r(24.)).pb(r(8.)).text_xs().text_color(hsla(p.destructive_foreground)).child(error)))
             .child(footer);
 
         let overlay = div()

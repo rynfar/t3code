@@ -55,6 +55,11 @@ pub const DRIVERS: [Driver; 10] = [
     Driver { kind: ACP_REGISTRY, label: "ACP Registry", has_default_instance: false, featured: true, custom_model_placeholder: "model-slug" },
 ];
 
+/// Drivers in the Add provider wizard, in catalog order.
+pub fn offered_drivers(featured: bool, policy: Option<&Value>) -> impl Iterator<Item = &'static Driver> {
+    DRIVERS.iter().filter(move |driver| driver.kind != ACP_REGISTRY && driver.featured == featured && crate::managed_policy::driver_allowed(policy, driver.kind))
+}
+
 pub fn find_driver(kind: &str) -> Option<&'static Driver> {
     DRIVERS.iter().find(|driver| driver.kind == kind)
 }

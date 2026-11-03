@@ -255,6 +255,11 @@ impl ModelPicker {
     }
 
     fn select_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        let message = match &tab {
+            Tab::Favorites => "Favorites".to_owned(),
+            Tab::Instance(id) => self.state.read(cx).server_config.config.as_ref().and_then(|c| c.provider(id)).map(providers::display_name).unwrap_or_else(|| id.clone()),
+        };
+        self.state.update(cx, |state, cx| state.announce(message, Some("model-picker"), cx));
         self.tab = tab;
         self.legacy_expanded = false;
         self.refresh_rows(cx);
@@ -264,7 +269,8 @@ impl ModelPicker {
 
     fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
         match self.rows.get(index).cloned() {
-            Some(Row::Model { instance_id, slug, disabled: None, .. }) => {
+            Some(Row::Model { instance_id, slug, name, disabled: None, .. }) => {
+                self.state.update(cx, |state, cx| state.announce(format!("Model: {name}"), Some("model-picker"), cx));
                 cx.emit(PickerEvent::Model { instance_id, model: slug });
             }
             Some(Row::Legacy { expanded }) => {

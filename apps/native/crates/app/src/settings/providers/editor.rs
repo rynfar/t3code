@@ -208,9 +208,9 @@ impl SettingsView {
                             .child(div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child(environment_label.to_owned()))
                             .when(!enabled, |this| {
                                 this.child(
-                                    Button::new("enable-antigravity", ButtonVariant::Outline, ButtonSize::Sm)
+                                    crate::components::managed::ManagedControl::new("managed-antigravity", t3_core::managed_policy::driver_denial(self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), "antigravity", "Antigravity"), Button::new("enable-antigravity", ButtonVariant::Outline, ButtonSize::Sm)
                                         .label("Enable Antigravity")
-                                        .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, model::InstanceEdit::Enabled(true), cx))),
+                                        .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, model::InstanceEdit::Enabled(true), cx)))),
                                 )
                             }),
                     )
