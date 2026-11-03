@@ -38,10 +38,12 @@ fn sync_navigation_focus(tips: &mut minimap::NavigationTooltips, index: usize, f
     pending != tips.deadline()
 }
 
-fn navigation_reference_press(tips: &mut minimap::NavigationTooltips, index: usize, focus: &FocusHandle, window: &mut Window, cx: &mut gpui::App) {
-    window.prevent_default();
-    window.focus(focus, cx);
-    sync_navigation_focus(tips, index, focus, window);
+fn navigation_reference_press(tips: &mut minimap::NavigationTooltips, index: usize, button: MouseButton, focus: &FocusHandle, window: &mut Window, cx: &mut gpui::App) {
+    if button == MouseButton::Left {
+        window.prevent_default();
+        window.focus(focus, cx);
+        sync_navigation_focus(tips, index, focus, window);
+    }
     tips.press(index);
 }
 
@@ -586,10 +588,10 @@ impl ThreadView {
                 view.minimap_tab(if previous { minimap::FocusPart::Previous } else { minimap::FocusPart::Next }, true, window, cx);
             }))
             .key_context("TimelineMinimap")
-            .on_mouse_down(MouseButton::Left, cx.listener(move |view, _, window, cx| {
-                window.prevent_default();
+            .on_any_mouse_down(cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Left { window.prevent_default(); }
                 if interactive && enabled {
-                    navigation_reference_press(&mut view.minimap.tooltips, nav_index, &mouse_focus, window, cx);
+                    navigation_reference_press(&mut view.minimap.tooltips, nav_index, event.button, &mouse_focus, window, cx);
                     view.minimap_tooltip_changed(cx);
                 }
             }))
@@ -778,8 +780,8 @@ mod tests {
                 let owner = cx.entity().downgrade();
                 div().relative().size_full()
                     .child(div().id("navigation-focus").track_focus(&self.focus).size_full()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|nav, _, window, cx| {
-                            navigation_reference_press(&mut nav.tips, 0, &nav.focus, window, cx);
+                        .on_any_mouse_down(cx.listener(|nav, event: &gpui::MouseDownEvent, window, cx| {
+                            navigation_reference_press(&mut nav.tips, 0, event.button, &nav.focus, window, cx);
                         })))
                     .child(tooltip_dismiss_area(move |_, _, cx| {
                         owner.update(cx, |nav, _| nav.tips.outside_press()).unwrap();
@@ -810,20 +812,23 @@ mod tests {
         nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), Some(0)));
         cx.update_window(window.into(), |_, window, _| window.blur()).unwrap();
         draw(cx);
-        nav.update(cx, |nav, _| {
-            nav.tips = minimap::NavigationTooltips::default();
-            nav.tips.hover(0, true, Duration::ZERO);
-            nav.tips.pointer_move(0, 50., 50., Duration::ZERO);
-            nav.tips.advance(Duration::from_millis(600));
-            assert!(!nav.tips.instant(0));
-        });
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_mouse_move(point(px(50.), px(50.)), None, Default::default());
-        visual.simulate_mouse_down(point(px(50.), px(50.)), MouseButton::Left, Default::default());
-        visual.update(|window, cx| window.draw(cx).clear());
-        nav.read_with(visual, |nav, _| assert_eq!(nav.tips.visible(), None, "a held reference press cannot reopen through newly acquired focus"));
-        nav.read_with(visual, |nav, _| assert!(nav.tips.instant(0), "reference press overrides the earlier outside-press capture reason"));
-        visual.simulate_mouse_up(point(px(50.), px(50.)), MouseButton::Left, Default::default());
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            visual.update(|window, cx| { window.blur(); window.draw(cx).clear(); });
+            nav.update(visual, |nav, _| {
+                nav.tips = minimap::NavigationTooltips::default();
+                nav.tips.hover(0, true, Duration::ZERO);
+                nav.tips.pointer_move(0, 50., 50., Duration::ZERO);
+                nav.tips.advance(Duration::from_millis(600));
+                assert!(!nav.tips.instant(0));
+            });
+            visual.simulate_mouse_move(point(px(50.), px(50.)), None, Default::default());
+            visual.simulate_mouse_down(point(px(50.), px(50.)), button, Default::default());
+            visual.update(|window, cx| window.draw(cx).clear());
+            nav.read_with(visual, |nav, _| assert_eq!(nav.tips.visible(), None, "a held reference press cannot reopen through newly acquired focus"));
+            nav.read_with(visual, |nav, _| assert!(nav.tips.instant(0), "reference press overrides outside-press capture, button={button:?}"));
+            visual.simulate_mouse_up(point(px(50.), px(50.)), button, Default::default());
+        }
     }
 
     #[gpui::test]

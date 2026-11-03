@@ -423,10 +423,12 @@ impl NavigationTooltips {
         if self.focused[index] == value { return; }
         self.focused[index] = value;
         if value && !visible { return; }
-        self.dismissed[index] = false;
-        self.cancel_pending(index);
-        if value { self.show(index, true); }
-        else if !value && self.open == Some(index) { self.open = None; }
+        if value {
+            self.dismissed[index] = false;
+            self.show(index, true);
+        } else {
+            self.dismiss(index, false);
+        }
     }
 
     pub fn pointer_move(&mut self, index: usize, x: f32, y: f32, now: Duration) {
