@@ -838,13 +838,13 @@ pub fn question_history(entry_id: &str, questions: &[AnsweredQuestion], cx: &mut
             .collect();
         rows.push(
             v_flex()
-                .gap(px(4.))
+                .gap(rem(4.))
                 .children(question.question.as_ref().map(|text| div().text_color(muted).child(selectable(&format!("{id}:q"), text.clone()))))
-                .children(question.answer.as_ref().map(|text| div().ml(px(12.)).text_color(muted).child(selectable(&format!("{id}:a"), text.clone()))))
-                .when(!files.is_empty(), |this| this.child(h_flex().flex_wrap().gap(px(8.)).children(files))),
+                .children(question.answer.as_ref().map(|text| div().ml(rem(12.)).text_color(muted).child(selectable(&format!("{id}:a"), text.clone()))))
+                .when(!files.is_empty(), |this| this.child(h_flex().flex_wrap().gap(rem(8.)).children(files))),
         );
     }
-    v_flex().ml(px(28.)).mt(px(8.)).gap(px(8.)).text_size(px(14.)).line_height(px(20.)).children(rows).into_any_element()
+    v_flex().ml(rem(28.)).mt(rem(8.)).gap(rem(8.)).text_size(rem(14.)).line_height(rem(20.)).children(rows).into_any_element()
 }
 
 #[cfg(test)]

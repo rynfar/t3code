@@ -73,6 +73,7 @@ pub struct ThreadView {
     local_error: Option<String>,
     clock: Clock,
     window_height: f32,
+    measured_font_size: gpui::Pixels,
     rewind: rewind::RewindUi,
     media: Entity<crate::media::MediaCache>,
     viewer: Entity<crate::media::MediaViewer>,
@@ -157,6 +158,7 @@ impl ThreadView {
             local_error: None,
             clock: Clock::now(),
             window_height: 0.,
+            measured_font_size: _window.rem_size(),
             rewind: rewind::RewindUi::default(),
             media,
             viewer,
@@ -735,6 +737,7 @@ fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>, g
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        remeasure_for_font_size(window.rem_size(), &mut self.measured_font_size, &self.list, &self.group_lists.borrow());
         let thread = self.thread_state(self.state.read(cx));
         let loading = thread.projection.is_none() && !thread.is_merging_history();
         let muted = hsla(palette(cx).muted_foreground);
@@ -811,5 +814,55 @@ impl Render for ThreadView {
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
             .relative().size_full().child(transcript).children(minimap).children(banners).children(find_bar).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+    }
+}
+
+fn remeasure_for_font_size(size: gpui::Pixels, previous: &mut gpui::Pixels, list: &ListState, groups: &HashMap<String, ListState>) {
+    if *previous == size { return; }
+    *previous = size;
+    // GPUI invalidates cached heights for width changes; rem changes need the same treatment.
+    list.remeasure();
+    for group in groups.values() { group.remeasure(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn font_resize_invalidates_offscreen_transcript_and_group_measurements(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let main_list = ListState::new(100, ListAlignment::Top, px(0.));
+        let groups = HashMap::from([("group".to_owned(), ListState::new(100, ListAlignment::Top, px(0.)))]);
+        struct TestLists { main: ListState, group: ListState, height: f32 }
+        impl Render for TestLists {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let height = self.height;
+                div().flex().size_full()
+                    .child(list(self.main.clone(), move |_, _, _| div().h(px(height)).into_any_element()).w(px(100.)).h_full())
+                    .child(list(self.group.clone(), move |_, _, _| div().h(px(height)).into_any_element()).w(px(100.)).h_full())
+            }
+        }
+        let view = cx.update(|_, cx| cx.new(|_| TestLists { main: main_list.clone(), group: groups["group"].clone(), height: 24. }));
+        let draw = |viewport, cx: &mut gpui::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(200.), px(viewport)), |_, _| view.clone().into_any_element());
+        };
+        draw(2400., cx);
+        draw(100., cx);
+        let mut previous = px(16.);
+        remeasure_for_font_size(px(16.), &mut previous, &main_list, &groups);
+        assert_eq!(main_list.bounds_for_item(99).unwrap().size.height, px(24.));
+        assert_eq!(groups["group"].bounds_for_item(99).unwrap().size.height, px(24.));
+        remeasure_for_font_size(px(20.), &mut previous, &main_list, &groups);
+        assert!(main_list.bounds_for_item(99).is_none(), "offscreen main rows must be measured again");
+        assert!(groups["group"].bounds_for_item(99).is_none(), "offscreen group members must be measured again");
+        assert_eq!(previous, px(20.));
+        cx.update(|_, cx| view.update(cx, |view, cx| { view.height = 30.; cx.notify(); }));
+        draw(100., cx);
+        remeasure_for_font_size(px(20.), &mut previous, &main_list, &groups);
+        assert_eq!(main_list.bounds_for_item(0).unwrap().size.height, px(30.));
+        remeasure_for_font_size(px(16.), &mut previous, &main_list, &groups);
+        assert!(main_list.bounds_for_item(0).is_none());
+        assert!(groups["group"].bounds_for_item(0).is_none());
     }
 }

@@ -12,7 +12,7 @@ use t3_core::timeline::AnswerAttachment;
 
 use crate::icons::Icon;
 use crate::media::{self, ImageState, MediaScope, Variant, ViewerItem};
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 
 /// One corner radius per corner: top-left, top-right, bottom-right, bottom-left.
@@ -342,7 +342,7 @@ pub fn answer_attachment(id: SharedString, attachment: &AnswerAttachment, cx: &m
     match image {
         Some(image) => {
             let width = media::dimensions(&source, cx).filter(|(_, height)| *height > 0).map_or(80., |(width, height)| (80. * width as f32 / height as f32).min(128.));
-            frame.h(px(80.)).w(px(width)).child(img(image).size_full().rounded(px(4.)).object_fit(ObjectFit::Contain)).into_any_element()
+            frame.h(rem(80.)).w(rem(width)).child(img(image).size_full().rounded(px(4.)).object_fit(ObjectFit::Contain)).into_any_element()
         }
         None => frame.underline().child(SharedString::from(attachment.name.clone())).into_any_element(),
     }

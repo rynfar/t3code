@@ -384,7 +384,8 @@ fn delimiter_language(name: &str) -> Option<&'static str> {
 }
 
 fn file_language(path: &str) -> Option<&'static str> {
-    delimiter_language(path.trim_matches(['\'', '"']).rsplit('.').next()?)
+    let path = path.trim_matches(['\'', '"']);
+    crate::files::syntax_language(path).or_else(|| delimiter_language(path.rsplit('.').next()?))
 }
 
 #[cfg(test)]
@@ -421,6 +422,10 @@ mod tests {
             ("env FOO=1 sudo -u bob node --eval=\"console.log(1)\"", "javascript", "console.log(1)"),
             ("python3 - <<'PY'\nprint(1)\nPY", "python", "print(1)\n"),
             ("cat > src/app.ts <<'EOF'\nconst a = 1;\nEOF", "typescript", "const a = 1;\n"),
+            ("cat > main.rs <<'EOF'\nfn main() {}\nEOF", "rust", "fn main() {}\n"),
+            ("cat > main.go <<'EOF'\npackage main\nEOF", "go", "package main\n"),
+            ("tee app.tsx <<'EOF'\nconst app = <div />;\nEOF", "tsx", "const app = <div />;\n"),
+            ("cat > readme.md <<'EOF'\n# Title\nEOF", "markdown", "# Title\n"),
             ("kubectl apply -f - <<'YAML'\nkind: Pod\nYAML", "yaml", "kind: Pod\n"),
             ("echo \"$(node -e 'console.log(1)')\"", "javascript", "console.log(1)"),
         ] {

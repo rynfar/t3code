@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
 [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -44,6 +44,7 @@ enum Gesture {
     /// Space-separated keystrokes, as `cmd-a escape`.
     Keys(String),
     Text(String),
+    FontSize(f32),
 }
 
 fn gestures(args: &[String]) -> Vec<Gesture> {
@@ -61,6 +62,7 @@ fn gestures(args: &[String]) -> Vec<Gesture> {
                 ("--hover", Some(n @ [_, _])) => Gesture::Hover(at(n)),
                 ("--drag", Some(n @ [_, _, _, _])) => Gesture::Drag(at(n), at(&n[2..])),
                 ("--scroll", Some(n @ [_, _, dy])) => Gesture::Scroll(at(n), *dy),
+                ("--resize-font", Some([size])) => Gesture::FontSize(*size),
                 ("--keys", _) => Gesture::Keys(pair[1].clone()),
                 ("--type", _) => Gesture::Text(pair[1].clone()),
                 _ => return None,
@@ -103,6 +105,10 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
         }
         Gesture::Keys(keys) => cx.simulate_keystrokes(window, keys),
         Gesture::Text(text) => cx.simulate_input(window, text),
+        Gesture::FontSize(size) => cx.update(|cx| {
+            let current = crate::theme::preferences(cx).clone();
+            crate::theme::set_preferences(crate::theme::Preferences { interface_font_size: *size, ..current }, cx);
+        }),
     }
 }
 

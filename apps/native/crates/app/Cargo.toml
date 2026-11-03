@@ -105,3 +105,6 @@ objc2-web-kit = { version = "0.3", default-features = false, features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
