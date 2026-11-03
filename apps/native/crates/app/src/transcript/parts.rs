@@ -6,7 +6,7 @@ use gpui::{AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, Interactive
 use gpui_component::h_flex;
 
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem};
 
 pub const ROW_GROUP: &str = "timeline-row";
 
@@ -49,7 +49,7 @@ pub fn focusable(element: gpui::Stateful<gpui::Div>, cx: &App) -> gpui::Stateful
 
 /// The 24px icon slot of a work row with a 16px icon (§7.7).
 pub fn icon_slot(icon: Icon, color: Hsla) -> AnyElement {
-    div().size(px(24.)).flex_none().flex().items_center().justify_center().child(icon.render(px(16.), color)).into_any_element()
+    div().size(rem(24.)).flex_none().flex().items_center().justify_center().child(icon.render(px(16.), color).size(rem(16.))).into_any_element()
 }
 
 /// `WorkLogLine`: min 24, gap 6, 14px on a 1.625 line, label in `secondary_label`.
@@ -57,16 +57,16 @@ pub fn work_line(icon: Option<AnyElement>, label: AnyElement, trailing: Vec<AnyE
     h_flex()
         .w_full()
         .min_w_0()
-        .min_h(px(24.))
-        .gap(px(6.))
-        .text_size(px(14.))
-        .line_height(px(22.75))
+        .min_h(rem(24.))
+        .gap(rem(6.))
+        .text_size(rem(14.))
+        .line_height(rem(22.75))
         .when(wrap, |this| this.items_start())
         .child(
             h_flex()
                 .flex_1()
                 .min_w_0()
-                .gap(px(6.))
+                .gap(rem(6.))
                 .when(wrap, |this| this.items_start())
                 .children(icon)
                 .child(
@@ -90,21 +90,21 @@ pub fn work_row_frame(id: impl Into<ElementId>, grouped: bool) -> gpui::Stateful
         .w_full()
         .min_w_0()
         .rounded(px(6.))
-        .px(px(2.))
-        .when(!grouped, |this| this.py(px(2.)))
+        .px(rem(2.))
+        .when(!grouped, |this| this.py(rem(2.)))
 }
 
 /// The 12px disclosure chevron at the end of a work row, rotated when open.
 pub fn chevron(open: bool, visible: bool, cx: &App) -> AnyElement {
     let icon = if open { Icon::ChevronDown } else { Icon::ChevronRight };
     div()
-        .size(px(16.))
+        .size(rem(16.))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .when(!visible, |this| this.invisible())
-        .child(icon.render(px(12.), hsla(palette(cx).icon_muted).opacity(0.7)))
+        .child(icon.render(px(12.), hsla(palette(cx).icon_muted).opacity(0.7)).size(rem(12.)))
         .into_any_element()
 }
 

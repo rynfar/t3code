@@ -2,7 +2,7 @@
 //! chip with its popover (`BackgroundWorktreeSetupChip` in `TimelineWorkGroupRows.tsx`). Rules and
 //! copy come from `t3_core::worktree_setup`. Only a running stage's time changes on a timer, each
 //! through its own `WorkingTimer`, which exists only while setup runs. Text and spacing are rem
-//! metrics; offsets that line up with the stage icons stay px like the shared work row.
+//! metrics, including offsets that line up with the shared work row's icon slot.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,7 +127,7 @@ fn output_tail(lines: &[String], failed: bool, cx: &App) -> AnyElement {
     let rows = rules::tail_rows(lines).map(|line| div().w_full().min_w_0().truncate().child(if line.is_empty() { "\u{a0}".to_owned() } else { line.to_owned() }));
     v_flex()
         .mb(rem(4.))
-        .ml(px(32.))
+        .ml(rem(32.))
         .min_w_0()
         .overflow_hidden()
         .rounded(px(6.))
@@ -205,7 +205,7 @@ fn details(snapshot: &Snapshot, cx: &App) -> AnyElement {
         .items_start()
         .mt(rem(4.))
         .mb(rem(6.))
-        .ml(px(32.))
+        .ml(rem(32.))
         .min_w_0()
         .gap(rem(12.))
         .text_xs()
@@ -232,7 +232,7 @@ pub fn card(scope: &str, snapshot: &Arc<Snapshot>, embedded: bool, env: &RowEnv,
         }
         v_flex().w_full().min_w_0().when(layout.show_header, |this| this.pt(rem(6.))).children(rows).into_any_element()
     };
-    let error = snapshot.error.clone().filter(|_| layout.show_error).map(|error| muted_text(error, cx).mt(rem(4.)).ml(px(32.)));
+    let error = snapshot.error.clone().filter(|_| layout.show_error).map(|error| muted_text(error, cx).mt(rem(4.)).ml(rem(32.)));
 
     let open = env.setup.details_open;
     let mut actions = vec![ghost_text_button(
@@ -329,5 +329,5 @@ pub fn background_chip(env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<Any
 
 /// The blank row that keeps the "Thinking" slot's height while the worktree is prepared.
 pub fn empty_work_row(id: &str) -> AnyElement {
-    work_row_frame(SharedString::from(format!("preparing:{id}")), false).child(div().min_h(px(24.))).into_any_element()
+    work_row_frame(SharedString::from(format!("preparing:{id}")), false).child(div().min_h(rem(24.))).into_any_element()
 }

@@ -188,7 +188,7 @@ enum Block {
 }
 
 enum CallPart {
-    /// `ShellCommandBlock`, not highlighted yet.
+    /// `ShellCommandBlock`, including embedded scripts.
     Command(SharedString),
     /// `key value` lines: keys muted, values at 85%.
     Args(Text),
@@ -614,7 +614,7 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
 fn call_parts(call: ToolCallLines, tool_name: Option<&str>) -> Vec<CallPart> {
     let mut parts = Vec::new();
     if let Some(command) = call.command {
-        parts.push(CallPart::Command(with_visible_control_characters(&command).into()));
+        parts.push(CallPart::Command(with_visible_control_characters(js_trim(&command)).into()));
     }
     let mut lines = String::new();
     let mut keys: Vec<Range<usize>> = Vec::new();
@@ -783,7 +783,7 @@ fn structured(id: &str, text: &Text, cx: &App) -> AnyElement {
 fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyElement>>, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     match part {
-        CallPart::Command(command) => div().text_color(hsla(p.foreground).opacity(0.85)).child(selectable(id, command.clone())).into_any_element(),
+        CallPart::Command(command) => super::command_output::ShellCommandBlock::new(id, command.clone()).into_any_element(),
         CallPart::Args(text) => {
             let mut lines = selectable(id, text.text.clone());
             if let Some(highlights) = text.highlights(cx) {

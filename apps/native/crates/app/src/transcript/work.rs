@@ -19,7 +19,7 @@ use super::markdown::{MarkdownStore, prose};
 use super::parts::{chevron, focusable, icon_slot, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 
 pub fn work_icon(icon: WorkIcon) -> Icon {
@@ -77,7 +77,8 @@ fn group_list(id: &str, members: Vec<Arc<WorkLogEntry>>, env: &RowEnv, cx: &mut 
     let count = members.len();
     let reasoning = members.iter().all(|e| e.item_type == Some("reasoning"));
     let opened = members.iter().filter(|e| env.ui.expanded_entries.contains(&e.id)).count() as f32;
-    let cap = if reasoning { 384. } else { 288f32.min(env.window_height * 0.5) + opened * 264. };
+    let scale = cx.theme().font_size / px(16.);
+    let cap = if reasoning { 384. * scale } else { (288. * scale).min(env.window_height * 0.5) + opened * 264. * scale };
     let state = {
         let mut lists = env.group_lists.borrow_mut();
         let state = lists.entry(id.to_owned()).or_insert_with(|| ListState::new(count, ListAlignment::Top, px(240.)));
@@ -101,7 +102,7 @@ fn group_list(id: &str, members: Vec<Arc<WorkLogEntry>>, env: &RowEnv, cx: &mut 
     .w_full()
     .max_h(px(cap));
     let body = div().w_full().min_w_0().child(list);
-    if reasoning { body.ml(px(28.)).px(px(2.)).py(px(4.)).into_any_element() } else { body.into_any_element() }
+    if reasoning { body.ml(rem(28.)).px(rem(2.)).py(rem(4.)).into_any_element() } else { body.into_any_element() }
 }
 
 /// One member of an open group: a work row, or one thought of a reasoning trace.
@@ -111,7 +112,7 @@ pub fn group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut Mark
     {
         let text: Arc<str> = Arc::from(detail);
         let state = markdown.state(&format!("reasoning:{}", entry.id), &text, cx);
-        return div().pb(px(12.)).child(prose(&state, cx)).into_any_element();
+        return div().pb(rem(12.)).child(prose(&state, cx)).into_any_element();
     }
     entry_row(entry, None, true, env, markdown, cx)
 }
@@ -146,7 +147,7 @@ fn entry_row(
         return work_row_frame(SharedString::from(entry.id.clone()), grouped)
             .child(work_line(
                 Some(icon_slot(Icon::CircleAlert, color)),
-                div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(color).child(label).into_any_element(),
+                div().text_size(rem(14.)).font_weight(FontWeight::MEDIUM).text_color(color).child(label).into_any_element(),
                 vec![timestamp(&env.clock, &entry.created_at, true, cx)],
                 true,
                 cx,
@@ -154,10 +155,10 @@ fn entry_row(
             .when(!warning, |this| {
                 this.child(
                     div()
-                        .ml(px(28.))
-                        .py(px(4.))
-                        .text_size(px(14.))
-                        .line_height(px(22.75))
+                        .ml(rem(28.))
+                        .py(rem(4.))
+                        .text_size(rem(14.))
+                        .line_height(rem(22.75))
                         .text_color(hsla(p.foreground).opacity(0.8))
                         .child(failure.message.clone()),
                 )
@@ -198,13 +199,13 @@ fn entry_row(
     let can_expand = entry_can_expand(entry, env.workspace_root);
     let mut trailing = Vec::new();
     if failed && !severe {
-        trailing.push(Icon::WorkX.render(px(12.), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
+        trailing.push(Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
     }
     trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     trailing.push(chevron(expanded, can_expand, cx));
     let label = h_flex()
         .min_w_0()
-        .gap(px(6.))
+        .gap(rem(6.))
         .child(
             div()
                 .min_w_0()
@@ -230,10 +231,10 @@ fn entry_row(
         frame = frame.child(
             div()
                 .id(SharedString::from(format!("work-trace:{}", entry.id)))
-                .ml(px(28.))
-                .px(px(2.))
-                .py(px(4.))
-                .max_h(px(384.))
+                .ml(rem(28.))
+                .px(rem(2.))
+                .py(rem(4.))
+                .max_h(rem(384.))
                 .overflow_y_scroll()
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(prose(&state, cx)),
@@ -281,9 +282,9 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
         .id(SharedString::from(format!("work-detail:{}", entry.id)))
         .w_full()
         .min_w_0()
-        .mt(px(2.))
-        .mb(px(6.))
-        .pb(px(8.))
+        .mt(rem(2.))
+        .mb(rem(6.))
+        .pb(rem(8.))
         .on_click(|_, _, cx| cx.stop_propagation())
         .child(content)
         .into_any_element()
@@ -327,11 +328,11 @@ fn approval_row(entry: &WorkLogEntry, cx: &App) -> AnyElement {
             Some(icon_slot(icon, hsla(p.icon_muted))),
             div()
                 .id(SharedString::from(format!("approval-detail:{}", entry.id)))
-                .max_h(px(160.))
+                .max_h(rem(160.))
                 .overflow_y_scroll()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_xs()
-                .line_height(px(20.))
+                .line_height(rem(20.))
                 .text_color(hsla(p.foreground))
                 .child(detail)
                 .into_any_element(),
@@ -341,17 +342,17 @@ fn approval_row(entry: &WorkLogEntry, cx: &App) -> AnyElement {
         ))
         .child(
             v_flex()
-                .ml(px(30.))
-                .gap(px(4.))
-                .pb(px(4.))
+                .ml(rem(30.))
+                .gap(rem(4.))
+                .pb(rem(4.))
                 .text_xs()
                 .children(app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
                 .children(reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
                 .child(
                     h_flex()
-                        .gap(px(4.))
+                        .gap(rem(4.))
                         .text_color(hsla(p.warning_foreground))
-                        .child(Icon::Shield.render(px(12.), hsla(p.warning_foreground)))
+                        .child(Icon::Shield.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.warning_foreground)))
                         .child("Waiting for approval"),
                 ),
         )
@@ -362,7 +363,7 @@ fn approval_row(entry: &WorkLogEntry, cx: &App) -> AnyElement {
 fn live_activity(label: AnyElement, icon: Icon, failed: bool, cx: &App) -> gpui::Div {
     let p = palette(cx);
     let color = if failed { hsla(p.tool_error_icon).opacity(0.4) } else { hsla(p.icon_muted) };
-    let trailing = if failed { vec![Icon::WorkX.render(px(12.), color).into_any_element()] } else { Vec::new() };
+    let trailing = if failed { vec![Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), color).into_any_element()] } else { Vec::new() };
     work_line(Some(icon_slot(icon, color)), label, trailing, false, cx)
 }
 
