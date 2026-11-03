@@ -381,6 +381,23 @@ pub fn tab_target(part: FocusPart, backwards: bool, previous: bool, next: bool) 
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NavigationTooltip {
+    hovered: bool,
+    focused: bool,
+    dismissed: bool,
+}
+
+impl NavigationTooltip {
+    pub fn visible(&mut self, hovered: bool, focused: bool, hover_ready: bool) -> bool {
+        if (self.hovered, self.focused) != (hovered, focused) { self.dismissed = false; }
+        (self.hovered, self.focused) = (hovered, focused);
+        !self.dismissed && (focused || hovered && hover_ready)
+    }
+
+    pub fn dismiss(&mut self) { self.dismissed = true; }
+}
+
 /// `TimelineMinimap`'s focus and key handlers.
 pub fn focus_index(active: Option<usize>, current: Option<usize>, count: usize) -> Option<usize> {
     active.filter(|i| *i < count).or_else(|| current.filter(|i| *i < count)).or_else(|| (count > 0).then_some(0))

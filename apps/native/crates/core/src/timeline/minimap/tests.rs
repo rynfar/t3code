@@ -226,3 +226,21 @@ fn tab_order_skips_disabled_turn_buttons() {
     assert_eq!(tab_target(Previous, true, true, true), None);
     assert_eq!(tab_target(Next, false, true, true), None);
 }
+
+#[test]
+fn navigation_tooltip_escape_survives_renders_and_delayed_hover_opens() {
+    let mut tooltip = NavigationTooltip::default();
+    assert!(tooltip.visible(false, true, false));
+    tooltip.dismiss();
+    assert!(!tooltip.visible(false, true, false));
+    assert!(!tooltip.visible(false, true, false));
+    assert!(!tooltip.visible(false, false, false));
+    assert!(tooltip.visible(false, true, false));
+    tooltip.dismiss();
+    assert!(tooltip.visible(true, true, false), "a new hover resets dismissal");
+    assert!(!tooltip.visible(true, false, false));
+    tooltip.dismiss();
+    assert!(!tooltip.visible(true, false, true), "a delayed hover open cannot undo Escape");
+    assert!(!tooltip.visible(false, false, false));
+    assert!(tooltip.visible(true, false, true));
+}
