@@ -396,7 +396,7 @@ pub struct NavigationTooltips {
     instant: [bool; 2],
     open: Option<usize>,
     pending: Option<(usize, Duration)>,
-    hover_closing: Option<(usize, Duration)>,
+    hover_closing: [Option<Duration>; 2],
     reduced_motion: bool,
 }
 
@@ -407,14 +407,14 @@ impl NavigationTooltips {
         self.pointer[index] = None;
         self.dismissed[index] = false;
         if value {
-            let reentry = self.hover_closing.is_some_and(|(closing, end)| closing == index && now < end);
+            let reentry = self.hover_closing[index].is_some_and(|end| now < end);
             if reentry { self.show(index, false); }
         } else {
             self.cancel_pending(index);
             if self.open == Some(index) {
                 self.open = None;
                 self.instant[index] = false;
-                self.hover_closing = (!self.reduced_motion).then_some((index, now + MOTION_DURATION));
+                self.hover_closing[index] = (!self.reduced_motion).then_some(now + MOTION_DURATION);
             }
         }
     }
@@ -441,7 +441,7 @@ impl NavigationTooltips {
 
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
-        if reduced { self.hover_closing = None; }
+        if reduced { self.hover_closing = [None; 2]; }
     }
 
     pub fn advance(&mut self, now: Duration) {
@@ -469,7 +469,11 @@ impl NavigationTooltips {
     }
 
     pub fn outside_press(&mut self) {
-        for index in 0..2 { self.dismiss(index, false); }
+        for index in 0..2 {
+            if self.open == Some(index) || self.pending.is_some_and(|(pending, _)| pending == index) {
+                self.dismiss(index, false);
+            }
+        }
     }
 
     pub fn escape(&mut self) -> bool {
@@ -481,7 +485,7 @@ impl NavigationTooltips {
 
     fn dismiss(&mut self, index: usize, instant: bool) {
         self.dismissed[index] = true;
-        self.hover_closing = None;
+        self.hover_closing[index] = None;
         self.cancel_pending(index);
         if self.open == Some(index) {
             self.instant[index] |= instant;
@@ -494,7 +498,7 @@ impl NavigationTooltips {
     }
 
     fn show(&mut self, index: usize, instant: bool) {
-        self.hover_closing = None;
+        self.hover_closing[index] = None;
         let displaced = self.open.filter(|previous| *previous != index);
         if let Some(previous) = displaced {
             self.dismissed[previous] = true;

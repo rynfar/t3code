@@ -353,8 +353,13 @@ fn navigation_tooltips_arbitrate_focus_and_hover_without_reopening_the_displaced
     tips.advance(ms(601));
     assert_eq!(tips.visible(), Some(1));
     tips.hover(1, false, ms(602));
+    tips.focus(0, false, true);
+    tips.hover(1, true, ms(650));
+    assert_eq!(tips.visible(), Some(1), "blurring the displaced trigger preserves its neighbor's close-fade reentry");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(1, false, ms(651));
     tips.advance(ms(1500));
-    assert_eq!(tips.visible(), None, "the still-focused displaced trigger cannot reopen on a render");
+    assert_eq!(tips.visible(), None, "the displaced trigger cannot reopen on a render");
     tips.focus(0, false, true);
     tips.focus(0, true, true);
     assert_eq!(tips.visible(), Some(0));
@@ -465,6 +470,8 @@ fn navigation_tooltip_reentry_only_skips_warmup_during_its_own_hover_close_trans
         tips.pointer_move(0, 10., 20., ms(0));
         tips.advance(ms(600));
         tips.hover(0, false, ms(600));
+        tips.outside_press();
+        tips.press(1);
         tips.hover(0, true, ms(reentry));
         assert_eq!(tips.visible(), expected, "reentry={reentry}, reduced={reduced}");
     }
@@ -518,4 +525,30 @@ fn navigation_tooltip_hover_dismissal_uses_the_press_escape_instant_reason() {
         assert!(tips.instant(0), "a hover-opened label dismisses instantly, escape={escape}");
         assert_eq!(tips.deadline(), None);
     }
+}
+
+#[test]
+fn navigation_tooltip_close_fades_belong_to_each_trigger() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    tips.advance(ms(600));
+    tips.hover(0, false, ms(601));
+    tips.focus(1, true, true);
+    tips.hover(1, true, ms(602));
+    tips.hover(1, false, ms(603));
+    tips.hover(0, true, ms(650));
+    assert_eq!(tips.visible(), Some(0), "opening and closing the other root does not erase this root's fade");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(0, false, ms(651));
+    tips.hover(1, true, ms(652));
+    assert_eq!(tips.visible(), Some(1), "both roots retain their own closing deadlines");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(1, false, ms(653));
+    tips.set_reduced_motion(true);
+    tips.hover(0, true, ms(654));
+    tips.hover(1, true, ms(655));
+    assert_eq!(tips.visible(), None, "reduced motion ends both close fades immediately");
 }
