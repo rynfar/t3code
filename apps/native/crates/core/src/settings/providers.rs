@@ -543,7 +543,7 @@ pub fn codex_managed(instance: &ProviderInstanceConfig) -> bool {
 
 /// The explicit refresh the header's button runs: rediscover models and re-read secrets.
 pub fn refresh_payload() -> Value {
-    json!({ "refreshModels": true, "reloadSecrets": true, "workspaceSnapshotsOnDemand": true })
+    crate::providers::RefreshProviders::Settings.payload()
 }
 
 /// `runProviderUpdate`.
@@ -557,6 +557,7 @@ pub fn update_payload(driver: &str, instance_id: &str, target_version: Option<&s
 
 /// The providers a `server.refreshProviders` or `server.updateProvider` reply carries.
 pub fn decode_providers_reply(reply: Value) -> Option<Vec<ServerProvider>> {
+    reply.get("providers")?.as_array()?;
     serde_json::from_value::<crate::server_config::ProvidersPayload>(reply).ok().map(|payload| payload.providers)
 }
 

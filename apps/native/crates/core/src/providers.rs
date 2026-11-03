@@ -9,6 +9,43 @@ use crate::model::ModelSelection;
 use crate::server_config::{ProviderInstanceConfig, ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow};
 use crate::sidebar::time::parse_iso;
 
+/// Refresh inputs from `ProviderStatusBanner.tsx`, provider settings, Usage and composer menus.
+/// `client-runtime/src/state/server.ts` adds on-demand workspace snapshots to every request.
+pub enum RefreshProviders<'a> {
+    Status(&'a str),
+    Settings,
+    Limits,
+    Workspace { instance_id: &'a str, cwd: &'a str },
+}
+
+impl RefreshProviders<'_> {
+    pub fn payload(self) -> serde_json::Value {
+        use serde_json::json;
+        let mut payload = json!({ "workspaceSnapshotsOnDemand": true });
+        match self {
+            Self::Status(instance_id) => {
+                payload["instanceId"] = json!(instance_id);
+                payload["refreshModels"] = json!(true);
+            }
+            Self::Settings => {
+                payload["refreshModels"] = json!(true);
+                payload["reloadSecrets"] = json!(true);
+            }
+            Self::Workspace { instance_id, cwd } => {
+                payload["instanceId"] = json!(instance_id);
+                payload["cwd"] = json!(cwd);
+            }
+            Self::Limits => {}
+        }
+        payload
+    }
+}
+
+/// `CLIENT_GUARDED_RPC_SCOPES[serverRefreshProviders]` / its `permissionAtom`.
+pub fn can_refresh(session: Option<&crate::auth::AuthSessionState>) -> bool {
+    session.is_some_and(|session| session.grants(crate::auth::ORCHESTRATION_READ_SCOPE))
+}
+
 /// Drivers whose instances are off until configured (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
 const DEFAULT_DISABLED_DRIVERS: [&str; 8] = ["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"];
 /// Instances on without any config (`DEFAULT_ENABLED_DEFAULT_INSTANCES`).

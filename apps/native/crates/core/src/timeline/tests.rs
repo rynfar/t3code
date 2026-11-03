@@ -1489,3 +1489,35 @@ fn mcp_apps_keep_source_identity_and_stay_outside_work_folds() {
     assert_eq!((&*frame.source_thread_id, &*frame.source_item_id), ("inherited-source", "original-item"));
     assert_eq!(frame.reference.server,"weather");
 }
+
+#[test]
+fn provider_refresh_reply_updates_the_instance_banner_and_models() {
+    use crate::server_config::{ServerConfig, ServerConfigState, ServerProvider};
+    use crate::settings::providers::decode_providers_reply;
+    use serde_json::json;
+    let original = json!({
+        "instanceId":"work-codex", "driver":"codex", "displayName":"Work Codex", "enabled":true,
+        "installed":true,"status":"error", "auth":{"status":"unauthenticated"}
+    });
+    let provider: ServerProvider = serde_json::from_value(original.clone()).unwrap();
+    let mut config = ServerConfigState::default();
+    config.config = Some(ServerConfig { providers: vec![provider.clone()], ..Default::default() });
+    let before = provider_banner(&provider).unwrap();
+    assert_eq!(before.instance_id, "work-codex");
+    assert_eq!(before.refresh_tooltip, "Refresh Work Codex provider status");
+    let mut refreshed = original;
+    refreshed["status"] = json!("warning");
+    refreshed["message"] = json!("New diagnostic from refresh");
+    refreshed["models"] = json!([{"slug":"new-model","name":"New model","isCustom":false}]);
+    assert!(config.apply_providers(decode_providers_reply(json!({"providers":[refreshed.clone()]})).unwrap()));
+    let current = &config.config.as_ref().unwrap().providers[0];
+    assert_eq!(current.models.len(), 1);
+    let banner = provider_banner(current).unwrap();
+    assert_ne!(before.key, banner.key);
+    assert_eq!(banner.message, "New diagnostic from refresh");
+    refreshed["status"] = json!("ready");
+    refreshed["auth"] = json!({"status":"authenticated"});
+    assert!(config.apply_providers(decode_providers_reply(json!({"providers":[refreshed]})).unwrap()));
+    assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
+    assert!(decode_providers_reply(json!({"providers":"invalid"})).is_none());
+}

@@ -184,3 +184,24 @@ fn accents_and_badges_mark_instances_apart() {
     assert!(shows_instance_badge(&entries[0], &entries));
     assert!(!shows_instance_badge(&entries[2], &entries));
 }
+
+#[test]
+fn status_refresh_matches_the_banner_and_environment_command_wire_payload() {
+    assert_eq!(super::RefreshProviders::Status("work-codex").payload(), serde_json::json!({
+        "instanceId": "work-codex", "refreshModels": true, "workspaceSnapshotsOnDemand": true
+    }));
+}
+
+#[test]
+fn status_refresh_requires_this_environments_authenticated_read_grant() {
+    use crate::auth::AuthSessionState;
+    let session = |value| serde_json::from_value::<AuthSessionState>(value).unwrap();
+    let read = session(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]}));
+    let operate = session(serde_json::json!({"authenticated":true,"permissions":["orchestration:operate","providers:manage"]}));
+    let revoked = session(serde_json::json!({"authenticated":true,"permissions":[],"scopes":["orchestration:read"]}));
+    let legacy = session(serde_json::json!({"authenticated":true,"scopes":["orchestration:read"]}));
+    let signed_out = session(serde_json::json!({"authenticated":false,"permissions":["orchestration:read"]}));
+    for (grants, expected) in [(None,false),(Some(&read),true),(Some(&operate),false),(Some(&revoked),false),(Some(&legacy),true),(Some(&signed_out),false)] {
+        assert_eq!(super::can_refresh(grants), expected);
+    }
+}

@@ -416,7 +416,7 @@ pub fn snapshot_is_current(snapshot: Option<&WorkspaceSnapshot>, now_ms: i64) ->
 
 /// `server.refreshProviders` for one provider's view of `cwd`.
 pub fn refresh_providers_request(instance_id: &str, cwd: &str) -> Value {
-    json!({ "instanceId": instance_id, "cwd": cwd, "workspaceSnapshotsOnDemand": true })
+    crate::providers::RefreshProviders::Workspace { instance_id, cwd }.payload()
 }
 
 /// The snapshot for `cwd` in a `server.refreshProviders` reply.

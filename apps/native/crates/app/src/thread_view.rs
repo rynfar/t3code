@@ -124,7 +124,10 @@ impl ThreadView {
                 this.sync_status(cx);
                 this.sync_command_outputs(cx);
             }
-            AppEvent::Phase => this.sync_command_outputs(cx),
+            AppEvent::Phase => {
+                this.watch_banner_grants(cx);
+                this.sync_command_outputs(cx);
+            },
             AppEvent::CitationSource => this.open_citation_source(cx),
             _ => {}
         });
