@@ -129,3 +129,19 @@ fn automatic_setup_waits_for_an_existing_install_and_permissions() {
     assert!(state.auto_start_ready(true, true, true));
     assert!(!state.auto_start_ready(false, true, true));
 }
+
+#[test]
+fn cancellation_releases_ownership_for_new_shared_installs_and_ignores_the_old_reply() {
+    let mut state = SetupState::default();
+    state.started_install(decode_install_state(json!({"phase":"downloading","operationId":"mine"})).unwrap());
+    let command = state.cancel_local("codex", &mut false).unwrap();
+    assert_eq!(command.0, super::super::auth::INSTALL_CANCEL);
+    assert_eq!(command.1, json!({"instanceId":"codex","operationId":"mine"}));
+    assert!(state.install_operation.is_none());
+    state.observe_install(decode_install_state(json!({"phase":"downloading","operationId":"other","downloadedBytes":10})).unwrap());
+    assert!(state.install_active());
+    assert_eq!(state.install.as_ref().unwrap().operation_id.as_deref(), Some("other"));
+    state.install_cancel_reply(decode_install_state(json!({"phase":"cancelled","operationId":"mine"})).unwrap());
+    assert!(state.install_active());
+    assert_eq!(super::super::auth::install_cancel_payload("codex", state.install.as_ref().unwrap()).unwrap()["operationId"], "other");
+}

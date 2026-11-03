@@ -267,3 +267,30 @@ impl SetupState {
         requested && allowed && self.install.is_some() && can_install && !self.busy() && self.error.is_none()
     }
 }
+
+impl SetupState {
+    pub fn cancel_local(&mut self, instance: &str, automatic: &mut bool) -> Option<(&'static str, Value)> {
+        let command = if self.handoff {
+            None
+        } else if self.install_active() {
+            self.install.as_ref().and_then(|state| super::auth::install_cancel_payload(instance, state)).map(|payload| (super::auth::INSTALL_CANCEL, payload))
+        } else {
+            self.auth.as_ref().and_then(|state| super::auth::cancel_payload(instance, state)).map(|payload| (super::auth::AUTH_CANCEL, payload))
+        };
+        *automatic = false;
+        self.install_operation = None;
+        self.transfer_failed = false;
+        self.pending = false;
+        self.finishing = false;
+        if self.handoff {
+            self.handoff = false;
+            self.auth = None;
+        }
+        command
+    }
+    pub fn install_cancel_reply(&mut self, state: InstallState) {
+        if self.install.as_ref().is_none_or(|current| current.operation_id == state.operation_id) {
+            self.observe_install(state);
+        }
+    }
+}

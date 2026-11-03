@@ -385,8 +385,13 @@ impl ChatGptSetup {
                         use t3_client::chatgpt::Update;
                         update.apply_install(&mut this.state);
                         match update {
-                            Update::Auth(auth) => {this.state.pending=false;this.state.auth=Some(auth);}
-                            Update::InstallStarted(_) | Update::Install(_) => {this.state.pending=false;}
+                            Update::Auth(auth) => {
+                                this.state.pending = false;
+                                this.state.auth = Some(auth);
+                            }
+                            Update::InstallStarted(_) | Update::Install(_) => {
+                                this.state.pending = false;
+                            }
                             Update::Handoff => {
                                 this.state.pending = false;
                                 this.state.handoff = true;
@@ -420,7 +425,7 @@ impl ChatGptSetup {
                     return;
                 }
                 this.operation = None;
-                this.state.install_operation=None;
+                this.state.install_operation = None;
                 this.state.pending = false;
                 this.state.handoff = false;
                 if let Ok(Err(error)) = result {
@@ -473,7 +478,9 @@ impl ChatGptSetup {
                 match result {
                     Ok(value) => {
                         if method == auth::INSTALL_CANCEL {
-                            this.state.install = auth::decode_install_state(value);
+                            if let Some(state) = auth::decode_install_state(value) {
+                                this.state.install_cancel_reply(state);
+                            }
                         } else if let Some(auth) = auth::decode_auth_state(value) {
                             this.state.auth = Some(auth);
                         }
@@ -506,18 +513,8 @@ impl ChatGptSetup {
         self.serial += 1;
         self.operation = None;
         self.retry = None;
-        self.state.transfer_failed = false;
-        self.state.pending = false;
-        self.state.finishing = false;
-        if self.state.handoff {
-            self.state.handoff = false;
-            self.state.auth = None;
-        } else if self.state.install_active() {
-            if let Some(payload) = self.state.install.as_ref().and_then(|s| auth::install_cancel_payload(&self.instance, s)) {
-                self.command(auth::INSTALL_CANCEL, payload, cx);
-            }
-        } else if let Some(payload) = self.state.auth.as_ref().and_then(|s| auth::cancel_payload(&self.instance, s)) {
-            self.command(auth::AUTH_CANCEL, payload, cx);
+        if let Some((method, payload)) = self.state.cancel_local(&self.instance, &mut self.auto_start) {
+            self.command(method, payload, cx);
         }
         cx.notify();
     }

@@ -52,7 +52,7 @@ async fn setup_waits_for_its_install_then_its_auth_flow() {
     let mut state = model::SetupState::default();
     while let Some(update) = updates.recv().await {
         update.apply_install(&mut state);
-        if let Some(install)=&state.install {
+        if let Some(install) = &state.install {
             assert_eq!(install.operation_id.as_deref(), Some("mine"));
         }
         match update {
@@ -191,4 +191,51 @@ async fn unmanaged_choice_never_subscribes_to_managed_install_before_the_mode_up
     }
     assert_eq!(observed, vec![auth::AUTH_SUBSCRIBE, auth::INSTALL_SUBSCRIBE]);
     drop(subscriptions.await.unwrap());
+}
+
+#[tokio::test]
+async fn cancelling_queued_setup_never_dispatches_install_or_auth_after_terminal_observations() {
+    let mut server = FakeServer::start().await;
+    let (client, mut socket, _events) = client(&mut server).await;
+    for terminal in [json!({"phase":"cancelled","operationId":"mine"}), json!({"phase":"succeeded","operationId":"mine","installedVersion":"1"})] {
+        let mut state = model::SetupState::default();
+        state.started_install(auth::decode_install_state(json!({"phase":"downloading","operationId":"mine"})).unwrap());
+        let mut automatic = true;
+        let (method, payload) = state.cancel_local("codex", &mut automatic).unwrap();
+        let cancel = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(method, payload).await }
+        });
+        let frame = socket.request(auth::INSTALL_CANCEL).await;
+        reply(&mut socket, &frame, terminal.clone()).await;
+        state.install_cancel_reply(auth::decode_install_state(cancel.await.unwrap().unwrap()).unwrap());
+        state.observe_install(auth::decode_install_state(terminal).unwrap());
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                if state.auto_start_ready(automatic, true, true) {
+                    let (tx, _updates) = mpsc::unbounded_channel();
+                    let (_retry_tx, retry) = mpsc::unbounded_channel();
+                    let _ = setup(client.clone(), request(state.install.unwrap()), tx, retry).await;
+                }
+                client.request("fixture.cancel-settled", json!({})).await.unwrap();
+            }
+        });
+        let mut starts = Vec::new();
+        loop {
+            let frame = socket.recv().await;
+            if frame["tag"] == auth::INSTALL_START {
+                starts.push(auth::INSTALL_START);
+                reply(&mut socket, &frame, json!({"phase":"failed","operationId":"unexpected"})).await;
+            } else if frame["tag"] == auth::AUTH_START {
+                starts.push(auth::AUTH_START);
+                reply(&mut socket, &frame, json!({"phase":"failed","flowId":"unexpected"})).await;
+            } else if frame["tag"] == "fixture.cancel-settled" {
+                reply(&mut socket, &frame, Value::Null).await;
+                break;
+            }
+        }
+        task.await.unwrap();
+        assert!(starts.is_empty(), "Cancel restarted setup: {starts:?}");
+    }
 }
