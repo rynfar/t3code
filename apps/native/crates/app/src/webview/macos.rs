@@ -10,12 +10,13 @@ use block2::RcBlock;
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{Bounds, Pixels, Window};
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, msg_send};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSEvent, NSEventMask, NSResponder, NSView, NSWindowOrderingMode,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
+use objc2_web_kit::{WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType, WKWebView};
 use wry::http::{Request, Response, header::CONTENT_TYPE};
 use wry::raw_window_handle::{AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use wry::{NewWindowResponse, WebViewBuilder, WebViewExtMacOS, WryWebView};
@@ -35,7 +36,6 @@ fn block_script_windows(page: &WryWebView) {
     }
 }
 
-const SCHEME: &str = "t3-page";
 const PAGE_URL: &str = "t3-page://page/index.html";
 /// What the server sends with agent HTML (`http.ts`), less downloads: an opaque origin with
 /// scripts and forms. Popups reach the app as link opens and never as windows.
@@ -47,6 +47,8 @@ pub(super) struct NativeView {
     container: Retained<NSView>,
     page: Retained<WryWebView>,
     webview: wry::WebView,
+    /// The page's navigation delegate; the web view holds it weakly.
+    _policy: Retained<PagePolicy>,
     scroll: Option<Rc<ScrollTarget>>,
 }
 
@@ -105,19 +107,24 @@ impl NativeView {
 
         let html = page.html.clone();
         let links = events.clone();
+        let link_events = events.clone();
         let builder = WebViewBuilder::new()
-            .with_custom_protocol(SCHEME.into(), move |_, request| serve(&html, &request))
+            .with_custom_protocol(super::PAGE_SCHEME.into(), move |_, request| serve(&html, &request))
             .with_url(PAGE_URL)
             .with_initialization_script_for_main_only(page.script.as_str(), true)
             .with_ipc_handler(move |request: Request<String>| {
+                // wry names the posting frame's URL; any frame can reach the handler.
+                if !super::from_page(&request.uri().to_string()) {
+                    return;
+                }
                 let body = request.into_body();
                 if body.len() <= MAX_MESSAGE_BYTES {
                     let _ = events.unbounded_send(WebEvent::Message(body));
                 }
             })
-            .with_navigation_handler(|url: String| super::navigable(&url))
+            // `window.open` after a click (link clicks go through `PagePolicy`).
             .with_new_window_req_handler(move |url, _| {
-                if url.starts_with("http://") || url.starts_with("https://") {
+                if super::web_link(&url) {
                     let _ = links.unbounded_send(WebEvent::OpenUrl(url));
                 }
                 NewWindowResponse::Deny
@@ -136,12 +143,13 @@ impl NativeView {
         };
         let page_view = webview.webview();
         block_script_windows(&page_view);
+        let policy = PagePolicy::install(&page_view, link_events, mtm);
         let scroll = page.scroll_through.then(|| {
             let target = Rc::new(ScrollTarget { host: host.clone(), frame: Cell::new(None) });
             ScrollTarget::register(&target);
             target
         });
-        Some(NativeView { host, container, page: page_view, webview, scroll })
+        Some(NativeView { host, container, page: page_view, webview, _policy: policy, scroll })
     }
 
     /// Shows the page at `frame`, cut to `visible`; both in window points from the top left.
@@ -197,6 +205,68 @@ impl Drop for NativeView {
     fn drop(&mut self) {
         self.release_focus();
         self.container.removeFromSuperview();
+    }
+}
+
+struct PolicyIvars {
+    events: UnboundedSender<WebEvent>,
+    /// wry's own delegate, which still runs scripts queued before the page committed.
+    wry: Option<Retained<ProtocolObject<dyn WKNavigationDelegate>>>,
+}
+
+define_class!(
+    /// Decides navigations by frame, which wry's URL-only handler cannot: the main frame keeps
+    /// the page, subframes load what a sandboxed frame could, and a new-window request from a
+    /// link the reader clicked opens in the browser. WebKit asks here before `createWebView`, so
+    /// those links never reach wry's new-window handler.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = PolicyIvars]
+    struct PagePolicy;
+
+    unsafe impl NSObjectProtocol for PagePolicy {}
+
+    unsafe impl WKNavigationDelegate for PagePolicy {
+        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
+        fn decide(&self, _webview: &WKWebView, action: &WKNavigationAction, handler: &block2::Block<dyn Fn(WKNavigationActionPolicy)>) {
+            let allowed = self.allows(action);
+            handler.call((if allowed { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
+        }
+
+        #[unsafe(method(webView:didCommitNavigation:))]
+        fn did_commit(&self, webview: &WKWebView, navigation: &WKNavigation) {
+            if let Some(wry) = &self.ivars().wry {
+                // SAFETY: wry's delegate implements this method with these argument types.
+                let _: () = unsafe { msg_send![&**wry, webView: webview, didCommitNavigation: navigation] };
+            }
+        }
+    }
+);
+
+impl PagePolicy {
+    fn install(page: &WryWebView, events: UnboundedSender<WebEvent>, mtm: MainThreadMarker) -> Retained<Self> {
+        // SAFETY: reading and replacing a live web view's delegate on the main thread.
+        let wry = unsafe { page.navigationDelegate() };
+        let policy: Retained<Self> = unsafe { msg_send![super(mtm.alloc::<Self>().set_ivars(PolicyIvars { events, wry })), init] };
+        unsafe { page.setNavigationDelegate(Some(ProtocolObject::from_ref(&*policy))) };
+        policy
+    }
+
+    fn allows(&self, action: &WKNavigationAction) -> bool {
+        // SAFETY: a navigation action's request and target frame are plain getters.
+        let (url, target, kind) = unsafe {
+            let url = action.request().URL().and_then(|url| url.absoluteString()).map(|url| url.to_string()).unwrap_or_default();
+            (url, action.targetFrame(), action.navigationType())
+        };
+        match target {
+            Some(frame) => super::navigable(&url, unsafe { frame.isMainFrame() }),
+            None => {
+                if kind == WKNavigationType::LinkActivated && super::web_link(&url) {
+                    let _ = self.ivars().events.unbounded_send(WebEvent::OpenUrl(url));
+                }
+                false
+            }
+        }
     }
 }
 

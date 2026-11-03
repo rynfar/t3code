@@ -29,12 +29,32 @@ use gpui::{
     Window, WindowId, point, px, relative, size,
 };
 
-/// Where any frame of a page may navigate: the page itself and inline content. Unlike the web's
-/// sandboxed iframe, a WebKit document keeps no sandbox across navigation, and every main-frame
-/// document gets the IPC bridge, so a remote site never loads; the reader's links open in the
-/// browser instead.
-pub(crate) fn navigable(url: &str) -> bool {
-    ["t3-page:", "about:", "data:", "blob:"].iter().any(|scheme| url.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme)))
+pub(crate) const PAGE_SCHEME: &str = "t3-page";
+
+fn has_scheme(url: &str, scheme: &str) -> bool {
+    url.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme)) && url[scheme.len()..].starts_with(':')
+}
+
+/// Where a frame of a page may navigate. Unlike the web's iframe, a WebKit document keeps no
+/// sandbox across a main-frame navigation (nor applies it to inherited `data:`, `blob:` or
+/// `about:` documents), and every main-frame document gets the IPC bridge, so the main frame
+/// holds only the page; the reader's links open in the browser instead. Subframes inherit the
+/// page's sandbox, as nested frames of the web's iframe do, but never load the page's scheme.
+pub(crate) fn navigable(url: &str, main_frame: bool) -> bool {
+    if main_frame {
+        return has_scheme(url, PAGE_SCHEME);
+    }
+    ["about", "data", "blob", "http", "https"].iter().any(|scheme| has_scheme(url, scheme))
+}
+
+/// Whether an IPC message came from the page itself: only its main frame has its scheme.
+pub(crate) fn from_page(frame_url: &str) -> bool {
+    has_scheme(frame_url, PAGE_SCHEME)
+}
+
+/// A link the reader may open in the browser.
+pub(crate) fn web_link(url: &str) -> bool {
+    has_scheme(url, "http") || has_scheme(url, "https")
 }
 
 /// Paint order among base-plane content: an occluder hides views of lower layers only.
@@ -376,15 +396,26 @@ mod tests {
         Bounds { origin: point(px(x), px(y)), size: size(px(w), px(h)) }
     }
 
-    /// A WebKit document keeps no sandbox across navigation and every main-frame document gets
-    /// the IPC bridge, so a frame may only load the page itself or inline content.
+    /// WebKit drops a document's `sandbox` with any main-frame navigation (and never applies it to
+    /// inherited `data:`/`blob:`/`about:` documents), and every main-frame document gets the IPC
+    /// bridge: the main frame holds only the page. Subframes inherit the page's sandbox, as the web
+    /// iframe's do, but never load the page's own scheme, so only the page can post to the app.
     #[test]
-    fn pages_never_navigate_to_remote_documents() {
-        for url in ["t3-page://page/index.html", "about:blank", "about:srcdoc", "data:text/html,<p>", "blob:null/1", "T3-PAGE://page/index.html"] {
-            assert!(super::navigable(url), "{url}");
+    fn only_the_page_owns_the_main_frame_and_the_bridge() {
+        for url in ["t3-page://page/index.html", "T3-PAGE://page/index.html"] {
+            assert!(super::navigable(url, true), "{url}");
+            assert!(super::from_page(url), "{url}");
         }
-        for url in ["https://attacker.example/", "http://127.0.0.1:3773/api", "HTTPS://x.example", "file:///etc/hosts", "javascript:alert(1)", "t3-pag"] {
-            assert!(!super::navigable(url), "{url}");
+        let elsewhere = ["https://attacker.example/", "data:text/html,<p>", "blob:null/1", "about:blank", "about:srcdoc", "file:///etc/hosts", "javascript:alert(1)", "t3-pag"];
+        for url in elsewhere {
+            assert!(!super::navigable(url, true), "{url}");
+            assert!(!super::from_page(url), "{url}");
+        }
+        for url in ["https://www.youtube.com/embed/x", "http://example.com", "data:text/html,<p>", "blob:null/1", "about:srcdoc", "about:blank"] {
+            assert!(super::navigable(url, false), "{url}");
+        }
+        for url in ["t3-page://page/index.html", "file:///etc/hosts", "javascript:alert(1)"] {
+            assert!(!super::navigable(url, false), "{url}");
         }
     }
 
