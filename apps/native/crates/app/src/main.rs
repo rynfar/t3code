@@ -22,6 +22,7 @@ mod new_thread;
 mod omitted_rows;
 mod notifications;
 mod onboarding;
+mod chatgpt_setup;
 mod palette;
 mod preview;
 mod project_files;

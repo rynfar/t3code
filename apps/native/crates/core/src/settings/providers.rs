@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod background;
+pub mod chatgpt;
 
 use std::collections::{HashMap, HashSet};
 

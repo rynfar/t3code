@@ -71,6 +71,7 @@ impl WelcomeWizard {
     /// `serverEnvironment.refreshProviders`; the reply replaces the provider list of the
     /// environment it came from.
     pub(super) fn refresh_providers(&mut self, cx: &mut Context<Self>) {
+        if crate::chatgpt_setup::fixture_active(cx) { return; }
         let app = self.state.read(cx);
         let asked_on = app.connection_id();
         let task = app.rpc(SERVER_REFRESH_PROVIDERS, refresh_payload());
@@ -228,7 +229,7 @@ impl WelcomeWizard {
         cx.notify();
     }
 
-    pub(super) fn render_agents(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let app = self.state.read(cx);
         let config = app.server_config.config.as_ref();
@@ -239,9 +240,36 @@ impl WelcomeWizard {
             .filter(|label| !label.trim().is_empty())
             .unwrap_or_else(|| "Computer".to_owned());
         let providers = config.map_or(&[][..], |config| &config.providers);
-        let rows: Vec<AgentRow> =
+        let mut rows: Vec<AgentRow> =
             onboarding_agents(providers, config.and_then(|config| config.managed_policy.as_ref())).iter().map(|agent| AgentRow::of(agent, config)).collect();
-        let cards: Vec<AnyElement> = rows.into_iter().map(|row| self.render_agent(row, cx)).collect();
+        if let Some(id)=&self.created_chatgpt {
+            let row=rows.iter().position(|r|r.instance_id.as_ref()==Some(id)).map(|index|rows.remove(index));
+            let mut row=row.unwrap_or_else(||AgentRow::of(&OnboardingAgent{driver:"codex",provider:None},config));
+            row.instance_id=Some(id.clone());rows.insert(0,row);
+        }
+        let can_add = providers.iter().any(|p|p.driver=="codex" && agent_state(Some(p))==AgentState::Ready);
+        let existing = config.map(|c| c.settings.provider_instances.iter().filter(|(_, p)| t3_core::settings::providers::chatgpt::existing_chosen(p.config.as_ref())).map(|(id, _)| id.to_owned()).collect::<Vec<_>>()).unwrap_or_default();
+        self.chatgpt.retain(|id,_|!existing.contains(id));
+        let mut cards = Vec::new();
+        let mut add_view = None;
+        for row in rows {
+            let id=row.instance_id.clone().unwrap_or_else(||"codex".into());
+            if row.driver == "codex" && !existing.contains(&id) {
+                let view=if let Some(view)=self.chatgpt.get(&id){view.clone()}else{
+                    let view=cx.new(|cx|crate::chatgpt_setup::ChatGptSetup::new(self.state.clone(),id.clone(),true,window,cx));
+                    self.chatgpt_subscriptions.push(cx.subscribe(&view,|this,_,created:&crate::chatgpt_setup::AccountCreated,cx|{this.created_chatgpt=Some(created.0.clone());cx.notify();}));
+                    if self.created_chatgpt.as_ref()==Some(&id){view.update(cx,|view,cx|view.start_automatically(cx));}
+                    self.chatgpt.insert(id,view.clone());view
+                };
+                cards.push(div().child(view.clone()).into_any_element());
+                if can_add {add_view=Some(view);}
+            }else{cards.push(self.render_agent(row,cx));}
+        }
+        if let Some(view)=add_view {
+            let enabled=view.read(cx).can_manage(cx);
+            cards.push(Button::new("welcome-chatgpt-another",ButtonVariant::GhostMuted,ButtonSize::Xs).label("Connect another ChatGPT account").disabled(!enabled)
+                .on_click(move|_,_,cx|view.update(cx,|view,cx|view.open_add(cx))).into_any_element());
+        }
         let setup = self.setup.as_ref().map(|setup| setup.terminal.clone());
         v_flex()
             .child(step_title("Connect your agents", "Choose an agent to start coding. You can add more later.", cx))

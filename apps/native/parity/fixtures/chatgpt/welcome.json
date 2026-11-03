@@ -1,0 +1,67 @@
+{
+  "provider": {
+    "instanceId": "codex",
+    "driver": "codex",
+    "displayName": "Codex",
+    "enabled": true,
+    "installed": true,
+    "auth": {
+      "status": "authenticated",
+      "email": "fixture@example.invalid",
+      "subscriptionSharing": true
+    },
+    "setup": {
+      "canInstall": true,
+      "canAuthenticate": true
+    },
+    "status": "ready"
+  },
+  "auth": {
+    "phase": "idle",
+    "flowId": null,
+    "methods": [
+      {
+        "id": "chatgpt",
+        "name": "ChatGPT"
+      },
+      {
+        "id": "chatgpt-profile:personal",
+        "name": "Personal \u00b7 fixture@example.invalid",
+        "accountEmail": "fixture@example.invalid"
+      },
+      {
+        "id": "chatgpt-profile:work",
+        "name": "Work \u00b7 work@example.invalid",
+        "accountEmail": "work@example.invalid"
+      }
+    ]
+  },
+  "install": {
+    "phase": "idle",
+    "operationId": null,
+    "installedVersion": "1.2.3",
+    "version": "1.2.3",
+    "source": "managed",
+    "executablePath": "/fixture/managed/codex"
+  },
+  "welcome": true,
+  "otherAccounts": [
+    {
+      "instanceId": "codex_work",
+      "driver": "codex",
+      "displayName": "ChatGPT - Work",
+      "enabled": true,
+      "installed": true,
+      "auth": {
+        "status": "authenticated",
+        "email": "work@example.invalid",
+        "subscriptionSharing": true
+      },
+      "setup": {
+        "canInstall": true,
+        "canAuthenticate": true
+      },
+      "status": "ready"
+    }
+  ]
+}

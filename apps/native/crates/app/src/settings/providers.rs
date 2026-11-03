@@ -82,6 +82,7 @@ struct InstallSession {
 
 pub(crate) struct ProvidersState {
     selected: Option<String>,
+    chatgpt: Option<(Option<u64>, Entity<crate::chatgpt_setup::ChatGptSetup>)>,
     refreshing: bool,
     /// Instances whose `server.updateProvider` call this client has in flight.
     dispatching: HashSet<String>,
@@ -118,6 +119,12 @@ pub(crate) struct ProvidersState {
 }
 
 impl ProvidersState {
+    pub(super) fn leave(&mut self) {
+        self.chatgpt=None;
+        self.auth=None;
+        self.install=None;
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         let display_name = cx.new(|cx| InputState::new(window, cx));
         let accent = cx.new(|cx| InputState::new(window, cx).placeholder("#2563eb"));
@@ -172,6 +179,7 @@ impl ProvidersState {
         ];
         ProvidersState {
             selected: None,
+            chatgpt: None,
             refreshing: false,
             dispatching: HashSet::new(),
             update_error: None,
@@ -697,7 +705,9 @@ impl SettingsView {
 
     /// Opens or replaces the selected instance's auth and install subscriptions.
     fn sync_streams(&mut self, selected: Option<&Selected>, cx: &mut Context<Self>) {
-        let wants_auth = selected.filter(|selected| editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone());
+        if crate::chatgpt_setup::fixture_active(cx) { return; }
+        if selected.is_none_or(|s| s.row.driver != "codex") { self.providers.chatgpt = None; }
+        let wants_auth = selected.filter(|selected| selected.row.driver != "codex" && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone());
         if self.providers.auth.as_ref().map(|session| &session.instance_id) != wants_auth.as_ref() {
             self.providers.method_id = SharedString::default();
             self.providers.auth = wants_auth.map(|instance_id| {

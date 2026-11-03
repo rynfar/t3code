@@ -13,6 +13,10 @@ use t3_core::prompt_links::{self as rules, NewThreadLink};
 
 impl AppState {
     pub(crate) fn open_prompt_url(&mut self, url: String, cx: &mut Context<Self>) {
+        if let Some(environment)=t3_core::settings::providers::chatgpt::resume_environment(&url) {
+            cx.defer(move |cx|crate::onboarding::resume(environment,cx));
+            return;
+        }
         self.prompt_link_urls.push_back(url);
         cx.emit(AppEvent::PromptLink);
     }

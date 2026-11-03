@@ -1,0 +1,36 @@
+{
+  "provider": {
+    "instanceId": "codex",
+    "driver": "codex",
+    "displayName": "Codex",
+    "enabled": true,
+    "installed": true,
+    "auth": {
+      "status": "unauthenticated"
+    },
+    "setup": {
+      "canInstall": true,
+      "canAuthenticate": true
+    },
+    "status": "ready"
+  },
+  "auth": {
+    "phase": "failed",
+    "flowId": "fixture-flow",
+    "methods": [
+      {
+        "id": "chatgpt",
+        "name": "ChatGPT"
+      }
+    ],
+    "message": "ChatGPT sign-in could not finish. Try again."
+  },
+  "install": {
+    "phase": "idle",
+    "operationId": null,
+    "installedVersion": "1.2.3",
+    "version": "1.2.3",
+    "source": "managed",
+    "executablePath": "/fixture/managed/codex"
+  }
+}

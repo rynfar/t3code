@@ -195,6 +195,14 @@ impl SettingsView {
     fn render_setup(&mut self, selected: &Selected, environment_label: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let mut rows: Vec<AnyElement> = Vec::new();
         let live = selected.live.as_ref();
+        if selected.row.driver == "codex" {
+            let connection = self.state.read(cx).connection_id();
+            if self.providers.chatgpt.as_ref().is_none_or(|(id, view)| *id != connection || view.read(cx).instance() != selected.row.instance_id) {
+                let view = cx.new(|cx| crate::chatgpt_setup::ChatGptSetup::new(self.state.clone(), selected.row.instance_id.clone(), false, window, cx));
+                self.providers.chatgpt = Some((connection, view));
+            }
+            rows.push(div().child(self.providers.chatgpt.as_ref().unwrap().1.clone()).into_any_element());
+        }
         if selected.row.driver == "antigravity" {
             let enabled = selected.view.enabled;
             let id = selected.row.instance_id.clone();
@@ -226,7 +234,7 @@ impl SettingsView {
                 }
             }
         }
-        if shows_account(selected)
+        if selected.row.driver != "codex" && shows_account(selected)
             && let Some(live) = live
         {
             rows.push(self.render_account(selected, live, environment_label, window, cx));

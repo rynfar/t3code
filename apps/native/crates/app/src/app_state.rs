@@ -183,6 +183,13 @@ impl AppState {
             state.clear_pending_notifications(cx);
             state.ssh.shutdown()
         }));
+        // Setup fixtures render without a client: no discovery, subscriptions, or commands.
+        if crate::chatgpt_setup::fixture_active(cx) {
+            state.phase=Phase::Online(ConnectionStatus::Connected);
+            state.shell.synchronized=true;
+            state.server_config.config=serde_json::from_value(serde_json::json!({"environment":{"environmentId":"fixture-env","label":"Fixture Computer"},"cwd":"/fixture"})).ok();
+            return state;
+        }
         match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
             Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
