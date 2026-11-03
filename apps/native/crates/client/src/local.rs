@@ -286,6 +286,7 @@ mod tests {
     struct SpawningCli {
         script: PathBuf,
         status: tokio::net::TcpListener,
+        nonce: String,
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -323,11 +324,12 @@ mod tests {
             // Socket EOF readiness works on macOS, where named FIFOs can miss that event.
             let status = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds status listener");
             let port = status.local_addr().expect("status address").port();
+            let nonce = dir.file_name().expect("scratch directory name").to_str().expect("UTF-8 scratch directory name").to_owned();
             let script = dir.join("fake-t3");
             let script_text = format!(
                 r#"#!/bin/sh
 /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}
-printf "%s\n" "$$" >&3
+printf "%s %s\n" "{nonce}" "$$" >&3
 read -r release <&3
 printf "survived\n" >&3' &
 wait
@@ -335,23 +337,38 @@ wait
             );
             std::fs::write(&script, script_text).expect("writes script");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-            Self { script, status }
+            Self { script, status, nonce }
         }
 
         async fn grandchild(&self) -> tokio::io::BufReader<tokio::net::TcpStream> {
             use tokio::io::AsyncBufReadExt;
+            let mut readers = tokio::task::JoinSet::new();
+            let prefix = format!("{} ", self.nonce);
             loop {
-                let (stream, _) = self.status.accept().await.expect("accepts grandchild");
-                let mut events = tokio::io::BufReader::new(stream);
-                let mut line = String::new();
-                events.read_line(&mut line).await.expect("reads PID");
-                // HTTP probes can reach this ephemeral listener before the grandchild.
-                if line.starts_with("HEAD ") {
-                    continue;
+                tokio::select! {
+                    connection = self.status.accept() => {
+                        let (stream, _) = connection.expect("accepts grandchild");
+                        readers.spawn(async move {
+                            let mut events = tokio::io::BufReader::new(stream);
+                            let mut line = String::new();
+                            if events.read_line(&mut line).await.ok()? == 0 {
+                                return None;
+                            }
+                            Some((events, line))
+                        });
+                    }
+                    finished = readers.join_next(), if !readers.is_empty() => {
+                        let Some(Ok(Some((events, line)))) = finished else { continue };
+                        let Some(pid) = line.strip_prefix(&prefix).and_then(|line| line.strip_suffix('\n')).and_then(|pid| pid.parse().ok()) else {
+                            continue;
+                        };
+                        if line != format!("{prefix}{pid}\n") {
+                            continue;
+                        }
+                        assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
+                        return events;
+                    }
                 }
-                let pid = line.trim().parse().expect("grandchild PID");
-                assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
-                return events;
             }
         }
 
@@ -369,8 +386,16 @@ wait
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn a_timed_out_cli_takes_everything_it_started_with_it() {
+        use tokio::io::AsyncWriteExt;
+
         let dir = scratch("timeout");
         let cli = SpawningCli::new(&dir).await;
+        let address = cli.status.local_addr().expect("status address");
+        for line in ["GET / HTTP/1.1\r\n".to_owned(), String::new(), format!("{}\n", std::process::id())] {
+            let mut peer = tokio::net::TcpStream::connect(address).await.expect("connects unrelated peer");
+            peer.write_all(line.as_bytes()).await.expect("writes unrelated line");
+        }
+        let _silent = tokio::net::TcpStream::connect(address).await.expect("connects silent peer");
         let result = run_cli(&cli.script, &[], &dir, Duration::from_secs(1));
         tokio::pin!(result);
         // Spawn once, then leave the timeout future unpolled until the grandchild is ready.
