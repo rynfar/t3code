@@ -106,6 +106,19 @@ impl PasswordRequest {
 struct Lifecycle {
     stopping: watch::Receiver<bool>,
     in_flight: Arc<watch::Sender<usize>>,
+    /// The process groups of the `ssh` children alive now, which quitting kills at once.
+    groups: Arc<Mutex<std::collections::HashSet<u32>>>,
+}
+
+/// Lists one `ssh` process group until its leader is reaped or killed.
+struct Registered(Arc<Mutex<std::collections::HashSet<u32>>>, Option<u32>);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if let (Some(pid), Ok(mut groups)) = (self.1, self.0.lock()) {
+            groups.remove(&pid);
+        }
+    }
 }
 
 /// Counts one `ssh` until it is killed or reaped.
@@ -132,6 +145,13 @@ impl Lifecycle {
     async fn stopped(&self) {
         let mut stopping = self.stopping.clone();
         let _ = stopping.wait_for(|stopping| *stopping).await;
+    }
+
+    fn register(&self, pid: Option<u32>) -> Registered {
+        if let (Some(pid), Ok(mut groups)) = (pid, self.groups.lock()) {
+            groups.insert(pid);
+        }
+        Registered(self.groups.clone(), pid)
     }
 }
 
@@ -223,6 +243,7 @@ async fn run_command(program: &Path, life: &Lifecycle, target: &SshTarget, spec:
     tracing::debug!(alias = %target.alias, ?args, "ssh command");
     let mut child = command.spawn().map_err(|error| SshError(format!("Failed to spawn SSH command for {host}: {error}")))?;
     let pid = child.id();
+    let _registered = life.register(pid);
     let (stdin, input) = (child.stdin.take(), spec.stdin);
     let output = async move {
         let write = async move {
@@ -352,6 +373,7 @@ async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, loca
     command.process_group(0);
     let mut child = command.spawn().map_err(|error| SshError(format!("Failed to spawn SSH tunnel for {}: {error}", target.alias)))?;
     let pid = child.id();
+    let registered = life.register(pid);
     tracing::debug!(alias = %target.alias, ?pid, local_port, remote_port, "ssh tunnel started");
     let tail = Arc::new(Mutex::new(Vec::new()));
     let drain = child.stderr.take().map(|mut stderr| {
@@ -374,7 +396,7 @@ async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, loca
     let (stop, stop_rx) = oneshot::channel::<()>();
     let life = life.clone();
     let monitor = tokio::spawn(async move {
-        let _in_flight = in_flight;
+        let (_in_flight, _registered) = (in_flight, registered);
         let stop = async {
             tokio::select! {
                 _ = stop_rx => {}
@@ -499,6 +521,7 @@ struct Inner {
     prompts: Option<mpsc::UnboundedSender<PasswordRequest>>,
     stopping: watch::Sender<bool>,
     in_flight: Arc<watch::Sender<usize>>,
+    groups: Arc<Mutex<std::collections::HashSet<u32>>>,
     version: Mutex<Option<String>>,
     state: Mutex<State>,
     /// One per target, so a reconnect never reuses a server while its stop is pending.
@@ -544,6 +567,7 @@ impl SshEnvironments {
             prompts,
             stopping: watch::Sender::new(false),
             in_flight: Arc::new(watch::Sender::new(0)),
+            groups: Arc::default(),
             version: Mutex::new(version),
             state: Mutex::default(),
             locks: Mutex::default(),
@@ -552,7 +576,7 @@ impl SshEnvironments {
     }
 
     fn life(&self) -> Lifecycle {
-        Lifecycle { stopping: self.inner.stopping.subscribe(), in_flight: self.inner.in_flight.clone() }
+        Lifecycle { stopping: self.inner.stopping.subscribe(), in_flight: self.inner.in_flight.clone(), groups: self.inner.groups.clone() }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -583,7 +607,9 @@ impl SshEnvironments {
             return Err(SshError("SSH host alias is required.".to_owned()));
         }
         let raw = SshTarget { alias: alias.to_owned(), hostname: alias.to_owned(), username: None, port: None };
-        match run_command(&self.inner.program, &self.life(), &raw, CommandSpec { pre_host: &["-G"], ..Default::default() }, &Auth::BATCH).await {
+        // No host name to pin: `ssh -G` reports the one the config gives.
+        let ask = SshTarget { hostname: String::new(), ..raw.clone() };
+        match run_command(&self.inner.program, &self.life(), &ask, CommandSpec { pre_host: &["-G"], ..Default::default() }, &Auth::BATCH).await {
             Ok(stdout) => Ok(core::parse_ssh_resolve_output(alias, &stdout)),
             Err(error) => {
                 tracing::debug!(%alias, %error, "ssh -G failed; using the alias as typed");
@@ -766,11 +792,20 @@ impl SshEnvironments {
         Ok(())
     }
 
-    /// Quitting: stops every `ssh` this app started, tunnels and commands still running alike,
-    /// and refuses new ones. Remote servers keep running for the next launch to reuse. The future
-    /// finishes once each `ssh` is signalled and gone.
+    /// Quitting: kills every `ssh` this app started, tunnels and commands still running alike,
+    /// before returning, since quit handlers get only a moment; and refuses new ones. Remote
+    /// servers keep running for the next launch to reuse. The future finishes once each `ssh` is
+    /// gone.
     pub fn shutdown(&self) -> impl Future<Output = ()> + Send + use<> {
         self.inner.stopping.send_replace(true);
+        #[cfg(unix)]
+        if let Ok(groups) = self.inner.groups.lock() {
+            for pid in groups.iter() {
+                // The whole group: ssh's own helpers (a ProxyCommand) die with it. A group ID
+                // outlives a reaped leader only through members this ssh started.
+                signal_group(Some(*pid), libc::SIGKILL);
+            }
+        }
         let tunnels: Vec<Tunnel> = self.state().tunnels.drain().map(|(_, tunnel)| tunnel).collect();
         drop(tunnels);
         let mut in_flight = self.inner.in_flight.subscribe();

@@ -37,6 +37,11 @@ esac
 const LAUNCH_HANGS: &str = r#"     printf '%s\n' "$$" > "$dir/launch.pid"
      exec sleep 600"#;
 
+/// A tunnel that ignores SIGTERM, as a hung `ssh` can.
+const TUNNEL_IGNORES_TERM: &str = r#"    trap '' TERM
+    printf '%s\n' "$$" > "$dir/tunnel.pid"
+    while :; do sleep 1; done"#;
+
 /// Another process holds the forwarded port.
 const TUNNEL_PORT_TAKEN: &str = r#"    printf 'bind [127.0.0.1]:x: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port\n' >&2
     exit 255"#;
@@ -329,18 +334,44 @@ async fn a_forwarded_port_another_process_took_is_replaced() {
 
 #[tokio::test]
 async fn disconnect_stops_the_tunnel_it_started_after_the_config_moves_the_alias() {
+    // The config gains or changes a HostName while connected.
+    for (name, original) in [("moved", "devbox.example.com"), ("moved-plain", "devbox")] {
+        let server = devbox_server().await;
+        let fixture = Fixture::new(name, "", TUNNEL_SLEEPS);
+        std::fs::write(fixture.dir.join("hostname"), original).expect("writes");
+        let ssh = fixture.manager(None);
+        forward_to(&ssh, &devbox(), &server);
+        let bootstrap = ssh.ensure(&devbox(), false).await.expect("connects");
+        let pid = fixture.recorded_pid("tunnel.pid").await;
+        std::fs::write(fixture.dir.join("hostname"), "devbox-new.example.com").expect("writes");
+        ssh.disconnect(&bootstrap.target).await.expect("disconnects");
+        assert!(!alive(pid), "the running tunnel is found and stopped");
+        let stops = fixture.lines("stops");
+        assert!(stops.len() == 1 && stops[0].contains(&format!("-o HostName={original} ")), "the stop reaches the host the server runs on: {stops:?}");
+        let resolves: Vec<String> = fixture.lines("calls").into_iter().filter(|call| call.contains(" -G ")).collect();
+        assert!(resolves.iter().all(|call| !call.contains("HostName=")), "resolving asks ssh, unpinned: {resolves:?}");
+    }
+}
+
+#[tokio::test]
+async fn quitting_kills_a_tunnel_that_ignores_sigterm_within_the_quit_budget() {
     let server = devbox_server().await;
-    let fixture = Fixture::new("moved", "", TUNNEL_SLEEPS);
+    let fixture = Fixture::new("quit-term", "", TUNNEL_IGNORES_TERM);
     let ssh = fixture.manager(None);
     forward_to(&ssh, &devbox(), &server);
-    let bootstrap = ssh.ensure(&devbox(), false).await.expect("connects");
+    ssh.ensure(&devbox(), false).await.expect("connects");
     let pid = fixture.recorded_pid("tunnel.pid").await;
-    // The alias now resolves to another host.
-    std::fs::write(fixture.dir.join("hostname"), "devbox-new.example.com").expect("writes");
-    ssh.disconnect(&bootstrap.target).await.expect("disconnects");
-    assert!(!alive(pid), "the running tunnel is found and stopped");
-    let stops = fixture.lines("stops");
-    assert!(stops.len() == 1 && stops[0].contains("-o HostName=devbox.example.com"), "the stop reaches the host the server runs on: {stops:?}");
+    // GPUI gives quit handlers 200 ms; the kill must not wait for the SIGTERM grace period.
+    drop(ssh.shutdown());
+    let mut gone = false;
+    for _ in 0..20 {
+        if !running(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "killed at once, not after the 2 s SIGTERM grace");
 }
 
 #[test]
@@ -355,18 +386,31 @@ fn the_stop_script_signals_only_the_server_it_started() {
     let pid: i32 = String::from_utf8_lossy(&spawned.stdout).trim().parse().expect("a pid");
     let started = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().expect("ps runs");
     let started = String::from_utf8_lossy(&started.stdout).trim_end_matches('\n').to_owned();
-    let stop = |recorded_start: &str| {
+    // A `ps` that cannot tell, as on a host without one.
+    let no_ps = home.join("no-ps");
+    std::fs::create_dir_all(&no_ps).expect("dir");
+    std::fs::write(no_ps.join("ps"), "#!/bin/sh\nexit 1\n").expect("writes");
+    std::fs::set_permissions(no_ps.join("ps"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    let stop_with = |recorded_start: &str, path: Option<&std::path::Path>| {
         std::fs::write(state.join("pid"), format!("{pid}\n")).expect("pid");
         std::fs::write(state.join("managed"), "managed\n").expect("managed");
         std::fs::write(state.join("started"), format!("{recorded_start}\n")).expect("started");
-        let mut sh = std::process::Command::new("/bin/sh").arg("-s").env("HOME", &home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("sh runs");
+        let mut command = std::process::Command::new("/bin/sh");
+        if let Some(path) = path {
+            command.env("PATH", format!("{}:/usr/bin:/bin", path.display()));
+        }
+        let mut sh = command.arg("-s").env("HOME", &home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("sh runs");
         sh.stdin.take().expect("stdin").write_all(scripts::stop_script("native-k").as_bytes()).expect("writes");
         sh.wait_with_output().expect("sh exits")
     };
+    let stop = |recorded_start: &str| stop_with(recorded_start, None);
     // The recorded PID now belongs to another process: it is left alone, and the files go.
     let output = stop("Thu Jan  1 00:00:00 1970");
     assert!(output.status.success() && running(pid), "a reused PID is not signalled");
     assert!(!state.join("pid").exists() && !state.join("started").exists());
+    // Without a start time to compare, nothing is signalled either.
+    let output = stop_with("", Some(&no_ps));
+    assert!(output.status.success() && running(pid), "no start time, no signal");
     // The server it started, by PID and start time, is stopped.
     let output = stop(&started);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

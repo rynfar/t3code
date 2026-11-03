@@ -166,12 +166,14 @@ server_running() {
 }
 # A recorded PID is the server this launcher started only while the process
 # also has the start time recorded with it: once that server exits, its PID
-# may belong to anything. Without ps to tell, trust kill -0.
+# may belong to anything. Without a start time to compare, it is not ours.
 process_started() {
   ps -o lstart= -p "$1" 2>/dev/null || true
 }
 owns_server() {
-  [ -n "$1" ] && kill -0 "$1" 2>/dev/null && [ "$(process_started "$1")" = "$(cat "$STARTED_FILE" 2>/dev/null || true)" ]
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+  OWNED_STARTED="$(process_started "$1")"
+  [ -n "$OWNED_STARTED" ] && [ "$OWNED_STARTED" = "$(cat "$STARTED_FILE" 2>/dev/null || true)" ]
 }
 resolve_default_runtime_port() {
   "$RUNNER_FILE" __ssh-helper runtime-port "$DEFAULT_RUNTIME_FILE"
@@ -267,6 +269,7 @@ if [ -z "$REMOTE_PORT" ]; then
     else
       printf 'It wrote nothing to %s, so it exited before producing any output.\n' "$LOG_FILE" >&2
     fi
+    # REMOTE_PID is this shell's own `$!` from just above, not a recorded PID.
     kill "$REMOTE_PID" 2>/dev/null || true
     wait_for_pid_exit "$REMOTE_PID"
     rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE" "$STARTED_FILE"
@@ -291,7 +294,7 @@ PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
 "#;
 
 /// Stops the server this app started, identified by its PID and start time; an adopted
-/// (external) one, or a reused PID, is left alone.
+/// (external) one, a reused PID, or one with no start time to compare is left alone.
 const STOP_SCRIPT: &str = r#"set -eu
 STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 PID_FILE="$STATE_DIR/pid"
@@ -301,7 +304,7 @@ STARTED_FILE="$STATE_DIR/started"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 REMOTE_STARTED="$(cat "$STARTED_FILE" 2>/dev/null || true)"
-if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null \
+if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_STARTED" ] && kill -0 "$REMOTE_PID" 2>/dev/null \
   && [ "$(ps -o lstart= -p "$REMOTE_PID" 2>/dev/null || true)" = "$REMOTE_STARTED" ]; then
   kill "$REMOTE_PID" 2>/dev/null || true
   WAIT_COUNT=0
