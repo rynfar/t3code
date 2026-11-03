@@ -15,6 +15,7 @@ use t3_core::settings::providers::{self as model, ACP_REGISTRY, DisplayModel, Mo
 use super::super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, icon, r};
 use super::super::{SettingsView, store};
 use super::{Selected, failure_text, flat_section, status_dot};
+use crate::components::badge::{BadgeKind, badge};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette};
@@ -98,6 +99,7 @@ impl SettingsView {
             .gap(r(8.))
             .child(ProviderIcon::new(ProviderMark::configured(&row.driver, &view.display_name, selected.accent)).size(px(20.)).badge(BadgeSize::Compact, hsla(p.background)))
             .child(div().flex_1().min_w_0().truncate().text_base().font_weight(FontWeight::SEMIBOLD).child(view.display_name.clone()))
+            .children(model::find_driver(&row.driver).and_then(|driver| driver.badge_label).map(|label| badge(label, BadgeKind::Warning, false, cx)))
             .children(view.version.clone().map(|version| {
                 div().flex_none().text_xs().font_family(cx.theme().mono_font_family.clone()).text_color(hsla(p.muted_foreground)).child(version)
             }))
