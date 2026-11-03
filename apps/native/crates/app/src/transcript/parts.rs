@@ -14,17 +14,16 @@ pub const ROW_GROUP: &str = "timeline-row";
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
     pub now_ms: i64,
-    pub offset_minutes: i64,
 }
 
 impl Clock {
     pub fn now() -> Self {
         let now = chrono::Local::now();
-        Clock { now_ms: now.timestamp_millis(), offset_minutes: i64::from(now.offset().local_minus_utc() / 60) }
+        Clock { now_ms: now.timestamp_millis() }
     }
 
-    pub fn format(&self, iso: &str) -> String {
-        t3_core::timeline::format_day_aware(iso, self.now_ms, self.offset_minutes).unwrap_or_default()
+    pub fn format(&self, iso: &str, cx: &App) -> String {
+        t3_core::timeline::format_day_aware(iso, self.now_ms, &crate::sidebar::controller::SystemZone, crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
     }
 }
 
@@ -36,7 +35,7 @@ pub fn timestamp(clock: &Clock, iso: &str, always: bool, cx: &App) -> AnyElement
         .text_xs()
         .text_color(hsla(palette(cx).muted_foreground))
         .when(!always, |this| this.invisible().group_hover(ROW_GROUP, |style| style.visible()))
-        .child(clock.format(iso))
+        .child(clock.format(iso, cx))
         .into_any_element()
 }
 

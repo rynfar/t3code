@@ -9,7 +9,9 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{format_duration, format_upcoming, parse_iso_ms};
+use super::{TimestampLocale, format_duration, format_upcoming, parse_iso_ms};
+use crate::client_settings::TimestampFormat;
+use crate::sidebar::time::Zone;
 use crate::providers::driver_label;
 use crate::server_config::ServerProvider;
 use crate::shell::ThreadShell;
@@ -188,8 +190,8 @@ impl LimitRecovery {
         format!("usage-limit-recovery:{}", self.run_id)
     }
 
-    pub fn description(&self, now_ms: i64, offset_minutes: i64) -> String {
-        match self.reset_at.as_deref().and_then(|reset| format_upcoming(reset, now_ms, offset_minutes)) {
+    pub fn description(&self, now_ms: i64, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
+        match self.reset_at.as_deref().filter(|reset| !reset.is_empty()).map(|reset| format_upcoming(reset, now_ms, zone, format, locale)) {
             Some(reset) => format!("Resets {reset}"),
             None => "Reset time unavailable; retry manually".to_owned(),
         }

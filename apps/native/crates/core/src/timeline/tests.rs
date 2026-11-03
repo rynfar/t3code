@@ -361,8 +361,8 @@ fn durations_and_tokens_match_the_web() {
     assert_eq!(parse_iso_ms("2026-01-01T02:00:00+02:00"), parse_iso_ms("2026-01-01T00:00:00Z"));
     assert_eq!(format_short_time("2026-01-01T13:05:00Z", 0).as_deref(), Some("1:05 PM"));
     let now = parse_iso_ms("2026-03-10T12:00:00Z").unwrap_or_default();
-    assert_eq!(format_day_aware("2026-03-09T08:00:00Z", now, 0).as_deref(), Some("yesterday at 8:00 AM"));
-    assert_eq!(format_day_aware("2026-01-05T08:00:00Z", now, 0).as_deref(), Some("1/5 8:00 AM"));
+    assert_eq!(format_day_aware("2026-03-09T08:00:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "yesterday at 8:00 AM");
+    assert_eq!(format_day_aware("2026-01-05T08:00:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "1/5 8:00 AM");
 }
 
 #[test]
@@ -990,7 +990,7 @@ fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
     let recovery = limit_recovery(Some(&error), &shell, now).expect("recovery");
     assert_eq!(recovery.id(), "usage-limit-recovery:run-1");
     assert!(recovery.can_schedule && !recovery.scheduled && !recovery.snoozed && !recovery.reset_passed);
-    assert_eq!(recovery.description(now, 0), "Resets 5:00 AM");
+    assert_eq!(recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "Resets 5:00 AM");
     let resume = recovery.toggle_resume("c", "t").expect("resume");
     assert_eq!(resume["limitRecovery"], serde_json::json!({ "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true }));
     assert_eq!(recovery.toggle_snooze("c", "t", now).expect("snooze")["limitRecovery"]["snooze"], true);
@@ -1011,7 +1011,7 @@ fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
     }))]), serde_json::json!([]))).expect("an error");
     let recovery = limit_recovery(Some(&no_reset), &shell, now).expect("recovery");
     assert!(!recovery.can_schedule);
-    assert_eq!(recovery.description(now, 0), "Reset time unavailable; retry manually");
+    assert_eq!(recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "Reset time unavailable; retry manually");
 }
 
 /// `presentRunStop`: Stopping shows from the request until its result; an ended run's Stop only
@@ -1057,11 +1057,11 @@ fn goal_lines_match_the_web() {
 #[test]
 fn upcoming_times_name_the_day() {
     let now = parse_iso_ms("2026-03-10T12:00:00Z").expect("now");
-    assert_eq!(format_upcoming("2026-03-10T18:30:00Z", now, 0).as_deref(), Some("6:30 PM"));
-    assert_eq!(format_upcoming("2026-03-11T09:05:00Z", now, 0).as_deref(), Some("tomorrow at 9:05 AM"));
-    assert_eq!(format_upcoming("2026-03-14T09:05:00Z", now, 0).as_deref(), Some("3/14 9:05 AM"));
-    assert_eq!(format_upcoming("2027-01-02T09:05:00Z", now, 0).as_deref(), Some("1/2/2027 9:05 AM"));
-    assert_eq!(format_upcoming("2026-03-09T09:05:00Z", now, 0).as_deref(), Some("yesterday at 9:05 AM"));
+    assert_eq!(format_upcoming("2026-03-10T18:30:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "6:30 PM");
+    assert_eq!(format_upcoming("2026-03-11T09:05:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "tomorrow at 9:05 AM");
+    assert_eq!(format_upcoming("2026-03-14T09:05:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "3/14 9:05 AM");
+    assert_eq!(format_upcoming("2027-01-02T09:05:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "1/2/2027 9:05 AM");
+    assert_eq!(format_upcoming("2026-03-09T09:05:00Z", now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "yesterday at 9:05 AM");
 }
 
 #[test]
@@ -1569,4 +1569,94 @@ fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
     assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
     assert!(refresh.finish(&current));
     assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
+}
+
+// `apps/web/src/timestampFormat.test.ts` and the usage-limit timeline browser cases.
+struct TimestampNewYork;
+impl crate::sidebar::time::Zone for TimestampNewYork {
+    fn offset_seconds_at(&self, at: i64) -> i64 {
+        let spring = parse_iso_ms("2026-03-08T07:00:00Z").unwrap();
+        let fall = parse_iso_ms("2026-11-01T06:00:00Z").unwrap();
+        if (spring..fall).contains(&at) { -4 * 3600 } else { -5 * 3600 }
+    }
+}
+
+struct TimestampEnglish { british: bool }
+impl TimestampLocale for TimestampEnglish {
+    fn time(&self, local: crate::sidebar::time::LocalTime, format: crate::client_settings::TimestampFormat) -> String {
+        use crate::client_settings::TimestampFormat;
+        let hour12 = match format {
+            TimestampFormat::Locale => !self.british,
+            TimestampFormat::TwelveHour => true,
+            TimestampFormat::TwentyFourHour => false,
+        };
+        if hour12 {
+            format!("{}:{:02} {}", (local.hour + 11) % 12 + 1, local.minute, if local.hour < 12 { "AM" } else { "PM" })
+        } else {
+            format!("{}:{:02}", local.hour, local.minute)
+        }
+    }
+    fn numeric_date(&self, local: crate::sidebar::time::LocalTime, include_year: bool) -> String {
+        let date = if self.british { format!("{:02}/{:02}", local.day, local.month) } else { format!("{}/{}", local.month, local.day) };
+        if include_year { format!("{date}/{}", local.year) } else { date }
+    }
+}
+
+#[test]
+fn explicit_timestamp_zone_picks_relative_calendar_days() {
+    use crate::client_settings::TimestampFormat::TwelveHour;
+    let now = parse_iso_ms("2026-07-01T23:00:00.000Z").unwrap();
+    let locale = TimestampEnglish { british: false };
+    assert_eq!(format_upcoming("2026-07-02T00:30:00.000Z", now, &TimestampNewYork, TwelveHour, &locale), "8:30 PM");
+    assert_eq!(format_upcoming("2026-07-02T05:30:00.000Z", now, &TimestampNewYork, TwelveHour, &locale), "tomorrow at 1:30 AM");
+    assert_eq!(format_day_aware("2026-07-01T03:30:00.000Z", now, &TimestampNewYork, TwelveHour, &locale), "yesterday at 11:30 PM");
+    // One render in Madrid must not cache the zone used by the next render in New York.
+    let reset = Some("2026-07-01T19:30:00Z");
+    let now = parse_iso_ms("2026-07-01T17:00:00Z").unwrap();
+    let madrid = crate::sidebar::time::FixedZone(2 * 3600);
+    assert_eq!(usage_limit_label(reset, now, &madrid, "Europe/Madrid", TwelveHour, &locale), "Usage limit reached. Retry after 9:30 PM (Europe/Madrid).");
+    assert_eq!(usage_limit_label(reset, now, &TimestampNewYork, "America/New_York", TwelveHour, &locale), "Usage limit reached. Retry after 3:30 PM (America/New_York).");
+}
+
+#[test]
+fn timestamp_zones_resolve_dst_at_each_instant() {
+    use crate::client_settings::TimestampFormat::TwelveHour;
+    let locale = TimestampEnglish { british: false };
+    for (now, target, upcoming, day_aware) in [
+        ("2026-03-08T23:30:00Z", "2026-03-08T04:30:00Z", "yesterday at 11:30 PM", "yesterday at 11:30 PM"),
+        ("2026-11-01T03:30:00Z", "2026-11-02T04:30:00Z", "tomorrow at 11:30 PM", "11:30 PM"),
+    ] {
+        let now = parse_iso_ms(now).unwrap();
+        assert_eq!(format_upcoming(target, now, &TimestampNewYork, TwelveHour, &locale), upcoming);
+        assert_eq!(format_day_aware(target, now, &TimestampNewYork, TwelveHour, &locale), day_aware);
+    }
+}
+
+#[test]
+fn usage_limit_timestamps_honor_format_locale_invalid_and_past_values() {
+    use crate::client_settings::TimestampFormat::{Locale, TwelveHour, TwentyFourHour};
+    let now = parse_iso_ms("2026-07-01T23:00:00Z").unwrap();
+    let american = TimestampEnglish { british: false };
+    let british = TimestampEnglish { british: true };
+    for (format, locale, clock) in [(TwelveHour, &american, "8:30 PM"), (TwentyFourHour, &american, "20:30"), (Locale, &american, "8:30 PM"), (Locale, &british, "20:30")] {
+        assert_eq!(usage_limit_label(Some("2026-07-02T00:30:00Z"), now, &TimestampNewYork, "America/New_York", format, locale), format!("Usage limit reached. Retry after {clock} (America/New_York)."));
+    }
+    for (reset, expected) in [
+        (None, "Usage limit reached."),
+        (Some(""), "Usage limit reached."),
+        (Some("invalid"), "Usage limit reached. Retry after  (America/New_York)."),
+        (Some("2026-07-03T05:30:00Z"), "Usage limit reached. Retry after 7/3 1:30 AM (America/New_York)."),
+        (Some("2027-01-02T06:30:00Z"), "Usage limit reached. Retry after 1/2/2027 1:30 AM (America/New_York)."),
+        (Some("2026-07-01T21:00:00Z"), "Usage limit reached. Retry after 5:00 PM (America/New_York)."),
+        (Some("2026-07-01T03:30:00Z"), "Usage limit reached. Retry after yesterday at 11:30 PM (America/New_York)."),
+        (Some("2025-12-25T06:30:00Z"), "Usage limit reached. Retry after 12/25/2025 1:30 AM (America/New_York)."),
+    ] {
+        assert_eq!(usage_limit_label(reset, now, &TimestampNewYork, "America/New_York", TwelveHour, &american), expected);
+    }
+    assert_eq!(format_upcoming("2026-07-03T05:30:00Z", now, &TimestampNewYork, Locale, &british), "03/07 1:30");
+    assert_eq!(format_day_aware("invalid", now, &TimestampNewYork, Locale, &british), "");
+    assert_eq!(format_upcoming("invalid", now, &TimestampNewYork, Locale, &british), "");
+    let new_year = parse_iso_ms("2027-01-01T02:00:00Z").unwrap();
+    assert_eq!(format_upcoming("2027-01-02T03:30:00Z", new_year, &TimestampNewYork, Locale, &british), "tomorrow at 22:30");
+    assert_eq!(format_upcoming("2027-01-03T03:30:00Z", new_year, &TimestampNewYork, Locale, &british), "02/01/2027 22:30");
 }

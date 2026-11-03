@@ -156,7 +156,7 @@ impl Render for LimitRecoveryBanner {
                     .gap(px(4.))
                     .whitespace_nowrap()
                     .child(div().flex_none().font_weight(gpui::FontWeight::MEDIUM).line_height(px(24.)).child(LimitRecovery::TITLE))
-                    .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(recovery.description(clock.now_ms, clock.offset_minutes))),
+                    .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(recovery.description(clock.now_ms, &crate::sidebar::controller::SystemZone, crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale))),
             )
             .children(actions);
         banner_surface(true, content, cx).into_any_element()

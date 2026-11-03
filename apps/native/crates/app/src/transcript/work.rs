@@ -137,10 +137,15 @@ fn entry_row(
         let warning = failure.class == "usage_limit";
         let color = hsla(if warning { p.warning } else { p.destructive });
         let label = if warning {
-            match failure.reset_at.as_deref() {
-                Some(reset) => format!("Usage limit reached. Retry after {}.", env.clock.format(reset)),
-                None => "Usage limit reached.".into(),
-            }
+            let zone = crate::timestamp::ViewerZone::current();
+            t3_core::timeline::usage_limit_label(
+                failure.reset_at.as_deref(),
+                env.clock.now_ms,
+                &zone,
+                &zone.name,
+                crate::settings::store::client(cx).timestamp_format(),
+                &crate::timestamp::SystemTimestampLocale,
+            )
         } else {
             entry.label.clone()
         };

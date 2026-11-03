@@ -165,7 +165,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .max_w(relative(0.8))
         .invisible()
         .group_hover(ROW_GROUP, |style| style.visible())
-        .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(env.clock.format(&message.created_at)))
+        .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(env.clock.format(&message.created_at, cx)))
         .children(env.revert_counts.get(&message.id).map(|&turn_count| {
             let (message_id, text) = (message.id.clone(), message.text.to_string());
             tooltip_icon_button(
@@ -267,7 +267,7 @@ fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, 
         }))
         .children(copy)
         .children(fork)
-        .when(!message.streaming, |this| this.child(div().text_color(hsla(p.muted_foreground)).child(clock.format(&message.updated_at))))
+        .when(!message.streaming, |this| this.child(div().text_color(hsla(p.muted_foreground)).child(clock.format(&message.updated_at, cx))))
         .into_any_element()
 }
 
