@@ -215,6 +215,7 @@ impl AppState {
         // Side subscriptions and a side chat start (with its timeout) belong to this environment.
         self.side_threads = Default::default();
         self.server_config = ServerConfigState::default();
+        crate::theme::set_environment_themes(&[], cx);
         self.draft_project = None;
         self.pull_requests_open = false;
         self.composer_mentions.clear();

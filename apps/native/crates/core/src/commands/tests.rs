@@ -112,3 +112,8 @@ fn thread_setting_commands_use_wire_literals() {
     assert_eq!(set_model_selection("c", "t", &selection())["type"], "thread.model-selection.set");
     assert_eq!(ApprovalDecision::parse("acceptAlways"), Some(ApprovalDecision::AcceptAlways));
 }
+
+#[test]
+fn config_subscription_requests_published_themes() {
+    assert_eq!(subscribe_server_config(), json!({"workspaceSnapshotsOnDemand":true,"usageLimitSources":true,"environmentThemes":true}));
+}

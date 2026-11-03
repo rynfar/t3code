@@ -27,7 +27,7 @@ pub fn r(px: f32) -> Rems {
 pub const LOADING_OPACITY: f32 = 0.4;
 
 /// A provider's series color.
-pub fn provider_color(provider: UsageProvider, p: &Palette) -> Hsla {
+pub fn provider_color(provider: UsageProvider, p: Palette) -> Hsla {
     hsla(match provider {
         UsageProvider::Codex => p.usage_codex,
         UsageProvider::Claude => p.usage_claude,
@@ -41,7 +41,7 @@ pub fn provider_color(provider: UsageProvider, p: &Palette) -> Hsla {
 }
 
 /// A driver's bar color on the Limits page (`barColor`): its provider's hue, else foreground.
-pub fn driver_color(driver: &str, p: &Palette) -> Hsla {
+pub fn driver_color(driver: &str, p: Palette) -> Hsla {
     UsageProvider::from_driver(driver).map_or(hsla(p.foreground), |provider| provider_color(provider, p))
 }
 

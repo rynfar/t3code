@@ -27,7 +27,7 @@ pub const CREATION_SOURCE: &str = "web";
 /// and `server.refreshProviders` fetches them on demand when it does. Limit sources feed the
 /// Usage page's pooled limits, as the web opts in.
 pub fn subscribe_server_config() -> Value {
-    json!({ "workspaceSnapshotsOnDemand": true, "usageLimitSources": true })
+    json!({ "workspaceSnapshotsOnDemand": true, "usageLimitSources": true, "environmentThemes":true })
 }
 
 /// Which rows the shell may leave to on-demand reads, as `shell.ts` decides from the config.

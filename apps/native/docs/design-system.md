@@ -236,11 +236,12 @@ Sources: `apps/web/src/themePalette.ts`, `apps/web/src/hooks/useTheme.ts`,
 2. **Named themes.** `tokens::BUILT_IN_THEMES` is generated from the shared list, so a theme added
    there appears after regenerating. Store preferences with the web's vocabulary (theme id string,
    appearance mode, halves) so a future settings sync is lossless.
-3. **Custom and environment themes (later).** These need the role → token mapping (§2.6) at runtime in
-   Rust, plus T3 Chat fallback for missing roles. Port `createVividThemeColors` only when seeded
-   environment themes are needed.
-4. **Contrast, glass opacity and diff scheme (later).** Apply them as transforms over the active
-   `Palette` (§2.3, §4.6). The generated values are exact at the defaults (100 / 80% / red-green).
+3. **Custom and environment themes.** The generator also emits CSS recipes into core's theme data.
+   Core evaluates those recipes with the active roles, contrast and glass opacity; missing custom
+   roles use T3 Chat. Keep that runtime path and the generated default palettes in agreement;
+   the core palette test checks every token.
+4. **Palette lifetime.** Runtime palettes are owned values; caches use the theme revision rather
+   than a palette address. No theme change may leak a palette to keep a static reference alive.
 
 ### 2.6 Role → token mapping (named, custom and environment themes)
 

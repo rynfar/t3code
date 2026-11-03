@@ -263,6 +263,7 @@ pub struct SettingsView {
     pub(crate) devices: devices::DevicesState,
     browser: diffs_browser::BrowserState,
     typography: typography::TypographyState,
+    appearance_ui: appearance::AppearanceState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -315,6 +316,7 @@ impl SettingsView {
             devices: devices::DevicesState::new(cx),
             browser: diffs_browser::BrowserState::new(window, cx),
             typography: typography::TypographyState::new(window, cx),
+            appearance_ui: appearance::AppearanceState::new(cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -857,4 +859,19 @@ impl Render for SettingsView {
             .children(secret_dialog)
             .children(background_dialog)
     }
+}
+
+#[cfg(feature="snapshot")]
+pub(crate) fn import_theme_fixture(path:&std::path::Path,state:&Entity<AppState>,cx:&mut App)->Result<(),String> {
+    let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
+    let theme=t3_core::themes::import(&text)?;
+    appearance::import_theme(state,theme,true,cx);Ok(())
+}
+
+#[cfg(feature="snapshot")]
+pub(crate) fn reimport_theme_fixture(path:&std::path::Path,cx:&mut App)->Result<(),String> {
+    let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
+    let theme=t3_core::themes::import(&text)?;
+    let view=cx.global::<Host>().view.clone().ok_or("settings must be open for reimport")?;
+    view.update(cx,|view,cx|view.install_theme(theme,true,cx));Ok(())
 }

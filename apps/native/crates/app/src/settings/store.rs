@@ -56,6 +56,8 @@ pub fn init(cx: &mut App) {
 fn preferences(doc: &ClientSettingsDoc) -> Preferences {
     Preferences {
         theme: doc.theme(),
+        contrast: doc.appearance_contrast(), glass: doc.glass_opacity(),
+        halves: t3_core::themes::halves(doc), custom: t3_core::themes::library(doc),
         mode: doc.appearance_mode(),
         interface_font_size: doc.interface_font_size() as f32,
         typography: doc.typography(),

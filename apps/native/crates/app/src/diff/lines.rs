@@ -29,7 +29,7 @@ struct LineColors {
     bar: Option<Hsla>,
 }
 
-fn line_colors(kind: LineKind, p: &Palette) -> LineColors {
+fn line_colors(kind: LineKind, p: Palette) -> LineColors {
     match kind {
         LineKind::Addition => LineColors {
             row: hsla(p.diff_row_addition),
@@ -353,7 +353,7 @@ fn display_text(line: &DiffLine) -> SharedString {
 }
 
 /// Pierre's change icons with the app's tokens (`[data-change-icon]` in `diffRendering.ts`).
-fn change_icon(file: &FileDiff, p: &Palette) -> (Icon, Hsla) {
+fn change_icon(file: &FileDiff, p: Palette) -> (Icon, Hsla) {
     match file.change {
         ChangeKind::New => (Icon::FilePlus, hsla(p.diff_addition_foreground)),
         ChangeKind::Deleted => (Icon::FileMinus, hsla(p.diff_deletion_foreground)),

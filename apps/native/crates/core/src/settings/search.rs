@@ -204,6 +204,8 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("default-permissions", "Permissions", Threads, &["new thread default runtime mode supervised approvals auto accept edits full access"]),
         SearchItem::new("color-scheme", "Color scheme", Appearance, &["appearance light dark system mode"]).target("appearance"),
         SearchItem::new("theme", "Themes", Appearance, &["appearance colors palette custom import"]).target("appearance"),
+        SearchItem::new("setting-appearance-contrast", "Contrast", Appearance, &["colors borders readability contrast"]),
+        SearchItem::new("setting-glass-opacity", "Glass opacity", Appearance, &["menus dialogs composer transparency glass"]),
         SearchItem::new("chat-width", "Chat width", Appearance, &["wide full width column layout messages composer monitor"]),
         SearchItem::new("prompt-font", "Prompt font", Appearance, &["typography composer input family size"]),
         SearchItem::new("code-font", "Code font", Appearance, &["typography monospace family size diffs previews"]),

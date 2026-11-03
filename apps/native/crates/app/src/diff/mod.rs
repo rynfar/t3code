@@ -735,7 +735,7 @@ impl DiffPanel {
     }
 }
 
-fn centered_message(text: &str, p: &Palette) -> gpui::AnyElement {
+fn centered_message(text: &str, p: Palette) -> gpui::AnyElement {
     div()
         .flex_1()
         .flex()
@@ -750,7 +750,7 @@ fn centered_message(text: &str, p: &Palette) -> gpui::AnyElement {
 }
 
 /// The strip above the files that says what the patch leaves out.
-fn notice(text: impl Into<gpui::SharedString>, p: &Palette) -> gpui::Div {
+fn notice(text: impl Into<gpui::SharedString>, p: Palette) -> gpui::Div {
     div()
         .flex_none()
         .border_b_1()
@@ -763,7 +763,7 @@ fn notice(text: impl Into<gpui::SharedString>, p: &Palette) -> gpui::Div {
         .child(text.into())
 }
 
-fn error_line(error: String, p: &Palette) -> gpui::Div {
+fn error_line(error: String, p: Palette) -> gpui::Div {
     div().px(px(12.)).mb(px(8.)).text_size(px(11.)).text_color(hsla(p.error).opacity(0.8)).child(error)
 }
 

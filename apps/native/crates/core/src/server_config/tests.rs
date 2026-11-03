@@ -98,9 +98,15 @@ fn updates_before_a_snapshot_are_dropped_and_unchanged_resends_are_quiet() {
     assert!(state.apply(settings));
     assert_eq!(state.config.as_ref().unwrap().settings.default_runtime_mode, RuntimeMode::Auto);
 
+    let published = json!({"id":"office","name":"Office","appearance":"dark","canvas":"#123","accent":"#abc"});
+    let themes:ServerConfigStreamEvent=serde_json::from_value(json!({"type":"environmentThemesUpdated","payload":{"themes":[published.clone()]}})).unwrap();
+    assert!(state.apply(themes.clone()));assert!(!state.apply(themes));
+    assert!(!state.apply(snapshot(json!({"defaultRuntimeMode":"auto"}))));
+    assert_eq!(state.config.as_ref().unwrap().environment_themes,vec![published]);
     let unknown: ServerConfigStreamEvent =
         serde_json::from_value(json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": []}})).unwrap();
-    assert!(!state.apply(unknown));
+    assert!(state.apply(unknown));
+    assert!(state.config.as_ref().unwrap().environment_themes.is_empty());
 }
 
 #[test]

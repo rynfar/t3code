@@ -6,13 +6,14 @@
 
 mod tokens;
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::LazyLock;
+use t3_core::themes::{self, ThemeDefinition};
 
 use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
 use serde_json::json;
-use t3_core::client_settings::typography::{FontDefaults, FontRole, Typography, MONO_STACK, resolve_font_stack};
+use t3_core::client_settings::typography::{FontDefaults, FontRole, MONO_STACK, Typography, resolve_font_stack};
 use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
@@ -23,7 +24,7 @@ pub const WHITE: u32 = 0xffff_ffff;
 struct ActiveFonts([gpui::SharedString; 4]);
 impl Global for ActiveFonts {}
 
-struct ActivePalette(&'static Palette);
+struct ActivePalette(Palette, usize);
 
 impl Global for ActivePalette {}
 
@@ -36,6 +37,10 @@ pub struct Preferences {
     pub typography: Typography,
     pub chat_width: ChatWidth,
     pub diff_color_scheme: DiffColorScheme,
+    pub contrast: u32,
+    pub glass: u32,
+    pub halves: BTreeMap<String, String>,
+    pub custom: Vec<ThemeDefinition>,
 }
 
 impl Default for Preferences {
@@ -47,6 +52,10 @@ impl Default for Preferences {
             typography: Typography::default(),
             chat_width: ChatWidth::Comfortable,
             diff_color_scheme: DiffColorScheme::default(),
+            contrast: 100,
+            glass: 80,
+            halves: BTreeMap::new(),
+            custom: Vec::new(),
         }
     }
 }
@@ -54,11 +63,12 @@ impl Default for Preferences {
 struct ThemeState {
     preferences: Preferences,
     system_dark: bool,
+    environment: Vec<ThemeDefinition>,
 }
 
 impl Global for ThemeState {}
 
-pub fn palette(cx: &App) -> &'static Palette {
+pub fn palette(cx: &App) -> Palette {
     cx.global::<ActivePalette>().0
 }
 
@@ -67,7 +77,7 @@ pub fn hsla(color: u32) -> Hsla {
 }
 
 pub fn init(cx: &mut App) {
-    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false });
+    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false, environment: Vec::new() });
     cache_font_inventory(cx);
     install(cx);
 }
@@ -84,7 +94,9 @@ pub fn set_preferences(preferences: Preferences, cx: &mut App) {
     }
     let families_changed = state.preferences.typography.families != preferences.typography.families;
     state.preferences = preferences;
-    if families_changed { cache_font_inventory(cx); }
+    if families_changed {
+        cache_font_inventory(cx);
+    }
     install(cx);
     let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);
@@ -109,9 +121,7 @@ pub fn chat_max_width(cx: &App) -> Option<Rems> {
 
 pub fn follow_system_appearance(window: &mut Window, cx: &mut App) {
     apply(window.appearance(), window, cx);
-    window
-        .observe_window_appearance(|window, cx| apply(window.appearance(), window, cx))
-        .detach();
+    window.observe_window_appearance(|window, cx| apply(window.appearance(), window, cx)).detach();
 }
 
 fn apply(appearance: WindowAppearance, window: &mut Window, cx: &mut App) {
@@ -123,19 +133,41 @@ fn apply(appearance: WindowAppearance, window: &mut Window, cx: &mut App) {
 
 fn is_dark(cx: &App) -> bool {
     let state = cx.global::<ThemeState>();
-    match state.preferences.mode {
-        AppearanceMode::System => state.system_dark,
-        AppearanceMode::Light => false,
-        AppearanceMode::Dark => true,
-    }
+    let prefs = &state.preferences;
+    themes::resolved_dark(&prefs.theme, &prefs.halves, themes::mode_dark(prefs.mode, state.system_dark), &prefs.custom, &state.environment)
 }
 
-/// The light and dark halves of the chosen theme: a built-in named theme, else T3 Code.
-fn halves(theme: &ThemePreference) -> (&'static Palette, &'static Palette) {
-    let named = theme.named_id().and_then(|id| BUILT_IN_THEMES.iter().find(|candidate| candidate.id == id));
-    let light = named.and_then(|named| named.light.as_ref()).unwrap_or(&tokens::LIGHT);
-    let dark = named.and_then(|named| named.dark.as_ref()).unwrap_or(&tokens::DARK);
-    (light, dark)
+pub fn environment_themes(cx: &App) -> &[ThemeDefinition] {
+    &cx.global::<ThemeState>().environment
+}
+pub fn set_environment_themes(values: &[ThemeDefinition], cx: &mut App) {
+    if cx.global::<ThemeState>().environment == values {
+        return;
+    }
+    cx.global_mut::<ThemeState>().environment = values.to_vec();
+    install(cx);
+    let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
+    Theme::change(mode, None, cx);
+    cx.refresh_windows();
+}
+
+fn derived(theme: &ThemePreference, dark: bool, prefs: &Preferences, environment: &[ThemeDefinition]) -> Palette {
+    let definition = themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, environment);
+    let selected = definition.map(|t| t.id.as_str());
+    let roles = definition.and_then(|t| t.half(dark));
+    let base = selected
+        .and_then(|id| BUILT_IN_THEMES.iter().find(|t| t.id == id))
+        .and_then(|t| if dark { t.dark } else { t.light })
+        .unwrap_or(if dark { tokens::DARK } else { tokens::LIGHT });
+    let Ok(colors) = themes::palette_for(selected, roles, dark, prefs.contrast, prefs.glass) else {
+        return base;
+    };
+    let mut value = serde_json::to_value(base).expect("serializable palette");
+    if let Some(map) = value.as_object_mut() {
+        map.extend(colors.into_iter().map(|(k, v)| (k, v.into())));
+    }
+    let p = serde_json::from_value(value).unwrap_or(base);
+    if prefs.diff_color_scheme == DiffColorScheme::BlueOrange { blue_orange(p) } else { p }
 }
 
 fn blue_orange(mut palette: Palette) -> Palette {
@@ -151,32 +183,6 @@ fn blue_orange(mut palette: Palette) -> Palette {
     palette
 }
 
-fn diff_halves(preferences: &Preferences) -> (&'static Palette, &'static Palette) {
-    if preferences.diff_color_scheme == DiffColorScheme::RedGreen {
-        return halves(&preferences.theme);
-    }
-    static DEFAULT: LazyLock<(Palette, Palette)> =
-        LazyLock::new(|| (blue_orange(tokens::LIGHT), blue_orange(tokens::DARK)));
-    static NAMED: LazyLock<Vec<(Palette, Palette)>> = LazyLock::new(|| {
-        BUILT_IN_THEMES
-            .iter()
-            .map(|theme| {
-                (
-                    blue_orange(theme.light.unwrap_or(tokens::LIGHT)),
-                    blue_orange(theme.dark.unwrap_or(tokens::DARK)),
-                )
-            })
-            .collect()
-    });
-    let pair = preferences
-        .theme
-        .named_id()
-        .and_then(|id| BUILT_IN_THEMES.iter().position(|theme| theme.id == id))
-        .map(|index| &NAMED[index])
-        .unwrap_or(&DEFAULT);
-    (&pair.0, &pair.1)
-}
-
 struct FontInventory {
     names: Vec<String>,
     mono: String,
@@ -187,8 +193,11 @@ impl Global for FontInventory {}
 fn cache_font_inventory(cx: &mut App) {
     let names = cx.text_system().all_font_names();
     let first_installed = |stack: &[&str]| {
-        stack.iter().find_map(|family| names.iter().find(|name| name.eq_ignore_ascii_case(family)))
-            .map(String::to_owned).unwrap_or_else(|| stack[0].to_owned())
+        stack
+            .iter()
+            .find_map(|family| names.iter().find(|name| name.eq_ignore_ascii_case(family)))
+            .map(String::to_owned)
+            .unwrap_or_else(|| stack[0].to_owned())
     };
     let mono = first_installed(MONO_STACK);
     let serif = first_installed(&["Times", "Times New Roman", "Georgia"]);
@@ -206,11 +215,21 @@ pub fn default_mono_family(cx: &App) -> &str {
 fn resolve_family(role: FontRole, cx: &App) -> gpui::SharedString {
     let inventory = cx.global::<FontInventory>();
     let family = preferences(cx).typography.family(role);
-    let fallback = if role.monospace() { inventory.mono.clone().into() }
-        else if role == FontRole::Prompt { resolve_family(FontRole::Interface, cx) }
-        else { gpui::SharedString::from(".SystemUIFont") };
-    resolve_font_stack(family, &inventory.names,
-        FontDefaults { sans: ".SystemUIFont", mono: &inventory.mono, serif: &inventory.serif }, &fallback).to_owned().into()
+    let fallback = if role.monospace() {
+        inventory.mono.clone().into()
+    } else if role == FontRole::Prompt {
+        resolve_family(FontRole::Interface, cx)
+    } else {
+        gpui::SharedString::from(".SystemUIFont")
+    };
+    resolve_font_stack(
+        family,
+        &inventory.names,
+        FontDefaults { sans: ".SystemUIFont", mono: &inventory.mono, serif: &inventory.serif },
+        &fallback,
+    )
+    .to_owned()
+    .into()
 }
 
 pub fn font_family(role: FontRole, cx: &App) -> gpui::SharedString {
@@ -219,11 +238,15 @@ pub fn font_family(role: FontRole, cx: &App) -> gpui::SharedString {
 
 pub fn font_size(role: FontRole, cx: &App) -> f32 {
     let prefs = preferences(cx);
-    if role == FontRole::Prompt && !prefs.typography.separate { return prefs.interface_font_size * 14. / 16.; }
+    if role == FontRole::Prompt && !prefs.typography.separate {
+        return prefs.interface_font_size * 14. / 16.;
+    }
     prefs.typography.size(role)
 }
 
-pub fn code_line_height(cx: &App) -> f32 { font_size(FontRole::Code, cx) * 20. / 13. }
+pub fn code_line_height(cx: &App) -> f32 {
+    font_size(FontRole::Code, cx) * 20. / 13.
+}
 
 fn install(cx: &mut App) {
     let dark = is_dark(cx);
@@ -232,12 +255,17 @@ fn install(cx: &mut App) {
     let mono = font_family(FontRole::Code, cx);
     let sans = font_family(FontRole::Interface, cx);
     let preferences = preferences(cx).clone();
-    let (light_palette, dark_palette) = diff_halves(&preferences);
-    cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }));
+    let environment = &cx.global::<ThemeState>().environment;
+    let light_palette = derived(&preferences.theme, false, &preferences, environment);
+    let dark_palette = derived(&preferences.theme, true, &preferences, environment);
+    let revision = cx.try_global::<ActivePalette>().map_or(0, |p| p.1.wrapping_add(1));
+    cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }, revision));
     let size = preferences.interface_font_size;
     let theme = Theme::global_mut(cx);
-    theme.light_theme = Rc::new(config("T3 Code Light", light_palette, false, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
-    theme.dark_theme = Rc::new(config("T3 Code Dark", dark_palette, true, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
+    theme.light_theme =
+        Rc::new(config("T3 Code Light", &light_palette, false, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
+    theme.dark_theme =
+        Rc::new(config("T3 Code Dark", &dark_palette, true, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
     theme.font_size = px(size);
     theme.font_family = sans;
     theme.mono_font_family = mono;
@@ -245,9 +273,19 @@ fn install(cx: &mut App) {
 }
 
 /// A theme's swatch colors for the theme cards: (background, card, primary, foreground).
-pub fn swatch(theme: &ThemePreference, dark: bool) -> [u32; 4] {
-    let (light, dark_palette) = halves(theme);
-    let p = if dark { dark_palette } else { light };
+pub fn swatch(theme: &ThemePreference, dark: bool, cx: &App) -> [u32; 4] {
+    if let Some(p) =
+        theme.named_id().and_then(|id| BUILT_IN_THEMES.iter().find(|t| t.id == id)).and_then(|t| if dark { t.dark } else { t.light })
+    {
+        return [p.background, p.card, p.primary, p.foreground];
+    }
+    let prefs = preferences(cx);
+    if let Some(t) = theme.named_id().and_then(|id| themes::resolve(id, &prefs.custom, environment_themes(cx)))
+        && let Some(roles) = t.half(dark)
+    {
+        return themes::swatch(roles);
+    }
+    let p = if dark { tokens::DARK } else { tokens::LIGHT };
     [p.background, p.card, p.primary, p.foreground]
 }
 
@@ -348,4 +386,8 @@ fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str, sans:
         tracing::warn!(%error, "invalid theme config");
         ThemeConfig::default()
     })
+}
+
+pub fn revision(cx: &App) -> usize {
+    cx.global::<ActivePalette>().1
 }

@@ -32,7 +32,7 @@ fn status_icon(icon: StatusIcon) -> Icon {
     }
 }
 
-fn tone_color(tone: StatusTone, p: &Palette) -> u32 {
+fn tone_color(tone: StatusTone, p: Palette) -> u32 {
     match tone {
         StatusTone::Info => p.info_foreground,
         StatusTone::Muted => p.muted_foreground,
@@ -69,7 +69,7 @@ fn row_state(thread: &SidebarThread, active: bool, now: i64) -> RowState {
 }
 
 /// A 12px text action revealed on hover (design-system §7.2 hover actions).
-fn hover_action(id: SharedString, p: &Palette) -> gpui::Stateful<gpui::Div> {
+fn hover_action(id: SharedString, p: Palette) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h_full()

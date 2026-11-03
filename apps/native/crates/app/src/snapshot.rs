@@ -406,6 +406,15 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let store = cx.update(|cx| crate::worktree_setup::store(&state, cx));
         store.update(&mut cx, |store, cx| store.show_fixture(snapshot, cx));
     }
+    if let Some(path) = std::env::var_os("T3_NATIVE_IMPORT_THEME_FIXTURE") {
+        cx.update(|cx|crate::settings::import_theme_fixture(std::path::Path::new(&path), &state, cx))?;
+    }
+    if let Some(path) = std::env::var_os("T3_NATIVE_ENVIRONMENT_THEMES_FIXTURE") {
+        let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
+        let values:Vec<serde_json::Value>=serde_json::from_str(&text).map_err(|e|e.to_string())?;
+        let definitions=std::thread::spawn(move||t3_core::themes::environment(&values)).join().map_err(|_|"theme fixture worker failed")?;
+        cx.update(|cx|crate::theme::set_environment_themes(&definitions,cx));
+    }
     if options.appearance.is_some() || options.font_size.is_some() {
         cx.update(|cx| {
             let current = crate::theme::preferences(cx).clone();
@@ -455,6 +464,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             }
             None => cx.update(|cx| crate::settings::open(section, cx)),
         }
+    }
+    if let Some(path)=std::env::var_os("T3_NATIVE_THEME_REIMPORT_FIXTURE") {
+        pump(&mut cx,1.,|_|false);
+        cx.update(|cx|crate::settings::reimport_theme_fixture(std::path::Path::new(&path),cx))?;
     }
     if options.pull_requests || options.pull_request.is_some() {
         if let Some(number) = options.pull_request {

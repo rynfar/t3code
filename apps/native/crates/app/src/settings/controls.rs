@@ -1045,3 +1045,25 @@ pub fn dialog_footer(bare: bool, buttons: Vec<AnyElement>, cx: &App) -> gpui::Di
 pub fn muted_text(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
     div().text_sm().text_color(hsla(palette(cx).muted_foreground)).child(text.into())
 }
+
+#[derive(IntoElement)]
+pub struct PercentSlider {
+    state: gpui::Entity<gpui_component::slider::SliderState>,
+    value: u32,
+}
+impl PercentSlider {
+    pub fn new(state: gpui::Entity<gpui_component::slider::SliderState>, value:u32) -> Self {Self {state,value}}
+}
+impl RenderOnce for PercentSlider {
+    fn render(self,window:&mut Window,cx:&mut App)->impl IntoElement {
+        let p=palette(cx);
+        if self.state.read(cx).value().start()!=self.value as f32 {
+            self.state.update(cx,|s,cx|s.set_value(self.value as f32,window,cx));
+        }
+        h_flex().w(r(208.)).gap(r(12.)).child(
+            div().min_w(r(48.)).rounded(r(6.)).bg(hsla(p.muted)).px(r(8.)).py(r(4.))
+                .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Code,cx))
+                .text_xs().text_color(hsla(p.foreground)).child(format!("{}%",self.value))
+        ).child(div().flex_1().child(gpui_component::slider::Slider::new(&self.state)))
+    }
+}
