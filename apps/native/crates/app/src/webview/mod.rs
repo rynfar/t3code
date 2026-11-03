@@ -29,6 +29,14 @@ use gpui::{
     Window, WindowId, point, px, relative, size,
 };
 
+/// Where any frame of a page may navigate: the page itself and inline content. Unlike the web's
+/// sandboxed iframe, a WebKit document keeps no sandbox across navigation, and every main-frame
+/// document gets the IPC bridge, so a remote site never loads; the reader's links open in the
+/// browser instead.
+pub(crate) fn navigable(url: &str) -> bool {
+    ["t3-page:", "about:", "data:", "blob:"].iter().any(|scheme| url.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme)))
+}
+
 /// Paint order among base-plane content: an occluder hides views of lower layers only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Layer {
@@ -112,11 +120,6 @@ impl WebView {
         }
         let native = NativeView::new(window, &page, events)?;
         Some(Rc::new(WebView { native, layer, occluders: occluders(window, cx), leases: Cell::new(0), applied: Cell::new(None), dark: Cell::new(page.dark) }))
-    }
-
-    /// Whether an element drew it in the last frame.
-    pub fn is_drawn(&self) -> bool {
-        self.leases.get() > 0
     }
 
     pub fn set_zoom(&self, zoom: f64) {
@@ -371,6 +374,18 @@ mod tests {
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<gpui::Pixels> {
         Bounds { origin: point(px(x), px(y)), size: size(px(w), px(h)) }
+    }
+
+    /// A WebKit document keeps no sandbox across navigation and every main-frame document gets
+    /// the IPC bridge, so a frame may only load the page itself or inline content.
+    #[test]
+    fn pages_never_navigate_to_remote_documents() {
+        for url in ["t3-page://page/index.html", "about:blank", "about:srcdoc", "data:text/html,<p>", "blob:null/1", "T3-PAGE://page/index.html"] {
+            assert!(super::navigable(url), "{url}");
+        }
+        for url in ["https://attacker.example/", "http://127.0.0.1:3773/api", "HTTPS://x.example", "file:///etc/hosts", "javascript:alert(1)", "t3-pag"] {
+            assert!(!super::navigable(url), "{url}");
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! under the frame instead of on it.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use t3_core::timeline::HtmlRenderEntry;
 use super::parts::{outline_button, tooltip_icon_button};
 use crate::app_state::AppState;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 use crate::webview::{self, Layer, Page, WebEvent, WebView};
 
@@ -84,10 +84,12 @@ struct PageState {
     used: u64,
 }
 
+/// The frame drawing a view holds it (its lease and the presented frame), so a view goes as soon
+/// as no frame draws it: a row scrolled away, a thread switched, a transcript closed.
 struct InlineView {
     key: PageKey,
     owner: EntityId,
-    view: Rc<WebView>,
+    view: Weak<WebView>,
     canvas: u32,
     _events: Task<()>,
 }
@@ -114,13 +116,6 @@ pub fn init(state: &Entity<AppState>, cx: &mut App) {
 
 fn frames(cx: &App) -> Option<Entity<HtmlFrames>> {
     cx.try_global::<Frames>().map(|frames| frames.0.clone())
-}
-
-/// Called as `owner` starts rendering its rows: lets go of its pages no frame drew last time.
-pub fn begin_frame(owner: EntityId, cx: &mut App) {
-    if let Some(frames) = frames(cx) {
-        frames.update(cx, |frames, _| frames.views.retain(|inline| inline.owner != owner || inline.view.is_drawn()));
-    }
 }
 
 /// What a row draws this frame.
@@ -242,12 +237,15 @@ impl HtmlFrames {
     /// Making one in a background window would bring the app forward on macOS 13.
     fn inline_view(&mut self, key: &PageKey, owner: EntityId, html: Arc<str>, dark: bool, window: &mut Window, cx: &mut Context<Self>) -> Slot {
         let canvas = canvas(cx);
-        if let Some(inline) = self.views.iter_mut().find(|inline| &inline.key == key && inline.owner == owner) {
+        self.views.retain(|inline| inline.view.strong_count() > 0);
+        if let Some(inline) = self.views.iter_mut().find(|inline| &inline.key == key && inline.owner == owner)
+            && let Some(view) = inline.view.upgrade()
+        {
             if inline.canvas != canvas {
-                inline.view.evaluate(&canvas_update(canvas));
+                view.evaluate(&canvas_update(canvas));
                 inline.canvas = canvas;
             }
-            return Slot::View(inline.view.clone());
+            return Slot::View(view);
         }
         if !webview::available(window) {
             return Slot::Card;
@@ -256,8 +254,7 @@ impl HtmlFrames {
             return Slot::Pending;
         }
         if self.views.len() >= MAX_INLINE_VIEWS {
-            let Some(idle) = self.views.iter().position(|inline| !inline.view.is_drawn()) else { return Slot::Card };
-            self.views.remove(idle);
+            return Slot::Card;
         }
         let (events, mut received) = mpsc::unbounded();
         let page = Page { html, dark, scroll_through: true, script: format!("{CONTENT_HEIGHT_SCRIPT}{}", canvas_script(canvas)) };
@@ -270,7 +267,7 @@ impl HtmlFrames {
                 }
             }
         });
-        self.views.push(InlineView { key: key.clone(), owner, view: view.clone(), canvas, _events: pump });
+        self.views.push(InlineView { key: key.clone(), owner, view: Rc::downgrade(&view), canvas, _events: pump });
         Slot::View(view)
     }
 }
@@ -505,19 +502,43 @@ fn black(alpha: f32) -> gpui::Hsla {
     gpui_hsla(0., 0., 0., alpha)
 }
 
-fn overlay_button(id: &'static str, size: f32, disabled: bool) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(size))
-        .min_w(px(size))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(8.))
-        .bg(black(0.7))
-        .text_color(white(0.65))
-        .when(disabled, |this| this.opacity(0.64))
-        .when(!disabled, |this| this.cursor_pointer().hover(|this| this.bg(black(0.9))))
+/// The media dialog's buttons (`button.tsx` `overlay` and `media-close`), in rem so they follow
+/// the interface size.
+#[derive(Clone, Copy)]
+enum MediaButton {
+    /// `overlay` at `icon-sm`.
+    Icon(Icon),
+    /// `overlay` at `sm`.
+    Label,
+    /// `media-close` at `icon-xs`.
+    Close,
+}
+
+impl MediaButton {
+    fn build(self, id: &'static str, disabled: bool, window: &Window) -> gpui::Stateful<gpui::Div> {
+        let size = |value: f32| rem(value).to_pixels(window.rem_size());
+        let (height, fill, hover) = match self {
+            MediaButton::Close => (24., 0.65, 0.8),
+            _ => (28., 0.7, 0.9),
+        };
+        let button = div()
+            .id(id)
+            .h(rem(height))
+            .min_w(rem(height))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(rem(8.))
+            .bg(black(fill))
+            .when(disabled, |this| this.opacity(0.64))
+            .when(!disabled, |this| this.cursor_pointer().hover(|this| this.bg(black(hover))));
+        match self {
+            MediaButton::Icon(icon) => button.child(icon.render(size(16.), white(0.65))),
+            MediaButton::Label => button.px(rem(9.)).text_sm().font_weight(FontWeight::MEDIUM).text_color(white(0.65)),
+            MediaButton::Close => button.border_1().border_color(white(0.2)).child(Icon::X.render(size(14.), white(1.))),
+        }
+    }
 }
 
 impl Render for HtmlFullscreen {
@@ -547,42 +568,28 @@ impl Render for HtmlFullscreen {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(4.))
+            .gap(rem(4.))
             .child(
-                overlay_button("html-render-zoom-out", 28., !zoom_out)
-                    .child(Icon::Minus.render(px(16.), white(0.65)))
+                MediaButton::Icon(Icon::Minus)
+                    .build("html-render-zoom-out", !zoom_out, window)
                     .when(zoom_out, |this| this.on_click(cx.listener(move |this, _, _, cx| this.set_zoom(zoom - ZOOM_STEP, cx)))),
             )
             .child(
-                overlay_button("html-render-zoom-reset", 28., false)
-                    .px(px(9.))
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
+                MediaButton::Label
+                    .build("html-render-zoom-reset", false, window)
                     .child(format!("{}%", (zoom * 100.).round()))
                     .on_click(cx.listener(|this, _, _, cx| this.set_zoom(1., cx))),
             )
             .child(
-                overlay_button("html-render-zoom-in", 28., !zoom_in)
-                    .child(Icon::Plus.render(px(16.), white(0.65)))
+                MediaButton::Icon(Icon::Plus)
+                    .build("html-render-zoom-in", !zoom_in, window)
                     .when(zoom_in, |this| this.on_click(cx.listener(move |this, _, _, cx| this.set_zoom(zoom + ZOOM_STEP, cx)))),
             );
         let close = div()
-            .id("html-render-fullscreen-close")
             .absolute()
             .right_0()
-            .top(px(-40.))
-            .size(px(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.))
-            .cursor_pointer()
-            .bg(black(0.65))
-            .border_1()
-            .border_color(white(0.2))
-            .hover(|this| this.bg(black(0.8)))
-            .child(Icon::X.render(px(14.), white(1.)))
-            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)));
+            .top(rem(-40.))
+            .child(MediaButton::Close.build("html-render-fullscreen-close", false, window).on_click(cx.listener(|this, _, window, cx| this.close(window, cx))));
         div()
             .id("html-render-fullscreen")
             .track_focus(&self.focus)
@@ -613,8 +620,8 @@ impl Render for HtmlFullscreen {
                     .child(
                         div()
                             .h(px(box_height))
-                            .p(px(16.))
-                            .rounded(px(8.))
+                            .p(rem(16.))
+                            .rounded(rem(8.))
                             .bg(hsla(p.background))
                             .border_1()
                             .border_color(hsla(p.border).opacity(0.7))
@@ -623,12 +630,12 @@ impl Render for HtmlFullscreen {
                     )
                     .child(
                         div()
-                            .mt(px(8.))
+                            .mt(rem(8.))
                             .flex()
                             .min_w_0()
                             .items_center()
                             .justify_center()
-                            .gap(px(12.))
+                            .gap(rem(12.))
                             .text_xs()
                             .text_color(white(0.8))
                             .child(div().min_w_0().truncate().child(self.title.clone()))

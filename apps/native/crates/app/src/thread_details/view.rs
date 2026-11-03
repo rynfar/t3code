@@ -165,6 +165,7 @@ impl Render for DetailsView {
             .flex_col()
             .rounded(px(16.))
             .child(crate::glass::backdrop(16., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+            .child(crate::webview::occluder("thread-details-cover", crate::webview::Layer::TranscriptChrome))
             .when(popover, |this| this.occlude().shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark())))
             .child(div().id("thread-details-scroll").relative().min_h_0().overflow_y_scroll().child(content))
             .context_menu(move |menu, _, cx| if claim.replace(false) { menu } else { items_menu(menu, &details, cx) });

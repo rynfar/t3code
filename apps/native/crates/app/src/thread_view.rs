@@ -741,7 +741,6 @@ impl Render for ThreadView {
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
         self.media.update(cx, |media, cx| media.begin_frame(window, cx));
-        crate::transcript::html_render::begin_frame(cx.entity_id(), cx);
         let scope = crate::media::MediaScope {
             owner: cx.entity_id(),
             thread_id: self.thread_id.clone(),

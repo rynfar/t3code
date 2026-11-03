@@ -22,14 +22,25 @@ use wry::{NewWindowResponse, WebViewBuilder, WebViewExtMacOS, WryWebView};
 
 use super::{Page, WebEvent};
 
+/// WebKit opens script windows without a click on macOS by default; with this off, only a
+/// reader's click (a link's `target=_blank`) asks for a window, which becomes a link open.
+fn block_script_windows(page: &WryWebView) {
+    // SAFETY: a web view's configuration and its preferences are live objects; the setter takes a BOOL.
+    unsafe {
+        let configuration: *mut AnyObject = msg_send![page, configuration];
+        let preferences: *mut AnyObject = msg_send![configuration, preferences];
+        if !preferences.is_null() {
+            let _: () = msg_send![preferences, setJavaScriptCanOpenWindowsAutomatically: false];
+        }
+    }
+}
+
 const SCHEME: &str = "t3-page";
 const PAGE_URL: &str = "t3-page://page/index.html";
 /// What the server sends with agent HTML (`http.ts`), less downloads: an opaque origin with
 /// scripts and forms. Popups reach the app as link opens and never as windows.
 const CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-forms allow-popups";
 const MAX_MESSAGE_BYTES: usize = 4096;
-/// Where a page may navigate itself: its own document and what a sandboxed frame could load.
-const NAVIGABLE: [&str; 6] = ["t3-page:", "about:", "http:", "https:", "data:", "blob:"];
 
 pub(super) struct NativeView {
     host: Retained<NSView>,
@@ -104,7 +115,7 @@ impl NativeView {
                     let _ = events.unbounded_send(WebEvent::Message(body));
                 }
             })
-            .with_navigation_handler(|url: String| NAVIGABLE.iter().any(|scheme| url.starts_with(scheme)))
+            .with_navigation_handler(|url: String| super::navigable(&url))
             .with_new_window_req_handler(move |url, _| {
                 if url.starts_with("http://") || url.starts_with("https://") {
                     let _ = links.unbounded_send(WebEvent::OpenUrl(url));
@@ -124,6 +135,7 @@ impl NativeView {
             }
         };
         let page_view = webview.webview();
+        block_script_windows(&page_view);
         let scroll = page.scroll_through.then(|| {
             let target = Rc::new(ScrollTarget { host: host.clone(), frame: Cell::new(None) });
             ScrollTarget::register(&target);
