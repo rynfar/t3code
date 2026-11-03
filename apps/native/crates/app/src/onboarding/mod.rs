@@ -4,11 +4,14 @@
 //! reuses the connect screen's pairing (`environments.rs`). One environment is connected at a
 //! time, so the connection step picks the computer to set up. Pending evidence never blocks the
 //! app as the web's blank gate does: the wizard opens over it once a fresh workspace is confirmed.
-//! Not here yet: T3 Connect (CN-RELAY), the import step, Codex's ChatGPT setup, and the setup
+//! Not here yet: T3 Connect (CN-RELAY), Codex's ChatGPT setup, and the setup
 //! terminal (the agents step shows the command to run instead).
 
 mod agents;
 mod connection;
+mod projects;
+#[cfg(test)]
+mod tests;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +40,7 @@ use crate::theme::{hsla, palette};
 pub enum Step {
     Connection,
     Agents,
+    Projects,
 }
 
 actions!(welcome, [FocusNextInWelcome, FocusPreviousInWelcome]);
@@ -83,8 +87,8 @@ fn key_stop(
         })
 }
 
-/// `ONBOARDING_STAGES` up to the import step, which is not ported yet.
-const STAGES: [&str; 2] = ["Connect", "Agents"];
+/// `ONBOARDING_STAGES` up to which is not ported yet.
+const STAGES: [&str; 3] = ["Connect", "Agents", "Projects"];
 
 /// The wizard opened or closed; the workspace swaps what it shows.
 pub struct Visibility;
@@ -125,6 +129,7 @@ pub struct WelcomeWizard {
     submitted: bool,
     setup: Option<AgentSetup>,
     copied: Option<(String, Task<()>)>,
+    projects: projects::Projects,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -158,6 +163,7 @@ impl WelcomeWizard {
             submitted: false,
             setup: None,
             copied: None,
+            projects: projects::Projects::default(),
             _subscriptions: subscriptions,
         };
         wizard.evaluate(cx);
@@ -187,6 +193,9 @@ impl WelcomeWizard {
     }
 
     fn on_app_event(&mut self, event: AppEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(event, AppEvent::Phase | AppEvent::Shell | AppEvent::ServerConfig) {
+            self.projects_changed(cx);
+        }
         if event == AppEvent::Phase {
             let app = self.state.read(cx);
             let (pairing, failed, unpaired) = (app.connect.pairing.is_some(), app.connect.error.is_some(), app.phase == Phase::Unpaired);
@@ -197,7 +206,7 @@ impl WelcomeWizard {
                     self.pairing_open = Some(false);
                 }
             }
-            if unpaired && self.step == Step::Agents {
+            if unpaired && self.step != Step::Connection {
                 self.step = Step::Connection;
             }
         }
@@ -309,6 +318,7 @@ impl WelcomeWizard {
 
     /// Closing or finishing the wizard: setup is done either way, as on the web.
     fn finish(&mut self, cx: &mut Context<Self>) {
+        self.cancel_projects();
         self.open = false;
         self.setup = None;
         self.complete(cx);
@@ -317,10 +327,14 @@ impl WelcomeWizard {
     }
 
     fn go_to(&mut self, step: Step, cx: &mut Context<Self>) {
+        self.cancel_projects();
         if step == Step::Agents && self.step != Step::Agents {
             self.refresh_providers(cx);
         }
         self.step = step;
+        if step == Step::Projects {
+            self.enter_projects(cx);
+        }
         self.setup = None;
         self.focus_pending = true;
         cx.notify();
@@ -382,6 +396,7 @@ impl WelcomeWizard {
         let current = match self.step {
             Step::Connection => 0,
             Step::Agents => 1,
+            Step::Projects => 2,
         };
         h_flex()
             .w_full()
@@ -441,7 +456,7 @@ impl WelcomeWizard {
                             .child(*label),
                     );
                 if done {
-                    let back = cx.listener(|this, _: &(), _, cx| this.go_to(Step::Connection, cx));
+                    let back = cx.listener(move |this, _: &(), _, cx| this.go_to(if index == 0 { Step::Connection } else { Step::Agents }, cx));
                     key_stop(tab, &id, back, window, cx).hover(move |style| style.bg(hsla(p.card)))
                 } else {
                     tab
@@ -479,6 +494,7 @@ impl Render for WelcomeWizard {
         let body: AnyElement = match self.step {
             Step::Connection => self.render_connection(window, cx),
             Step::Agents => self.render_agents(window, cx),
+            Step::Projects => self.render_projects(window, cx),
         };
         let header = v_flex()
             .gap(r(8.))
