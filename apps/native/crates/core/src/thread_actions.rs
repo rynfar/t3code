@@ -404,6 +404,7 @@ pub fn thread_reference(title: &str, thread_id: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoStep {
+    RestoreDraft,
     Unsettle,
     Unsnooze,
     Pin { order_key: Option<String> },
@@ -413,6 +414,7 @@ pub enum UndoStep {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UndoKind {
+    Discard,
     Settle,
     Snooze,
     Pin,
@@ -453,6 +455,7 @@ pub fn runnable_step(step: &UndoStep, now: Ms) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndoAction {
+    Discarded,
     Settled,
     Snoozed,
     Unpinned,
@@ -462,6 +465,7 @@ pub enum UndoAction {
 impl UndoAction {
     pub fn label(self) -> &'static str {
         match self {
+            UndoAction::Discarded => "Discarded",
             UndoAction::Settled => "Settled",
             UndoAction::Snoozed => "Snoozed",
             UndoAction::Unpinned => "Unpinned",

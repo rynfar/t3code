@@ -14,6 +14,15 @@ fn empty_drafts_are_dropped_and_unchanged_ones_not_rewritten() {
     assert!(store.set(&thread_key("t1"), draft("  ", 4)), "clearing the prompt drops the draft");
     assert!(store.get(&thread_key("t1")).is_none());
     assert!(!store.set(&thread_key("t1"), draft("", 5)));
+    let discarded = draft("original", 6);
+    assert!(store.restore(&new_thread_key("p1"), discarded.clone()));
+    assert!(!store.restore(&new_thread_key("p1"), draft("replacement", 7)));
+    assert_eq!(store.get(&new_thread_key("p1")).unwrap().prompt, "original");
+    store.remove(&new_thread_key("p1"));
+    let pending = Draft { pending_attachment_count: 2, ..Draft::default() };
+    assert!(store.set(&new_thread_key("upload"), pending));
+    assert!(store.get(&new_thread_key("upload")).unwrap().has_user_content());
+    assert!(DraftStore::from_value(Some(&store.to_value())).get(&new_thread_key("upload")).is_none(), "unuploaded bytes do not persist");
     let choice = Draft { interaction_mode: Some(InteractionMode::Plan), ..Draft::default() };
     assert!(store.set(&new_thread_key("p1"), choice), "a choice alone is worth keeping");
 }
@@ -51,6 +60,8 @@ fn the_store_round_trips_and_skips_bad_entries() {
         threads: Draft::saved_threads(&[thread.clone(), ThreadContext::new("env", "t3", "Unlinked")], &prompt),
         terminals: Draft::saved_terminals(&[unlinked, excerpt.clone()], &prompt),
         attachments: vec![SavedAttachment::of(&attachment).unwrap()],
+        pending_attachment_count: 0,
+        created_at: Some(7),
         updated_at: 7,
     };
     store.set(&thread_key("t1"), full.clone());

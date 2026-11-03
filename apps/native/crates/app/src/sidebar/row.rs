@@ -86,6 +86,13 @@ fn hover_action(id: SharedString, p: &Palette) -> gpui::Stateful<gpui::Div> {
 
 impl SidebarPane {
     pub(super) fn render_row(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if index < self.drafts.rows.len() { return self.render_draft_row(index, cx); }
+        let index = if self.drafts.rows.is_empty() { index } else {
+            if index == self.drafts.rows.len() {
+                return div().h(px(13.)).mx(px(10.)).py(px(6.)).child(div().h(px(1.)).bg(hsla(palette(cx).sidebar_border).opacity(0.6))).into_any_element();
+            }
+            index - self.drafts.rows.len() - 1
+        };
         let model = self.state.read(cx).sidebar.model.clone();
         let Some(row) = model.rows.get(index) else { return div().into_any_element() };
         let element = match row {
@@ -472,7 +479,7 @@ impl SidebarPane {
     }
 
     /// The 16px project icon, or the folder fallback. Slim rows mute it until hovered.
-    fn favicon(&self, project_id: &str, muted: bool, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn favicon(&self, project_id: &str, muted: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let size = px(16.);
         let Some(image) = self.state.read(cx).sidebar.favicons.image(project_id) else {

@@ -5,6 +5,7 @@
 //! rendered `.cached()` and notifies itself only on shell, selection and notice changes.
 
 mod bulk;
+mod drafts;
 pub mod controller;
 mod drag;
 mod favicons;
@@ -49,11 +50,17 @@ enum ClockRate {
     Minute,
 }
 
+#[derive(PartialEq, Eq)]
+enum PaneRowKey { Draft(String), Divider, Thread(RowKey) }
+
 pub struct SidebarPane {
+    composer: Entity<crate::composer::Composer>,
+    drafts: t3_core::sidebar::drafts::DraftRows,
+    discarded: std::collections::HashMap<String, (t3_core::thread_actions::Claim, crate::composer::drafts::DiscardedDraft)>,
     state: Entity<AppState>,
     menu: Entity<ContextMenu>,
     list: ListState,
-    row_keys: Vec<RowKey>,
+    row_keys: Vec<PaneRowKey>,
     search_input: Entity<InputState>,
     search: SearchState,
     rename: Option<(String, Entity<InputState>)>,
@@ -75,6 +82,7 @@ pub struct SidebarPane {
 impl SidebarPane {
     pub fn new(
         state: Entity<AppState>,
+        composer: Entity<crate::composer::Composer>,
         menu: Entity<ContextMenu>,
         dialog: Entity<ConfirmDialog>,
         snooze: Entity<SnoozeDialog>,
@@ -83,6 +91,23 @@ impl SidebarPane {
     ) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscriptions = vec![
+            cx.subscribe(&composer, |this, _, _: &crate::composer::drafts::DraftsChanged, cx| {
+                let before = this.drafts.rows.clone();
+                this.sync_rows(cx);
+                if this.drafts.rows != before { cx.notify(); }
+            }),
+            cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
+                if *event == AppEvent::RestoreDraft {
+                    let projects = this.state.update(cx, |state, _| std::mem::take(&mut state.sidebar.drafts_to_restore));
+                    for project in projects {
+                        if let Some((_, draft)) = this.discarded.remove(&project) {
+                            this.composer.update(cx, |composer, cx| composer.restore_sidebar_draft(&project, draft, window, cx));
+                        }
+                    }
+                    this.sync_rows(cx);
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
                 AppEvent::Shell | AppEvent::Selection => {
                     let model = this.state.read(cx).sidebar.model.clone();
@@ -95,7 +120,15 @@ impl SidebarPane {
                     this.search.refresh(&this.state, cx);
                     cx.notify();
                 }
-                AppEvent::Notice => cx.notify(),
+                AppEvent::Notice => {
+                    let expired: Vec<_> = this.discarded.iter().filter(|(project, (claim, _))| !this.state.read(cx).sidebar.undo.is_current(claim) && !this.state.read(cx).sidebar.drafts_to_restore.contains(*project)).map(|(project, _)| project.clone()).collect();
+                    for project in expired {
+                        if let Some((_, discarded)) = this.discarded.remove(&project) {
+                            this.composer.update(cx, |composer, cx| composer.commit_sidebar_discard(discarded, cx));
+                        }
+                    }
+                    cx.notify();
+                },
                 AppEvent::SidebarSelection => {
                     this.model_seen = this.state.read(cx).sidebar.model.clone();
                     this.sync_rows(cx);
@@ -121,6 +154,7 @@ impl SidebarPane {
                 }
             }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
+                ContextMenuEvent::DiscardDraft(project) => this.discard_draft(project, window, cx),
                 ContextMenuEvent::Rename(thread_id) => this.start_rename(thread_id, window, cx),
                 ContextMenuEvent::CustomSnooze(thread_ids) => snooze.update(cx, |snooze, cx| snooze.open(thread_ids.clone(), window, cx)),
                 ContextMenuEvent::BulkDelete(thread_ids) => {
@@ -143,6 +177,9 @@ impl SidebarPane {
             }),
         ];
         let mut pane = SidebarPane {
+            composer,
+            drafts: Default::default(),
+            discarded: Default::default(),
             state,
             menu,
             list: ListState::new(0, ListAlignment::Top, px(200.)),
@@ -167,7 +204,11 @@ impl SidebarPane {
 
     /// Splices the list so scroll position and measured heights survive streaming updates.
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
-        let keys = self.state.read(cx).sidebar.model.row_keys();
+        let state = self.state.read(cx);
+        self.drafts.update(self.composer.read(cx).sidebar_drafts(), state.draft_project.as_deref(), state.sidebar.project_scope.as_ref());
+        let mut keys: Vec<_> = self.drafts.rows.iter().map(|row| PaneRowKey::Draft(row.project_id.clone())).collect();
+        if !keys.is_empty() { keys.push(PaneRowKey::Divider); }
+        keys.extend(state.sidebar.model.row_keys().into_iter().map(PaneRowKey::Thread));
         if let Some((range, count)) = t3_core::sidebar::splice_range(&self.row_keys, &keys) {
             self.list.splice(range, count);
         }
@@ -584,13 +625,12 @@ fn new_thread_label(cx: &App) -> String {
 
 impl Render for SidebarPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let model = self.state.read(cx).sidebar.model.clone();
         let synchronized = self.state.read(cx).shell.synchronized;
         self.live_rendered = false;
         let p = palette(cx);
         let body = if self.search.is_active() {
             self.render_search_results(cx).into_any_element()
-        } else if model.rows.is_empty() {
+        } else if self.row_keys.is_empty() {
             div()
                 .px(px(8.))
                 .py(px(24.))

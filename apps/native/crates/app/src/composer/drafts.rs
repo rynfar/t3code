@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use gpui::{Context, Task, Window};
+use gpui::{Context, EventEmitter, Task, Window};
 use t3_client::store;
 use t3_core::composer::drafts::{self as rules, Draft, DraftStore, SavedAttachment};
 
@@ -59,6 +59,8 @@ impl Composer {
             model_selection: choices.model,
             runtime_mode: choices.runtime_mode,
             interaction_mode: choices.interaction_mode,
+            pending_attachment_count: self.staged_for(target).iter().filter(|staged| staged.attachment.attachment_id().is_none()).count(),
+            created_at: None,
             updated_at: now_ms(),
         }
     }
@@ -125,9 +127,60 @@ impl Composer {
     }
 
     fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        cx.emit(DraftsChanged);
         self.drafts.save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(rules::PERSIST_DEBOUNCE_MS)).await;
             let _ = this.update(cx, |this, _| store::save_ui_state(rules::STORE_NAME, &this.drafts.store.to_value()));
         }));
+    }
+}
+
+pub(crate) struct DiscardedDraft {
+    draft: Draft,
+    attachments: Vec<super::attachments::Staged>,
+}
+
+pub(crate) struct DraftsChanged;
+impl EventEmitter<DraftsChanged> for Composer {}
+
+impl Composer {
+    pub(crate) fn sidebar_drafts(&self) -> &DraftStore { &self.drafts.store }
+
+    pub(crate) fn discard_sidebar_draft(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
+        let target = Target::Draft(project.into());
+        self.record_draft(&target, cx);
+        let draft = self.drafts.store.get(&key(&target))?.clone();
+        self.discard_draft(&target, cx);
+        let attachments = self.take_draft_attachments(&target);
+        self.clear_mentions(&target);
+        if self.snapshot.target.as_ref() == Some(&target) { self.set_prompt("", window, cx); }
+        cx.notify();
+        Some(DiscardedDraft { draft, attachments })
+    }
+
+    pub(crate) fn restore_sidebar_draft(&mut self, project: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
+        let target = Target::Draft(project.into());
+        let DiscardedDraft { draft, attachments } = discarded;
+        if !self.drafts.store.restore(&key(&target), draft.clone()) {
+            self.commit_sidebar_discard(DiscardedDraft { draft, attachments }, cx);
+            self.error = Some("Failed to restore draft: The draft has new content.".into());
+            cx.notify();
+            return;
+        }
+        self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
+        self.seed_mentions(&target, draft.thread_contexts());
+        self.seed_terminals(&target, draft.terminals.clone());
+        self.restore_draft_attachments(&target, attachments, cx);
+        if self.snapshot.target.as_ref() == Some(&target) { self.set_prompt(&draft.restored_prompt(), window, cx); }
+        self.schedule_draft_save(cx);
+        cx.notify();
+    }
+}
+
+impl Composer {
+    pub(crate) fn commit_sidebar_discard(&mut self, discarded: DiscardedDraft, cx: &mut Context<Self>) {
+        for attachment in discarded.attachments {
+            if let Some(id) = attachment.attachment.attachment_id() { self.release_upload(id, cx); }
+        }
     }
 }

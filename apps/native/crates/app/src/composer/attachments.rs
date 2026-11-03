@@ -235,7 +235,7 @@ impl Composer {
         }
     }
 
-    fn release_upload(&self, attachment_id: &str, cx: &App) {
+    pub(super) fn release_upload(&self, attachment_id: &str, cx: &App) {
         let request = self.state.read(cx).rpc(rules::DELETE, rules::delete_request(attachment_id));
         cx.background_executor().spawn(async move { request.await.ok() }).detach();
     }
@@ -510,3 +510,16 @@ fn ghost_icon_button(id: SharedString, icon: Icon, cx: &App) -> gpui::Stateful<g
         .child(icon.render(px(14.), hsla(p.muted_foreground)))
 }
 
+
+impl Composer {
+    pub(super) fn take_draft_attachments(&mut self, target: &Target) -> Vec<Staged> {
+        let mut staged = self.attachments.staged.remove(target).unwrap_or_default();
+        for entry in &mut staged { entry._upload = None; }
+        staged
+    }
+    pub(super) fn restore_draft_attachments(&mut self, target: &Target, staged: Vec<Staged>, cx: &mut Context<Self>) {
+        let retry: Vec<_> = staged.iter().filter(|entry| entry.attachment.attachment_id().is_none()).map(|entry| entry.attachment.id.clone()).collect();
+        self.attachments.staged.insert(target.clone(), staged);
+        for id in retry { self.start_upload(target.clone(), id, cx); }
+    }
+}

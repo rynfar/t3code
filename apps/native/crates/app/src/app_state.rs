@@ -32,6 +32,7 @@ pub enum Phase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
+    RestoreDraft,
     /// The connection, the saved environments, or the connect screen changed. Also sent for
     /// every new connection, so whatever follows one can check `connection_id`.
     Phase,

@@ -221,7 +221,7 @@ fn isolated_home() -> Result<PathBuf, String> {
         .ok_or("set T3_NATIVE_HOME to the native home whose saved environments to use")?;
     let home = std::env::temp_dir().join(format!("t3-native-snapshot-{}", std::process::id()));
     std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
-    for name in ["environments.json", "connection.json"] {
+    for name in ["environments.json", "connection.json", "composer-drafts.json"] {
         if source.join(name).exists() {
             std::fs::copy(source.join(name), home.join(name)).map_err(|error| format!("could not copy {name}: {error}"))?;
         }

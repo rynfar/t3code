@@ -96,6 +96,8 @@ pub struct SidebarController {
     /// The thread being dragged and the section it left.
     pub drag: Option<(String, t3_core::sidebar::Section)>,
     pub favicons: super::favicons::FaviconStore,
+    pub drafts_to_restore: Vec<String>,
+    pub hidden_thread_ids: std::collections::HashSet<String>,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
     wake_timer: Option<Task<()>>,
@@ -119,6 +121,13 @@ impl AppState {
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
         let now = now_ms();
         let extras = self.omitted.mounts.extras(&self.shell);
+        let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
+        let environment_id = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or("local");
+        let threads: Vec<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter()).chain(extras.iter().copied()).collect();
+        self.sidebar.hidden_thread_ids = t3_core::sidebar::tag_filter::hidden_thread_keys(
+            &[t3_core::sidebar::tag_filter::Environment { environment_id, threads: &threads, hidden_tags: tags.as_deref() }],
+            &Default::default(), &Default::default(), tags.is_some(),
+        ).into_iter().map(|key| key.thread_id).collect();
         let older = self.omitted.older();
         let frontier = self.omitted.pages.listing_frontier(older.as_ref());
         let older_settled = older.as_ref().map(|older| OlderSettledShelf { older, frontier });
@@ -132,6 +141,7 @@ impl AppState {
                     shelves: &self.sidebar.shelves,
                     selected_thread_id: self.selected_thread.as_deref(),
                     project_scope: self.sidebar.project_scope.as_ref(),
+                    hidden_thread_ids: Some(&self.sidebar.hidden_thread_ids),
                     connected: connected(&self.phase),
                     now,
                     dragging: self.sidebar.drag.as_ref().map(|(_, from)| *from),
@@ -165,6 +175,8 @@ impl AppState {
         self.sidebar.capabilities.auto_settle_opt_out = config.environment.capabilities.thread_auto_settle_opt_out == Some(true);
         let keybindings = config.keybindings.clone();
         crate::keymap::install(&keybindings, cx);
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Shell);
     }
 
     pub fn toggle_shelf(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
@@ -273,7 +285,7 @@ impl AppState {
         .detach();
     }
 
-    fn after_undo_change(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn after_undo_change(&mut self, cx: &mut Context<Self>) {
         cx.emit(AppEvent::Notice);
         let Some(at) = self.sidebar.undo.expires_at() else {
             self.sidebar.undo_timer = None;
@@ -528,10 +540,10 @@ impl AppState {
         if group.is_empty() {
             return false;
         }
-        self.after_undo_change(cx);
         for (thread_id, plan) in group {
             self.run_undo_steps(thread_id, plan, cx);
         }
+        self.after_undo_change(cx);
         true
     }
 
@@ -544,6 +556,11 @@ impl AppState {
         let step = steps.remove(0);
         // Each step goes through its action's claim invalidation, as `runUndoPlan` calls the actions.
         let command = match &step {
+            UndoStep::RestoreDraft => {
+                self.sidebar.drafts_to_restore.push(thread_id);
+                cx.emit(AppEvent::RestoreDraft);
+                return;
+            }
             UndoStep::Unsettle => {
                 self.sidebar.undo.invalidate(UndoKind::Settle, &thread_id);
                 actions::unsettle(&uuid(), &thread_id)

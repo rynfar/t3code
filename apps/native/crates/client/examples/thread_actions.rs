@@ -26,7 +26,7 @@ fn section(shell: &ShellState, thread_id: &str) -> Option<Section> {
         settings: &Default::default(),
         shelves: &Default::default(),
         selected_thread_id: Some(thread_id),
-        project_scope: None,
+        project_scope: None, hidden_thread_ids: None,
         connected: true,
         dragging: None,
         now: now(),
