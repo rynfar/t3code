@@ -665,3 +665,33 @@ fn hiding_whitespace_turns_whitespace_only_edits_into_context() {
     assert_eq!((files[0].additions, files[0].deletions), (0, 0));
     assert_eq!(hide_whitespace_changes(&ParsedPatch::Empty), ParsedPatch::Empty);
 }
+
+#[test]
+fn session_whitespace_defaults_follow_threads_without_leaking_toolbar_overrides() {
+    let mut session = DiffSession::default();
+    assert!(session.ignore_whitespace("thread-a", true));
+    assert!(!session.ignore_whitespace("thread-b", false), "new threads use the saved default");
+    assert!(session.toggle_whitespace("thread-b", false));
+    assert!(!session.ignore_whitespace("thread-a", false), "a toolbar override belongs to its thread");
+    assert!(session.ignore_whitespace("thread-b", false), "returning to the overridden thread keeps its choice");
+    assert!(!session.ignore_whitespace("thread-c", false));
+    assert!(session.ignore_whitespace("thread-c", true), "an untouched thread can pick up a new default on reopen");
+}
+
+#[test]
+fn session_fold_defaults_follow_current_files_until_an_explicit_action() {
+    let mut session = DiffSession::default();
+    let initial = vec!["a".to_owned(), "b".to_owned()];
+    let appended = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+    assert_eq!(session.resolve_folds("scope-a", &initial, true), vec![true, true]);
+    assert_eq!(session.resolve_folds("scope-a", &appended, true), vec![true, true, true], "new files inherit the default");
+    assert_eq!(session.resolve_folds("scope-a", &appended, false), vec![false, false, false], "untouched scopes follow default changes");
+    assert!(session.stored_folds("scope-a").is_none(), "rendering never saves an override");
+    session.set_file_fold("scope-a".to_owned(), "b".to_owned(), false, || initial.iter().cloned().collect());
+    assert_eq!(session.resolve_folds("scope-a", &appended, true), vec![true, false, false]);
+    assert_eq!(session.resolve_folds("scope-a", &appended, false), vec![true, false, false]);
+    session.remember_folds("scope-a".to_owned(), HashSet::new());
+    assert_eq!(session.resolve_folds("scope-a", &appended, true), vec![false, false, false], "expand-all is an explicit override");
+    assert!(session.resolve_folds("scope-b", &[], true).is_empty());
+    assert_eq!(session.resolve_folds("scope-b", &appended, true), vec![true, true, true], "an empty loading scope does not pin an empty override");
+}

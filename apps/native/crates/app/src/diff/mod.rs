@@ -20,7 +20,7 @@ use gpui::{
 use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::diff::{
-    DiffScope, DiffSelection, Layout, ParsedPatch, ToolCallTarget, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id,
+    DiffScope, DiffSelection, DiffSession, Layout, ParsedPatch, ToolCallTarget, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id,
 };
 use t3_core::right_panel::{Surface, SurfaceKind};
 
@@ -55,12 +55,10 @@ pub struct DiffPanel {
     repositories: HashMap<String, bool>,
     connected: bool,
     visible: bool,
-    /// The persisted layout and file tree toggle, as last rendered.
-    ui: (Layout, bool),
+    /// The persisted layout, file tree toggle and default folds, as last rendered.
+    ui: (Layout, bool, bool),
     view: Option<View>,
-    /// Session-only folds per scope; a scope with no entry starts all collapsed
-    /// (`diffFilesCollapsed` defaults to true).
-    collapsed: HashMap<String, HashSet<String>>,
+    session: DiffSession,
     tree_collapsed: HashSet<String>,
     list: ListState,
     tree_scroll: UniformListScrollHandle,
@@ -116,9 +114,9 @@ impl DiffPanel {
             repositories: HashMap::new(),
             connected: false,
             visible: false,
-            ui: (Layout::Stacked, false),
+            ui: (Layout::Stacked, false, true),
             view: None,
-            collapsed: HashMap::new(),
+            session: DiffSession::default(),
             tree_collapsed: HashSet::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             tree_scroll: UniformListScrollHandle::new(),
@@ -152,7 +150,7 @@ impl DiffPanel {
     /// scope, the request, the connection or the workspace actually changed.
     fn sync(&mut self, cx: &mut Context<Self>) {
         if self.external.is_some() {
-            let ui = (crate::settings::client_settings(cx).diff_layout(), self.state.read(cx).panels.diff_file_tree_open);
+            let ui = (crate::settings::client_settings(cx).diff_layout(), self.state.read(cx).panels.diff_file_tree_open, crate::settings::client_settings(cx).diff_files_collapsed());
             if ui != self.ui {
                 self.ui = ui;
                 self.rebuild(cx);
@@ -162,7 +160,8 @@ impl DiffPanel {
         }
         let state = self.state.read(cx);
         let thread_id = state.selected_thread.clone();
-        if thread_id != self.thread_id {
+        let thread_changed = thread_id != self.thread_id;
+        if thread_changed {
             self.thread_id = thread_id.clone();
             self.fingerprint = (0, None);
             self.summaries = Arc::new(Vec::new());
@@ -178,6 +177,9 @@ impl DiffPanel {
             }
             return;
         };
+        let ignore_whitespace = self.session.ignore_whitespace(&thread_id, crate::settings::client_settings(cx).diff_ignore_whitespace());
+        let whitespace_changed = self.ignore_whitespace != ignore_whitespace;
+        self.ignore_whitespace = ignore_whitespace;
         // A failed request reruns once the connection settles (`runtime.ts` query re-execution).
         let connected = matches!(state.phase, Phase::Online(ConnectionStatus::Connected));
         let reconnected = connected && !self.connected;
@@ -249,11 +251,13 @@ impl DiffPanel {
             DiffScope::Turn { .. } | DiffScope::NoTurns => None,
             DiffScope::ToolCall(target) => Some(RequestKey::ToolCall { environment, target: target.clone() }),
         });
-        let ui = (crate::settings::client_settings(cx).diff_layout(), state.panels.diff_file_tree_open);
-        let changed = request != self.request
+        let ui = (crate::settings::client_settings(cx).diff_layout(), state.panels.diff_file_tree_open, crate::settings::client_settings(cx).diff_files_collapsed());
+        let changed = thread_changed
+            || request != self.request
             || scope != self.scope
             || selection != self.selection
             || checkpoints_changed
+            || whitespace_changed
             || reconnected
             || ui != self.ui;
         self.ui = ui;
@@ -382,8 +386,9 @@ impl DiffPanel {
         };
         let scope_key = self.scope_key();
         let layout = crate::settings::client_settings(cx).diff_layout();
+        let files_collapsed_default = crate::settings::client_settings(cx).diff_files_collapsed();
         let same = self.view.as_ref().is_some_and(|view| {
-            Arc::ptr_eq(&view.parsed, &parsed) && view.scope_key == scope_key && view.layout == layout
+            Arc::ptr_eq(&view.parsed, &parsed) && view.scope_key == scope_key && view.layout == layout && view.files_collapsed_default == files_collapsed_default
         });
         if same {
             self.reveal_requested(cx);
@@ -395,18 +400,7 @@ impl DiffPanel {
             .as_ref()
             .filter(|view| view.scope_key == scope_key && view.layout == layout)
             .map(|_| self.list.logical_scroll_top());
-        let folds = self.collapsed.entry(scope_key.clone()).or_insert_with(|| {
-            if crate::settings::client_settings(cx).diff_files_collapsed() {
-                parsed
-                    .files()
-                    .iter()
-                    .map(t3_core::diff::FileDiff::key)
-                    .collect()
-            } else {
-                HashSet::new()
-            }
-        });
-        let view = View::new(parsed, scope_key.clone(), layout, Some(folds), &self.tree_collapsed);
+        let view = View::new(parsed, scope_key.clone(), layout, &self.session, files_collapsed_default, &self.tree_collapsed);
         let count = view.row_count();
         self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT));
         match keep.filter(|top| top.item_ix < count) {
@@ -421,19 +415,13 @@ impl DiffPanel {
     /// Folds or unfolds one file, splicing only its rows so the list keeps its place.
     fn set_folded(&mut self, file: usize, folded: bool, cx: &mut Context<Self>) {
         let Some(view) = self.view.as_mut() else { return };
-        let Some((range, count)) = view.set_folded(file, folded) else { return };
-        let key = view.key(file).map(str::to_owned);
-        let defaults = || view.folded_keys();
-        let folds = self.collapsed.entry(view.scope_key.clone()).or_insert_with(defaults);
-        if let Some(key) = key {
-            if folded {
-                folds.insert(key);
-            } else {
-                folds.remove(&key);
-            }
+        let change = view.set_folded(file, folded);
+        let Some(key) = view.key(file).map(str::to_owned) else { return };
+        self.session.set_file_fold(view.scope_key.clone(), key, folded, || view.folded_keys());
+        if let Some((range, count)) = change {
+            self.list.splice(range, count);
+            cx.notify();
         }
-        self.list.splice(range, count);
-        cx.notify();
     }
 
     pub fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
@@ -446,7 +434,7 @@ impl DiffPanel {
         let Some(view) = self.view.as_mut() else { return };
         let fold = !view.all_folded();
         view.set_all_folded(fold);
-        self.collapsed.insert(view.scope_key.clone(), view.folded_keys());
+        self.session.remember_folds(view.scope_key.clone(), view.folded_keys());
         self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
         cx.notify();
     }
@@ -521,7 +509,8 @@ impl DiffPanel {
     }
 
     pub fn toggle_whitespace(&mut self, cx: &mut Context<Self>) {
-        self.ignore_whitespace = !self.ignore_whitespace;
+        let Some(thread_id) = self.thread_id.as_deref() else { return };
+        self.ignore_whitespace = self.session.toggle_whitespace(thread_id, crate::settings::client_settings(cx).diff_ignore_whitespace());
         self.sync(cx);
         // A tool call hides whitespace itself, so its request stays the same.
         self.rebuild(cx);

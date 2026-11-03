@@ -9,6 +9,7 @@
 mod parse;
 mod rows;
 mod scope;
+mod session;
 mod tool_call;
 mod tree;
 mod whitespace;
@@ -16,6 +17,7 @@ mod whitespace;
 use std::sync::Arc;
 
 pub use parse::parse_patch;
+pub use session::DiffSession;
 pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{
     CheckpointFile, method, DiffPreviewSource, DiffScope, DiffSelection, FileTotals, PreviewSourceKind,
