@@ -6873,9 +6873,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tree-sitter",
- "tree-sitter-applescript",
  "tree-sitter-bash",
- "tree-sitter-fish",
  "tree-sitter-powershell",
  "tree-sitter-ruby",
  "tree-sitter-xml",
@@ -7446,15 +7444,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-applescript"
-version = "2.1.0"
-source = "git+https://github.com/waddie/tree-sitter-applescript?rev=e47cf0c9ae03055aedcc086e62f41004a112e1a3#e47cf0c9ae03055aedcc086e62f41004a112e1a3"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
 name = "tree-sitter-bash"
 version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7482,16 +7471,6 @@ checksum = "dfe1e5ca280a65dfe5ba4205c1bcc84edf486464fed315db53dee6da9a335889"
 dependencies = [
  "cc",
  "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-fish"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "014e3b299f251e9c2e372e3b5e1b0323ef21196e9aa2e90a5bc1f6130cbe8b18"
-dependencies = [
- "cc",
- "tree-sitter",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ pub struct Grammar {
     pub highlights: String,
 }
 
-pub const LANGUAGES: [&str; 5] = ["powershell", "fish", "perl", "applescript", "xml"];
+pub const LANGUAGES: [&str; 3] = ["powershell", "perl", "xml"];
 
 pub fn grammar(name: &str) -> Option<Grammar> {
     let (language, highlights) = match name {
@@ -26,7 +26,6 @@ pub fn grammar(name: &str) -> Option<Grammar> {
 ["=" "|"] @operator
 "#,
         ),
-        "fish" => (tree_sitter_fish::language(), tree_sitter_fish::HIGHLIGHTS_QUERY.replace("@constant", "@variable")),
         "perl" => {
             let mut query = ts_parser_perl::HIGHLIGHTS_QUERY.to_owned();
             for capture in ["include", "conditional", "repeat", "exception"] {
@@ -35,20 +34,32 @@ pub fn grammar(name: &str) -> Option<Grammar> {
             query = query.replace("@method", "@function").replace("@character.special", "@string.special");
             (ts_parser_perl::LANGUAGE.into(), query)
         }
-        "applescript" => (
-            tree_sitter_applescript::LANGUAGE.into(),
-            tree_sitter_applescript::HIGHLIGHTS_QUERY
-                .replace("@constant.builtin.boolean", "@boolean")
-                .replace("@constant.numeric.integer", "@number")
-                .replace("@constant.numeric.float", "@number"),
-        ),
         "xml" => (
             tree_sitter_xml::LANGUAGE_XML.into(),
-            tree_sitter_xml::XML_HIGHLIGHT_QUERY.replace("(Attribute (Name) @property)", "(Attribute (Name) @attribute)"),
+            tree_sitter_xml::XML_HIGHLIGHT_QUERY
+                .replace("(Attribute (Name) @property)", "(Attribute (Name) @attribute)")
+                .replace("@constant.builtin", "@string.escape")
+                .replace("(EntityRef) @constant", "(EntityRef) @string.escape")
+                .replace("(CharRef) @constant", "(CharRef) @string.escape")
+                .replace(r#"[ "\"" "'" ] @punctuation.delimiter"#, r#"[ "\"" "'" ] @string"#)
+                .replace(r#"[ "," "|" "=" ] @operator"#, r#"[ "," "|" ] @operator
+"=" @punctuation.delimiter"#),
         ),
         _ => return None,
     };
     Some(Grammar { language, highlights })
+}
+
+pub fn ruby_highlights(query: &str) -> String {
+    query
+        .replace("(escape_sequence) @escape", "(escape_sequence) @string.escape")
+        .replace("@property", "@variable.special")
+        .replace("  (true)\n  (false)\n", "")
+        + r#"
+[(true) (false)] @boolean
+(binary operator: _ @operator)
+(unary operator: _ @operator)
+"#
 }
 
 #[cfg(test)]
@@ -61,14 +72,12 @@ mod tests {
         for (name, code, tokens) in [
             ("powershell", "$n = 2; Get-Item \"src\" # note", vec![("$n", "variable"), ("2", "number"), ("Get-Item", "function"), ("\"src\"", "string"), ("# note", "comment")]),
             ("powershell", "Get-Item -Path $env:HOME; if ($true) { Write-Host \"hi $n\" }", vec![("-Path", "variable"), ("$env:HOME", "variable"), ("$true", "boolean"), ("(", "punctuation"), ("$n", "variable")]),
-            ("fish", "if test $n; echo \"hi\"; end # note\n", vec![("if", "keyword"), ("$n", "variable"), ("echo", "function"), ("\"hi\"", "string"), ("# note", "comment")]),
             ("perl", "my $n = 2; print \"hi\"; # note", vec![("my", "keyword"), ("$n", "variable"), ("2", "number"), ("print", "function"), ("\"hi\"", "string"), ("# note", "comment")]),
-            ("applescript", "set n to 2 -- note\nreturn \"hi\"", vec![("set", "keyword"), ("n", "variable"), ("2", "number"), ("-- note", "comment"), ("\"hi\"", "string")]),
             ("xml", "<item n=\"2\">hi</item><!-- note -->", vec![("item", "tag"), ("n", "attribute"), ("\"2\"", "string"), ("<!-- note -->", "comment")]),
             ("ruby", "if n == 2; puts \"hi\"; end # note\n", vec![("if", "keyword"), ("2", "number"), ("puts", "function"), ("\"hi\"", "string"), ("# note", "comment")]),
         ] {
             let grammar = if name == "ruby" {
-                Grammar { language: tree_sitter_ruby::LANGUAGE.into(), highlights: tree_sitter_ruby::HIGHLIGHTS_QUERY.into() }
+                Grammar { language: tree_sitter_ruby::LANGUAGE.into(), highlights: ruby_highlights(tree_sitter_ruby::HIGHLIGHTS_QUERY) }
             } else {
                 grammar(name).unwrap_or_else(|| panic!("missing {name} grammar"))
             };

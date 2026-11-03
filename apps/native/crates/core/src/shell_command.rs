@@ -1,6 +1,7 @@
 //! Embedded script byte mappings from `apps/web/src/lib/embeddedScripts.ts`.
 
 pub mod grammars;
+mod statements;
 
 use std::ops::Range;
 
@@ -45,38 +46,7 @@ pub fn highlight_language(command: &str) -> &'static str {
             verbs.split_whitespace().any(|known| known == verb) && noun.starts_with(|ch: char| ch.is_ascii_uppercase()) && noun.chars().all(|ch| ch.is_ascii_alphabetic())
         })
     };
-    let mut quote = None;
-    let mut escaped = false;
-    let mut start = 0;
-    let mut segments = 0;
-    for (index, ch) in command.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if matches!(ch, '\'' | '\"' | '`') {
-            if quote == Some(ch) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(ch);
-            }
-        }
-        if quote.is_none() && matches!(ch, ';' | '&' | '|' | '\n') {
-            if is_powershell(&command[start..index]) {
-                return "powershell";
-            }
-            start = index + ch.len_utf8();
-            segments += 1;
-            if segments >= 64 {
-                return "bash";
-            }
-        }
-    }
-    if is_powershell(&command[start..]) { "powershell" } else { "bash" }
+    if statements::statements(command).iter().any(|statement| is_powershell(statement)) { "powershell" } else { "bash" }
 }
 
 pub fn embedded_scripts(source: &str, tree: &tree_sitter::Tree) -> Vec<EmbeddedScript> {
@@ -388,11 +358,16 @@ fn delimiter_language(name: &str) -> Option<&'static str> {
 
 fn file_language(path: &str) -> Option<&'static str> {
     let path = path.trim_matches(['\'', '"']);
+    if matches!(path.rsplit(['/', '\\']).next()?, "Gemfile" | "Rakefile" | "Guardfile" | "Capfile" | "Berksfile" | "Brewfile" | "Vagrantfile" | "Thorfile" | "Appraisals" | "Dangerfile") {
+        return Some("ruby");
+    }
     crate::files::syntax_language(path).or_else(|| {
         let extension = path.rsplit('.').next()?.to_ascii_lowercase();
         match extension.as_str() {
             "ps1" | "psm1" | "psd1" => Some("powershell"),
-            "pl" | "pm" => Some("perl"),
+            "pl" => Some("prolog"),
+            "pm" => Some("perl"),
+            "rake" | "gemspec" | "jbuilder" | "builder" | "rabl" | "arb" | "ru" | "podspec" => Some("ruby"),
             "fish" => Some("fish"),
             "applescript" | "scpt" => Some("applescript"),
             "xsl" | "xslt" => Some("xml"),
@@ -421,6 +396,12 @@ mod tests {
             ("cd src; Get-Item .", "powershell"),
             ("echo 'Get-Item .; hi'", "bash"),
             ("node -e 'console.log(1)'", "bash"),
+            ("perl <<'EOF'\n$n = 2; print $n;\nEOF", "bash"),
+            ("cat > app.ps1 <<'EOF'\nGet-Item .\nEOF", "bash"),
+            ("echo ok # ignored; Get-Item .\necho done", "bash"),
+            ("echo $(printf 'x'; Get-Item .)", "bash"),
+            ("cat <<-'EOF' <<NEXT\n\tGet-Item .\n\tEOF\n$n = 2\nNEXT\nGet-Item .", "powershell"),
+            ("cat <<EOF; Get-Item .\n$n = 2\nEOF", "powershell"),
         ] {
             assert_eq!(highlight_language(command), language, "{command}");
         }
@@ -449,7 +430,7 @@ mod tests {
             ("cat > readme.md <<'EOF'\n# Title\nEOF", "markdown", "# Title\n"),
             ("cat > app.ps1 <<'EOF'\nGet-Item .\nEOF", "powershell", "Get-Item .\n"),
             ("tee app.fish <<'EOF'\nset n 2\nEOF", "fish", "set n 2\n"),
-            ("cat > app.pl <<'EOF'\nmy $n = 2;\nEOF", "perl", "my $n = 2;\n"),
+            ("cat > app.pl <<'EOF'\nmy $n = 2;\nEOF", "prolog", "my $n = 2;\n"),
             ("cat > app.applescript <<'EOF'\nset n to 2\nEOF", "applescript", "set n to 2\n"),
             ("kubectl apply -f - <<'YAML'\nkind: Pod\nYAML", "yaml", "kind: Pod\n"),
             ("echo \"$(node -e 'console.log(1)')\"", "javascript", "console.log(1)"),
