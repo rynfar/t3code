@@ -1,9 +1,8 @@
-//! Ports client-runtime/relay/{discovery,errorPresentation}.ts and web/cloud/dpop.ts.
-use crate::connect::encode;
-use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+//! Ports client-runtime/relay/{discovery,errorPresentation}.ts.
+
+pub const CONNECTION_UNAVAILABLE: &str = "Connecting through T3 Connect is not supported with native sign-in yet. Use a pairing link or SSH.";
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,63 +132,10 @@ pub fn error_message(status: u16, error: &Value) -> String {
     }
 }
 
-#[derive(Clone)]
-pub struct ProofKey(SigningKey);
-impl ProofKey {
-    pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, p256::ecdsa::Error> {
-        SigningKey::from_bytes(bytes.into()).map(Self)
-    }
-    fn jwk(&self) -> Value {
-        let point = self.0.verifying_key().to_encoded_point(false);
-        json!({"crv":"P-256","kty":"EC","x":encode(point.x().expect("uncompressed x")),"y":encode(point.y().expect("uncompressed y"))})
-    }
-    pub fn thumbprint(&self) -> String {
-        let j = self.jwk();
-        let canonical = format!(
-            r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
-            j["x"].as_str().unwrap_or_default(),
-            j["y"].as_str().unwrap_or_default()
-        );
-        encode(&Sha256::digest(canonical.as_bytes()))
-    }
-    pub fn proof(&self, method: &str, url: &str, token: Option<&str>, now: u64, jti: &str) -> Result<String, url::ParseError> {
-        let mut url = url::Url::parse(url)?;
-        url.set_query(None);
-        url.set_fragment(None);
-        let header = json!({"typ":"dpop+jwt","alg":"ES256","jwk":self.jwk()});
-        let mut claims = json!({"htm":method.to_uppercase(),"htu":url.as_str(),"iat":now,"jti":jti});
-        if let Some(token) = token {
-            claims["ath"] = json!(encode(&Sha256::digest(token.as_bytes())));
-        }
-        let input = format!("{}.{}", encode(header.to_string().as_bytes()), encode(claims.to_string().as_bytes()));
-        let signature: Signature = self.0.sign(input.as_bytes());
-        Ok(format!("{input}.{}", encode(&signature.to_bytes())))
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use p256::ecdsa::signature::Verifier;
-    #[test]
-    fn proofs_bind_the_key_method_url_and_token() {
-        let key = ProofKey::from_bytes(&[1; 32]).unwrap();
-        let jwt = key.proof("post", "https://relay.test/path?q=1#hash", Some("access"), 100, "id").unwrap();
-        let parts: Vec<_> = jwt.split('.').collect();
-        let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
-        assert_eq!(
-            claims,
-            json!({"htm":"POST","htu":"https://relay.test/path","iat":100,"jti":"id","ath":encode(&Sha256::digest(b"access"))})
-        );
-        let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
-        assert!(
-            key.0
-                .verifying_key()
-                .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
-                .is_ok()
-        );
-        assert_eq!(key.thumbprint().len(), 43);
-    }
+    use serde_json::json;
     #[test]
     fn discovery_rejects_cross_environment_status_and_accepts_future_fields_and_states() {
         let endpoint = json!({"httpBaseUrl":"https://env.test","wsBaseUrl":"wss://env.test/ws","providerKind":"cloudflare_tunnel"});

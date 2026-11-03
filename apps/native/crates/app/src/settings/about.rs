@@ -44,7 +44,7 @@ impl SettingsView {
                     .into_any_element(),
                 Row::new("orchestration-protocol", "Orchestration protocol").control(value(protocol.to_string())).into_any_element(),
                 Row::new("cloud-account", "T3 Connect")
-                    .description("Sign in to connect to your environments from anywhere.")
+                    .description("Sign in to view your T3 Connect environments.")
                     .control(Button::new("cloud-account-button", ButtonVariant::Outline, ButtonSize::Sm).label("Manage…").on_click(move |_, window, cx| {
                         close(window, cx);
                         cloud_state.update(cx, |state, cx| state.open_switcher(cx));

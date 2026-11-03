@@ -77,7 +77,7 @@ impl SavedEnvironment {
 
     pub fn credentials(&self) -> Option<Credentials> {
         let access_token = self.access_token.clone()?;
-        Some(Credentials { http_base: self.http_base.clone(), access_token, relay: None })
+        Some(Credentials { http_base: self.http_base.clone(), access_token })
     }
 }
 
@@ -168,7 +168,8 @@ impl SavedEnvironments {
                 .or_else(|| previous.as_ref().and_then(|environment| environment.server_version.clone())),
             local: ssh.is_none() && (local || previous.is_some_and(|environment| environment.local)),
             ssh,
-            relay: None,        };
+            relay: None,
+        };
         match self.environments.iter_mut().find(|entry| entry.id == id) {
             Some(entry) => *entry = environment,
             None => self.environments.push(environment),
@@ -177,13 +178,11 @@ impl SavedEnvironments {
         id
     }
 
-    pub fn upsert_relay(&mut self, environment: t3_core::relay::Environment) -> String {
-        let existing = self.find(Some(&environment.environment_id), &environment.endpoint.http_base_url).map(|e| e.id.clone());
-        let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let saved = SavedEnvironment { id: id.clone(), environment_id: Some(environment.environment_id.clone()), label: environment.label.clone(), http_base: environment.endpoint.http_base_url.trim_end_matches('/').into(), access_token: None, server_version: None, local: false, ssh: None, relay: Some(environment) };
-        match self.environments.iter_mut().find(|e| e.id == id) { Some(entry) => *entry = saved, None => self.environments.push(saved) }
-        self.active = Some(id.clone());
-        id
+    pub fn upsert_relay(&mut self, environment: t3_core::relay::Environment) -> Result<String, &'static str> {
+        if self.find(Some(&environment.environment_id), &environment.endpoint.http_base_url).is_some_and(|entry| entry.relay.is_none()) {
+            return Err("This computer is already saved with a direct or SSH connection. Its saved connection was kept.");
+        }
+        Err(t3_core::relay::CONNECTION_UNAVAILABLE)
     }
 
     /// Points a saved environment at another address of the same server, as when T3 Code on this
@@ -582,7 +581,7 @@ mod tests {
             server_version: "0.1.7".into(),
             ..Default::default()
         });
-        Paired { credentials: Credentials { http_base: http_base.into(), access_token: token.into(), relay: None }, descriptor }
+        Paired { credentials: Credentials { http_base: http_base.into(), access_token: token.into() }, descriptor }
     }
 
     #[test]
@@ -690,14 +689,21 @@ mod tests {
         saved.upsert(&paired("https://devbox.ts.net", "t3", "env-devbox", "devbox"), false);
         assert_eq!(saved.get(&devbox).map(|e| (e.ssh.is_none(), e.http_base.as_str())), Some((true, "https://devbox.ts.net")));
         let relay = t3_core::relay::Environment { environment_id: "env-devbox".into(), label: "devbox".into(), endpoint: t3_core::relay::Endpoint { http_base_url: "https://devbox.connect.test".into(), ws_base_url: "wss://devbox.connect.test/ws".into(), provider_kind: "cloudflare_tunnel".into() } };
-        assert_eq!(saved.upsert_relay(relay), devbox);
-        let text = serde_json::to_string(&saved).unwrap();
-        let restored = decode_environments(Some(&text), None);
-        let entry = restored.get(&devbox).unwrap();
-        assert_eq!(entry.address(), "T3 Connect");
-        assert!(entry.ssh.is_none() && entry.access_token.is_none() && entry.relay.is_some());
-        saved.upsert(&paired("https://devbox.ts.net", "direct", "env-devbox", "devbox"), false);
-        assert!(saved.get(&devbox).unwrap().relay.is_none());
+        let direct = saved.clone();
+        assert!(saved.upsert_relay(relay.clone()).unwrap_err().contains("kept"));
+        assert_eq!(saved, direct, "cloud discovery must not replace a direct credential");
+        saved.upsert_ssh(&paired("http://127.0.0.1:52003", "ssh", "env-devbox", "devbox"), t3_core::ssh::SshTarget { alias: "devbox".into(), hostname: "devbox.example.com".into(), username: None, port: None });
+        let ssh = saved.clone();
+        assert!(saved.upsert_relay(relay.clone()).unwrap_err().contains("kept"));
+        assert_eq!(saved, ssh, "cloud discovery must not replace an SSH credential or tunnel");
+        saved.upsert(&paired("http://127.0.0.1:14658", "local", "env-devbox", "devbox"), true);
+        let local = saved.clone();
+        assert!(saved.upsert_relay(relay.clone()).is_err());
+        assert_eq!(saved, local, "cloud discovery must not replace this Mac's pairing");
+        let mut empty = SavedEnvironments::default();
+        assert_eq!(empty.upsert_relay(relay), Err(t3_core::relay::CONNECTION_UNAVAILABLE));
+        assert_eq!(empty, SavedEnvironments::default());
+
         // Entries saved before SSH existed read as direct.
         assert_eq!(decode_environments(Some(r#"{"environments":[{"id":"a","label":"A","httpBase":"http://h"}]}"#), None).environments[0].ssh, None);
     }

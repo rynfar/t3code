@@ -116,7 +116,7 @@ async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, one
 #[tokio::test]
 async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
     let (commands, mut rx) = mpsc::unbounded_channel();
-    let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into(), relay: None });
+    let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() });
     let handle = ClientHandle { commands, credentials, session_state: watch::channel(None).1 };
     let sends = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
     let run = tokio::spawn(async move { handle.dispatch_in_order(sends).await });

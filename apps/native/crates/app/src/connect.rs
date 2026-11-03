@@ -378,10 +378,7 @@ impl ConnectView {
                             .child("T3 Connect"),
                     )
                     .child(muted(
-                        cloud
-                            .identity
-                            .clone()
-                            .unwrap_or_else(|| "Sign in to connect to your environments from anywhere.".into()),
+                        cloud.identity.clone().unwrap_or_else(|| "Sign in to view your T3 Connect environments.".into()),
                         cx,
                     )),
             )
@@ -398,6 +395,7 @@ impl ConnectView {
             .gap(px(12.))
             .child(heading)
             .child(actions)
+            .when(signed_in, |this| this.child(muted(t3_core::relay::CONNECTION_UNAVAILABLE, cx)))
             .children(cloud.error.clone().map(|error| error_text(error, cx)));
         if signed_in && cloud.discovery.refreshing {
             body = body.child(muted("Loading T3 Connect environments…", cx));
@@ -430,74 +428,48 @@ impl ConnectView {
             return div().h(px(64.)).into_any_element();
         };
         let environment = entry.environment.clone();
-        let mismatch = entry
-            .status
-            .as_ref()
-            .and_then(|s| s.descriptor.as_ref())
-            .and_then(t3_core::compatibility::protocol_mismatch);
-        let status = entry.error.clone().unwrap_or_else(|| {
-            entry
-                .status
-                .as_ref()
-                .map(|s| {
-                    if s.offline_reason.is_some() { return s.message().to_owned(); }
-                    match s.status {
-                        t3_core::relay::Availability::Online => "Relay online",
-                        t3_core::relay::Availability::Offline => "Relay offline",
-                        t3_core::relay::Availability::Unknown => "Checking relay status…",
-                    }.to_owned()
-                })
-                .unwrap_or_else(|| "Checking relay status…".into())
-        });
-        let disabled = cloud.busy || mismatch.is_some() || state.connect.pairing.is_some();
-        let saved = state
-            .environments
-            .environments
-            .iter()
-            .any(|e| e.relay.is_some() && e.environment_id.as_deref() == Some(environment.environment_id.as_str()));
-        let tone = if entry.error.is_some() {
-            Some(DotTone::Destructive)
-        } else {
-            match entry.status.as_ref().map(|s| &s.status) {
-                Some(t3_core::relay::Availability::Online) => Some(DotTone::Success),
-                _ => None,
-            }
-        };
+        let status = "T3 Connect · Connection unavailable";
         h_flex()
             .w_full()
             .min_w_0()
             .h(px(64.))
             .gap(px(10.))
-            .child(status_dot(tone, cx))
+            .child(status_dot(None, cx))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .gap(px(4.))
-                    .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(palette(cx).foreground)).child(environment.label.clone()))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(palette(cx).foreground))
+                            .child(environment.label.clone()),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("relay-status-{}", environment.environment_id)))
                             .truncate()
                             .text_xs()
                             .text_color(hsla(palette(cx).muted_foreground))
-                            .child(format!("T3 Connect · {status}"))
-                            .tooltip(crate::settings::controls::tooltip(status.into())),
+                            .child(status)
+                            .tooltip(crate::settings::controls::tooltip(t3_core::relay::CONNECTION_UNAVAILABLE.into())),
                     ),
             )
-            .when(!saved, |this| {
-                this.child(
-                    Button::new(
-                        SharedString::from(format!("relay-{}", environment.environment_id)),
-                        ButtonVariant::Outline,
-                        ButtonSize::Compact,
-                    )
-                    .label("Add")
-                    .disabled(disabled)
-                    .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.connect_cloud_environment(environment.clone(), cx)))),
+            .child(
+                Button::new(
+                    SharedString::from(format!("relay-{}", environment.environment_id)),
+                    ButtonVariant::Outline,
+                    ButtonSize::Compact,
                 )
-            })
+                .label("Unavailable")
+                .disabled(true)
+                .tooltip(t3_core::relay::CONNECTION_UNAVAILABLE)
+                .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.connect_cloud_environment(environment.clone(), cx)))),
+            )
             .into_any_element()
     }
 
@@ -505,7 +477,8 @@ impl ConnectView {
         let state = self.state.read(cx);
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
         let (tone, status, error_tone) = match &state.phase {
-            _ if environment.access_token.is_none() && environment.relay.is_none() => (Some(DotTone::Destructive), "Needs pairing again".to_owned(), true),
+            _ if environment.relay.is_some() => (None, "Connection unavailable".to_owned(), false),
+            _ if environment.access_token.is_none() => (Some(DotTone::Destructive), "Needs pairing again".to_owned(), true),
             Phase::Online(status) if active => {
                 let (text, error) = status.summary();
                 (Some(status.dot()), text, error)
@@ -532,7 +505,7 @@ impl ConnectView {
                 )))
         } else {
             let (connect, remove) = (id.clone(), id.clone());
-            let action = if active { None } else if environment.access_token.is_some() || environment.relay.is_some() { Some("Connect") } else { Some("Pair again") };
+            let action = if active || environment.relay.is_some() { None } else if environment.access_token.is_some() { Some("Connect") } else { Some("Pair again") };
             h_flex()
                 .gap_1()
                 .children(action.map(|action| {

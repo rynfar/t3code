@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn stream_url_carries_the_target_and_ticket() {
-        let credentials = Credentials { http_base: "https://host.example:3773".into(), access_token: "t".into(), relay: None };
+        let credentials = Credentials { http_base: "https://host.example:3773".into(), access_token: "t".into() };
         let target = StreamTarget { thread_id: "thread 1".into(), tab_id: "tab".into(), max_width: 1080, max_height: 0 };
         assert_eq!(
             stream_url(&credentials, &target, "abc"),

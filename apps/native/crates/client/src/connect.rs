@@ -1,11 +1,12 @@
-//! Native I/O for server/cloud/CliTokenManager.ts and client-runtime/relay/managedRelay.ts.
+//! CLI OAuth from server/cloud/CliTokenManager.ts and bearer listing from relay/managedRelay.ts.
+//! Relay health/connection endpoints require a JWT-only DPoP exchange; CLI OAuth cannot use it.
 use rand::RngCore;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use t3_core::connect::{self, Callback, Token, TokenResponse};
-use t3_core::relay::{Discovered, Discovery, Endpoint, Environment, ProofKey, Status};
+use t3_core::relay::{Discovered, Discovery, Environment};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -76,17 +77,10 @@ struct Account {
     token: Option<Token>,
     generation: u64,
 }
-struct RelayAccess {
-    token: String,
-    expires: u64,
-    generation: u64,
-}
 pub struct Cloud {
     config: Result<Config, String>,
     account: Arc<Mutex<Account>>,
     home: Option<std::path::PathBuf>,
-    relay_access: Mutex<Option<RelayAccess>>,
-    key: ProofKey,
 }
 impl Cloud {
     pub fn new() -> Arc<Self> {
@@ -98,8 +92,6 @@ impl Cloud {
                 token: None,
                 generation: 0,
             })),
-            relay_access: Mutex::new(None),
-            key: ProofKey::from_bytes(&random()).expect("random P-256 key"),
         })
     }
     fn home(&self) -> Result<&std::path::Path, String> {
@@ -175,7 +167,6 @@ impl Cloud {
         account.loaded = true;
         let result = crate::store::clear_cloud_token(self.home()?).map_err(|_| "Could not remove the stored T3 Connect credential.".into());
         drop(account);
-        *self.relay_access.lock().await = None;
         result
     }
     pub async fn sign_in(&self, browser: oneshot::Sender<String>) -> Result<String, String> {
@@ -224,80 +215,6 @@ impl Cloud {
         account.generation += 1;
         Ok(identity)
     }
-    pub fn proof(&self, method: &str, url: &str, token: Option<&str>) -> Result<String, String> {
-        self.key
-            .proof(method, url, token, now_ms() / 1000, &uuid::Uuid::new_v4().to_string())
-            .map_err(|_| "Could not create the DPoP proof.".into())
-    }
-    async fn relay_token(&self) -> Result<(String, u64), String> {
-        let config = self.config()?;
-        let (subject, generation) = self.token().await?;
-        let mut cached = self.relay_access.lock().await;
-        if let Some(access) = cached.as_ref().filter(|a| a.generation == generation && a.expires > now_ms() + 5_000) {
-            return Ok((access.token.clone(), generation));
-        }
-        let exchange = format!("{}/v1/client/dpop-token", config.relay);
-        let scopes = "environment:status environment:connect";
-        let response = http()
-            .post(&exchange)
-            .header("dpop", self.proof("POST", &exchange, None)?)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
-                ("subject_token", &subject),
-                ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
-                ("requested_token_type", "urn:ietf:params:oauth:token-type:access_token"),
-                ("resource", &config.relay),
-                ("scope", scopes),
-                ("client_id", "t3-web"),
-            ])
-            .send()
-            .await
-            .map_err(|_| "Could not reach T3 Connect.")?;
-        let access = relay_response(response).await?;
-        if access["token_type"] != "DPoP" || !scope_matches(access["scope"].as_str().unwrap_or("")) {
-            return Err("Relay returned unexpected access token scopes or type.".into());
-        }
-        let token = access["access_token"]
-            .as_str()
-            .filter(|t| !t.is_empty())
-            .ok_or("Invalid relay token response.")?
-            .to_owned();
-        let expires = access["expires_in"].as_u64().filter(|e| *e > 0).ok_or("Invalid relay token expiry.")?;
-        self.assert_account(generation).await?;
-        *cached = Some(RelayAccess {
-            token: token.clone(),
-            expires: now_ms().saturating_add(expires.saturating_mul(1000)),
-            generation,
-        });
-        Ok((token, generation))
-    }
-    async fn relay_request(&self, path: &str, payload: Option<Value>) -> Result<Value, String> {
-        let url = format!("{}{path}", self.config()?.relay);
-        for attempt in 0..2 {
-            let (token, generation) = self.relay_token().await?;
-            let request = http()
-                .post(&url)
-                .header("authorization", format!("DPoP {token}"))
-                .header("dpop", self.proof("POST", &url, Some(&token))?);
-            let request = if let Some(payload) = &payload { request.json(payload) } else { request };
-            let response = request.send().await.map_err(|_| "Could not reach T3 Connect.")?;
-            let status = response.status();
-            let value = response.json::<Value>().await.unwrap_or(Value::Null);
-            self.assert_account(generation).await?;
-            if !status.is_success() {
-                if attempt == 0 && value["_tag"] == "RelayAuthInvalidError" && value["reason"] == "invalid_bearer" {
-                    let mut cache = self.relay_access.lock().await;
-                    if cache.as_ref().is_some_and(|a| a.token == token) {
-                        *cache = None;
-                    }
-                    continue;
-                }
-                return Err(t3_core::relay::error_message(status.as_u16(), &value));
-            }
-            return Ok(value);
-        }
-        Err("Relay rejected the cloud session token.".into())
-    }
     pub async fn discover(&self) -> Result<Discovery, String> {
         let config = self.config()?;
         let (token, generation) = self.token().await?;
@@ -312,29 +229,15 @@ impl Cloud {
             environments: Vec<Environment>,
         }
         let list: List = serde_json::from_value(relay_response(response).await?).map_err(|_| "Invalid T3 Connect environment list.")?;
-        let environments = futures::stream::iter(list.environments.into_iter().map(|environment| async move {
-            let result = async {
-                let value = self.relay_request(&environment_path(&environment.environment_id, "status"), None).await?;
-                let status: Status = serde_json::from_value(value).map_err(|_| "Invalid relay status response.")?;
-                status.validate(&environment)?;
-                Ok::<_, String>(status)
-            }
-            .await;
-            match result {
-                Ok(status) => Discovered {
-                    environment,
-                    status: Some(status),
-                    error: None,
-                },
-                Err(error) => Discovered {
-                    environment,
-                    status: None,
-                    error: Some(error),
-                },
-            }
-        }));
-        use futures::StreamExt;
-        let environments = environments.buffered(8).collect().await;
+        let environments = list
+            .environments
+            .into_iter()
+            .map(|environment| Discovered {
+                environment,
+                status: None,
+                error: None,
+            })
+            .collect();
         self.assert_account(generation).await?;
         Ok(Discovery {
             listed: true,
@@ -342,15 +245,6 @@ impl Cloud {
             ..Default::default()
         })
     }
-}
-fn environment_path(id: &str, action: &str) -> String {
-    let mut url = url::Url::parse("https://relay.invalid/v1/environments/").expect("constant URL");
-    url.path_segments_mut().expect("base URL").pop_if_empty().push(id).push(action);
-    url.path().into()
-}
-fn scope_matches(scope: &str) -> bool {
-    let set: std::collections::BTreeSet<_> = scope.split_whitespace().collect();
-    set == ["environment:status", "environment:connect"].into_iter().collect()
 }
 async fn relay_response(response: reqwest::Response) -> Result<Value, String> {
     let status = response.status();
@@ -407,102 +301,10 @@ async fn receive_callback(listener: TcpListener, state: &str) -> Result<String, 
     }
 }
 
-pub struct RelayConnection {
-    pub cloud: Arc<Cloud>,
-    pub environment: Environment,
-    token: Mutex<Option<(String, u64, u64)>>,
-}
-impl std::fmt::Debug for RelayConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RelayConnection")
-    }
-}
-impl PartialEq for RelayConnection {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
-    }
-}
-impl Eq for RelayConnection {}
-impl RelayConnection {
-    pub fn new(cloud: Arc<Cloud>, environment: Environment) -> Arc<Self> {
-        Arc::new(Self {
-            cloud,
-            environment,
-            token: Mutex::new(None),
-        })
-    }
-    pub async fn access(&self) -> Result<String, String> {
-        let mut cached = self.token.lock().await;
-        if let Some((token, expires, generation)) = cached.as_ref() {
-            self.cloud.assert_account(*generation).await?;
-            if *expires > now_ms() + 5000 {
-                return Ok(token.clone());
-            }
-        }
-        let (_, generation) = self.cloud.token().await?;
-        let value = self
-            .cloud
-            .relay_request(
-                &environment_path(&self.environment.environment_id, "connect"),
-                Some(json!({"clientKeyThumbprint":self.cloud.key.thumbprint()})),
-            )
-            .await?;
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Bootstrap {
-            environment_id: String,
-            endpoint: Endpoint,
-            credential: String,
-        }
-        let bootstrap: Bootstrap = serde_json::from_value(value).map_err(|_| "Invalid relay connection response.")?;
-        if bootstrap.environment_id != self.environment.environment_id || bootstrap.endpoint != self.environment.endpoint || !bootstrap.endpoint.is_secure() {
-            return Err("Relay returned a different or insecure environment endpoint.".into());
-        }
-        let base = bootstrap.endpoint.http_base_url.trim_end_matches('/');
-        let descriptor = crate::auth::fetch_descriptor(base)
-            .await
-            .map_err(|_| "Could not read the relay environment descriptor.")?;
-        if descriptor.environment_id != self.environment.environment_id {
-            return Err("Relay returned a descriptor for a different environment.".into());
-        }
-        if let Some(mismatch) = t3_core::compatibility::protocol_mismatch(&descriptor) {
-            return Err(mismatch.message(&descriptor.label));
-        }
-        let url = format!("{base}/oauth/token");
-        let response = http()
-            .post(&url)
-            .header("dpop", self.cloud.proof("POST", &url, None)?)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
-                ("subject_token", bootstrap.credential.as_str()),
-                ("subject_token_type", "urn:t3:params:oauth:token-type:environment-bootstrap"),
-                ("requested_token_type", "urn:ietf:params:oauth:token-type:access_token"),
-                ("client_label", "T3 Code Native"),
-                ("client_device_type", "desktop"),
-                ("client_os", crate::auth::client_os()),
-            ])
-            .send()
-            .await
-            .map_err(|_| "Could not authorize the relay environment.")?;
-        let value = relay_response(response).await?;
-        if value["token_type"] != "DPoP" {
-            return Err("Environment returned an unexpected token type.".into());
-        }
-        let token = value["access_token"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("Invalid environment token response.")?
-            .to_owned();
-        let expires = value["expires_in"].as_u64().filter(|e| *e > 0).ok_or("Invalid environment token expiry.")?;
-        self.cloud.assert_account(generation).await?;
-        *cached = Some((token.clone(), now_ms().saturating_add(expires.saturating_mul(1000)), generation));
-        Ok(token)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::net::TcpStream;
 
     struct Fixture {
@@ -525,10 +327,17 @@ mod tests {
             let task = tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let request = read_request(&mut socket).await;
+                    let jwt_only_exchange = request.starts_with("POST /v1/client/dpop-token ");
                     if request_tx.send(request).is_err() {
                         return;
                     }
-                    let Some((status, value)) = reply_rx.recv().await else { return };
+                    // Api.ts rejects CLI OAuth on this endpoint, unlike bearer account listing.
+                    let (status, value) = if jwt_only_exchange {
+                        (401, json!({"_tag":"RelayAuthInvalidError","reason":"invalid_bearer"}))
+                    } else {
+                        let Some(reply) = reply_rx.recv().await else { return };
+                        reply
+                    };
                     let body = value.to_string();
                     let response = format!(
                         "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -587,8 +396,6 @@ mod tests {
                 token: None,
                 generation: 0,
             })),
-            relay_access: Mutex::new(None),
-            key: ProofKey::from_bytes(&[1; 32]).unwrap(),
         })
     }
     fn token(expires: u64) -> Token {
@@ -671,120 +478,43 @@ mod tests {
         std::fs::remove_dir_all(cloud.home().unwrap()).unwrap();
     }
     #[tokio::test]
-    async fn discovery_checks_status_with_scoped_dpop_and_drops_results_after_sign_out() {
+    async fn oauth_discovery_only_lists_and_never_attempts_jwt_only_health_or_connection_endpoints() {
         let mut fixture = Fixture::new().await;
         let cloud = cloud(&fixture);
         cloud.account.lock().await.token = Some(token(u64::MAX));
-        let environment = json!({"environmentId":"env","label":"Mac","endpoint":{"httpBaseUrl":"https://env.test","wsBaseUrl":"wss://env.test/ws","providerKind":"cloudflare_tunnel"},"future":true});
+        let environment = json!({"environmentId":"env","label":"Mac","endpoint":{"httpBaseUrl":"https://old.test","wsBaseUrl":"wss://old.test/ws","providerKind":"cloudflare_tunnel"},"future":true});
         fixture.reply(200, json!({"environments":[environment]}));
-        fixture.reply(
-            200,
-            json!({"access_token":"relay-access","token_type":"DPoP","scope":"environment:connect environment:status","expires_in":60}),
-        );
-        let discover = {
-            let c = cloud.clone();
-            tokio::spawn(async move { c.discover().await })
-        };
+        let discovery = cloud.discover().await.unwrap();
         let listing = fixture.request().await;
         assert!(listing.starts_with("GET /v1/client/environments"));
         assert!(listing.contains("Bearer fixture-access"));
-        let exchange = fixture.request().await;
-        assert!(exchange.starts_with("POST /v1/client/dpop-token"));
-        assert!(exchange.contains("dpop:"));
-        assert!(exchange.contains("client_id=t3-web"));
-        let status = fixture.request().await;
-        assert!(status.starts_with("POST /v1/environments/env/status"));
-        assert!(status.contains("DPoP relay-access"));
+        assert!(fixture.requests.try_recv().is_err(), "CLI OAuth must not call the JWT-only token exchange");
+        assert_eq!(discovery.environments.len(), 1);
+        assert!(discovery.environments[0].status.is_none());
+        assert!(discovery.environments[0].error.is_none());
+        let mut next = environment;
+        next["endpoint"]["httpBaseUrl"] = json!("https://reallocated.test");
+        next["endpoint"]["wsBaseUrl"] = json!("wss://reallocated.test/ws");
+        fixture.reply(200, json!({"environments":[next]}));
+        let refreshed = cloud.discover().await.unwrap();
+        assert_eq!(refreshed.environments[0].environment.endpoint.http_base_url, "https://reallocated.test");
+        assert!(fixture.request().await.starts_with("GET /v1/client/environments"));
+        assert!(fixture.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_a_list_that_finishes_after_sign_out() {
+        let mut fixture = Fixture::new().await;
+        let cloud = cloud(&fixture);
+        cloud.account.lock().await.token = Some(token(u64::MAX));
+        let discovery = {
+            let cloud = cloud.clone();
+            tokio::spawn(async move { cloud.discover().await })
+        };
+        assert!(fixture.request().await.starts_with("GET /v1/client/environments"));
         cloud.sign_out().await.unwrap();
-        fixture.reply(200, json!({"environmentId":"env","endpoint":environment["endpoint"],"status":"online"}));
-        assert!(discover.await.unwrap().is_err());
+        fixture.reply(200, json!({"environments":[]}));
+        assert!(discovery.await.unwrap().is_err());
         assert!(cloud.identity().await.unwrap().is_none());
-    }
-    #[tokio::test]
-    async fn discovery_preserves_offline_errors_and_rejects_unexpected_scopes() {
-        let fixture = Fixture::new().await;
-        let cloud = cloud(&fixture);
-        cloud.account.lock().await.token = Some(token(u64::MAX));
-        let endpoint = json!({"httpBaseUrl":"https://env.test","wsBaseUrl":"wss://env.test/ws","providerKind":"cloudflare_tunnel"});
-        fixture.reply(200, json!({"environments":[{"environmentId":"env","label":"Mac","endpoint":endpoint}]}));
-        fixture.reply(
-            200,
-            json!({"access_token":"relay-access","token_type":"DPoP","scope":"environment:status environment:connect","expires_in":60}),
-        );
-        fixture.reply(
-            200,
-            json!({"environmentId":"env","endpoint":endpoint,"status":"offline","offlineReason":"tunnel_released","traceId":"trace"}),
-        );
-        let result = cloud.discover().await.unwrap();
-        assert!(result.listed);
-        assert!(result.environments[0].status.as_ref().unwrap().message().contains("tunnel was removed"));
-        *cloud.relay_access.lock().await = None;
-        fixture.reply(200, json!({"access_token":"relay-access","token_type":"DPoP","scope":"mobile:registration"}));
-        assert!(cloud.relay_request("/unused", None).await.unwrap_err().contains("scopes"));
-        assert_eq!(environment_path("a/b", "connect"), "/v1/environments/a%2Fb/connect");
-    }
-    #[tokio::test]
-    async fn cached_relay_access_is_reexchanged_once_after_rejection() {
-        let mut fixture = Fixture::new().await;
-        let cloud = cloud(&fixture);
-        cloud.account.lock().await.token = Some(token(u64::MAX));
-        *cloud.relay_access.lock().await = Some(RelayAccess {
-            token: "old-relay".into(),
-            expires: u64::MAX,
-            generation: 0,
-        });
-        fixture.reply(401, json!({"_tag":"RelayAuthInvalidError","reason":"invalid_bearer"}));
-        fixture.reply(
-            200,
-            json!({"access_token":"new-relay","expires_in":60,"token_type":"DPoP","scope":"environment:status environment:connect"}),
-        );
-        fixture.reply(200, json!({"ok":true}));
-        assert_eq!(cloud.relay_request("/status", None).await.unwrap(), json!({"ok":true}));
-        assert!(fixture.request().await.contains("DPoP old-relay"));
-        assert!(fixture.request().await.starts_with("POST /v1/client/dpop-token"));
-        assert!(fixture.request().await.contains("DPoP new-relay"));
-        fixture.reply(200, json!({"ok":true}));
-        cloud.relay_request("/status", None).await.unwrap();
-        assert!(fixture.request().await.contains("DPoP new-relay"));
-    }
-    #[tokio::test]
-    async fn relay_environment_requests_and_rpc_upgrade_use_the_bound_key_and_fresh_path_proofs() {
-        let mut fixture = Fixture::new().await;
-        let cloud = cloud(&fixture);
-        cloud.account.lock().await.token = Some(token(u64::MAX));
-        let environment = Environment {
-            environment_id: "env".into(),
-            label: "Mac".into(),
-            endpoint: Endpoint {
-                http_base_url: fixture.base.clone(),
-                ws_base_url: "wss://socket.test/custom".into(),
-                provider_kind: "cloudflare_tunnel".into(),
-            },
-        };
-        let relay = RelayConnection::new(cloud.clone(), environment);
-        *relay.token.lock().await = Some(("bound-access".into(), u64::MAX, 0));
-        let credentials = crate::auth::Credentials {
-            http_base: fixture.base.clone(),
-            access_token: String::new(),
-            relay: Some(relay),
-        };
-        fixture.reply(404, json!({}));
-        fixture.reply(200, json!({"ticket":"ticket"}));
-        assert_eq!(crate::auth::issue_rpc_ticket(&credentials).await.unwrap(), "ticket");
-        let scoped = fixture.request().await;
-        let fallback = fixture.request().await;
-        assert!(scoped.starts_with("POST /api/auth/websocket-ticket/rpc"));
-        assert!(fallback.starts_with("POST /api/auth/websocket-ticket "));
-        assert!(scoped.contains("DPoP bound-access") && scoped.contains("dpop:"));
-        let proof = |request: String| request.lines().find(|l| l.starts_with("dpop:")).unwrap().to_owned();
-        assert_ne!(proof(scoped), proof(fallback));
-        let url = url::Url::parse(&crate::auth::socket_url(&credentials, "ticket")).unwrap();
-        assert_eq!((url.host_str(), url.path()), (Some("socket.test"), "/custom"));
-        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(params["connectionMethod"], "relay");
-        assert!(!params["dpop"].is_empty());
-        assert!(!format!("{credentials:?}").contains("bound-access"));
-        cloud.sign_out().await.unwrap();
-        assert!(credentials.relay.unwrap().access().await.is_err());
     }
 }

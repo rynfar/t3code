@@ -259,18 +259,12 @@ impl AppState {
     /// through its tunnel on this session's port, which the supervisor readies before each attempt.
     pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.environments.get(id).cloned() else { return };
-        if let Some(target) = environment.relay.clone() {
-            let relay = t3_client::connect::RelayConnection::new(self.cloud.service.clone(), target);
-            let prepare_relay = relay.clone();
-            let prepare: Prepare = Arc::new(move || {
-                let relay = prepare_relay.clone();
-                Box::pin(async move { relay.access().await.map(|_| ()).map_err(t3_client::supervisor::PrepareError::Blocked) })
-            });
-            return self.start_client(Credentials { http_base: environment.http_base, access_token: String::new(), relay: Some(relay) }, Some(prepare), cx);
+        if environment.relay.is_some() {
+            return self.fail_pairing(PairingSource::Link, t3_core::relay::CONNECTION_UNAVAILABLE.into(), cx);
         }
         let Some(access_token) = environment.access_token.clone() else { return };
         let Some(target) = environment.ssh.clone() else {
-            return self.start_client(Credentials { http_base: environment.http_base, access_token, relay: None }, None, cx);
+            return self.start_client(Credentials { http_base: environment.http_base, access_token }, None, cx);
         };
         let port = match self.ssh.session_port(&target) {
             Ok(port) => port,
@@ -285,7 +279,7 @@ impl AppState {
             let (ssh, target, expected, address) = (ssh.clone(), target.clone(), expected.clone(), address.clone());
             Box::pin(async move { ssh.prepare(&target, expected.as_deref(), &address).await })
         });
-        self.start_client(Credentials { http_base, access_token, relay: None }, Some(prepare), cx);
+        self.start_client(Credentials { http_base, access_token }, Some(prepare), cx);
     }
 
     /// The SSH tunnel had to move to another local port, and its client stopped. Reconnects
@@ -310,6 +304,9 @@ impl AppState {
     pub fn connect_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let moved = self.relocate_local(id);
         let Some(environment) = self.environments.get(id).cloned() else { return };
+        if environment.relay.is_some() {
+            return self.fail_pairing(PairingSource::Link, t3_core::relay::CONNECTION_UNAVAILABLE.into(), cx);
+        }
         if !moved && self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
             return self.close_switcher(cx);
         }

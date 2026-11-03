@@ -26,7 +26,9 @@ pub fn history_url(http_base: &str, thread_id: &str, cursor: &str) -> Option<url
 pub async fn fetch_history_page(credentials: &Credentials, thread_id: &str, cursor: &str) -> Result<HistoryPage, String> {
     let url = history_url(&credentials.http_base, thread_id, cursor).ok_or_else(|| FALLBACK.to_owned())?;
     let client = reqwest::Client::builder().timeout(TIMEOUT).build().map_err(|_| FALLBACK.to_owned())?;
-    let response = credentials.authorize(client.get(url.clone()), "GET", url.as_str()).await?
+    let response = client
+        .get(url)
+        .bearer_auth(&credentials.access_token)
         .header(PROTOCOL_HEADER, ORCHESTRATION_PROTOCOL_VERSION.to_string())
         .send()
         .await

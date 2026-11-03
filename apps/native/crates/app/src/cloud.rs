@@ -61,7 +61,9 @@ impl AppState {
                 state.cloud.discovery.refreshing = false;
                 match result {
                     Ok(Ok((identity, discovery))) => {
-                        if identity.is_none() { state.clear_relay_environments(cx); }
+                        if identity.is_none() {
+                            state.clear_relay_environments(cx);
+                        }
                         state.cloud.identity = identity;
                         match discovery {
                             Ok(d) => state.cloud.discovery = d,
@@ -182,10 +184,9 @@ impl AppState {
         if self.cloud.identity.is_none() || self.cloud.busy {
             return;
         }
-        let id = self.environments.upsert_relay(environment);
-        self.persist_environments();
-        self.reset_connection(cx);
-        self.connect.switching = false;
-        self.start_environment(&id, cx);
+        if let Err(message) = self.environments.upsert_relay(environment) {
+            self.cloud.error = Some(message.to_owned());
+            cx.emit(AppEvent::Phase);
+        }
     }
 }

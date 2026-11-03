@@ -81,7 +81,7 @@ impl FakeServer {
     }
 
     pub fn credentials(&self) -> Credentials {
-        Credentials { http_base: format!("http://{}", self.addr), access_token: "token".into(), relay: None }
+        Credentials { http_base: format!("http://{}", self.addr), access_token: "token".into() }
     }
 
     pub fn ws_url(&self) -> String {
