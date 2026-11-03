@@ -98,5 +98,10 @@ pub fn visible_linked_threads<'a, Row>(
         .collect()
 }
 
+/// `ThreadRouteView.tsx`: hidden routes redirect home, including unknown off-shell threads.
+pub fn route_visible(id: &str, loaded: bool, hidden: &HashSet<String>, hiding: bool) -> bool {
+    !hidden.contains(id) && (!hiding || loaded)
+}
+
 #[cfg(test)]
 mod tests;

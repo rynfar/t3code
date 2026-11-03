@@ -182,10 +182,10 @@ impl AppState {
                 {
                     let exists = family.threads.iter().any(|thread| thread.id == thread_id);
                     state.omitted.mounts.mount(&family_key(&thread_id), generation, vec![family]);
+                    state.rebuild_sidebar(cx);
                     if select && exists && state.selected_thread.is_none() && state.draft_project.is_none() {
                         state.select_thread(&thread_id, cx);
                     }
-                    state.rebuild_sidebar(cx);
                     state.sync_side_threads(cx);
                     cx.emit(AppEvent::Shell);
                 }

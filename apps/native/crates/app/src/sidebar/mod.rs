@@ -91,10 +91,12 @@ impl SidebarPane {
     ) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscriptions = vec![
-            cx.subscribe(&composer, |this, _, _: &crate::composer::drafts::DraftsChanged, cx| {
-                let before = this.drafts.rows.clone();
-                this.sync_rows(cx);
-                if this.drafts.rows != before { cx.notify(); }
+            cx.subscribe(&composer, |this, _, event: &crate::composer::drafts::DraftsChanged, cx| {
+                let state = this.state.read(cx);
+                if this.drafts.update_draft(this.composer.read(cx).sidebar_drafts(), &event.project_id, state.sidebar.project_scope.as_ref()) {
+                    this.sync_list_rows(cx);
+                    cx.notify();
+                }
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
                 if *event == AppEvent::RestoreDraft {
@@ -206,6 +208,11 @@ impl SidebarPane {
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         self.drafts.update(self.composer.read(cx).sidebar_drafts(), state.draft_project.as_deref(), state.sidebar.project_scope.as_ref());
+        self.sync_list_rows(cx);
+    }
+
+    fn sync_list_rows(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
         let mut keys: Vec<_> = self.drafts.rows.iter().map(|row| PaneRowKey::Draft(row.project_id.clone())).collect();
         if !keys.is_empty() { keys.push(PaneRowKey::Divider); }
         keys.extend(state.sidebar.model.row_keys().into_iter().map(PaneRowKey::Thread));

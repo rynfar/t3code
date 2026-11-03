@@ -106,3 +106,18 @@ fn tags_and_settings_decode_forward_compatibly() {
     settings.hidden_thread_tags = vec![" ".into()];
     assert_eq!(settings.hidden_tags(), None);
 }
+
+#[test]
+fn hidden_routes_redirect_and_history_cannot_reopen_them() {
+    use crate::sidebar::history::{NavEntry, NavHistory};
+    let hidden = HashSet::from(["private".to_owned()]);
+    assert!(!route_visible("private", true, &hidden, true), "filtering an open thread must redirect home");
+    assert!(!route_visible("unknown", false, &hidden, true), "off-shell routes cannot bypass the filter");
+    assert!(route_visible("plain", true, &hidden, true));
+    assert!(route_visible("unknown", false, &HashSet::new(), false));
+    let mut history = NavHistory::default();
+    for id in ["plain", "private", "latest"] { history.visit(NavEntry::Thread(id.into())); }
+    let visible = |entry: &NavEntry| match entry { NavEntry::Thread(id) => route_visible(id, true, &hidden, true), NavEntry::Draft(_) => true };
+    assert_eq!(history.go(true, visible), Some(&NavEntry::Thread("plain".into())));
+    assert_eq!(history.go(false, visible), Some(&NavEntry::Thread("latest".into())));
+}

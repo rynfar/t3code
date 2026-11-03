@@ -342,6 +342,11 @@ impl AppState {
     }
 
     pub fn select_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if !self.thread_route_visible(thread_id) {
+            self.restore_thread = None;
+            self.clear_selection(cx);
+            return;
+        }
         if self.selected_thread.as_deref() == Some(thread_id) {
             return self.set_pull_requests_open(false, cx);
         }

@@ -183,6 +183,7 @@ impl Composer {
             bytes: Some(Arc::new(bytes)),
             _upload: None,
         });
+        self.record_draft(target, cx);
         self.start_upload(target.clone(), id, cx);
     }
 
@@ -208,20 +209,14 @@ impl Composer {
         let (task_target, task_id) = (target.clone(), id.clone());
         let task = cx.spawn(async move |this, cx| {
             let result = runtime
-                .spawn(async move { t3_client::upload::upload_attachment(&client, request, &mime_type, bytes.to_vec()).await })
+                .spawn(async move { t3_client::upload::upload_attachment_owned(client, request, &mime_type, bytes.to_vec()).await })
                 .await
                 .unwrap_or_else(|_| Err("Upload failed".to_owned()));
             let _ = this.update(cx, |this, cx| {
-                let Some(staged) = this.find_staged(&task_target, &task_id) else {
-                    // Removed while it uploaded: release the server's copy.
-                    if let Ok(attachment_id) = &result {
-                        this.release_upload(attachment_id, cx);
-                    }
-                    return;
-                };
+                let Some(staged) = this.find_staged(&task_target, &task_id) else { return };
                 match result {
                     Ok(attachment_id) => {
-                        staged.attachment.upload = Upload::Ready { attachment_id };
+                        staged.attachment.upload = Upload::Ready { attachment_id: attachment_id.into_id() };
                         staged.bytes = None;
                         this.record_draft(&task_target, cx);
                     }

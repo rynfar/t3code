@@ -15,11 +15,13 @@ fn empty_drafts_are_dropped_and_unchanged_ones_not_rewritten() {
     assert!(store.get(&thread_key("t1")).is_none());
     assert!(!store.set(&thread_key("t1"), draft("", 5)));
     let discarded = draft("original", 6);
-    assert!(store.restore(&new_thread_key("p1"), discarded.clone()));
-    assert!(!store.restore(&new_thread_key("p1"), draft("replacement", 7)));
+    assert!(store.restore(&new_thread_key("p1"), discarded.clone(), &Draft::default()));
+    assert!(!store.restore(&new_thread_key("p1"), draft("replacement", 7), &Draft::default()));
     assert_eq!(store.get(&new_thread_key("p1")).unwrap().prompt, "original");
     store.remove(&new_thread_key("p1"));
     let pending = Draft { pending_attachment_count: 2, ..Draft::default() };
+    assert!(!store.restore(&new_thread_key("upload"), discarded, &pending), "Undo must refuse newly staged attachments even before persistence records them");
+    assert!(store.get(&new_thread_key("upload")).is_none());
     assert!(store.set(&new_thread_key("upload"), pending));
     assert!(store.get(&new_thread_key("upload")).unwrap().has_user_content());
     assert!(DraftStore::from_value(Some(&store.to_value())).get(&new_thread_key("upload")).is_none(), "unuploaded bytes do not persist");

@@ -98,6 +98,7 @@ pub struct SidebarController {
     pub favicons: super::favicons::FaviconStore,
     pub drafts_to_restore: Vec<String>,
     pub hidden_thread_ids: std::collections::HashSet<String>,
+    hiding_tags: bool,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
     wake_timer: Option<Task<()>>,
@@ -105,9 +106,12 @@ pub struct SidebarController {
     undo_timer: Option<Task<()>>,
 }
 
-fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, entry: &NavEntry) -> bool {
+fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, hidden: &std::collections::HashSet<String>, hiding: bool, entry: &NavEntry) -> bool {
     match entry {
-        NavEntry::Thread(id) => mounts.thread(shell, id).is_some(),
+        NavEntry::Thread(id) => {
+            let loaded = mounts.thread(shell, id).is_some();
+            loaded && t3_core::sidebar::tag_filter::route_visible(id, loaded, hidden, hiding)
+        }
         NavEntry::Draft(project_id) => shell.project(project_id).is_some(),
     }
 }
@@ -122,6 +126,7 @@ impl AppState {
         let now = now_ms();
         let extras = self.omitted.mounts.extras(&self.shell);
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
+        self.sidebar.hiding_tags = tags.is_some();
         let environment_id = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or("local");
         let threads: Vec<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter()).chain(extras.iter().copied()).collect();
         self.sidebar.hidden_thread_ids = t3_core::sidebar::tag_filter::hidden_thread_keys(
@@ -153,6 +158,10 @@ impl AppState {
         let next = model.next_change_at;
         let listed_settled = model.listed_settled_count;
         self.sidebar.model = Arc::new(model);
+        if self.selected_thread.as_deref().is_some_and(|id| !self.thread_route_visible(id)) {
+            self.clear_selection(cx);
+            return;
+        }
         self.grow_settled_shelf(listed_settled, cx);
         self.sidebar.wake_timer = next.map(|at| {
             cx.spawn(async move |this, cx| {
@@ -192,15 +201,25 @@ impl AppState {
         cx.emit(AppEvent::Shell);
     }
 
+    fn hiding_thread_tags(&self) -> bool {
+        self.sidebar.hiding_tags
+    }
+
+    pub(crate) fn thread_route_visible(&self, id: &str) -> bool {
+        t3_core::sidebar::tag_filter::route_visible(id, self.thread_shell(id).is_some(), &self.sidebar.hidden_thread_ids, self.hiding_thread_tags())
+    }
+
     pub fn can_navigate(&self, back: bool) -> bool {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        self.sidebar.history.can_go(back, |entry| history_entry_exists(shell, mounts, entry))
+        self.sidebar.history.can_go(back, |entry| history_entry_exists(shell, mounts, &self.sidebar.hidden_thread_ids, self.hiding_thread_tags(), entry))
     }
 
     /// `navigation.back` / `navigation.forward`.
     pub fn navigate_history(&mut self, back: bool, cx: &mut Context<Self>) {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        match self.sidebar.history.go(back, |entry| history_entry_exists(shell, mounts, entry)).cloned() {
+        let hiding = self.hiding_thread_tags();
+        let hidden = &self.sidebar.hidden_thread_ids;
+        match self.sidebar.history.go(back, |entry| history_entry_exists(shell, mounts, hidden, hiding, entry)).cloned() {
             Some(NavEntry::Thread(id)) => self.select_thread(&id, cx),
             Some(NavEntry::Draft(project_id)) => self.start_draft(&project_id, cx),
             None => {}

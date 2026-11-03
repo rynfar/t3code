@@ -189,8 +189,8 @@ impl DraftStore {
         changed
     }
 
-    pub fn restore(&mut self, key: &str, draft: Draft) -> bool {
-        if self.get(key).is_some_and(Draft::has_user_content) { return false; }
+    pub fn restore(&mut self, key: &str, draft: Draft, live: &Draft) -> bool {
+        if live.has_user_content() || self.get(key).is_some_and(Draft::has_user_content) { return false; }
         self.drafts.remove(key);
         self.set(key, draft);
         true
