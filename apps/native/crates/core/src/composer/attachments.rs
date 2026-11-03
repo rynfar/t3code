@@ -9,6 +9,8 @@
 
 use serde_json::{Value, json};
 
+use crate::usage::format::to_fixed;
+
 use super::context::TerminalContext;
 use super::menu::{ThreadContext, kind_scoped_context_id, referenced_context_ids, sanitize_context_label};
 
@@ -233,10 +235,11 @@ pub fn file_staging_limit(advertised_max_upload_bytes: Option<u64>) -> Option<u6
 
 /// `formatAttachmentSize`.
 pub fn format_size(size_bytes: u64) -> String {
-    if size_bytes >= 1024 * 1024 {
-        format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
+    let kilobytes = size_bytes.div_ceil(1024).max(1);
+    if kilobytes >= 1024 {
+        format!("{} MB", to_fixed(size_bytes as f64 / (1024.0 * 1024.0), 1))
     } else {
-        format!("{} KB", size_bytes.div_ceil(1024).max(1))
+        format!("{kilobytes} KB")
     }
 }
 

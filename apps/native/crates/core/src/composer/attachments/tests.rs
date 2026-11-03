@@ -49,6 +49,20 @@ fn sizes_format_like_the_strip() {
     assert_eq!(format_size(1), "1 KB");
     assert_eq!(format_size(1025), "2 KB");
     assert_eq!(format_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    for (size_bytes, label) in [
+        (1_047_552, "1023 KB"),
+        (1_047_553, "1.0 MB"),
+        (1_048_575, "1.0 MB"),
+        (1_048_576, "1.0 MB"),
+        (1_310_719, "1.2 MB"),
+        (1_310_720, "1.3 MB"),
+        (1_310_721, "1.3 MB"),
+        (2_359_295, "2.2 MB"),
+        (2_359_296, "2.3 MB"),
+        (2_359_297, "2.3 MB"),
+    ] {
+        assert_eq!(format_size(size_bytes), label, "{size_bytes} bytes");
+    }
 }
 
 #[test]
