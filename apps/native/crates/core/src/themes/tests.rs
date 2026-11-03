@@ -336,6 +336,9 @@ fn editor_family_derives_linked_roles_readability_and_filter_aliases() {
         assert!(color::contrast(color::parse(&colors["codeForeground"]).unwrap(),color::parse(&colors["codeBackground"]).unwrap())>=4.5);
     }
     assert!(editor::FAMILIES.iter().find(|f|f.role=="mutedForeground").unwrap().matches("sidebar muted foreground"));
+    for (role,alias) in [("error","error text"),("warning","warning background"),("accent","accent color"),("canvas","toolbar background")] {
+        assert!(editor::FAMILIES.iter().find(|f|f.role==role).unwrap().matches(alias),"{alias}");
+    }
 }
 #[test]
 fn editor_picker_rgb_hex_hsv_preserve_alpha_and_roundtrip() {
@@ -355,13 +358,40 @@ fn editor_picker_rgb_hex_hsv_preserve_alpha_and_roundtrip() {
 #[test]
 fn editor_families_match_web_color_fixtures() {
     #[derive(serde::Deserialize)]
-    struct Fixture {dark:bool,role:String,value:String,expected:std::collections::BTreeMap<String,String>}
+    struct Fixture {dark:bool,role:String,value:String,#[serde(default)]background:Colors,expected:std::collections::BTreeMap<String,String>}
     let fixtures:Vec<Fixture>=serde_json::from_str(include_str!("editor/fixtures.json")).unwrap();
     for f in fixtures {
-        let colors=editor::update_family(f.dark,&standard(f.dark),&f.role,&f.value);
+        let mut input=standard(f.dark);input.extend(f.background);
+        let colors=editor::update_family(f.dark,&input,&f.role,&f.value);
         for (role,expected) in f.expected {
             let actual=editor::picker::swatch(&colors[&role]).unwrap();let expected=editor::picker::swatch(&expected).unwrap();
             for shift in [24,16,8,0] {assert!((((actual>>shift)&255) as i32-((expected>>shift)&255) as i32).abs()<=1,"{} {} dark={} input={} actual={} expected={expected:08x}",f.role,role,f.dark,f.value,colors[&role]);}
         }
     }
+}
+
+#[test]
+fn editor_picker_drags_have_one_owner_and_frame_commit_keeps_latest() {
+    use editor::picker::{Drag,Surface,Hsv,FrameCommit};
+    let initial=Hsv{h:120.,s:0.4,v:0.5};let mut drag=Drag::default();
+    assert!(drag.sample(initial,1.,1.).is_none());
+    drag.start(Surface::SaturationValue);
+    let next=drag.sample(initial,1.5,-0.2).unwrap();assert_eq!(next,Hsv{h:120.,s:1.,v:1.});
+    assert_eq!(drag.surface(),Some(Surface::SaturationValue));
+    drag.end();assert!(drag.sample(initial,0.,0.).is_none());
+    drag.start(Surface::Hue);assert_eq!(drag.sample(initial,-1.,0.).unwrap().h,0.);
+    let mut pending=FrameCommit::default();assert!(pending.schedule(initial));assert!(!pending.schedule(next));
+    assert_eq!(pending.take(),Some(next));assert_eq!(pending.take(),None);assert!(pending.schedule(initial));
+}
+#[test]
+fn editor_preview_ignores_name_and_invalid_color_changes() {
+    let mut session=editor::Session::new(None,None,None,false);
+    let mut preview=editor::Preview::new(session.dark,session.colors());
+    session.set_name("Aurora".into(),&ClientSettingsDoc::default());
+    assert!(!preview.update(session.dark,session.colors()));
+    session.set_advanced(true);session.update_color("canvas","bad color".into());
+    assert!(!preview.update(session.dark,session.colors()));
+    session.update_color("canvas","#112233".into());assert!(preview.update(session.dark,session.colors()));
+    assert!(!preview.update(session.dark,session.colors()));
+    session.set_appearance(true,&ClientSettingsDoc::default());assert!(preview.update(session.dark,session.colors()));
 }

@@ -662,7 +662,11 @@ fn wireframe(theme: &ThemePreference, mode: AppearanceMode, cx: &App) -> impl In
     };
     let frame = h_flex().h(r(112.)).w_full().rounded(r(8.)).overflow_hidden();
     match mode {
-        AppearanceMode::System => frame.child(half(false)).child(half(true)),
+        AppearanceMode::System => frame.child(
+            div().relative().flex_1().h_full().overflow_hidden().child(div().absolute().left_0().top_0().w(gpui::relative(2.)).h_full().flex().child(half(false)))
+        ).child(
+            div().relative().flex_1().h_full().overflow_hidden().child(div().absolute().right_0().top_0().w(gpui::relative(2.)).h_full().flex().child(half(true)))
+        ),
         AppearanceMode::Light => frame.child(half(false)),
         AppearanceMode::Dark => frame.child(half(true)),
     }

@@ -135,3 +135,64 @@ pub fn key(mut hsv: Hsv, axis: Axis, key: &str, shift: bool) -> Option<Hsv> {
     }
     Some(hsv)
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    SaturationValue,
+    Hue,
+}
+impl Surface {
+    pub fn index(self) -> usize {
+        match self {
+            Self::SaturationValue => 0,
+            Self::Hue => 1,
+        }
+    }
+}
+#[derive(Default)]
+pub struct Drag {
+    surface: Option<Surface>,
+}
+impl Drag {
+    pub fn start(&mut self, surface: Surface) {
+        self.surface = Some(surface);
+    }
+    pub fn end(&mut self) {
+        self.surface = None;
+    }
+    pub fn surface(&self) -> Option<Surface> {
+        self.surface
+    }
+    pub fn sample(&self, mut hsv: Hsv, x: f64, y: f64) -> Option<Hsv> {
+        match self.surface? {
+            Surface::SaturationValue => {
+                hsv.s = x.clamp(0., 1.);
+                hsv.v = 1. - y.clamp(0., 1.);
+            }
+            Surface::Hue => hsv.h = x.clamp(0., 1.) * 360.,
+        }
+        Some(hsv)
+    }
+}
+pub struct FrameCommit<T> {
+    pending: Option<T>,
+    scheduled: bool,
+}
+impl<T> Default for FrameCommit<T> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            scheduled: false,
+        }
+    }
+}
+impl<T> FrameCommit<T> {
+    pub fn schedule(&mut self, value: T) -> bool {
+        self.pending = Some(value);
+        !std::mem::replace(&mut self.scheduled, true)
+    }
+    pub fn take(&mut self) -> Option<T> {
+        self.scheduled = false;
+        self.pending.take()
+    }
+}

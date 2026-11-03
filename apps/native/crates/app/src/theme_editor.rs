@@ -16,7 +16,7 @@ use gpui_component::{
 };
 use std::collections::BTreeMap;
 use t3_core::themes::{
-    self, Colors, ThemeDefinition,
+    self, ThemeDefinition,
     editor::{FAMILIES, Session, picker},
 };
 mod color_picker;
@@ -86,7 +86,9 @@ struct Editor {
     fields: BTreeMap<&'static str, Entity<InputState>>,
     subscriptions: Vec<Subscription>,
     syncing: bool,
-    preview: Colors,
+    preview: themes::editor::Preview,
+    swatches: BTreeMap<&'static str, FocusHandle>,
+    picker_epoch: usize,
     minimized: bool,
     picker: Option<color_picker::Picker>,
     selected: Option<&'static str>,
@@ -116,6 +118,11 @@ impl Editor {
             }),
             cx.subscribe(&query, |_, _, _: &InputEvent, cx| cx.notify()),
         ];
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.stop_picker_drag(window, cx);
+            }
+        }));
         let fields = FAMILIES
             .iter()
             .map(|f| {
@@ -137,8 +144,8 @@ impl Editor {
                 (role, input)
             })
             .collect();
-        let preview = session.colors().clone();
-        theme::preview(Some((&preview, session.dark)), cx);
+        let preview = themes::editor::Preview::new(session.dark, session.colors());
+        theme::preview(Some((&preview.colors, session.dark)), cx);
         Self {
             state,
             session,
@@ -148,6 +155,8 @@ impl Editor {
             subscriptions,
             syncing: false,
             preview,
+            swatches: FAMILIES.iter().map(|f| (f.role, cx.focus_handle().tab_stop(true))).collect(),
+            picker_epoch: 0,
             minimized: false,
             picker: None,
             selected: None,
@@ -159,13 +168,11 @@ impl Editor {
         }
     }
     fn apply_preview(&mut self, cx: &mut Context<Self>) {
-        for (role, value) in self.session.colors() {
-            if picker::hex(value).is_some() {
-                self.preview.insert(role.clone(), value.clone());
-            }
+        if self.preview.update(self.session.dark, self.session.colors()) {
+            theme::preview(Some((&self.preview.colors, self.preview.dark)), cx);
         }
-        theme::preview(Some((&self.preview, self.session.dark)), cx);
     }
+
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.syncing = true;
         for (role, field) in &self.fields {
@@ -240,7 +247,7 @@ impl Editor {
             }
         }
     }
-    fn field(&self, role: &'static str, label: &'static str, cx: &mut Context<Self>) -> AnyElement {
+    fn field(&self, role: &'static str, label: &'static str, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let invalid = picker::hex(&self.session.colors()[role]).is_none();
         h_flex()
@@ -253,10 +260,20 @@ impl Editor {
             .child(
                 div()
                     .id(ElementId::Name(format!("choose-{role}").into()))
+                    .track_focus(&self.swatches[role])
+                    .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                        if crate::settings::controls::activates(e) {
+                            this.open_picker(role, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .size(r(24.))
                     .rounded_full()
                     .border_1()
                     .border_color(hsla(p.foreground).opacity(0.3))
+                    .when(self.swatches[role].is_focused(window) && window.last_input_was_keyboard(), |d| {
+                        d.border_2().border_color(hsla(p.ring))
+                    })
                     .bg(hsla(picker::swatch(&self.session.colors()[role]).unwrap_or(p.background)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| this.open_picker(role, window, cx))),
@@ -338,7 +355,7 @@ impl Render for Editor {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.end_picker(false, window, cx);
                             this.session.set_appearance(dark, store::client(cx));
-                            this.preview = this.session.colors().clone();
+
                             this.sync(window, cx);
                         }))
                     }))),
@@ -388,7 +405,7 @@ impl Render for Editor {
                 body = body.child(div().pt(r(12.)).text_sm().font_weight(FontWeight::MEDIUM).child(group));
             }
             found = true;
-            body = body.child(self.field(family.role, family.label, cx));
+            body = body.child(self.field(family.role, family.label, window, cx));
         }
         if !found {
             body = body.child(div().text_xs().child("No matches."));

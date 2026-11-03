@@ -9,12 +9,16 @@ pub(super) struct Picker {
     _subscriptions: Vec<Subscription>,
     bounds: [Rc<Cell<Bounds<Pixels>>>; 2],
     focus: [FocusHandle; 3],
+    drag: picker::Drag,
+    pending: picker::FrameCommit<picker::Hsv>,
+    epoch: usize,
 }
 impl Editor {
     pub(super) fn open_picker(&mut self, role: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         self.end_picker(false, window, cx);
         self.selected = Some(role);
         self.session.start_color_edit();
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
         let value = &self.session.colors()[role];
         let hex = cx.new(|cx| {
             InputState::new(window, cx).default_value(picker::hex(value).unwrap_or_default().chars().take(7).collect::<String>())
@@ -40,6 +44,7 @@ impl Editor {
                             picker::from_hex(&draft, previous)
                         };
                         if let Some(color) = color {
+                            this.flush_picker(window, cx);
                             let hsv = picker::hsv(&color);
                             this.picker.as_mut().unwrap().hsv = hsv;
                             let hex_value = color.chars().take(7).collect::<String>();
@@ -68,16 +73,41 @@ impl Editor {
             _subscriptions: subscriptions,
             bounds: std::array::from_fn(|_| Rc::new(Cell::new(Bounds::default()))),
             focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            drag: picker::Drag::default(),
+            pending: picker::FrameCommit::default(),
+            epoch: self.picker_epoch,
         });
+        self.picker.as_ref().unwrap().focus[0].focus(window, cx);
         cx.notify();
     }
     pub(super) fn end_picker(&mut self, cancel: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.take().is_some() {
+        if !cancel {
+            self.flush_picker(window, cx);
+        }
+        if let Some(picker) = self.picker.take() {
             self.session.end_color_edit(cancel);
-            self.preview = self.session.colors().clone();
             self.sync(window, cx);
+            self.swatches[picker.role].focus(window, cx);
         }
     }
+    pub(super) fn stop_picker_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = self.picker.as_mut() {
+            p.drag.end();
+        }
+        self.flush_picker(window, cx);
+    }
+    fn flush_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.picker.as_mut() else {
+            return;
+        };
+        let Some(hsv) = p.pending.take() else {
+            return;
+        };
+        let role = p.role;
+        self.session.update_color(role, picker::from_hsv(hsv, &self.session.colors()[role]));
+        self.sync(window, cx);
+    }
+
     fn sync_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(p) = self.picker.as_ref() {
             let value = picker::from_hsv(p.hsv, &self.session.colors()[p.role]);
@@ -89,23 +119,30 @@ impl Editor {
             self.syncing = false;
         }
     }
-    fn picker_at(&mut self, index: usize, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn picker_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.picker.as_mut() else {
             return;
         };
-        let bounds = p.bounds[index].get();
-        let x = ((position.x - bounds.left()) / bounds.size.width).clamp(0., 1.);
-        if index == 0 {
-            p.hsv.s = f64::from(x);
-            p.hsv.v = f64::from(1. - ((position.y - bounds.top()) / bounds.size.height).clamp(0., 1.));
-        } else {
-            p.hsv.h = f64::from(x) * 360.;
+        let Some(owner) = p.drag.surface() else {
+            return;
+        };
+        let bounds = p.bounds[owner.index()].get();
+        if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+            return;
         }
-        let role = p.role;
-        let value = picker::from_hsv(p.hsv, &self.session.colors()[role]);
-        self.session.update_color(role, value);
+        let x = f64::from((position.x - bounds.left()) / bounds.size.width);
+        let y = f64::from((position.y - bounds.top()) / bounds.size.height);
+        p.hsv = p.drag.sample(p.hsv, x, y).expect("active drag");
+        let epoch = p.epoch;
+        if p.pending.schedule(p.hsv) {
+            cx.on_next_frame(window, move |this, window, cx| {
+                if this.picker.as_ref().is_some_and(|p| p.epoch == epoch) {
+                    this.flush_picker(window, cx);
+                }
+            });
+        }
         self.sync_picker(window, cx);
-        self.sync(window, cx);
+        cx.notify();
     }
     pub(super) fn render_picker(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picker = self.picker.as_ref()?;
@@ -129,14 +166,18 @@ impl Editor {
                 linear_color_stop(color(0., 0., 0.), 1.),
             )))
             .child(
-                div()
-                    .absolute()
-                    .left(relative(hsv.s as f32))
-                    .top(relative(1. - hsv.v as f32))
-                    .size(px(10.))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(color(0., 0., 1.)),
+                div().absolute().inset(px(6.)).child(
+                    div()
+                        .absolute()
+                        .left(relative(hsv.s as f32))
+                        .top(relative(1. - hsv.v as f32))
+                        .ml(px(-6.))
+                        .mt(px(-6.))
+                        .size(px(12.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(hsla(p.picker_thumb_border)),
+                ),
             );
         let hue = h_flex()
             .relative()
@@ -152,13 +193,17 @@ impl Editor {
                 ))
             }))
             .child(
-                div()
-                    .absolute()
-                    .left(relative((hsv.h / 360.) as f32))
-                    .h_full()
-                    .w(px(5.))
-                    .border_2()
-                    .border_color(color(0., 0., 1.)),
+                div().absolute().left(px(8.)).right(px(8.)).top_0().h_full().child(
+                    div()
+                        .absolute()
+                        .left(relative((hsv.h / 360.) as f32))
+                        .ml(px(-8.))
+                        .size(px(16.))
+                        .rounded_full()
+                        .bg(color(hsv.h, 1., 1.))
+                        .border_2()
+                        .border_color(hsla(p.picker_thumb_border)),
+                ),
             );
         let areas = [plane.into_any_element(), hue.into_any_element()]
             .into_iter()
@@ -174,6 +219,7 @@ impl Editor {
                     .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().inset_0())
                     .when(index == 0, |d| d.child(div().absolute().size(px(1.)).track_focus(&picker.focus[1])))
                     .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                        this.flush_picker(window, cx);
                         let Some(p) = this.picker.as_ref() else {
                             return;
                         };
@@ -197,18 +243,18 @@ impl Editor {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                            if let Some(p) = this.picker.as_ref() {
+                            if let Some(p) = this.picker.as_mut() {
+                                p.drag.start(if index == 0 {
+                                    picker::Surface::SaturationValue
+                                } else {
+                                    picker::Surface::Hue
+                                });
                                 p.focus[if index == 0 { 0 } else { 2 }].focus(window, cx);
                             }
-                            this.picker_at(index, e.position, window, cx);
+                            this.picker_at(e.position, window, cx);
                             cx.stop_propagation();
                         }),
                     )
-                    .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
-                        if e.pressed_button == Some(MouseButton::Left) {
-                            this.picker_at(index, e.position, window, cx);
-                        }
-                    }))
             });
         let viewport = window.viewport_size();
         let pos = self.position.unwrap_or(point(
@@ -268,6 +314,49 @@ impl Editor {
                 div()
                     .absolute()
                     .inset_0()
+                    .child({
+                        let view = cx.entity().clone();
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, window, _cx| {
+                                let moves = view.clone();
+                                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    moves.update(cx, |this, cx| {
+                                        if !this.picker.as_ref().is_some_and(|p| p.drag.surface().is_some()) {
+                                            return;
+                                        }
+                                        if event.pressed_button == Some(MouseButton::Left) {
+                                            this.picker_at(event.position, window, cx);
+                                        } else {
+                                            this.picker.as_mut().unwrap().drag.end();
+                                            this.flush_picker(window, cx);
+                                        }
+                                        cx.stop_propagation();
+                                    });
+                                });
+                                let ups = view.clone();
+                                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                                        return;
+                                    }
+                                    ups.update(cx, |this, cx| {
+                                        if !this.picker.as_ref().is_some_and(|p| p.drag.surface().is_some()) {
+                                            return;
+                                        }
+                                        this.picker_at(event.position, window, cx);
+                                        this.picker.as_mut().unwrap().drag.end();
+                                        this.flush_picker(window, cx);
+                                        cx.stop_propagation();
+                                    });
+                                });
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| this.end_picker(false, window, cx)),

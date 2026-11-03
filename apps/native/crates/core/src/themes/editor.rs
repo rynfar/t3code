@@ -278,3 +278,28 @@ impl Session {
         })
     }
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    pub dark: bool,
+    pub colors: Colors,
+}
+impl Preview {
+    pub fn new(dark: bool, colors: &Colors) -> Self {
+        Self {
+            dark,
+            colors: colors.clone(),
+        }
+    }
+    pub fn update(&mut self, dark: bool, colors: &Colors) -> bool {
+        let mut changed = self.dark != dark;
+        self.dark = dark;
+        for (role, value) in colors {
+            if self.colors.get(role) != Some(value) && color::parse(value).is_ok() {
+                self.colors.insert(role.clone(), value.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+}

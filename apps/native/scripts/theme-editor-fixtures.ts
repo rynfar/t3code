@@ -36,21 +36,49 @@ const families = [
     .matchAll(/role: "([^"]+)",\s*roles: \[([^\]]+)\]/g),
 ].map((m) => ({ role: m[1], roles: [...m[2]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!) }));
 const fixtures = [false, true].flatMap((dark) =>
-  families.flatMap((f) =>
-    ["#734fa080", "oklch(0.62 0.3 280)"].map((value) => {
-      const colors = updateThemeColorFamily(
-        dark ? "dark" : "light",
-        data.standard[Number(dark)],
-        f.role,
-        value,
-      );
-      return {
-        dark,
-        role: f.role,
-        value,
-        expected: Object.fromEntries(f.roles.map((role) => [role, themeColorToHex(colors[role])])),
-      };
-    }),
+  [
+    {},
+    { canvas: "#00000000", sidebar: "#00000000", accent: "#ffffff00" },
+    { canvas: "#142f6080", sidebar: "#86ab4390", accent: "#feddab40" },
+  ].flatMap((background) =>
+    families
+      .filter(
+        (f) =>
+          !Object.keys(background).length ||
+          [
+            "searchMatchBackground",
+            "searchMatchActiveBackground",
+            "accent",
+            "error",
+            "warning",
+            "terminalBackground",
+            "sidebarRowSelected",
+            "messageAction",
+            "secondary",
+            "messageSurface",
+            "codeBackground",
+            "sidebar",
+          ].includes(f.role!),
+      )
+      .flatMap((f) =>
+        ["#734fa080", "oklch(0.62 0.3 280)"].map((value) => {
+          const colors = updateThemeColorFamily(
+            dark ? "dark" : "light",
+            { ...data.standard[Number(dark)], ...background },
+            f.role,
+            value,
+          );
+          return {
+            dark,
+            background,
+            role: f.role,
+            value,
+            expected: Object.fromEntries(
+              f.roles.map((role) => [role, themeColorToHex(colors[role])]),
+            ),
+          };
+        }),
+      ),
   ),
 );
 const output = NodePath.join(native, "crates/core/src/themes/editor/fixtures.json");

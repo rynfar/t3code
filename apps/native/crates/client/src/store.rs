@@ -405,28 +405,31 @@ fn writer() -> Option<&'static mpsc::Sender<WriteRequest>> {
     WRITER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<WriteRequest>();
         let spawned = std::thread::Builder::new().name("t3-ui-state".into()).spawn(move || {
-            while let Ok(first) = rx.recv() {
-                let mut pending = Vec::new();
-                for (name, save, reply) in std::iter::once(first).chain(rx.try_iter()) {
-                    if let Some(reply) = reply {
-                        write_pending(std::mem::take(&mut pending));
-                        let result = base().ok_or_else(|| "Native home is unavailable.".to_owned()).and_then(|base| {
-                            match save {
-                                Save::Patch(patch) => write_patch_result(&base, &name, &patch).map_err(|e|e.to_string()),
-                                _ => unreachable!("only settings patches request confirmation"),
-                            }
-                        });
-                        let _ = reply.send(result);
-                    } else { pending.push((name, save)); }
-                }
-                write_pending(pending);
-            }
+            run_writer(rx,base);
         });
         spawned.ok().map(|_| tx)
     }).as_ref()
 }
-fn write_pending(pending: Vec<(String, Save)>) {
-    if let Some(base) = base() {
+fn run_writer(rx:mpsc::Receiver<WriteRequest>,resolve_base:impl Fn()->Option<PathBuf>) {
+    while let Ok(first) = rx.recv() {
+        let mut pending = Vec::new();
+        for (name, save, reply) in std::iter::once(first).chain(rx.try_iter()) {
+            if let Some(reply) = reply {
+                write_pending(resolve_base(),std::mem::take(&mut pending));
+                let result = resolve_base().ok_or_else(|| "Native home is unavailable.".to_owned()).and_then(|base| {
+                    match save {
+                        Save::Patch(patch) => write_patch_result(&base, &name, &patch).map_err(|e|e.to_string()),
+                        _ => unreachable!("only settings patches request confirmation"),
+                    }
+                });
+                let _ = reply.send(result);
+            } else { pending.push((name, save)); }
+        }
+        write_pending(resolve_base(),pending);
+    }
+}
+fn write_pending(base:Option<PathBuf>,pending: Vec<(String, Save)>) {
+    if let Some(base) = base {
         for (name, save) in coalesce(pending.into_iter()) {
             match save {
                 Save::Replace(text) => write_atomically(&base, &name, &text),
@@ -743,6 +746,28 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_barriers_commit_prior_patches_and_keep_later_writes_ordered() {
+        let dir=std::env::temp_dir().join(format!("t3-theme-barrier-test-{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&dir);
+        let (tx,rx)=mpsc::channel();let home=dir.clone();
+        let worker=std::thread::spawn(move||run_writer(rx,||Some(home.clone())));
+        tx.send((CLIENT_SETTINGS.into(),patch(serde_json::json!({"before":true,"value":1})),None)).unwrap();
+        let (done,receipt)=mpsc::channel();
+        tx.send((CLIENT_SETTINGS.into(),patch(serde_json::json!({"value":2})),Some(done))).unwrap();
+        receipt.recv().unwrap().unwrap();
+        let value:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(value,serde_json::json!({"before":true,"value":2}));
+        tx.send((CLIENT_SETTINGS.into(),Save::Replace("{\"after\":true,\"value\":3}".into()),None)).unwrap();
+        let (done,receipt)=mpsc::channel();
+        tx.send((CLIENT_SETTINGS.into(),patch(serde_json::json!({"final":true})),Some(done))).unwrap();
+        receipt.recv().unwrap().unwrap();
+        drop(tx);worker.join().unwrap();
+        let value:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(value,serde_json::json!({"after":true,"value":3,"final":true}));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

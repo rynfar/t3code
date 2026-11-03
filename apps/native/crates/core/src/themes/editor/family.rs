@@ -15,16 +15,44 @@ impl Family {
         let q = query.trim().to_lowercase();
         self.label.to_lowercase().contains(&q)
             || self.roles.iter().any(|r| {
-                let mut label = String::new();
-                for c in r.chars() {
-                    if c.is_uppercase() {
-                        label.push(' ');
-                    }
-                    label.extend(c.to_lowercase());
-                }
+                let label = role_label(r).to_lowercase();
                 label.contains(&q)
             })
     }
+}
+fn role_label(role: &str) -> String {
+    match role {
+        "canvas" => "Background",
+        "toolbar" => "Toolbar background",
+        "toolbarForeground" => "Toolbar text",
+        "toolbarBorder" => "Toolbar border",
+        "toolbarControl" => "Toolbar control",
+        "toolbarControlForeground" => "Toolbar control text",
+        "toolbarControlHover" => "Toolbar control hover",
+        "accent" => "Accent color",
+        "errorForeground" => "Error text",
+        "errorSurface" => "Error background",
+        "warningForeground" => "Warning text",
+        "warningSurface" => "Warning background",
+        "updateForeground" => "Update text",
+        "updateSurface" => "Update background",
+        _ => {
+            let mut label = String::new();
+            for c in role.chars() {
+                if c.is_uppercase() {
+                    label.push(' ');
+                }
+                label.push(c);
+            }
+            return label;
+        }
+    }
+    .into()
+}
+fn rgb(c: Color) -> Color {
+    let mut c = quantize(c);
+    c[3] = 1.;
+    c
 }
 pub const FAMILIES: &[Family] = &[
     Family {
@@ -188,9 +216,9 @@ pub fn update_family(dark: bool, colors: &Colors, role: &str, value: &str) -> Co
         return next;
     };
     let normalized = canonical(parsed);
-    let mut selected = quantize(parsed);
+    let mut selected = rgb(parsed);
     selected[3] = 1.;
-    let canvas = quantize(parse(&colors["canvas"]).unwrap_or(if dark {
+    let canvas = rgb(parse(&colors["canvas"]).unwrap_or(if dark {
         [24. / 255., 15. / 255., 27. / 255., 1.]
     } else {
         [250. / 255., 245. / 255., 250. / 255., 1.]
@@ -230,7 +258,7 @@ pub fn update_family(dark: bool, colors: &Colors, role: &str, value: &str) -> Co
         "searchMatchBackground" => put("searchMatchForeground", fg(painted)),
         "searchMatchActiveBackground" => put("searchMatchActiveForeground", fg(painted)),
         "sidebarRowSelected" => {
-            let sidebar = quantize(parse(&colors["sidebar"]).unwrap_or(canvas));
+            let sidebar = rgb(parse(&colors["sidebar"]).unwrap_or(canvas));
             let painted = on(sidebar);
             put("sidebarRowHover", mix(painted, sidebar, 0.5, "srgb"));
             put("sidebarRowActive", mix(painted, sidebar, 0.8, "srgb"));
@@ -242,7 +270,7 @@ pub fn update_family(dark: bool, colors: &Colors, role: &str, value: &str) -> Co
             put(
                 "terminalSelection",
                 mix(
-                    quantize(parse(&colors["accent"]).unwrap_or([168. / 255., 67. / 255., 112. / 255., 1.])),
+                    rgb(parse(&colors["accent"]).unwrap_or([168. / 255., 67. / 255., 112. / 255., 1.])),
                     painted,
                     if dark { 0.35 } else { 0.18 },
                     "srgb",

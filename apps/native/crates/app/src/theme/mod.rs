@@ -64,9 +64,25 @@ struct ThemeState {
     preferences: Preferences,
     system_dark: bool,
     environment: Vec<ThemeDefinition>,
-    preview: Option<(bool, Palette)>,
+    preview: Option<themes::editor::Preview>,
+    saved: Option<Rc<SavedTheme>>,
+    prepared_preview: Option<PreparedPreview>,
 }
 
+#[derive(Clone)]
+struct SavedTheme {
+    preferences: Preferences,
+    palettes: [Palette; 2],
+    configs: [Rc<ThemeConfig>; 2],
+    fonts: [gpui::SharedString; 4],
+}
+#[derive(Clone)]
+struct PreparedPreview {
+    input: themes::editor::Preview,
+    saved: Rc<SavedTheme>,
+    palette: Palette,
+    config: Rc<ThemeConfig>,
+}
 impl Global for ThemeState {}
 
 pub fn palette(cx: &App) -> Palette {
@@ -78,7 +94,14 @@ pub fn hsla(color: u32) -> Hsla {
 }
 
 pub fn init(cx: &mut App) {
-    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false, environment: Vec::new(), preview: None });
+    cx.set_global(ThemeState {
+        preferences: Preferences::default(),
+        system_dark: false,
+        environment: Vec::new(),
+        preview: None,
+        saved: None,
+        prepared_preview: None,
+    });
     cache_font_inventory(cx);
     install(cx);
 }
@@ -95,6 +118,7 @@ pub fn set_preferences(preferences: Preferences, cx: &mut App) {
     }
     let families_changed = state.preferences.typography.families != preferences.typography.families;
     state.preferences = preferences;
+    state.saved = None;
     if families_changed {
         cache_font_inventory(cx);
     }
@@ -122,7 +146,9 @@ pub fn chat_max_width(cx: &App) -> Option<Rems> {
 
 pub fn follow_system_appearance(window: &mut Window, cx: &mut App) {
     apply(window.appearance(), window, cx);
-    window.observe_window_appearance(|window, cx| apply(window.appearance(), window, cx)).detach();
+    window
+        .observe_window_appearance(|window, cx| apply(window.appearance(), window, cx))
+        .detach();
 }
 
 fn apply(appearance: WindowAppearance, window: &mut Window, cx: &mut App) {
@@ -134,9 +160,17 @@ fn apply(appearance: WindowAppearance, window: &mut Window, cx: &mut App) {
 
 fn is_dark(cx: &App) -> bool {
     let state = cx.global::<ThemeState>();
-    if let Some((dark, _)) = state.preview { return dark; }
+    if let Some(preview) = &state.preview {
+        return preview.dark;
+    }
     let prefs = &state.preferences;
-    themes::resolved_dark(&prefs.theme, &prefs.halves, themes::mode_dark(prefs.mode, state.system_dark), &prefs.custom, &state.environment)
+    themes::resolved_dark(
+        &prefs.theme,
+        &prefs.halves,
+        themes::mode_dark(prefs.mode, state.system_dark),
+        &prefs.custom,
+        &state.environment,
+    )
 }
 
 pub fn environment_themes(cx: &App) -> &[ThemeDefinition] {
@@ -147,6 +181,7 @@ pub fn set_environment_themes(values: &[ThemeDefinition], cx: &mut App) {
         return;
     }
     cx.global_mut::<ThemeState>().environment = values.to_vec();
+    cx.global_mut::<ThemeState>().saved = None;
     install(cx);
     let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);
@@ -169,7 +204,11 @@ fn derived(theme: &ThemePreference, dark: bool, prefs: &Preferences, environment
         map.extend(colors.into_iter().map(|(k, v)| (k, v.into())));
     }
     let p = serde_json::from_value(value).unwrap_or(base);
-    if prefs.diff_color_scheme == DiffColorScheme::BlueOrange { blue_orange(p) } else { p }
+    if prefs.diff_color_scheme == DiffColorScheme::BlueOrange {
+        blue_orange(p)
+    } else {
+        p
+    }
 }
 
 fn blue_orange(mut palette: Palette) -> Palette {
@@ -227,7 +266,11 @@ fn resolve_family(role: FontRole, cx: &App) -> gpui::SharedString {
     resolve_font_stack(
         family,
         &inventory.names,
-        FontDefaults { sans: ".SystemUIFont", mono: &inventory.mono, serif: &inventory.serif },
+        FontDefaults {
+            sans: ".SystemUIFont",
+            mono: &inventory.mono,
+            serif: &inventory.serif,
+        },
         &fallback,
     )
     .to_owned()
@@ -252,40 +295,101 @@ pub fn code_line_height(cx: &App) -> f32 {
 
 fn install(cx: &mut App) {
     let dark = is_dark(cx);
-    let fonts = FontRole::ALL.map(|role| resolve_family(role, cx));
-    cx.set_global(ActiveFonts(fonts));
-    let mono = font_family(FontRole::Code, cx);
-    let sans = font_family(FontRole::Interface, cx);
-    let preferences = preferences(cx).clone();
-    let environment = &cx.global::<ThemeState>().environment;
-    let light_palette = derived(&preferences.theme, false, &preferences, environment);
-    let dark_palette = derived(&preferences.theme, true, &preferences, environment);
-    let (light_palette, dark_palette) = match cx.global::<ThemeState>().preview {
-        Some((true, p)) => (light_palette, p), Some((false, p)) => (p, dark_palette), None => (light_palette, dark_palette),
-    };
+    let saved = cx.global::<ThemeState>().saved.clone();
+    let saved = saved.unwrap_or_else(|| {
+        let preferences = preferences(cx).clone();
+        let fonts = FontRole::ALL.map(|role| resolve_family(role, cx));
+        let environment = cx.global::<ThemeState>().environment.clone();
+        let palettes = [false, true].map(|dark| derived(&preferences.theme, dark, &preferences, &environment));
+        let configs = std::array::from_fn(|i| {
+            Rc::new(config(
+                if i == 0 { "T3 Code Light" } else { "T3 Code Dark" },
+                &palettes[i],
+                i == 1,
+                preferences.interface_font_size,
+                &fonts[FontRole::Code as usize],
+                &fonts[FontRole::Interface as usize],
+                preferences.typography.size(FontRole::Code),
+            ))
+        });
+        let saved = Rc::new(SavedTheme {
+            preferences,
+            palettes,
+            configs,
+            fonts,
+        });
+        cx.global_mut::<ThemeState>().saved = Some(saved.clone());
+        saved
+    });
+    let preferences = &saved.preferences;
+    cx.set_global(ActiveFonts(saved.fonts.clone()));
+    let mut palettes = saved.palettes;
+    let mut configs = saved.configs.clone();
+    if let Some(input) = cx.global::<ThemeState>().preview.clone() {
+        let cached = cx
+            .global::<ThemeState>()
+            .prepared_preview
+            .as_ref()
+            .filter(|p| p.input == input && Rc::ptr_eq(&p.saved, &saved))
+            .cloned();
+        let prepared = cached.or_else(|| {
+            let values = themes::palette(Some(&input.colors), input.dark, preferences.contrast, preferences.glass).ok()?;
+            let base = if input.dark { tokens::DARK } else { tokens::LIGHT };
+            let mut value = serde_json::to_value(base).ok()?;
+            value.as_object_mut()?.extend(values.into_iter().map(|(k, v)| (k, v.into())));
+            let palette = serde_json::from_value(value).ok()?;
+            let palette = if preferences.diff_color_scheme == DiffColorScheme::BlueOrange {
+                blue_orange(palette)
+            } else {
+                palette
+            };
+            let config = Rc::new(config(
+                "Theme editor preview",
+                &palette,
+                input.dark,
+                preferences.interface_font_size,
+                &saved.fonts[FontRole::Code as usize],
+                &saved.fonts[FontRole::Interface as usize],
+                preferences.typography.size(FontRole::Code),
+            ));
+            let prepared = PreparedPreview {
+                input: input.clone(),
+                saved: saved.clone(),
+                palette,
+                config,
+            };
+            cx.global_mut::<ThemeState>().prepared_preview = Some(prepared.clone());
+            Some(prepared)
+        });
+        if let Some(prepared) = prepared {
+            let i = usize::from(input.dark);
+            palettes[i] = prepared.palette;
+            configs[i] = prepared.config;
+        }
+    }
     let revision = cx.try_global::<ActivePalette>().map_or(0, |p| p.1.wrapping_add(1));
-    cx.set_global(ActivePalette(if dark { dark_palette } else { light_palette }, revision));
-    let size = preferences.interface_font_size;
+    cx.set_global(ActivePalette(palettes[usize::from(dark)], revision));
     let theme = Theme::global_mut(cx);
-    theme.light_theme =
-        Rc::new(config("T3 Code Light", &light_palette, false, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
-    theme.dark_theme =
-        Rc::new(config("T3 Code Dark", &dark_palette, true, size, &mono, &sans, preferences.typography.size(FontRole::Code)));
-    theme.font_size = px(size);
-    theme.font_family = sans;
-    theme.mono_font_family = mono;
+    [theme.light_theme, theme.dark_theme] = configs;
+    theme.font_size = px(preferences.interface_font_size);
+    theme.font_family = saved.fonts[FontRole::Interface as usize].clone();
+    theme.mono_font_family = saved.fonts[FontRole::Code as usize].clone();
     theme.mono_font_size = px(preferences.typography.size(FontRole::Code));
 }
 
 /// A theme's swatch colors for the theme cards: (background, card, primary, foreground).
 pub fn swatch(theme: &ThemePreference, dark: bool, cx: &App) -> [u32; 4] {
-    if let Some(p) =
-        theme.named_id().and_then(|id| BUILT_IN_THEMES.iter().find(|t| t.id == id)).and_then(|t| if dark { t.dark } else { t.light })
+    if let Some(p) = theme
+        .named_id()
+        .and_then(|id| BUILT_IN_THEMES.iter().find(|t| t.id == id))
+        .and_then(|t| if dark { t.dark } else { t.light })
     {
         return [p.background, p.card, p.primary, p.foreground];
     }
     let prefs = preferences(cx);
-    if let Some(t) = theme.named_id().and_then(|id| themes::resolve(id, &prefs.custom, environment_themes(cx)))
+    if let Some(t) = theme
+        .named_id()
+        .and_then(|id| themes::resolve(id, &prefs.custom, environment_themes(cx)))
         && let Some(roles) = t.half(dark)
     {
         return themes::swatch(roles);
@@ -399,25 +503,31 @@ pub fn revision(cx: &App) -> usize {
 
 /// Prepared once per editor change; rendering only reads the installed palette.
 pub fn preview(colors: Option<(&themes::Colors, bool)>, cx: &mut App) {
-    let prepared = colors.and_then(|(roles,dark)| {
-        let prefs=preferences(cx);
-        let values=themes::palette(Some(roles),dark,prefs.contrast,prefs.glass).ok()?;
-        let base=if dark {tokens::DARK}else{tokens::LIGHT};
-        let mut value=serde_json::to_value(base).ok()?;
-        value.as_object_mut()?.extend(values.into_iter().map(|(k,v)|(k,v.into())));
-        let p=serde_json::from_value(value).ok()?;
-        Some((dark,if prefs.diff_color_scheme==DiffColorScheme::BlueOrange {blue_orange(p)}else{p}))
-    });
-    cx.global_mut::<ThemeState>().preview=prepared;
+    let input = colors.map(|(colors, dark)| themes::editor::Preview::new(dark, colors));
+    if cx.global::<ThemeState>().preview == input {
+        return;
+    }
+    cx.global_mut::<ThemeState>().preview = input;
     install(cx);
-    let mode=if is_dark(cx) {ThemeMode::Dark}else{ThemeMode::Light};
-    Theme::change(mode,None,cx); cx.refresh_windows();
+    let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
+    Theme::change(mode, None, cx);
+    cx.refresh_windows();
 }
 
-pub fn wireframe(theme:&ThemePreference,dark:bool,cx:&App)->[u32;7] {
-    let prefs=preferences(cx);
-    let roles=themes::half_theme(theme,&prefs.halves,dark,&prefs.custom,environment_themes(cx)).and_then(|t|t.half(dark));
-    if let Some(roles)=roles {return themes::wireframe(roles);}
-    let p=if dark {tokens::DARK}else{tokens::LIGHT};
-    [p.background,p.sidebar,p.card,p.accent,p.message_surface,p.message_action,p.foreground]
+pub fn wireframe(theme: &ThemePreference, dark: bool, cx: &App) -> [u32; 7] {
+    let prefs = preferences(cx);
+    let roles = themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, environment_themes(cx)).and_then(|t| t.half(dark));
+    if let Some(roles) = roles {
+        return themes::wireframe(roles);
+    }
+    let p = if dark { tokens::DARK } else { tokens::LIGHT };
+    [
+        p.background,
+        p.sidebar,
+        p.card,
+        p.accent,
+        p.message_surface,
+        p.message_action,
+        p.foreground,
+    ]
 }
