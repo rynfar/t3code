@@ -260,8 +260,8 @@ impl Render for Composer {
         let approval = self.snapshot.pending.approvals.first().cloned();
         let approval_count = self.snapshot.pending.approvals.len();
         let question = self.active_input().cloned();
-        let surface = hsla(if dark { p.surface_raised } else { p.card });
-        let outline = if dark { gpui::white().opacity(0.05) } else { gpui::black().opacity(0.08) };
+        let surface = hsla(p.composer_surface);
+        let outline = hsla(p.composer_outline);
         let show_permissions = resolved.runtime_mode != resolved.default_runtime_mode;
         let show_attach = self.shows_attach_button(cx);
         let (drop_fill, drop_ring) = (hsla(p.accent).opacity(0.45), hsla(p.primary).opacity(0.7));
@@ -350,7 +350,8 @@ impl Render for Composer {
                         .border_1()
                         .border_color(outline)
                         .relative()
-                        .child(crate::glass::backdrop(16., surface.opacity(crate::theme::glass_opacity(cx)), outline, cx))
+                        .child(crate::glass::backdrop(16., surface, outline, cx))
+                        .when(dark, |this| this.shadow(vec![gpui::BoxShadow { color:hsla(p.composer_highlight), offset:gpui::point(px(0.),px(1.)), blur_radius:px(0.),spread_radius:px(0.),inset:true }]))
                         .when(!dark, |this| {
                             this.shadow(vec![gpui::BoxShadow {
                                 color: gpui::black().opacity(0.05),

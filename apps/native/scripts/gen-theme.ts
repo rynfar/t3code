@@ -16,6 +16,7 @@ type ThemeDefinition = Readonly<{
 }>;
 
 const ROOT = NodePath.resolve(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "../../..");
+const COMPOSER_SURFACE = "apps/web/src/components/chat/ComposerSurface.tsx";
 const INDEX_CSS = "apps/web/src/index.css";
 const WEB_PALETTE = "apps/web/src/themePalette.ts";
 const SHARED_PALETTES = "packages/shared/src/themePalettes.ts";
@@ -810,7 +811,60 @@ const diffRowTokens = (kind: "addition" | "deletion"): ColorToken[] => {
   ];
 };
 
+const composerDeclarations = [
+  ...read(COMPOSER_SURFACE).matchAll(/"([^"\n]*--chat-composer-[^"\n]*)"/g),
+]
+  .flatMap(([, classes]) => classes!.split(/\s+/))
+  .flatMap((fragment) => {
+    const match = /\[(--chat-composer-(?:glass-surface|outline|highlight)):(.*)\]$/.exec(fragment);
+    return match
+      ? [
+          {
+            prop: match[1]!,
+            value: match[2]!.replaceAll("_", " "),
+            dark: fragment.startsWith("dark:"),
+            themed: fragment.includes("html[data-theme-id]"),
+            chat: fragment.includes("data-theme-id=t3-chat") ? !fragment.includes(":not(") : null,
+          },
+        ]
+      : [];
+  });
+function composerTokens(): ColorToken[] {
+  const value = (variant: Variant, prop: string) => {
+    const vars = new Map<string, string>();
+    for (const d of composerDeclarations) {
+      if (d.dark && variant.appearance !== "dark") continue;
+      if ((d.themed || d.chat !== null) && !variant.theme) continue;
+      if (d.chat !== null && d.chat !== (variant.theme?.id === "t3-chat")) continue;
+      vars.set(d.prop, d.value);
+    }
+    const result = vars.get(`--chat-composer-${prop}`);
+    if (!result && prop !== "highlight")
+      throw new Error(`Composer ${prop} missing in ${COMPOSER_SURFACE}`);
+    return result ?? "transparent";
+  };
+  return [
+    {
+      name: "composer_surface",
+      web: "ComposerSurface.tsx --chat-composer-glass-surface",
+      css: ({ variant }) =>
+        `color-mix(in srgb, ${value(variant, "glass-surface")} var(--glass-opacity), transparent)`,
+    },
+    {
+      name: "composer_outline",
+      web: "ComposerSurface.tsx --chat-composer-outline",
+      css: ({ variant }) => value(variant, "outline"),
+    },
+    {
+      name: "composer_highlight",
+      web: "ComposerSurface.tsx --chat-composer-highlight",
+      css: ({ variant }) => value(variant, "highlight"),
+    },
+  ];
+}
+
 const COLOR_TOKENS: readonly ColorToken[] = [
+  ...composerTokens(),
   {
     name: "app_chrome_background",
     web: "--app-chrome-background",
@@ -1471,6 +1525,7 @@ function renderRust(): string {
   const lines: string[] = [];
   const sources = [
     INDEX_CSS,
+    COMPOSER_SURFACE,
     WEB_PALETTE,
     SHARED_PALETTES,
     SETTINGS,

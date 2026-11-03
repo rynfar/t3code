@@ -19,6 +19,7 @@ pub(super) struct AppearanceState {
     sliders: [Entity<SliderState>; 2],
     _subscriptions: Vec<Subscription>,
     removal: Option<ThemeDefinition>,
+    pending_import: Option<ThemeDefinition>,
     removal_ids: Vec<String>,
     variants: std::collections::BTreeMap<String, String>,
 }
@@ -50,7 +51,14 @@ impl AppearanceState {
                 })
             })
             .collect();
-        Self { sliders, _subscriptions: subscriptions, removal: None, removal_ids: Vec::new(), variants: std::collections::BTreeMap::new() }
+        Self {
+            sliders,
+            _subscriptions: subscriptions,
+            removal: None,
+            pending_import: None,
+            removal_ids: Vec::new(),
+            variants: std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -105,7 +113,21 @@ impl SettingsView {
                     return None;
                 }
                 Some(
-                    self.appearance_ui.variants.get(&collection.id).and_then(|id| custom.iter().find(|t| t.id == *id)).unwrap_or(t).clone(),
+                    self.appearance_ui
+                        .variants
+                        .get(&collection.id)
+                        .and_then(|id| custom.iter().find(|t| t.id == id.split(':').next().unwrap_or(id)))
+                        .or_else(|| {
+                            custom.iter().find(|candidate| {
+                                candidate.collection.as_ref().is_some_and(|c| c.id == collection.id)
+                                    && [false, true].into_iter().any(|dark| {
+                                        themes::half_theme(&theme, &themes::halves(&doc), dark, &custom, theme::environment_themes(cx))
+                                            .is_some_and(|owner| owner.id == candidate.id)
+                                    })
+                            })
+                        })
+                        .unwrap_or(t)
+                        .clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -163,18 +185,31 @@ impl SettingsView {
                 let variants = custom
                     .iter()
                     .filter(|t| t.collection.as_ref().is_some_and(|c| c.id == collection.id))
-                    .map(|t| SelectOption::new(t.id.clone(), t.label.clone()))
+                    .flat_map(|t| {
+                        [false, true].into_iter().filter(|dark| t.half(*dark).is_some()).map(move |dark| {
+                            SelectOption::new(
+                                format!("{}:{}", t.id, if dark { "dark" } else { "light" }),
+                                format!("{} ({})", t.label, if dark { "Dark" } else { "Light" }),
+                            )
+                        })
+                    })
                     .collect::<Vec<_>>();
                 if variants.len() > 1 {
                     body = body.child(
                         div().px(r(8.)).pt(r(4.)).child(
                             Select::new(ElementId::Name(format!("variants-{collection_id}").into()), variants)
-                                .selected(card.named_id().unwrap_or("").to_owned())
+                                .selected(self.appearance_ui.variants.get(&collection.id).cloned().unwrap_or_else(|| {
+                                    format!("{}:{}", card.named_id().unwrap_or(""), definition.as_ref().unwrap().appearance)
+                                }))
                                 .label(collection_label)
                                 .width(220.)
                                 .on_change(move |id, _, cx| {
                                     let _ = weak.update(cx, |this, cx| {
-                                        this.appearance_ui.variants.insert(collection_id.clone(), id.to_string());
+                                        if let Some((theme_id, mode)) = id.split_once(':') {
+                                            let patch = themes::assign_half(store::client(cx), mode == "dark", Some(theme_id));
+                                            store::update_client(&this.state, ClientSettingChange::ThemePatch(patch), cx);
+                                            this.appearance_ui.variants.insert(collection_id.clone(), id.to_string());
+                                        }
                                         cx.notify();
                                     });
                                 }),
@@ -185,6 +220,12 @@ impl SettingsView {
             let state = self.state.clone();
             let chosen = card.clone();
             let use_definition = definition.clone();
+            let collection = definition.as_ref().and_then(|t| t.collection.as_ref()).map(|c| c.id.clone());
+            let collection_themes = collection
+                .as_ref()
+                .map(|id| custom.iter().filter(|t| t.collection.as_ref().is_some_and(|c| c.id == *id)).cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+
             let mut actions = h_flex().px(r(8.)).py(r(8.)).gap(r(4.)).child(
                 Button::new(
                     ElementId::Name(format!("theme-use-{}", card.named_id().unwrap_or("default")).into()),
@@ -192,8 +233,15 @@ impl SettingsView {
                     ButtonSize::Xs,
                 )
                 .label("Use")
-                .on_click(move |_, _, cx| {
-                    if let Some(t) = &use_definition
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if collection_themes.len() > 1 {
+                        let patch = themes::select_collection(store::client(cx), &collection_themes);
+                        store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
+                        if let Some(id) = &collection {
+                            this.appearance_ui.variants.remove(id);
+                        }
+                        cx.notify();
+                    } else if let Some(t) = &use_definition
                         && t.variants.is_empty()
                     {
                         let patch = themes::assign_half(store::client(cx), t.appearance == "dark", Some(&t.id));
@@ -201,7 +249,7 @@ impl SettingsView {
                     } else {
                         store::update_client(&state, ClientSettingChange::Theme(chosen.clone()), cx);
                     }
-                }),
+                })),
             );
             if let Some(definition) = definition {
                 let duplicate = definition.clone();
@@ -290,6 +338,37 @@ impl SettingsView {
                 ),
             )
             .child(grid)
+            .when_some(self.appearance_ui.pending_import.clone(), |this, pending| {
+                this.child(
+                    v_flex()
+                        .p(r(16.))
+                        .gap(r(12.))
+                        .child(section_title("Already installed"))
+                        .child(super::controls::muted_text(pending.label, cx))
+                        .child(
+                            h_flex()
+                                .gap(r(8.))
+                                .child(
+                                    Button::new("theme-update-existing", ButtonVariant::Default, ButtonSize::Sm)
+                                        .label("Update existing")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.resolve_theme_import(themes::ImportChoice::Update, cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("theme-keep-both", ButtonVariant::Outline, ButtonSize::Sm).label("Keep both").on_click(
+                                        cx.listener(|this, _, _, cx| this.resolve_theme_import(themes::ImportChoice::KeepBoth, cx)),
+                                    ),
+                                )
+                                .child(Button::new("theme-cancel-import", ButtonVariant::Ghost, ButtonSize::Sm).label("Cancel").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.appearance_ui.pending_import = None;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                )
+            })
             .when_some(self.appearance_ui.removal.clone(), |this, target| {
                 let variants = custom
                     .iter()
@@ -502,8 +581,25 @@ impl SettingsView {
         })
         .detach();
     }
-    fn install_theme(&mut self, theme: ThemeDefinition, activate: bool, cx: &mut Context<Self>) {
-        import_theme(&self.state, theme, activate, cx);
+    pub(super) fn install_theme(&mut self, theme: ThemeDefinition, activate: bool, cx: &mut Context<Self>) {
+        if activate && theme::preferences(cx).custom.iter().any(|t| t.id == theme.id) {
+            self.appearance_ui.pending_import = Some(theme);
+            cx.notify();
+        } else {
+            import_theme(&self.state, theme, activate, cx);
+        }
+    }
+    fn resolve_theme_import(&mut self, choice: themes::ImportChoice, cx: &mut Context<Self>) {
+        if let Some(pending) = self.appearance_ui.pending_import.as_ref() {
+            match themes::resolve_import(store::client(cx), pending, choice) {
+                Ok(library) => {
+                    store::update_client(&self.state, ClientSettingChange::ThemeLibrary(library), cx);
+                    self.appearance_ui.pending_import = None;
+                }
+                Err(e) => store::show_error(e, cx),
+            }
+            cx.notify();
+        }
     }
 }
 

@@ -751,6 +751,8 @@ impl<'de> Deserialize<'de> for ProviderInstances {
 pub struct ServerConfig {
     #[serde(default)]
     pub environment_themes: Vec<Value>,
+    #[serde(skip)]
+    pub environment_theme_definitions: Vec<crate::themes::ThemeDefinition>,
     #[serde(default)]
     pub environment: EnvironmentDescriptor,
     #[serde(default)]
@@ -845,8 +847,22 @@ pub enum ServerConfigStreamEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnvironmentThemesPayload {
+    #[serde(skip)]
+    pub definitions: Vec<crate::themes::ThemeDefinition>,
     #[serde(default)]
     pub themes: Vec<Value>,
+}
+
+impl ServerConfigStreamEvent {
+    /// Run by the network worker before crossing into the UI's config reducer.
+    pub fn prepare(mut self)->Self {
+        match &mut self {
+            Self::EnvironmentThemesUpdated{payload}=>payload.definitions=crate::themes::environment(&payload.themes),
+            Self::Snapshot{config}=>config.environment_theme_definitions=crate::themes::environment(&config.environment_themes),
+            _=>{}
+        }
+        self
+    }
 }
 
 /// Client-side config. Events before the first snapshot are dropped, as `Option.map` drops them.
@@ -872,7 +888,7 @@ impl ServerConfigState {
                 if let Some(current) = self.config.as_ref().filter(|current| !current.usage_limit_sources.is_empty()) {
                     config.usage_limit_sources = current.usage_limit_sources.clone();
                 }
-                if let Some(current) = self.config.as_ref() { config.environment_themes = current.environment_themes.clone(); }
+                if let Some(current) = self.config.as_ref() { config.environment_themes = current.environment_themes.clone();config.environment_theme_definitions=current.environment_theme_definitions.clone(); }
                 if self.config.as_ref() == Some(&*config) {
                     return false;
                 }
@@ -891,7 +907,11 @@ impl ServerConfigState {
             ServerConfigStreamEvent::UsageLimitSourcesUpdated { payload } => {
                 self.update(|config| replace(&mut config.usage_limit_sources, payload.sources))
             }
-            ServerConfigStreamEvent::EnvironmentThemesUpdated { payload } => self.update(|config| replace(&mut config.environment_themes, payload.themes)),
+            ServerConfigStreamEvent::EnvironmentThemesUpdated { payload } => self.update(|config| {
+                let raw=replace(&mut config.environment_themes,payload.themes);
+                let prepared=replace(&mut config.environment_theme_definitions,payload.definitions);
+                raw||prepared
+            }),
             ServerConfigStreamEvent::Unknown => false,
         }
     }

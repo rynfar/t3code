@@ -867,3 +867,11 @@ pub(crate) fn import_theme_fixture(path:&std::path::Path,state:&Entity<AppState>
     let theme=t3_core::themes::import(&text)?;
     appearance::import_theme(state,theme,true,cx);Ok(())
 }
+
+#[cfg(feature="snapshot")]
+pub(crate) fn reimport_theme_fixture(path:&std::path::Path,cx:&mut App)->Result<(),String> {
+    let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
+    let theme=t3_core::themes::import(&text)?;
+    let view=cx.global::<Host>().view.clone().ok_or("settings must be open for reimport")?;
+    view.update(cx,|view,cx|view.install_theme(theme,true,cx));Ok(())
+}

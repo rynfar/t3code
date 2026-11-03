@@ -459,3 +459,65 @@ pub fn import(source: &str) -> Result<ThemeDefinition, String> {
         decode(&serde_json::from_str::<Value>(source).map_err(|_| "That theme file is not valid JSON.")?, false)
     }
 }
+
+#[derive(Clone, Copy)]
+pub enum ImportChoice {
+    Update,
+    KeepBoth,
+}
+pub fn resolve_import(doc: &ClientSettingsDoc, theme: &ThemeDefinition, choice: ImportChoice) -> Result<Value, String> {
+    match choice {
+        ImportChoice::Update => {
+            let mut stored =
+                doc.entries().get(LIBRARY_KEY).and_then(Value::as_array).cloned().ok_or("Couldn’t read the theme library. Try again.")?;
+            let existing = library(doc).into_iter().find(|t| t.id == theme.id).ok_or("The theme is no longer installed.")?;
+            let updated = ThemeDefinition { collection: existing.collection.or_else(|| theme.collection.clone()), ..theme.clone() };
+            let mut replaced = false;
+            stored.retain_mut(|value| {
+                if value.get("id").and_then(Value::as_str) != Some(&theme.id) {
+                    return true;
+                }
+                if replaced {
+                    return false;
+                }
+                *value = serde_json::to_value(&updated).expect("serializable theme");
+                replaced = true;
+                true
+            });
+            Ok(Value::Array(stored))
+        }
+        ImportChoice::KeepBoth => {
+            for copy in 1..100 {
+                let suffix = format!(" ({copy})");
+                let label = format!("{}{}", theme.label.chars().take(48 - suffix.len()).collect::<String>(), suffix);
+                let candidate = ThemeDefinition { id: id_from_name(&label), label, collection: None, ..theme.clone() };
+                if !reserved(&candidate.id)
+                    && !doc
+                        .entries()
+                        .get(LIBRARY_KEY)
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| a.iter().any(|v| v.get("id").and_then(Value::as_str) == Some(&candidate.id)))
+                {
+                    return install(doc, &candidate);
+                }
+            }
+            Err(format!("Too many copies of \"{}\".", theme.label))
+        }
+    }
+}
+pub fn select_collection(doc: &ClientSettingsDoc, themes: &[ThemeDefinition]) -> serde_json::Map<String, Value> {
+    if themes.len() == 1 {
+        let t = &themes[0];
+        if t.variants.is_empty() {
+            return assign_half(doc, t.appearance == "dark", Some(&t.id));
+        }
+        return doc.clone().apply_change(&crate::client_settings::ClientSettingChange::Theme(ThemePreference::Named(t.id.clone())));
+    }
+    let mut selected = halves(doc);
+    for dark in [false, true] {
+        if let Some(t) = themes.iter().find(|t| t.half(dark).is_some()) {
+            selected.insert(if dark { "dark" } else { "light" }.into(), t.id.clone());
+        }
+    }
+    serde_json::Map::from_iter([(HALVES_KEY.into(), serde_json::json!(selected))])
+}

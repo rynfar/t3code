@@ -61,9 +61,7 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     assert_eq!(thread["payload"].get("afterSequence"), None);
     assert_eq!(thread["payload"]["acceptBoundedSnapshot"], true);
 
-    first
-        .chunk(&shell, json!([{"kind": "snapshot", "snapshot": {"snapshotSequence": 40, "projects": [], "threads": []}}]))
-        .await;
+    first.chunk(&shell, json!([{"kind": "snapshot", "snapshot": {"snapshotSequence": 40, "projects": [], "threads": []}}])).await;
     first
         .chunk(
             &thread,
@@ -106,7 +104,6 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     let thread = third.request(method::SUBSCRIBE_THREAD).await;
     assert_eq!(thread["payload"]["afterSequence"], 6);
 }
-
 
 async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, oneshot::Sender<Result<Value, RpcError>>) {
     match rx.recv().await {
@@ -226,14 +223,20 @@ async fn next_status(events: &mut mpsc::Receiver<ClientEvent>) -> ConnectionStat
 async fn a_server_on_another_protocol_blocks_until_retried() {
     let mut server = FakeServer::start().await;
     let newer = t3_core::compatibility::ORCHESTRATION_PROTOCOL_VERSION + 1;
-    server.set_descriptor(Some(json!({ "environmentId": "env", "label": "Studio", "serverVersion": "9.0.0", "orchestrationProtocolVersion": newer })));
+    server.set_descriptor(Some(
+        json!({ "environmentId": "env", "label": "Studio", "serverVersion": "9.0.0", "orchestrationProtocolVersion": newer }),
+    ));
     let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
     assert_eq!(next_status(&mut events).await, ConnectionStatus::Connecting);
-    let ConnectionStatus::Unsupported { reason, server_outdated: false } = next_status(&mut events).await else { panic!("blocked as unsupported") };
+    let ConnectionStatus::Unsupported { reason, server_outdated: false } = next_status(&mut events).await else {
+        panic!("blocked as unsupported")
+    };
     assert!(reason.contains("Studio"));
 
     // Fixed on the server: Retry connects, still reading as a recovery from that failure.
-    server.set_descriptor(Some(json!({ "environmentId": "env", "label": "Studio", "serverVersion": "9.0.0", "orchestrationProtocolVersion": newer - 1 })));
+    server.set_descriptor(Some(
+        json!({ "environmentId": "env", "label": "Studio", "serverVersion": "9.0.0", "orchestrationProtocolVersion": newer - 1 }),
+    ));
     client.retry_now();
     assert!(matches!(next_status(&mut events).await, ConnectionStatus::Reconnecting { reason: last, .. } if last == reason));
     server.connection().await;
@@ -245,11 +248,14 @@ async fn a_socket_refused_for_its_protocol_blocks_instead_of_retrying() {
     let mut server = FakeServer::start().await;
     // No descriptor to check first: the socket's 426 is the only signal.
     let newer = t3_core::compatibility::ORCHESTRATION_PROTOCOL_VERSION + 1;
-    let body = json!({"code": "orchestration_protocol_incompatible", "message": "Update this client.", "orchestrationProtocolVersion": newer});
+    let body =
+        json!({"code": "orchestration_protocol_incompatible", "message": "Update this client.", "orchestrationProtocolVersion": newer});
     server.refuse_upgrades(Some((426, body)));
     let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
     assert_eq!(next_status(&mut events).await, ConnectionStatus::Connecting);
-    let ConnectionStatus::Unsupported { reason, server_outdated: false } = next_status(&mut events).await else { panic!("blocked as unsupported") };
+    let ConnectionStatus::Unsupported { reason, server_outdated: false } = next_status(&mut events).await else {
+        panic!("blocked as unsupported")
+    };
     assert!(reason.starts_with("This client is not supported by this server."), "{reason}");
 
     // Nothing retries on its own; Retry checks again.
@@ -283,7 +289,9 @@ async fn a_prepared_route_is_readied_before_every_attempt_and_a_blocked_one_wait
 
     // Nothing retries on its own; Retry prepares again and connects.
     client.retry_now();
-    assert!(matches!(next_status(&mut events).await, ConnectionStatus::Reconnecting { reason, attempt: 1 } if reason.contains("cancelled")));
+    assert!(
+        matches!(next_status(&mut events).await, ConnectionStatus::Reconnecting { reason, attempt: 1 } if reason.contains("cancelled"))
+    );
     let first = server.connection().await;
     assert_eq!(next_status(&mut events).await, ConnectionStatus::Connected);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -303,4 +311,45 @@ async fn a_route_that_moved_stops_the_client_and_says_where() {
     let moved = tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("an event arrives");
     assert!(matches!(moved, Some(ClientEvent::Moved { ref http_base }) if http_base == "http://127.0.0.1:52002"), "{moved:?}");
     assert!(tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("ends").is_none(), "the client stopped");
+}
+
+#[tokio::test]
+async fn published_themes_arrive_prepared_from_the_network_worker() {
+    let mut server = FakeServer::start().await;
+    let (_client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut connection = server.connection().await;
+    let config = connection.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+    assert_eq!(config["payload"]["environmentThemes"], true);
+    connection.chunk(&config, json!([{"type":"snapshot","config":{}}])).await;
+    connection.chunk(&config,json!([{"type":"environmentThemesUpdated","payload":{"themes":[{"id":"office","name":"Office","appearance":"dark","canvas":"#123","accent":"#abc"}]}}])).await;
+    let mut state = t3_core::server_config::ServerConfigState::default();
+    loop {
+        if let ClientEvent::ServerConfig(event) = events.recv().await.expect("open config stream") {
+            let published = matches!(&*event, ServerConfigStreamEvent::EnvironmentThemesUpdated { .. });
+            state.apply(*event);
+            if published {
+                break;
+            }
+        }
+    }
+    let prepared = &state.config.as_ref().unwrap().environment_theme_definitions;
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].id, "office");
+    assert_ne!(prepared[0].colors["surface"], t3_core::themes::defaults(true)["surface"]);
+    connection.chunk(&config, json!([{"type":"snapshot","config":{}}])).await;
+    loop {
+        if let ClientEvent::ServerConfig(event) = events.recv().await.expect("reconnect snapshot") {
+            assert!(!state.apply(*event));
+            break;
+        }
+    }
+    assert_eq!(state.config.as_ref().unwrap().environment_theme_definitions.len(), 1);
+    connection.chunk(&config, json!([{"type":"environmentThemesUpdated","payload":{"themes":[]}}])).await;
+    loop {
+        if let ClientEvent::ServerConfig(event) = events.recv().await.expect("withdrawal") {
+            assert!(state.apply(*event));
+            break;
+        }
+    }
+    assert!(state.config.as_ref().unwrap().environment_theme_definitions.is_empty());
 }

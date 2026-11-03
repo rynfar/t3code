@@ -1,8 +1,14 @@
 //! CSS Color 4 interpolation used by `index.css` and `themePalette.ts`.
 
+mod spaces;
+
 pub type Color = [f64; 4];
 pub fn parse(s: &str) -> Result<Color, String> {
-    let s = s.trim();
+    let normalized = s.trim().to_ascii_lowercase();
+    let s = normalized.as_str();
+    if s.starts_with("color(") {
+        return spaces::parse(s);
+    }
     for name in ["oklch", "oklab"] {
         if let Some(args) = s.strip_prefix(&format!("{name}(")).and_then(|s| s.strip_suffix(')')) {
             let parts = split(args, '/');

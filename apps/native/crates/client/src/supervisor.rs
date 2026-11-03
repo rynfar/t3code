@@ -452,7 +452,7 @@ async fn run_session(
             },
             value = next_config(&mut server_config) => match value {
                 Some(Ok(value)) => match serde_json::from_value::<ServerConfigStreamEvent>(value) {
-                    Ok(event) => { let _ = events.send(ClientEvent::ServerConfig(Box::new(event))).await; }
+                    Ok(event) => { let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await; }
                     Err(error) => report(events, "server config", error.to_string()).await,
                 },
                 // The rest of the session works without it; the next session subscribes again.
@@ -534,7 +534,7 @@ async fn initial_shell_options(stream: &mut Option<StreamHandle>, events: &Event
                             }
                             _ => None,
                         };
-                        let _ = events.send(ClientEvent::ServerConfig(Box::new(event))).await;
+                        let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
                         if let Some(options) = options {
                             return options;
                         }

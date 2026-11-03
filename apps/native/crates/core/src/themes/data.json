@@ -872,6 +872,9 @@
   ],
   "expected": [
     {
+      "composer_surface": 4294967244,
+      "composer_outline": 20,
+      "composer_highlight": 0,
       "app_chrome_background": 4244438271,
       "background": 4244438271,
       "foreground": 404233215,
@@ -1012,6 +1015,9 @@
       "blue_orange_diff_row_deletion_gutter": 4294110207
     },
     {
+      "composer_surface": 286331340,
+      "composer_outline": 4294967053,
+      "composer_highlight": 4294967048,
       "app_chrome_background": 255,
       "background": 255,
       "foreground": 4126537215,
@@ -1152,6 +1158,9 @@
       "blue_orange_diff_row_deletion_gutter": 386728703
     },
     {
+      "composer_surface": 4261084620,
+      "composer_outline": 4022201343,
+      "composer_highlight": 0,
       "app_chrome_background": 4260888063,
       "background": 4260888063,
       "foreground": 1343771903,
@@ -1292,6 +1301,9 @@
       "blue_orange_diff_row_deletion_gutter": 4293782527
     },
     {
+      "composer_surface": 740700620,
+      "composer_outline": 605956351,
+      "composer_highlight": 1127041055,
       "app_chrome_background": 521807103,
       "background": 521807103,
       "foreground": 4193844223,
@@ -1432,6 +1444,9 @@
       "blue_orange_diff_row_deletion_gutter": 757081087
     },
     {
+      "composer_surface": 3975146956,
+      "composer_outline": 3588677119,
+      "composer_highlight": 0,
       "app_chrome_background": 4093113599,
       "background": 4093113599,
       "foreground": 605365247,
@@ -1572,6 +1587,9 @@
       "blue_orange_diff_row_deletion_gutter": 4142785535
     },
     {
+      "composer_surface": 910245068,
+      "composer_outline": 708719871,
+      "composer_highlight": 1332895519,
       "app_chrome_background": 455614975,
       "background": 455614975,
       "foreground": 4294639615,
@@ -1712,6 +1730,9 @@
       "blue_orange_diff_row_deletion_gutter": 707600639
     },
     {
+      "composer_surface": 3991925196,
+      "composer_outline": 3638882047,
+      "composer_highlight": 0,
       "app_chrome_background": 4126669055,
       "background": 4126669055,
       "foreground": 605365247,
@@ -1852,6 +1873,9 @@
       "blue_orange_diff_row_deletion_gutter": 4176340991
     },
     {
+      "composer_surface": 859522508,
+      "composer_outline": 674644991,
+      "composer_highlight": 1332181791,
       "app_chrome_background": 388049919,
       "background": 388049919,
       "foreground": 4294639615,
@@ -1992,6 +2016,9 @@
       "blue_orange_diff_row_deletion_gutter": 656878335
     },
     {
+      "composer_surface": 4059033292,
+      "composer_outline": 4007713279,
+      "composer_highlight": 0,
       "app_chrome_background": 4193777151,
       "background": 4193777151,
       "foreground": 605365247,
@@ -2132,6 +2159,9 @@
       "blue_orange_diff_row_deletion_gutter": 4226671871
     },
     {
+      "composer_surface": 1127757260,
+      "composer_outline": 1093741055,
+      "composer_highlight": 2052934943,
       "app_chrome_background": 689838847,
       "background": 689838847,
       "foreground": 4294639615,
@@ -2272,6 +2302,9 @@
       "blue_orange_diff_row_deletion_gutter": 891558399
     },
     {
+      "composer_surface": 4042257100,
+      "composer_outline": 3856724223,
+      "composer_highlight": 0,
       "app_chrome_background": 4177000959,
       "background": 4177000959,
       "foreground": 605365247,
@@ -2412,6 +2445,9 @@
       "blue_orange_diff_row_deletion_gutter": 4209895679
     },
     {
+      "composer_surface": 942949324,
+      "composer_outline": 808076031,
+      "composer_highlight": 1565686559,
       "app_chrome_background": 488188415,
       "background": 488188415,
       "foreground": 4294639615,
@@ -2554,6 +2590,9 @@
   ],
   "recipes": [
     {
+      "composer_surface": "color-mix(in srgb, #fff $glass%, transparent)",
+      "composer_outline": "rgb(0 0 0/8%)",
+      "composer_highlight": "transparent",
       "app_chrome_background": "oklch(99.2% 0 0)",
       "background": "oklch(99.2% 0 0)",
       "foreground": "color-mix( in oklab, color-mix(in oklab, oklch(21% 0.006 285.885) $base%, oklch(99.2% 0 0)), black $boost% )",
@@ -2688,6 +2727,9 @@
       "blue_orange_diff_row_deletion_gutter": "light-dark(color-mix(in lab, oklch(99.2% 0 0) 91%, color-mix(in srgb, oklch(99.2% 0 0) 35%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))), color-mix(in lab, oklch(99.2% 0 0) 85%, color-mix(in srgb, oklch(99.2% 0 0) 60%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))))"
     },
     {
+      "composer_surface": "color-mix(in srgb, color-mix(in srgb, oklch(14.5% 0 none) 97%, #fff) $glass%, transparent)",
+      "composer_outline": "color-mix(in srgb,#fff 5%,transparent)",
+      "composer_highlight": "rgb(255 255 255/3%)",
       "app_chrome_background": "#000",
       "background": "#000",
       "foreground": "color-mix( in oklab, color-mix(in oklab, oklch(97% 0 none) $base%, #000), white $boost% )",
@@ -2822,6 +2864,9 @@
       "blue_orange_diff_row_deletion_gutter": "light-dark(color-mix(in lab, #000 91%, color-mix(in srgb, #000 35%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))), color-mix(in lab, #000 85%, color-mix(in srgb, #000 60%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))))"
     },
     {
+      "composer_surface": "color-mix(in srgb, role(surfaceRaised) $glass%, transparent)",
+      "composer_outline": "role(toolbarBorder)",
+      "composer_highlight": "transparent",
       "app_chrome_background": "role(chrome)",
       "background": "role(canvas)",
       "foreground": "color-mix( in oklab, color-mix(in oklab, role(text) $base%, role(canvas)), black $boost% )",
@@ -2956,6 +3001,9 @@
       "blue_orange_diff_row_deletion_gutter": "light-dark(color-mix(in lab, role(canvas) 91%, color-mix(in srgb, role(canvas) 35%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))), color-mix(in lab, role(canvas) 85%, color-mix(in srgb, role(canvas) 60%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))))"
     },
     {
+      "composer_surface": "color-mix(in srgb, role(surfaceRaised) $glass%, transparent)",
+      "composer_outline": "color-mix(in srgb,role(input) 30%,role(canvas))",
+      "composer_highlight": "color-mix(in srgb,role(input) 12%,transparent)",
       "app_chrome_background": "role(chrome)",
       "background": "role(canvas)",
       "foreground": "color-mix( in oklab, color-mix(in oklab, role(text) $base%, role(canvas)), white $boost% )",
@@ -3090,6 +3138,9 @@
       "blue_orange_diff_row_deletion_gutter": "light-dark(color-mix(in lab, role(canvas) 91%, color-mix(in srgb, role(canvas) 35%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))), color-mix(in lab, role(canvas) 85%, color-mix(in srgb, role(canvas) 60%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))))"
     },
     {
+      "composer_surface": "color-mix(in srgb, role(surfaceRaised) $glass%, transparent)",
+      "composer_outline": "role(toolbarBorder)",
+      "composer_highlight": "transparent",
       "app_chrome_background": "role(chrome)",
       "background": "role(canvas)",
       "foreground": "color-mix( in oklab, color-mix(in oklab, role(text) $base%, role(canvas)), black $boost% )",
@@ -3224,6 +3275,9 @@
       "blue_orange_diff_row_deletion_gutter": "light-dark(color-mix(in lab, role(canvas) 91%, color-mix(in srgb, role(canvas) 35%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))), color-mix(in lab, role(canvas) 85%, color-mix(in srgb, role(canvas) 60%, light-dark(oklch(64.6% 0.222 41.116), oklch(75% 0.183 55.934)))))"
     },
     {
+      "composer_surface": "color-mix(in srgb, role(surfaceRaised) $glass%, transparent)",
+      "composer_outline": "#241e28",
+      "composer_highlight": "color-mix(in srgb,#432d48 12%,transparent)",
       "app_chrome_background": "role(chrome)",
       "background": "role(canvas)",
       "foreground": "color-mix( in oklab, color-mix(in oklab, role(text) $base%, role(canvas)), white $boost% )",

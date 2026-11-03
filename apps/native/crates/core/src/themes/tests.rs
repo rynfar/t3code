@@ -7,6 +7,33 @@ fn imports_validate_and_fill_both_halves_from_t3_chat() {
     assert_eq!(theme.colors["canvas"], "#1234");
     assert_eq!(theme.colors["border"], defaults(true)["border"]);
     assert_eq!(theme.half(false).unwrap()["border"], defaults(false)["border"]);
+    for literal in [
+        "color(display-p3 0.8 0.2 0.3 / 50%)",
+        "color(srgb 0.1 0.2 0.3)",
+        "color(rec2020 0.2 0.4 0.6)",
+        "color(a98-rgb 0.2 0.4 0.6)",
+        "color(prophoto-rgb 0.2 0.4 0.6)",
+        "color(xyz-d50 0.2 0.3 0.4)",
+        "color(xyz-d65 0.2 0.3 0.4)",
+        "color(srgb-linear 0.2 0.3 0.4)",
+    ] {
+        let file = json!({"version":1,"name":"Wide gamut","appearance":"light","colors":{"canvas":literal}});
+        let imported = decode(&file, false).unwrap();
+        let published = environment(&[json!({"id":"wide-gamut","name":"Wide gamut","appearance":"light","colors":{"canvas":literal}})]);
+        assert_eq!(published[0].colors["canvas"], imported.colors["canvas"]);
+        palette(Some(&imported.colors), false, 100, 80).unwrap();
+    }
+    for (literal, expected) in [
+        ("color(display-p3 0.8 0.2 0.3 / 50%)", 0xde184980),
+        ("color(rec2020 0.2 0.4 0.6)", 0x0078a8ff),
+        ("color(a98-rgb 0.2 0.4 0.6)", 0x00669cff),
+        ("color(prophoto-rgb 0.2 0.4 0.6)", 0x0082b0ff),
+        ("color(xyz-d50 0.2 0.3 0.4)", 0x00a8bdff),
+        ("color(xyz-d65 0.2 0.3 0.4)", 0x00a7a4ff),
+        ("color(srgb-linear 0.2 0.3 0.4)", 0x7c95aaff),
+    ] {
+        assert_eq!(color::packed(color::parse(literal).unwrap()), expected, "{literal}");
+    }
     for invalid in [
         json!({"version":2}),
         json!({"version":1,"name":"X","id":"light","appearance":"dark","colors":{"canvas":"black"}}),
@@ -22,6 +49,14 @@ fn contrast_and_glass_follow_css_and_preserve_alpha() {
     let normal = palette(None, true, 100, 80).unwrap();
     let high = palette(None, true, 200, 100).unwrap();
     let low = palette(None, true, 50, 0).unwrap();
+    assert_eq!(normal.get("composer_surface"), Some(&0x111111cc));
+    let mut roles = defaults(false);
+    roles.insert("surface".into(), "#ffffff".into());
+    roles.insert("surfaceRaised".into(), "#335577".into());
+    roles.insert("toolbarBorder".into(), "#448866".into());
+    let custom = palette(Some(&roles), false, 100, 80).unwrap();
+    assert_eq!(custom.get("composer_surface"), Some(&0x335577cc));
+    assert_eq!(custom.get("composer_outline"), Some(&0x448866ff));
     assert_eq!(high["foreground"], 0xffffffff);
     assert_eq!(low["glass_surface"] & 255, 102);
     assert_eq!(normal["glass_surface"] & 255, 204);
@@ -154,6 +189,11 @@ fn vscode_jsonc_import_flattens_overlays_and_keeps_controls_readable() {
     },}"##,
     )
     .unwrap();
+    let alpha = import(r##"{"name":"Alpha","colors":{"editor.background":"#000000","focusBorder":"#ff000080"}}"##).unwrap();
+    let seed = vivid::derive(true, "#000000", "#330000").unwrap();
+    assert_eq!(alpha.colors["sidebar"], seed["sidebar"]);
+    let hidden=import(r##"{"name":"Hidden","colors":{"editor.background":"#000000","editorWidget.background":"#808080","focusBorder":"#808080","button.background":"#00ff00"}}"##).unwrap();
+    assert_eq!(hidden.colors["accent"], "#00ff00");
     assert_eq!(theme.label, "Office Night");
     assert_eq!(theme.id, "office-night");
     assert_eq!(theme.appearance, "dark");
@@ -168,4 +208,47 @@ fn vscode_jsonc_import_flattens_overlays_and_keeps_controls_readable() {
     assert_eq!(p3.appearance, "light");
     assert!(import(r##"{"tokenColors":[]}"##).unwrap_err().contains("editor.background"));
     assert!(import(r##"{"version":1,"name":"Strict","appearance":"dark","colors":{"canvas":"#123"},}"##).is_err());
+}
+
+#[test]
+fn reimport_choices_preserve_selections_and_existing_collection() {
+    use crate::client_settings::ClientSettingChange as C;
+    let mut old = decode(
+        &json!({"version":1,"name":"Night","appearance":"dark","colors":{"canvas":"#123"},"collection":{"id":"pkg","label":"Package"}}),
+        false,
+    )
+    .unwrap();
+    let mut doc = ClientSettingsDoc::from_json(
+        &json!({LIBRARY_KEY:[old.clone(),{"future":true}],HALVES_KEY:{"dark":"night","light":"iris"},"t3code:theme":"ocean"}).to_string(),
+    );
+    old.collection = None;
+    old.colors.insert("canvas".into(), "#456".into());
+    let updated = resolve_import(&doc, &old, ImportChoice::Update).unwrap();
+    doc.apply(&C::ThemeLibrary(updated));
+    let saved = library(&doc);
+    assert_eq!(saved[0].colors["canvas"], "#456");
+    assert_eq!(saved[0].collection.as_ref().unwrap().id, "pkg");
+    assert_eq!(halves(&doc), BTreeMap::from([("dark".into(), "night".into()), ("light".into(), "iris".into())]));
+    assert_eq!(doc.theme().named_id(), Some("ocean"));
+    assert_eq!(doc.entries()[LIBRARY_KEY][1], json!({"future":true}));
+    let copied = resolve_import(&doc, &old, ImportChoice::KeepBoth).unwrap();
+    doc.apply(&C::ThemeLibrary(copied));
+    let copied = library(&doc);
+    assert_eq!(copied.len(), 2);
+    assert_eq!(copied[1].label, "Night (1)");
+    assert_ne!(copied[0].id, copied[1].id);
+    assert!(copied[1].collection.is_none());
+    assert_eq!(halves(&doc)["dark"], "night");
+}
+#[test]
+fn collection_use_assigns_first_variant_for_each_appearance_together() {
+    use crate::client_settings::ClientSettingChange as C;
+    let light = decode(&json!({"version":1,"name":"Day","appearance":"light","colors":{"canvas":"white"}}), false).unwrap();
+    let dark = decode(&json!({"version":1,"name":"Night","appearance":"dark","colors":{"canvas":"black"}}), false).unwrap();
+    let mut doc = ClientSettingsDoc::from_json(&json!({"t3code:theme":"ocean",HALVES_KEY:{"dark":"iris"}}).to_string());
+    doc.apply(&C::ThemePatch(select_collection(&doc, &[light.clone(), dark])));
+    assert_eq!(halves(&doc), BTreeMap::from([("light".into(), "day".into()), ("dark".into(), "night".into())]));
+    assert_eq!(doc.theme().named_id(), Some("ocean"));
+    doc.apply(&C::ThemePatch(select_collection(&doc, &[light])));
+    assert_eq!(halves(&doc)["dark"], "night");
 }

@@ -99,7 +99,7 @@ pub(super) fn convert(v: &Value) -> Result<ThemeDefinition, String> {
     let canvas_hex = hex(canvas);
     let raised = solid(colors, canvas, &["editorWidget.background", "dropdown.background"]);
     let stands = |s: &str| apart(s, &canvas_hex) && raised.as_ref().is_none_or(|r| apart(s, r));
-    let accent = [
+    let (accent, accent_color) = [
         "focusBorder",
         "button.background",
         "textLink.foreground",
@@ -108,13 +108,15 @@ pub(super) fn convert(v: &Value) -> Result<ThemeDefinition, String> {
         "badge.background",
     ]
     .into_iter()
-    .filter_map(|key| solid(colors, canvas, &[key]))
-    .find(|s| stands(s))
+    .filter_map(|key| pick(colors, &[key]).map(|c| (flatten(c, canvas), c)))
+    .find(|(s, _)| stands(s))
     .unwrap_or_else(|| {
         let accent = hex(rgb(&standard(dark)["accent"]));
-        [accent.clone(), "#ffffff".into(), "#000000".into()].into_iter().find(|s| stands(s)).unwrap_or(accent)
+        let accent = [accent.clone(), "#ffffff".into(), "#000000".into()].into_iter().find(|s| stands(s)).unwrap_or(accent);
+        let c = rgb(&accent);
+        (accent, c)
     });
-    let mut tint = rgb(&accent);
+    let mut tint = accent_color;
     tint[3] = 0.2;
     let derived = vivid::derive(dark, &canvas_hex, &flatten(tint, canvas)).ok_or("Could not derive this theme.")?;
     let sidebar = solid(colors, canvas, &["sideBar.background", "activityBar.background"]).unwrap_or_else(|| derived["sidebar"].clone());

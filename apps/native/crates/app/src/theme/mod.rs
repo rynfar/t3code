@@ -64,7 +64,6 @@ struct ThemeState {
     preferences: Preferences,
     system_dark: bool,
     environment: Vec<ThemeDefinition>,
-    environment_raw: Vec<serde_json::Value>,
 }
 
 impl Global for ThemeState {}
@@ -78,12 +77,7 @@ pub fn hsla(color: u32) -> Hsla {
 }
 
 pub fn init(cx: &mut App) {
-    cx.set_global(ThemeState {
-        preferences: Preferences::default(),
-        system_dark: false,
-        environment: Vec::new(),
-        environment_raw: Vec::new(),
-    });
+    cx.set_global(ThemeState { preferences: Preferences::default(), system_dark: false, environment: Vec::new() });
     cache_font_inventory(cx);
     install(cx);
 }
@@ -146,16 +140,11 @@ fn is_dark(cx: &App) -> bool {
 pub fn environment_themes(cx: &App) -> &[ThemeDefinition] {
     &cx.global::<ThemeState>().environment
 }
-pub fn set_environment_themes(values: &[serde_json::Value], cx: &mut App) {
-    if cx.global::<ThemeState>().environment_raw == values {
+pub fn set_environment_themes(values: &[ThemeDefinition], cx: &mut App) {
+    if cx.global::<ThemeState>().environment == values {
         return;
     }
-    cx.global_mut::<ThemeState>().environment_raw = values.to_vec();
-    let next = themes::environment(values);
-    if cx.global::<ThemeState>().environment == next {
-        return;
-    }
-    cx.global_mut::<ThemeState>().environment = next;
+    cx.global_mut::<ThemeState>().environment = values.to_vec();
     install(cx);
     let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);
@@ -298,10 +287,6 @@ pub fn swatch(theme: &ThemePreference, dark: bool, cx: &App) -> [u32; 4] {
     }
     let p = if dark { tokens::DARK } else { tokens::LIGHT };
     [p.background, p.card, p.primary, p.foreground]
-}
-
-pub fn glass_opacity(cx: &App) -> f32 {
-    preferences(cx).glass as f32 / 100.
 }
 
 fn hex(color: u32) -> String {
