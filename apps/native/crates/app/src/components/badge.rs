@@ -1,10 +1,10 @@
 //! Shared badges from `web/src/components/ui/badge.tsx`.
 
-use gpui::{App, Hsla, ParentElement, SharedString, Styled, div, prelude::*, px, relative};
+use gpui::{App, Hsla, ParentElement, SharedString, Styled, div, prelude::*, relative};
 use gpui::FontWeight;
 use gpui_component::ActiveTheme;
 
-use crate::theme::{hsla, palette};
+use crate::theme::{hsla, palette, rem as r};
 
 /// Shared `badge.tsx` variants.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,16 +36,16 @@ pub fn badge(text: impl Into<SharedString>, kind: BadgeKind, large: bool, cx: &A
         .flex_none()
         .items_center()
         .justify_center()
-        .gap(px(4.))
+        .gap(r(4.))
         .min_w_0()
-        .max_w(px(160.))
-        .h(px(if large { 18. } else { 16. }))
-        .px(px(3.))
-        .rounded(px(4.))
+        .max_w(r(160.))
+        .h(r(if large { 18. } else { 16. }))
+        .px(r(3.))
+        .rounded(r(4.))
         .border_1()
         .border_color(border.unwrap_or(gpui::transparent_black()))
         .bg(fill)
-        .text_size(px(if large { 12. } else { 10. }))
+        .text_size(r(if large { 12. } else { 10. }))
         .when(!large, |this| this.line_height(relative(1.)))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
