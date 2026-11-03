@@ -21,6 +21,8 @@ mod rows;
 mod status;
 mod time;
 mod locale;
+mod host_locale;
+pub use host_locale::{linux_time_locale, mac_time_locale, to_system_locale_tag};
 pub use locale::IntlTimestampClock;
 mod tool_activity;
 mod user_input;

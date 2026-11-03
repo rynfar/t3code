@@ -1,0 +1,5406 @@
+{
+  "node": "v22.22.3",
+  "icu": "78.2",
+  "cases": [
+    {
+      "locale": "en-US",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "en-US",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "en-US",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "en-US",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "en-US",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "en-US",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0:30 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0:00 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0:00 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "00:30"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "en-US-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-GB",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-GB",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-GB",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-GB",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0:30 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0:00 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0:00 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-GB-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-NL",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-NL",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-NL",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-NL",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0:30 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0:00 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0:00 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 am"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 pm"
+    },
+    {
+      "locale": "en-NL-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "de-DE",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "de-DE",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "de-DE",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "de-DE",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0:30 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0:00 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0:00 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "de-DE-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "١٢:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "١٢:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "٠٠:٣٠"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "١٢:٠٠ م"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "١٢:٠٠ م"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "٠:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "٠:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "٠٠:٣٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "٠:٠٠ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "٠:٠٠ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "١٢:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "١٢:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "٠٠:٣٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "١٢:٠٠ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "١٢:٠٠ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "٠٠:٣٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "١٢:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "٠٠:٣٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "١٢:٠٠ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "٢٤:٣٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "١٢:٣٠ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "٢٤:٣٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "٩:٠٥ ص"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "٠٩:٠٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "١٢:٠٠ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "١٢:٠٠"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "١:٤٥ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "١٣:٤٥"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "١١:٥٩ م"
+    },
+    {
+      "locale": "ar-EG-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "٢٣:٥٩"
+    },
+    {
+      "locale": "es-MX",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 a.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 a.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "es-MX",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 p.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 p.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0:30 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0:00 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0:00 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "00:30"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 a.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 p.m."
+    },
+    {
+      "locale": "es-MX-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0 h 30"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0 h 30"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0 h 30"
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0 h 30"
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0 h 30"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0 h 30"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24 h 30"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12 h 30 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24 h 30"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9 h 05 a.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9 h 05"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12 h 00 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12 h 00"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1 h 45 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13 h 45"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11 h 59 p.m."
+    },
+    {
+      "locale": "fr-CA-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23 h 59"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "上午12:30"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "上午12:30"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "下午12:00"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "下午12:00"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "上午0:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "上午0:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "下午0:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "下午0:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "上午12:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "上午12:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "下午12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "下午12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "00:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "上午12:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "下午12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "上午12:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "上午9:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "下午12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "下午1:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "下午11:59"
+    },
+    {
+      "locale": "zh-TW-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "午前0:30"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "午後0:00"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "午前0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "午前0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "午後0:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "午後0:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "午前12:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "午前12:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "午後12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "午後12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "午前0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "午後0:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "午前0:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "午前9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "午後0:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "午後1:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "午後11:59"
+    },
+    {
+      "locale": "ja-JP-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "AM 12:30"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "AM 12:30"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "PM 12:00"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "PM 12:00"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "AM 0:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "AM 0:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "PM 0:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "PM 0:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "AM 12:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "AM 12:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "PM 12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "PM 12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "00:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "AM 12:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "00:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "PM 12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "AM 12:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "AM 9:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "09:05"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "PM 12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "PM 1:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "PM 11:59"
+    },
+    {
+      "locale": "ko-KR-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "0:30 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "0:00 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "0:00 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "0:30"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "0:30"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "24:30"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "12:30 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "24:30"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "9:05 AM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "9:05"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "12:00 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "12:00"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "1:45 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "13:45"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "11:59 PM"
+    },
+    {
+      "locale": "fr-FR-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "23:59"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "۰:۳۰"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "۱۲:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "۰:۳۰"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "۱۲:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "۰:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "۰:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "۰:۳۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "۰:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "۰:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h11",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "۱۲:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "۱۲:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "۰:۳۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "۱۲:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "۱۲:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h12",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "۰:۳۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "۱۲:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "۰:۳۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "۱۲:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h23",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "00:30",
+      "format": "locale",
+      "expected": "۲۴:۳۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "00:30",
+      "format": "12-hour",
+      "expected": "۱۲:۳۰ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "00:30",
+      "format": "24-hour",
+      "expected": "۲۴:۳۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "09:05",
+      "format": "locale",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "09:05",
+      "format": "12-hour",
+      "expected": "۹:۰۵ ق.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "09:05",
+      "format": "24-hour",
+      "expected": "۹:۰۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "12:00",
+      "format": "locale",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "12:00",
+      "format": "12-hour",
+      "expected": "۱۲:۰۰ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "12:00",
+      "format": "24-hour",
+      "expected": "۱۲:۰۰"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "13:45",
+      "format": "locale",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "13:45",
+      "format": "12-hour",
+      "expected": "۱:۴۵ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "13:45",
+      "format": "24-hour",
+      "expected": "۱۳:۴۵"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "23:59",
+      "format": "locale",
+      "expected": "۲۳:۵۹"
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "23:59",
+      "format": "12-hour",
+      "expected": "۱۱:۵۹ ب.ظ."
+    },
+    {
+      "locale": "fa-IR-u-hc-h24",
+      "time": "23:59",
+      "format": "24-hour",
+      "expected": "۲۳:۵۹"
+    }
+  ]
+}
