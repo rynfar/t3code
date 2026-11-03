@@ -43,6 +43,7 @@ pub fn init(cx: &mut App) {
         let patch = doc.migrate_diff_layout(&legacy_panels);
         if !patch.is_empty() { store::patch_client_settings(patch); }
     }
+    crate::notifications::prepare_sounds(doc.notification_mode());
     theme::set_preferences(preferences(&doc), cx);
     terminal::set_typography(terminal::typography(doc.entries()), cx);
     cx.set_global(ClientPrefs { doc, error: None, saving: false, queue: VecDeque::new() });
@@ -89,6 +90,7 @@ pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: 
     state.update(cx, |state, cx| {
         state.client_settings = composer;
         if matches!(change, ClientSettingChange::NotificationMode(_) | ClientSettingChange::InAppNotifications(_)) {
+            crate::notifications::prepare_sounds(state.client_settings.notification_mode);
             state.observe_notifications(cx);
         }
         if matches!(change, ClientSettingChange::DiffLayout(_) | ClientSettingChange::DiffFilesCollapsed(_) | ClientSettingChange::DiffIgnoreWhitespace(_)) {

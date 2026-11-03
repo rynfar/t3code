@@ -14,6 +14,8 @@ use t3_core::sidebar::status::ThreadStatus;
 use crate::app_state::{AppState, Phase};
 use crate::toast::{Toast, ToastKind};
 
+pub(crate) use platform::prepare_sounds;
+
 #[derive(Default)]
 pub struct NotificationCenter {
     watcher: ThreadNotifications,
@@ -123,6 +125,8 @@ impl AppState {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use std::cell::OnceCell;
+
     use objc2::{AnyThread, MainThreadMarker, rc::Retained};
     use objc2_app_kit::{NSApplication, NSSound};
     use objc2_foundation::{NSData, NSString};
@@ -145,7 +149,16 @@ mod platform {
 
     thread_local! {
         // AppKit access stays on GPUI's main thread; environment resets keep these sounds loaded.
-        static SOUNDS: Sounds = Sounds::load();
+        static SOUNDS: OnceCell<Sounds> = const { OnceCell::new() };
+    }
+
+    pub(crate) fn prepare_sounds(mode: NotificationMode) {
+        if !mode.has_sound() || MainThreadMarker::new().is_none() {
+            return;
+        }
+        SOUNDS.with(|sounds| {
+            sounds.get_or_init(Sounds::load);
+        });
     }
 
     pub fn play_sound(kind: NotificationKind, mode: NotificationMode) {
@@ -153,6 +166,7 @@ mod platform {
             return;
         }
         SOUNDS.with(|sounds| {
+            let Some(sounds) = sounds.get() else { return };
             let sound = match kind {
                 NotificationKind::Completion => &sounds.completion,
                 NotificationKind::Input => &sounds.input,
@@ -176,6 +190,7 @@ mod platform {
 mod platform {
     use t3_core::notifications::{NotificationKind, NotificationMode};
 
+    pub(crate) fn prepare_sounds(_: NotificationMode) {}
     pub fn play_sound(_: NotificationKind, _: NotificationMode) {}
     pub fn set_badge(_: usize) {}
 }
