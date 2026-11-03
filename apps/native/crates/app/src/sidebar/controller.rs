@@ -128,6 +128,8 @@ impl AppState {
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
         self.sidebar.hiding_tags = tags.is_some();
         let environment_id = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or("local");
+        self.sidebar.settings.grouping = crate::settings::store::client(cx).project_grouping_settings();
+        self.sidebar.settings.grouping.environment_id = Some(environment_id.to_owned());
         let threads: Vec<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter()).chain(extras.iter().copied()).collect();
         self.sidebar.hidden_thread_ids = t3_core::sidebar::tag_filter::hidden_thread_keys(
             &[t3_core::sidebar::tag_filter::Environment { environment_id, threads: &threads, hidden_tags: tags.as_deref() }],

@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -177,6 +177,7 @@ pub struct Options {
     open_url: Option<String>,
     prompt_link_repository: Option<String>,
     prompt_link_fixture: Option<PathBuf>,
+    project_grouping_fixture: Option<PathBuf>,
     clipboard_output: Option<PathBuf>,
     pull_requests: bool,
     pull_request: Option<u64>,
@@ -238,6 +239,7 @@ impl Options {
             open_url: flag("--open-url"),
             prompt_link_repository: flag("--prompt-link-repository"),
             prompt_link_fixture: flag("--prompt-link-fixture").map(PathBuf::from),
+            project_grouping_fixture: flag("--project-grouping-fixture").map(PathBuf::from),
             clipboard_output: flag("--clipboard-output").map(PathBuf::from),
             pull_requests: has("--pull-requests"),
             pull_request: flag("--pull-request").and_then(|value| value.trim_start_matches('#').parse().ok()),
@@ -456,6 +458,18 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                 projection.visible_turn_items = items;
                 cx.emit(crate::app_state::AppEvent::Thread);
             }
+        });
+    }
+    if let Some(path) = &options.project_grouping_fixture {
+        let configured = state.clone();
+        pump(&mut cx, options.wait, move |cx| configured.read_with(cx, |state, _| state.server_config.config.is_some()));
+        let projects: Vec<t3_core::shell::ProjectShell> = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        state.update(&mut cx, |state, cx| {
+            // Freeze this renderer's project list; fixture checkouts never reach the server.
+            state.stop_pump();
+            if let Some(snapshot) = state.shell.snapshot.as_mut() { snapshot.projects = projects; }
+            state.rebuild_sidebar(cx);
+            cx.emit(crate::app_state::AppEvent::Shell);
         });
     }
     if let Some(path) = &options.prompt_link_fixture {

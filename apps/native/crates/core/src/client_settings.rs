@@ -87,6 +87,17 @@ literal_enum!(
     } default Repository
 );
 
+/// `PROJECT_GROUPING_MODE_LABELS` from `web/src/sidebarProjectGrouping.ts`.
+pub const PROJECT_GROUPING_MODE_LABELS: &[(ProjectGroupingMode, &str)] = &[
+    (ProjectGroupingMode::Repository, "Group by repository"),
+    (ProjectGroupingMode::RepositoryPath, "Group by repository path"),
+    (ProjectGroupingMode::Separate, "Keep separate"),
+];
+
+pub fn project_grouping_label(mode: ProjectGroupingMode) -> &'static str {
+    PROJECT_GROUPING_MODE_LABELS.iter().find(|(value, _)| *value == mode).map(|(_, label)| *label).unwrap_or_default()
+}
+
 literal_enum!(
     /// `SidebarProjectSortOrder` with `SIDEBAR_PROJECT_SORT_ORDER_LABELS`.
     ProjectSortOrder {
@@ -197,6 +208,7 @@ pub enum ClientSettingChange {
     NotificationMode(NotificationMode),
     InAppNotifications(bool),
     ProjectGrouping(ProjectGroupingMode),
+    ProjectGroupingOverride { key: String, mode: Option<ProjectGroupingMode> },
     ProjectSortOrder(ProjectSortOrder),
     WorkingShelf(bool),
     ConfirmThreadUnpin(bool),
@@ -260,6 +272,7 @@ impl ClientSettingChange {
             ),
             ClientSettingChange::NotificationMode(mode) => ("notificationMode", text(notification_mode_value(*mode))),
             ClientSettingChange::InAppNotifications(on) => ("inAppNotificationsEnabled", Value::Bool(*on)),
+            ClientSettingChange::ProjectGroupingOverride { .. } => unreachable!("grouping overrides apply to the current record"),
             ClientSettingChange::ProjectGrouping(mode) => ("sidebarProjectGroupingMode", text(mode.as_str())),
             ClientSettingChange::ProjectSortOrder(order) => ("sidebarProjectSortOrder", text(order.as_str())),
             ClientSettingChange::WorkingShelf(on) => ("sidebarWorkingShelfEnabled", Value::Bool(*on)),
@@ -336,6 +349,21 @@ impl ClientSettingsDoc {
 
     /// Applies one edit and returns the keys it changed: the patch to save onto the file.
     pub fn apply_change(&mut self, change: &ClientSettingChange) -> Map<String, Value> {
+        if let ClientSettingChange::ProjectGroupingOverride { key, mode } = change {
+            let key = crate::json_text::js_trim(key);
+            if key.is_empty() { return Map::new(); }
+            let mut overrides = self.project_grouping_settings().overrides;
+            if let Some(mode) = mode {
+                overrides.insert(key.to_owned(), crate::sidebar::grouping::GroupingMode::parse(mode.as_str()).unwrap_or_default());
+            } else {
+                overrides.remove(key);
+            }
+            let value = Value::Object(overrides.into_iter().map(|(key, mode)| (key, Value::String(mode.as_str().to_owned()))).collect());
+            let key = "sidebarProjectGroupingOverrides";
+            if self.entries.get(key) == Some(&value) { return Map::new(); }
+            self.entries.insert(key.to_owned(), value.clone());
+            return [(key.to_owned(), value)].into_iter().collect();
+        }
         if let ClientSettingChange::ThemePatch(patch) = change {
             let patch: Map<String, Value> = patch.iter().filter(|(k,v)|self.entries.get(*k)!=Some(*v)).map(|(k,v)|(k.clone(),v.clone())).collect();
             self.entries.extend(patch.clone()); return patch;
@@ -446,6 +474,28 @@ impl ClientSettingsDoc {
 
     pub fn project_grouping(&self) -> ProjectGroupingMode {
         self.literal("sidebarProjectGroupingMode", ProjectGroupingMode::parse)
+    }
+
+    pub fn project_grouping_settings(&self) -> crate::sidebar::grouping::GroupingSettings {
+        use crate::sidebar::grouping::{GroupingMode, GroupingSettings};
+        let overrides = self
+            .entries
+            .get("sidebarProjectGroupingOverrides")
+            .and_then(Value::as_object)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = crate::json_text::js_trim(key);
+                        if key.is_empty() {
+                            return None;
+                        }
+                        Some((key.to_owned(), GroupingMode::parse(value.as_str()?)?))
+                    })
+                    .collect::<Option<_>>()
+            })
+            .unwrap_or_default();
+        GroupingSettings { mode: GroupingMode::parse(self.project_grouping().as_str()).unwrap_or_default(), overrides, ..Default::default() }
     }
 
     /// `readLastEnabledProjectGroupingMode`: only the path mode is remembered.

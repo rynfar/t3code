@@ -158,6 +158,11 @@ fn apply_client(
     let typography = terminal::typography(prefs.doc.entries());
     state.update(cx, |state, cx| {
         state.client_settings = composer;
+        let grouping = client(cx).project_grouping_settings();
+        if grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides {
+            state.rebuild_sidebar(cx);
+            cx.emit(AppEvent::Shell);
+        }
         if matches!(
             change,
             ClientSettingChange::NotificationMode(_) | ClientSettingChange::InAppNotifications(_)

@@ -20,6 +20,14 @@ pub enum GroupingMode {
 }
 
 impl GroupingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::RepositoryPath => "repository_path",
+            Self::Separate => "separate",
+        }
+    }
+
     pub fn parse(value: &str) -> Option<GroupingMode> {
         match value {
             "repository" => Some(GroupingMode::Repository),
@@ -33,6 +41,8 @@ impl GroupingMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupingSettings {
     pub mode: GroupingMode,
+    /// The connected server's identity; thread navigation still uses the local scope.
+    pub environment_id: Option<String>,
     /// Keyed by physical project key (`<environmentId>:<normalized path>`).
     pub overrides: HashMap<String, GroupingMode>,
 }
@@ -176,6 +186,7 @@ fn replaces_winner(existing: &ProjectShell, candidate: &ProjectShell) -> bool {
 
 /// `buildProjectGroups` for one environment.
 pub fn build_project_groups(environment_id: &str, projects: &[ProjectShell], settings: &GroupingSettings) -> Vec<ProjectGroup> {
+    let environment_id = settings.environment_id.as_deref().unwrap_or(environment_id);
     let mut by_physical: Vec<(String, Vec<&ProjectShell>)> = Vec::new();
     for project in projects {
         let key = physical_project_key(environment_id, &project.workspace_root);
@@ -269,5 +280,103 @@ pub fn sort_project_groups(groups: &mut [ProjectGroup], projects: &[ProjectShell
     });
     for (slot, (_, group)) in groups.iter_mut().zip(keyed) {
         *slot = group;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_settings::ClientSettingsDoc;
+    use serde_json::json;
+
+    fn project(id: &str, path: &str) -> ProjectShell {
+        serde_json::from_value(json!({
+            "id": id, "title": id, "workspaceRoot": path,
+            "repositoryIdentity": {"canonicalKey": "github.com/t3/code", "rootPath": "/repo"},
+            "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn persisted_physical_override_keeps_siblings_and_duplicate_refs() {
+        let projects = [project("first", "/repo"), project("second", "/copy/"), project("third", "/third"), project("stale", "/copy")];
+        let mut doc = ClientSettingsDoc::from_json(r#"{"sidebarProjectGroupingOverrides":{" env:/copy ":"separate"}}"#);
+        let groups = build_project_groups("env", &projects, &doc.project_grouping_settings());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].member_project_ids, ["first", "third"]);
+        assert_eq!(groups[1].key, "env:/copy");
+        assert_eq!(groups[1].member_project_ids, ["second", "stale"]);
+        assert_eq!(groups[1].representative_id, "stale");
+        assert_eq!(build_project_groups("other-env", &projects, &doc.project_grouping_settings()).len(), 1);
+        doc.apply(&crate::client_settings::ClientSettingChange::ProjectGroupingOverride { key: "env:/copy".into(), mode: None });
+        assert_eq!(build_project_groups("env", &projects, &doc.project_grouping_settings()).len(), 1);
+    }
+
+    #[test]
+    fn overrides_take_precedence_over_each_global_mode() {
+        let projects = [project("web", "/repo/apps/web"), project("root", "/repo"), project("copy", "/copy")];
+        for mode in ["repository", "repository_path", "separate"] {
+            let doc = ClientSettingsDoc::from_json(
+                &json!({
+                    "sidebarProjectGroupingMode": mode,
+                    "sidebarProjectGroupingOverrides": {"env:/repo/apps/web": "repository_path", "env:/repo": "repository", "env:/copy": "repository"}
+                })
+                .to_string(),
+            );
+            let groups = build_project_groups("env", &projects, &doc.project_grouping_settings());
+            assert_eq!(groups.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(), ["github.com/t3/code::apps/web", "github.com/t3/code"]);
+            assert_eq!(groups[1].member_project_ids, ["root", "copy"]);
+        }
+    }
+    #[test]
+    fn configured_environment_scopes_overrides_even_with_local_thread_keys() {
+        let projects = [project("first", "/repo"), project("second", "/copy")];
+        let doc = ClientSettingsDoc::from_json(r#"{"sidebarProjectGroupingOverrides":{"server:/copy":"separate","other:/repo":"separate"}}"#);
+        let settings = GroupingSettings { environment_id: Some("server".into()), ..doc.project_grouping_settings() };
+        let groups = build_project_groups("local", &projects, &settings);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].key, "server:/copy");
+    }
+
+    #[test]
+    fn physical_duplicates_use_freshest_identity_but_keep_every_registration() {
+        let mut stale = project("stale", "/repo/");
+        stale.repository_identity = Some(json!({"canonicalKey":"old-repo"}));
+        let mut fresh = project("fresh", "/repo");
+        fresh.updated_at = "2026-01-02T00:00:00.000Z".into();
+        let mut winner = project("winner", "/repo");
+        winner.updated_at = "2026-01-03T00:00:00.000Z".into();
+        winner.repository_identity = None;
+        winner.pinned_at = Some("2026-01-03T00:00:00.000Z".into());
+        let sibling = project("sibling", "/copy");
+        let projects = [stale, fresh, winner, sibling];
+        let groups = build_project_groups("env", &projects, &GroupingSettings::default());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "github.com/t3/code");
+        assert_eq!(groups[0].representative_id, "winner");
+        assert_eq!(groups[0].member_project_ids, ["stale", "fresh", "winner", "sibling"]);
+        assert!(groups[0].pinned);
+        let doc = ClientSettingsDoc::from_json(r#"{"sidebarProjectGroupingOverrides":{"env:/repo":"separate"}}"#);
+        let groups = build_project_groups("env", &projects, &doc.project_grouping_settings());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].key, "env:/repo");
+        assert_eq!(groups[0].member_project_ids, ["stale", "fresh", "winner"]);
+    }
+
+    #[test]
+    fn override_uses_normalized_windows_path_and_origin_identity() {
+        let mut first = project("first", "C:/Work/Code/");
+        let mut copy = project("copy", "D:/Code");
+        let identity = json!({"canonicalKey":"legacy-repo", "origin":{"canonicalKey":"fork", "displayName":"My fork"}});
+        first.repository_identity = Some(identity.clone());
+        copy.repository_identity = Some(identity);
+        let doc = ClientSettingsDoc::from_json(
+            r#"{"sidebarProjectGroupingMode":"separate","sidebarProjectGroupingOverrides":{"env:c:\\work\\code":"repository","env:d:\\code":"repository"}}"#,
+        );
+        let groups = build_project_groups("env", &[first, copy], &doc.project_grouping_settings());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "fork");
+        assert_eq!(groups[0].label, "My fork");
     }
 }
