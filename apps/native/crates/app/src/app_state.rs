@@ -160,7 +160,7 @@ impl AppState {
         };
         // Quitting stops the tunnels this app started, by the PIDs it spawned.
         state._ssh_quit = Some(cx.on_app_quit(|state, _| state.ssh.shutdown()));
-        match state.environments.active().filter(|environment| environment.credentials().is_some() || environment.relay.is_some()).map(|environment| environment.id.clone()) {
+        match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
             Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
         }

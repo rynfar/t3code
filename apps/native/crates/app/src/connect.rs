@@ -427,7 +427,7 @@ impl ConnectView {
         let Some(entry) = cloud.discovery.environments.get(index) else {
             return div().h(px(64.)).into_any_element();
         };
-        let environment = entry.environment.clone();
+        let environment = entry.clone();
         let status = "T3 Connect · Connection unavailable";
         h_flex()
             .w_full()
@@ -467,8 +467,7 @@ impl ConnectView {
                 )
                 .label("Unavailable")
                 .disabled(true)
-                .tooltip(t3_core::relay::CONNECTION_UNAVAILABLE)
-                .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.connect_cloud_environment(environment.clone(), cx)))),
+                .tooltip(t3_core::relay::CONNECTION_UNAVAILABLE),
             )
             .into_any_element()
     }
@@ -477,7 +476,6 @@ impl ConnectView {
         let state = self.state.read(cx);
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
         let (tone, status, error_tone) = match &state.phase {
-            _ if environment.relay.is_some() => (None, "Connection unavailable".to_owned(), false),
             _ if environment.access_token.is_none() => (Some(DotTone::Destructive), "Needs pairing again".to_owned(), true),
             Phase::Online(status) if active => {
                 let (text, error) = status.summary();
@@ -505,7 +503,7 @@ impl ConnectView {
                 )))
         } else {
             let (connect, remove) = (id.clone(), id.clone());
-            let action = if active || environment.relay.is_some() { None } else if environment.access_token.is_some() { Some("Connect") } else { Some("Pair again") };
+            let action = if active { None } else if environment.access_token.is_some() { Some("Connect") } else { Some("Pair again") };
             h_flex()
                 .gap_1()
                 .children(action.map(|action| {

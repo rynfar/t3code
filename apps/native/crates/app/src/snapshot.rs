@@ -377,7 +377,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     if let Some(path) = &options.cloud_fixture {
         #[derive(serde::Deserialize)]
-        struct Fixture { identity: String, environments: Vec<t3_core::relay::Discovered> }
+        struct Fixture { identity: String, environments: Vec<t3_core::relay::Environment> }
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         state.update(&mut cx, |state, cx| {
             state.cloud.busy = false;

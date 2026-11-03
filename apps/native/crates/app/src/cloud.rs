@@ -1,7 +1,7 @@
 //! Connect screen account lifecycle, ported from web/cloud/managedAuth.tsx and relay discovery.
-use crate::app_state::{AppEvent, AppState, Phase};
+use crate::app_state::{AppEvent, AppState};
 use gpui::Context;
-use t3_core::relay::{Discovery, Environment};
+use t3_core::relay::Discovery;
 
 pub struct CloudState {
     pub service: std::sync::Arc<t3_client::connect::Cloud>,
@@ -61,9 +61,6 @@ impl AppState {
                 state.cloud.discovery.refreshing = false;
                 match result {
                     Ok(Ok((identity, discovery))) => {
-                        if identity.is_none() {
-                            state.clear_relay_environments(cx);
-                        }
                         state.cloud.identity = identity;
                         match discovery {
                             Ok(d) => state.cloud.discovery = d,
@@ -110,7 +107,6 @@ impl AppState {
                 state.cloud.task = None;
                 match result {
                     Ok(Ok(identity)) => {
-                        state.clear_relay_environments(cx);
                         state.cloud.identity = Some(identity);
                         state.refresh_cloud(cx);
                     }
@@ -137,7 +133,6 @@ impl AppState {
     pub fn sign_out_cloud(&mut self, cx: &mut Context<Self>) {
         self.cloud.signing_in = false;
         self.cancel_cloud_task(cx);
-        self.clear_relay_environments(cx);
         self.cloud.identity = None;
         self.cloud.discovery = Default::default();
         self.cloud.error = None;
@@ -160,33 +155,5 @@ impl AppState {
             });
         })
         .detach();
-    }
-    fn clear_relay_environments(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<_> = self
-            .environments
-            .environments
-            .iter()
-            .filter(|e| e.relay.is_some())
-            .map(|e| e.id.clone())
-            .collect();
-        let active = self.active_environment().is_some_and(|e| e.relay.is_some());
-        for id in ids {
-            self.environments.remove(&id);
-        }
-        self.persist_environments();
-        if active {
-            self.reset_connection(cx);
-            self.connect.switching = false;
-            self.set_phase(Phase::Unpaired, cx);
-        }
-    }
-    pub fn connect_cloud_environment(&mut self, environment: Environment, cx: &mut Context<Self>) {
-        if self.cloud.identity.is_none() || self.cloud.busy {
-            return;
-        }
-        if let Err(message) = self.environments.upsert_relay(environment) {
-            self.cloud.error = Some(message.to_owned());
-            cx.emit(AppEvent::Phase);
-        }
     }
 }

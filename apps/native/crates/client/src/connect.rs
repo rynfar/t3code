@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use t3_core::connect::{self, Callback, Token, TokenResponse};
-use t3_core::relay::{Discovered, Discovery, Environment};
+use t3_core::relay::{Discovery, Environment};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -229,19 +229,10 @@ impl Cloud {
             environments: Vec<Environment>,
         }
         let list: List = serde_json::from_value(relay_response(response).await?).map_err(|_| "Invalid T3 Connect environment list.")?;
-        let environments = list
-            .environments
-            .into_iter()
-            .map(|environment| Discovered {
-                environment,
-                status: None,
-                error: None,
-            })
-            .collect();
         self.assert_account(generation).await?;
         Ok(Discovery {
             listed: true,
-            environments,
+            environments: list.environments,
             ..Default::default()
         })
     }
@@ -490,14 +481,13 @@ mod tests {
         assert!(listing.contains("Bearer fixture-access"));
         assert!(fixture.requests.try_recv().is_err(), "CLI OAuth must not call the JWT-only token exchange");
         assert_eq!(discovery.environments.len(), 1);
-        assert!(discovery.environments[0].status.is_none());
-        assert!(discovery.environments[0].error.is_none());
+        assert_eq!(discovery.environments[0].environment_id, "env");
         let mut next = environment;
         next["endpoint"]["httpBaseUrl"] = json!("https://reallocated.test");
         next["endpoint"]["wsBaseUrl"] = json!("wss://reallocated.test/ws");
         fixture.reply(200, json!({"environments":[next]}));
         let refreshed = cloud.discover().await.unwrap();
-        assert_eq!(refreshed.environments[0].environment.endpoint.http_base_url, "https://reallocated.test");
+        assert_eq!(refreshed.environments[0].endpoint.http_base_url, "https://reallocated.test");
         assert!(fixture.request().await.starts_with("GET /v1/client/environments"));
         assert!(fixture.requests.try_recv().is_err());
     }

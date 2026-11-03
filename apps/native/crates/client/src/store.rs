@@ -39,7 +39,7 @@ const ENVIRONMENTS_KEY: &str = "environments";
 const LEGACY_CONNECTION: &str = "connection.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SavedEnvironment {
     /// This device's key for the entry; stable across re-pairing.
     pub id: String,
@@ -60,15 +60,12 @@ pub struct SavedEnvironment {
     /// the tunnel's local address for the current session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<t3_core::ssh::SshTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay: Option<t3_core::relay::Environment>,
 }
 
 impl SavedEnvironment {
     /// How the environment is reached, as its row shows it: `SSH user@host` over SSH, else its
     /// address (`environmentTransportLabel`).
     pub fn address(&self) -> String {
-        if self.relay.is_some() { return "T3 Connect".into(); }
         match &self.ssh {
             Some(target) => format!("SSH {}", t3_core::ssh::format_target(target)),
             None => self.http_base.clone(),
@@ -87,7 +84,7 @@ pub struct SavedEnvironments {
     /// The environment to connect at launch; `None` after an explicit disconnect.
     #[serde(default)]
     pub active: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_environments")]
     pub environments: Vec<SavedEnvironment>,
 }
 
@@ -112,7 +109,6 @@ impl SavedEnvironments {
             server_version: None,
             local: false,
             ssh: None,
-            relay: None,
         };
         SavedEnvironments { active: Some(id), environments: vec![environment] }
     }
@@ -168,7 +164,6 @@ impl SavedEnvironments {
                 .or_else(|| previous.as_ref().and_then(|environment| environment.server_version.clone())),
             local: ssh.is_none() && (local || previous.is_some_and(|environment| environment.local)),
             ssh,
-            relay: None,
         };
         match self.environments.iter_mut().find(|entry| entry.id == id) {
             Some(entry) => *entry = environment,
@@ -176,13 +171,6 @@ impl SavedEnvironments {
         }
         self.active = Some(id.clone());
         id
-    }
-
-    pub fn upsert_relay(&mut self, environment: t3_core::relay::Environment) -> Result<String, &'static str> {
-        if self.find(Some(&environment.environment_id), &environment.endpoint.http_base_url).is_some_and(|entry| entry.relay.is_none()) {
-            return Err("This computer is already saved with a direct or SSH connection. Its saved connection was kept.");
-        }
-        Err(t3_core::relay::CONNECTION_UNAVAILABLE)
     }
 
     /// Points a saved environment at another address of the same server, as when T3 Code on this
@@ -277,6 +265,11 @@ pub enum EnvironmentChange {
     Put(Box<SavedEnvironment>),
     Remove(String),
     SetActive(Option<String>),
+}
+
+fn deserialize_environments<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<SavedEnvironment>, D::Error> {
+    let entries = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(entries.into_iter().filter_map(|entry| serde_json::from_value(entry).ok()).collect())
 }
 
 fn decode_environments(environments: Option<&str>, legacy: Option<&str>) -> SavedEnvironments {
@@ -595,6 +588,10 @@ mod tests {
         assert_eq!(decode_environments(Some(r#"{"environments":[]}"#), Some(legacy)), SavedEnvironments::default());
         assert_eq!(decode_environments(None, Some("not json")), SavedEnvironments::default());
         assert_eq!(decode_environments(Some("{}"), None), SavedEnvironments::default());
+        let mixed = decode_environments(Some(r#"{"active":"unknown","environments":[{"id":"known","label":"Mac","httpBase":"http://localhost","accessToken":"paired"},{"id":"unknown","label":"Unsupported","httpBase":"https://unused","kind":"future"},{"id":"malformed"}]}"#), None);
+        assert_eq!(mixed.environments.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(), ["known"]);
+        assert!(mixed.active().is_none());
+        assert_eq!(mixed.get("known").and_then(SavedEnvironment::credentials).map(|credentials| credentials.access_token), Some("paired".to_owned()));
     }
 
     #[test]
@@ -688,22 +685,6 @@ mod tests {
         // A pairing link for the same machine reaches it directly from now on.
         saved.upsert(&paired("https://devbox.ts.net", "t3", "env-devbox", "devbox"), false);
         assert_eq!(saved.get(&devbox).map(|e| (e.ssh.is_none(), e.http_base.as_str())), Some((true, "https://devbox.ts.net")));
-        let relay = t3_core::relay::Environment { environment_id: "env-devbox".into(), label: "devbox".into(), endpoint: t3_core::relay::Endpoint { http_base_url: "https://devbox.connect.test".into(), ws_base_url: "wss://devbox.connect.test/ws".into(), provider_kind: "cloudflare_tunnel".into() } };
-        let direct = saved.clone();
-        assert!(saved.upsert_relay(relay.clone()).unwrap_err().contains("kept"));
-        assert_eq!(saved, direct, "cloud discovery must not replace a direct credential");
-        saved.upsert_ssh(&paired("http://127.0.0.1:52003", "ssh", "env-devbox", "devbox"), t3_core::ssh::SshTarget { alias: "devbox".into(), hostname: "devbox.example.com".into(), username: None, port: None });
-        let ssh = saved.clone();
-        assert!(saved.upsert_relay(relay.clone()).unwrap_err().contains("kept"));
-        assert_eq!(saved, ssh, "cloud discovery must not replace an SSH credential or tunnel");
-        saved.upsert(&paired("http://127.0.0.1:14658", "local", "env-devbox", "devbox"), true);
-        let local = saved.clone();
-        assert!(saved.upsert_relay(relay.clone()).is_err());
-        assert_eq!(saved, local, "cloud discovery must not replace this Mac's pairing");
-        let mut empty = SavedEnvironments::default();
-        assert_eq!(empty.upsert_relay(relay), Err(t3_core::relay::CONNECTION_UNAVAILABLE));
-        assert_eq!(empty, SavedEnvironments::default());
-
         // Entries saved before SSH existed read as direct.
         assert_eq!(decode_environments(Some(r#"{"environments":[{"id":"a","label":"A","httpBase":"http://h"}]}"#), None).environments[0].ssh, None);
     }

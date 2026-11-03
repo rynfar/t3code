@@ -259,9 +259,6 @@ impl AppState {
     /// through its tunnel on this session's port, which the supervisor readies before each attempt.
     pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.environments.get(id).cloned() else { return };
-        if environment.relay.is_some() {
-            return self.fail_pairing(PairingSource::Link, t3_core::relay::CONNECTION_UNAVAILABLE.into(), cx);
-        }
         let Some(access_token) = environment.access_token.clone() else { return };
         let Some(target) = environment.ssh.clone() else {
             return self.start_client(Credentials { http_base: environment.http_base, access_token }, None, cx);
@@ -304,13 +301,10 @@ impl AppState {
     pub fn connect_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let moved = self.relocate_local(id);
         let Some(environment) = self.environments.get(id).cloned() else { return };
-        if environment.relay.is_some() {
-            return self.fail_pairing(PairingSource::Link, t3_core::relay::CONNECTION_UNAVAILABLE.into(), cx);
-        }
         if !moved && self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
             return self.close_switcher(cx);
         }
-        if environment.access_token.is_none() && environment.relay.is_none() {
+        if environment.access_token.is_none() {
             if environment.local && self.local_saved_environment().is_some_and(|local| local.id == environment.id) {
                 return self.pair_local(cx);
             }
@@ -460,13 +454,13 @@ impl AppState {
 
     /// Hands the edits since the last save to the store's writer, off the UI thread. It applies
     /// them to the file as it is then, so another instance's entries survive.
-    pub(crate) fn persist_environments(&mut self) {
+    fn persist_environments(&mut self) {
         store::save_environment_changes(self.environments.changes_since(&self.environments_saved));
         self.environments_saved = self.environments.clone();
     }
 
     /// Stops the connection and drops everything that belonged to it.
-    pub(crate) fn reset_connection(&mut self, cx: &mut Context<Self>) {
+    fn reset_connection(&mut self, cx: &mut Context<Self>) {
         self.stop_pump();
         self.clear_connection_state(cx);
     }
