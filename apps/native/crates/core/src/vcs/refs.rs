@@ -1,7 +1,8 @@
 //! Ref snapshot revisions from `packages/client-runtime/src/state/vcs.ts`,
-//! `vcsRefInvalidation.ts`, and `git.ts`. One cache belongs to one environment session owner.
+//! `vcsRefInvalidation.ts`, `git.ts`, `vcsAction.ts`, `sourceControl.ts`, and web
+//! `state/queries.ts`. One cache belongs to one environment session owner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
@@ -18,6 +19,8 @@ pub fn invalidates_refs(method: &str) -> bool {
             | "vcs.createWorktree"
             | "vcs.removeWorktree"
             | "git.preparePullRequestThread"
+            | method::GIT_RUN_STACKED_ACTION
+            | "sourceControl.publishRepository"
     )
 }
 
@@ -84,9 +87,18 @@ pub struct RefListing {
     pub next_cursor: Option<u64>,
     pub total: u64,
     pub loading: bool,
+    pub loading_next_page: bool,
     pub loaded: bool,
     pub error: Option<String>,
+    cursors: Vec<Option<u64>>,
     request: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefLoad {
+    pub cursors: Vec<Option<u64>>,
+    id: u64,
+    append: bool,
 }
 
 impl RefListing {
@@ -98,44 +110,96 @@ impl RefListing {
         };
     }
 
-    pub fn begin(&mut self, query: &str, next_page: bool) -> Option<(u64, Option<u64>)> {
-        let cursor = if next_page {
+    pub fn begin(&mut self, query: &str, next_page: bool) -> Option<RefLoad> {
+        let cursors = if next_page {
             if self.query != query || self.loading {
                 return None;
             }
-            Some(self.next_cursor?)
+            let cursor = Some(self.next_cursor?);
+            if !self.cursors.contains(&cursor) {
+                self.cursors.push(cursor);
+            }
+            vec![cursor]
         } else {
-            self.reset();
+            if self.query != query {
+                self.reset();
+            }
             self.query = query.to_owned();
-            None
+            if self.cursors.is_empty() {
+                self.cursors.push(None);
+            }
+            self.cursors.clone()
         };
         self.request += 1;
         self.loading = true;
-        Some((self.request, cursor))
+        self.loading_next_page = next_page;
+        Some(RefLoad {
+            id: self.request,
+            cursors,
+            append: next_page,
+        })
     }
 
-    pub fn finish(&mut self, request: u64, result: Result<super::ListRefsResult, String>) -> bool {
-        if request != self.request || !self.loading {
+    pub fn finish(&mut self, request: &RefLoad, result: Result<Vec<super::ListRefsResult>, String>) -> bool {
+        if request.id != self.request || !self.loading {
             return false;
         }
         self.loading = false;
+        self.loading_next_page = false;
         self.loaded = true;
         match result {
-            Ok(page) => {
-                for item in page.refs {
-                    match self.refs.iter_mut().find(|existing| existing.name == item.name) {
-                        Some(existing) => *existing = item,
-                        None => self.refs.push(item),
+            Ok(pages) => {
+                if !request.append {
+                    self.refs.clear();
+                    self.cursors.clear();
+                    self.total = 0;
+                    self.next_cursor = None;
+                }
+                let mut positions = self.refs.iter().enumerate().map(|(index, item)| (item.name.clone(), index)).collect::<HashMap<_, _>>();
+                for (page, cursor) in pages.into_iter().zip(&request.cursors) {
+                    for item in page.refs {
+                        if let Some(&index) = positions.get(&item.name) {
+                            self.refs[index] = item;
+                        } else {
+                            positions.insert(item.name.clone(), self.refs.len());
+                            self.refs.push(item);
+                        }
                     }
+                    if !self.cursors.contains(cursor) {
+                        self.cursors.push(*cursor);
+                    }
+                    self.next_cursor = page.next_cursor;
+                    self.total = self.total.max(page.total_count);
                 }
                 self.revision += 1;
-                self.next_cursor = page.next_cursor;
-                self.total = self.total.max(page.total_count);
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
         }
         true
+    }
+}
+
+/// Combobox item values, retained by identity while mounted pages refresh (`BranchPicker.tsx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefChoice {
+    Ref(String),
+    Create(String),
+}
+
+impl RefChoice {
+    pub fn at(refs: &[super::VcsRef], indices: &[usize], create: Option<&str>, index: usize) -> Option<Self> {
+        indices
+            .get(index)
+            .map(|&index| Self::Ref(refs[index].name.clone()))
+            .or_else(|| create.filter(|_| index == indices.len()).map(|name| Self::Create(name.to_owned())))
+    }
+
+    pub fn index_in(&self, refs: &[super::VcsRef], indices: &[usize], create: Option<&str>) -> Option<usize> {
+        match self {
+            Self::Ref(name) => indices.iter().position(|&index| refs[index].name == *name),
+            Self::Create(name) => (create == Some(name.as_str())).then_some(indices.len()),
+        }
     }
 }
 

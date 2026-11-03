@@ -84,7 +84,7 @@ enum Command {
     RefreshSessionState,
     RetryNow,
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>>, settled: Option<crate::vcs::OnSettled> },
-    Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>> },
+    Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>>, settled: Option<crate::vcs::OnSettled> },
 }
 
 #[derive(Clone)]
@@ -198,7 +198,7 @@ impl ClientHandle {
     /// drops, and callers resubscribe. Dropping the handle interrupts it on the server.
     pub fn stream(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<StreamHandle, RpcError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let queued = self.commands.send(Command::Stream { method, payload, reply }).is_ok();
+        let queued = self.commands.send(Command::Stream { method, payload, reply, settled: self.refs.on_settled(method) }).is_ok();
         async move {
             if !queued {
                 return Err(RpcError::Closed);
@@ -358,7 +358,8 @@ fn drain_command(command: Command, resume: &mut Resume) {
             drop(settled);
             let _ = reply.send(Err(RpcError::Closed));
         }
-        Command::Stream { reply, .. } => {
+        Command::Stream { reply, settled, .. } => {
+            drop(settled);
             let _ = reply.send(Err(RpcError::Closed));
         }
     }
@@ -506,8 +507,12 @@ async fn run_session(
                         });
                     }
                 }
-                Some(Command::Stream { method, payload, reply }) => {
-                    let _ = reply.send(session.stream(method, payload));
+                Some(Command::Stream { method, payload, reply, settled }) => {
+                    let stream = session.stream(method, payload).map(|mut stream| {
+                        stream.settled = settled;
+                        stream
+                    });
+                    let _ = reply.send(stream);
                 }
             },
             reason = session.closed() => break SessionEnd::Closed(reason),

@@ -1,5 +1,6 @@
 //! Ref refresh I/O for `client-runtime/src/state/vcs.ts` and the ref-affecting commands'
-//! `onSettled` hooks in `state/vcs.ts` and `state/git.ts`.
+//! `onSettled` hooks in `state/vcs.ts`, `state/git.ts`, `state/sourceControl.ts`, and the
+//! stacked-action finalizer in `state/vcsAction.ts`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

@@ -418,3 +418,40 @@ async fn ref_commands_settle_before_the_picker_refreshes_and_stale_results_are_d
         "release"
     );
 }
+
+#[tokio::test]
+async fn stacked_action_exits_invalidate_refs_on_success_failure_and_interruption() {
+    use t3_core::vcs::{self, method as vcs_method};
+
+    let mut server = FakeServer::start().await;
+    let (client, _events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut connection = server.connection().await;
+    answer_config(&mut connection, None).await;
+    let mut revision = client.refs_revision();
+    for (index, outcome) in ["success", "failure", "interruption"].iter().enumerate() {
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move { client.list_refs(vcs::list_refs("/repo", None, None, 100)).await }
+        });
+        let refs = connection.request(vcs_method::VCS_LIST_REFS).await;
+        let opening = client.stream(vcs_method::GIT_RUN_STACKED_ACTION, json!({"cwd":"/repo","actionId":"action","action":"commit","featureBranch":true}));
+        let action = connection.request(vcs_method::GIT_RUN_STACKED_ACTION).await;
+        let mut stream = opening.await.unwrap();
+        assert_eq!(*revision.borrow(), index as u64, "opening a stream does not settle it");
+        if *outcome != "interruption" {
+            let exit = if *outcome == "success" {
+                json!({"_tag":"Success","value":null})
+            } else {
+                json!({"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"failed after creating a feature branch"}}]})
+            };
+            connection.send(json!({"_tag":"Exit","requestId":action["id"],"exit":exit})).await;
+            let result = stream.receiver.recv().await;
+            if *outcome == "success" { assert!(result.is_none()); } else { assert!(matches!(result, Some(Err(_)))); }
+        }
+        drop(stream);
+        revision.changed().await.unwrap();
+        assert_eq!(*revision.borrow(), index as u64 + 1);
+        connection.send(json!({"_tag":"Exit","requestId":refs["id"],"exit":{"_tag":"Success","value":{"refs":[{"name":"stale"}]}}})).await;
+        assert!(pending.await.unwrap().unwrap().is_none());
+    }
+}

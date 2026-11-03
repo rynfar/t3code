@@ -91,26 +91,90 @@ fn page(names: &[&str], next: Option<u64>) -> crate::vcs::ListRefsResult {
 #[test]
 fn refreshed_picker_replaces_old_refs_and_rejects_stale_search_page_and_checkout_replies() {
     let mut list = RefListing::default();
-    let (old, _) = list.begin("", false).unwrap();
-    let (fresh, _) = list.begin("", false).unwrap();
-    assert!(!list.finish(old, Ok(page(&["deleted-outside-t3"], None))));
+    let old = list.begin("", false).unwrap();
+    let fresh = list.begin("", false).unwrap();
+    assert!(!list.finish(&old, Ok(vec![page(&["deleted-outside-t3"], None)])));
     assert!(list.loading);
-    assert!(list.finish(fresh, Ok(page(&["created-outside-t3"], Some(100)))));
+    assert!(list.finish(&fresh, Ok(vec![page(&["created-outside-t3"], Some(100))])));
     let mut filter = crate::vcs::RefFilter::default();
     filter.update(&list.refs, list.revision, "created");
     assert_eq!(filter.indices(), &[0]);
-    let (pagination, cursor) = list.begin("", true).unwrap();
-    assert_eq!(cursor, Some(100));
+    let pagination = list.begin("", true).unwrap();
+    assert_eq!(pagination.cursors, [Some(100)]);
     assert!(list.begin("", true).is_none(), "duplicate next pages are suppressed");
-    let (search, _) = list.begin("release", false).unwrap();
-    assert!(!list.finish(pagination, Ok(page(&["old-page"], None))));
-    assert!(!list.finish(fresh, Err("late failure".into())));
-    assert!(list.finish(search, Ok(page(&["release"], Some(100)))));
-    let (pagination, _) = list.begin("release", true).unwrap();
-    assert!(list.finish(pagination, Ok(page(&["release", "release-2"], None))));
+    let search = list.begin("release", false).unwrap();
+    assert!(!list.finish(&pagination, Ok(vec![page(&["old-page"], None)])));
+    assert!(!list.finish(&fresh, Err("late failure".into())));
+    assert!(list.finish(&search, Ok(vec![page(&["release"], Some(100))])));
+    let pagination = list.begin("release", true).unwrap();
+    assert!(list.finish(&pagination, Ok(vec![page(&["release", "release-2"], None)])));
     assert_eq!(list.refs.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["release", "release-2"]);
-    let (checkout, _) = list.begin("release", false).unwrap();
+    let checkout = list.begin("release", false).unwrap();
     list.reset();
-    assert!(!list.finish(checkout, Ok(page(&["other-checkout"], None))));
+    assert!(!list.finish(&checkout, Ok(vec![page(&["other-checkout"], None)])));
     assert!(list.refs.is_empty());
+}
+
+#[test]
+fn background_refresh_retains_a_nonempty_paginated_listing_even_on_failure() {
+    let mut list = RefListing::default();
+    let first = list.begin("", false).unwrap();
+    assert!(list.finish(&first, Ok(vec![page(&["main", "old"], Some(100))])));
+    let next = list.begin("", true).unwrap();
+    assert!(list.finish(&next, Ok(vec![page(&["later"], Some(200))])));
+    let retained = list.refs.clone();
+    let revision = list.revision;
+    let refresh = list.begin("", false).unwrap();
+    assert_eq!(refresh.cursors, [None, Some(100)]);
+    assert!(!list.loading_next_page);
+    assert_eq!(list.refs, retained, "pending refresh keeps all mounted pages");
+    assert!(list.loaded);
+    assert_eq!(list.next_cursor, Some(200));
+    assert_eq!(list.revision, revision);
+    assert!(list.finish(&refresh, Err("refresh failed".into())));
+    assert_eq!(list.refs, retained, "failure retains rows and pagination");
+    assert_eq!(list.next_cursor, Some(200));
+    assert_eq!(list.error.as_deref(), Some("refresh failed"));
+    let refresh = list.begin("", false).unwrap();
+    assert_eq!(refresh.cursors, [None, Some(100)]);
+    let selected = RefChoice::Ref("later".into());
+    let indices = (0..list.refs.len()).collect::<Vec<_>>();
+    assert_eq!(selected.index_in(&list.refs, &indices, None), Some(2));
+    assert!(list.finish(&refresh, Ok(vec![page(&["new", "main"], Some(100)), page(&["later", "last"], Some(200))])));
+    assert_eq!(list.refs.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["new", "main", "later", "last"]);
+    assert_eq!(list.next_cursor, Some(200));
+    assert!(list.error.is_none());
+    let indices = (0..list.refs.len()).collect::<Vec<_>>();
+    assert_eq!(selected.index_in(&list.refs, &indices, None), Some(2));
+    let pending = list.begin("", true).unwrap();
+    let refresh = list.begin("", false).unwrap();
+    assert_eq!(refresh.cursors, [None, Some(100), Some(200)], "invalidation also restarts a newly mounted page");
+    assert!(!list.finish(&pending, Ok(vec![page(&["stale-third-page"], None)])));
+    assert!(list.finish(&refresh, Ok(vec![page(&["later", "main"], Some(100)), page(&["last"], Some(200)), page(&[], None)])));
+    let indices = (0..list.refs.len()).collect::<Vec<_>>();
+    assert_eq!(
+        selected.index_in(&list.refs, &indices, None),
+        Some(0),
+        "the highlighted ref follows reordering across pages"
+    );
+    let refresh = list.begin("", false).unwrap();
+    assert!(list.finish(&refresh, Ok(vec![page(&["main"], None), page(&[], None), page(&[], None)])));
+    assert_eq!(selected.index_in(&list.refs, &[0], None), None, "removal must not select the ref now occupying that index");
+    assert_eq!(list.next_cursor, None);
+    assert_eq!(RefChoice::Create("main".into()).index_in(&list.refs, &[0], None), None);
+    assert_eq!(RefChoice::Create("main".into()).index_in(&list.refs, &[0], Some("main")), Some(1));
+    let search = list.begin("new-query", false).unwrap();
+    assert_eq!(search.cursors, [None]);
+    assert!(list.refs.is_empty(), "a different query starts a new listing");
+}
+
+#[test]
+fn stacked_actions_and_publishing_invalidate_ref_snapshots() {
+    let mut cache = RefCache::default();
+    for method in [method::GIT_RUN_STACKED_ACTION, "sourceControl.publishRepository"] {
+        let pending = cache.begin(list_refs("/repo", None, None, 100));
+        assert!(cache.settle(method));
+        assert!(!cache.commit(&pending));
+        assert_eq!(cache.begin(list_refs("/repo", None, None, 100)).input["refresh"], true);
+    }
 }

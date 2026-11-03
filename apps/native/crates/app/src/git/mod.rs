@@ -532,16 +532,27 @@ impl GitStore {
             return;
         };
         let query = vcs::sanitize_new_ref_name(query);
-        let Some((request, cursor)) = self.refs.begin(&query, next_page) else {
+        let Some(request) = self.refs.begin(&query, next_page) else {
             return;
         };
-        let payload = vcs::list_refs(&target.cwd, Some(&query), cursor, vcs::REF_PAGE_LIMIT);
+        let cwd = target.cwd.clone();
+        let cursors = request.cursors.clone();
         let connection = self.connection;
         let revisions = client.refs_revision();
         let revision = *revisions.borrow();
         let sessions = client.connection_generation();
         let generation = *sessions.borrow();
-        let task = runtime.spawn(async move { client.list_refs(payload).await });
+        let task = runtime.spawn(async move {
+            let mut pages = Vec::with_capacity(cursors.len());
+            for cursor in cursors {
+                let payload = vcs::list_refs(&cwd, Some(&query), cursor, vcs::REF_PAGE_LIMIT);
+                match client.list_refs(payload).await? {
+                    Some(page) => pages.push(page),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(pages))
+        });
         cx.emit(GitEvent::Changed);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let result = task
@@ -556,7 +567,7 @@ impl GitStore {
                     Ok(None) => return,
                     Err(error) => Err(error),
                 };
-                if store.refs.finish(request, result) {
+                if store.refs.finish(&request, result) {
                     cx.emit(GitEvent::Changed);
                 }
             });
