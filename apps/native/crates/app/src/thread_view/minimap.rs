@@ -66,9 +66,46 @@ impl Render for MinimapLayer {
 /// What the rail last measured after layout. Render draws from it; click handlers read it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Measured {
+    range: Option<(usize, usize)>,
     current: Option<usize>,
     persistent: bool,
     hit_width: f32,
+}
+
+#[derive(Clone)]
+struct ListLayout {
+    list: gpui::ListState,
+    header: usize,
+    row_count: usize,
+    rows: Rc<Vec<usize>>,
+    lane_padding: f32,
+    lane_max: Option<f32>,
+}
+
+impl ListLayout {
+    fn measure(&self) -> Measured {
+        let viewport = self.list.viewport_bounds();
+        let width = f32::from(viewport.size.width);
+        let lane = (width - self.lane_padding).max(0.);
+        let lane = self.lane_max.map_or(lane, |max| lane.min(max));
+        let scroll = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        let range = minimap::visible_range(self.row_count, scroll, f32::from(viewport.size.height), |index| f32::from(self.list.offset_for_item(self.header + index)));
+        Measured {
+            range,
+            current: minimap::current_index(range, self.rows.iter().copied()),
+            persistent: minimap::has_persistent_gutter(width, lane),
+            hit_width: minimap::hit_strip_width(width, lane),
+        }
+    }
+
+    fn observe(self, content: AnyElement, measured: Rc<Cell<Measured>>, repaint: gpui::EntityId) -> AnyElement {
+        // Descendants can resize without notifying either cached sibling's owner.
+        let measure = canvas(move |_, window, _| {
+            let next = self.measure();
+            if measured.replace(next) != next { window.on_next_frame(move |_, cx| cx.notify(repaint)); }
+        }, |_, _, _, _| {}).absolute().size_full();
+        div().relative().size_full().child(content).child(measure).into_any_element()
+    }
 }
 
 #[derive(Default)]
@@ -132,6 +169,22 @@ impl MinimapUi {
 }
 
 impl ThreadView {
+    fn minimap_list_layout(&self, window: &Window, cx: &gpui::App) -> ListLayout {
+        ListLayout {
+            list: self.list.clone(),
+            header: self.header_count(),
+            row_count: self.rows.len(),
+            rows: self.minimap.row_indices.clone(),
+            lane_padding: 2. * self.gutter() * f32::from(window.rem_size()) / 16.,
+            lane_max: crate::theme::chat_max_width(cx).map(|width| f32::from(width.to_pixels(window.rem_size()))),
+        }
+    }
+
+    pub(super) fn observe_minimap_layout(&self, transcript: AnyElement, window: &Window, cx: &gpui::App) -> AnyElement {
+        if self.minimap.items.len() < minimap::MIN_ITEMS { return transcript; }
+        self.minimap_list_layout(window, cx).observe(transcript, self.minimap.measured.clone(), self.minimap_layer.entity_id())
+    }
+
     pub(super) fn minimap_escape(&mut self, key: &gpui::Keystroke, window: &Window, cx: &mut Context<Self>) -> bool {
         if key.key != "escape" { return false; }
         let mut dismissed = false;
@@ -368,15 +421,11 @@ impl ThreadView {
 
     /// The strips, painted from the list's layout of this frame.
     fn render_minimap_rail(&self, active: Option<usize>, revealed: bool, rem_px: f32, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let list = self.list.clone();
-        let header = self.header_count();
-        let row_count = self.rows.len();
+        let layout = self.minimap_list_layout(window, cx);
         let rows = self.minimap.row_indices.clone();
         let rail_cell = self.minimap.rail.clone();
         let measured_cell = self.minimap.measured.clone();
         let rendered = measured_cell.get();
-        let lane_padding = 2. * self.gutter() * rem_px;
-        let lane_max = crate::theme::chat_max_width(cx).map(|width| f32::from(width.to_pixels(window.rem_size())));
         let view = self.minimap.repaint.unwrap();
         let p = palette(cx);
         let (line, strip, strip_active, lit) =
@@ -384,22 +433,12 @@ impl ThreadView {
         canvas(
             move |bounds, window, _| {
                 rail_cell.set(bounds);
-                let viewport = list.viewport_bounds();
-                let width = f32::from(viewport.size.width);
-                let lane = (width - lane_padding).max(0.);
-                let lane = lane_max.map_or(lane, |max| lane.min(max));
-                let scroll = -f32::from(list.scroll_px_offset_for_scrollbar().y);
-                let range = minimap::visible_range(row_count, scroll, f32::from(viewport.size.height), |index| f32::from(list.offset_for_item(header + index)));
-                let next = Measured {
-                    current: minimap::current_index(range, rows.iter().copied()),
-                    persistent: minimap::has_persistent_gutter(width, lane),
-                    hit_width: minimap::hit_strip_width(width, lane),
-                };
+                let next = layout.measure();
                 measured_cell.set(next);
                 if next != rendered {
                     window.on_next_frame(move |_, cx| cx.notify(view));
                 }
-                (range, next.persistent, rows)
+                (next.range, next.persistent, rows)
             },
             move |bounds, (range, persistent, rows), window, cx| {
                 let opacity = transition("minimap-gutter-opacity", vec![if persistent || revealed { 1. } else { 0. }], view, window, cx)[0];
@@ -640,6 +679,86 @@ fn transition(id: &'static str, target: Vec<f32>, view: gpui::EntityId, window: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn descendant_height_changes_refresh_a_cached_minimap_without_owner_notifications(cx: &mut gpui::TestAppContext) {
+        struct Row { height: f32 }
+        impl Render for Row {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().h(px(self.height)) }
+        }
+        struct Rail { layout: ListLayout, displayed: Rc<Cell<Measured>> }
+        impl Render for Rail {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let layout = self.layout.clone();
+                let displayed = self.displayed.clone();
+                canvas(move |_, _, _| displayed.set(layout.measure()), |_, _, _, _| {}).size_full()
+            }
+        }
+        struct Rows { row: Entity<Row>, layout: ListLayout, measured: Rc<Cell<Measured>>, rail: gpui::EntityId }
+        impl Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let row = self.row.clone();
+                let content = gpui::list(self.layout.list.clone(), move |index, _, _| {
+                    if index == 1 { row.clone().into_any_element() } else { div().h(px(40.)).into_any_element() }
+                }).size_full().into_any_element();
+                self.layout.clone().observe(content, self.measured.clone(), self.rail)
+            }
+        }
+        struct Owner { rows: Entity<Rows>, rail: Entity<Rail> }
+        impl Render for Owner {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().relative().size_full()
+                    .child(self.rows.clone().cached(gpui::StyleRefinement::default().size_full()))
+                    .child(self.rail.clone().cached(gpui::StyleRefinement::default().absolute().inset_0()))
+            }
+        }
+        let list = gpui::ListState::new(6, gpui::ListAlignment::Top, px(600.));
+        list.scroll_to(ListOffset { item_ix: 1, offset_in_item: px(20.) });
+        let layout = ListLayout { list: list.clone(), header: 0, row_count: 6, rows: Rc::new(vec![0, 2, 4]), lane_padding: 0., lane_max: None };
+        let displayed = Rc::new(Cell::new(Measured::default()));
+        let window = cx.open_window(size(px(200.), px(120.)), |_, cx| {
+            let row = cx.new(|_| Row { height: 40. });
+            let rail = cx.new(|_| Rail { layout: layout.clone(), displayed: displayed.clone() });
+            let rows = cx.new(|_| Rows { row, layout: layout.clone(), measured: Rc::default(), rail: rail.entity_id() });
+            Owner { rows, rail }
+        });
+        let owner = window.root(cx).unwrap();
+        let (rows, row) = cx.read(|cx| {
+            let rows = owner.read(cx).rows.clone();
+            (rows.clone(), rows.read(cx).row.clone())
+        });
+        let owner_notifications = Rc::new(Cell::new(0));
+        let _owner_subscription = cx.update(|cx| {
+            let notifications = owner_notifications.clone();
+            cx.observe(&owner, move |_, _| notifications.set(notifications.get() + 1))
+        });
+        let _rows_subscription = cx.update(|cx| {
+            let notifications = owner_notifications.clone();
+            cx.observe(&rows, move |_, _| notifications.set(notifications.get() + 1))
+        });
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear()).unwrap();
+        };
+        let next_frame = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.simulate_next_frame(cx)).unwrap()
+        };
+        draw(cx);
+        next_frame(cx);
+        draw(cx);
+        assert_eq!(displayed.get().range, Some((1, 4)));
+        assert_eq!(displayed.get().current, Some(1));
+        for (height, range, current) in [(200., (1, 1), 0), (40., (1, 4), 1)] {
+            row.update(cx, |row, cx| { row.height = height; cx.notify(); });
+            draw(cx);
+            assert_eq!(list.bounds_for_item(1).unwrap().size.height, px(height));
+            next_frame(cx);
+            draw(cx);
+            assert_eq!(displayed.get().range, Some(range), "the cached visible strips must follow descendant height {height}");
+            assert_eq!(displayed.get().current, Some(current), "Previous/Next must use the remeasured current item");
+            assert_eq!(owner_notifications.get(), 0, "only the descendant and minimap may notify");
+            assert_eq!(next_frame(cx), 0, "unchanged measurements must not request another frame");
+        }
+    }
 
     #[gpui::test]
     fn tab_enters_minimap_from_an_adjacent_control_and_skips_disabled_endpoints(cx: &mut gpui::TestAppContext) {

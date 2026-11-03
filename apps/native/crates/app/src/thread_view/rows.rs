@@ -39,7 +39,7 @@ impl ThreadView {
             viewer: self.viewer.downgrade(),
         };
         crate::media::set_scope(scope, cx);
-        list(
+        let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, _window, cx| {
                 let offset = this.header_count();
@@ -75,6 +75,7 @@ impl ThreadView {
                 div().relative().child(lane).child(request).into_any_element()
             }),
         )
-        .size_full().into_any_element()
+        .size_full().into_any_element();
+        self.observe_minimap_layout(transcript, window, cx)
     }
 }
