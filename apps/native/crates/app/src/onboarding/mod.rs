@@ -113,7 +113,6 @@ struct AgentSetup {
     driver: &'static str,
     terminal: Entity<agent_terminal::AgentInstallTerminal>,
     _closed: Subscription,
-    _changed: Subscription,
 }
 
 pub struct WelcomeWizard {
@@ -618,12 +617,10 @@ pub fn terminal_fixture(fixture: TerminalFixture, window: &mut Window, cx: &mut 
             this.refresh_providers(cx);
             cx.notify();
         });
-        let changed = cx.observe(&terminal, |_, _, cx| cx.notify());
         wizard.setup = Some(AgentSetup {
             driver: "codex",
             terminal,
             _closed: closed,
-            _changed: changed,
         });
         cx.notify();
         Ok(())

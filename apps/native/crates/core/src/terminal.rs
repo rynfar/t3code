@@ -595,6 +595,8 @@ pub struct LaunchLocation {
     pub cwd: String,
     pub worktree_path: Option<String>,
     pub env: BTreeMap<String, String>,
+    /// Reattachment may recreate the PTY, which still needs the instance's environment.
+    pub provider_instance_id: Option<String>,
 }
 
 impl LaunchLocation {
@@ -607,6 +609,7 @@ impl LaunchLocation {
             cwd: worktree_path.unwrap_or(workspace_root).to_owned(),
             worktree_path: worktree_path.map(str::to_owned),
             env,
+            provider_instance_id: None,
         }
     }
 }
@@ -628,6 +631,9 @@ pub fn open_input(thread_id: &str, terminal_id: &str, location: &LaunchLocation,
     let mut payload = session(thread_id, terminal_id);
     payload["cwd"] = json!(location.cwd);
     payload["env"] = json!(location.env);
+    if let Some(instance_id) = &location.provider_instance_id {
+        payload["providerInstanceId"] = json!(instance_id);
+    }
     if let Some(worktree) = &location.worktree_path {
         payload["worktreePath"] = json!(worktree);
     }
@@ -641,6 +647,9 @@ pub fn attach_input(thread_id: &str, terminal_id: &str, location: &LaunchLocatio
     payload["cwd"] = json!(location.cwd);
     payload["worktreePath"] = json!(location.worktree_path);
     payload["env"] = json!(location.env);
+    if let Some(instance_id) = &location.provider_instance_id {
+        payload["providerInstanceId"] = json!(instance_id);
+    }
     if resume {
         payload["resume"] = json!(true);
     }

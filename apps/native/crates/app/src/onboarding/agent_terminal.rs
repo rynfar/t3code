@@ -30,12 +30,12 @@ pub(super) struct AgentInstallTerminal {
     command: String,
     terminal_id: String,
     cwd: String,
+    provider_instance_id: Option<String>,
     client: ClientHandle,
     runtime: tokio::runtime::Handle,
     queue: Option<mpsc::UnboundedSender<Operation>>,
     pane: Option<Entity<TerminalPane>>,
     pane_events: Option<Subscription>,
-    pane_changes: Option<Subscription>,
     focus_pending: bool,
     _pump: Option<Task<()>>,
     #[cfg(feature = "snapshot")]
@@ -72,6 +72,7 @@ impl AgentInstallTerminal {
             client.clone(),
         );
         let directory = cwd.clone();
+        let pane_provider_instance_id = Some(provider_instance_id.clone());
         runtime.spawn(async move {
             while let Some(operation) = operations.recv().await {
                 match operation {
@@ -128,12 +129,12 @@ impl AgentInstallTerminal {
             command,
             terminal_id,
             cwd,
+            provider_instance_id: pane_provider_instance_id,
             client,
             runtime,
             queue: Some(queue),
             pane: None,
             pane_events: None,
-            pane_changes: None,
             focus_pending: true,
             _pump: Some(pump),
             #[cfg(feature = "snapshot")]
@@ -159,7 +160,6 @@ impl AgentInstallTerminal {
             let _ = queue.send(Operation::Close);
         }
         self.pane_events = None;
-        self.pane_changes = None;
         self.pane = None;
         self.focus_pending = true;
         self.begin();
@@ -220,6 +220,7 @@ impl AgentInstallTerminal {
                     cwd: self.cwd.clone(),
                     worktree_path: None,
                     env: Default::default(),
+                    provider_instance_id: self.provider_instance_id.clone(),
                 },
             };
             let pane = cx.new(|cx| {
@@ -236,7 +237,6 @@ impl AgentInstallTerminal {
                     cx.emit(Closed);
                 }
             }));
-            self.pane_changes = Some(cx.observe(&pane, |_, _, cx| cx.notify()));
             self.pane = Some(pane);
         }
         if std::mem::take(&mut self.focus_pending)
@@ -318,6 +318,7 @@ pub struct Fixture {
     command: String,
     cwd: String,
     terminal_id: Option<String>,
+    provider_instance_id: Option<String>,
     pub can_operate: bool,
 }
 
@@ -340,12 +341,12 @@ impl AgentInstallTerminal {
                 .terminal_id
                 .unwrap_or_else(|| "onboarding-fixture".to_owned()),
             cwd: fixture.cwd,
+            provider_instance_id: fixture.provider_instance_id,
             client,
             runtime,
             queue: None,
             pane: None,
             pane_events: None,
-            pane_changes: None,
             focus_pending: true,
             _pump: None,
             permission_fixture: Some(fixture.can_operate),

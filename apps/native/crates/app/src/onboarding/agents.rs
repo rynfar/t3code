@@ -220,13 +220,10 @@ impl WelcomeWizard {
             this.refresh_providers(cx);
             cx.notify();
         });
-        // The deferred dialog must redraw its scene when the embedded pane publishes a frame.
-        let changed = cx.observe(&terminal, |_, _, cx| cx.notify());
         self.setup = Some(AgentSetup {
             driver,
             terminal,
             _closed: closed,
-            _changed: changed,
         });
         cx.notify();
     }
