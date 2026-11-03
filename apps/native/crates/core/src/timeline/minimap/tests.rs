@@ -183,3 +183,64 @@ fn only_a_press_that_starts_on_the_rail_scrubs_or_jumps() {
         "a button-free move ends a press whose release was missed",
     );
 }
+
+#[test]
+fn keyboard_focus_and_navigation_match_the_web_rail() {
+    assert_eq!(focus_index(None, Some(3), 6), Some(3));
+    assert_eq!(focus_index(Some(1), Some(3), 6), Some(1));
+    assert_eq!(focus_index(None, None, 6), Some(0));
+    assert_eq!(focus_index(Some(8), Some(9), 0), None);
+    for (active, key, expected) in [
+        (None, "ArrowDown", KeyboardAction::Preview(1)),
+        (Some(0), "ArrowUp", KeyboardAction::Preview(0)),
+        (Some(5), "ArrowDown", KeyboardAction::Preview(5)),
+        (Some(3), "Home", KeyboardAction::Preview(0)),
+        (Some(3), "End", KeyboardAction::Preview(5)),
+        (Some(3), "Enter", KeyboardAction::Jump(3)),
+        (Some(3), " ", KeyboardAction::Jump(3)),
+        (None, "Enter", KeyboardAction::Ignore),
+        (Some(3), "Tab", KeyboardAction::Ignore),
+    ] {
+        assert_eq!(keyboard_action(active, 6, key), expected, "{active:?}, {key}");
+    }
+    assert_eq!(keyboard_action(Some(0), 0, "End"), KeyboardAction::Ignore);
+    assert_eq!(keyboard_action(Some(6), 6, "Enter"), KeyboardAction::Ignore);
+}
+
+#[test]
+fn preview_hangs_from_the_first_and_last_strips_and_centres_between() {
+    assert_eq!(preview_offset(0, 6, 104.), 0.);
+    assert_eq!(preview_offset(3, 6, 104.), -52.);
+    assert_eq!(preview_offset(5, 6, 104.), -104.);
+}
+
+#[test]
+fn tab_order_skips_disabled_turn_buttons() {
+    use FocusPart::*;
+    assert_eq!(tab_target(Previous, false, true, true), Some(Rail));
+    assert_eq!(tab_target(Rail, false, true, true), Some(Next));
+    assert_eq!(tab_target(Next, true, true, true), Some(Rail));
+    assert_eq!(tab_target(Rail, true, true, true), Some(Previous));
+    assert_eq!(tab_target(Rail, false, true, false), None);
+    assert_eq!(tab_target(Rail, true, false, true), None);
+    assert_eq!(tab_target(Previous, true, true, true), None);
+    assert_eq!(tab_target(Next, false, true, true), None);
+}
+
+#[test]
+fn navigation_tooltip_escape_survives_renders_and_delayed_hover_opens() {
+    let mut tooltip = NavigationTooltip::default();
+    assert!(tooltip.visible(false, true, false));
+    tooltip.dismiss();
+    assert!(!tooltip.visible(false, true, false));
+    assert!(!tooltip.visible(false, true, false));
+    assert!(!tooltip.visible(false, false, false));
+    assert!(tooltip.visible(false, true, false));
+    tooltip.dismiss();
+    assert!(tooltip.visible(true, true, false), "a new hover resets dismissal");
+    assert!(!tooltip.visible(true, false, false));
+    tooltip.dismiss();
+    assert!(!tooltip.visible(true, false, true), "a delayed hover open cannot undo Escape");
+    assert!(!tooltip.visible(false, false, false));
+    assert!(tooltip.visible(true, false, true));
+}

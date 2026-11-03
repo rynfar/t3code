@@ -332,8 +332,8 @@ impl Render for Workspace {
                                 .flex_1()
                                 .min_h_0()
                                 .pr(px(details_layout.lane_inset))
-                                // Cached so terminal output repaints do not re-render the transcript.
-                                .child(div().flex_1().min_h_0().child(self.thread.clone().cached(gpui::StyleRefinement::default().size_full())))
+                                // An uncached shell lets minimap frames reuse the transcript's row cache.
+                                .child(div().flex_1().min_h_0().child(self.thread.clone()))
                                 .child(self.lineage.clone())
                                 .when(!composer_replaced, |this| this.child(self.composer.clone()))
                                 .child(self.details.clone()),

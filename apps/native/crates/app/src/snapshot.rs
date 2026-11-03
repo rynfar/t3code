@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--chatgpt-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -43,6 +43,7 @@ enum Gesture {
     Scroll(Point<Pixels>, f32),
     /// Space-separated keystrokes, as `cmd-a escape`.
     Keys(String),
+    Focus(String),
     Text(String),
     FontSize(f32),
 }
@@ -64,6 +65,7 @@ fn gestures(args: &[String]) -> Vec<Gesture> {
                 ("--scroll", Some(n @ [_, _, dy])) => Gesture::Scroll(at(n), *dy),
                 ("--resize-font", Some([size])) => Gesture::FontSize(*size),
                 ("--keys", _) => Gesture::Keys(pair[1].clone()),
+                ("--focus", _) => Gesture::Focus(pair[1].clone()),
                 ("--type", _) => Gesture::Text(pair[1].clone()),
                 _ => return None,
             })
@@ -104,12 +106,35 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
             cx.simulate_event(window, ScrollWheelEvent { position: *at, delta, modifiers: none, touch_phase: TouchPhase::Moved });
         }
         Gesture::Keys(keys) => cx.simulate_keystrokes(window, keys),
+        Gesture::Focus(id) => {
+            cx.update_window(window, |_, window, cx| {
+                let focus = cx.global::<FocusTargets>().0.get(id.as_str()).expect("unknown snapshot focus target").clone();
+                window.focus(&focus, cx);
+            }).expect("snapshot window closed");
+        }
         Gesture::Text(text) => cx.simulate_input(window, text),
         Gesture::FontSize(size) => cx.update(|cx| {
             let current = crate::theme::preferences(cx).clone();
             crate::theme::set_preferences(crate::theme::Preferences { interface_font_size: *size, ..current }, cx);
         }),
     }
+}
+
+#[derive(Default)]
+struct FocusTargets(std::collections::HashMap<&'static str, gpui::FocusHandle>);
+impl gpui::Global for FocusTargets {}
+
+pub(crate) fn register_focus(id: &'static str, focus: gpui::FocusHandle, cx: &mut gpui::App) {
+    if cx.try_global::<FocusTargets>().is_none() { cx.set_global(FocusTargets::default()); }
+    cx.global_mut::<FocusTargets>().0.insert(id, focus);
+}
+
+#[derive(Default)]
+struct RenderCounts(std::cell::RefCell<std::collections::HashMap<&'static str, usize>>);
+impl gpui::Global for RenderCounts {}
+
+pub(crate) fn record_render(name: &'static str, cx: &mut gpui::App) {
+    if let Some(counts) = cx.try_global::<RenderCounts>() { *counts.0.borrow_mut().entry(name).or_default() += 1; }
 }
 
 pub struct Options {
@@ -148,6 +173,8 @@ pub struct Options {
     worktree_setup: Option<PathBuf>,
     resource_telemetry_fixture: Option<PathBuf>,
     gestures: Vec<Gesture>,
+    motion_frames: Option<PathBuf>,
+    render_counts_output: Option<PathBuf>,
     width: f32,
     height: f32,
     appearance: Option<AppearanceMode>,
@@ -205,6 +232,8 @@ impl Options {
             worktree_setup: flag("--worktree-setup").map(PathBuf::from),
             resource_telemetry_fixture: flag("--resource-telemetry-fixture").map(PathBuf::from),
             gestures: gestures(&args),
+            motion_frames: flag("--motion-frames").map(PathBuf::from),
+            render_counts_output: flag("--render-counts-output").map(PathBuf::from),
             width: number("--width", 1440.),
             height: number("--height", 900.),
             appearance: if has("--dark") {
@@ -287,6 +316,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let fixture: crate::chatgpt_setup::Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         cx.update(|cx| cx.set_global(fixture));
     }
+    if options.render_counts_output.is_some() { cx.update(|cx| cx.set_global(RenderCounts::default())); }
     let state: Entity<AppState> = cx.update(|cx| crate::boot(runtime, cx));
     let window: AnyWindowHandle = cx
         .open_offscreen_window(size(px(options.width), px(options.height)), |window, cx| crate::root_view(&state, window, cx))
@@ -571,11 +601,26 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             cx.emit(crate::app_state::AppEvent::Phase);
         });
     }
-    for gesture in &options.gestures {
+    for (index, gesture) in options.gestures.iter().enumerate() {
         pump(&mut cx, options.wait.min(3.), |_| false);
+        if index + 1 == options.gestures.len() && options.render_counts_output.is_some() {
+            cx.update(|cx| cx.global::<RenderCounts>().0.borrow_mut().clear());
+        }
         replay(&mut cx, window, gesture);
+        if index + 1 == options.gestures.len() && let Some(directory) = &options.motion_frames {
+            std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            for frame in 0..8 {
+                pump(&mut cx, 0.034, |_| false);
+                let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;
+                image.save(directory.join(format!("{frame:02}.png"))).map_err(|error| error.to_string())?;
+            }
+        }
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
+    if let Some(path) = &options.render_counts_output {
+        let counts = cx.update(|cx| serde_json::to_vec_pretty(&*cx.global::<RenderCounts>().0.borrow())).map_err(|error| error.to_string())?;
+        std::fs::write(path, counts).map_err(|error| error.to_string())?;
+    }
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
     pump(&mut cx, 0.5, |_| false);
     let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;

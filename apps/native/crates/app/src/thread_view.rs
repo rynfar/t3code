@@ -13,7 +13,9 @@ mod citations;
 mod find;
 mod limit_recovery;
 mod minimap;
+pub use minimap::init;
 mod rewind;
+mod rows;
 mod status;
 
 pub use limit_recovery::LimitRecoveryBanner;
@@ -63,6 +65,8 @@ pub struct ThreadView {
     find: Option<find::FindUi>,
     citation_ui: citations::CitationUi,
     minimap: minimap::MinimapUi,
+    minimap_layer: Entity<minimap::MinimapLayer>,
+    timeline_rows: Entity<rows::TimelineRows>,
     footer: status::ThreadFooter,
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
     fork_support: HashMap<String, bool>,
@@ -123,8 +127,13 @@ impl ThreadView {
         let citation_window = _window.window_handle().window_id();
         let citation_keys = cx.intercept_keystrokes(move |event, window, cx| {
             if window.window_handle().window_id() != citation_window { return; }
-            let _ = owner.update(cx, |this, cx| this.citation_key(&event.keystroke, window, cx));
+            let _ = owner.update(cx, |this, cx| {
+                if !this.minimap_escape(&event.keystroke, window, cx) { this.citation_key(&event.keystroke, window, cx); }
+            });
         });
+        let minimap_owner = cx.entity();
+        let timeline_rows = cx.new(|cx| rows::TimelineRows::new(&minimap_owner, cx));
+        let minimap_layer = cx.new(|cx| minimap::MinimapLayer::new(&minimap_owner, &timeline_rows, cx));
         let mut subscriptions = vec![subscription, citation_keys];
         if let Some(setup) = &setup {
             subscriptions.push(cx.subscribe(setup, |this, _, _: &SetupEvent, cx| this.sync_setup(cx)));
@@ -151,6 +160,8 @@ impl ThreadView {
             find: None,
             citation_ui: citations::CitationUi::new(cx),
             minimap: minimap::MinimapUi::default(),
+            minimap_layer,
+            timeline_rows,
             footer: status::ThreadFooter::default(),
             turn_diffs: HashMap::new(),
             fork_support: HashMap::new(),
@@ -777,6 +788,8 @@ fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>, g
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(feature = "snapshot")]
+        crate::snapshot::record_render("thread-shell", cx);
         remeasure_for_typography(TranscriptTypography::of(window, cx), &mut self.measured_typography, &self.list, &self.group_lists.borrow());
         let thread = self.thread_state(self.state.read(cx));
         let loading = thread.projection.is_none() && !thread.is_merging_history();
@@ -798,20 +811,9 @@ impl Render for ThreadView {
                 .children(banners)
                 .into_any_element();
         }
-        self.clock = Clock::now();
-        self.window_height = f32::from(window.viewport_size().height);
-        self.markdown.begin_frame();
-        self.media.update(cx, |media, cx| media.begin_frame(window, cx));
-        let scope = crate::media::MediaScope {
-            owner: cx.entity_id(),
-            thread_id: self.thread_id.clone(),
-            workspace_root: self.workspace_root.clone(),
-            viewer: self.viewer.downgrade(),
-        };
-        crate::media::set_scope(scope, cx);
         let find_bar = self.render_find_bar(cx);
         let banners = self.render_banners(cx);
-        let minimap = self.render_minimap(window, cx);
+        let minimap = self.minimap_layer.clone().cached(gpui::StyleRefinement::default().absolute().inset_0());
         if let Some(generation) = self.disclosure.generation() {
             // Match the web's two-frame disclosure settle; newer layouts invalidate this ticket.
             cx.on_next_frame(window, move |_, window, cx| {
@@ -820,43 +822,7 @@ impl Render for ThreadView {
                 });
             });
         }
-        let transcript = list(
-            self.list.clone(),
-            cx.processor(|this, ix: usize, _window, cx| {
-                let offset = this.header_count();
-                if ix < offset {
-                    let content = match &this.history {
-                        Some(control) => history_control(control.has_more, control.loading, control.error.as_deref(), cx),
-                        None => div().into_any_element(),
-                    };
-                    return lane(content, true, crate::theme::chat_max_width(cx), this.gutter());
-                }
-                let Some(row) = this.rows.get(ix - offset).cloned() else {
-                    return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx), this.gutter());
-                };
-                let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
-                let lane = lane(content, ix == 0, crate::theme::chat_max_width(cx), this.gutter());
-                if this.anchor_gap.borrow().as_ref().is_none_or(|(id, _)| *id != row.id) {
-                    return lane;
-                }
-                let gap = this.anchor_gap.clone();
-                // Scrolling up into rows above this one in the same frame, so it never shows moved.
-                let request = canvas(
-                    move |bounds, window, _| {
-                        if let Some((_, gap)) = gap.borrow_mut().take() {
-                            window.request_autoscroll(Bounds::new(point(bounds.left(), bounds.top() - px(gap)), size(bounds.size.width, px(1.))));
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full();
-                div().relative().child(lane).child(request).into_any_element()
-            }),
-        )
-        .size_full();
+        let transcript = self.timeline_rows.clone().cached(gpui::StyleRefinement::default().size_full());
         div().id("citation-viewport")
             .track_focus(&self.citation_ui.selection_focus)
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
@@ -864,7 +830,7 @@ impl Render for ThreadView {
                 this.disclosure.cancel();
                 this.dismiss_citation_selection(cx);
             }))
-            .relative().size_full().child(transcript).children(minimap).children(banners).children(find_bar).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+            .relative().size_full().child(transcript).child(minimap).children(banners).children(find_bar).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }
 

@@ -369,5 +369,62 @@ impl RailPointer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusPart { Previous, Rail, Next }
+
+pub fn tab_target(part: FocusPart, backwards: bool, previous: bool, next: bool) -> Option<FocusPart> {
+    match (part, backwards) {
+        (FocusPart::Previous, false) | (FocusPart::Next, true) => Some(FocusPart::Rail),
+        (FocusPart::Rail, true) if previous => Some(FocusPart::Previous),
+        (FocusPart::Rail, false) if next => Some(FocusPart::Next),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NavigationTooltip {
+    hovered: bool,
+    focused: bool,
+    dismissed: bool,
+}
+
+impl NavigationTooltip {
+    pub fn visible(&mut self, hovered: bool, focused: bool, hover_ready: bool) -> bool {
+        if (self.hovered, self.focused) != (hovered, focused) { self.dismissed = false; }
+        (self.hovered, self.focused) = (hovered, focused);
+        !self.dismissed && (focused || hovered && hover_ready)
+    }
+
+    pub fn dismiss(&mut self) { self.dismissed = true; }
+}
+
+/// `TimelineMinimap`'s focus and key handlers.
+pub fn focus_index(active: Option<usize>, current: Option<usize>, count: usize) -> Option<usize> {
+    active.filter(|i| *i < count).or_else(|| current.filter(|i| *i < count)).or_else(|| (count > 0).then_some(0))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardAction {
+    Ignore,
+    Preview(usize),
+    Jump(usize),
+}
+
+pub fn keyboard_action(active: Option<usize>, count: usize, key: &str) -> KeyboardAction {
+    if count == 0 { return KeyboardAction::Ignore; }
+    match key {
+        "ArrowDown" => KeyboardAction::Preview(active.unwrap_or(0).saturating_add(1).min(count - 1)),
+        "ArrowUp" => KeyboardAction::Preview(active.unwrap_or(0).saturating_sub(1).min(count - 1)),
+        "Home" => KeyboardAction::Preview(0),
+        "End" => KeyboardAction::Preview(count - 1),
+        "Enter" | " " => active.filter(|i| *i < count).map_or(KeyboardAction::Ignore, KeyboardAction::Jump),
+        _ => KeyboardAction::Ignore,
+    }
+}
+
+pub fn preview_offset(index: usize, count: usize, height: f32) -> f32 {
+    if index == 0 { 0. } else if index + 1 == count { -height } else { -height / 2. }
+}
+
 #[cfg(test)]
 mod tests;
