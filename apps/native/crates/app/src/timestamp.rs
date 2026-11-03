@@ -1,98 +1,68 @@
-//! Host locale formatting for `apps/web/src/timestampFormat.ts`; calendar decisions live in core.
+//! Host preferences for `apps/web/src/timestampFormat.ts`; formatting and zones live in core.
 
+use std::cell::RefCell;
 use t3_core::client_settings::TimestampFormat;
-use t3_core::sidebar::time::{LocalTime, Ms, Zone};
-use t3_core::timeline::TimestampLocale;
+use t3_core::sidebar::time::{LocalTime, NamedZone};
+use t3_core::timeline::{IntlTimestampClock, TimestampLocale};
+
+pub fn viewer_zone() -> NamedZone {
+    iana_time_zone::get_timezone().ok().and_then(|name| NamedZone::new(&name)).unwrap_or_else(|| NamedZone::new("UTC").expect("UTC is a bundled zone"))
+}
 
 pub struct SystemTimestampLocale;
 
-pub struct ViewerZone {
-    pub name: String,
+fn with_locale<T>(format: impl FnOnce(&IntlTimestampClock) -> T) -> T {
+    thread_local! { static CACHE: RefCell<Option<(String, IntlTimestampClock)>> = const { RefCell::new(None) }; }
     #[cfg(target_os = "macos")]
-    zone: objc2::rc::Retained<objc2_foundation::NSTimeZone>,
-}
-
-impl ViewerZone {
-    pub fn current() -> Self {
-        let name = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_owned());
-        #[cfg(target_os = "macos")]
-        {
-            use objc2_foundation::{NSString, NSTimeZone};
-            match NSTimeZone::timeZoneWithName(&NSString::from_str(&name)) {
-                Some(zone) => Self { name, zone },
-                None => Self { name: "UTC".to_owned(), zone: NSTimeZone::timeZoneForSecondsFromGMT(0) },
-            }
+    let tag = objc2_foundation::NSLocale::currentLocale().localeIdentifier().to_string().split('@').next().unwrap_or("en-US").replace('_', "-");
+    #[cfg(not(target_os = "macos"))]
+    let tag = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_owned());
+    CACHE.with_borrow_mut(|cache| {
+        if cache.as_ref().is_none_or(|(previous, _)| *previous != tag) {
+            let locale = IntlTimestampClock::new(&tag).or_else(|| IntlTimestampClock::new("en-US")).expect("en-US is bundled");
+            *cache = Some((tag, locale));
         }
-        #[cfg(not(target_os = "macos"))]
-        Self { name }
-    }
-}
-
-impl Zone for ViewerZone {
-    fn offset_seconds_at(&self, utc_ms: Ms) -> i64 {
-        #[cfg(target_os = "macos")]
-        { self.zone.secondsFromGMTForDate(&objc2_foundation::NSDate::dateWithTimeIntervalSince1970(utc_ms as f64 / 1000.)) as i64 }
-        #[cfg(not(target_os = "macos"))]
-        { crate::sidebar::controller::SystemZone.offset_seconds_at(utc_ms) }
-    }
+        format(&cache.as_ref().expect("locale is cached").1)
+    })
 }
 
 impl TimestampLocale for SystemTimestampLocale {
     fn time(&self, local: LocalTime, format: TimestampFormat) -> String {
-        let template = match format {
-            TimestampFormat::Locale => "jm",
-            TimestampFormat::TwelveHour => "hm",
-            TimestampFormat::TwentyFourHour => "Hm",
-        };
-        format_local(local, template)
+        with_locale(|locale| locale.time(local, format))
     }
-
     fn numeric_date(&self, local: LocalTime, include_year: bool) -> String {
-        format_local(local, if include_year { "yMd" } else { "Md" })
+        #[cfg(target_os = "macos")]
+        { numeric_date(local, include_year, &objc2_foundation::NSLocale::currentLocale()) }
+        #[cfg(not(target_os = "macos"))]
+        { if include_year { format!("{}/{}/{}", local.month, local.day, local.year) } else { format!("{}/{}", local.month, local.day) } }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn format_local(local: LocalTime, template: &'static str) -> String {
-    format_local_with_locale(local, template, &objc2_foundation::NSLocale::currentLocale())
-}
-
-#[cfg(target_os = "macos")]
-fn format_local_with_locale(local: LocalTime, template: &'static str, locale: &objc2_foundation::NSLocale) -> String {
-    use std::cell::RefCell;
+fn numeric_date(local: LocalTime, include_year: bool, locale: &objc2_foundation::NSLocale) -> String {
     use objc2::rc::Retained;
     use objc2_foundation::{NSDate, NSDateFormatter, NSString, NSTimeZone};
-    use t3_core::sidebar::time::{DAY_MS, HOUR_MS, MINUTE_MS, days_from_civil};
-
+    use t3_core::sidebar::time::{DAY_MS, days_from_civil};
     #[derive(Default)]
-    struct Formatters {
+    struct Dates {
         locale: String,
-        formats: Vec<(&'static str, Retained<NSDateFormatter>)>,
+        formats: Option<[Retained<NSDateFormatter>; 2]>,
     }
-    thread_local! { static CACHE: RefCell<Formatters> = RefCell::default(); }
+    thread_local! { static CACHE: RefCell<Dates> = RefCell::default(); }
     CACHE.with_borrow_mut(|cache| {
-        let identifier = locale.localeIdentifier().to_string();
-        if cache.locale != identifier {
-            cache.locale = identifier;
-            cache.formats.clear();
+        let tag = locale.localeIdentifier().to_string();
+        if cache.locale != tag || cache.formats.is_none() {
+            cache.locale = tag;
+            cache.formats = Some(["Md", "yMd"].map(|template| {
+                let formatter = NSDateFormatter::new();
+                formatter.setTimeZone(Some(&NSTimeZone::timeZoneForSecondsFromGMT(0)));
+                formatter.setLocale(Some(locale));
+                formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
+                formatter
+            }));
         }
-        let index = cache.formats.iter().position(|(key, _)| *key == template).unwrap_or_else(|| {
-            let formatter = NSDateFormatter::new();
-            // Core has already resolved the zone at the instant; format its wall clock in UTC.
-            formatter.setTimeZone(Some(&NSTimeZone::timeZoneForSecondsFromGMT(0)));
-            formatter.setLocale(Some(locale));
-            formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
-            // Intl's numeric hour is unpadded in locales whose default clock is 24-hour.
-            let default = NSDateFormatter::dateFormatFromTemplate_options_locale(&NSString::from_str("jm"), 0, Some(locale));
-            if matches!(template, "jm" | "Hm") && default.is_some_and(|pattern| pattern.to_string().contains('H')) {
-                formatter.setDateFormat(Some(&NSString::from_str(&formatter.dateFormat().to_string().replace("HH", "H"))));
-            }
-            cache.formats.push((template, formatter));
-            cache.formats.len() - 1
-        });
-        let ms = days_from_civil(local.year, local.month, local.day) * DAY_MS + local.hour * HOUR_MS + local.minute * MINUTE_MS;
-        let date = NSDate::dateWithTimeIntervalSince1970(ms as f64 / 1000.);
-        cache.formats[index].1.stringFromDate(&date).to_string().replace(['\u{202f}', '\u{a0}'], " ")
+        let date = NSDate::dateWithTimeIntervalSince1970((days_from_civil(local.year, local.month, local.day) * DAY_MS) as f64 / 1000.);
+        cache.formats.as_ref().expect("date formats are cached")[usize::from(include_year)].stringFromDate(&date).to_string()
     })
 }
 
@@ -103,28 +73,19 @@ mod tests {
     use t3_core::sidebar::time::{FixedZone, parse_iso, to_local};
 
     #[test]
-    fn host_locale_templates_match_intl_numeric_time_and_date() {
+    fn host_numeric_dates_match_intl() {
         let local = to_local(parse_iso("2026-07-03T00:30:00Z").unwrap(), &FixedZone(0));
-        for (locale, clock, twelve, twenty_four, date, year) in [
-            ("en_US", "12:30 AM", "12:30 AM", "00:30", "7/3", "7/3/2026"),
-            ("en_GB", "0:30", "12:30 am", "0:30", "03/07", "03/07/2026"),
-            ("de_DE", "0:30", "12:30 AM", "0:30", "3.7.", "3.7.2026"),
-            ("ar_EG", "١٢:٣٠ ص", "١٢:٣٠ ص", "٠٠:٣٠", "٣\u{200f}/٧", "٣\u{200f}/٧\u{200f}/٢٠٢٦"),
+        for (tag, date, year) in [
+            ("en_US", "7/3", "7/3/2026"),
+            ("en_GB", "03/07", "03/07/2026"),
+            ("de_DE", "3.7.", "3.7.2026"),
+            ("es_MX", "3/7", "3/7/2026"),
+            ("fr_CA", "07-03", "2026-07-03"),
+            ("ar_EG", "٣\u{200f}/٧", "٣\u{200f}/٧\u{200f}/٢٠٢٦"),
         ] {
-            let locale = NSLocale::localeWithLocaleIdentifier(&NSString::from_str(locale));
-            for (template, expected) in [("jm", clock), ("hm", twelve), ("Hm", twenty_four), ("Md", date), ("yMd", year)] {
-                assert_eq!(format_local_with_locale(local, template, &locale), expected);
-            }
+            let locale = NSLocale::localeWithLocaleIdentifier(&NSString::from_str(tag));
+            assert_eq!(numeric_date(local, false, &locale), date);
+            assert_eq!(numeric_date(local, true, &locale), year);
         }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn format_local(local: LocalTime, template: &'static str) -> String {
-    match template {
-        "Hm" => format!("{:02}:{:02}", local.hour, local.minute),
-        "hm" | "jm" => format!("{}:{:02} {}", (local.hour + 11) % 12 + 1, local.minute, if local.hour < 12 { "AM" } else { "PM" }),
-        "yMd" => format!("{}/{}/{}", local.month, local.day, local.year),
-        _ => format!("{}/{}", local.month, local.day),
     }
 }

@@ -154,6 +154,26 @@ pub trait Zone {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct NamedZone(chrono_tz::Tz);
+
+impl NamedZone {
+    pub fn new(name: &str) -> Option<Self> {
+        name.parse().ok().map(Self)
+    }
+
+    pub fn name(&self) -> &str {
+        self.0.name()
+    }
+}
+
+impl Zone for NamedZone {
+    fn offset_seconds_at(&self, utc_ms: Ms) -> i64 {
+        use chrono::{Offset, TimeZone};
+        self.0.timestamp_millis_opt(utc_ms).single().map(|at| i64::from(at.offset().fix().local_minus_utc())).unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct FixedZone(pub i64);
 
 impl Zone for FixedZone {

@@ -20,6 +20,8 @@ mod rewind;
 mod rows;
 mod status;
 mod time;
+mod locale;
+pub use locale::IntlTimestampClock;
 mod tool_activity;
 mod user_input;
 

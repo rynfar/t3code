@@ -1572,13 +1572,8 @@ fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
 }
 
 // `apps/web/src/timestampFormat.test.ts` and the usage-limit timeline browser cases.
-struct TimestampNewYork;
-impl crate::sidebar::time::Zone for TimestampNewYork {
-    fn offset_seconds_at(&self, at: i64) -> i64 {
-        let spring = parse_iso_ms("2026-03-08T07:00:00Z").unwrap();
-        let fall = parse_iso_ms("2026-11-01T06:00:00Z").unwrap();
-        if (spring..fall).contains(&at) { -4 * 3600 } else { -5 * 3600 }
-    }
+fn timestamp_new_york() -> crate::sidebar::time::NamedZone {
+    crate::sidebar::time::NamedZone::new("America/New_York").unwrap()
 }
 
 struct TimestampEnglish { british: bool }
@@ -1607,15 +1602,15 @@ fn explicit_timestamp_zone_picks_relative_calendar_days() {
     use crate::client_settings::TimestampFormat::TwelveHour;
     let now = parse_iso_ms("2026-07-01T23:00:00.000Z").unwrap();
     let locale = TimestampEnglish { british: false };
-    assert_eq!(format_upcoming("2026-07-02T00:30:00.000Z", now, &TimestampNewYork, TwelveHour, &locale), "8:30 PM");
-    assert_eq!(format_upcoming("2026-07-02T05:30:00.000Z", now, &TimestampNewYork, TwelveHour, &locale), "tomorrow at 1:30 AM");
-    assert_eq!(format_day_aware("2026-07-01T03:30:00.000Z", now, &TimestampNewYork, TwelveHour, &locale), "yesterday at 11:30 PM");
+    assert_eq!(format_upcoming("2026-07-02T00:30:00.000Z", now, &timestamp_new_york(), TwelveHour, &locale), "8:30 PM");
+    assert_eq!(format_upcoming("2026-07-02T05:30:00.000Z", now, &timestamp_new_york(), TwelveHour, &locale), "tomorrow at 1:30 AM");
+    assert_eq!(format_day_aware("2026-07-01T03:30:00.000Z", now, &timestamp_new_york(), TwelveHour, &locale), "yesterday at 11:30 PM");
     // One render in Madrid must not cache the zone used by the next render in New York.
     let reset = Some("2026-07-01T19:30:00Z");
     let now = parse_iso_ms("2026-07-01T17:00:00Z").unwrap();
     let madrid = crate::sidebar::time::FixedZone(2 * 3600);
     assert_eq!(usage_limit_label(reset, now, &madrid, "Europe/Madrid", TwelveHour, &locale), "Usage limit reached. Retry after 9:30 PM (Europe/Madrid).");
-    assert_eq!(usage_limit_label(reset, now, &TimestampNewYork, "America/New_York", TwelveHour, &locale), "Usage limit reached. Retry after 3:30 PM (America/New_York).");
+    assert_eq!(usage_limit_label(reset, now, &timestamp_new_york(), "America/New_York", TwelveHour, &locale), "Usage limit reached. Retry after 3:30 PM (America/New_York).");
 }
 
 #[test]
@@ -1627,8 +1622,8 @@ fn timestamp_zones_resolve_dst_at_each_instant() {
         ("2026-11-01T03:30:00Z", "2026-11-02T04:30:00Z", "tomorrow at 11:30 PM", "11:30 PM"),
     ] {
         let now = parse_iso_ms(now).unwrap();
-        assert_eq!(format_upcoming(target, now, &TimestampNewYork, TwelveHour, &locale), upcoming);
-        assert_eq!(format_day_aware(target, now, &TimestampNewYork, TwelveHour, &locale), day_aware);
+        assert_eq!(format_upcoming(target, now, &timestamp_new_york(), TwelveHour, &locale), upcoming);
+        assert_eq!(format_day_aware(target, now, &timestamp_new_york(), TwelveHour, &locale), day_aware);
     }
 }
 
@@ -1639,7 +1634,7 @@ fn usage_limit_timestamps_honor_format_locale_invalid_and_past_values() {
     let american = TimestampEnglish { british: false };
     let british = TimestampEnglish { british: true };
     for (format, locale, clock) in [(TwelveHour, &american, "8:30 PM"), (TwentyFourHour, &american, "20:30"), (Locale, &american, "8:30 PM"), (Locale, &british, "20:30")] {
-        assert_eq!(usage_limit_label(Some("2026-07-02T00:30:00Z"), now, &TimestampNewYork, "America/New_York", format, locale), format!("Usage limit reached. Retry after {clock} (America/New_York)."));
+        assert_eq!(usage_limit_label(Some("2026-07-02T00:30:00Z"), now, &timestamp_new_york(), "America/New_York", format, locale), format!("Usage limit reached. Retry after {clock} (America/New_York)."));
     }
     for (reset, expected) in [
         (None, "Usage limit reached."),
@@ -1651,12 +1646,24 @@ fn usage_limit_timestamps_honor_format_locale_invalid_and_past_values() {
         (Some("2026-07-01T03:30:00Z"), "Usage limit reached. Retry after yesterday at 11:30 PM (America/New_York)."),
         (Some("2025-12-25T06:30:00Z"), "Usage limit reached. Retry after 12/25/2025 1:30 AM (America/New_York)."),
     ] {
-        assert_eq!(usage_limit_label(reset, now, &TimestampNewYork, "America/New_York", TwelveHour, &american), expected);
+        assert_eq!(usage_limit_label(reset, now, &timestamp_new_york(), "America/New_York", TwelveHour, &american), expected);
     }
-    assert_eq!(format_upcoming("2026-07-03T05:30:00Z", now, &TimestampNewYork, Locale, &british), "03/07 1:30");
-    assert_eq!(format_day_aware("invalid", now, &TimestampNewYork, Locale, &british), "");
-    assert_eq!(format_upcoming("invalid", now, &TimestampNewYork, Locale, &british), "");
+    assert_eq!(format_upcoming("2026-07-03T05:30:00Z", now, &timestamp_new_york(), Locale, &british), "03/07 1:30");
+    assert_eq!(format_day_aware("invalid", now, &timestamp_new_york(), Locale, &british), "");
+    assert_eq!(format_upcoming("invalid", now, &timestamp_new_york(), Locale, &british), "");
     let new_year = parse_iso_ms("2027-01-01T02:00:00Z").unwrap();
-    assert_eq!(format_upcoming("2027-01-02T03:30:00Z", new_year, &TimestampNewYork, Locale, &british), "tomorrow at 22:30");
-    assert_eq!(format_upcoming("2027-01-03T03:30:00Z", new_year, &TimestampNewYork, Locale, &british), "02/01/2027 22:30");
+    assert_eq!(format_upcoming("2027-01-02T03:30:00Z", new_year, &timestamp_new_york(), Locale, &british), "tomorrow at 22:30");
+    assert_eq!(format_upcoming("2027-01-03T03:30:00Z", new_year, &timestamp_new_york(), Locale, &british), "02/01/2027 22:30");
+}
+
+#[test]
+fn named_timestamp_zone_keeps_the_label_and_offsets_together() {
+    use crate::client_settings::TimestampFormat::TwelveHour;
+    use crate::sidebar::time::NamedZone;
+    let zone = NamedZone::new("America/New_York").unwrap();
+    let now = parse_iso_ms("2026-07-01T17:00:00Z").unwrap();
+    assert_eq!(usage_limit_label(Some("2026-07-01T19:30:00Z"), now, &zone, zone.name(), TwelveHour, &TimestampEnglish { british: false }), "Usage limit reached. Retry after 3:30 PM (America/New_York).");
+    let winter = parse_iso_ms("2026-01-01T17:00:00Z").unwrap();
+    assert_eq!(format_day_aware("2026-01-01T16:30:00Z", winter, &zone, TwelveHour, &TimestampEnglish { british: false }), "11:30 AM");
+    assert!(NamedZone::new("not/a-zone").is_none());
 }

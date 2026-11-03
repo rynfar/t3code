@@ -14,16 +14,17 @@ pub const ROW_GROUP: &str = "timeline-row";
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
     pub now_ms: i64,
+    pub zone: t3_core::sidebar::time::NamedZone,
 }
 
 impl Clock {
     pub fn now() -> Self {
         let now = chrono::Local::now();
-        Clock { now_ms: now.timestamp_millis() }
+        Clock { now_ms: now.timestamp_millis(), zone: crate::timestamp::viewer_zone() }
     }
 
     pub fn format(&self, iso: &str, cx: &App) -> String {
-        t3_core::timeline::format_day_aware(iso, self.now_ms, &crate::sidebar::controller::SystemZone, crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
+        t3_core::timeline::format_day_aware(iso, self.now_ms, &self.zone, crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
     }
 }
 

@@ -471,7 +471,7 @@ impl UsageView {
                 .child(div().min_w_0().text_color(hsla(p.foreground)).child(value))
         };
         let resets_at = window_data.resets_at.as_deref().map(|at| {
-            timeline::format_upcoming(at, now, &crate::sidebar::controller::SystemZone, crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
+            timeline::format_upcoming(at, now, &crate::timestamp::viewer_zone(), crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
         });
         let credits = account.limits.reset_credits.clone().filter(|credits| credits.available_count > 0 && account.redeem.is_some());
         let redeem = account.redeem.clone();

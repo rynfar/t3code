@@ -56,6 +56,7 @@ serde_json.workspace = true
 time.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 iana-time-zone = "0.1"
+sys-locale = "0.3"
 # Pairing-link QR codes, drawn as quads; no image rendering.
 qrcode = { version = "0.14", default-features = false }
 tokio.workspace = true
