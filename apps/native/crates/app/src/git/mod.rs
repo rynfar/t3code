@@ -20,7 +20,7 @@ use t3_client::supervisor::ClientHandle;
 use t3_core::auth::AuthSessionState;
 use t3_core::git_actions::{self, ActionProgress, Operation, ProgressEvent, RunRequest, RunResult, StackedAction, StackedActionRun, Terminology, terminology};
 use t3_core::project_scripts::{self, ProjectScript, TerminalMetadataEvent, Terminals};
-use t3_core::vcs::{self, ListRefsResult, PullResult, RefNameResult, VcsRef, VcsStatus, VcsStatusEvent, apply_status_event, method};
+use t3_core::vcs::{self, PullResult, RefNameResult, VcsRef, VcsStatus, VcsStatusEvent, apply_status_event, method};
 use tokio::sync::mpsc;
 
 pub use actions::{changes_row, git_actions_row};
@@ -53,20 +53,6 @@ pub struct InlineSuccess {
     pub description: Option<String>,
 }
 
-/// One loaded listing of the branch picker: every page fetched for `query`.
-#[derive(Debug, Clone, Default)]
-pub struct Refs {
-    pub query: String,
-    pub refs: Vec<VcsRef>,
-    /// Changes whenever `refs` does, so the picker knows when to filter again.
-    pub revision: u64,
-    pub next_cursor: Option<u64>,
-    pub total: u64,
-    pub loading: bool,
-    pub loaded: bool,
-    pub error: Option<String>,
-}
-
 /// A network task and the UI task that applies what it sends; dropping it stops both.
 struct Feed {
     net: tokio::task::JoinHandle<()>,
@@ -90,7 +76,8 @@ pub struct GitStore {
     pub optimistic_branch: Option<Option<String>>,
     pub branch_pending: bool,
     pub initializing: bool,
-    pub refs: Refs,
+    pub refs: vcs::refs::RefListing,
+    refs_feed: Option<Task<()>>,
     pub terminals: Terminals,
     /// This device's grants, `None` until the server answers (which grants nothing).
     grants: Option<AuthSessionState>,
@@ -160,7 +147,8 @@ impl GitStore {
             optimistic_branch: None,
             branch_pending: false,
             initializing: false,
-            refs: Refs::default(),
+            refs: Default::default(),
+            refs_feed: None,
             terminals: Terminals::default(),
             grants: None,
             status_feed: None,
@@ -203,6 +191,9 @@ impl GitStore {
             // Another environment: nothing read from the last one applies, and its feeds hold
             // its client open.
             self.connection = current;
+            self.refs_feed = None;
+            self.refs_task = None;
+            self.refs.reset();
             self.terminal_feed = None;
             self.status_feed = None;
             self.grants_task = None;
@@ -214,6 +205,9 @@ impl GitStore {
             cx.emit(GitEvent::Changed);
         }
         if connected {
+            if self.refs_feed.is_none() {
+                self.watch_refs(cx);
+            }
             if self.terminal_feed.is_none() {
                 self.start_terminal_feed(cx);
             }
@@ -234,15 +228,41 @@ impl GitStore {
             self.status_error = None;
             self.success = None;
             self.optimistic_branch = None;
-            self.reset_refs(String::new());
+            self.refs.reset();
             self.refs_task = None;
             self.start_status_feed(cx);
         }
         cx.emit(GitEvent::Changed);
     }
 
-    fn reset_refs(&mut self, query: String) {
-        self.refs = Refs { query, revision: self.refs.revision + 1, ..Refs::default() };
+    fn watch_refs(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client_handle() else {
+            return;
+        };
+        let mut revisions = client.refs_revision();
+        let mut sessions = client.connection_generation();
+        self.refs_feed = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let changed = tokio::select! {
+                    changed = revisions.changed() => changed,
+                    changed = sessions.changed() => changed,
+                };
+                if changed.is_err() {
+                    return;
+                }
+                if this
+                    .update(cx, |store, cx| {
+                        if store.refs.loaded || store.refs.loading {
+                            let query = store.refs.query.clone();
+                            store.load_refs(&query, false, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
     }
 
     /// Follows this device's grants; the last answer holds while reconnecting.
@@ -508,43 +528,37 @@ impl GitStore {
 
     /// Loads the first page for `query`, or the next page of the current listing.
     pub fn load_refs(&mut self, query: &str, next_page: bool, cx: &mut Context<Self>) {
-        let Some(target) = self.target.clone() else { return };
-        let query = vcs::sanitize_new_ref_name(query);
-        let cursor = if next_page && self.refs.query == query { self.refs.next_cursor } else { None };
-        if next_page && cursor.is_none() {
+        let (Some(target), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else {
             return;
-        }
-        if !next_page {
-            self.reset_refs(query.clone());
-        }
-        self.refs.loading = true;
+        };
+        let query = vcs::sanitize_new_ref_name(query);
+        let Some((request, cursor)) = self.refs.begin(&query, next_page) else {
+            return;
+        };
         let payload = vcs::list_refs(&target.cwd, Some(&query), cursor, vcs::REF_PAGE_LIMIT);
-        let Some(task) = self.state.read(cx).request(method::VCS_LIST_REFS, payload, decode::<ListRefsResult>) else { return };
+        let connection = self.connection;
+        let revisions = client.refs_revision();
+        let revision = *revisions.borrow();
+        let sessions = client.connection_generation();
+        let generation = *sessions.borrow();
+        let task = runtime.spawn(async move { client.list_refs(payload).await });
         cx.emit(GitEvent::Changed);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|_| Err("Failed to load refs.".into()));
+            let result = task
+                .await
+                .unwrap_or_else(|_| Err("Failed to load refs.".into()));
             let _ = this.update(cx, |store, cx| {
-                if store.refs.query != query {
+                if store.connection != connection || !store.shows(&target) || *revisions.borrow() != revision || *sessions.borrow() != generation {
                     return;
                 }
-                store.refs.loading = false;
-                store.refs.loaded = true;
-                match result {
-                    Ok(page) => {
-                        for item in page.refs {
-                            match store.refs.refs.iter_mut().find(|existing| existing.name == item.name) {
-                                Some(existing) => *existing = item,
-                                None => store.refs.refs.push(item),
-                            }
-                        }
-                        store.refs.revision += 1;
-                        store.refs.next_cursor = page.next_cursor;
-                        store.refs.total = store.refs.total.max(page.total_count);
-                        store.refs.error = None;
-                    }
-                    Err(error) => store.refs.error = Some(error),
+                let result = match result {
+                    Ok(Some(page)) => Ok(page),
+                    Ok(None) => return,
+                    Err(error) => Err(error),
+                };
+                if store.refs.finish(request, result) {
+                    cx.emit(GitEvent::Changed);
                 }
-                cx.emit(GitEvent::Changed);
             });
         }));
     }

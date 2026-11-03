@@ -28,3 +28,5 @@ pub mod resource_telemetry;
 pub mod chatgpt;
 
 pub mod theme_import;
+
+pub mod vcs;

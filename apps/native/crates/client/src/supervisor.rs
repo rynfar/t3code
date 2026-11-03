@@ -83,12 +83,13 @@ enum Command {
     CloseThread(String),
     RefreshSessionState,
     RetryNow,
-    Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>> },
+    Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>>, settled: Option<crate::vcs::OnSettled> },
     Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>> },
 }
 
 #[derive(Clone)]
 pub struct ClientHandle {
+    pub(crate) refs: crate::vcs::RefState,
     commands: mpsc::UnboundedSender<Command>,
     credentials: Arc<Credentials>,
     session_state: watch::Receiver<Option<AuthSessionState>>,
@@ -110,7 +111,7 @@ impl ClientHandle {
     }
 
     /// Advances only after a new WebSocket connects; update handoffs must outlive the old one.
-    pub(crate) fn connection_generation(&self) -> watch::Receiver<u64> { self.connection_generation.clone() }
+    pub fn connection_generation(&self) -> watch::Receiver<u64> { self.connection_generation.clone() }
 
     /// This device's grants, `None` until the first fetch answers. The last answer stays while
     /// reconnecting; every connection fetches anew.
@@ -184,7 +185,7 @@ impl ClientHandle {
     /// depends on it).
     pub fn request(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let queued = self.commands.send(Command::Request { method, payload, reply }).is_ok();
+        let queued = self.commands.send(Command::Request { method, payload, reply, settled: self.refs.on_settled(method) }).is_ok();
         async move {
             if !queued {
                 return Err(RpcError::Closed);
@@ -226,7 +227,7 @@ pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     let (grants, session_state) = watch::channel(None);
     let (generations, connection_generation) = watch::channel(0);
-    let handle = ClientHandle { commands, credentials: Arc::new(credentials.clone()), session_state, connection_generation };
+    let handle = ClientHandle { refs: Default::default(), commands, credentials: Arc::new(credentials.clone()), session_state, connection_generation };
     runtime.spawn(supervise(credentials, prepare, command_rx, events, grants, generations));
     (handle, event_rx)
 }
@@ -353,7 +354,8 @@ fn drain_command(command: Command, resume: &mut Resume) {
             resume.threads.remove(&id);
         }
         Command::RefreshSessionState | Command::RetryNow => {}
-        Command::Request { reply, .. } => {
+        Command::Request { reply, settled, .. } => {
+            drop(settled);
             let _ = reply.send(Err(RpcError::Closed));
         }
         Command::Stream { reply, .. } => {
@@ -493,13 +495,13 @@ async fn run_session(
                 }
                 Some(Command::RefreshSessionState) => fetch.start(),
                 Some(Command::RetryNow) => {}
-                Some(Command::Request { method, payload, mut reply }) => {
+                Some(Command::Request { method, payload, mut reply, settled }) => {
                     if !reply.is_closed() {
                         let response = session.send_request(method, payload);
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = reply.closed() => {},
-                                result = response => { let _ = reply.send(result); }
+                                result = response => { drop(settled); let _ = reply.send(result); }
                             }
                         });
                     }
