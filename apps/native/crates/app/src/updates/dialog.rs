@@ -18,6 +18,9 @@ pub struct UpdateDialog {
     pub(super) fixture: bool,
     pub(super) counts: Vec<(String, usize)>,
     expanded: bool,
+    focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
+    skipped_focus: FocusHandle,
     cancel_focus: FocusHandle,
     update_focus: FocusHandle,
     _subscription: Subscription,
@@ -48,8 +51,11 @@ impl UpdateDialog {
             fixture: false,
             counts: Vec::new(),
             expanded: false,
-            cancel_focus: cx.focus_handle(),
-            update_focus: cx.focus_handle(),
+            focus: cx.focus_handle(),
+            previous_focus: None,
+            skipped_focus: cx.focus_handle().tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_stop(true),
+            update_focus: cx.focus_handle().tab_stop(true),
             _subscription: subscription,
         }
     }
@@ -59,6 +65,7 @@ impl UpdateDialog {
         self.expanded = false;
         self.connection = self.state.read(cx).connection_id();
         self.counts = self.running_counts(cx);
+        self.previous_focus = window.focused(cx);
         window.focus(&self.cancel_focus, cx);
         cx.notify();
     }
@@ -96,13 +103,45 @@ impl UpdateDialog {
         }
         None
     }
+    fn cycle_focus(&self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut stops = Vec::new();
+        if self
+            .plan
+            .as_ref()
+            .is_some_and(|p| p.rows.iter().any(|r| r.skipped.is_some()))
+        {
+            stops.push(&self.skipped_focus);
+        }
+        stops.push(&self.cancel_focus);
+        if self.disabled_reason(cx).is_none() {
+            stops.push(&self.update_focus);
+        }
+        let index = stops
+            .iter()
+            .position(|focus| focus.is_focused(window))
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % stops.len()
+        } else {
+            (index + stops.len() - 1) % stops.len()
+        };
+        window.focus(stops[next], cx);
+    }
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.plan = None;
-        window.blur();
+        if let Some(focus) = self.previous_focus.take() {
+            window.focus(&focus, cx);
+        } else {
+            window.blur();
+        }
         cx.notify();
     }
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.fixture || self.disabled_reason(cx).is_some() {
+        if self.fixture {
+            self.close(window, cx);
+            return;
+        }
+        if self.disabled_reason(cx).is_some() {
             return;
         }
         let Some(plan) = self.plan.clone() else {
@@ -238,6 +277,8 @@ impl Render for UpdateDialog {
             rows = rows.child(
                 div()
                     .id("update-skipped")
+                    .track_focus(&self.skipped_focus)
+                    .focus_visible(|s| s.text_color(hsla(p.foreground)))
                     .flex()
                     .items_center()
                     .gap(rem(4.))
@@ -253,9 +294,19 @@ impl Render for UpdateDialog {
                         .sized(px(14.)),
                     )
                     .child(format!("{} skipped", skipped.len()))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                        if event.is_keyboard() {
+                            return;
+                        }
                         this.expanded = !this.expanded;
                         cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if crate::settings::controls::activates(event) {
+                            cx.stop_propagation();
+                            this.expanded = !this.expanded;
+                            cx.notify();
+                        }
                     })),
             );
             if self.expanded {
@@ -315,7 +366,15 @@ impl Render for UpdateDialog {
                 }))
                 .text_sm()
                 .cursor_pointer()
-                .focus_visible(|s| s.border_color(hsla(p.ring)))
+                .focus_visible(|s| {
+                    s.shadow(vec![gpui::BoxShadow {
+                        color: hsla(p.ring),
+                        offset: gpui::point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(2.),
+                        inset: false,
+                    }])
+                })
                 .child(label)
         };
         deferred(
@@ -331,6 +390,16 @@ impl Render for UpdateDialog {
                 .child(
                     div()
                         .id("update-everything-dialog")
+                        .key_context(super::DIALOG_CONTEXT)
+                        .track_focus(&self.focus)
+                        .on_action(cx.listener(|this, _: &super::FocusNextUpdate, window, cx| {
+                            this.cycle_focus(true, window, cx)
+                        }))
+                        .on_action(cx.listener(
+                            |this, _: &super::FocusPreviousUpdate, window, cx| {
+                                this.cycle_focus(false, window, cx)
+                            },
+                        ))
                         .relative()
                         .w_full()
                         .max_w(rem(576.))
@@ -390,14 +459,16 @@ impl Render for UpdateDialog {
                                 }))
                                 .child(
                                     button("updates-cancel", "Cancel", false, &self.cancel_focus)
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.close(window, cx)
-                                            }),
-                                        )
+                                        .on_click(cx.listener(
+                                            |this, event: &gpui::ClickEvent, window, cx| {
+                                                if !event.is_keyboard() {
+                                                    this.close(window, cx);
+                                                }
+                                            },
+                                        ))
                                         .on_key_down(cx.listener(
                                             |this, event: &KeyDownEvent, window, cx| {
-                                                if event.keystroke.key == "enter" {
+                                                if crate::settings::controls::activates(event) {
                                                     cx.stop_propagation();
                                                     this.close(window, cx);
                                                 }
@@ -405,19 +476,24 @@ impl Render for UpdateDialog {
                                         )),
                                 )
                                 .child(
-                                    button("updates-confirm", "Update", true, &self.update_focus)
-                                        .when(disabled.is_some(), |s| s.opacity(0.5))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.confirm(window, cx)
-                                        }))
-                                        .on_key_down(cx.listener(
-                                            |this, event: &KeyDownEvent, window, cx| {
-                                                if event.keystroke.key == "enter" {
-                                                    cx.stop_propagation();
-                                                    this.confirm(window, cx);
-                                                }
-                                            },
-                                        )),
+                                    button(
+                                        "updates-confirm",
+                                        "Update",
+                                        true,
+                                        &self.update_focus.clone().tab_stop(disabled.is_none()),
+                                    )
+                                    .when(disabled.is_some(), |s| s.opacity(0.5))
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.confirm(window, cx)),
+                                    )
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            if crate::settings::controls::activates(event) {
+                                                cx.stop_propagation();
+                                                this.confirm(window, cx);
+                                            }
+                                        },
+                                    )),
                                 ),
                         ),
                 ),

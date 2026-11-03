@@ -53,6 +53,7 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
     let mut first = server.connection().await;
     assert!(first.path.contains("wsTicket=ticket"), "{}", first.path);
     answer_config(&mut first, None).await;
+    assert_eq!(*client.connection_generation().borrow(), 1);
     let shell = first.request(method::SUBSCRIBE_SHELL).await;
     assert_eq!(shell["payload"].get("afterSequence"), None);
     assert_eq!(shell["payload"].get("omitIdleSubagents"), None, "a failed config asks for every row");
@@ -78,6 +79,7 @@ async fn reconnect_resumes_every_stream_after_the_last_sequence_it_delivered() {
 
     let mut second = server.connection().await;
     answer_config(&mut second, None).await;
+    assert_eq!(*client.connection_generation().borrow(), 2);
     let shell = second.request(method::SUBSCRIBE_SHELL).await;
     assert_eq!(shell["payload"]["afterSequence"], 40);
     let thread = second.request(method::SUBSCRIBE_THREAD).await;
@@ -117,7 +119,7 @@ async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, one
 async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
     let (commands, mut rx) = mpsc::unbounded_channel();
     let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() });
-    let handle = ClientHandle { commands, credentials, session_state: watch::channel(None).1 };
+    let handle = ClientHandle { commands, credentials, session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 };
     let sends = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
     let run = tokio::spawn(async move { handle.dispatch_in_order(sends).await });
 

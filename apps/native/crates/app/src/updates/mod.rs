@@ -1,6 +1,56 @@
 //! Sidebar update notices and confirmation from the web's `SidebarProviderUpdatePill.tsx`,
 //! `SidebarUpdatePill.tsx`, and `UpdateEverythingDialog.tsx`. Indicators are static at idle.
 mod dialog;
+use crate::settings::controls::{activates, focus_handle};
+use gpui::{Div, KeyBinding, KeyDownEvent, Stateful, actions};
+actions!(updates, [FocusNextUpdate, FocusPreviousUpdate]);
+const DIALOG_CONTEXT: &str = "UpdateEverythingDialog";
+const CONTROL_CONTEXT: &str = "SidebarUpdates";
+pub fn init(cx: &mut App) {
+    for context in [DIALOG_CONTEXT, CONTROL_CONTEXT] {
+        cx.bind_keys([
+            KeyBinding::new("tab", FocusNextUpdate, Some(context)),
+            KeyBinding::new("shift-tab", FocusPreviousUpdate, Some(context)),
+        ]);
+    }
+}
+
+fn keyboard_button(
+    element: Stateful<Div>,
+    id: &'static str,
+    enabled: bool,
+    activate: impl Fn(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let activate = std::rc::Rc::new(activate);
+    let on_key = activate.clone();
+    let ring = hsla(palette(cx).ring);
+    let focus = enabled.then(|| focus_handle(&id.into(), window, cx));
+    element
+        .when_some(focus, |element, focus| element.track_focus(&focus))
+        .focus_visible(move |s| {
+            s.shadow(vec![gpui::BoxShadow {
+                color: ring,
+                offset: gpui::point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(2.),
+                inset: true,
+            }])
+        })
+        .on_click(move |event, window, cx| {
+            if enabled && !event.is_keyboard() {
+                activate(window, cx);
+            }
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            if enabled && activates(event) {
+                cx.stop_propagation();
+                on_key(window, cx);
+            }
+        })
+}
+
 #[cfg(feature = "snapshot")]
 mod fixture;
 
@@ -186,9 +236,17 @@ impl UpdateControl {
     }
 }
 impl Render for UpdateControl {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let mut body = div().flex_none().flex().flex_col().gap(rem(6.)).px(rem(8.));
+        let mut body = div()
+            .key_context(CONTROL_CONTEXT)
+            .on_action(|_: &FocusNextUpdate, window, cx| window.focus_next(cx))
+            .on_action(|_: &FocusPreviousUpdate, window, cx| window.focus_prev(cx))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(rem(6.))
+            .px(rem(8.));
         if let Some(view) = &self.pill {
             let (fill, color, icon) = match view.tone {
                 Tone::Loading => (
@@ -218,7 +276,7 @@ impl Render for UpdateControl {
                 .text_color(hsla(color))
                 .text_size(px(11.))
                 .line_height(rem(16.));
-            row = row.child(
+            row = row.child(keyboard_button(
                 div()
                     .id("provider-update-main")
                     .flex_1()
@@ -234,11 +292,16 @@ impl Render for UpdateControl {
                         gpui_component::tooltip::Tooltip::new(description.clone()).build(window, cx)
                     })
                     .child(icon.sized(px(14.)).text_color(hsla(color)))
-                    .child(view.title.clone())
-                    .on_click(|_, _, cx| crate::settings::open(Section::Providers, cx)),
-            );
+                    .child(view.title.clone()),
+                "provider-update-main",
+                true,
+                |_, cx| crate::settings::open(Section::Providers, cx),
+                window,
+                cx,
+            ));
             if view.dismissible {
-                row = row.child(
+                let this = cx.weak_entity();
+                row = row.child(keyboard_button(
                     div()
                         .id("dismiss-provider-update")
                         .size(px(20.))
@@ -256,8 +319,14 @@ impl Render for UpdateControl {
                             )
                             .build(window, cx)
                         })
-                        .child(Icon::X.sized(px(14.)).text_color(hsla(color)))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .child(Icon::X.sized(px(14.)).text_color(hsla(color))),
+                    "dismiss-provider-update",
+                    true,
+                    move |window, cx| {
+                        if window.last_input_was_keyboard() {
+                            window.focus_next(cx);
+                        }
+                        let _ = this.update(cx, |this, cx| {
                             if let Some(pill) = &this.pill {
                                 this.dismissed.insert(pill.key.clone());
                             }
@@ -267,14 +336,18 @@ impl Render for UpdateControl {
                             } else {
                                 this.sync(cx);
                             }
-                        })),
-                );
+                        });
+                    },
+                    window,
+                    cx,
+                ));
             }
             body = body.child(row);
         }
         if self.plan.has_updates() || self.busy.is_some() {
             let label = self.busy.clone().unwrap_or_else(|| self.plan.summary());
-            body = body.child(
+            let this = cx.weak_entity();
+            body = body.child(keyboard_button(
                 div()
                     .id("update-everything")
                     .w_full()
@@ -299,16 +372,22 @@ impl Render for UpdateControl {
                         .sized(px(14.))
                         .text_color(hsla(p.update_foreground)),
                     )
-                    .child(label)
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .child(label),
+                "update-everything",
+                self.busy.is_none(),
+                move |window, cx| {
+                    let _ = this.update(cx, |this, cx| {
                         if this.busy.is_none() {
                             let plan = this.plan.clone();
                             this.dialog.update(cx, |dialog, cx| {
                                 dialog.open(plan, this.fixture, window, cx)
                             });
                         }
-                    })),
-            );
+                    });
+                },
+                window,
+                cx,
+            ));
         }
         body
     }
