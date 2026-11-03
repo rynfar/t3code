@@ -520,8 +520,14 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         }
     }
     if let Some(path)=std::env::var_os("T3_NATIVE_THEME_EDITOR_FIXTURE") {
-        let value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        let pending_exit=value.get("pendingExit").and_then(serde_json::Value::as_str).map(str::to_owned);
         cx.update_window(window,|_,window,cx|crate::theme_editor::fixture(value,window,cx)).map_err(|e|e.to_string())?;
+        if let Some(exit)=pending_exit {
+            // Settle save receipts before delivering the queued preview frame.
+            cx.run_until_parked();
+            cx.update(|cx|crate::theme_editor::verify_pending_exit_retired(&exit,cx))?;
+        }
     }
     if let Some(path)=std::env::var_os("T3_NATIVE_THEME_REIMPORT_FIXTURE") {
         pump(&mut cx,1.,|_|false);
@@ -627,6 +633,12 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
     pump(&mut cx, 0.5, |_| false);
+    if let Some(path)=std::env::var_os("T3_NATIVE_THEME_EDITOR_FIXTURE") {
+        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        if let Some(exit)=value.get("pendingExit").and_then(serde_json::Value::as_str) {
+            cx.update(|cx|crate::theme_editor::verify_pending_exit_fixture(exit,cx))?;
+        }
+    }
     let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;
     if let Some(parent) = options.out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;

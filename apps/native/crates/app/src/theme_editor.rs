@@ -61,6 +61,10 @@ pub fn open(editing: Option<ThemeDefinition>, seed: Option<ThemeDefinition>, nam
     cx.global_mut::<Host>().pending = Some(Session::new(editing, seed.as_ref(), name, dark));
     cx.refresh_windows();
 }
+fn is_current_editor(id: EntityId, cx: &App) -> bool {
+    let host = cx.global::<Host>();
+    host.pending.is_none() && host.view.as_ref().is_some_and(|view| view.entity_id() == id)
+}
 fn close(cx: &mut App) {
     let host = cx.global_mut::<Host>();
     host.view = None;
@@ -168,7 +172,7 @@ impl Editor {
         }
     }
     fn apply_preview(&mut self, cx: &mut Context<Self>) {
-        if self.preview.update(self.session.dark, self.session.colors()) {
+        if is_current_editor(cx.entity().entity_id(), cx) && self.preview.update(self.session.dark, self.session.colors()) {
             theme::preview(Some((&self.preview.colors, self.preview.dark)), cx);
         }
     }
@@ -590,6 +594,39 @@ pub fn fixture(value: serde_json::Value, window: &mut Window, cx: &mut App) {
         }
         this.name.focus_handle(cx).focus(window, cx);
     });
-    cx.global_mut::<Host>().view = Some(view);
+    cx.global_mut::<Host>().view = Some(view.clone());
+    if let Some(exit) = value.get("pendingExit").and_then(serde_json::Value::as_str) {
+        view.update(cx, |this, cx| this.pending_sample_fixture(window, cx));
+        match exit {
+            "toggle" => toggle(cx),
+            "cancel" => close(cx),
+            "save" => view.update(cx, |this, cx| this.save(cx)),
+            "replace" => open(None, None, Some("Replacement".into()), cx),
+            _ => panic!("unknown pending preview exit"),
+        }
+    }
     cx.refresh_windows();
+}
+
+#[cfg(feature = "snapshot")]
+pub fn verify_pending_exit_fixture(exit: &str, cx: &App) -> Result<(), String> {
+    if exit == "replace" {
+        let editor = cx
+            .global::<Host>()
+            .view
+            .as_ref()
+            .ok_or("Replacement editor did not open.")?
+            .read(cx);
+        theme::verify_preview_source(editor.session.colors(), editor.session.dark, cx)
+    } else {
+        theme::verify_saved_palette(cx)
+    }
+}
+
+#[cfg(feature = "snapshot")]
+pub fn verify_pending_exit_retired(exit: &str, cx: &App) -> Result<(), String> {
+    if exit != "replace" && cx.global::<Host>().view.is_some() {
+        return Err("The editor did not close before the queued frame.".into());
+    }
+    Ok(())
 }

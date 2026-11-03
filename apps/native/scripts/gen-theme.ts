@@ -584,6 +584,11 @@ const CHIP_KINDS = [
   "thread",
   "environment",
   "citation",
+  "doc-pdf",
+  "doc-word",
+  "doc-spreadsheet",
+  "doc-slides",
+  "doc-epub",
 ] as const;
 const culoriPackage = require.resolve("culori/package.json");
 const culoriVersion = (

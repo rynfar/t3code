@@ -382,6 +382,7 @@ fn editor_picker_drags_have_one_owner_and_frame_commit_keeps_latest() {
     drag.start(Surface::Hue);assert_eq!(drag.sample(initial,-1.,0.).unwrap().h,0.);
     let mut pending=FrameCommit::default();assert!(pending.schedule(initial));assert!(!pending.schedule(next));
     assert_eq!(pending.take(),Some(next));assert_eq!(pending.take(),None);assert!(pending.schedule(initial));
+    assert_eq!(pending.take_if(false),None);assert_eq!(pending.take_if(true),None);
 }
 #[test]
 fn editor_preview_ignores_name_and_invalid_color_changes() {

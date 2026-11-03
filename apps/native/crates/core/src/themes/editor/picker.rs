@@ -191,6 +191,10 @@ impl<T> FrameCommit<T> {
         self.pending = Some(value);
         !std::mem::replace(&mut self.scheduled, true)
     }
+    pub fn take_if(&mut self, active: bool) -> Option<T> {
+        let pending = self.take();
+        if active { pending } else { None }
+    }
     pub fn take(&mut self) -> Option<T> {
         self.scheduled = false;
         self.pending.take()

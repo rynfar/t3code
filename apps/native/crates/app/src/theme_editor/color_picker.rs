@@ -97,10 +97,11 @@ impl Editor {
         self.flush_picker(window, cx);
     }
     fn flush_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = is_current_editor(cx.entity().entity_id(), cx);
         let Some(p) = self.picker.as_mut() else {
             return;
         };
-        let Some(hsv) = p.pending.take() else {
+        let Some(hsv) = p.pending.take_if(active) else {
             return;
         };
         let role = p.role;
@@ -133,6 +134,14 @@ impl Editor {
         let x = f64::from((position.x - bounds.left()) / bounds.size.width);
         let y = f64::from((position.y - bounds.top()) / bounds.size.height);
         p.hsv = p.drag.sample(p.hsv, x, y).expect("active drag");
+        self.schedule_picker_commit(window, cx);
+        self.sync_picker(window, cx);
+        cx.notify();
+    }
+    fn schedule_picker_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.picker.as_mut() else {
+            return;
+        };
         let epoch = p.epoch;
         if p.pending.schedule(p.hsv) {
             cx.on_next_frame(window, move |this, window, cx| {
@@ -141,8 +150,12 @@ impl Editor {
                 }
             });
         }
-        self.sync_picker(window, cx);
-        cx.notify();
+    }
+    #[cfg(feature = "snapshot")]
+    pub(super) fn pending_sample_fixture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker("canvas", window, cx);
+        self.picker.as_mut().unwrap().hsv = picker::Hsv { h: 125., s: 1., v: 0.4 };
+        self.schedule_picker_commit(window, cx);
     }
     pub(super) fn render_picker(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picker = self.picker.as_ref()?;

@@ -752,21 +752,19 @@ mod tests {
     fn writer_barriers_commit_prior_patches_and_keep_later_writes_ordered() {
         let dir=std::env::temp_dir().join(format!("t3-theme-barrier-test-{}",std::process::id()));
         let _=std::fs::remove_dir_all(&dir);
-        let (tx,rx)=mpsc::channel();let home=dir.clone();
-        let worker=std::thread::spawn(move||run_writer(rx,||Some(home.clone())));
-        tx.send((CLIENT_SETTINGS.into(),patch(serde_json::json!({"before":true,"value":1})),None)).unwrap();
-        let (done,receipt)=mpsc::channel();
-        tx.send((CLIENT_SETTINGS.into(),patch(serde_json::json!({"value":2})),Some(done))).unwrap();
-        receipt.recv().unwrap().unwrap();
-        let value:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
-        assert_eq!(value,serde_json::json!({"before":true,"value":2}));
-        tx.send((CLIENT_SETTINGS.into(),Save::Replace("{\"after\":true,\"value\":3}".into()),None)).unwrap();
-        let (done,receipt)=mpsc::channel();
-        tx.send((CLIENT_SETTINGS.into(),patch(serde_json::json!({"final":true})),Some(done))).unwrap();
-        receipt.recv().unwrap().unwrap();
-        drop(tx);worker.join().unwrap();
-        let value:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
-        assert_eq!(value,serde_json::json!({"after":true,"value":3,"final":true}));
+        for (before,barrier,expected) in [
+            (patch(serde_json::json!({"before":true,"value":1})),patch(serde_json::json!({"value":2})),serde_json::json!({"before":true,"value":2})),
+            (Save::Replace("{\"after\":true,\"value\":3}".into()),patch(serde_json::json!({"final":true})),serde_json::json!({"after":true,"value":3,"final":true})),
+        ] {
+            let (tx,rx)=mpsc::channel();let (done,receipt)=mpsc::channel();
+            tx.send((CLIENT_SETTINGS.into(),before,None)).unwrap();
+            tx.send((CLIENT_SETTINGS.into(),barrier,Some(done))).unwrap();
+            drop(tx);
+            let home=dir.clone();let worker=std::thread::spawn(move||run_writer(rx,||Some(home.clone())));
+            receipt.recv().unwrap().unwrap();worker.join().unwrap();
+            let value:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+            assert_eq!(value,expected);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

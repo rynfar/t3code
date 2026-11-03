@@ -531,3 +531,24 @@ pub fn wireframe(theme: &ThemePreference, dark: bool, cx: &App) -> [u32; 7] {
         p.foreground,
     ]
 }
+
+#[cfg(feature="snapshot")]
+pub fn verify_saved_palette(cx:&App)->Result<(),String> {
+    let state=cx.global::<ThemeState>();
+    if state.preview.is_some() {return Err("A discarded editor restored its preview.".into());}
+    let prefs=&state.preferences;
+    let dark=themes::resolved_dark(&prefs.theme,&prefs.halves,themes::mode_dark(prefs.mode,state.system_dark),&prefs.custom,&state.environment);
+    let saved=state.saved.as_ref().ok_or("The saved theme was not prepared.")?;
+    if serde_json::to_value(palette(cx)).unwrap()!=serde_json::to_value(saved.palettes[usize::from(dark)]).unwrap() {
+        return Err("The saved palette is not active.".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature="snapshot")]
+pub fn verify_preview_source(colors:&themes::Colors,dark:bool,cx:&App)->Result<(),String> {
+    if cx.global::<ThemeState>().preview.as_ref()!=Some(&themes::editor::Preview::new(dark,colors)) {
+        return Err("A replaced editor restored its preview.".into());
+    }
+    Ok(())
+}
