@@ -282,67 +282,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A script that starts a grandchild and records its PID, then waits on it.
-    #[cfg(unix)]
-    fn spawning_cli(dir: &Path) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let (script, pidfile) = (dir.join("fake-t3"), dir.join("grandchild.pid"));
-        let script_text = format!("#!/bin/sh\nsleep 60 &\necho $! > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n", pidfile.display());
-        std::fs::write(&script, script_text).expect("writes script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        (script, pidfile)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    struct SpawningCli {
+        script: PathBuf,
+        status: tokio::net::TcpListener,
+        nonce: String,
     }
 
-    /// The grandchild's PID, once the script recorded it. Bounded, so a script killed before it
-    /// got that far fails the test instead of hanging it.
-    #[cfg(unix)]
-    async fn grandchild(pidfile: &Path) -> u32 {
-        for _ in 0..200 {
-            if let Some(pid) = std::fs::read_to_string(pidfile).ok().and_then(|text| text.trim().parse::<u32>().ok()) {
-                return pid;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    impl SpawningCli {
+        async fn require_bash_tcp() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds preflight listener");
+            let port = listener.local_addr().expect("preflight address").port();
+            let mut child = tokio::process::Command::new("/bin/bash")
+                .args(["-c", &format!("exec 3<>/dev/tcp/127.0.0.1/{port}")])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("bash /dev/tcp is unavailable");
+            tokio::select! {
+                biased;
+                connection = listener.accept() => {
+                    connection.expect("bash /dev/tcp is unavailable");
+                }
+                status = child.wait() => {
+                    status.expect("bash /dev/tcp is unavailable");
+                    // A successful probe may exit before Tokio delivers the queued connection.
+                    listener.into_std().expect("preflight listener").accept().expect("bash /dev/tcp is unavailable");
+                }
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            let status = child.wait().await.expect("bash /dev/tcp is unavailable");
+            assert!(status.success(), "bash /dev/tcp is unavailable: {status}");
         }
-        panic!("the script never started its child");
-    }
 
-    /// Whether the process is gone; reparented processes are reaped by launchd shortly after
-    /// they die.
-    #[cfg(unix)]
-    async fn dies(pid: u32) -> bool {
-        for _ in 0..100 {
-            if !process_alive(pid) {
-                return true;
+        async fn new(dir: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            Self::require_bash_tcp().await;
+            // Socket EOF readiness works on macOS, where named FIFOs can miss that event.
+            let status = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds status listener");
+            let port = status.local_addr().expect("status address").port();
+            let nonce = dir.file_name().expect("scratch directory name").to_str().expect("UTF-8 scratch directory name").to_owned();
+            let script = dir.join("fake-t3");
+            let script_text = format!(
+                r#"#!/bin/sh
+/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}
+printf "%s %s\n" "{nonce}" "$$" >&3
+read -r release <&3
+printf "survived\n" >&3' &
+wait
+"#
+            );
+            std::fs::write(&script, script_text).expect("writes script");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            Self { script, status, nonce }
+        }
+
+        async fn grandchild(&self) -> tokio::io::BufReader<tokio::net::TcpStream> {
+            use tokio::io::AsyncBufReadExt;
+            let mut readers = tokio::task::JoinSet::new();
+            let prefix = format!("{} ", self.nonce);
+            loop {
+                tokio::select! {
+                    connection = self.status.accept() => {
+                        let (stream, _) = connection.expect("accepts grandchild");
+                        readers.spawn(async move {
+                            let mut events = tokio::io::BufReader::new(stream);
+                            let mut line = String::new();
+                            if events.read_line(&mut line).await.ok()? == 0 {
+                                return None;
+                            }
+                            Some((events, line))
+                        });
+                    }
+                    finished = readers.join_next(), if !readers.is_empty() => {
+                        let Some(Ok(Some((events, line)))) = finished else { continue };
+                        let Some(pid) = line.strip_prefix(&prefix).and_then(|line| line.strip_suffix('\n')).and_then(|pid| pid.parse().ok()) else {
+                            continue;
+                        };
+                        if line != format!("{prefix}{pid}\n") {
+                            continue;
+                        }
+                        assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
+                        return events;
+                    }
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        false
+
+        async fn exits(mut events: tokio::io::BufReader<tokio::net::TcpStream>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut remaining = Vec::new();
+            // Half-close to release a surviving grandchild: it must report itself before EOF,
+            // so neither natural expiry nor delayed readiness can satisfy the exit assertion.
+            events.get_mut().shutdown().await.expect("releases grandchild");
+            events.read_to_end(&mut remaining).await.expect("reads EOF");
+            assert!(remaining.is_empty(), "the CLI's own children are killed too: {}", String::from_utf8_lossy(&remaining));
+        }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn a_timed_out_cli_takes_everything_it_started_with_it() {
+        use tokio::io::AsyncWriteExt;
+
         let dir = scratch("timeout");
-        let (script, pidfile) = spawning_cli(&dir);
-        let result = run_cli(&script, &[], &dir, Duration::from_secs(1)).await;
+        let cli = SpawningCli::new(&dir).await;
+        let address = cli.status.local_addr().expect("status address");
+        for line in ["GET / HTTP/1.1\r\n".to_owned(), String::new(), format!("{}\n", std::process::id())] {
+            let mut peer = tokio::net::TcpStream::connect(address).await.expect("connects unrelated peer");
+            peer.write_all(line.as_bytes()).await.expect("writes unrelated line");
+        }
+        let _silent = tokio::net::TcpStream::connect(address).await.expect("connects silent peer");
+        let result = run_cli(&cli.script, &[], &dir, Duration::from_secs(1));
+        tokio::pin!(result);
+        // Spawn once, then leave the timeout future unpolled until the grandchild is ready.
+        assert!(futures::poll!(&mut result).is_pending());
+        let events = cli.grandchild().await;
+        let result = result.await;
         assert!(matches!(result, Err(LocalPairError::CliFailed(ref message)) if message.contains("did not finish")), "{result:?}");
-        assert!(dies(grandchild(&pidfile).await).await, "the CLI's own children are killed too");
+        SpawningCli::exits(events).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cancelling_a_running_cli_kills_its_process_group() {
         let dir = scratch("cancel");
-        let (script, pidfile) = spawning_cli(&dir);
-        let task = tokio::spawn({
-            let (script, dir) = (script.clone(), dir.clone());
-            async move { run_cli(&script, &[], &dir, PAIR_TIMEOUT).await }
-        });
-        let pid = grandchild(&pidfile).await;
-        task.abort();
-        assert!(task.await.is_err_and(|error| error.is_cancelled()));
-        assert!(dies(pid).await, "Cancel stops the CLI and what it started");
+        let cli = SpawningCli::new(&dir).await;
+        let mut task = Box::pin(run_cli(&cli.script, &[], &dir, PAIR_TIMEOUT));
+        assert!(futures::poll!(&mut task).is_pending());
+        let events = cli.grandchild().await;
+        drop(task);
+        SpawningCli::exits(events).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
