@@ -705,9 +705,14 @@ impl SettingsView {
 
     /// Opens or replaces the selected instance's auth and install subscriptions.
     fn sync_streams(&mut self, selected: Option<&Selected>, cx: &mut Context<Self>) {
+        #[cfg(feature="snapshot")]
+        if let Some(fixture)=cx.try_global::<crate::chatgpt_setup::Fixture>().filter(|f|!f.managed) {
+            self.providers.auth=Some(AuthSession {instance_id:fixture.provider.instance_id.clone(),state:Some(fixture.auth.clone()),load_error:None,pending:false,error:None,_stream:None});
+            return;
+        }
         if crate::chatgpt_setup::fixture_active(cx) { return; }
         if selected.is_none_or(|s| s.row.driver != "codex") { self.providers.chatgpt = None; }
-        let wants_auth = selected.filter(|selected| selected.row.driver != "codex" && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone());
+        let wants_auth = selected.filter(|selected| model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone());
         if self.providers.auth.as_ref().map(|session| &session.instance_id) != wants_auth.as_ref() {
             self.providers.method_id = SharedString::default();
             self.providers.auth = wants_auth.map(|instance_id| {

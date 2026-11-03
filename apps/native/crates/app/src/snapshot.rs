@@ -306,7 +306,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                 config.providers.retain(|p| p.driver != "codex");
                 let mut instances=config.settings.provider_instances.iter().filter(|(_,p)|p.driver!="codex").map(|(id,p)|(id.to_owned(),p.clone())).collect::<Vec<_>>();
                 for provider in std::iter::once(&fixture.provider).chain(&fixture.other_accounts) {
-                    instances.push((provider.instance_id.clone(),t3_core::server_config::ProviderInstanceConfig {driver:"codex".into(),display_name:provider.display_name.clone(),config:Some(serde_json::json!({"setupMode":"managed"})),..Default::default()}));
+                    instances.push((provider.instance_id.clone(),t3_core::server_config::ProviderInstanceConfig {driver:"codex".into(),display_name:provider.display_name.clone(),config:fixture.managed.then(||serde_json::json!({"setupMode":"managed"})),..Default::default()}));
                 }
                 config.settings.provider_instances=instances.into_iter().collect();
                 config.providers.splice(0..0,std::iter::once(fixture.provider).chain(fixture.other_accounts));

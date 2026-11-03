@@ -1,8 +1,8 @@
 //! The selected instance's editor (`ProviderInstanceCard.tsx` in editor mode): its header, the
 //! Status and Display name rows, Setup (`ProviderSetupSection.tsx`'s runtime and
 //! `ProviderAuthenticationSection.tsx`'s account), and Models (`ProviderModelsSection.tsx`). The
-//! Runtime form, Environment variables, and Codex's managed ChatGPT runtime are not ported; a
-//! managed Codex instance signs in through the generic Account row.
+//! Runtime forms and environment variables remain partial. Managed Codex uses `chatgpt_setup`;
+//! existing Codex keeps the generic Account row.
 
 use gpui::{AnyElement, AppContext, Context, FontWeight, IntoElement, ParentElement, PromptLevel, SharedString, Styled, Window, div, list, prelude::*, px, relative};
 use gpui_component::input::{Input, InputState};
@@ -234,7 +234,7 @@ impl SettingsView {
                 }
             }
         }
-        if selected.row.driver != "codex" && shows_account(selected)
+        if model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && shows_account(selected)
             && let Some(live) = live
         {
             rows.push(self.render_account(selected, live, environment_label, window, cx));
@@ -358,7 +358,7 @@ impl SettingsView {
         }
         match view.action.clone() {
             Some(AccountAction::OpenDocs(url)) => {
-                controls = controls.child(Button::new("provider-open-docs", ButtonVariant::Outline, ButtonSize::Sm).label("Open docs").on_click(move |_, _, cx| cx.open_url(&url)));
+                controls = controls.child(Button::new("provider-open-docs", ButtonVariant::Outline, ButtonSize::Sm).label("Open docs").on_click(move |_, _, cx| {if !crate::chatgpt_setup::fixture_active(cx){cx.open_url(&url);}}));
             }
             Some(AccountAction::Cancel) => {
                 let id = instance_id.clone();
@@ -887,6 +887,7 @@ impl SettingsView {
     /// Runs one `provider.auth.*` call for the selected instance, one at a time, and shows the
     /// state it answers with at once.
     pub(super) fn auth_command(&mut self, method: &'static str, payload: Value, cx: &mut Context<Self>) {
+        if crate::chatgpt_setup::fixture_active(cx){return;}
         let Some(session) = self.providers.auth.as_mut() else { return };
         if session.pending {
             return;
@@ -919,6 +920,7 @@ impl SettingsView {
     /// Opens (or copies) the sign-in page. A browser interaction that asks for consent records
     /// it first, as the web does before opening the tab.
     fn open_auth_page(&mut self, instance_id: &str, copy: bool, cx: &mut Context<Self>) {
+        if crate::chatgpt_setup::fixture_active(cx){return;}
         let Some(state) = self.providers.auth.as_ref().and_then(|session| session.state.clone()) else { return };
         let Some(url) = state.url().map(str::to_owned) else { return };
         if copy {

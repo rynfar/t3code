@@ -38,7 +38,7 @@ async fn setup_waits_for_its_install_then_its_auth_flow() {
     let install_start = socket.request(auth::INSTALL_START).await;
     reply(&mut socket, &install_start, json!({"phase":"downloading","operationId":"mine"})).await;
     socket
-        .chunk(&install_stream, json!([{"phase":"succeeded","operationId":"previous","installedVersion":"1"},{"phase":"succeeded","operationId":"mine","installedVersion":"1"}]))
+        .chunk(&install_stream, json!([{"phase":"idle"},{"phase":"succeeded","operationId":"previous","installedVersion":"1"},{"phase":"downloading","operationId":"previous"},{"phase":"succeeded","operationId":"mine","installedVersion":"1"}]))
         .await;
     let auth_stream = socket.request(auth::AUTH_SUBSCRIBE).await;
     let auth_start = socket.request(auth::AUTH_START).await;
@@ -49,7 +49,12 @@ async fn setup_waits_for_its_install_then_its_auth_flow() {
     assert!(task.await.unwrap().is_ok());
     let mut pages = Vec::new();
     let mut finished = false;
+    let mut state = model::SetupState::default();
     while let Some(update) = updates.recv().await {
+        update.apply_install(&mut state);
+        if let Some(install)=&state.install {
+            assert_eq!(install.operation_id.as_deref(), Some("mine"));
+        }
         match update {
             Update::Page(page) => pages.push(page),
             Update::Finishing => finished = true,
@@ -118,4 +123,72 @@ async fn finished_handoff_retries_import_without_repeating_sign_in() {
     assert!(task.await.unwrap().is_ok());
     assert!(matches!(updates.recv().await, Some(Update::Finishing)));
     assert!(updates.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn unmanaged_choice_never_subscribes_to_managed_install_before_the_mode_update() {
+    let mut server = FakeServer::start().await;
+    let (client, mut socket, _events) = client(&mut server).await;
+    let choice = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let mut streams = Vec::new();
+            for method in model::managed_subscriptions(false) {
+                streams.push(client.stream(method, auth::subscribe_payload("codex")).await.unwrap());
+            }
+            client.request("fixture.choice-ready", json!({})).await.unwrap();
+            streams
+        }
+    });
+    let mut rejections = 0;
+    loop {
+        let frame = socket.recv().await;
+        if frame["tag"] == auth::INSTALL_SUBSCRIBE {
+            rejections += 1;
+            socket.send(json!({"_tag":"Exit","requestId":frame["id"],"exit":{"_tag":"Failure","cause":[{"_tag":"Fail","error":{"_tag":"ProviderSetupError","operation":"observe-install","detail":"Choose managed setup to install Codex in T3 Code."}}]}})).await;
+        }
+        if frame["tag"] == "fixture.choice-ready" {
+            reply(&mut socket, &frame, Value::Null).await;
+            break;
+        }
+    }
+    drop(choice.await.unwrap());
+    assert_eq!(rejections, 0, "the default choice must not hit the managed-only observe-install guard");
+    let settings = t3_core::server_config::ServerSettings::default();
+    let patch = model::mode_payload(&settings, "codex", true);
+    let update = tokio::spawn({
+        let client = client.clone();
+        async move { client.request(t3_core::commands::method::SERVER_UPDATE_SETTINGS, patch).await }
+    });
+    let frame = socket.request(t3_core::commands::method::SERVER_UPDATE_SETTINGS).await;
+    assert_eq!(frame["payload"]["providerInstanceMutation"]["instance"]["config"]["setupMode"], "managed");
+    reply(&mut socket, &frame, json!({})).await;
+    update.await.unwrap().unwrap();
+    let subscriptions = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let mut streams = Vec::new();
+            for method in model::managed_subscriptions(true) {
+                streams.push(client.stream(method, auth::subscribe_payload("codex")).await.unwrap());
+            }
+            client.request("fixture.managed-ready", json!({})).await.unwrap();
+            streams
+        }
+    });
+    let mut observed = Vec::new();
+    loop {
+        let frame = socket.recv().await;
+        if frame["_tag"] == "Request" {
+            if frame["tag"] == "fixture.managed-ready" {
+                reply(&mut socket, &frame, Value::Null).await;
+                break;
+            }
+            observed.push(frame["tag"].as_str().unwrap().to_owned());
+            if frame["tag"] == auth::INSTALL_SUBSCRIBE {
+                socket.chunk(&frame, json!([{"phase":"idle","installedVersion":null}])).await;
+            }
+        }
+    }
+    assert_eq!(observed, vec![auth::AUTH_SUBSCRIBE, auth::INSTALL_SUBSCRIBE]);
+    drop(subscriptions.await.unwrap());
 }

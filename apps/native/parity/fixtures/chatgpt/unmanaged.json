@@ -1,0 +1,36 @@
+{
+  "provider": {
+    "instanceId": "codex",
+    "driver": "codex",
+    "displayName": "Codex",
+    "enabled": true,
+    "installed": true,
+    "auth": {
+      "status": "unauthenticated"
+    },
+    "setup": {
+      "canInstall": false,
+      "canAuthenticate": true
+    },
+    "status": "ready"
+  },
+  "auth": {
+    "phase": "idle",
+    "flowId": null,
+    "methods": [
+      {
+        "id": "chatgpt",
+        "name": "ChatGPT"
+      }
+    ]
+  },
+  "install": {
+    "phase": "idle",
+    "operationId": null,
+    "installedVersion": "1.2.3",
+    "version": "1.2.3",
+    "source": "managed",
+    "executablePath": "/fixture/managed/codex"
+  },
+  "managed": false
+}

@@ -24,7 +24,7 @@
         "accountEmail": "fixture@example.invalid"
       }
     ],
-    "authorizationUrl": "https://example.invalid/chatgpt/sign-in",
+    "authorizationUrl": "https://example.invalid/chatgpt/sign-in?id_token_hint=obviously-fake-fixture-hint",
     "message": "Complete sign-in in your browser."
   },
   "install": {

@@ -11,11 +11,22 @@ use tokio::sync::mpsc;
 
 pub enum Update {
     Auth(auth::AuthState),
+    InstallStarted(auth::InstallState),
     Install(auth::InstallState),
     Page(String),
     Handoff,
     Finishing,
     TransferFailed,
+}
+
+impl Update {
+    pub fn apply_install(&self, state: &mut model::SetupState) {
+        match self {
+            Self::InstallStarted(install) => state.started_install(install.clone()),
+            Self::Install(install) => state.observe_install(install.clone()),
+            _ => {}
+        }
+    }
 }
 
 pub struct SetupRequest {
@@ -38,7 +49,7 @@ pub async fn setup(client: ClientHandle, request: SetupRequest, updates: mpsc::U
         let mut stream = client.stream(auth::INSTALL_SUBSCRIBE, auth::subscribe_payload(&instance)).await.map_err(|_| "Could not read runtime status.")?;
         let started =
             client.request(auth::INSTALL_START, auth::subscribe_payload(&instance)).await.ok().and_then(auth::decode_install_state).ok_or("Codex setup failed. Try again.")?;
-        let _ = updates.send(Update::Install(started.clone()));
+        let _ = updates.send(Update::InstallStarted(started.clone()));
         let mut current = started.clone();
         loop {
             match model::settle_install(&started, Some(&current)) {

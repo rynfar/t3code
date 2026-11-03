@@ -977,6 +977,16 @@ pub struct DialogFrame {
 
 impl DialogFrame {
     pub fn render(self, window: &Window, on_dismiss: impl Fn(&mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
+        self.render_inner(window,3,false,on_dismiss,cx)
+    }
+
+    pub fn render_modal(self,window:&Window,priority:usize,on_dismiss:impl Fn(&mut Window,&mut App)+'static,cx:&App)->AnyElement {
+        self.render_inner(window,priority,true,on_dismiss,cx)
+    }
+
+    fn render_inner(self,window:&Window,priority:usize,close:bool,on_dismiss:impl Fn(&mut Window,&mut App)+'static,cx:&App)->AnyElement {
+        let on_dismiss=std::rc::Rc::new(on_dismiss);
+        let dismiss_button=on_dismiss.clone();
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let viewport = window.viewport_size();
@@ -1006,7 +1016,10 @@ impl DialogFrame {
                     .when(!self.description.is_empty(), |this| this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(self.description))),
             )
             .child(div().id(ElementId::Name(format!("{}-panel", self.id).into())).flex_1().min_h_0().overflow_y_scroll().px(r(24.)).pt(r(4.)).pb(r(24.)).child(self.body))
-            .child(self.footer);
+            .child(self.footer)
+            .when(close,|v|v.child(div().absolute().top(r(8.)).right(r(8.)).child(
+                Button::new("modal-dialog-close",ButtonVariant::Ghost,ButtonSize::Icon).icon(Icon::X).tooltip("Close")
+                    .on_click(move|_,window,cx|dismiss_button(window,cx)))));
         gpui::deferred(
             gpui::anchored().position_mode(gpui::AnchoredPositionMode::Window).position(point(px(0.), px(0.))).child(
                 div()
@@ -1023,7 +1036,7 @@ impl DialogFrame {
                     .child(dialog),
             ),
         )
-        .with_priority(3)
+        .with_priority(priority)
         .into_any_element()
     }
 }

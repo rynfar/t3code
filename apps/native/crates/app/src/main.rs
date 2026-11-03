@@ -146,6 +146,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     files::init(cx);
     selectable_text::init(cx);
     onboarding::init(cx);
+    chatgpt_setup::init(cx);
     updates::init(cx);
     state
 }

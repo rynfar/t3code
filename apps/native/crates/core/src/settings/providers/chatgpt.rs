@@ -135,9 +135,6 @@ impl SetupState {
         if self.install_operation.as_ref().is_some_and(|id| state.operation_id.as_ref() != Some(id)) {
             return;
         }
-        if !state.is_active() {
-            self.install_operation = None;
-        }
         self.install = Some(state);
     }
     pub fn auth_active(&self) -> bool {
@@ -201,7 +198,8 @@ mod tests;
 
 pub fn resume_environment(value: &str) -> Option<String> {
     let url = url::Url::parse(value).ok()?;
-    let welcome = matches!(url.scheme(), "t3code" | "t3code-dev") && url.host_str() == Some("welcome") || matches!(url.scheme(), "http" | "https") && url.path() == "/welcome";
+    let welcome = matches!(url.scheme(), "t3code-native" | "t3code" | "t3code-dev") && url.host_str() == Some("welcome")
+        || matches!(url.scheme(), "http" | "https") && url.path() == "/welcome";
     if !welcome || !url.username().is_empty() || url.password().is_some() {
         return None;
     }
@@ -247,4 +245,25 @@ pub fn picker_selection(methods: &[super::auth::AuthMethod], selection: &str) ->
         .find(|m| m.id == selection)
         .or_else(|| methods.iter().find(|m| m.id.starts_with("chatgpt-profile:")))
         .map_or_else(|| "chatgpt-change-account".into(), |m| m.id.clone())
+}
+
+pub fn managed_subscriptions(managed: bool) -> &'static [&'static str] {
+    if managed { &[super::auth::AUTH_SUBSCRIBE, super::auth::INSTALL_SUBSCRIBE] } else { &[] }
+}
+pub fn uses_generic_account(driver: &str, config: Option<&Value>) -> bool {
+    driver != "codex" || !managed(config)
+}
+pub fn authorization_page_label(_auth: &AuthState) -> String {
+    "Sign-in page is ready to open.".into()
+}
+impl SetupState {
+    pub fn choice_enabled(&self, managed: bool, allowed: bool, available: bool) -> bool {
+        allowed
+            && available
+            && !self.busy()
+            && (!managed || (self.install.is_some() && self.error.as_deref() != Some("Could not read Codex setup status. Reconnect and try again.")))
+    }
+    pub fn auto_start_ready(&self, requested: bool, allowed: bool, can_install: bool) -> bool {
+        requested && allowed && self.install.is_some() && can_install && !self.busy() && self.error.is_none()
+    }
 }

@@ -42,6 +42,7 @@ fn future_handoff_phases_do_not_break_the_stream() {
 
 #[test]
 fn welcome_resume_names_the_environment_and_rejects_other_routes() {
+    assert_eq!(resume_environment("t3code-native://welcome#agents:fixture-env"), Some("fixture-env".into()));
     assert_eq!(resume_environment("t3code://welcome#agents:fixture-env"), Some("fixture-env".into()));
     assert_eq!(resume_environment("https://example.invalid/welcome#agents:fixture-env"), Some("fixture-env".into()));
     assert_eq!(resume_environment("https://example.invalid/threads#agents:fixture-env"), None);
@@ -52,9 +53,14 @@ fn welcome_resume_names_the_environment_and_rejects_other_routes() {
 fn observed_previous_install_cannot_clear_the_owned_busy_state() {
     let mut state = SetupState::default();
     state.started_install(decode_install_state(json!({"phase":"downloading","operationId":"mine"})).unwrap());
-    state.observe_install(decode_install_state(json!({"phase":"succeeded","operationId":"old","installedVersion":"1"})).unwrap());
-    assert!(state.install_active());
+    for stale in [json!({"phase":"idle"}), json!({"phase":"succeeded","operationId":"old","installedVersion":"1"}), json!({"phase":"downloading","operationId":"old"})] {
+        state.observe_install(decode_install_state(stale).unwrap());
+        assert!(state.install_active());
+        assert_eq!(state.install.as_ref().unwrap().operation_id.as_deref(), Some("mine"));
+    }
     state.observe_install(decode_install_state(json!({"phase":"succeeded","operationId":"mine","installedVersion":"1"})).unwrap());
+    assert!(!state.install_active());
+    state.observe_install(decode_install_state(json!({"phase":"downloading","operationId":"old"})).unwrap());
     assert!(!state.install_active());
 }
 
@@ -86,4 +92,40 @@ fn picker_keeps_a_valid_choice_and_falls_back_when_a_saved_account_disappears() 
     assert_eq!(picker_selection(&methods, "removed"), "chatgpt-profile:one");
     assert_eq!(picker_selection(&methods, "chatgpt-change-account"), "chatgpt-change-account");
     assert_eq!(picker_selection(&[], "removed"), "chatgpt-change-account");
+}
+
+#[test]
+fn unmanaged_choice_does_not_depend_on_managed_only_install_readiness() {
+    let state = SetupState { error: Some("Could not read Codex setup status. Reconnect and try again.".into()), ..Default::default() };
+    assert!(state.choice_enabled(false, true, true));
+    assert!(!state.choice_enabled(true, true, true));
+    assert!(managed_subscriptions(false).is_empty());
+    assert_eq!(managed_subscriptions(true), [super::super::auth::AUTH_SUBSCRIBE, super::super::auth::INSTALL_SUBSCRIBE]);
+}
+#[test]
+fn existing_codex_uses_generic_auth_including_sign_out() {
+    assert!(uses_generic_account("codex", None));
+    assert!(uses_generic_account("codex", Some(&json!({"setupMode":"existing"}))));
+    assert!(!uses_generic_account("codex", Some(&json!({"setupMode":"managed"}))));
+    assert!(uses_generic_account("claudeAgent", None));
+}
+#[test]
+fn authorization_page_copy_never_contains_a_reconnect_token() {
+    let auth = decode_auth_state(json!({"phase":"waiting","authorizationUrl":"https://example.invalid/authorize?id_token_hint=obviously-fake-token&state=fake"})).unwrap();
+    let label = authorization_page_label(&auth);
+    assert!(!label.contains("obviously-fake-token"));
+    assert!(!label.contains("id_token_hint"));
+    assert_eq!(label, "Sign-in page is ready to open.");
+}
+#[test]
+fn automatic_setup_waits_for_an_existing_install_and_permissions() {
+    let mut state = SetupState { install: decode_install_state(json!({"phase":"downloading","operationId":"other"})), ..Default::default() };
+    assert!(!state.auto_start_ready(true, true, true));
+    state.install = decode_install_state(json!({"phase":"idle","installedVersion":"1"}));
+    state.pending = true;
+    assert!(!state.auto_start_ready(true, true, true));
+    state.pending = false;
+    assert!(!state.auto_start_ready(true, false, true));
+    assert!(state.auto_start_ready(true, true, true));
+    assert!(!state.auto_start_ready(false, true, true));
 }

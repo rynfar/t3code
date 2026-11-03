@@ -1,10 +1,11 @@
 //! Shared Settings/onboarding presentation of `CodexSetupSection.tsx`, account picker,
 //! `AddCodexAccountDialog.tsx` and `ChatGptWelcomeCoordinator.tsx`.
+mod dialog_focus;
 use crate::{
     app_state::{AppEvent, AppState},
     icons::Icon,
     provider_icon::{ProviderIcon, ProviderMark},
-    settings::controls::{Button, ButtonSize, ButtonVariant, Row, r},
+    settings::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, dialog_footer, r},
     theme::{hsla, palette},
 };
 use gpui::{prelude::*, *};
@@ -18,6 +19,10 @@ use t3_core::{
     server_config::ServerProvider,
     settings::providers::{self as providers, auth, chatgpt as model},
 };
+
+pub fn init(cx: &mut App) {
+    dialog_focus::init(cx);
+}
 
 pub struct AccountCreated(pub String);
 impl EventEmitter<AccountCreated> for ChatGptSetup {}
@@ -34,6 +39,8 @@ impl Drop for Network {
 #[serde(rename_all = "camelCase")]
 pub struct Fixture {
     pub provider: ServerProvider,
+    #[serde(default = "fixture_managed")]
+    pub managed: bool,
     #[serde(default)]
     pub other_accounts: Vec<ServerProvider>,
     pub auth: auth::AuthState,
@@ -46,6 +53,10 @@ pub struct Fixture {
     pub add_account: bool,
     #[serde(default)]
     pub welcome: bool,
+}
+#[cfg(feature = "snapshot")]
+fn fixture_managed() -> bool {
+    true
 }
 #[cfg(feature = "snapshot")]
 impl Global for Fixture {}
@@ -85,8 +96,9 @@ pub struct ChatGptSetup {
     acknowledged: Option<String>,
     _subscription: Subscription,
     _inputs: Vec<Subscription>,
-    dialog_focus: FocusHandle,
-    dialog_visible: bool,
+    dialog_scope: dialog_focus::Scope,
+    observed_managed: Option<bool>,
+    watch_generation: u64,
 }
 impl ChatGptSetup {
     pub fn new(app: Entity<AppState>, instance: String, onboarding: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -99,10 +111,11 @@ impl ChatGptSetup {
             }
             if *event == AppEvent::Phase && this.connection == this.app.read(cx).connection_id() && !fixture_active(cx) {
                 this.streams.clear();
-                this.state.error = None;
-                this.watch(cx);
+                this.observed_managed = None;
+                this.sync_watch(cx);
             }
             if matches!(event, AppEvent::ServerConfig | AppEvent::Phase) {
+                this.sync_watch(cx);
                 if let Some(provider) = this.provider(cx)
                     && provider.auth.status == "authenticated"
                 {
@@ -158,21 +171,22 @@ impl ChatGptSetup {
             acknowledged: None,
             _subscription: subscription,
             _inputs: inputs,
-            dialog_focus: cx.focus_handle(),
-            dialog_visible: false,
+            dialog_scope: dialog_focus::Scope::new(cx),
+            observed_managed: None,
+            watch_generation: 0,
         };
         #[cfg(feature = "snapshot")]
         if let Some(fixture) = cx.try_global::<Fixture>().cloned() {
             view.state.auth = Some(fixture.auth);
             view.state.requested_method = "chatgpt".into();
-            view.state.install = Some(fixture.install);
+            view.state.install = fixture.managed.then_some(fixture.install);
             view.state.handoff = fixture.handoff;
             view.picker = fixture.picker;
             view.adding = fixture.add_account;
             view.welcome = fixture.welcome;
             return view;
         }
-        view.watch(cx);
+        view.sync_watch(cx);
         view
     }
     pub fn instance(&self) -> &str {
@@ -187,8 +201,8 @@ impl ChatGptSetup {
     }
     fn config(&self, cx: &App) -> Option<Value> {
         #[cfg(feature = "snapshot")]
-        if fixture_active(cx) {
-            return Some(json!({"setupMode":"managed"}));
+        if let Some(fixture) = cx.try_global::<Fixture>() {
+            return fixture.managed.then(|| json!({"setupMode":"managed"}));
         }
         self.app.read(cx).server_config.config.as_ref()?.settings.provider_instances.get(&self.instance)?.config.clone()
     }
@@ -206,13 +220,28 @@ impl ChatGptSetup {
             && !t3_core::managed_policy::instance_field_locked(policy, "codex", "config.setupMode")
             && app.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|s| s.grants("providers:manage")))
     }
+    fn sync_watch(&mut self, cx: &mut Context<Self>) {
+        if fixture_active(cx) {
+            return;
+        }
+        let managed = model::managed(self.config(cx).as_ref());
+        if self.observed_managed == Some(managed) {
+            return;
+        }
+        self.observed_managed = Some(managed);
+        self.watch_generation += 1;
+        self.streams.clear();
+        self.state = Default::default();
+        self.watch(cx);
+    }
     fn watch(&mut self, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
         let Some(client) = app.client_handle() else {
             return;
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        for method in [auth::AUTH_SUBSCRIBE, auth::INSTALL_SUBSCRIBE] {
+        let generation = self.watch_generation;
+        for &method in model::managed_subscriptions(model::managed(self.config(cx).as_ref())) {
             let (tx, client, instance) = (tx.clone(), client.clone(), self.instance.clone());
             let network = app.runtime().spawn(async move {
                 let Ok(mut stream) = client.stream(method, auth::subscribe_payload(&instance)).await else {
@@ -231,6 +260,9 @@ impl ChatGptSetup {
             while let Some((method, item)) = rx.recv().await {
                 if this
                     .update(cx, |this, cx| {
+                        if this.watch_generation != generation {
+                            return;
+                        }
                         match item {
                             Ok(value) if method == auth::AUTH_SUBSCRIBE => {
                                 if let Some(next) = auth::decode_auth_state(value) {
@@ -306,30 +338,30 @@ impl ChatGptSetup {
         })
         .detach();
     }
-    fn start(&mut self, method: String, cx: &mut Context<Self>) {
+    fn start(&mut self, method: String, cx: &mut Context<Self>) -> bool {
         if fixture_active(cx) || !self.allowed(cx) || self.state.busy() {
-            return;
+            return false;
         }
         let app = self.app.read(cx);
         let Some(client) = app.client_handle() else {
-            return;
+            return false;
         };
         let Some(environment) = app.active_environment() else {
-            return;
+            return false;
         };
         let local = model::local_server(&environment.http_base, environment.ssh.is_some());
         let environment_id = environment.environment_id.clone().unwrap_or_else(|| environment.id.clone());
         let Some(return_url) = model::return_url(&environment.http_base, &environment_id, &self.instance, self.onboarding) else {
-            return;
+            return false;
         };
         let helper =
             if local { None } else { app.environments.environments.iter().find(|e| e.local && model::local_server(&e.http_base, e.ssh.is_some())).and_then(|e| e.credentials()) };
         let Some(install) = self.state.install.clone() else {
-            return;
+            return false;
         };
         let can_start = self.provider(cx).is_some_and(|p| p.enabled && p.setup.is_some_and(|s| if model::needs_install(&install) { s.can_install } else { s.can_authenticate }));
         if !can_start {
-            return;
+            return false;
         }
         let request = t3_client::chatgpt::SetupRequest { instance: self.instance.clone(), method: method.clone(), environment: environment_id, return_url, local, helper, install };
         self.state.requested_method = method;
@@ -351,15 +383,10 @@ impl ChatGptSetup {
                             return;
                         }
                         use t3_client::chatgpt::Update;
+                        update.apply_install(&mut this.state);
                         match update {
-                            Update::Auth(auth) => {
-                                this.state.pending = false;
-                                this.state.auth = Some(auth);
-                            }
-                            Update::Install(install) => {
-                                this.state.pending = false;
-                                this.state.started_install(install);
-                            }
+                            Update::Auth(auth) => {this.state.pending=false;this.state.auth=Some(auth);}
+                            Update::InstallStarted(_) | Update::Install(_) => {this.state.pending=false;}
                             Update::Handoff => {
                                 this.state.pending = false;
                                 this.state.handoff = true;
@@ -393,6 +420,7 @@ impl ChatGptSetup {
                     return;
                 }
                 this.operation = None;
+                this.state.install_operation=None;
                 this.state.pending = false;
                 this.state.handoff = false;
                 if let Ok(Err(error)) = result {
@@ -406,6 +434,7 @@ impl ChatGptSetup {
         })
         .detach();
         cx.notify();
+        true
     }
     fn refresh(&self, cx: &mut Context<Self>) {
         if fixture_active(cx) {
@@ -569,7 +598,8 @@ impl ChatGptSetup {
                     .as_ref()
                     .and_then(|p| p.setup.as_ref())
                     .is_some_and(|s| if self.state.install.as_ref().is_some_and(model::needs_install) { s.can_install } else { s.can_authenticate }));
-        let disabled = !self.allowed(cx) || !available || self.state.error.as_deref() == Some("Could not read Codex setup status. Reconnect and try again.");
+        let choice_enabled = self.state.choice_enabled(managed, self.allowed(cx), available);
+        let disabled = !self.allowed(cx) || !available || (managed && self.state.error.as_deref() == Some("Could not read Codex setup status. Reconnect and try again."));
         let profiles = self.state.has_profiles();
         let url = self.state.auth.as_ref().and_then(auth::AuthState::url).map(str::to_owned);
         let waiting = self.state.auth.as_ref().is_some_and(|a| a.phase == "waiting");
@@ -651,15 +681,16 @@ impl ChatGptSetup {
                 Button::new("chatgpt-connect", ButtonVariant::Default, ButtonSize::Sm)
                     .icon(Icon::OpenAi)
                     .label(if profiles { "Reconnect account" } else { "Continue with ChatGPT" })
-                    .disabled(disabled || busy || self.state.install.is_none())
+                    .disabled(!choice_enabled)
                     .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
             );
             if profiles {
                 controls = controls.child(
-                    Button::new("chatgpt-different", ButtonVariant::GhostMuted, ButtonSize::Sm)
-                        .label("Use a different account")
-                        .disabled(disabled || busy)
-                        .on_click(cx.listener(|this, _, _, cx| this.start("chatgpt-change-account".into(), cx))),
+                    Button::new("chatgpt-different", ButtonVariant::GhostMuted, ButtonSize::Sm).label("Use a different account").disabled(disabled || busy).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.start("chatgpt-change-account".into(), cx);
+                        },
+                    )),
                 );
             } else {
                 controls = controls.child(
@@ -672,47 +703,42 @@ impl ChatGptSetup {
         }
         controls.into_any_element()
     }
+    fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.welcome {
+            self.dismiss_welcome(cx);
+        }
+        self.picker = false;
+        self.adding = false;
+        self.added = None;
+        self.dialog_scope.sync(false, window, cx);
+        cx.notify();
+    }
     fn render_dialog(&self, title: String, description: &'static str, body: AnyElement, footer: AnyElement, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
-        let viewport = window.viewport_size();
-        let popup = v_flex()
-            .id("chatgpt-dialog")
-            .track_focus(&self.dialog_focus)
-            .occlude()
-            .w(r(640.))
-            .max_w(viewport.width - px(32.))
-            .max_h(viewport.height - px(64.))
-            .rounded(r(16.))
-            .relative()
-            .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    this.picker = false;
-                    this.adding = false;
-                    this.welcome = false;
-                    this.added = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }
+        let this = cx.weak_entity();
+        let frame = DialogFrame {
+            id: "chatgpt-dialog",
+            title: title.into(),
+            description: description.into(),
+            max_width: if self.adding { 768. } else { 512. },
+            body,
+            footer: dialog_footer(self.adding, vec![footer], cx).into_any_element(),
+            focus: self.dialog_scope.focus.clone(),
+        }
+        .render_modal(
+            window,
+            65,
+            move |window, cx| {
+                let _ = this.update(cx, |this, cx| this.close_dialog(window, cx));
+            },
+            cx,
+        );
+        self.dialog_scope
+            .wrap(frame)
+            .on_action(cx.listener(|this, _: &dialog_focus::Close, window, cx| {
+                this.close_dialog(window, cx);
+                cx.stop_propagation();
             }))
-            .child(
-                v_flex()
-                    .p(r(24.))
-                    .gap(r(8.))
-                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(description)),
-            )
-            .child(div().id("chatgpt-dialog-body").overflow_y_scroll().px(r(24.)).pb(r(24.)).child(body))
-            .child(h_flex().justify_end().gap(r(8.)).px(r(24.)).pb(r(24.)).child(footer));
-        deferred(
-            anchored()
-                .position_mode(AnchoredPositionMode::Window)
-                .position(point(px(0.), px(0.)))
-                .child(div().w(viewport.width).h(viewport.height).flex().items_center().justify_center().bg(hsla(p.dialog_backdrop)).occlude().child(popup)),
-        )
-        .with_priority(65)
-        .into_any_element()
+            .into_any_element()
     }
     fn render_picker(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let profiles = self.profiles();
@@ -850,10 +876,13 @@ impl Render for ChatGptSetup {
             self.adding = false;
             self.added = None;
         }
-        if self.auto_start && self.state.install.is_some() && self.provider(cx).and_then(|p| p.setup).is_some_and(|s| s.can_install) {
-            self.auto_start = false;
+        if self.state.auto_start_ready(self.auto_start, self.allowed(cx), self.provider(cx).and_then(|p| p.setup).is_some_and(|s| s.can_install)) {
             cx.spawn(async |this, cx| {
-                let _ = this.update(cx, |this, cx| this.start("chatgpt".into(), cx));
+                let _ = this.update(cx, |this, cx| {
+                    if this.start("chatgpt".into(), cx) {
+                        this.auto_start = false;
+                    }
+                });
             })
             .detach();
         }
@@ -923,7 +952,7 @@ impl Render for ChatGptSetup {
             );
         }
         if self.state.auth.as_ref().is_some_and(|a| a.phase == "waiting") && !self.state.handoff {
-            let url = self.state.auth.as_ref().and_then(auth::AuthState::url).unwrap_or("").to_owned();
+            let page_label = self.state.auth.as_ref().map(model::authorization_page_label).unwrap_or_default();
             let callback_button = Button::new("chatgpt-callback", ButtonVariant::Outline, ButtonSize::Sm)
                 .label("Connect")
                 .disabled(self.state.pending || !self.allowed(cx))
@@ -937,7 +966,7 @@ impl Render for ChatGptSetup {
                     .px(r(16.))
                     .pb(r(12.))
                     .gap(r(8.))
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(url))
+                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(page_label))
                     .child(Button::new("chatgpt-help", ButtonVariant::GhostMuted, ButtonSize::Xs).label("Having trouble signing in?").on_click(cx.listener(|this, _, _, cx| {
                         this.help = !this.help;
                         cx.notify();
@@ -970,10 +999,7 @@ impl Render for ChatGptSetup {
             content = content.rounded(r(8.)).border_1().border_color(hsla(p.border)).bg(hsla(p.background));
         }
         let visible = self.adding || self.picker || self.welcome;
-        if visible && !self.dialog_visible {
-            window.focus(&self.dialog_focus, cx);
-        }
-        self.dialog_visible = visible;
+        self.dialog_scope.sync(visible, window, cx);
         let dialog = if self.adding {
             Some(self.render_add(window, cx))
         } else if self.picker {
