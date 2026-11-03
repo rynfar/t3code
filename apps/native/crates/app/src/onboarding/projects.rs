@@ -25,7 +25,7 @@ impl std::fmt::Display for RequestFailure {
 }
 impl From<t3_client::session::RpcError> for RequestFailure {
     fn from(error: t3_client::session::RpcError) -> Self {
-        let definitive = matches!(&error,t3_client::session::RpcError::Failure(failure) if failure.message != "Interrupted");
+        let definitive = matches!(&error,t3_client::session::RpcError::Failure(failure) if model::confirmed_project_rejection(failure));
         Self { message: error.to_string(), definitive }
     }
 }
@@ -207,6 +207,15 @@ impl WelcomeWizard {
                 }
             }
             if let Some(result) = fixture.get("importResult").and_then(|r| serde_json::from_value::<model::ImportResult>(r.clone()).ok()) {
+                self.projects.progress.selection = self
+                    .projects
+                    .scan
+                    .as_ref()
+                    .map(|scan| scan.candidates.iter().map(|c| model::key(&self.projects.environment, &c.path)).filter(|key| self.projects.selected.contains(key)).collect())
+                    .unwrap_or_default();
+                if let (Some(key), Some(id)) = (self.projects.progress.selection.first(), fixture.get("importedProjectId").and_then(Value::as_str)) {
+                    self.projects.progress.with_history.insert(key.clone(), id.to_owned());
+                }
                 self.projects.progress.imported = result.imported_count;
                 self.projects.progress.skipped = result.skipped_count;
                 self.projects.error = self.projects.progress.warning();
@@ -278,7 +287,7 @@ impl WelcomeWizard {
         if self.projects.busy || !self.projects_access(ORCHESTRATION_OPERATE_SCOPE, cx) {
             return;
         }
-        self.projects.progress.selection = self
+        let selection = self
             .projects
             .scan
             .as_ref()
@@ -292,8 +301,7 @@ impl WelcomeWizard {
                     .collect()
             })
             .unwrap_or_default();
-        self.projects.progress.skipped = 0;
-        self.projects.progress.failures = 0;
+        self.projects.progress.begin_attempt(selection);
         self.projects.error = None;
         self.projects.busy = true;
         self.next_import(0, cx);
@@ -370,18 +378,32 @@ impl WelcomeWizard {
         });
     }
     fn finish_import(&mut self, cx: &mut Context<Self>) {
+        self.finish_projects(model::FinishIntent::Import, cx);
+    }
+    fn skip_import(&mut self, cx: &mut Context<Self>) {
+        self.finish_projects(model::FinishIntent::Skip, cx);
+    }
+    fn finish_projects(&mut self, intent: model::FinishIntent, cx: &mut Context<Self>) {
         if !self.projects_current(cx) {
             return;
         }
-        if !self.projects.progress.selection.is_empty() && !self.projects_access(ORCHESTRATION_OPERATE_SCOPE, cx) {
-            self.projects.error = Some(model::PERMISSION_MESSAGE.into());
-            cx.notify();
-            return;
-        }
-        self.projects.landing = self.projects.progress.landing().map(str::to_owned);
-        if self.projects.landing.is_none() {
-            self.finish_with_import_notice(cx);
-            return;
+        let app = self.state.read(cx);
+        let completion = self.projects.progress.completion(intent, self.projects_access(ORCHESTRATION_OPERATE_SCOPE, cx), |id| app.shell.project(id).is_some());
+        match completion {
+            model::Completion::Denied => {
+                self.projects.error = Some(model::PERMISSION_MESSAGE.into());
+                cx.notify();
+                return;
+            }
+            model::Completion::Ready(landing) => {
+                self.cancel_projects();
+                if let Some(id) = landing {
+                    self.state.update(cx, |state, cx| state.start_draft(&id, cx));
+                }
+                self.finish_with_import_notice(cx);
+                return;
+            }
+            model::Completion::Wait(id) => self.projects.landing = Some(id),
         }
         self.projects.busy = true;
         self.projects.landing_timeout = Some(cx.spawn(async move |this, cx| {
@@ -667,7 +689,7 @@ impl WelcomeWizard {
                         Button::new("welcome-projects-skip", ButtonVariant::GhostMuted, ButtonSize::Default)
                             .label("Do not import projects")
                             .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.finish_import(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.skip_import(cx))),
                     )
                     .child(
                         Button::new("welcome-projects-import", ButtonVariant::Default, ButtonSize::Default)

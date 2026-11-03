@@ -114,3 +114,61 @@ fn leaving_reentering_or_switching_discards_late_replies_even_after_access_retur
     assert!(!demand.accepts(second, Some(7), false));
     assert!(demand.accepts(second, Some(7), true));
 }
+
+#[test]
+fn only_typed_project_rejections_discard_create_ids() {
+    let failure = |tag: Option<&str>, error: Value| crate::rpc::RpcFailure {
+        tag: tag.map(str::to_owned),
+        message: "request failed".into(),
+        error,
+    };
+    for error in [json!({"message":"projection store unavailable"}), json!({"message":"malformed response"}), json!({"_tag":"FutureError"})] {
+        assert!(!confirmed_project_rejection(&failure(None, error)));
+    }
+    for cause in [
+        json!({"name":"ProjectOperationError","message":"read-project failed"}),
+        json!({"_tag":"ProjectOperationError","operation":"dispatch-project-command","cause":{"_tag":"EventSinkV2Error"}}),
+        Value::Null,
+    ] {
+        assert!(!confirmed_project_rejection(&failure(Some("ProjectMutationError"), json!({"_tag":"ProjectMutationError","cause":cause}))));
+    }
+    assert!(!confirmed_project_rejection(&failure(Some("FutureError"), json!({"_tag":"FutureError"}))));
+    for cause in [
+        json!({"name":"ProjectConflictError","message":"Workspace already belongs to another project"}),
+        json!({"name":"ProjectNotFoundError","message":"Project was not found"}),
+    ] {
+        assert!(confirmed_project_rejection(&failure(Some("ProjectMutationError"), json!({"_tag":"ProjectMutationError","cause":cause}))));
+    }
+}
+
+#[test]
+fn retry_counts_are_per_attempt_while_successes_and_landing_survive() {
+    let key = key("local", "/repo");
+    let mut p = Progress::default();
+    p.begin_attempt(vec![key.clone()]);
+    p.attempts.insert(key.clone(), "stable".into());
+    p.record(key.clone(), "p".into(), ImportResult { imported_count: 2, skipped_count: 1 });
+    p.failed_attempt(&key, false);
+    p.begin_attempt(vec![key.clone()]);
+    assert_eq!((p.imported, p.skipped, p.failures), (0, 0, 0));
+    assert_eq!(p.landing(), Some("p"));
+    assert_eq!(p.attempts[&key], "stable");
+    p.record(key.clone(), "p".into(), ImportResult { imported_count: 3, skipped_count: 0 });
+    assert_eq!(p.imported, 3);
+    assert_eq!(p.completed[&key], "p");
+    p.begin_attempt(vec![key.clone()]);
+    assert_eq!(p.completed[&key], "p");
+    assert_eq!(p.landing(), Some("p"));
+}
+
+#[test]
+fn explicit_skip_after_revocation_finishes_locally_without_waiting_for_projects() {
+    let key = key("local", "/repo");
+    let mut p = Progress::default();
+    p.begin_attempt(vec![key.clone()]);
+    p.record(key, "p".into(), ImportResult { imported_count: 2, skipped_count: 1 });
+    assert_eq!(p.completion(FinishIntent::Import, false, |_| true), Completion::Denied);
+    assert_eq!(p.completion(FinishIntent::Skip, false, |id| id == "p"), Completion::Ready(Some("p".into())));
+    assert_eq!(p.completion(FinishIntent::Skip, false, |_| false), Completion::Ready(None));
+    assert_eq!(p.completion(FinishIntent::Import, true, |_| false), Completion::Wait("p".into()));
+}

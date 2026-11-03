@@ -11,6 +11,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+pub fn confirmed_project_rejection(failure: &crate::rpc::RpcFailure) -> bool {
+    // Schema.Defect serializes service errors as name/message; ProjectOperationError can follow a commit.
+    failure.tag.as_deref() == Some("ProjectMutationError") && matches!(failure.error["cause"]["name"].as_str(), Some("ProjectConflictError" | "ProjectNotFoundError"))
+}
+
 pub const SCAN: &str = "agentSessions.scan";
 pub const IMPORT: &str = "agentSessions.import";
 pub const PERMISSION_MESSAGE: &str = "This connection cannot import projects or thread history.";
@@ -118,7 +123,34 @@ pub struct Progress {
     pub skipped: u64,
     pub failures: usize,
 }
+#[derive(Debug, Clone, Copy)]
+pub enum FinishIntent {
+    Import,
+    Skip,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum Completion {
+    Denied,
+    Ready(Option<String>),
+    Wait(String),
+}
 impl Progress {
+    pub fn begin_attempt(&mut self, selection: Vec<String>) {
+        self.selection = selection;
+        self.imported = 0;
+        self.skipped = 0;
+        self.failures = 0;
+    }
+    pub fn completion(&self, intent: FinishIntent, can_operate: bool, listed: impl Fn(&str) -> bool) -> Completion {
+        if matches!(intent, FinishIntent::Import) && !self.selection.is_empty() && !can_operate {
+            return Completion::Denied;
+        }
+        match self.landing() {
+            Some(id) if listed(id) => Completion::Ready(Some(id.to_owned())),
+            Some(id) if matches!(intent, FinishIntent::Import) => Completion::Wait(id.to_owned()),
+            _ => Completion::Ready(None),
+        }
+    }
     pub fn failed_attempt(&mut self, key: &str, definitive: bool) {
         self.failures += 1;
         if definitive {

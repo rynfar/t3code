@@ -19,35 +19,52 @@ async fn onboarding_rpc_retries_ambiguous_creates_and_partial_history_without_du
     let mut port = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut port).unwrap();
     let _server = Server(child);
-    let session = Session::connect(&format!("ws://127.0.0.1:{}", port.trim())).await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", port.trim());
+    let mut session = Session::connect(&url).await.unwrap();
     let scan: model::Scan = serde_json::from_value(session.request(model::SCAN, json!({})).await.unwrap()).unwrap();
     let candidate = &scan.candidates[0];
-    assert_eq!(candidate.sources, ["claudeAgent", "codex"]);
-    let payload = model::create_payload("stable-project", candidate);
-    let ambiguous = session.request(PROJECTS_MUTATE, payload.clone()).await.unwrap_err();
-    assert!(!super::projects::RequestFailure::from(ambiguous).definitive);
-    let session = Session::connect(&format!("ws://127.0.0.1:{}", port.trim())).await.unwrap();
-    session.request(PROJECTS_MUTATE, payload).await.unwrap();
-    let mut progress = model::Progress {
-        selection: vec![model::key("fixture", &candidate.path)],
-        ..Default::default()
-    };
-    for _ in 0..2 {
-        let result = serde_json::from_value(session.request(model::IMPORT, model::import_payload("stable-project", candidate)).await.unwrap()).unwrap();
-        progress.record(progress.selection[0].clone(), "stable-project".into(), result);
+    let key = model::key("fixture", &candidate.path);
+    let mut progress = model::Progress::default();
+    progress.begin_attempt(vec![key.clone()]);
+    progress.attempts.insert(key.clone(), "stable-project".into());
+    for _ in 0..4 {
+        let id = progress.attempts[&key].clone();
+        let failure = session.request(PROJECTS_MUTATE, model::create_payload(&id, candidate)).await.unwrap_err();
+        let failure = super::projects::RequestFailure::from(failure);
+        assert!(!failure.definitive, "{failure}");
+        progress.failed_attempt(&key, failure.definitive);
+        assert_eq!(progress.attempts[&key], "stable-project");
+        session = Session::connect(&url).await.unwrap();
     }
-    assert_eq!(progress.imported, 2);
+    session.request(PROJECTS_MUTATE, model::create_payload(&progress.attempts[&key], candidate)).await.unwrap();
+    let rejected = session.request(PROJECTS_MUTATE, model::create_payload("rejected-project", candidate)).await.unwrap_err();
+    assert!(super::projects::RequestFailure::from(rejected).definitive);
+    for expected in [2, 3] {
+        progress.begin_attempt(vec![key.clone()]);
+        let result = serde_json::from_value(session.request(model::IMPORT, model::import_payload("stable-project", candidate)).await.unwrap()).unwrap();
+        progress.record(key.clone(), "stable-project".into(), result);
+        assert_eq!(progress.imported, expected);
+    }
+    assert_eq!(progress.skipped, 0);
     assert_eq!(progress.completed.len(), 1);
     assert_eq!(progress.landing(), Some("stable-project"));
     let rejected = session.request("unsupported.onboarding", json!({})).await.unwrap_err();
-    assert!(super::projects::RequestFailure::from(rejected).definitive);
-    let mut held = Box::pin(session.request(model::SCAN, json!({"hold":true})));
+    assert!(!super::projects::RequestFailure::from(rejected).definitive);
+    let mut demand = model::Demand::default();
+    let token = demand.begin(7);
+    let mut held = Box::pin(session.request(model::IMPORT, json!({"projectId":"held-project","expectedWorkspaceRoot":"/fixture/repo"})));
     assert!(matches!(futures::poll!(held.as_mut()), std::task::Poll::Pending));
+    assert_eq!(progress.completion(model::FinishIntent::Import, false, |_| true), model::Completion::Denied);
+    assert_eq!(progress.completion(model::FinishIntent::Skip, false, |id| id == "stable-project"), model::Completion::Ready(Some("stable-project".into())));
+    demand.cancel();
     drop(held);
+    assert!(!demand.accepts(token, Some(7), true));
     let stats = session.request("fixture.inspect", json!({})).await.unwrap();
     assert_eq!(stats["interrupts"], 1);
     assert_eq!(stats["creates"], 1);
-    assert_eq!(stats["createCalls"], 2);
+    assert_eq!(stats["createCalls"], 6);
     assert_eq!(stats["imports"], 2);
-    println!("scan: Claude/Codex candidate; create: ambiguous commit/retry -> 1 project; import: 2 imported/1 skipped -> retry 0/0; unsupported RPC: recovered; no provider turns");
+    println!(
+        "create committed once across Defect, ClientProtocolError, post-commit ProjectMutationError and unknown failure; typed conflict confirmed; retry 2/1 -> 3/0 reports 3; revoked automatic completion denied; local skip retains landing, interrupts pending import, no extra writes"
+    );
 }

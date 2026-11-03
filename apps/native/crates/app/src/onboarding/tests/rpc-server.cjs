@@ -18,13 +18,13 @@ server.on("connection", (socket) =>
       const send = (value) => socket.send(JSON.stringify(value));
       const ok = (value) =>
         send({ _tag: "Exit", requestId: request.id, exit: { _tag: "Success", value } });
-      const fail = (message) =>
+      const fail = (message, tag = "FixtureError", extra = {}) =>
         send({
           _tag: "Exit",
           requestId: request.id,
           exit: {
             _tag: "Failure",
-            cause: [{ _tag: "Fail", error: { _tag: "FixtureError", message } }],
+            cause: [{ _tag: "Fail", error: { _tag: tag, message, ...extra } }],
           },
         });
       if (request._tag === "Ping") {
@@ -61,19 +61,47 @@ server.on("connection", (socket) =>
             `onboarding:project:create:${request.payload.projectId}`,
           );
           createCalls++;
+          if (request.payload.projectId === "rejected-project") {
+            fail("Failed to mutate project.", "ProjectMutationError", {
+              cause: {
+                name: "ProjectConflictError",
+                message: "Workspace belongs to another project.",
+              },
+            });
+            break;
+          }
           if (!commands.has(request.payload.commandId)) {
             commands.add(request.payload.commandId);
             creates++;
-            socket.close();
-          } else ok({});
+          }
+          if (createCalls === 1)
+            send({
+              _tag: "Defect",
+              defect: { message: "projection store unavailable after commit" },
+            });
+          else if (createCalls === 2)
+            send({
+              _tag: "ClientProtocolError",
+              error: { message: "invalid response after commit" },
+            });
+          else if (createCalls === 3)
+            fail("Failed to mutate project.", "ProjectMutationError", {
+              cause: {
+                name: "ProjectOperationError",
+                message: "Project operation 'read-project' failed.",
+              },
+            });
+          else if (createCalls === 4) fail("unknown outcome after commit", "FutureError");
+          else ok({});
           break;
         case "agentSessions.import":
+          if (request.payload.projectId === "held-project") break;
           assert.deepEqual(request.payload, {
             projectId: "stable-project",
             expectedWorkspaceRoot: "/fixture/repo",
           });
           imports++;
-          ok({ importedCount: imports === 1 ? 2 : 0, skippedCount: imports === 1 ? 1 : 0 });
+          ok({ importedCount: imports === 1 ? 2 : 3, skippedCount: imports === 1 ? 1 : 0 });
           break;
         case "fixture.inspect":
           ok({ creates, createCalls, imports, interrupts });
