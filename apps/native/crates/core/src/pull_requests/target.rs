@@ -46,7 +46,7 @@ fn matches(identity: &Value, link: &super::link::ChangeRequestLink, url: &url::U
     let provider = text(identity, "provider")?;
     let remote = identity.get("locator").and_then(|v| v.get("remoteUrl")).and_then(Value::as_str).and_then(|v| url::Url::parse(v).ok());
     let link_authority = authority(url);
-    if url.port().is_some() && remote.as_ref().is_some_and(|remote| matches!(remote.scheme(), "http" | "https") && authority(remote) != link_authority) {
+    if (provider == "forgejo" || url.port().is_some()) && remote.as_ref().is_some_and(|remote| matches!(remote.scheme(), "http" | "https") && authority(remote) != link_authority) {
         return None;
     }
     let key = text(identity, "canonicalKey").unwrap_or_default().to_lowercase();
@@ -64,7 +64,8 @@ fn matches(identity: &Value, link: &super::link::ChangeRequestLink, url: &url::U
         let mount = parts[..parts.len().saturating_sub(2)].join("/");
         return Some((repository == link.repository, mount.is_empty() || link.repository.starts_with(&format!("{mount}/"))));
     }
-    let host = key.split('/').next().filter(|v| !v.trim().is_empty()).map(str::trim).unwrap_or(provider);
+    let remote_host = remote.as_ref().filter(|remote| provider == "forgejo" && matches!(remote.scheme(), "http" | "https")).map(authority);
+    let host = remote_host.as_deref().unwrap_or_else(|| key.split('/').next().filter(|v| !v.trim().is_empty()).map(str::trim).unwrap_or(provider));
     let on_host = host == link.host || host == link_authority;
     let repository = text(identity, "displayName").map(str::to_owned).or_else(|| Some(format!("{}/{}", text(identity, "owner")?, text(identity, "name")?)));
     Some((on_host && repository.is_some_and(|r| r.eq_ignore_ascii_case(&link.repository)), on_host))
@@ -136,6 +137,14 @@ mod tests {
         assert!(resolve("https://forge.example:5000/git/acme/app/pulls/9", &p, Some("e"), None, None, true).is_none());
         assert!(resolve("https://forge.example:4000/elsewhere/acme/app/pulls/9", &p, Some("e"), None, None, true).is_none());
         assert!(resolve("https://forge.example:4000/git/sibling/repo/pulls/9", &p, Some("e"), None, None, true).is_some());
+        let mut forge_without_web = identity("forgejo", "forge.example", "acme/app");
+        forge_without_web["locator"]["remoteUrl"] = json!("http://forge.example:4000/acme/app.git");
+        let p = [Project { id: "forge", environment: "e", identity: Some(&forge_without_web), config_loaded: true }];
+        for (repository, lend_host) in [("acme/app", false), ("sibling/repo", true)] {
+            assert!(resolve(&format!("http://forge.example/{repository}/pulls/7"), &p, Some("e"), None, None, lend_host).is_none(), "{repository}");
+            let target = resolve(&format!("http://forge.example:4000/{repository}/pulls/7"), &p, Some("e"), None, None, lend_host).unwrap();
+            assert_eq!(target.reference.host.as_deref(), Some("forge.example:4000"));
+        }
         let azure = identity("azure-devops", "ssh.dev.azure.com", "v3/acme/project/app");
         let p = [Project { id: "azure", environment: "e", identity: Some(&azure), config_loaded: true }];
         assert!(resolve("https://dev.azure.com/acme/project/_git/app/pullrequest/3", &p, Some("e"), None, None, true).is_some());
