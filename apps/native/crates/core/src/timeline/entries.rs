@@ -410,6 +410,10 @@ fn build_entry(row: &ProjectedTurnItem, lookups: &Lookups, plans: &[Entity]) -> 
         }))
     } else if let Some(reference) = html_render_reference(item) {
         EntryKind::HtmlRender(Arc::new(HtmlRenderEntry { run_id: item.run_id.clone(), reference, item: item.clone() }))
+    } else if let crate::turn_item::TurnItemKind::DynamicTool { tool_name, output, .. } = &item.kind
+        && let Some(reference) = crate::mcp_apps::from_tool_item(tool_name.as_deref(), output.as_ref())
+    {
+        EntryKind::McpApp(Arc::new(super::McpAppEntry { run_id: item.run_id.clone(), reference, source_thread_id: row.source_thread_id.clone(), source_item_id: row.source_item_id.clone(), item: item.clone() }))
     } else if is_standalone(&item.kind) {
         EntryKind::Event(item.clone())
     } else {
@@ -428,6 +432,7 @@ fn entry_item(entry: &TimelineEntry) -> Option<&Arc<TurnItem>> {
         EntryKind::Work(work) => work.item.as_ref(),
         EntryKind::Event(item) => Some(item),
         EntryKind::HtmlRender(render) => Some(&render.item),
+        EntryKind::McpApp(app) => Some(&app.item),
         EntryKind::ProposedPlan(_) => None,
     }
 }

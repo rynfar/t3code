@@ -473,6 +473,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                 continue;
             }
             EntryKind::ProposedPlan(plan) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::ProposedPlan(plan.clone()))),
+            EntryKind::McpApp(app) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::McpApp(app.clone()))),
             EntryKind::HtmlRender(render) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::HtmlRender(render.clone()))),
             EntryKind::Event(item) => {
                 if let Some(previous) = rows.last_mut()

@@ -1471,3 +1471,21 @@ fn completed_html_renders_draw_as_frames_outside_the_fold() {
         assert_eq!(shape(&rows(unfinished)), ["user:prompt", "fold:Worked for 9s", "assistant:answer"]);
     }
 }
+
+#[test]
+fn mcp_apps_keep_source_identity_and_stay_outside_work_folds() {
+    let app = serde_json::json!({"attachmentId":"weather-app","server":"weather","tool":"get_weather","resourceUri":"ui://weather/dashboard"});
+    let mut visible = projected(vec![serde_json::json!({
+        "id":"app-item","threadId":"conversation","runId":"run-1","nodeId":null,"parentItemId":null,"ordinal":1,"status":"running","title":null,
+        "startedAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","completedAt":null,
+        "type":"dynamic_tool","toolName":"weather.get_weather","input":{},"outputOmitted":true,"output":{"t3McpApp":app}
+    })]);
+    visible[0].source_thread_id = "inherited-source".into();
+    visible[0].source_item_id = "original-item".into();
+    let entries = derive_entries(&mut EntriesCache::default(), &visible, &[], &[], &[]);
+    let rows = Input::idle().rows(&entries);
+    assert_eq!(shape(&rows), ["McpApp"]);
+    let RowKind::McpApp(frame) = &rows[0].kind else { panic!("MCP app row") };
+    assert_eq!((&*frame.source_thread_id, &*frame.source_item_id), ("inherited-source", "original-item"));
+    assert_eq!(frame.reference.server,"weather");
+}

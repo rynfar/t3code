@@ -44,6 +44,7 @@ pub(super) fn entry_run_id(entry: &TimelineEntry) -> Option<&str> {
         EntryKind::ProposedPlan(plan) => plan.run_id.as_deref(),
         EntryKind::Work(work) => work.run_id.as_deref(),
         EntryKind::HtmlRender(render) => render.run_id.as_deref(),
+        EntryKind::McpApp(app) => app.run_id.as_deref(),
         _ => None,
     }
 }
@@ -245,7 +246,7 @@ pub(super) fn superseded_attempt_folds(
             || complete_attempts.contains(attempt.id.as_str())
             || is_user(entry)
             || entry.event().is_some_and(|item| matches!(item.kind, TurnItemKind::Handoff { .. }))
-            || matches!(entry.kind, EntryKind::HtmlRender(_))
+            || matches!(entry.kind, EntryKind::HtmlRender(_) | EntryKind::McpApp(_))
             || is_persistent_resource(entry)
             || live_subagents.contains(&entry.id)
             || entry.work().is_some_and(|w| w.item_type == Some("system_notice"))

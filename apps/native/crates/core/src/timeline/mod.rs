@@ -208,12 +208,22 @@ pub struct HtmlRenderEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct McpAppEntry {
+    pub run_id: Option<String>,
+    pub reference: crate::mcp_apps::Reference,
+    pub source_thread_id: String,
+    pub source_item_id: String,
+    pub item: Arc<TurnItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     Message(Arc<ChatMessage>),
     ProposedPlan(Arc<ProposedPlan>),
     Work(Arc<WorkLogEntry>),
     Event(Arc<TurnItem>),
     HtmlRender(Arc<HtmlRenderEntry>),
+    McpApp(Arc<McpAppEntry>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -318,6 +328,7 @@ pub enum RowKind {
         embedded: bool,
     },
     HtmlRender(Arc<HtmlRenderEntry>),
+    McpApp(Arc<McpAppEntry>),
 }
 
 impl RowKind {
@@ -367,6 +378,7 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
         }
         (RowKind::ProposedPlan(pa), RowKind::ProposedPlan(pb)) => Arc::ptr_eq(pa, pb),
         (RowKind::WorktreeSetup { snapshot: sa, embedded: ea }, RowKind::WorktreeSetup { snapshot: sb, embedded: eb }) => Arc::ptr_eq(sa, sb) && ea == eb,
+        (RowKind::McpApp(a), RowKind::McpApp(b)) => Arc::ptr_eq(a, b),
         (RowKind::HtmlRender(a), RowKind::HtmlRender(b)) => a.reference == b.reference,
         (
             RowKind::WorkToggle { run_id: ra, group_id: ga, entries: ea, hidden_count: ha, expanded: xa, summary: sa, summary_kind: ka, tool_surface: ta, has_failure: fa },

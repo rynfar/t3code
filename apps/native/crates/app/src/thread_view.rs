@@ -114,6 +114,7 @@ impl ThreadView {
         });
         let media = crate::media::cache(&state, cx);
         crate::transcript::html_render::init(&state, cx);
+        crate::transcript::mcp_app::init(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
         let owner = cx.entity().downgrade();
@@ -212,7 +213,9 @@ impl ThreadView {
                 #[cfg(feature = "snapshot")]
                 let fixture = crate::transcript::html_render::fixture::with_page(&projection.visible_turn_items);
                 #[cfg(feature = "snapshot")]
-                let items: &[t3_core::thread::ProjectedTurnItem] = &fixture;
+                let mcp_fixture = crate::transcript::mcp_app::fixture::with_page(&fixture);
+                #[cfg(feature = "snapshot")]
+                let items: &[t3_core::thread::ProjectedTurnItem] = &mcp_fixture;
                 #[cfg(not(feature = "snapshot"))]
                 let items: &[t3_core::thread::ProjectedTurnItem] = &projection.visible_turn_items;
                 update_entries(&mut self.entries_cache, items, &projection.attempts, &projection.nodes, &projection.plans);
