@@ -338,6 +338,7 @@ fn render_preview(index: usize, count: usize, rail_height: f32, preview: Minimap
             view.minimap_hover_changed(window, cx);
         }))
         .child(crate::glass::backdrop(12., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+        .child(crate::webview::occluder("timeline-minimap-preview-cover", crate::webview::Layer::TranscriptChrome))
         .child(
             div()
                 .truncate()

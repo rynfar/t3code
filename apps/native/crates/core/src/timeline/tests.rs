@@ -1431,3 +1431,43 @@ fn a_new_setup_snapshot_rederives_rows_a_streamed_token_would_patch() {
     assert_eq!((card(&before), card(&after)), (Some(1), Some(2)));
     assert!(Arc::ptr_eq(&before[0], &after[0]), "the unchanged message row keeps its identity");
 }
+
+/// `deriveTimelineEntriesFromVisibleTurnItems` and `deriveMessagesTimelineRows`: a completed
+/// `html_render` result becomes its own frame row, outside the turn's fold; a running or failed
+/// one stays a tool row.
+#[test]
+fn completed_html_renders_draw_as_frames_outside_the_fold() {
+    let at = |second: u32| format!("2026-09-25T22:00:{second:02}.000Z");
+    let item = |id: &str, ordinal: u64, second: u32, body: serde_json::Value| {
+        let mut value = serde_json::json!({
+            "id": id, "threadId": "t", "runId": "run-1", "nodeId": null, "providerThreadId": null, "providerTurnId": null,
+            "parentItemId": null, "ordinal": ordinal, "status": "completed", "title": null,
+            "startedAt": at(second), "completedAt": at(second), "updatedAt": at(second),
+        });
+        value.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        value
+    };
+    let page = serde_json::json!({ "htmlRender": { "attachmentId": "t-page.html", "title": "Revenue", "height": 360 } });
+    let render = |status: &str, output: serde_json::Value| {
+        let mut value = item("render", 3, 6, serde_json::json!({ "type": "dynamic_tool", "toolName": "mcp__t3-code__html_render", "input": {}, "output": output, "outputOmitted": true }));
+        value["status"] = status.into();
+        value
+    };
+    let rows = |render: serde_json::Value| {
+        let visible = projected(vec![
+            item("prompt", 1, 0, serde_json::json!({ "type": "user_message", "messageId": "prompt", "text": "Chart it", "attachments": [], "inputIntent": "turn_start" })),
+            item("ls", 2, 2, serde_json::json!({ "type": "command_execution", "input": "ls" })),
+            render,
+            item("answer", 4, 9, serde_json::json!({ "type": "assistant_message", "messageId": "answer", "text": "Done.", "streaming": false })),
+        ]);
+        Input::idle().rows(&derive_entries(&mut EntriesCache::default(), &visible, &[], &[], &[]))
+    };
+    let settled = rows(render("completed", page.clone()));
+    assert_eq!(shape(&settled), ["user:prompt", "fold:Worked for 9s", "HtmlRender", "assistant:answer"]);
+    let RowKind::HtmlRender(frame) = &settled[2].kind else { unreachable!() };
+    assert_eq!((settled[2].id.as_str(), frame.run_id.as_deref(), frame.reference.title.as_str()), ("render", Some("run-1"), "Revenue"));
+    let error = serde_json::json!({ "isError": true, "htmlRender": page["htmlRender"] });
+    for unfinished in [render("running", page.clone()), render("failed", page.clone()), render("completed", error)] {
+        assert_eq!(shape(&rows(unfinished)), ["user:prompt", "fold:Worked for 9s", "assistant:answer"]);
+    }
+}

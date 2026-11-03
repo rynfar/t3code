@@ -107,6 +107,7 @@ impl ThreadView {
             _ => {}
         });
         let media = crate::media::cache(&state, cx);
+        crate::transcript::html_render::init(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
         let mut subscriptions = vec![subscription];
@@ -194,7 +195,13 @@ impl ThreadView {
         let state = self.state.read(cx);
         match self.thread_state(state).projection.as_ref() {
             Some(projection) => {
-                update_entries(&mut self.entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
+                #[cfg(feature = "snapshot")]
+                let fixture = crate::transcript::html_render::fixture::with_page(&projection.visible_turn_items);
+                #[cfg(feature = "snapshot")]
+                let items: &[t3_core::thread::ProjectedTurnItem] = &fixture;
+                #[cfg(not(feature = "snapshot"))]
+                let items: &[t3_core::thread::ProjectedTurnItem] = &projection.visible_turn_items;
+                update_entries(&mut self.entries_cache, items, &projection.attempts, &projection.nodes, &projection.plans);
                 self.activity = derive_activity(projection);
                 self.fork_support = fork_support(projection);
                 let thread = &projection.thread;

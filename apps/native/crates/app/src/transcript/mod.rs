@@ -3,6 +3,7 @@
 
 mod changed_files;
 mod command_output;
+pub mod html_render;
 mod inspector;
 pub mod markdown;
 mod media;
@@ -105,7 +106,7 @@ fn bottom_space(row: &TimelineRow) -> f32 {
         RowKind::TurnFold { .. } | RowKind::Working { .. } => 6.,
         RowKind::Message { grouped_with_next: true, .. } => 4.,
         RowKind::Message { message, show_assistant_meta: false, .. } if message.role == Role::Assistant => 8.,
-        RowKind::Event { .. } | RowKind::AttemptFold { .. } | RowKind::WorktreeSetup { .. } => 8.,
+        RowKind::Event { .. } | RowKind::AttemptFold { .. } | RowKind::WorktreeSetup { .. } | RowKind::HtmlRender(_) => 8.,
         _ => 16.,
     }
 }
@@ -134,6 +135,7 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         RowKind::AssistantMeta { message, show_copy, copy_streaming } => messages::assistant_meta_row(message, *show_copy, *copy_streaming, env, cx),
         RowKind::Event { item, subagents, resource_summary } => notices::event_row(id, item, subagents, *resource_summary, env, cx),
         RowKind::ProposedPlan(plan) => messages::plan_card(id, plan, env, markdown, cx),
+        RowKind::HtmlRender(entry) => html_render::frame_row(id, entry, cx),
     };
     let found = env.find_target.is_some_and(|target| holds(row, target));
     div()

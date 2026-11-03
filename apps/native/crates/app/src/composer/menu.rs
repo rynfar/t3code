@@ -513,7 +513,8 @@ impl Composer {
             .bg(hsla(if dark { p.surface_raised } else { p.card }))
             .pb(px(OVERLAP))
             .child(body);
-        Some(div().absolute().left(px(22.)).right(px(22.)).bottom_full().child(surface).into_any_element())
+        let cover = crate::webview::occluder("composer-menu-cover", crate::webview::Layer::TranscriptChrome);
+        Some(div().absolute().left(px(22.)).right(px(22.)).bottom_full().child(surface).child(cover).into_any_element())
     }
 
     fn render_menu_row(&self, index: usize, item: &MenuItem, kind: TriggerKind, active: bool, cx: &mut Context<Self>) -> AnyElement {

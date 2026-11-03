@@ -12,6 +12,7 @@ pub mod git_actions;
 pub mod history;
 pub mod json_text;
 pub mod home;
+pub mod html_render;
 pub mod keybindings;
 pub mod lineage;
 pub mod lists;

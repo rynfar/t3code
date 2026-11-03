@@ -323,6 +323,7 @@ impl Render for Workspace {
             })
             .when(!on_pull_requests, |this| this.child(self.right_panel.clone()))
             .child(self.render_sidebar_toggle(cx))
+            .children(crate::transcript::html_render::fullscreen(window, cx))
             .child(self.menu.clone())
             .child(self.dialog.clone())
             .child(self.git_dialogs.clone())
