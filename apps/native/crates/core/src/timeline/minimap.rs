@@ -392,6 +392,8 @@ pub struct NavigationTooltips {
     focused: [bool; 2],
     dismissed: [bool; 2],
     pointer: [Option<(f32, f32)>; 2],
+    active_reference: [bool; 2],
+    instant: [bool; 2],
     open: Option<usize>,
     pending: Option<(usize, Duration)>,
     hover_closing: Option<(usize, Duration)>,
@@ -406,33 +408,33 @@ impl NavigationTooltips {
         self.dismissed[index] = false;
         if value {
             let reentry = self.hover_closing.is_some_and(|(closing, end)| closing == index && now < end);
-            if self.focused[index] || reentry { self.show(index); }
-            else { self.pending = Some((index, now + TOOLTIP_WARMUP)); }
+            if reentry { self.show(index, false); }
         } else {
             self.cancel_pending(index);
-            if !self.focused[index] && self.open == Some(index) {
+            if self.open == Some(index) {
                 self.open = None;
+                self.instant[index] = false;
                 self.hover_closing = (!self.reduced_motion).then_some((index, now + MOTION_DURATION));
             }
         }
     }
 
-    pub fn focus(&mut self, index: usize, value: bool) {
+    pub fn focus(&mut self, index: usize, value: bool, visible: bool) {
         if self.focused[index] == value { return; }
         self.focused[index] = value;
+        if value && !visible { return; }
         self.dismissed[index] = false;
         self.cancel_pending(index);
-        if value { self.show(index); }
-        else if self.open == Some(index) { self.open = None; }
+        if value { self.show(index, true); }
+        else if !value && self.open == Some(index) { self.open = None; }
     }
 
     pub fn pointer_move(&mut self, index: usize, x: f32, y: f32, now: Duration) {
         let previous = self.pointer[index].replace((x, y));
-        if self.hovered[index] && !self.dismissed[index] && !self.focused[index] && self.open != Some(index)
-            && previous.is_some_and(|(px, py)| (x - px).powi(2) + (y - py).powi(2) >= 2.)
-        {
-            self.pending = Some((index, now + TOOLTIP_WARMUP));
-        }
+        if !self.hovered[index] || self.dismissed[index] || self.open == Some(index) { return; }
+        let jitter = self.active_reference[index] && self.pending.is_some_and(|(pending, _)| pending == index)
+            && previous.is_some_and(|(px, py)| (x - px).powi(2) + (y - py).powi(2) < 2.);
+        if !jitter { self.pending = Some((index, now + TOOLTIP_WARMUP)); }
     }
 
     pub fn set_reduced_motion(&mut self, reduced: bool) {
@@ -443,9 +445,11 @@ impl NavigationTooltips {
     pub fn advance(&mut self, now: Duration) {
         if let Some((index, deadline)) = self.pending && now >= deadline {
             self.pending = None;
-            if self.hovered[index] && !self.dismissed[index] { self.show(index); }
+            if self.hovered[index] && !self.dismissed[index] { self.show(index, false); }
         }
     }
+
+    pub fn instant(&self, index: usize) -> bool { self.instant[index] }
 
     pub fn visible(&self) -> Option<usize> { self.open }
 
@@ -453,30 +457,49 @@ impl NavigationTooltips {
 
     pub fn scroll(&mut self) {
         for index in 0..2 {
-            if self.hovered[index] && !self.focused[index] { self.press(index); }
+            if self.hovered[index] && !self.focused[index] { self.dismiss(index, false); }
         }
     }
 
     pub fn press(&mut self, index: usize) {
-        self.dismissed[index] = true;
-        self.hover_closing = None;
-        self.cancel_pending(index);
-        if self.open == Some(index) { self.open = None; }
+        self.instant[index] = true;
+        self.dismiss(index, true);
+    }
+
+    pub fn outside_press(&mut self) {
+        for index in 0..2 { self.dismiss(index, false); }
     }
 
     pub fn escape(&mut self) -> bool {
-        let active = self.open.is_some() || self.pending.is_some();
-        for index in 0..2 { self.press(index); }
-        active
+        if let Some((index, _)) = self.pending.take() { self.dismissed[index] = true; }
+        let active = self.open;
+        if let Some(index) = active { self.dismiss(index, true); }
+        active.is_some()
+    }
+
+    fn dismiss(&mut self, index: usize, instant: bool) {
+        self.dismissed[index] = true;
+        self.hover_closing = None;
+        self.cancel_pending(index);
+        if self.open == Some(index) {
+            self.instant[index] |= instant;
+            self.open = None;
+        }
     }
 
     fn cancel_pending(&mut self, index: usize) {
         if self.pending.is_some_and(|(pending, _)| pending == index) { self.pending = None; }
     }
 
-    fn show(&mut self, index: usize) {
+    fn show(&mut self, index: usize, instant: bool) {
         self.hover_closing = None;
-        if let Some(previous) = self.open && previous != index { self.dismissed[previous] = true; }
+        let displaced = self.open.filter(|previous| *previous != index);
+        if let Some(previous) = displaced {
+            self.dismissed[previous] = true;
+            self.instant[previous] = true;
+        }
+        self.active_reference[index] = true;
+        self.instant[index] = instant || displaced.is_some();
         self.cancel_pending(index);
         self.open = Some(index);
     }

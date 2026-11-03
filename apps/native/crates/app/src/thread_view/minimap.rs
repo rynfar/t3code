@@ -34,7 +34,7 @@ pub fn init(cx: &mut gpui::App) {
 
 fn sync_navigation_focus(tips: &mut minimap::NavigationTooltips, index: usize, focus: &FocusHandle, window: &Window) -> bool {
     let pending = tips.deadline();
-    tips.focus(index, focus.is_focused(window));
+    tips.focus(index, focus.is_focused(window), window.last_input_was_keyboard());
     pending != tips.deadline()
 }
 
@@ -84,13 +84,7 @@ impl Render for MinimapLayer {
 enum TooltipDismiss { Scroll, Press }
 
 fn tooltip_dismiss_area(dismiss: impl Fn(TooltipDismiss, &mut Window, &mut gpui::App) + Clone + 'static) -> impl IntoElement {
-    canvas(|_, _, _| {}, move |bounds, _, window, _| {
-        let on_scroll = dismiss.clone();
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase.capture() && bounds.contains(&event.position) && !event.modifiers.control && event.delta.pixel_delta(px(20.)).y != px(0.) {
-                on_scroll(TooltipDismiss::Scroll, window, cx);
-            }
-        });
+    canvas(|_, _, _| {}, move |_, _, window, _| {
         let on_press = dismiss.clone();
         window.on_mouse_event(move |_: &gpui::MouseDownEvent, phase, window, cx| {
             if phase.capture() { on_press(TooltipDismiss::Press, window, cx); }
@@ -236,8 +230,8 @@ impl ThreadView {
     pub(super) fn minimap_escape(&mut self, key: &gpui::Keystroke, _window: &Window, cx: &mut Context<Self>) -> bool {
         if key.key != "escape" { return false; }
         let dismissed = self.minimap.tooltips.escape();
+        self.minimap.nav_tooltip_task = None;
         if dismissed {
-            self.minimap.nav_tooltip_task = None;
             self.notify_minimap(cx);
             cx.stop_propagation();
         }
@@ -270,7 +264,7 @@ impl ThreadView {
         let before = (self.minimap.tooltips.visible(), self.minimap.tooltips.deadline());
         match dismiss {
             TooltipDismiss::Scroll => self.minimap.tooltips.scroll(),
-            TooltipDismiss::Press => { self.minimap.tooltips.escape(); }
+            TooltipDismiss::Press => self.minimap.tooltips.outside_press(),
         }
         if before != (self.minimap.tooltips.visible(), self.minimap.tooltips.deadline()) { self.minimap_tooltip_changed(cx); }
     }
@@ -485,6 +479,9 @@ impl ThreadView {
         let current = measured.current.filter(|current| *current < count);
         let previous = current.and_then(|current| current.checked_sub(1));
         let next = current.map(|current| current + 1).filter(|next| *next < count);
+        for (index, focus) in [self.minimap.previous_focus.as_ref().unwrap(), self.minimap.next_focus.as_ref().unwrap()].into_iter().enumerate() {
+            if sync_navigation_focus(&mut self.minimap.tooltips, index, focus, window) { self.minimap.nav_tooltip_task = None; }
+        }
         let previous = self.render_minimap_nav(-1, previous.is_some(), navigation, rail_height, window, cx);
         let next = self.render_minimap_nav(1, next.is_some(), navigation, rail_height, window, cx);
         let strip = div().relative().flex_none().ml(rem(12.)).w(px(width)).h(px(rail_height)).child(previous).child(jump).child(next);
@@ -553,10 +550,9 @@ impl ThreadView {
         let hovered = self.minimap.nav_hovers[usize::from(!previous)];
         let opacity = transition(if previous { "minimap-previous-fade" } else { "minimap-next-fade" }, vec![if focused || hovered { 1. } else { 0. }], self.minimap.repaint.unwrap(), window, cx)[0];
         let nav_index = usize::from(!previous);
-        if sync_navigation_focus(&mut self.minimap.tooltips, nav_index, &focus, window) { self.minimap.nav_tooltip_task = None; }
         let tooltip_visible = self.minimap.tooltips.visible() == Some(nav_index);
-        let displaced = self.minimap.tooltips.visible().is_some_and(|index| index != nav_index);
-        let tooltip_opacity = transition_to(if previous { "minimap-previous-tooltip" } else { "minimap-next-tooltip" }, vec![if tooltip_visible { 1. } else { 0. }], displaced, self.minimap.repaint.unwrap(), window, cx)[0];
+        let instant = self.minimap.tooltips.instant(nav_index);
+        let tooltip_opacity = transition_to(if previous { "minimap-previous-tooltip" } else { "minimap-next-tooltip" }, vec![if tooltip_visible { 1. } else { 0. }], instant, self.minimap.repaint.unwrap(), window, cx)[0];
         let bounds = self.minimap.nav_bounds[nav_index].clone();
         let tooltip_bounds = bounds.clone();
         let tooltip = (tooltip_opacity > 0.).then(|| gpui::deferred(
@@ -599,12 +595,17 @@ impl ThreadView {
             }))
             .aria_label(label)
             .focus_visible(move |style| style.shadow(focus_ring(hsla(p.ring))))
-            .on_hover(cx.listener(move |view, hovered: &bool, _, cx| {
+            .on_hover(cx.listener(move |view, hovered: &bool, window, cx| {
                 if !interactive { return; }
                 view.minimap.nav_hovers[usize::from(!previous)] = *hovered;
                 view.minimap.nav_hovered = view.minimap.nav_hovers.iter().any(|hover| *hover);
                 let now = view.minimap_tooltip_now(cx);
                 view.minimap.tooltips.hover(nav_index, *hovered, now);
+                // GPUI emits hover entry from this MouseMove, after on_mouse_move.
+                if *hovered {
+                    let position = window.mouse_position();
+                    view.minimap.tooltips.pointer_move(nav_index, f32::from(position.x), f32::from(position.y), now);
+                }
                 view.minimap_tooltip_changed(cx);
             }))
             .on_mouse_move(cx.listener(move |view, event: &MouseMoveEvent, _, cx| {
@@ -774,9 +775,14 @@ mod tests {
         impl Render for Nav {
             fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 sync_navigation_focus(&mut self.tips, 0, &self.focus, window);
-                div().id("navigation-focus").track_focus(&self.focus).size_full()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|nav, _, window, cx| {
-                        navigation_reference_press(&mut nav.tips, 0, &nav.focus, window, cx);
+                let owner = cx.entity().downgrade();
+                div().relative().size_full()
+                    .child(div().id("navigation-focus").track_focus(&self.focus).size_full()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|nav, _, window, cx| {
+                            navigation_reference_press(&mut nav.tips, 0, &nav.focus, window, cx);
+                        })))
+                    .child(tooltip_dismiss_area(move |_, _, cx| {
+                        owner.update(cx, |nav, _| nav.tips.outside_press()).unwrap();
                     }))
             }
         }
@@ -785,6 +791,12 @@ mod tests {
         let focus = nav.read_with(cx, |nav, _| nav.focus.clone());
         let draw = |cx: &mut gpui::TestAppContext| { cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear()).unwrap(); };
         draw(cx);
+        cx.update_window(window.into(), |_, window, cx| window.focus(&focus, cx)).unwrap();
+        draw(cx);
+        nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), None, "programmatic pointer-modality focus is not focus-visible"));
+        cx.update_window(window.into(), |_, window, _| window.blur()).unwrap();
+        draw(cx);
+        cx.simulate_keystrokes(window.into(), "a");
         cx.update_window(window.into(), |_, window, cx| window.focus(&focus, cx)).unwrap();
         draw(cx);
         nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), Some(0)));
@@ -798,16 +810,24 @@ mod tests {
         nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), Some(0)));
         cx.update_window(window.into(), |_, window, _| window.blur()).unwrap();
         draw(cx);
+        nav.update(cx, |nav, _| {
+            nav.tips = minimap::NavigationTooltips::default();
+            nav.tips.hover(0, true, Duration::ZERO);
+            nav.tips.pointer_move(0, 50., 50., Duration::ZERO);
+            nav.tips.advance(Duration::from_millis(600));
+            assert!(!nav.tips.instant(0));
+        });
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.simulate_mouse_move(point(px(50.), px(50.)), None, Default::default());
         visual.simulate_mouse_down(point(px(50.), px(50.)), MouseButton::Left, Default::default());
         visual.update(|window, cx| window.draw(cx).clear());
         nav.read_with(visual, |nav, _| assert_eq!(nav.tips.visible(), None, "a held reference press cannot reopen through newly acquired focus"));
+        nav.read_with(visual, |nav, _| assert!(nav.tips.instant(0), "reference press overrides the earlier outside-press capture reason"));
         visual.simulate_mouse_up(point(px(50.), px(50.)), MouseButton::Left, Default::default());
     }
 
     #[gpui::test]
-    fn tooltip_dismissal_captures_input_consumed_by_preview_children(cx: &mut gpui::TestAppContext) {
+    fn tooltip_press_capture_survives_consuming_children_but_wheel_without_scrolling_does_not_dismiss(cx: &mut gpui::TestAppContext) {
         struct Area { tips: minimap::NavigationTooltips }
         impl Render for Area {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -819,7 +839,7 @@ mod tests {
                     .child(tooltip_dismiss_area(move |dismiss, _, cx| {
                         owner.update(cx, |area, _| match dismiss {
                             TooltipDismiss::Scroll => area.tips.scroll(),
-                            TooltipDismiss::Press => { area.tips.escape(); }
+                            TooltipDismiss::Press => area.tips.outside_press(),
                         }).unwrap();
                     }))
             }
@@ -831,6 +851,7 @@ mod tests {
             area.update(cx, |area, _| {
                 area.tips = minimap::NavigationTooltips::default();
                 area.tips.hover(0, true, Duration::ZERO);
+                area.tips.pointer_move(0, 10., 20., Duration::ZERO);
                 if !pending { area.tips.advance(Duration::from_millis(600)); }
             });
             cx.update(|window, cx| window.draw(cx).clear());
@@ -840,9 +861,9 @@ mod tests {
             });
             area.update(cx, |area, _| {
                 area.tips.advance(Duration::from_secs(2));
-                assert_eq!(area.tips.visible(), None);
+                assert_eq!(area.tips.visible(), Some(0), "wheel intent without offset change must not dismiss");
                 assert_eq!(area.tips.deadline(), None);
-                area.tips.focus(0, true);
+                area.tips.focus(0, true, true);
             });
             cx.simulate_event(gpui::ScrollWheelEvent {
                 position: point(px(50.), px(50.)), delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
@@ -869,14 +890,15 @@ mod tests {
                 canvas(move |_, _, _| displayed.set(layout.measure()), |_, _, _, _| {}).size_full()
             }
         }
-        struct Rows { row: Entity<Row>, layout: ListLayout, measured: Rc<Cell<Measured>>, rail: gpui::EntityId }
+        struct Rows { row: Entity<Row>, layout: ListLayout, measured: Rc<Cell<Measured>>, scroll: Rc<Cell<Option<Pixels>>>, scroll_changes: Rc<Cell<usize>>, rail: gpui::EntityId }
         impl Render for Rows {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let row = self.row.clone();
                 let content = gpui::list(self.layout.list.clone(), move |index, _, _| {
                     if index == 1 { row.clone().into_any_element() } else { div().h(px(40.)).into_any_element() }
                 }).size_full().into_any_element();
-                self.layout.clone().observe(content, self.measured.clone(), self.rail, Rc::default(), |_| {})
+                let changes = self.scroll_changes.clone();
+                self.layout.clone().observe(content, self.measured.clone(), self.rail, self.scroll.clone(), move |_| changes.set(changes.get() + 1))
             }
         }
         struct Owner { rows: Entity<Rows>, rail: Entity<Rail> }
@@ -891,10 +913,11 @@ mod tests {
         list.scroll_to(ListOffset { item_ix: 1, offset_in_item: px(20.) });
         let layout = ListLayout { list: list.clone(), header: 0, row_count: 6, rows: Rc::new(vec![0, 2, 4]), lane_padding: 0., lane_max: None };
         let displayed = Rc::new(Cell::new(Measured::default()));
+        let scroll_changes = Rc::new(Cell::new(0));
         let window = cx.open_window(size(px(200.), px(120.)), |_, cx| {
             let row = cx.new(|_| Row { height: 40. });
             let rail = cx.new(|_| Rail { layout: layout.clone(), displayed: displayed.clone() });
-            let rows = cx.new(|_| Rows { row, layout: layout.clone(), measured: Rc::default(), rail: rail.entity_id() });
+            let rows = cx.new(|_| Rows { row, layout: layout.clone(), measured: Rc::default(), scroll: Rc::default(), scroll_changes: scroll_changes.clone(), rail: rail.entity_id() });
             Owner { rows, rail }
         });
         let owner = window.root(cx).unwrap();
@@ -922,6 +945,20 @@ mod tests {
         draw(cx);
         assert_eq!(displayed.get().range, Some((1, 4)));
         assert_eq!(displayed.get().current, Some(1));
+        assert_eq!(scroll_changes.get(), 0, "initial measurement is not scrolling");
+        list.scroll_by(px(40.));
+        rows.update(cx, |_, cx| cx.notify());
+        draw(cx);
+        next_frame(cx);
+        draw(cx);
+        assert_eq!(scroll_changes.get(), 1, "actual list scrolling invokes dismissal once");
+        assert_eq!(next_frame(cx), 0, "settled scroll offsets schedule no work");
+        list.scroll_to(ListOffset { item_ix: 1, offset_in_item: px(20.) });
+        rows.update(cx, |_, cx| cx.notify());
+        draw(cx);
+        next_frame(cx);
+        draw(cx);
+        owner_notifications.set(0);
         for (height, range, current) in [(200., (1, 1), 0), (40., (1, 4), 1)] {
             row.update(cx, |row, cx| { row.height = height; cx.notify(); });
             draw(cx);
