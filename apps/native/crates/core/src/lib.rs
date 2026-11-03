@@ -1,3 +1,4 @@
+pub mod assistant_citations;
 pub mod auth;
 pub mod client_settings;
 pub mod command_output;

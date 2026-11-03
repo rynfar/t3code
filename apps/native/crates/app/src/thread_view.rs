@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod citations;
 mod find;
 mod limit_recovery;
 mod minimap;
@@ -59,6 +60,7 @@ pub struct ThreadView {
     anchor_gap: Rc<RefCell<Option<(String, f32)>>>,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
+    citation_ui: citations::CitationUi,
     minimap: minimap::MinimapUi,
     footer: status::ThreadFooter,
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
@@ -97,20 +99,28 @@ impl ThreadView {
     fn new_for(state: Entity<AppState>, fixed: Option<String>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
             AppEvent::Thread | AppEvent::Selection | AppEvent::SideThread => this.sync(cx),
-            AppEvent::History => this.sync_history(cx),
+            AppEvent::History => {
+                this.sync_history(cx);
+                this.advance_citation_source(cx);
+            }
             AppEvent::Shell => this.sync_status(cx),
             AppEvent::ServerConfig => {
                 this.sync_status(cx);
                 this.sync_command_outputs(cx);
             }
             AppEvent::Phase => this.sync_command_outputs(cx),
+            AppEvent::CitationSource => this.open_citation_source(cx),
             _ => {}
         });
         let media = crate::media::cache(&state, cx);
         crate::transcript::html_render::init(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
-        let mut subscriptions = vec![subscription];
+        let owner = cx.entity().downgrade();
+        let citation_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            let _ = owner.update(cx, |this, cx| this.citation_key(&event.keystroke, window, cx));
+        });
+        let mut subscriptions = vec![subscription, citation_keys];
         if let Some(setup) = &setup {
             subscriptions.push(cx.subscribe(setup, |this, _, _: &SetupEvent, cx| this.sync_setup(cx)));
         }
@@ -133,6 +143,7 @@ impl ThreadView {
             anchor_gap: Rc::default(),
             working_timer: None,
             find: None,
+            citation_ui: citations::CitationUi::new(cx),
             minimap: minimap::MinimapUi::default(),
             footer: status::ThreadFooter::default(),
             turn_diffs: HashMap::new(),
@@ -171,6 +182,7 @@ impl ThreadView {
             return;
         }
         if selected != self.thread_id {
+            self.dismiss_citation_selection(cx);
             self.thread_id = selected;
             self.ui = TranscriptUi::default();
             self.markdown.clear();
@@ -223,6 +235,7 @@ impl ThreadView {
         self.sync_status(cx);
         self.refresh_open_details(cx);
         self.refresh_find_after_change(cx);
+        self.advance_citation_source(cx);
     }
 
     /// The control above the first row: shown, hidden, or relabelled without touching rows.
@@ -601,7 +614,7 @@ impl ThreadView {
             details: &self.details,
             group_lists: &self.group_lists,
             working_timer: self.working_timer.as_ref(),
-            find_target: self.find.as_ref().and_then(|find| find.active_entry()),
+            find_target: self.find.as_ref().and_then(|find| find.active_entry()).or(self.citation_ui.highlighted.as_deref()),
             turn_diffs: &self.turn_diffs,
             fork_support: &self.fork_support,
             forking: &self.forking,
@@ -788,6 +801,10 @@ impl Render for ThreadView {
             }),
         )
         .size_full();
-        div().relative().size_full().child(transcript).children(minimap).children(banners).children(find_bar).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+        div().id("citation-viewport")
+            .track_focus(&self.citation_ui.selection_focus)
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
+            .relative().size_full().child(transcript).children(minimap).children(banners).children(find_bar).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }

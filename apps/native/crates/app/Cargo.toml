@@ -39,6 +39,7 @@ gpui-component = { workspace = true, features = [
   "tree-sitter-yaml",
 ] }
 gpui-component-assets.workspace = true
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
 # Bounded decoding of file previews; the formats are a subset of what GPUI already builds.
 image = { version = "0.25.1", default-features = false, features = [
   "bmp",

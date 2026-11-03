@@ -6,6 +6,7 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+mod citations;
 mod context;
 pub(crate) mod controls;
 pub(crate) mod drafts;
@@ -165,6 +166,7 @@ pub struct Composer {
     attachments: attachments::Attachments,
     /// Terminal excerpts per target and the chip row's popover.
     context: context::ContextChips,
+    citation_editor: Option<citations::CommentEditor>,
     drafts: drafts::Drafts,
     queue: queue::Queue,
     stash_state: stash::Stashed,
@@ -210,6 +212,13 @@ impl Composer {
                 }
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
+                if *event == AppEvent::ComposerCitation
+                    && let Some(thread_id) = this.thread_id()
+                    && this.state.read(cx).composer_citation.as_ref().is_some_and(|c| c.thread_id == thread_id)
+                    && let Some(citation) = this.state.update(cx, |state, _| state.composer_citation.take())
+                {
+                    this.add_citation(citation, window, cx);
+                }
                 if *event == AppEvent::ComposerRestore {
                     this.restore_prompt(window, cx);
                 }
@@ -256,6 +265,7 @@ impl Composer {
             menu: Menu::default(),
             attachments: Default::default(),
             context: Default::default(),
+            citation_editor: None,
             drafts: Default::default(),
             queue: Default::default(),
             stash_state: Default::default(),
@@ -328,6 +338,8 @@ impl Composer {
                 self.carry = (resolved.model, Some(resolved.interaction_mode));
             }
             let previous = self.snapshot.target.clone();
+            self.close_citation_comment("outside-press", window, cx);
+            self.citation_editor = None;
             self.switch_draft(previous.as_ref(), next.target.as_ref(), window, cx);
             self.picker_open = false;
             self.permissions_open = false;

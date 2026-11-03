@@ -252,13 +252,18 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         (row.id.as_str(), *show_assistant_meta, *show_assistant_timestamp, *show_copy, *copy_streaming);
     let text: Arc<str> = if message.text.is_empty() && !message.streaming { Arc::from("(empty response)") } else { message.text.clone() };
     let state = markdown.state(&format!("assistant:{id}"), &text, cx);
+    let selection_state = state.entity.clone();
+    let message_id = message.id.clone();
     v_flex()
         .group(ROW_GROUP)
         .w_full()
         .min_w_0()
         .px(px(4.))
         .py(px(2.))
-        .child(prose(&state, cx))
+        .child(div().id(SharedString::from(format!("assistant-select:{id}")))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
+                view.capture_citation_selection(selection_state.clone(), message_id.clone(), text.clone(), event.position, window, cx);
+            })).child(prose(&state, cx)))
         .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
         .when(show_meta || show_timestamp, |this| {
             let fork = if show_meta { fork_button(message, env, cx) } else { None };

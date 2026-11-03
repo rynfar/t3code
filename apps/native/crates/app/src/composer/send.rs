@@ -43,6 +43,9 @@ struct Outgoing {
 impl Composer {
     /// Submit, as the send button and Enter do.
     pub(super) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.close_citation_comment("outside-press", window, cx) {
+            return;
+        }
         if self.sending {
             return;
         }
