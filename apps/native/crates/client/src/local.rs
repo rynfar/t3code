@@ -285,52 +285,51 @@ mod tests {
     #[cfg(unix)]
     struct SpawningCli {
         script: PathBuf,
-        events: tokio::io::BufReader<tokio::fs::File>,
-        startup_writer: Option<std::fs::File>,
+        status: tokio::net::TcpListener,
     }
 
     #[cfg(unix)]
     impl SpawningCli {
-        fn new(dir: &Path) -> Self {
-            use std::os::unix::ffi::OsStrExt;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        async fn new(dir: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
 
-            let fifo = dir.join("grandchild.pipe");
-            let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
-            // SAFETY: `path` is a valid, NUL-terminated path in this test's scratch directory.
-            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "creates FIFO: {}", std::io::Error::last_os_error());
-            let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).expect("opens FIFO reader");
-            // Keep the FIFO from reporting EOF before the script has opened its writer.
-            let startup_writer = Some(std::fs::OpenOptions::new().write(true).open(&fifo).expect("opens FIFO writer"));
-            drop(reader);
-            let events = tokio::io::BufReader::new(tokio::fs::File::from_std(std::fs::File::open(&fifo).expect("opens blocking FIFO reader")));
-
+            // Socket EOF readiness works on macOS, where named FIFOs can miss that event.
+            let status = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds status listener");
+            let port = status.local_addr().expect("status address").port();
             let script = dir.join("fake-t3");
-            std::fs::write(&script, "#!/bin/sh\nexec 3> \"$T3CODE_HOME/grandchild.pipe\"\nsleep 60 &\necho $! >&3\nwait\n").expect("writes script");
+            let script_text = format!(
+                r#"#!/bin/sh
+/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}
+printf "%s\n" "$$" >&3
+read -r release <&3
+printf "survived\n" >&3' &
+wait
+"#
+            );
+            std::fs::write(&script, script_text).expect("writes script");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-            Self { script, events, startup_writer }
+            Self { script, status }
         }
 
-        async fn grandchild(&mut self) -> u32 {
+        async fn grandchild(&self) -> tokio::io::BufReader<tokio::net::TcpStream> {
             use tokio::io::AsyncBufReadExt;
+            let (stream, _) = self.status.accept().await.expect("accepts grandchild");
+            let mut events = tokio::io::BufReader::new(stream);
             let mut line = String::new();
-            tokio::time::timeout(PAIR_TIMEOUT, self.events.read_line(&mut line)).await.expect("the script starts its child").expect("reads PID");
+            events.read_line(&mut line).await.expect("reads PID");
             let pid = line.trim().parse().expect("grandchild PID");
-            self.startup_writer.take();
             assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
-            pid
+            events
         }
 
-        async fn exits(&mut self) {
-            use tokio::io::AsyncReadExt;
+        async fn exits(mut events: tokio::io::BufReader<tokio::net::TcpStream>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut remaining = Vec::new();
-            // The shell and its grandchild both hold fd 3; EOF requires both to exit, without
-            // depending on when launchd reaps the orphan. This deadline precedes sleep's exit.
-            tokio::time::timeout(PAIR_TIMEOUT, self.events.read_to_end(&mut remaining))
-                .await
-                .expect("the CLI's own children are killed too")
-                .expect("reads EOF");
-            assert!(remaining.is_empty());
+            // Half-close to release a surviving grandchild: it must report itself before EOF,
+            // so neither natural expiry nor delayed readiness can satisfy the exit assertion.
+            events.get_mut().shutdown().await.expect("releases grandchild");
+            events.read_to_end(&mut remaining).await.expect("reads EOF");
+            assert!(remaining.is_empty(), "the CLI's own children are killed too: {}", String::from_utf8_lossy(&remaining));
         }
     }
 
@@ -338,16 +337,15 @@ mod tests {
     #[tokio::test]
     async fn a_timed_out_cli_takes_everything_it_started_with_it() {
         let dir = scratch("timeout");
-        let mut cli = SpawningCli::new(&dir);
-        let script = cli.script.clone();
-        let result = run_cli(&script, &[], &dir, Duration::from_secs(1));
+        let cli = SpawningCli::new(&dir).await;
+        let result = run_cli(&cli.script, &[], &dir, Duration::from_secs(1));
         tokio::pin!(result);
         // Spawn once, then leave the timeout future unpolled until the grandchild is ready.
         assert!(futures::poll!(&mut result).is_pending());
-        cli.grandchild().await;
+        let events = cli.grandchild().await;
         let result = result.await;
         assert!(matches!(result, Err(LocalPairError::CliFailed(ref message)) if message.contains("did not finish")), "{result:?}");
-        cli.exits().await;
+        SpawningCli::exits(events).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -355,13 +353,12 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_running_cli_kills_its_process_group() {
         let dir = scratch("cancel");
-        let mut cli = SpawningCli::new(&dir);
-        let script = cli.script.clone();
-        let mut task = Box::pin(run_cli(&script, &[], &dir, PAIR_TIMEOUT));
+        let cli = SpawningCli::new(&dir).await;
+        let mut task = Box::pin(run_cli(&cli.script, &[], &dir, PAIR_TIMEOUT));
         assert!(futures::poll!(&mut task).is_pending());
-        cli.grandchild().await;
+        let events = cli.grandchild().await;
         drop(task);
-        cli.exits().await;
+        SpawningCli::exits(events).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
