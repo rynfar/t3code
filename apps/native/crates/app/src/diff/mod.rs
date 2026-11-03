@@ -279,7 +279,7 @@ impl DiffPanel {
         self.visible = visible;
         let can_read = state.can_read_threads();
         let source_exists = match &scope {
-            DiffScope::ToolCall(target) => state.thread_shell(&target.thread_id).is_some() && !state.thread_state(&target.thread_id).deleted,
+            DiffScope::ToolCall(target) => target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)),
             _ => true,
         };
         let request = environment.filter(|_| can_read && source_exists).and_then(|environment| match &scope {

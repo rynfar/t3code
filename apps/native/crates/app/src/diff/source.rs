@@ -95,6 +95,7 @@ pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHand
                 decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, false, None, None, None)))
             })
         }
+        RequestKey::ToolCall { target, .. } if !target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)) => None,
         RequestKey::ToolCall { target, .. } => state.request(GET_TURN_ITEM, target.request(), |value| {
             let item = decode_detail(value).map_err(|error| error.to_string())?;
             let mut diff = item.and_then(|item| tool_call_diff(&item.kind)).unwrap_or_default();

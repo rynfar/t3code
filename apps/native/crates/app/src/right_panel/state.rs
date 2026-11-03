@@ -163,7 +163,7 @@ impl AppState {
 
     /// `parentPanel.openToolDiff`: keep the panel owner selected, even for a side chat's tool.
     pub fn open_tool_call_diff(&mut self, target: t3_core::diff::ToolCallTarget, cx: &mut Context<Self>) {
-        if !self.can_read_threads() || self.thread_shell(&target.thread_id).is_none() {
+        if !self.can_read_threads() || !target.source_available(self.thread_shell(&target.thread_id), self.thread_state(&target.thread_id)) {
             return;
         }
         let Some(thread_id) = self.panel_thread() else { return };

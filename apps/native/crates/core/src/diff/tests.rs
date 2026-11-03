@@ -639,6 +639,44 @@ fn tool_call_target_follows_the_row_the_thread_shows() {
     assert_eq!(target.resolve(&[]), target);
     assert_eq!(target.request(), json!({ "threadId": "t", "itemId": "f1", "revision": "live" }));
 
+    let fork: crate::shell::ThreadShell = serde_json::from_value(json!({
+        "id": "fork", "projectId": "p", "title": "Fork", "providerInstanceId": "codex",
+        "modelSelection": {"instanceId": "codex", "model": "gpt"}, "runtimeMode": "auto", "interactionMode": "default",
+        "branch": null, "worktreePath": null, "lineage": {"parentThreadId": "t", "relationshipToParent": "fork", "rootThreadId": "t"},
+        "latestRunId": null, "activeRunId": null, "status": "completed", "pendingRuntimeRequest": null,
+        "latestVisibleMessage": null, "latestUserMessageAt": null, "hasActionableProposedPlan": false,
+        "itemCount": 1, "visibleItemCount": 1, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+        "archivedAt": null, "settledOverride": null, "settledAt": null, "deletedAt": null
+    })).expect("fork shell");
+    let mut shell = crate::shell::ShellState::default();
+    shell.snapshot = Some(crate::shell::ShellSnapshot { snapshot_sequence: 1, threads: vec![fork], ..Default::default() });
+    let mut source = crate::thread::ThreadState::default();
+    assert!(shell.thread("fork").is_some());
+    assert!(shell.thread(&target.thread_id).is_none());
+    assert!(target.source_available(shell.thread(&target.thread_id), &source), "the inherited item's original source is unloaded, not deleted");
+    let mut original = shell.thread("fork").unwrap().clone();
+    original.id = target.thread_id.clone();
+    shell.snapshot.as_mut().unwrap().threads.push(original);
+    assert!(target.source_available(shell.thread(&target.thread_id), &source), "a loaded source remains readable");
+    shell.snapshot.as_mut().unwrap().threads.last_mut().unwrap().deleted_at = Some("2026-01-03T00:00:00Z".into());
+    assert!(!target.source_available(shell.thread(&target.thread_id), &source), "a loaded deletion marker also cancels the read");
+    shell.snapshot.as_mut().unwrap().threads.pop();
+    assert!(shell.apply(crate::shell::ShellStreamItem::ThreadRemoved { thread_id: target.thread_id.clone(), sequence: 2 }));
+    assert!(target.source_available(shell.thread(&target.thread_id), &source), "shell removal can be archival, so it cannot cancel an inherited detail read");
+    let mut deleted: crate::thread::AppThread = serde_json::from_value(serde_json::to_value(shell.thread("fork").unwrap()).unwrap()).unwrap();
+    deleted.id = target.thread_id.clone();
+    assert!(source.apply(crate::thread::ThreadStreamItem::Event {
+        sequence: 3,
+        event: Box::new(crate::thread::DomainEvent {
+            id: "deleted".into(), thread_id: target.thread_id.clone(), occurred_at: "2026-01-03T00:00:00Z".into(),
+            body: crate::thread::EventBody::ThreadDeleted(Box::new(deleted)),
+        }),
+    }));
+    let snapshot = shell.snapshot.clone().unwrap();
+    shell.apply(crate::shell::ShellStreamItem::Snapshot { snapshot: Box::new(snapshot), resolved_repository_identity_roots: None });
+    assert!(shell.removed_at.is_empty());
+    assert!(!target.source_available(shell.thread(&target.thread_id), &source), "the retained detail tombstone survives a fresh shell");
+
     let selection = DiffSelection::ToolCall(target.clone());
     let text = serde_json::to_string(&selection).expect("encode");
     assert_eq!(text, r#"{"kind":"tool-call","threadId":"t","itemId":"f1","revision":"live"}"#);

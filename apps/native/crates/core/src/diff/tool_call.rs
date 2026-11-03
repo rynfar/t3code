@@ -41,6 +41,11 @@ impl ToolCallTarget {
         }
     }
 
+    /// Missing or removed shells may be unloaded or archived; only explicit deletion blocks a read.
+    pub fn source_available(&self, shell: Option<&crate::shell::ThreadShell>, state: &crate::thread::ThreadState) -> bool {
+        !state.deleted && shell.filter(|thread| thread.id == self.thread_id).is_none_or(|thread| thread.deleted_at.is_none())
+    }
+
     /// `orchestration.getTurnItem`'s input.
     pub fn request(&self) -> Value {
         json!({ "threadId": self.thread_id, "itemId": self.item_id, "revision": self.revision })
