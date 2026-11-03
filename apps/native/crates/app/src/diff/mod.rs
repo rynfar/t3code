@@ -3,6 +3,7 @@
 //! and its loading, empty and error states. Patches are fetched and parsed on the network
 //! runtime; the view paints only the rows on screen.
 
+mod comments;
 mod header;
 mod lines;
 mod source;
@@ -71,6 +72,7 @@ pub struct DiffPanel {
     handled_reveal: Option<(String, String, u64)>,
     /// A patch from outside the thread (a pull request's Code tab) replaces the scopes.
     external: Option<External>,
+    comments: comments::Comments,
     _subscription: Subscription,
 }
 
@@ -91,6 +93,10 @@ impl DiffPanel {
 
     fn construct(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+            if *event == AppEvent::ReviewComments {
+                if let Some(view) = &this.view { let count = view.row_count(); this.list.splice(0..count, count); }
+                cx.notify();
+            }
             if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::RightPanel | AppEvent::Shell | AppEvent::Phase) {
                 this.sync(cx);
             }
@@ -128,6 +134,7 @@ impl DiffPanel {
             selected_file: None,
             handled_reveal: None,
             external: None,
+            comments: comments::Comments::default(),
             _subscription: subscription,
         }
     }
@@ -162,6 +169,7 @@ impl DiffPanel {
         let thread_id = state.selected_thread.clone();
         let thread_changed = thread_id != self.thread_id;
         if thread_changed {
+            self.comments = comments::Comments::default();
             self.thread_id = thread_id.clone();
             self.fingerprint = (0, None);
             self.summaries = Arc::new(Vec::new());
@@ -385,6 +393,8 @@ impl DiffPanel {
             return;
         };
         let scope_key = self.scope_key();
+        if self.comments.scope != scope_key { self.comments = comments::Comments::default(); self.comments.scope = scope_key.clone(); }
+        if self.comments.editor.as_ref().is_some_and(|editor| !parsed.files().iter().any(|file| file.key() == editor.file_key)) { self.comments.editor = None; }
         let layout = crate::settings::client_settings(cx).diff_layout();
         let files_collapsed_default = crate::settings::client_settings(cx).diff_files_collapsed();
         let same = self.view.as_ref().is_some_and(|view| {

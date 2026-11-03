@@ -222,6 +222,18 @@ impl Composer {
                 if *event == AppEvent::ComposerRestore {
                     this.restore_prompt(window, cx);
                 }
+                if *event == AppEvent::RemoveReviewComment
+                    && let Some(thread_id) = this.thread_id()
+                    && let Some(id) = this.state.update(cx, |state, _| state.take_removed_review_comment(&thread_id))
+                {
+                    this.remove_review_comment(&id, window, cx);
+                }
+                if *event == AppEvent::ComposerReviewComment
+                    && let Some(thread_id) = this.thread_id()
+                    && let Some(comment) = this.state.update(cx, |state, _| state.take_review_comment(&thread_id))
+                {
+                    this.add_review_comment(comment, window, cx);
+                }
                 if *event == AppEvent::ComposerTerminalContext
                     && let Some(thread_id) = this.thread_id()
                     && let Some(selection) = this.state.update(cx, |state, _| state.take_terminal_context(&thread_id))
@@ -272,7 +284,7 @@ impl Composer {
             setup,
             _subscriptions: subscriptions,
         };
-        composer.load_drafts();
+        composer.load_drafts(cx);
         composer.load_stash();
         composer.refresh(true, window, cx);
         composer

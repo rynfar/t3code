@@ -350,10 +350,15 @@ pub fn text_for_send(text: &str, has_attachments: bool) -> String {
 /// `buildMessageContext`: the terminal excerpts and threads the text still links, then every
 /// uploaded attachment, or `None` when there is nothing to carry.
 pub fn message_context(text: &str, threads: &[ThreadContext], terminals: &[TerminalContext], attachments: &[Attachment]) -> Option<Value> {
+    message_context_with_reviews(text, threads, terminals, &[], attachments)
+}
+
+pub fn message_context_with_reviews(text: &str, threads: &[ThreadContext], terminals: &[TerminalContext], reviews: &[super::review::ReviewComment], attachments: &[Attachment]) -> Option<Value> {
     let referenced = referenced_context_ids(text);
     let records: Vec<Value> = super::context::referenced(text, terminals)
         .into_iter()
         .map(TerminalContext::record)
+        .chain(super::review::referenced(text, reviews).into_iter().map(super::review::ReviewComment::record))
         .chain(threads.iter().filter(|thread| referenced.contains(&thread.context_id.as_str())).map(ThreadContext::to_record))
         .chain(attachments.iter().filter_map(Attachment::context_record))
         .collect();

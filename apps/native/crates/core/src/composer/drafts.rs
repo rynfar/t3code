@@ -91,6 +91,7 @@ pub struct Draft {
     pub threads: Vec<SavedThread>,
     /// Terminal excerpts the prompt links, with their text (`PersistedTerminalContextDraft`).
     pub terminals: Vec<TerminalContext>,
+    pub review_comments: Vec<super::review::ReviewComment>,
     pub attachments: Vec<SavedAttachment>,
     #[serde(skip)]
     pub pending_attachment_count: usize,
@@ -100,7 +101,7 @@ pub struct Draft {
 
 impl Draft {
     pub fn has_user_content(&self) -> bool {
-        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || self.pending_attachment_count > 0
+        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || !self.review_comments.is_empty() || self.pending_attachment_count > 0
     }
 
     /// Nothing worth keeping: `composerDraftHasUserContent` plus the choices.
@@ -109,6 +110,7 @@ impl Draft {
             && self.attachments.is_empty()
             && self.pending_attachment_count == 0
             && self.terminals.is_empty()
+            && self.review_comments.is_empty()
             && self.model_selection.is_none()
             && self.runtime_mode.is_none()
             && self.interaction_mode.is_none()

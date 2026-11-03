@@ -60,6 +60,7 @@ fn the_store_round_trips_and_skips_bad_entries() {
         runtime_mode: Some(RuntimeMode::FullAccess),
         interaction_mode: Some(InteractionMode::Default),
         threads: Draft::saved_threads(&[thread.clone(), ThreadContext::new("env", "t3", "Unlinked")], &prompt),
+        review_comments: vec![],
         terminals: Draft::saved_terminals(&[unlinked, excerpt.clone()], &prompt),
         attachments: vec![SavedAttachment::of(&attachment).unwrap()],
         pending_attachment_count: 0,

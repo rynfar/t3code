@@ -32,6 +32,8 @@ pub struct StashEntry {
     pub threads: Vec<SavedThread>,
     #[serde(default)]
     pub terminals: Vec<TerminalContext>,
+    #[serde(default)]
+    pub review_comments: Vec<super::review::ReviewComment>,
 }
 
 impl StashEntry {

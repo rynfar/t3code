@@ -4,7 +4,7 @@
 //! the server recorded, and archives the thread (`--keep` leaves it).
 //!
 //!   cargo run -p t3-client --example composer_probe -- [--query <text>] [--project <id>]
-//!       [--provider <instance>] [--send [--image <png>] [--keep]] [--cleanup <thread>]
+//!       [--provider <instance>] [--review-comment] [--send [--image <png>] [--keep]] [--cleanup <thread>]
 
 use std::time::Duration;
 
@@ -30,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let query = flag("--query").unwrap_or_else(|| "main".to_owned());
     let credentials = store::load().ok_or_else(|| anyhow::anyhow!("no saved connection"))?;
+    if args.iter().any(|arg| arg == "--review-comment") && (credentials.http_base != "http://127.0.0.1:14658" || flag("--provider").as_deref() != Some("devReplay")) {
+        anyhow::bail!("review-comment smoke is restricted to Replay (dev) on port 14658");
+    }
     let (client, mut events) = start(&tokio::runtime::Handle::current(), credentials);
     let (mut shell, mut config) = (ShellState::default(), ServerConfigState::default());
     while !shell.synchronized || config.config.is_none() {
@@ -128,7 +131,13 @@ async fn main() -> anyhow::Result<()> {
         attachment.upload = attachments::Upload::Ready { attachment_id };
         staged.push(attachment);
     }
-    let context = attachments::message_context(&text, thread_context.as_slice(), std::slice::from_ref(&terminal), &staged);
+    let reviews = if args.iter().any(|arg| arg == "--review-comment") {
+        use t3_core::{composer::review::{build_diff_comment, Selection, Side}, diff::{parse_patch, ParsedPatch}};
+        let ParsedPatch::Files(files) = parse_patch("--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-old\n+new\n") else { anyhow::bail!("invalid fixture") };
+        vec![build_diff_comment("native-103".into(), "unstaged".into(), "Uncommitted".into(), &files[0], Selection {start:1, side:Side::Deletions, end:1, end_side:Side::Additions}, "Keep both sides compatible.").expect("fixture selection")]
+    } else { vec![] };
+    let text = reviews.iter().fold(text, |text, comment| t3_core::composer::context::insert_reference(&text, text.len(), &comment.reference()).0.trim_end().to_owned());
+    let context = attachments::message_context_with_reviews(&text, thread_context.as_slice(), std::slice::from_ref(&terminal), &reviews, &staged);
     let chat_attachments = attachments::chat_attachments(&staged).unwrap_or_default();
     let model = provider.models.first().map(|model| model.slug.clone()).unwrap_or_default();
     let selection = ModelSelection { instance_id: provider.instance_id.clone(), model, options: None };

@@ -90,6 +90,7 @@ impl Composer {
             created_at: now_ms(),
             threads: Draft::saved_threads(self.mentions(&target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(&target), &prompt),
+            review_comments: t3_core::composer::review::referenced(&prompt, self.reviews_for(&target)).into_iter().cloned().collect(),
             attachments: attachments.iter().filter_map(SavedAttachment::of).collect(),
             prompt,
         };
@@ -133,6 +134,7 @@ impl Composer {
         }
         self.seed_mentions(&target, threads);
         self.seed_terminals(&target, entry.terminals.clone());
+        self.seed_reviews(&target, entry.review_comments.clone());
         let prompt = rules::merge_prompt(&self.prompt(cx), &entry.prompt);
         self.set_prompt(&prompt, window, cx);
         let end = prompt.len();

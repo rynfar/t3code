@@ -434,7 +434,7 @@ impl Composer {
     /// its text still links, then its attachments.
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
-        t3_core::composer::attachments::message_context(text, threads, self.current_terminals(), attachments)
+        t3_core::composer::attachments::message_context_with_reviews(text, threads, self.current_terminals(), self.current_reviews(), attachments)
     }
 
     /// How many mentioned threads `text` links, which make a message sendable on their own.
@@ -458,6 +458,7 @@ impl Composer {
     pub(super) fn clear_mentions(&mut self, target: &Target) {
         self.menu.threads.remove(target);
         self.clear_terminals(target);
+        self.context.reviews.remove(target);
     }
 
     /// The threads a send's `prompt` links; the rest go with the prompt's history.

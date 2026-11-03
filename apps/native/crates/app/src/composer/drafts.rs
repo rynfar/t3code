@@ -34,7 +34,7 @@ fn target(key: &str) -> Option<Target> {
 impl Composer {
     /// Loads the saved drafts: choices, mentions and uploaded attachments go back to their
     /// targets; prompts load when a target opens.
-    pub(super) fn load_drafts(&mut self) {
+    pub(super) fn load_drafts(&mut self, cx: &mut Context<Self>) {
         let store = DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref());
         for key in store.keys() {
             let (Some(target), Some(draft)) = (target(key), store.get(key)) else { continue };
@@ -44,9 +44,18 @@ impl Composer {
             );
             self.seed_mentions(&target, draft.thread_contexts());
             self.seed_terminals(&target, draft.terminals.clone());
+        self.seed_reviews(&target, draft.review_comments.clone());
+            self.publish_review_comments(&target, &draft.prompt, cx);
             self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect());
         }
         self.drafts.store = store;
+    }
+
+    fn publish_review_comments(&self, target: &Target, prompt: &str, cx: &mut Context<Self>) {
+        if let Target::Thread(thread) = target {
+            let comments = t3_core::composer::review::referenced(prompt, self.reviews_for(target)).into_iter().cloned().collect();
+            self.state.update(cx, |state, cx| state.set_review_comments(thread, comments, cx));
+        }
     }
 
     fn capture_draft(&self, target: &Target, prompt: String) -> Draft {
@@ -54,6 +63,7 @@ impl Composer {
         Draft {
             threads: Draft::saved_threads(self.mentions(target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(target), &prompt),
+            review_comments: t3_core::composer::review::referenced(&prompt, self.reviews_for(target)).into_iter().cloned().collect(),
             attachments: self.staged_for(target).iter().filter_map(|staged| SavedAttachment::of(&staged.attachment)).collect(),
             prompt,
             model_selection: choices.model,
@@ -94,6 +104,7 @@ impl Composer {
     /// Records `target`'s draft; one not open keeps its saved prompt.
     pub(super) fn record_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
         let draft = self.current_draft(target, cx);
+        self.publish_review_comments(target, &draft.prompt, cx);
         if self.drafts.store.set(&key(target), draft) {
             self.schedule_draft_save(target, cx);
         }
@@ -119,6 +130,7 @@ impl Composer {
         };
         if let Some(from) = from {
             self.reset_context_history(from, &leaving);
+            self.publish_review_comments(from, &leaving, cx);
             let draft = self.capture_draft(from, leaving);
             if self.drafts.store.set(&key(from), draft) {
                 self.schedule_draft_save(from, cx);
@@ -178,6 +190,7 @@ impl Composer {
         self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
         self.seed_mentions(&target, draft.thread_contexts());
         self.seed_terminals(&target, draft.terminals.clone());
+        self.seed_reviews(&target, draft.review_comments.clone());
         self.restore_draft_attachments(&target, attachments, cx);
         if self.snapshot.target.as_ref() == Some(&target) { self.set_prompt(&draft.restored_prompt(), window, cx); }
         self.schedule_draft_save(&target, cx);

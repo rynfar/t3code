@@ -54,6 +54,9 @@ pub enum AppEvent {
     ComposerRestore,
     /// A terminal selection is waiting for the composer (`take_terminal_context`).
     ComposerTerminalContext,
+    ComposerReviewComment,
+    ReviewComments,
+    RemoveReviewComment,
     ComposerCitation,
     CitationSource,
     /// A side subscription (side chat tab, child approval) changed, or an action on one did.
@@ -96,6 +99,9 @@ pub struct AppState {
     composer_restore: Option<(String, String)>,
     /// A terminal selection added to a thread's chat, as the drawer hands it over.
     composer_terminal_context: Option<(String, t3_core::composer::context::TerminalSelection)>,
+    pub review_comments: std::collections::HashMap<String, Vec<t3_core::composer::review::ReviewComment>>,
+    remove_review_comment: Option<(String, String)>,
+    composer_review_comment: Option<(String, t3_core::composer::review::ReviewComment)>,
     pub composer_citation: Option<t3_core::assistant_citations::Citation>,
     pub citation_source: Option<t3_core::assistant_citations::Citation>,
     client: Option<ClientHandle>,
@@ -153,6 +159,9 @@ impl AppState {
             select_when_listed: None,
             composer_restore: None,
             composer_terminal_context: None,
+            review_comments: Default::default(),
+            remove_review_comment: None,
+            composer_review_comment: None,
             composer_citation: None,
             citation_source: None,
             client: None,
@@ -202,6 +211,9 @@ impl AppState {
         self.composer_mentions.clear();
         self.composer_terminal_context = None;
         self.composer_citation = None;
+        self.composer_review_comment = None;
+        self.review_comments.clear();
+        self.remove_review_comment = None;
         self.citation_source = None;
         self.last_error = None;
         cx.emit(AppEvent::Shell);
@@ -514,6 +526,32 @@ impl AppState {
 
     pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<String> {
         if self.composer_restore.as_ref().is_some_and(|(thread, _)| thread == thread_id) { self.composer_restore.take().map(|(_, prompt)| prompt) } else { None }
+    }
+
+    pub fn set_review_comments(&mut self, thread: &str, comments: Vec<t3_core::composer::review::ReviewComment>, cx: &mut Context<Self>) {
+        if self.review_comments.get(thread).is_some_and(|held| *held == comments) { return; }
+        self.review_comments.insert(thread.into(), comments);
+        cx.emit(AppEvent::ReviewComments);
+    }
+
+    pub fn remove_review_comment(&mut self, thread: &str, context_id: String, cx: &mut Context<Self>) {
+        self.remove_review_comment = Some((thread.into(), context_id));
+        cx.emit(AppEvent::RemoveReviewComment);
+    }
+
+    pub fn take_removed_review_comment(&mut self, thread: &str) -> Option<String> {
+        if self.remove_review_comment.as_ref().is_some_and(|(id, _)| id == thread) { self.remove_review_comment.take().map(|(_, id)| id) } else { None }
+    }
+
+    pub fn add_review_comment(&mut self, thread: &str, comment: t3_core::composer::review::ReviewComment, cx: &mut Context<Self>) {
+        self.composer_review_comment = Some((thread.to_owned(), comment));
+        cx.emit(AppEvent::ComposerReviewComment);
+    }
+
+    pub fn take_review_comment(&mut self, thread: &str) -> Option<t3_core::composer::review::ReviewComment> {
+        if self.composer_review_comment.as_ref().is_some_and(|(id, _)| id == thread) {
+            self.composer_review_comment.take().map(|(_, comment)| comment)
+        } else { None }
     }
 
     /// Hands a terminal selection to the composer of `thread_id` ("Add to chat").

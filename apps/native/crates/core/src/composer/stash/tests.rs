@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 fn entry(id: &str, prompt: &str) -> StashEntry {
-    StashEntry { id: id.into(), created_at: 1, prompt: prompt.into(), attachments: vec![], threads: vec![], terminals: vec![] }
+    StashEntry { id: id.into(), created_at: 1, prompt: prompt.into(), attachments: vec![], threads: vec![], terminals: vec![], review_comments: vec![] }
 }
 
 fn saved(image: bool) -> SavedAttachment {
