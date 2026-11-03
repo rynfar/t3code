@@ -142,188 +142,197 @@ impl SettingsView {
                     .map(|t| (ThemePreference::Named(t.id.clone()), t.label.clone(), Some(t.clone()))),
             )
             .collect::<Vec<_>>();
-        let grid = div().grid().grid_cols(3).w_full().gap(r(8.)).children(cards.into_iter().map(|(card, label, definition)| {
-            let halves = themes::halves(&doc);
-            let light = themes::half_theme(&theme, &halves, false, &custom, theme::environment_themes(cx)).map(|t| t.id.as_str())
-                == card.named_id();
-            let mut body = v_flex()
-                .id(ElementId::Name(format!("theme-card-{label}").into()))
-                .rounded(r(12.))
-                .border_1()
-                .border_color(hsla(p.border).opacity(0.7))
-                .overflow_hidden()
-                .bg(hsla(p.card).opacity(0.6))
-                .child(h_flex().h(r(80.)).justify_center().gap(r(12.)).children(
-                    [false, true].into_iter().filter(|dark| definition.as_ref().is_none_or(|t| t.half(*dark).is_some())).map(|dark| {
-                        let state = self.state.clone();
-                        let id = card.named_id().map(str::to_owned);
-                        div()
-                            .id(ElementId::Name(format!("theme-half-{label}-{dark}").into()))
-                            .cursor_pointer()
-                            .child(preview_circle(
-                                &card,
-                                dark,
-                                if dark {
-                                    themes::half_theme(&theme, &halves, true, &custom, theme::environment_themes(cx)).map(|t| t.id.as_str())
-                                        == card.named_id()
-                                } else {
-                                    light
-                                },
-                                cx,
-                            ))
-                            .on_click(move |_, _, cx| {
-                                let patch = themes::assign_half(store::client(cx), dark, id.as_deref());
-                                store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
+        let rendered_cards: Vec<_> = cards
+            .into_iter()
+            .map(|(card, label, definition)| {
+                let halves = themes::halves(&doc);
+                let light = themes::half_theme(&theme, &halves, false, &custom, theme::environment_themes(cx)).map(|t| t.id.as_str())
+                    == card.named_id();
+                let mut body = v_flex()
+                    .id(ElementId::Name(format!("theme-card-{label}").into()))
+                    .rounded(r(12.))
+                    .border_1()
+                    .border_color(hsla(p.border).opacity(0.7))
+                    .overflow_hidden()
+                    .bg(hsla(p.card).opacity(0.6))
+                    .child(h_flex().h(r(80.)).justify_center().gap(r(12.)).children(
+                        [false, true].into_iter().filter(|dark| definition.as_ref().is_none_or(|t| t.half(*dark).is_some())).map(|dark| {
+                            let state = self.state.clone();
+                            let id = card.named_id().map(str::to_owned);
+                            div()
+                                .id(ElementId::Name(format!("theme-half-{label}-{dark}").into()))
+                                .cursor_pointer()
+                                .child(preview_circle(
+                                    &card,
+                                    dark,
+                                    if dark {
+                                        themes::half_theme(&theme, &halves, true, &custom, theme::environment_themes(cx))
+                                            .map(|t| t.id.as_str())
+                                            == card.named_id()
+                                    } else {
+                                        light
+                                    },
+                                    cx,
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    let patch = themes::assign_half(store::client(cx), dark, id.as_deref());
+                                    store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
+                                })
+                        }),
+                    ))
+                    .child(div().px(r(12.)).text_sm().font_weight(FontWeight::MEDIUM).truncate().child(label));
+                if let Some(collection) = definition.as_ref().and_then(|t| t.collection.as_ref()) {
+                    let weak = cx.entity().downgrade();
+                    let collection_id = collection.id.clone();
+                    let collection_label = collection.label.clone();
+                    let variants = custom
+                        .iter()
+                        .filter(|t| t.collection.as_ref().is_some_and(|c| c.id == collection.id))
+                        .flat_map(|t| {
+                            [false, true].into_iter().filter(|dark| t.half(*dark).is_some()).map(move |dark| {
+                                SelectOption::new(
+                                    format!("{}:{}", t.id, if dark { "dark" } else { "light" }),
+                                    format!("{} ({})", t.label, if dark { "Dark" } else { "Light" }),
+                                )
                             })
-                    }),
-                ))
-                .child(div().px(r(12.)).text_sm().font_weight(FontWeight::MEDIUM).truncate().child(label));
-            if let Some(collection) = definition.as_ref().and_then(|t| t.collection.as_ref()) {
-                let weak = cx.entity().downgrade();
-                let collection_id = collection.id.clone();
-                let collection_label = collection.label.clone();
-                let variants = custom
-                    .iter()
-                    .filter(|t| t.collection.as_ref().is_some_and(|c| c.id == collection.id))
-                    .flat_map(|t| {
-                        [false, true].into_iter().filter(|dark| t.half(*dark).is_some()).map(move |dark| {
-                            SelectOption::new(
-                                format!("{}:{}", t.id, if dark { "dark" } else { "light" }),
-                                format!("{} ({})", t.label, if dark { "Dark" } else { "Light" }),
-                            )
                         })
-                    })
-                    .collect::<Vec<_>>();
-                if variants.len() > 1 {
-                    body = body.child(
-                        div().px(r(8.)).pt(r(4.)).child(
-                            Select::new(ElementId::Name(format!("variants-{collection_id}").into()), variants)
-                                .selected(self.appearance_ui.variants.get(&collection.id).cloned().unwrap_or_else(|| {
-                                    format!("{}:{}", card.named_id().unwrap_or(""), definition.as_ref().unwrap().appearance)
-                                }))
-                                .label(collection_label)
-                                .width(220.)
-                                .on_change(move |id, _, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        if let Some((theme_id, mode)) = id.split_once(':') {
-                                            let patch = themes::assign_half(store::client(cx), mode == "dark", Some(theme_id));
-                                            store::update_client(&this.state, ClientSettingChange::ThemePatch(patch), cx);
-                                            this.appearance_ui.variants.insert(collection_id.clone(), id.to_string());
-                                        }
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
-                    );
-                }
-            }
-            let state = self.state.clone();
-            let chosen = card.clone();
-            let use_definition = definition.clone();
-            let collection = definition.as_ref().and_then(|t| t.collection.as_ref()).map(|c| c.id.clone());
-            let collection_themes = collection
-                .as_ref()
-                .map(|id| custom.iter().filter(|t| t.collection.as_ref().is_some_and(|c| c.id == *id)).cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            let mut actions = h_flex().px(r(8.)).py(r(8.)).gap(r(4.)).child(
-                Button::new(
-                    ElementId::Name(format!("theme-use-{}", card.named_id().unwrap_or("default")).into()),
-                    ButtonVariant::Outline,
-                    ButtonSize::Xs,
-                )
-                .label("Use")
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if collection_themes.len() > 1 {
-                        let patch = themes::select_collection(store::client(cx), &collection_themes);
-                        store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
-                        if let Some(id) = &collection {
-                            this.appearance_ui.variants.remove(id);
-                        }
-                        cx.notify();
-                    } else if let Some(t) = &use_definition
-                        && t.variants.is_empty()
-                    {
-                        let patch = themes::assign_half(store::client(cx), t.appearance == "dark", Some(&t.id));
-                        store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
-                    } else {
-                        store::update_client(&state, ClientSettingChange::Theme(chosen.clone()), cx);
+                        .collect::<Vec<_>>();
+                    if variants.len() > 1 {
+                        body = body.child(
+                            div().px(r(8.)).pt(r(4.)).child(
+                                Select::new(ElementId::Name(format!("variants-{collection_id}").into()), variants)
+                                    .selected(self.appearance_ui.variants.get(&collection.id).cloned().unwrap_or_else(|| {
+                                        format!("{}:{}", card.named_id().unwrap_or(""), definition.as_ref().unwrap().appearance)
+                                    }))
+                                    .label(collection_label)
+                                    .width(220.)
+                                    .on_change(move |id, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            if let Some((theme_id, mode)) = id.split_once(':') {
+                                                let patch = themes::assign_half(store::client(cx), mode == "dark", Some(theme_id));
+                                                store::update_client(&this.state, ClientSettingChange::ThemePatch(patch), cx);
+                                                this.appearance_ui.variants.insert(collection_id.clone(), id.to_string());
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                        );
                     }
-                })),
-            );
-            if let Some(definition) = definition {
-                let duplicate = definition.clone();
-                actions = actions.child(
+                }
+                let state = self.state.clone();
+                let chosen = card.clone();
+                let use_definition = definition.clone();
+                let collection = definition.as_ref().and_then(|t| t.collection.as_ref()).map(|c| c.id.clone());
+                let collection_themes = collection
+                    .as_ref()
+                    .map(|id| custom.iter().filter(|t| t.collection.as_ref().is_some_and(|c| c.id == *id)).cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+
+                let mut actions = h_flex().px(r(8.)).py(r(8.)).gap(r(4.)).child(
                     Button::new(
-                        ElementId::Name(format!("duplicate-{}", definition.id).into()),
-                        ButtonVariant::GhostMuted,
-                        ButtonSize::IconXs,
+                        ElementId::Name(format!("theme-use-{}", card.named_id().unwrap_or("default")).into()),
+                        ButtonVariant::Outline,
+                        ButtonSize::Xs,
                     )
-                    .icon(crate::icons::Icon::Copy)
-                    .tooltip("Duplicate")
+                    .label("Use")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let copy = themes::duplicate(store::client(cx), &duplicate);
-                        this.install_theme(copy, false, cx);
+                        if collection_themes.len() > 1 {
+                            let patch = themes::select_collection(store::client(cx), &collection_themes);
+                            store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
+                            if let Some(id) = &collection {
+                                this.appearance_ui.variants.remove(id);
+                            }
+                            cx.notify();
+                        } else if let Some(t) = &use_definition
+                            && t.variants.is_empty()
+                        {
+                            let patch = themes::assign_half(store::client(cx), t.appearance == "dark", Some(&t.id));
+                            store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
+                        } else {
+                            store::update_client(&state, ClientSettingChange::Theme(chosen.clone()), cx);
+                        }
                     })),
                 );
-                if custom.iter().any(|t| t.id == definition.id) {
-                    let export = definition.clone();
+                if let Some(definition) = definition {
+                    let duplicate = definition.clone();
                     actions = actions.child(
                         Button::new(
-                            ElementId::Name(format!("export-{}", definition.id).into()),
+                            ElementId::Name(format!("duplicate-{}", definition.id).into()),
                             ButtonVariant::GhostMuted,
                             ButtonSize::IconXs,
                         )
-                        .icon(crate::icons::Icon::Download)
-                        .tooltip("Export theme")
-                        .on_click(cx.listener(move |this, _, window, cx| this.export_theme(export.clone(), window, cx))),
-                    );
-                    actions = actions.child(
-                        Button::new(
-                            ElementId::Name(format!("remove-{}", definition.id).into()),
-                            ButtonVariant::DestructiveOutline,
-                            ButtonSize::IconXs,
-                        )
-                        .icon(crate::icons::Icon::Trash2)
-                        .tooltip("Remove")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let count = themes::library(store::client(cx))
-                                .iter()
-                                .filter(|t| {
-                                    definition
-                                        .collection
-                                        .as_ref()
-                                        .is_some_and(|c| t.collection.as_ref().is_some_and(|other| other.id == c.id))
-                                })
-                                .count();
-                            this.appearance_ui.removal_ids = if count > 1 { Vec::new() } else { vec![definition.id.clone()] };
-                            this.appearance_ui.removal = Some(definition.clone());
-                            cx.notify();
-                        })),
-                    );
-                }
-            }
-            if card.named_id().is_none() {
-                actions = actions.child(
-                    Button::new("duplicate-default", ButtonVariant::GhostMuted, ButtonSize::IconXs)
                         .icon(crate::icons::Icon::Copy)
                         .tooltip("Duplicate")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let seed = ThemeDefinition {
-                                id: "t3-code".into(),
-                                label: "T3 Code".into(),
-                                appearance: "light".into(),
-                                colors: themes::standard(false),
-                                variants: std::collections::BTreeMap::from([("dark".into(), themes::standard(true))]),
-                                collection: None,
-                                managed: false,
-                            };
-                            this.install_theme(themes::duplicate(store::client(cx), &seed), false, cx);
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let copy = themes::duplicate(store::client(cx), &duplicate);
+                            this.install_theme(copy, false, cx);
                         })),
-                );
-            }
-            body = body.child(actions);
-            body
+                    );
+                    if custom.iter().any(|t| t.id == definition.id) {
+                        let export = definition.clone();
+                        actions = actions.child(
+                            Button::new(
+                                ElementId::Name(format!("export-{}", definition.id).into()),
+                                ButtonVariant::GhostMuted,
+                                ButtonSize::IconXs,
+                            )
+                            .icon(crate::icons::Icon::Download)
+                            .tooltip("Export theme")
+                            .on_click(cx.listener(move |this, _, window, cx| this.export_theme(export.clone(), window, cx))),
+                        );
+                        actions = actions.child(
+                            Button::new(
+                                ElementId::Name(format!("remove-{}", definition.id).into()),
+                                ButtonVariant::DestructiveOutline,
+                                ButtonSize::IconXs,
+                            )
+                            .icon(crate::icons::Icon::Trash2)
+                            .tooltip("Remove")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let count = themes::library(store::client(cx))
+                                    .iter()
+                                    .filter(|t| {
+                                        definition
+                                            .collection
+                                            .as_ref()
+                                            .is_some_and(|c| t.collection.as_ref().is_some_and(|other| other.id == c.id))
+                                    })
+                                    .count();
+                                this.appearance_ui.removal_ids = if count > 1 { Vec::new() } else { vec![definition.id.clone()] };
+                                this.appearance_ui.removal = Some(definition.clone());
+                                cx.notify();
+                            })),
+                        );
+                    }
+                }
+                if card.named_id().is_none() {
+                    actions = actions.child(
+                        Button::new("duplicate-default", ButtonVariant::GhostMuted, ButtonSize::IconXs)
+                            .icon(crate::icons::Icon::Copy)
+                            .tooltip("Duplicate")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let seed = ThemeDefinition {
+                                    id: "t3-code".into(),
+                                    label: "T3 Code".into(),
+                                    appearance: "light".into(),
+                                    colors: themes::standard(false),
+                                    variants: std::collections::BTreeMap::from([("dark".into(), themes::standard(true))]),
+                                    collection: None,
+                                    managed: false,
+                                };
+                                this.install_theme(themes::duplicate(store::client(cx), &seed), false, cx);
+                            })),
+                    );
+                }
+                body.child(actions).flex_1().min_w_0().into_any_element()
+            })
+            .collect();
+        let count = rendered_cards.len();
+        let mut cards = rendered_cards.into_iter();
+        let grid = v_flex().w_full().gap(r(8.)).children((0..count.div_ceil(3)).map(|row| {
+            let filled = (count - row * 3).min(3);
+            h_flex().w_full().items_start().gap(r(8.)).children(cards.by_ref().take(3)).children((filled..3).map(|_| div().flex_1()))
         }));
 
         let colors = v_flex()
