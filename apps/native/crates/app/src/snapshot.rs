@@ -27,14 +27,15 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
-[--click|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
+[--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
+[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
     /// Left presses: `--click`, `--double-click`, `--triple-click`, `--shift-click`.
     Click { at: Point<Pixels>, count: usize, shift: bool },
     RightClick(Point<Pixels>),
+    Press(Point<Pixels>),
     /// The pointer rests here, so hover states show.
     Hover(Point<Pixels>),
     /// Press, move in steps, release.
@@ -47,6 +48,7 @@ enum Gesture {
     Focus(String),
     Text(String),
     FontSize(f32),
+    Pause(f32),
 }
 
 fn gestures(args: &[String]) -> Vec<Gesture> {
@@ -61,10 +63,12 @@ fn gestures(args: &[String]) -> Vec<Gesture> {
                 ("--triple-click", Some(n @ [_, _])) => click(n, 3, false),
                 ("--shift-click", Some(n @ [_, _])) => click(n, 1, true),
                 ("--right-click", Some(n @ [_, _])) => Gesture::RightClick(at(n)),
+                ("--press", Some(n @ [_, _])) => Gesture::Press(at(n)),
                 ("--hover", Some(n @ [_, _])) => Gesture::Hover(at(n)),
                 ("--drag", Some(n @ [_, _, _, _])) => Gesture::Drag(at(n), at(&n[2..])),
                 ("--scroll", Some(n @ [_, _, dy])) => Gesture::Scroll(at(n), *dy),
                 ("--resize-font", Some([size])) => Gesture::FontSize(*size),
+                ("--pause", Some([seconds])) if seconds.is_finite() && *seconds >= 0. => Gesture::Pause(*seconds),
                 ("--keys", _) => Gesture::Keys(pair[1].clone()),
                 ("--key-up", _) => Gesture::KeyUp(pair[1].clone()),
                 ("--focus", _) => Gesture::Focus(pair[1].clone()),
@@ -100,6 +104,10 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
             }
             cx.simulate_mouse_up(window, *to, MouseButton::Left, none);
         }
+        Gesture::Press(at) => {
+            cx.simulate_mouse_move(window, *at, None, none);
+            cx.simulate_mouse_down(window, *at, MouseButton::Left, none);
+        }
         Gesture::Hover(at) => cx.simulate_mouse_move(window, *at, None, none),
         Gesture::Scroll(at, dy) => {
             cx.simulate_mouse_move(window, *at, None, none);
@@ -118,6 +126,7 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
             }).expect("snapshot window closed");
         }
         Gesture::Text(text) => cx.simulate_input(window, text),
+        Gesture::Pause(seconds) => pump(cx, *seconds, |_| false),
         Gesture::FontSize(size) => cx.update(|cx| {
             let current = crate::theme::preferences(cx).clone();
             crate::theme::set_preferences(crate::theme::Preferences { interface_font_size: *size, ..current }, cx);
@@ -183,6 +192,7 @@ pub struct Options {
     worktree_setup: Option<PathBuf>,
     resource_telemetry_fixture: Option<PathBuf>,
     gestures: Vec<Gesture>,
+    gesture_wait: f32,
     motion_frames: Option<PathBuf>,
     render_counts_output: Option<PathBuf>,
     width: f32,
@@ -244,6 +254,7 @@ impl Options {
             worktree_setup: flag("--worktree-setup").map(PathBuf::from),
             resource_telemetry_fixture: flag("--resource-telemetry-fixture").map(PathBuf::from),
             gestures: gestures(&args),
+            gesture_wait: number("--gesture-wait", 3.).max(0.),
             motion_frames: flag("--motion-frames").map(PathBuf::from),
             render_counts_output: flag("--render-counts-output").map(PathBuf::from),
             width: number("--width", 1440.),
@@ -688,7 +699,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         });
     }
     for (index, gesture) in options.gestures.iter().enumerate() {
-        pump(&mut cx, options.wait.min(3.), |_| false);
+        pump(&mut cx, options.wait.min(options.gesture_wait), |_| false);
         if index + 1 == options.gestures.len() && options.render_counts_output.is_some() {
             cx.update(|cx| cx.global::<RenderCounts>().0.borrow_mut().clear());
         }

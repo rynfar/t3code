@@ -32,6 +32,19 @@ pub fn init(cx: &mut gpui::App) {
     ]);
 }
 
+fn sync_navigation_focus(tips: &mut minimap::NavigationTooltips, index: usize, focus: &FocusHandle, window: &Window) -> bool {
+    let pending = tips.deadline();
+    tips.focus(index, focus.is_focused(window));
+    pending != tips.deadline()
+}
+
+fn navigation_reference_press(tips: &mut minimap::NavigationTooltips, index: usize, focus: &FocusHandle, window: &mut Window, cx: &mut gpui::App) {
+    window.prevent_default();
+    window.focus(focus, cx);
+    sync_navigation_focus(tips, index, focus, window);
+    tips.press(index);
+}
+
 fn focus_handles(cx: &mut gpui::App) -> [FocusHandle; 3] {
     std::array::from_fn(|_| cx.focus_handle().tab_stop(true))
 }
@@ -59,8 +72,30 @@ impl Render for MinimapLayer {
             owner.minimap.repaint = Some(repaint);
             owner.render_minimap(window, cx)
         }).ok().flatten();
-        div().relative().size_full().children(content)
+        let has_minimap = content.is_some();
+        let owner = self.owner.clone();
+        div().relative().size_full().children(content).when(has_minimap, |this| this.child(tooltip_dismiss_area(move |dismiss, _, cx| {
+            let _ = owner.update(cx, |view, cx| view.minimap_dismiss_tooltip(dismiss, cx));
+        })))
     }
+}
+
+#[derive(Clone, Copy)]
+enum TooltipDismiss { Scroll, Press }
+
+fn tooltip_dismiss_area(dismiss: impl Fn(TooltipDismiss, &mut Window, &mut gpui::App) + Clone + 'static) -> impl IntoElement {
+    canvas(|_, _, _| {}, move |bounds, _, window, _| {
+        let on_scroll = dismiss.clone();
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase.capture() && bounds.contains(&event.position) && !event.modifiers.control && event.delta.pixel_delta(px(20.)).y != px(0.) {
+                on_scroll(TooltipDismiss::Scroll, window, cx);
+            }
+        });
+        let on_press = dismiss.clone();
+        window.on_mouse_event(move |_: &gpui::MouseDownEvent, phase, window, cx| {
+            if phase.capture() { on_press(TooltipDismiss::Press, window, cx); }
+        });
+    }).absolute().inset_0().size_full()
 }
 
 /// What the rail last measured after layout. Render draws from it; click handlers read it.
@@ -98,11 +133,16 @@ impl ListLayout {
         }
     }
 
-    fn observe(self, content: AnyElement, measured: Rc<Cell<Measured>>, repaint: gpui::EntityId) -> AnyElement {
+    fn observe(self, content: AnyElement, measured: Rc<Cell<Measured>>, repaint: gpui::EntityId, scroll: Rc<Cell<Option<Pixels>>>, on_scroll: impl Fn(&mut gpui::App) + Clone + 'static) -> AnyElement {
         // Descendants can resize without notifying either cached sibling's owner.
         let measure = canvas(move |_, window, _| {
             let next = self.measure();
             if measured.replace(next) != next { window.on_next_frame(move |_, cx| cx.notify(repaint)); }
+            let position = self.list.scroll_px_offset_for_scrollbar().y;
+            if scroll.replace(Some(position)).is_some_and(|previous| previous != position) {
+                let on_scroll = on_scroll.clone();
+                window.on_next_frame(move |_, cx| on_scroll(cx));
+            }
         }, |_, _, _, _| {}).absolute().size_full();
         div().relative().size_full().child(content).child(measure).into_any_element()
     }
@@ -119,7 +159,8 @@ pub struct MinimapUi {
     preview_hovered: bool,
     nav_hovered: bool,
     nav_hovers: [bool; 2],
-    nav_tooltip: Option<usize>,
+    tooltip_epoch: Option<Instant>,
+    tooltip_scroll: Rc<Cell<Option<Pixels>>>,
     nav_tooltip_task: Option<gpui::Task<()>>,
     nav_bounds: [Rc<Cell<Bounds<Pixels>>>; 2],
     pointer: RailPointer,
@@ -131,7 +172,7 @@ pub struct MinimapUi {
     focus_subscriptions: Vec<Subscription>,
     preview_height: Rc<Cell<f32>>,
     repaint: Option<gpui::EntityId>,
-    tooltips: [minimap::NavigationTooltip; 2],
+    tooltips: minimap::NavigationTooltips,
 }
 
 impl MinimapUi {
@@ -149,6 +190,10 @@ impl MinimapUi {
         }
         self.row_indices = Rc::new(items.iter().map(|item| item.row_index).collect());
         self.items = items;
+        if self.items.len() < minimap::MIN_ITEMS {
+            self.nav_tooltip_task = None;
+            self.tooltips = minimap::NavigationTooltips::default();
+        }
     }
 
     fn preview(&mut self, index: usize) -> MinimapPreview {
@@ -182,26 +227,52 @@ impl ThreadView {
 
     pub(super) fn observe_minimap_layout(&self, transcript: AnyElement, window: &Window, cx: &gpui::App) -> AnyElement {
         if self.minimap.items.len() < minimap::MIN_ITEMS { return transcript; }
-        self.minimap_list_layout(window, cx).observe(transcript, self.minimap.measured.clone(), self.minimap_layer.entity_id())
+        let owner = self.minimap_layer.read(cx).owner.clone();
+        self.minimap_list_layout(window, cx).observe(transcript, self.minimap.measured.clone(), self.minimap_layer.entity_id(), self.minimap.tooltip_scroll.clone(), move |cx| {
+            let _ = owner.update(cx, |view, cx| view.minimap_dismiss_tooltip(TooltipDismiss::Scroll, cx));
+        })
     }
 
-    pub(super) fn minimap_escape(&mut self, key: &gpui::Keystroke, window: &Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn minimap_escape(&mut self, key: &gpui::Keystroke, _window: &Window, cx: &mut Context<Self>) -> bool {
         if key.key != "escape" { return false; }
-        let mut dismissed = false;
-        for (index, focus) in [&self.minimap.previous_focus, &self.minimap.next_focus].into_iter().enumerate() {
-            let tooltip = &mut self.minimap.tooltips[index];
-            if tooltip.visible(self.minimap.nav_hovers[index], focus.as_ref().is_some_and(|focus| focus.is_focused(window)), self.minimap.nav_tooltip == Some(index)) {
-                tooltip.dismiss();
-                dismissed = true;
-            }
-        }
+        let dismissed = self.minimap.tooltips.escape();
         if dismissed {
-            self.minimap.nav_tooltip = None;
             self.minimap.nav_tooltip_task = None;
             self.notify_minimap(cx);
             cx.stop_propagation();
         }
         dismissed
+    }
+
+    fn minimap_tooltip_now(&mut self, cx: &gpui::App) -> Duration {
+        let now = cx.background_executor().now();
+        self.minimap.tooltips.set_reduced_motion(cx.reduce_motion());
+        now.saturating_duration_since(*self.minimap.tooltip_epoch.get_or_insert(now))
+    }
+
+    fn minimap_tooltip_changed(&mut self, cx: &mut Context<Self>) {
+        self.minimap.nav_tooltip_task = None;
+        if let Some(deadline) = self.minimap.tooltips.deadline() {
+            let delay = deadline.saturating_sub(self.minimap_tooltip_now(cx));
+            self.minimap.nav_tooltip_task = Some(cx.spawn(async move |view, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = view.update(cx, |view, cx| {
+                    let now = view.minimap_tooltip_now(cx);
+                    view.minimap.tooltips.advance(now);
+                    view.notify_minimap(cx);
+                });
+            }));
+        }
+        self.notify_minimap(cx);
+    }
+
+    fn minimap_dismiss_tooltip(&mut self, dismiss: TooltipDismiss, cx: &mut Context<Self>) {
+        let before = (self.minimap.tooltips.visible(), self.minimap.tooltips.deadline());
+        match dismiss {
+            TooltipDismiss::Scroll => self.minimap.tooltips.scroll(),
+            TooltipDismiss::Press => { self.minimap.tooltips.escape(); }
+        }
+        if before != (self.minimap.tooltips.visible(), self.minimap.tooltips.deadline()) { self.minimap_tooltip_changed(cx); }
     }
 
     fn notify_minimap(&self, cx: &mut Context<Self>) {
@@ -321,8 +392,9 @@ impl ThreadView {
         if !navigation {
             self.minimap.nav_hovered = false;
             self.minimap.nav_hovers = [false; 2];
-            self.minimap.nav_tooltip = None;
             self.minimap.nav_tooltip_task = None;
+            let now = self.minimap_tooltip_now(cx);
+            for index in 0..2 { self.minimap.tooltips.hover(index, false, now); }
         }
         let rail_height = minimap::rail_height(count, f32::from(window.viewport_size().height) - minimap::MAX_HEIGHT_INSET * rem_px);
         let active = self.minimap.active.filter(|index| *index < count);
@@ -475,12 +547,16 @@ impl ThreadView {
         let label = if previous { minimap::PREVIOUS_TURN } else { minimap::NEXT_TURN };
         let icon = if previous { Icon::ChevronUp } else { Icon::ChevronDown };
         let focus = if previous { self.minimap.previous_focus.as_ref().unwrap() } else { self.minimap.next_focus.as_ref().unwrap() }.clone().tab_stop(enabled);
+        let mouse_focus = focus.clone();
+        let click_focus = focus.clone();
         let focused = focus.is_focused(window);
         let hovered = self.minimap.nav_hovers[usize::from(!previous)];
         let opacity = transition(if previous { "minimap-previous-fade" } else { "minimap-next-fade" }, vec![if focused || hovered { 1. } else { 0. }], self.minimap.repaint.unwrap(), window, cx)[0];
         let nav_index = usize::from(!previous);
-        let tooltip_visible = self.minimap.tooltips[nav_index].visible(hovered, focused, self.minimap.nav_tooltip == Some(nav_index));
-        let tooltip_opacity = transition(if previous { "minimap-previous-tooltip" } else { "minimap-next-tooltip" }, vec![if tooltip_visible { 1. } else { 0. }], self.minimap.repaint.unwrap(), window, cx)[0];
+        if sync_navigation_focus(&mut self.minimap.tooltips, nav_index, &focus, window) { self.minimap.nav_tooltip_task = None; }
+        let tooltip_visible = self.minimap.tooltips.visible() == Some(nav_index);
+        let displaced = self.minimap.tooltips.visible().is_some_and(|index| index != nav_index);
+        let tooltip_opacity = transition_to(if previous { "minimap-previous-tooltip" } else { "minimap-next-tooltip" }, vec![if tooltip_visible { 1. } else { 0. }], displaced, self.minimap.repaint.unwrap(), window, cx)[0];
         let bounds = self.minimap.nav_bounds[nav_index].clone();
         let tooltip_bounds = bounds.clone();
         let tooltip = (tooltip_opacity > 0.).then(|| gpui::deferred(
@@ -514,29 +590,37 @@ impl ThreadView {
                 view.minimap_tab(if previous { minimap::FocusPart::Previous } else { minimap::FocusPart::Next }, true, window, cx);
             }))
             .key_context("TimelineMinimap")
-            .on_mouse_down(MouseButton::Left, move |_, window, _| {
-                if !interactive { window.prevent_default(); }
-            })
+            .on_mouse_down(MouseButton::Left, cx.listener(move |view, _, window, cx| {
+                window.prevent_default();
+                if interactive && enabled {
+                    navigation_reference_press(&mut view.minimap.tooltips, nav_index, &mouse_focus, window, cx);
+                    view.minimap_tooltip_changed(cx);
+                }
+            }))
             .aria_label(label)
             .focus_visible(move |style| style.shadow(focus_ring(hsla(p.ring))))
             .on_hover(cx.listener(move |view, hovered: &bool, _, cx| {
                 if !interactive { return; }
                 view.minimap.nav_hovers[usize::from(!previous)] = *hovered;
                 view.minimap.nav_hovered = view.minimap.nav_hovers.iter().any(|hover| *hover);
-                view.minimap.nav_tooltip = None;
-                view.minimap.nav_tooltip_task = None;
-                if *hovered {
-                    view.minimap.nav_tooltip_task = Some(cx.spawn(async move |view, cx| {
-                        cx.background_executor().timer(Duration::from_millis(600)).await;
-                        let _ = view.update(cx, |view, cx| {
-                            if view.minimap.nav_hovers[nav_index] { view.minimap.nav_tooltip = Some(nav_index); view.notify_minimap(cx); }
-                        });
-                    }));
-                }
-                view.notify_minimap(cx);
+                let now = view.minimap_tooltip_now(cx);
+                view.minimap.tooltips.hover(nav_index, *hovered, now);
+                view.minimap_tooltip_changed(cx);
+            }))
+            .on_mouse_move(cx.listener(move |view, event: &MouseMoveEvent, _, cx| {
+                if !interactive { return; }
+                let deadline = view.minimap.tooltips.deadline();
+                let now = view.minimap_tooltip_now(cx);
+                view.minimap.tooltips.pointer_move(nav_index, f32::from(event.position.x), f32::from(event.position.y), now);
+                if view.minimap.tooltips.deadline() != deadline { view.minimap_tooltip_changed(cx); }
             }))
             .when(enabled, |this| this.on_click(cx.listener(move |view, event: &gpui::ClickEvent, window, cx| {
-                if interactive || event.is_keyboard() { view.step_minimap(delta, window, cx); }
+                if interactive || event.is_keyboard() {
+                    sync_navigation_focus(&mut view.minimap.tooltips, nav_index, &click_focus, window);
+                    view.minimap.tooltips.press(nav_index);
+                    view.minimap_tooltip_changed(cx);
+                    view.step_minimap(delta, window, cx);
+                }
             })))
             .child(button)
             .child(measure)
@@ -643,15 +727,19 @@ struct Motion {
 
 // A finite 150ms CSS transition, sampled at most 30 times a second; idle schedules nothing.
 fn transition(id: &'static str, target: Vec<f32>, view: gpui::EntityId, window: &mut Window, cx: &mut gpui::App) -> Vec<f32> {
+    transition_to(id, target, false, view, window, cx)
+}
+
+fn transition_to(id: &'static str, target: Vec<f32>, instant: bool, view: gpui::EntityId, window: &mut Window, cx: &mut gpui::App) -> Vec<f32> {
     let now = cx.background_executor().now();
     let state = window.use_keyed_state(id, cx, |_, _| Motion { from: target.clone(), target: target.clone(), start: now, pending: false });
     let reduced = cx.reduce_motion();
     let (value, schedule) = state.update(cx, |state, _| {
-        if state.target.len() != target.len() || reduced {
+        if state.target.len() != target.len() || reduced || instant {
             state.from = target.clone();
             state.target = target.clone();
         }
-        let progress = (now.saturating_duration_since(state.start).as_secs_f32() / 0.15).min(1.);
+        let progress = (now.saturating_duration_since(state.start).as_secs_f32() / minimap::MOTION_DURATION.as_secs_f32()).min(1.);
         let eased = gpui_base::animation::cubic_bezier(0.4, 0., 0.2, 1.)(progress);
         let value: Vec<_> = if progress == 1. { state.target.clone() } else { state.from.iter().zip(&state.target).map(|(from, to)| from + (to - from) * eased).collect() };
         if state.target != target {
@@ -681,6 +769,93 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn navigation_focus_is_sampled_without_relying_on_focus_event_delivery(cx: &mut gpui::TestAppContext) {
+        struct Nav { focus: FocusHandle, tips: minimap::NavigationTooltips }
+        impl Render for Nav {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                sync_navigation_focus(&mut self.tips, 0, &self.focus, window);
+                div().id("navigation-focus").track_focus(&self.focus).size_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|nav, _, window, cx| {
+                        navigation_reference_press(&mut nav.tips, 0, &nav.focus, window, cx);
+                    }))
+            }
+        }
+        let window = cx.open_window(size(px(200.), px(120.)), |_, cx| Nav { focus: cx.focus_handle(), tips: minimap::NavigationTooltips::default() });
+        let nav = window.root(cx).unwrap();
+        let focus = nav.read_with(cx, |nav, _| nav.focus.clone());
+        let draw = |cx: &mut gpui::TestAppContext| { cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear()).unwrap(); };
+        draw(cx);
+        cx.update_window(window.into(), |_, window, cx| window.focus(&focus, cx)).unwrap();
+        draw(cx);
+        nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), Some(0)));
+        nav.update(cx, |nav, _| { nav.tips.escape(); });
+        draw(cx);
+        nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), None, "sampling unchanged focus must preserve Escape"));
+        cx.update_window(window.into(), |_, window, _| window.blur()).unwrap();
+        draw(cx);
+        cx.update_window(window.into(), |_, window, cx| window.focus(&focus, cx)).unwrap();
+        draw(cx);
+        nav.read_with(cx, |nav, _| assert_eq!(nav.tips.visible(), Some(0)));
+        cx.update_window(window.into(), |_, window, _| window.blur()).unwrap();
+        draw(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_mouse_move(point(px(50.), px(50.)), None, Default::default());
+        visual.simulate_mouse_down(point(px(50.), px(50.)), MouseButton::Left, Default::default());
+        visual.update(|window, cx| window.draw(cx).clear());
+        nav.read_with(visual, |nav, _| assert_eq!(nav.tips.visible(), None, "a held reference press cannot reopen through newly acquired focus"));
+        visual.simulate_mouse_up(point(px(50.), px(50.)), MouseButton::Left, Default::default());
+    }
+
+    #[gpui::test]
+    fn tooltip_dismissal_captures_input_consumed_by_preview_children(cx: &mut gpui::TestAppContext) {
+        struct Area { tips: minimap::NavigationTooltips }
+        impl Render for Area {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let owner = cx.entity().downgrade();
+                div().relative().w(px(200.)).h(px(120.))
+                    .child(div().id("consuming-preview").size_full()
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
+                    .child(tooltip_dismiss_area(move |dismiss, _, cx| {
+                        owner.update(cx, |area, _| match dismiss {
+                            TooltipDismiss::Scroll => area.tips.scroll(),
+                            TooltipDismiss::Press => { area.tips.escape(); }
+                        }).unwrap();
+                    }))
+            }
+        }
+        let window = cx.open_window(size(px(200.), px(120.)), |_, _| Area { tips: minimap::NavigationTooltips::default() });
+        let area = window.root(cx).unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        for pending in [true, false] {
+            area.update(cx, |area, _| {
+                area.tips = minimap::NavigationTooltips::default();
+                area.tips.hover(0, true, Duration::ZERO);
+                if !pending { area.tips.advance(Duration::from_millis(600)); }
+            });
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: point(px(50.), px(50.)), delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                modifiers: Default::default(), touch_phase: gpui::TouchPhase::Moved,
+            });
+            area.update(cx, |area, _| {
+                area.tips.advance(Duration::from_secs(2));
+                assert_eq!(area.tips.visible(), None);
+                assert_eq!(area.tips.deadline(), None);
+                area.tips.focus(0, true);
+            });
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: point(px(50.), px(50.)), delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                modifiers: Default::default(), touch_phase: gpui::TouchPhase::Moved,
+            });
+            area.read_with(cx, |area, _| assert_eq!(area.tips.visible(), Some(0)));
+            cx.simulate_mouse_down(point(px(50.), px(50.)), MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(point(px(50.), px(50.)), MouseButton::Left, Default::default());
+            area.read_with(cx, |area, _| assert_eq!(area.tips.visible(), None));
+        }
+    }
+
+    #[gpui::test]
     fn descendant_height_changes_refresh_a_cached_minimap_without_owner_notifications(cx: &mut gpui::TestAppContext) {
         struct Row { height: f32 }
         impl Render for Row {
@@ -701,7 +876,7 @@ mod tests {
                 let content = gpui::list(self.layout.list.clone(), move |index, _, _| {
                     if index == 1 { row.clone().into_any_element() } else { div().h(px(40.)).into_any_element() }
                 }).size_full().into_any_element();
-                self.layout.clone().observe(content, self.measured.clone(), self.rail)
+                self.layout.clone().observe(content, self.measured.clone(), self.rail, Rc::default(), |_| {})
             }
         }
         struct Owner { rows: Entity<Rows>, rail: Entity<Rail> }

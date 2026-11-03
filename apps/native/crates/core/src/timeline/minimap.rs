@@ -5,6 +5,7 @@
 
 use std::borrow::Borrow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use markdown::mdast::Node;
 
@@ -21,6 +22,8 @@ pub const MAX_HEIGHT_INSET: f32 = 288.;
 pub const EXPANDED_HIT_STRIP_WIDTH: f32 = 352.;
 /// px a jumped-to message sits below the top (`scrollToIndex`'s `viewOffset`).
 pub const JUMP_VIEW_OFFSET: f32 = 24.;
+pub const MOTION_DURATION: Duration = Duration::from_millis(150);
+const TOOLTIP_WARMUP: Duration = Duration::from_millis(600);
 pub const PREVIOUS_TURN: &str = "Previous turn";
 pub const NEXT_TURN: &str = "Next turn";
 pub const USER_MESSAGE: &str = "User message";
@@ -381,21 +384,102 @@ pub fn tab_target(part: FocusPart, backwards: bool, previous: bool, next: bool) 
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NavigationTooltip {
-    hovered: bool,
-    focused: bool,
-    dismissed: bool,
+/// `ui/tooltip.tsx` and Base UI TooltipTrigger/useDelayGroup. The minimap has no
+/// TooltipProvider: every hover waits 600ms, with no provider grace period.
+#[derive(Debug, Default)]
+pub struct NavigationTooltips {
+    hovered: [bool; 2],
+    focused: [bool; 2],
+    dismissed: [bool; 2],
+    pointer: [Option<(f32, f32)>; 2],
+    open: Option<usize>,
+    pending: Option<(usize, Duration)>,
+    hover_closing: Option<(usize, Duration)>,
+    reduced_motion: bool,
 }
 
-impl NavigationTooltip {
-    pub fn visible(&mut self, hovered: bool, focused: bool, hover_ready: bool) -> bool {
-        if (self.hovered, self.focused) != (hovered, focused) { self.dismissed = false; }
-        (self.hovered, self.focused) = (hovered, focused);
-        !self.dismissed && (focused || hovered && hover_ready)
+impl NavigationTooltips {
+    pub fn hover(&mut self, index: usize, value: bool, now: Duration) {
+        if self.hovered[index] == value { return; }
+        self.hovered[index] = value;
+        self.pointer[index] = None;
+        self.dismissed[index] = false;
+        if value {
+            let reentry = self.hover_closing.is_some_and(|(closing, end)| closing == index && now < end);
+            if self.focused[index] || reentry { self.show(index); }
+            else { self.pending = Some((index, now + TOOLTIP_WARMUP)); }
+        } else {
+            self.cancel_pending(index);
+            if !self.focused[index] && self.open == Some(index) {
+                self.open = None;
+                self.hover_closing = (!self.reduced_motion).then_some((index, now + MOTION_DURATION));
+            }
+        }
     }
 
-    pub fn dismiss(&mut self) { self.dismissed = true; }
+    pub fn focus(&mut self, index: usize, value: bool) {
+        if self.focused[index] == value { return; }
+        self.focused[index] = value;
+        self.dismissed[index] = false;
+        self.cancel_pending(index);
+        if value { self.show(index); }
+        else if self.open == Some(index) { self.open = None; }
+    }
+
+    pub fn pointer_move(&mut self, index: usize, x: f32, y: f32, now: Duration) {
+        let previous = self.pointer[index].replace((x, y));
+        if self.hovered[index] && !self.dismissed[index] && !self.focused[index] && self.open != Some(index)
+            && previous.is_some_and(|(px, py)| (x - px).powi(2) + (y - py).powi(2) >= 2.)
+        {
+            self.pending = Some((index, now + TOOLTIP_WARMUP));
+        }
+    }
+
+    pub fn set_reduced_motion(&mut self, reduced: bool) {
+        self.reduced_motion = reduced;
+        if reduced { self.hover_closing = None; }
+    }
+
+    pub fn advance(&mut self, now: Duration) {
+        if let Some((index, deadline)) = self.pending && now >= deadline {
+            self.pending = None;
+            if self.hovered[index] && !self.dismissed[index] { self.show(index); }
+        }
+    }
+
+    pub fn visible(&self) -> Option<usize> { self.open }
+
+    pub fn deadline(&self) -> Option<Duration> { self.pending.map(|(_, deadline)| deadline) }
+
+    pub fn scroll(&mut self) {
+        for index in 0..2 {
+            if self.hovered[index] && !self.focused[index] { self.press(index); }
+        }
+    }
+
+    pub fn press(&mut self, index: usize) {
+        self.dismissed[index] = true;
+        self.hover_closing = None;
+        self.cancel_pending(index);
+        if self.open == Some(index) { self.open = None; }
+    }
+
+    pub fn escape(&mut self) -> bool {
+        let active = self.open.is_some() || self.pending.is_some();
+        for index in 0..2 { self.press(index); }
+        active
+    }
+
+    fn cancel_pending(&mut self, index: usize) {
+        if self.pending.is_some_and(|(pending, _)| pending == index) { self.pending = None; }
+    }
+
+    fn show(&mut self, index: usize) {
+        self.hover_closing = None;
+        if let Some(previous) = self.open && previous != index { self.dismissed[previous] = true; }
+        self.cancel_pending(index);
+        self.open = Some(index);
+    }
 }
 
 /// `TimelineMinimap`'s focus and key handlers.

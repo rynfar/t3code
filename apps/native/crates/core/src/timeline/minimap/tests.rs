@@ -229,18 +229,158 @@ fn tab_order_skips_disabled_turn_buttons() {
 
 #[test]
 fn navigation_tooltip_escape_survives_renders_and_delayed_hover_opens() {
-    let mut tooltip = NavigationTooltip::default();
-    assert!(tooltip.visible(false, true, false));
-    tooltip.dismiss();
-    assert!(!tooltip.visible(false, true, false));
-    assert!(!tooltip.visible(false, true, false));
-    assert!(!tooltip.visible(false, false, false));
-    assert!(tooltip.visible(false, true, false));
-    tooltip.dismiss();
-    assert!(tooltip.visible(true, true, false), "a new hover resets dismissal");
-    assert!(!tooltip.visible(true, false, false));
-    tooltip.dismiss();
-    assert!(!tooltip.visible(true, false, true), "a delayed hover open cannot undo Escape");
-    assert!(!tooltip.visible(false, false, false));
-    assert!(tooltip.visible(true, false, true));
+    use std::time::Duration;
+    let mut tooltip = NavigationTooltips::default();
+    tooltip.focus(0, true);
+    assert_eq!(tooltip.visible(), Some(0));
+    assert!(tooltip.escape());
+    tooltip.focus(0, true);
+    assert_eq!(tooltip.visible(), None);
+    tooltip.focus(0, false);
+    tooltip.focus(0, true);
+    assert_eq!(tooltip.visible(), Some(0));
+    tooltip.focus(0, false);
+    tooltip.hover(0, true, Duration::ZERO);
+    assert!(tooltip.escape());
+    tooltip.advance(Duration::from_secs(1));
+    assert_eq!(tooltip.visible(), None, "a delayed hover open cannot undo Escape");
+    assert_eq!(tooltip.deadline(), None);
+}
+
+
+#[test]
+fn navigation_tooltips_wait_for_each_trigger_without_a_provider_grace_period() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    assert_eq!(tips.deadline(), Some(ms(600)));
+    tips.advance(ms(599));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(600));
+    assert_eq!(tips.visible(), Some(0));
+    tips.hover(0, false, ms(610));
+    tips.hover(1, true, ms(610));
+    assert_eq!(tips.visible(), None, "TimelineMinimap has no TooltipProvider: the next trigger waits too");
+    tips.advance(ms(1209));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(1210));
+    assert_eq!(tips.visible(), Some(1));
+    assert_eq!(tips.deadline(), None, "settled tooltips schedule no work");
+}
+
+#[test]
+fn navigation_tooltip_scroll_cancels_pending_and_open_hover_but_preserves_focus() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for open in [false, true] {
+        let mut tips = NavigationTooltips::default();
+        tips.hover(0, true, ms(0));
+        if open { tips.advance(ms(600)); }
+        tips.scroll();
+        tips.advance(ms(900));
+        assert_eq!(tips.visible(), None, "scroll cancels pending opens as well as visible hover tips");
+        assert_eq!(tips.deadline(), None);
+        tips.hover(0, false, ms(900));
+        tips.hover(0, true, ms(901));
+        tips.advance(ms(1501));
+        assert_eq!(tips.visible(), Some(0), "leaving and reentering restores hover");
+    }
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true);
+    tips.hover(0, true, ms(0));
+    tips.scroll();
+    assert_eq!(tips.visible(), Some(0), "the web scroll tracker preserves the focused trigger");
+}
+
+#[test]
+fn navigation_tooltip_press_and_escape_do_not_reopen_until_a_new_interaction() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for focused in [false, true] {
+        for pending in [false, true] {
+            let mut tips = NavigationTooltips::default();
+            tips.hover(0, true, ms(0));
+            tips.focus(0, focused);
+            if !pending { tips.advance(ms(600)); }
+            tips.press(0);
+            tips.advance(ms(1000));
+            tips.hover(0, true, ms(1000));
+            tips.focus(0, focused);
+            assert_eq!(tips.visible(), None);
+            assert_eq!(tips.deadline(), None);
+            tips.hover(0, false, ms(1001));
+            tips.hover(0, true, ms(1002));
+            tips.advance(ms(1602));
+            assert_eq!(tips.visible(), Some(0));
+            tips.escape();
+            tips.advance(ms(2000));
+            assert_eq!(tips.visible(), None);
+        }
+    }
+}
+
+#[test]
+fn navigation_tooltips_arbitrate_focus_and_hover_without_reopening_the_displaced_tip() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true);
+    assert_eq!(tips.visible(), Some(0));
+    tips.hover(1, true, ms(1));
+    tips.advance(ms(601));
+    assert_eq!(tips.visible(), Some(1));
+    tips.hover(1, false, ms(602));
+    tips.advance(ms(1500));
+    assert_eq!(tips.visible(), None, "the still-focused displaced trigger cannot reopen on a render");
+    tips.focus(0, false);
+    tips.focus(0, true);
+    assert_eq!(tips.visible(), Some(0));
+}
+
+
+#[test]
+fn navigation_tooltip_warmup_waits_for_pointer_rest_and_ignores_small_jitter() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    tips.pointer_move(0, 12., 20., ms(300));
+    assert_eq!(tips.deadline(), Some(ms(900)));
+    tips.pointer_move(0, 12.5, 20., ms(500));
+    assert_eq!(tips.deadline(), Some(ms(900)), "Base UI ignores movement squared below 2 while waiting");
+    tips.advance(ms(899));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(900));
+    assert_eq!(tips.visible(), Some(0));
+    tips.pointer_move(0, 20., 30., ms(1000));
+    assert_eq!(tips.deadline(), None, "movement of an open trigger schedules nothing");
+    tips.scroll();
+    tips.pointer_move(0, 30., 40., ms(1100));
+    tips.advance(ms(2000));
+    assert_eq!(tips.visible(), None, "movement cannot reopen a dismissed tooltip");
+}
+
+
+#[test]
+fn navigation_tooltip_reentry_only_skips_warmup_during_its_own_hover_close_transition() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for (reduced, reentry, expected) in [(false, 749, Some(0)), (false, 750, None), (true, 601, None)] {
+        let mut tips = NavigationTooltips::default();
+        tips.set_reduced_motion(reduced);
+        tips.hover(0, true, ms(0));
+        tips.advance(ms(600));
+        tips.hover(0, false, ms(600));
+        tips.hover(0, true, ms(reentry));
+        assert_eq!(tips.visible(), expected, "reentry={reentry}, reduced={reduced}");
+    }
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.advance(ms(600));
+    tips.press(0);
+    tips.hover(0, false, ms(601));
+    tips.hover(0, true, ms(602));
+    assert_eq!(tips.visible(), None, "press dismissal does not get the hover-close grace");
 }
