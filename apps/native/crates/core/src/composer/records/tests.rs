@@ -230,3 +230,43 @@ fn clipboard_keeps_annotation_screenshots_and_rewrites_colliding_bindings() {
     assert_eq!(pasted_annotation["screenshotContextId"], "image_fresh");
     assert_eq!(pasted_annotation["annotationId"], "fresh");
 }
+
+#[test]
+fn sent_context_preserves_code_and_escaped_literals() {
+    let machine = environment_record("machine", "Mac");
+    let link = reference(&machine).unwrap();
+    let text = format!("`{link}`\n\n```md\n{link}\n```\n\n\\{link}\n\nUse {link}.");
+    assert_eq!(
+        presentation_records(&text, std::slice::from_ref(&machine)).len(),
+        1
+    );
+    assert_eq!(
+        display_text(&text),
+        format!("`{link}`\n\n```md\n{link}\n```\n\n\\{link}\n\nUse Mac.")
+    );
+    let only_code = format!("`{link}`");
+    assert!(presentation_records(&only_code, &[machine]).is_empty());
+    assert_eq!(display_text(&only_code), only_code);
+}
+
+#[test]
+fn media_only_message_copy_synthesizes_references_for_its_attachments() {
+    let image = json!({"version":1,"kind":"image","contextId":"image_a","label":"shot.png","attachmentId":"server-a","name":"shot.png","mimeType":"image/png","sizeBytes":8});
+    let stale = json!({"version":1,"kind":"image","contextId":"image_b","label":"other.png","attachmentId":"server-b","name":"other.png","mimeType":"image/png","sizeBytes":8});
+    let attachments = [
+        json!({"type":"image","id":"server-a","name":"shot.png","mimeType":"image/png","sizeBytes":8}),
+    ];
+    let (text, fragment) = copy_message(
+        "",
+        &[image.clone(), stale],
+        &attachments,
+        "env",
+        Some("thread"),
+        "message",
+    );
+    assert_eq!(text, reference(&image).unwrap());
+    assert_eq!(
+        decode_fragment(&fragment.unwrap()).unwrap()["records"],
+        json!([image])
+    );
+}

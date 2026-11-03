@@ -62,7 +62,7 @@ impl Composer {
     fn capture_draft(&self, target: &Target, prompt: String) -> Draft {
         let choices = self.choices.get(target).cloned().unwrap_or_default();
         Draft {
-            context_records: t3_core::composer::records::referenced(&prompt, self.records_for(target)),
+            context_records: t3_core::composer::records::referenced_shared(&prompt, self.records_for(target)),
             threads: Draft::saved_threads(self.mentions(target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(target), &prompt),
             review_comments: t3_core::composer::review::referenced(&prompt, self.reviews_for(target)).into_iter().cloned().collect(),

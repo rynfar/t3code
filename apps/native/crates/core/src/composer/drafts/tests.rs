@@ -56,7 +56,7 @@ fn the_store_round_trips_and_skips_bad_entries() {
     let machine=super::super::records::environment_record("env-build","Build Mac");
     let prompt = format!("see {} and {} on {}", thread.reference(), excerpt.reference(), super::super::records::reference(&machine).unwrap());
     let full = Draft {
-        context_records: vec![machine],
+        context_records: vec![machine.into()],
         prompt: prompt.clone(),
         model_selection: Some(ModelSelection { instance_id: "codex".into(), model: "gpt-5".into(), options: None }),
         runtime_mode: Some(RuntimeMode::FullAccess),

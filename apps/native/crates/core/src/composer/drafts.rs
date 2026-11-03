@@ -93,7 +93,7 @@ pub struct Draft {
     pub terminals: Vec<TerminalContext>,
     pub review_comments: Vec<super::review::ReviewComment>,
     pub attachments: Vec<SavedAttachment>,
-    pub context_records: Vec<Value>,
+    pub context_records: Vec<std::sync::Arc<Value>>,
     #[serde(skip)]
     pub pending_attachment_count: usize,
     pub updated_at: i64,

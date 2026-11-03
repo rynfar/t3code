@@ -46,6 +46,24 @@ pub fn referenced(prompt: &str, records: &[Value]) -> Vec<Value> {
     found
 }
 
+impl Linked for std::sync::Arc<Value> {
+    fn link_id(&self) -> String {
+        field(self, "contextId").to_owned()
+    }
+}
+
+pub fn referenced_shared(
+    prompt: &str,
+    records: &[std::sync::Arc<Value>],
+) -> Vec<std::sync::Arc<Value>> {
+    let ids = super::menu::referenced_context_ids(prompt);
+    records
+        .iter()
+        .filter(|r| ids.contains(&field(r, "contextId")))
+        .cloned()
+        .collect()
+}
+
 pub fn message_context(prompt: &str, records: &[Value]) -> Option<Value> {
     let mut selected = referenced(prompt, records);
     for record in records
@@ -72,7 +90,7 @@ pub fn message_context(prompt: &str, records: &[Value]) -> Option<Value> {
     (!records.is_empty()).then(|| json!({"version":1,"records":records}))
 }
 
-fn clipboard_records(markdown: &str, records: &[Value]) -> Vec<Value> {
+pub fn clipboard_records(markdown: &str, records: &[Value]) -> Vec<Value> {
     let mut selected = referenced(markdown, records);
     let screenshots: Vec<String> = selected
         .iter()
@@ -191,11 +209,22 @@ pub fn import_fragment(
     raw: &str,
     held: &mut Vec<Value>,
     environment: &str,
-    mut fresh: impl FnMut() -> String,
+    fresh: impl FnMut() -> String,
 ) -> Option<String> {
     let fragment = decode_fragment(raw)?;
     let source = field(&fragment["source"], "environmentId");
-    let mut selected = clipboard_records(markdown, fragment["records"].as_array()?);
+    let selected = clipboard_records(markdown, fragment["records"].as_array()?);
+    import_records(markdown, selected, held, environment, source, fresh)
+}
+
+pub fn import_records(
+    markdown: &str,
+    mut selected: Vec<Value>,
+    held: &mut Vec<Value>,
+    environment: &str,
+    source: &str,
+    mut fresh: impl FnMut() -> String,
+) -> Option<String> {
     selected.sort_by_key(|r| field(r, "kind") != "preview-annotation");
     let mut rewrites = std::collections::HashMap::new();
     let mut skipped = std::collections::HashSet::new();
@@ -359,13 +388,47 @@ pub fn environment_items<'a>(
         .collect()
 }
 
+pub fn sent_references(text: &str) -> Vec<super::menu::ContextReference<'_>> {
+    fn visit<'a>(
+        node: &markdown::mdast::Node,
+        text: &'a str,
+        found: &mut Vec<super::menu::ContextReference<'a>>,
+    ) {
+        if matches!(
+            node,
+            markdown::mdast::Node::Link(_) | markdown::mdast::Node::Image(_)
+        ) && let Some(position) = node.position()
+            && let Some(source) = text.get(position.start.offset..position.end.offset)
+        {
+            for mut reference in context_references(source) {
+                if reference.start == 0 && reference.end == source.len() {
+                    reference.start += position.start.offset;
+                    reference.end += position.start.offset;
+                    found.push(reference);
+                }
+            }
+        }
+        if let Some(children) = node.children() {
+            for child in children {
+                visit(child, text, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    if let Ok(root) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
+        visit(&root, text, &mut found);
+    }
+    found.sort_by_key(|r| r.start);
+    found
+}
+
 pub fn presentation_records<'a>(
     text: &str,
     records: &'a [Value],
 ) -> Vec<std::borrow::Cow<'a, Value>> {
     use std::borrow::Cow;
     let mut linked: Vec<Cow<'a, Value>> = Vec::new();
-    for r in context_references(text) {
+    for r in sent_references(text) {
         if linked.iter().any(|v| field(v, "contextId") == r.context_id) {
             continue;
         }
@@ -376,7 +439,7 @@ pub fn presentation_records<'a>(
 
 pub fn display_text(text: &str) -> String {
     let mut display = text.to_owned();
-    for r in context_references(text).into_iter().rev() {
+    for r in sent_references(text).into_iter().rev() {
         display.replace_range(r.start..r.end, if r.kind == "image" { "" } else { r.label });
     }
     display
@@ -428,4 +491,48 @@ pub fn fragment_from_html(html: &str) -> Option<String> {
     let fragment = String::from_utf8(decoded).ok()?;
     decode_fragment(&fragment)?;
     Some(fragment)
+}
+
+pub fn copy_message(
+    text: &str,
+    records: &[Value],
+    attachments: &[Value],
+    environment: &str,
+    thread: Option<&str>,
+    message: &str,
+) -> (String, Option<String>) {
+    let media: Vec<Value> = if text.is_empty() {
+        records
+            .iter()
+            .filter(|r| {
+                matches!(field(r, "kind"), "image" | "file")
+                    && attachments
+                        .iter()
+                        .any(|a| field(a, "id") == field(r, "attachmentId"))
+            })
+            .cloned()
+            .collect()
+    } else {
+        records.to_vec()
+    };
+    let text = if text.is_empty() {
+        media
+            .iter()
+            .filter_map(reference)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text.to_owned()
+    };
+    let fragment = if media.is_empty() {
+        None
+    } else {
+        let mut source = json!({"environmentId":environment,"messageId":message});
+        if let Some(thread) = thread {
+            source["threadId"] = json!(thread);
+        }
+        let encoded = json!({"version":1,"source":source,"records":media}).to_string();
+        (encoded.encode_utf16().count() <= 16_000_000).then_some(encoded)
+    };
+    (text, fragment)
 }

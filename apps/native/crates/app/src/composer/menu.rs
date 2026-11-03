@@ -447,15 +447,23 @@ impl Composer {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
         let base = t3_core::composer::attachments::message_context_with_reviews(text, threads, self.current_terminals(), self.current_reviews(), attachments);
         let mut records = base.and_then(|value| value["records"].as_array().cloned()).unwrap_or_default();
-        if let Some(target) = &self.snapshot.target { records.extend_from_slice(self.records_for(target)); }
+        if let Some(target) = &self.snapshot.target { records.extend(self.records_for(target).iter().map(|r|(**r).clone())); }
         t3_core::composer::records::message_context(text, &records)
     }
 
-    /// How many mentioned threads `text` links, which make a message sendable on their own.
+    pub(super) fn has_context_records(&self, text: &str) -> bool {
+        self.linked_threads(text) > 0 || self.chip_references(text).iter().any(|reference| {
+            self.current_terminals().iter().any(|terminal| terminal.context_id() == reference.id)
+                || self.current_reviews().iter().any(|review| review.context_id() == reference.id)
+        })
+    }
+
+    /// How many mentioned threads or stored context records make a message sendable on their own.
     pub(super) fn linked_threads(&self, text: &str) -> usize {
-        let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
-        let linked = rules::referenced_context_ids(text);
-        threads.iter().filter(|thread| linked.contains(&thread.context_id.as_str())).count() + self.snapshot.target.as_ref().map(|target| t3_core::composer::records::referenced(text, self.records_for(target)).len()).unwrap_or(0)
+        let Some(target) = self.snapshot.target.as_ref() else { return 0 };
+        let linked = self.chip_references(text);
+        self.mentions(target).iter().filter(|thread| linked.iter().any(|r| r.id == thread.context_id)).count()
+            + self.records_for(target).iter().filter(|record| linked.iter().any(|r| r.id == t3_core::composer::records::field(record, "contextId"))).count()
     }
 
     pub(super) fn mentions(&self, target: &Target) -> &[ThreadContext] {

@@ -189,9 +189,11 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                     Some(t3_core::turn_item::TurnItemKind::UserMessage { context:Some(context), .. }) => context["records"].as_array().map(Vec::as_slice).unwrap_or_default(),
                     _ => &[],
                 };
-                if let Some(fragment)=t3_core::composer::records::copy_fragment(&copy_text,records,&environment,view.state.read(cx).selected_thread.as_deref(),Some(&copy_message_id)) {
-                    crate::composer::clipboard::write(copy_text.clone(),fragment,cx);
-                } else { crate::composer::clipboard::write(copy_text.clone(),String::new(),cx); }
+                let attachments=match copy_item.as_ref().map(|item|&item.kind) {
+                    Some(t3_core::turn_item::TurnItemKind::UserMessage {attachments,..})=>attachments.as_slice(),_=>&[],
+                };
+                let (text,fragment)=t3_core::composer::records::copy_message(&copy_text,records,attachments,&environment,view.state.read(cx).selected_thread.as_deref(),&copy_message_id);
+                crate::composer::clipboard::write(text,fragment.unwrap_or_default(),cx);
             }),
             cx,
         ));

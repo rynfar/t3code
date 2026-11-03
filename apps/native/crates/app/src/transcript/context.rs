@@ -50,7 +50,7 @@ pub(super) fn chips(
             Some(source) => {
                 context_chip::copyable_message(shell, id.clone(), source.clone(), state)
             }
-            None => context_chip::copyable(shell, &record, state, cx),
+            None => context_chip::copyable_unresolved(shell, &record),
         };
         if context_chip::has_details(&record) {
             shell = shell.on_click(cx.listener(move |this, _, _, cx| {

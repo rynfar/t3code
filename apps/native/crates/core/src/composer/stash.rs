@@ -35,7 +35,7 @@ pub struct StashEntry {
     #[serde(default)]
     pub review_comments: Vec<super::review::ReviewComment>,
     #[serde(default)]
-    pub context_records: Vec<Value>,
+    pub context_records: Vec<std::sync::Arc<Value>>,
 }
 
 impl StashEntry {

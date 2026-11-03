@@ -227,30 +227,9 @@ pub(crate) fn shell(
     (shell, ink)
 }
 
-pub(crate) fn copyable(
-    shell: gpui::Stateful<gpui::Div>,
-    record: &Value,
-    state: &Entity<AppState>,
-    _cx: &App,
-) -> gpui::Stateful<gpui::Div> {
-    let record = record.clone();
-    let state = state.clone();
-    shell.on_action(move |_: &gpui_component::input::Copy, _, cx| {
-        let env = state
-            .read(cx)
-            .server_config
-            .config
-            .as_ref()
-            .map(|c| c.environment.environment_id.clone())
-            .unwrap_or_default();
-        if let Some(text) = rules::reference(&record)
-            && let Some(fragment) =
-                rules::copy_fragment(&text, std::slice::from_ref(&record), &env, None, None)
-        {
-            crate::composer::clipboard::write(text, fragment, cx);
-            cx.stop_propagation();
-        }
-    })
+pub(crate) fn copyable_unresolved(shell: gpui::Stateful<gpui::Div>, record: &Value) -> gpui::Stateful<gpui::Div> {
+    let text=rules::reference(record).unwrap_or_default();
+    shell.on_action(move|_: &gpui_component::input::Copy,_,cx| {crate::composer::clipboard::write(text.clone(),String::new(),cx);cx.stop_propagation();})
 }
 
 pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
@@ -325,12 +304,7 @@ pub(crate) fn copyable_message(
         else {
             return;
         };
-        let Some(record) = context["records"]
-            .as_array()
-            .and_then(|all| all.iter().find(|r| field(r, "contextId") == id))
-        else {
-            return;
-        };
+        let Some(all)=context["records"].as_array() else {return};
         let environment = state
             .read(cx)
             .server_config
@@ -338,17 +312,8 @@ pub(crate) fn copyable_message(
             .as_ref()
             .map(|c| c.environment.environment_id.clone())
             .unwrap_or_default();
-        if let Some(text) = rules::reference(record)
-            && let Some(fragment) = rules::copy_fragment(
-                &text,
-                std::slice::from_ref(record),
-                &environment,
-                None,
-                None,
-            )
-        {
-            crate::composer::clipboard::write(text, fragment, cx);
-            cx.stop_propagation();
+        if let Some((text,fragment))=crate::composer::imports::copy_chip(&id,all,&environment) {
+            crate::composer::clipboard::write(text,fragment,cx);cx.stop_propagation();
         }
     })
 }

@@ -86,7 +86,7 @@ impl Composer {
             return;
         }
         let entry = StashEntry {
-            context_records: t3_core::composer::records::referenced(&prompt,self.records_for(&target)),
+            context_records: t3_core::composer::records::referenced_shared(&prompt,self.records_for(&target)),
             id: uuid_v4(),
             created_at: now_ms(),
             threads: Draft::saved_threads(self.mentions(&target), &prompt),
@@ -123,21 +123,14 @@ impl Composer {
         let Some(target) = self.snapshot.target.clone() else { return };
         let Some(entry) = self.stash_state.store.take(id) else { return };
         self.save_stash();
-        let present: Vec<String> = self.staged_for(&target).iter().map(|staged| staged.attachment.id.clone()).collect();
-        let restored = entry.attachments.iter().filter(|attachment| !present.contains(&attachment.id)).map(SavedAttachment::restore).collect();
-        self.seed_attachments(&target, restored);
-        let mut threads = self.mentions(&target).to_vec();
-        let stashed = Draft { threads: entry.threads.clone(), ..Draft::default() };
-        for thread in stashed.thread_contexts() {
-            if !threads.iter().any(|existing| existing.context_id == thread.context_id) {
-                threads.push(thread);
-            }
-        }
-        self.seed_mentions(&target, threads);
-        self.seed_terminals(&target, entry.terminals.clone());
-        self.seed_reviews(&target, entry.review_comments.clone());
-        self.seed_records(&target, entry.context_records.clone());
-        let prompt = rules::merge_prompt(&self.prompt(cx), &entry.prompt);
+        let mut incoming:Vec<serde_json::Value>=entry.context_records.iter().map(|r|(**r).clone()).collect();
+        incoming.extend(entry.terminals.iter().map(t3_core::composer::context::TerminalContext::record));
+        incoming.extend(entry.review_comments.iter().map(t3_core::composer::review::ReviewComment::record));
+        incoming.extend(Draft{threads:entry.threads.clone(),..Draft::default()}.thread_contexts().iter().map(t3_core::composer::menu::ThreadContext::to_record));
+        incoming.extend(entry.attachments.iter().filter_map(|a|a.restore().context_record()));
+        let Some(plan)=super::imports::prepare(&entry.prompt,incoming,&self.all_context_records(),&self.environment_id(cx),super::imports::ImportMode::Move,uuid_v4) else {return};
+        let prompt=rules::merge_prompt(&self.prompt(cx),&plan.text);
+        self.apply_import(&target,plan,cx);
         self.set_prompt(&prompt, window, cx);
         let end = prompt.len();
         self.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));

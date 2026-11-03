@@ -1,31 +1,39 @@
 //! Clipboard payload transport for `composerInlineTokenPaste.ts`; rules live in core.
 use super::{Composer, Target};
-use gpui::{App, ClipboardItem, Context, Window};
+use gpui::{App, ClipboardItem, Context, InteractiveElement, Window};
 use serde_json::Value;
 use t3_core::composer::{context, records};
 
 impl Composer {
-    pub(super) fn records_for(&self, target: &Target) -> &[Value] {
+    pub(super) fn records_for(&self, target: &Target) -> &[std::sync::Arc<Value>] {
         self.context
             .records
             .get(target)
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
-    pub(super) fn seed_records(&mut self, target: &Target, records: Vec<Value>) {
+    pub(super) fn seed_records(
+        &mut self,
+        target: &Target,
+        records: impl IntoIterator<Item = impl Into<std::sync::Arc<Value>>>,
+    ) {
         context::restore_unsent(
             self.context.records.entry(target.clone()).or_default(),
-            records,
+            records.into_iter().map(Into::into).collect(),
         );
     }
-    pub(super) fn take_records(&mut self, target: &Target, text: &str) -> Vec<Value> {
+    pub(super) fn take_records(
+        &mut self,
+        target: &Target,
+        text: &str,
+    ) -> Vec<std::sync::Arc<Value>> {
         self.context
             .records
             .get_mut(target)
             .map(|r| context::take_for_send(r, text))
             .unwrap_or_default()
     }
-    fn all_context_records(&self) -> Vec<Value> {
+    pub(super) fn all_context_records(&self) -> Vec<Value> {
         let Some(target) = &self.snapshot.target else {
             return Vec::new();
         };
@@ -42,7 +50,7 @@ impl Composer {
                     .iter()
                     .map(t3_core::composer::menu::ThreadContext::to_record),
             )
-            .chain(self.records_for(target).iter().cloned())
+            .chain(self.records_for(target).iter().map(|r| (**r).clone()))
             .chain(
                 self.staged_for(target)
                     .iter()
@@ -50,6 +58,52 @@ impl Composer {
             )
             .collect()
     }
+    pub(super) fn apply_import(
+        &mut self,
+        target: &Target,
+        plan: super::imports::ImportPlan,
+        cx: &mut Context<Self>,
+    ) {
+        let mut held = Vec::new();
+        for record in plan.records {
+            if let Some(terminal) = records::terminal_from_record(
+                &record,
+                &self.thread_id().unwrap_or_default(),
+                &t3_core::sidebar::time::format_iso(crate::sidebar::controller::now_ms()),
+            ) {
+                self.seed_terminals(target, vec![terminal]);
+            } else {
+                held.push(record);
+            }
+        }
+        self.seed_records(target, held);
+        self.seed_reviews(target, plan.reviews);
+        for imported in plan.attachments {
+            self.stage_imported_attachment(target, imported, cx);
+        }
+    }
+
+    pub(super) fn with_context_copy(
+        &self,
+        shell: gpui::Stateful<gpui::Div>,
+        id: &str,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = id.to_owned();
+        shell.on_action(
+            cx.listener(move |this, _: &gpui_component::input::Copy, _, cx| {
+                if let Some((text, fragment)) = super::imports::copy_chip(
+                    &id,
+                    &this.all_context_records(),
+                    &this.environment_id(cx),
+                ) {
+                    write(text, fragment, cx);
+                    cx.stop_propagation();
+                }
+            }),
+        )
+    }
+
     pub(super) fn copy_context_selection(&self, cx: &mut Context<Self>) -> bool {
         let input = self.input.read(cx);
         let range = input.selected_range();
@@ -86,51 +140,29 @@ impl Composer {
         {
             return false;
         }
-        let mut held = self.all_context_records();
-        let Some(text) = records::import_fragment(
+        let Some(fragment) = records::decode_fragment(fragment) else {
+            return false;
+        };
+        let environment = self.environment_id(cx);
+        let mut incoming = records::clipboard_records(
             text,
-            fragment,
-            &mut held,
-            &self.environment_id(cx),
+            fragment["records"].as_array().expect("decoded records"),
+        );
+        if records::field(&fragment["source"], "environmentId") != environment {
+            incoming.retain(|r| !matches!(records::field(r, "kind"), "image" | "file"));
+        }
+        let Some(plan) = super::imports::prepare(
+            text,
+            incoming,
+            &self.all_context_records(),
+            &environment,
+            super::imports::ImportMode::Copy,
             crate::app_state::uuid_v4,
         ) else {
             return false;
         };
-        let existing: Vec<String> = self
-            .mentions(&target)
-            .iter()
-            .map(|r| r.context_id.clone())
-            .chain(self.terminals_for(&target).iter().map(|r| r.context_id()))
-            .chain(self.reviews_for(&target).iter().map(|r| r.context_id()))
-            .collect();
-        let mut terminals = Vec::new();
-        let mut attachments = Vec::new();
-        held.retain(|r| {
-            if let Some(terminal) = records::terminal_from_record(
-                r,
-                &self.thread_id().unwrap_or_default(),
-                &t3_core::sidebar::time::format_iso(crate::sidebar::controller::now_ms()),
-            ) {
-                terminals.push(terminal);
-                return false;
-            }
-            if let Some(attachment) = records::attachment_from_record(r) {
-                attachments.push(attachment);
-                return false;
-            }
-
-            true
-        });
-        self.seed_terminals(&target, terminals);
-        let present: Vec<String> = self
-            .staged_for(&target)
-            .iter()
-            .map(|s| s.attachment.context_id())
-            .collect();
-        attachments.retain(|a| !present.contains(&a.context_id()));
-        self.seed_attachments(&target, attachments);
-        held.retain(|r| !existing.contains(&records::field(r, "contextId").to_owned()));
-        self.seed_records(&target, held);
+        let text = plan.text.clone();
+        self.apply_import(&target, plan, cx);
         self.input
             .update(cx, |input, cx| input.insert(text, window, cx));
         self.draft_changed(cx);

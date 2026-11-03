@@ -17,7 +17,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::composer::review::ReviewComment;
 use t3_core::composer::context::{self as rules, TerminalContext, TerminalSelection};
-use t3_core::composer::menu::{ThreadContext, context_references, sanitize_context_label};
+use t3_core::composer::menu::{ThreadContext, sanitize_context_label};
 
 use super::controls::{Float, floating, floating_shadow};
 use super::{Composer, Target};
@@ -34,7 +34,8 @@ pub(super) struct ContextChips {
     /// Terminal excerpts per target. A send carries those the prompt still links; unlinked ones
     /// stay so an undo that brings a link back brings its chip back.
     terminals: HashMap<Target, Vec<TerminalContext>>,
-    pub(super) records: HashMap<Target, Vec<serde_json::Value>>,
+    pub(super) records: HashMap<Target, Vec<std::sync::Arc<serde_json::Value>>>,
+    parsed: std::cell::RefCell<super::imports::PresentationCache>,
     pub(super) reviews: HashMap<Target, Vec<ReviewComment>>,
     /// The chip whose details popover is open, by context id.
     open: Option<String>,
@@ -48,7 +49,7 @@ enum Chip {
     Terminal(TerminalContext),
     Review(ReviewComment),
     Thread(ThreadContext),
-    Record(serde_json::Value),
+    Record(std::sync::Arc<serde_json::Value>),
     /// A link whose context this composer does not have (`UnresolvedContextChip`).
     Unresolved { context_id: String, label: String },
 }
@@ -231,8 +232,12 @@ impl Composer {
     }
 
     /// Repaints only when the prompt's links change; called on every edit.
+    pub(super) fn chip_references(&self, text: &str) -> std::sync::Arc<[super::imports::ChipReference]> {
+        self.context.parsed.borrow_mut().references(text)
+    }
+
     pub(super) fn sync_context_chips(&mut self, text: &str, cx: &mut Context<Self>) {
-        let linked: Vec<String> = context_references(text).into_iter().map(|reference| reference.context_id.to_owned())
+        let linked: Vec<String> = self.chip_references(text).iter().map(|reference| reference.id.clone())
             .chain(t3_core::assistant_citations::collect(text).into_iter().map(|(range, _)| format!("{}:{}", range.start, &text[range.clone()]))).collect();
         if linked != self.context.linked {
             if self.context.open.as_ref().is_some_and(|open| !linked.contains(open)) {
@@ -248,32 +253,32 @@ impl Composer {
     fn chips(&self, prompt: &str) -> Vec<Chip> {
         let Some(target) = self.snapshot.target.as_ref() else { return Vec::new() };
         let mut chips: Vec<Chip> = Vec::new();
-        for reference in context_references(prompt) {
-            if matches!(reference.kind, "image" | "file") || chips.iter().any(|chip| chip.context_id() == reference.context_id) {
+        for reference in self.chip_references(prompt).iter() {
+            if matches!(reference.kind.as_str(), "image" | "file") || chips.iter().any(|chip| chip.context_id() == reference.id) {
                 continue;
             }
             let terminal = (reference.kind == rules::TERMINAL_KIND)
-                .then(|| self.terminals_for(target).iter().find(|context| context.context_id() == reference.context_id))
+                .then(|| self.terminals_for(target).iter().find(|context| context.context_id() == reference.id))
                 .flatten();
             let thread = (reference.kind == "thread")
-                .then(|| self.mentions(target).iter().find(|thread| thread.context_id == reference.context_id))
+                .then(|| self.mentions(target).iter().find(|thread| thread.context_id == reference.id))
                 .flatten();
             let record = self.records_for(target).iter().find(|r| {
-                t3_core::composer::records::field(r, "contextId") == reference.context_id
+                t3_core::composer::records::field(r, "contextId") == reference.id
                     && t3_core::composer::records::field(r, "kind") == reference.kind
             });
             if let Some(record) = record {
                 chips.push(Chip::Record(record.clone()));
                 continue;
             }
-            let review = self.reviews_for(target).iter().find(|comment| comment.context_id() == reference.context_id);
+            let review = self.reviews_for(target).iter().find(|comment| comment.context_id() == reference.id);
             chips.push(match (terminal, thread, review) {
                 (Some(terminal), _, _) => Chip::Terminal(terminal.clone()),
                 (_, Some(thread), _) => Chip::Thread(thread.clone()),
                 (_, _, Some(comment)) => Chip::Review(comment.clone()),
                 _ => Chip::Unresolved {
-                    context_id: reference.context_id.to_owned(),
-                    label: sanitize_context_label(reference.label, reference.kind),
+                    context_id: reference.id.to_owned(),
+                    label: sanitize_context_label(&reference.label, &reference.kind),
                 },
             });
         }
@@ -315,7 +320,7 @@ impl Composer {
                 let ink = Ink::Accent(p.context_chip_review_comment);
                 let open = self.context.open.as_deref() == Some(context_id.as_str());
                 let toggle_id = context_id.clone();
-                let shell = crate::context_chip::copyable(chip_shell(&context_id, Icon::MessageCircle, comment.label(), ink, true, cx), &comment.record(), &self.state, cx)
+                let shell = self.with_context_copy(chip_shell(&context_id, Icon::MessageCircle, comment.label(), ink, true, cx), &context_id, cx)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.context.open = if this.context.open.as_deref() == Some(&toggle_id) { None } else { Some(toggle_id.clone()) };
                         cx.notify();
@@ -327,7 +332,7 @@ impl Composer {
             Chip::Terminal(context) if !context.is_expired() => {
                 let open = self.context.open.as_deref() == Some(context_id.as_str());
                 let toggle_id = context_id.clone();
-                let shell = crate::context_chip::copyable(chip_shell(&context_id, Icon::Terminal, context.label(), Ink::Accent(p.context_chip_terminal), true, cx), &context.record(), &self.state, cx)
+                let shell = self.with_context_copy(chip_shell(&context_id, Icon::Terminal, context.label(), Ink::Accent(p.context_chip_terminal), true, cx), &context_id, cx)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if Self::guard_reopen(&mut this.context.dismissed) {
@@ -350,12 +355,12 @@ impl Composer {
             Chip::Thread(thread) => {
                 let record = thread.to_record();
                 let (shell, ink) = crate::context_chip::shell(&record, &self.state, true, cx);
-                let shell = crate::context_chip::copyable(shell, &record, &self.state, cx);
+                let shell = self.with_context_copy(shell, &context_id, cx);
                 self.with_remove(shell, &context_id, ink, cx).into_any_element()
             }
             Chip::Record(record) => {
                 let (shell, ink) = crate::context_chip::shell(&record, &self.state, true, cx);
-                let shell = crate::context_chip::copyable(shell, &record, &self.state, cx);
+                let shell = self.with_context_copy(shell, &context_id, cx);
                 let open = self.context.open.as_deref() == Some(&context_id);
                 let toggle_id = context_id.clone();
                 let shell = if crate::context_chip::has_details(&record) {

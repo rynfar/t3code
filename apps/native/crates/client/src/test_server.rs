@@ -27,10 +27,12 @@ pub struct FakeServer {
     session: Arc<Mutex<Value>>,
     descriptor: Arc<Mutex<Option<Value>>>,
     refusal: Refusal,
+    http: HttpRequests,
 }
 
 /// What `/ws` answers instead of upgrading, when set.
 type Refusal = Arc<Mutex<Option<(u16, Value)>>>;
+type HttpRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 pub struct Connection {
     pub path: String,
@@ -48,17 +50,20 @@ impl FakeServer {
         let described = descriptor.clone();
         let refusal: Refusal = Arc::new(Mutex::new(None));
         let refused = refusal.clone();
+        let http=Arc::new(Mutex::new(Vec::new()));
+        let requests=http.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (tx, session, descriptor, refusal) = (tx.clone(), served.clone(), described.clone(), refused.clone());
+                let http=requests.clone();
                 tokio::spawn(async move {
-                    if let Some(connection) = serve(stream, session, descriptor, refusal).await {
+                    if let Some(connection) = serve(stream, session, descriptor, refusal, http).await {
                         let _ = tx.send(connection);
                     }
                 });
             }
         });
-        FakeServer { addr, connections, session, descriptor, refusal }
+        FakeServer { addr, connections, session, descriptor, refusal, http }
     }
 
     /// `/ws` answers this status and JSON body instead of upgrading; `None` upgrades again.
@@ -75,6 +80,8 @@ impl FakeServer {
     pub fn set_session(&self, state: Value) {
         *self.session.lock().expect("session") = state;
     }
+
+    pub fn http_requests(&self) -> Vec<(String,Vec<u8>)> {self.http.lock().expect("HTTP requests").clone()}
 
     pub fn port(&self) -> u16 {
         self.addr.port()
@@ -120,7 +127,7 @@ async fn respond_status(mut stream: TcpStream, status: u16, body: Value) {
     let _ = stream.shutdown().await;
 }
 
-async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>, refusal: Refusal) -> Option<Connection> {
+async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>, refusal: Refusal, http: HttpRequests) -> Option<Connection> {
     let head = read_head(&mut stream).await?;
     let path = head.split_whitespace().nth(1)?.to_owned();
     let header = |name: &str| {
@@ -129,6 +136,14 @@ async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Ar
             key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
         })
     };
+    if path=="/test-copy-source" || path=="/test-copy-destination" {
+        let mut body=vec![0;header("content-length").and_then(|n|n.parse::<usize>().ok()).unwrap_or(0)];
+        stream.read_exact(&mut body).await.ok()?;
+        http.lock().expect("HTTP requests").push((path.clone(),body));
+        let bytes=if path=="/test-copy-source" {b"source bytes".as_slice()}else{b"{}".as_slice()};
+        stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",bytes.len()).as_bytes()).await.ok()?;
+        stream.write_all(bytes).await.ok()?; return None;
+    }
     if head.starts_with("POST /api/auth/websocket-ticket") {
         respond_json(stream, json!({ "ticket": "ticket" })).await;
         return None;

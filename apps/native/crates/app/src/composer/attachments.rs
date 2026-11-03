@@ -31,6 +31,7 @@ pub(super) struct Staged {
     /// The bytes, kept until the upload lands so a failed one can retry.
     bytes: Option<Arc<Vec<u8>>>,
     _upload: Option<Task<()>>,
+    source: Option<String>,
 }
 
 #[derive(Default)]
@@ -70,8 +71,15 @@ impl Composer {
         if restored.is_empty() {
             return;
         }
-        let staged = restored.into_iter().map(|attachment| Staged { attachment, preview: None, bytes: None, _upload: None });
+        let staged = restored.into_iter().map(|attachment| Staged { attachment, preview: None, bytes: None, _upload: None, source: None });
         self.attachments.staged.entry(target.clone()).or_default().extend(staged);
+    }
+
+    pub(super) fn stage_imported_attachment(&mut self, target: &Target, imported: super::imports::ImportedAttachment, cx: &mut Context<Self>) {
+        let id=imported.attachment.id.clone();
+        let copying=imported.source.is_some();
+        self.attachments.staged.entry(target.clone()).or_default().push(Staged {attachment:imported.attachment, preview:None, bytes:None, _upload:None, source:imported.source});
+        if copying {self.start_upload(target.clone(),id,cx);}
     }
 
     pub(super) fn staged_attachments(&self) -> Vec<Attachment> {
@@ -182,6 +190,7 @@ impl Composer {
             preview,
             bytes: Some(Arc::new(bytes)),
             _upload: None,
+            source: None,
         });
         self.record_draft(target, cx);
         self.start_upload(target.clone(), id, cx);
@@ -192,13 +201,16 @@ impl Composer {
     }
 
     /// Mints an upload and posts the bytes on the network runtime.
-    fn start_upload(&mut self, target: Target, id: String, cx: &mut Context<Self>) {
+    pub(super) fn start_upload(&mut self, target: Target, id: String, cx: &mut Context<Self>) {
         let (client, runtime) = {
             let state = self.state.read(cx);
             (state.client_handle(), state.runtime().clone())
         };
         let Some(staged) = self.find_staged(&target, &id) else { return };
-        let Some(bytes) = staged.bytes.clone() else { return };
+        let bytes = staged.bytes.clone();
+        let source = staged.source.clone();
+        if bytes.is_none() && source.is_none() { return; }
+        let attachment = staged.attachment.clone();
         staged.attachment.upload = Upload::Uploading;
         let Some(client) = client else {
             staged.attachment.upload = Upload::Failed { reason: "Not connected".to_owned() };
@@ -209,7 +221,10 @@ impl Composer {
         let (task_target, task_id) = (target.clone(), id.clone());
         let task = cx.spawn(async move |this, cx| {
             let result = runtime
-                .spawn(async move { t3_client::upload::upload_attachment_owned(client, request, &mime_type, bytes.to_vec()).await })
+                .spawn(async move { match source {
+                    Some(source)=>t3_client::upload::copy_attachment_owned(client,&attachment,&source).await,
+                    None=>t3_client::upload::upload_attachment_owned(client, request, &mime_type, bytes.expect("upload bytes").to_vec()).await,
+                } })
                 .await
                 .unwrap_or_else(|_| Err("Upload failed".to_owned()));
             let _ = this.update(cx, |this, cx| {

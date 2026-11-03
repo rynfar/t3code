@@ -6,6 +6,7 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+pub(crate) mod imports;
 mod citations;
 pub(crate) mod context;
 pub(crate) mod clipboard;
