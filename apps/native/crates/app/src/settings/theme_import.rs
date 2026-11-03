@@ -37,6 +37,8 @@ pub(super) struct ThemeImportDialog {
     saving: bool,
     save_error: Option<String>,
     _subscription: Subscription,
+    #[cfg(all(test, feature = "snapshot"))]
+    install_gates: Option<(futures::channel::oneshot::Receiver<()>, futures::channel::oneshot::Receiver<()>)>,
 }
 impl ThemeImportDialog {
     fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -62,6 +64,8 @@ impl ThemeImportDialog {
             saving: false,
             save_error: None,
             _subscription: subscription,
+            #[cfg(all(test, feature = "snapshot"))]
+            install_gates: None,
         }
     }
     #[cfg(feature = "snapshot")]
@@ -242,43 +246,62 @@ impl ThemeImportDialog {
         let session = self.session.clone();
         let doc = store::client(cx).clone();
         let resolving = matches!(operation, InstallOperation::Conflicts(_));
+        #[cfg(all(test, feature = "snapshot"))]
+        let gates = self.install_gates.take();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let (prepared, result) = cx
+            #[cfg(all(test, feature = "snapshot"))]
+            let completion_gate = if let Some((preparation, completion)) = gates {
+                let _ = preparation.await;
+                Some(completion)
+            } else {
+                None
+            };
+            let transaction = cx
                 .background_executor()
                 .spawn(async move {
-                    let prepared = prepare_import(session, &doc, operation);
-                    let result = if prepared.patch.is_empty() {
-                        Ok(())
-                    } else {
-                        t3_client::store::commit_client_settings(prepared.patch.clone())
-                    };
-                    (prepared, result)
+                    t3_client::store::commit_client_settings_with(doc, move |current| {
+                        let prepared = prepare_import(session, current, operation);
+                        (prepared.patch.clone(), prepared)
+                    })
                 })
                 .await;
+            #[cfg(all(test, feature = "snapshot"))]
+            if let Some(gate) = completion_gate {
+                let _ = gate.await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.saving = false;
                 this.session.reading = false;
-                if let Err(error) = result {
-                    this.save_error = Some(
-                        prepared
-                            .result
-                            .installed
-                            .iter()
-                            .map(|t| format!("{}: {error}", t.label))
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    );
-                    this.session.error = prepared.session.error;
-                    if !resolving {
-                        this.session.conflicts = prepared.session.conflicts;
+                let (prepared, result) = match transaction {
+                    Ok(value) => value,
+                    Err(error) => {
+                        this.save_error = Some(error);
+                        this.focus_form(window, cx);
+                        return cx.notify();
                     }
-                    this.focus_form(window, cx);
-                    return cx.notify();
-                }
-                if !prepared.patch.is_empty() {
-                    store::install_committed_client(&this.state, prepared.patch, cx);
-                }
+                };
+                let receipt = match result {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        this.save_error = Some(
+                            prepared
+                                .result
+                                .installed
+                                .iter()
+                                .map(|t| format!("{}: {error}", t.label))
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        );
+                        this.session.error = prepared.session.error;
+                        if !resolving {
+                            this.session.conflicts = prepared.session.conflicts;
+                        }
+                        this.focus_form(window, cx);
+                        return cx.notify();
+                    }
+                };
+                store::install_client_commit(&this.state, receipt, cx);
                 this.session = prepared.session;
                 if !prepared.result.installed.is_empty() {
                     let themes = &prepared.result.installed;
@@ -787,6 +810,10 @@ mod tests {
             })
             .clone();
         t3_client::store::use_home(home.clone());
+        let _ = t3_client::store::commit_client_settings(serde_json::Map::new());
+        let settings = home.join("settings.json");
+        if settings.is_dir() { std::fs::remove_dir_all(settings).unwrap(); }
+        else if settings.exists() { std::fs::remove_file(settings).unwrap(); }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -830,11 +857,9 @@ mod tests {
                 view.sync_input(window, cx);
                 let theme = themes::import(&source()).unwrap();
                 let library = themes::install(store::client(cx), &theme).unwrap();
-                store::install_committed_client(
-                    &state,
-                    serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), library)]),
-                    cx,
-                );
+                let patch=serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), library)]);
+                t3_client::store::commit_client_settings(patch.clone()).unwrap();
+                store::install_committed_client(&state,patch,cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -906,6 +931,94 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
+    fn concurrent_library_edits_survive_preparation_and_delayed_completion(
+        cx: &mut TestAppContext,
+    ) {
+        let (_runtime, state, home) = setup(cx);
+        let theme = |name: &str| themes::import(&source().replace("Dusk", name)).unwrap();
+        let baseline = serde_json::json!([theme("Keep"), theme("Remove")]);
+        let edited = serde_json::json!([theme("Keep"), theme("Other")]);
+        let mut outcomes = Vec::new();
+        for confirmed in [false, true] {
+            for after_commit in [false, true] {
+                let patch =
+                    serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), baseline.clone())]);
+                t3_client::store::commit_client_settings(patch.clone()).unwrap();
+                cx.update(|cx| store::install_committed_client(&state, patch, cx));
+                let (prepare, preparation) = futures::channel::oneshot::channel();
+                let mut prepare = Some(prepare);
+                let (complete, completion) = futures::channel::oneshot::channel();
+                let window =
+                    cx.add_window(|window, cx| ThemeImportDialog::new(state.clone(), window, cx));
+                window
+                    .update(cx, |view, window, cx| {
+                        view.install_gates = Some((preparation, completion));
+                        view.install_single(theme("Dusk"), window, cx);
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                if after_commit {
+                    prepare.take().unwrap().send(()).unwrap();
+                    cx.run_until_parked();
+                }
+                if confirmed {
+                    let before = cx.read(|cx| {
+                        store::client(cx)
+                            .entries()
+                            .get(themes::LIBRARY_KEY)
+                            .cloned()
+                    });
+                    let receipt = t3_client::store::commit_client_settings_rebased(
+                        serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), edited.clone())]),
+                        before,
+                    )
+                    .unwrap();
+                    cx.update(|cx| store::install_client_commit(&state, receipt, cx));
+                } else {
+                    cx.update(|cx| {
+                        store::update_client(
+                            &state,
+                            ClientSettingChange::ThemeLibrary(edited.clone()),
+                            cx,
+                        )
+                    });
+                }
+                t3_client::store::commit_client_settings(serde_json::Map::new()).unwrap();
+                if !after_commit {
+                    prepare.take().unwrap().send(()).unwrap();
+                }
+                complete.send(()).unwrap();
+                cx.run_until_parked();
+                let memory = cx.read(|cx| {
+                    themes::library(store::client(cx))
+                        .into_iter()
+                        .map(|t| t.id)
+                        .collect::<std::collections::BTreeSet<_>>()
+                });
+                let disk = t3_core::client_settings::ClientSettingsDoc::from_json(
+                    &std::fs::read_to_string(home.join("settings.json")).unwrap(),
+                );
+                let disk = themes::library(&disk)
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                outcomes.push((confirmed, after_commit, memory, disk));
+            }
+        }
+        let expected =
+            std::collections::BTreeSet::from(["dusk".into(), "keep".into(), "other".into()]);
+        for (confirmed, after_commit, memory, disk) in outcomes {
+            assert_eq!(
+                disk, expected,
+                "persisted library, confirmed: {confirmed}, delayed completion: {after_commit}"
+            );
+            assert_eq!(
+                memory, expected,
+                "in-memory library, confirmed: {confirmed}, delayed completion: {after_commit}"
+            );
+        }
+    }
+    #[gpui::test]
     fn single_batch_and_conflict_stay_open_when_the_settings_write_fails(cx: &mut TestAppContext) {
         let (_runtime, state, home) = setup(cx);
         std::fs::create_dir_all(home.join("settings.json")).unwrap();
@@ -955,6 +1068,8 @@ mod tests {
             last = Some(window);
         }
         std::fs::remove_dir_all(home.join("settings.json")).unwrap();
+        let baseline=cx.read(|cx|store::client(cx).entries().get(themes::LIBRARY_KEY).cloned().unwrap());
+        t3_client::store::commit_client_settings(serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(),baseline)])).unwrap();
         let window = last.unwrap();
         window
             .update(cx, |view, window, cx| {

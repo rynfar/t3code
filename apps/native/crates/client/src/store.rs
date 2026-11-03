@@ -294,7 +294,7 @@ pub fn load_environments() -> SavedEnvironments {
 /// Queues edits for the background writer, which re-reads the file and applies them in order.
 pub fn save_environment_changes(changes: Vec<EnvironmentChange>) {
     if !changes.is_empty() {
-        queue(ENVIRONMENTS_KEY, Save::Environments(changes));
+        let _ = queue(ENVIRONMENTS_KEY, Save::Environments(changes));
     }
 }
 
@@ -371,7 +371,7 @@ pub fn load_client_settings() -> Option<String> {
 /// cannot be read, and backs up a file that is not a settings object before replacing it.
 pub fn patch_client_settings(patch: serde_json::Map<String, serde_json::Value>) {
     if !patch.is_empty() {
-        queue(CLIENT_SETTINGS, Save::Patch(patch));
+        let _ = queue(CLIENT_SETTINGS, Save::Patch(patch));
     }
 }
 
@@ -388,7 +388,7 @@ pub fn load_ui_state(name: &str) -> Option<serde_json::Value> {
 /// can never overwrite a newer one.
 pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
     let Ok(text) = serde_json::to_string(value) else { return };
-    queue(name, Save::Replace(text));
+    let _ = queue(name, Save::Replace(text));
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -399,58 +399,207 @@ enum Save {
 }
 
 type SaveReply = mpsc::Sender<Result<(), String>>;
-type WriteRequest = (String, Save, Option<SaveReply>);
-fn writer() -> Option<&'static mpsc::Sender<WriteRequest>> {
-    static WRITER: OnceLock<Option<mpsc::Sender<WriteRequest>>> = OnceLock::new();
-    WRITER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<WriteRequest>();
-        let spawned = std::thread::Builder::new().name("t3-ui-state".into()).spawn(move || {
-            run_writer(rx,base);
-        });
-        spawned.ok().map(|_| tx)
-    }).as_ref()
+type SavedRequest = (String, Save, Option<SaveReply>);
+enum WriteRequest {
+    Save(SavedRequest),
+    Update(Box<dyn FnOnce(Option<PathBuf>) + Send>),
 }
-fn run_writer(rx:mpsc::Receiver<WriteRequest>,resolve_base:impl Fn()->Option<PathBuf>) {
-    while let Ok(first) = rx.recv() {
-        let mut pending = Vec::new();
-        for (name, save, reply) in std::iter::once(first).chain(rx.try_iter()) {
-            if let Some(reply) = reply {
-                write_pending(resolve_base(),std::mem::take(&mut pending));
-                let result = resolve_base().ok_or_else(|| "Native home is unavailable.".to_owned()).and_then(|base| {
-                    match save {
-                        Save::Patch(patch) => write_patch_result(&base, &name, &patch).map_err(|e|e.to_string()),
-                        _ => unreachable!("only settings patches request confirmation"),
-                    }
-                });
-                let _ = reply.send(result);
-            } else { pending.push((name, save)); }
-        }
-        write_pending(resolve_base(),pending);
+impl From<SavedRequest> for WriteRequest {
+    fn from(value: SavedRequest) -> Self {
+        Self::Save(value)
     }
 }
-fn write_pending(base:Option<PathBuf>,pending: Vec<(String, Save)>) {
+struct Writer(std::sync::Mutex<(u64, mpsc::Sender<WriteRequest>)>);
+impl Writer {
+    fn send(&self, request: impl FnOnce(u64) -> WriteRequest) -> Result<u64, String> {
+        let mut writer = self.0.lock().map_err(|e| e.to_string())?;
+        writer.0 += 1;
+        let sequence = writer.0;
+        writer
+            .1
+            .send(request(sequence))
+            .map_err(|e| e.to_string())?;
+        Ok(sequence)
+    }
+}
+fn writer() -> Option<&'static Writer> {
+    static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
+    WRITER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<WriteRequest>();
+            let spawned = std::thread::Builder::new()
+                .name("t3-ui-state".into())
+                .spawn(move || {
+                    run_writer(rx, base);
+                });
+            spawned.ok().map(|_| Writer(std::sync::Mutex::new((0, tx))))
+        })
+        .as_ref()
+}
+fn run_writer<T: Into<WriteRequest>>(
+    rx: mpsc::Receiver<T>,
+    resolve_base: impl Fn() -> Option<PathBuf>,
+) {
+    while let Ok(first) = rx.recv() {
+        let mut pending = Vec::new();
+        for request in std::iter::once(first).chain(rx.try_iter()).map(Into::into) {
+            match request {
+                WriteRequest::Update(update) => {
+                    write_pending(resolve_base(), std::mem::take(&mut pending));
+                    update(resolve_base());
+                }
+                WriteRequest::Save((name, save, reply)) => {
+                    if let Some(reply) = reply {
+                        write_pending(resolve_base(), std::mem::take(&mut pending));
+                        let result = resolve_base()
+                            .ok_or_else(|| "Native home is unavailable.".to_owned())
+                            .and_then(|base| match save {
+                                Save::Patch(patch) => write_patch_result(&base, &name, &patch)
+                                    .map_err(|e| e.to_string()),
+                                _ => unreachable!("only settings patches request confirmation"),
+                            });
+                        let _ = reply.send(result);
+                    } else {
+                        pending.push((name, save));
+                    }
+                }
+            }
+        }
+        write_pending(resolve_base(), pending);
+    }
+}
+fn write_pending(base: Option<PathBuf>, pending: Vec<(String, Save)>) {
     if let Some(base) = base {
         for (name, save) in coalesce(pending.into_iter()) {
             match save {
                 Save::Replace(text) => write_atomically(&base, &name, &text),
                 Save::Patch(patch) => write_patch(&base, &name, &patch),
                 Save::Environments(changes) => {
-                    if let Err(error) = write_environment_changes(&base, changes) { tracing::warn!(%error, "could not save environments"); }
+                    if let Err(error) = write_environment_changes(&base, changes) {
+                        tracing::warn!(%error, "could not save environments");
+                    }
                 }
             }
         }
     }
 }
-fn queue(name: &str, save: Save) {
-    if let Some(writer) = writer() { let _ = writer.send((name.to_owned(), save, None)); }
+fn queue(name: &str, save: Save) -> Option<u64> {
+    writer()?
+        .send(|_| (name.to_owned(), save, None).into())
+        .ok()
 }
 /// Commits a theme-library/selection transaction in writer order. Call off the UI thread.
-pub fn commit_client_settings(patch: serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+pub fn commit_client_settings(
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
-    writer().ok_or("Settings writer is unavailable.")?.send((CLIENT_SETTINGS.into(), Save::Patch(patch), Some(tx))).map_err(|e|e.to_string())?;
-    rx.recv().map_err(|e|e.to_string())?
+    writer()
+        .ok_or("Settings writer is unavailable.")?
+        .send(|_| (CLIENT_SETTINGS.into(), Save::Patch(patch), Some(tx)).into())?;
+    rx.recv().map_err(|e| e.to_string())?
 }
 
+pub struct ClientCommit {
+    pub sequence: u64,
+    pub patch: serde_json::Map<String, serde_json::Value>,
+}
+type ClientUpdateReply<T> = mpsc::Receiver<(T, Result<ClientCommit, String>)>;
+fn enqueue_client_update<T: Send + 'static>(
+    fallback: t3_core::client_settings::ClientSettingsDoc,
+    prepare: impl FnOnce(
+        &t3_core::client_settings::ClientSettingsDoc,
+    ) -> (serde_json::Map<String, serde_json::Value>, T)
+    + Send
+    + 'static,
+) -> Result<(u64, ClientUpdateReply<T>), String> {
+    let (tx, rx) = mpsc::channel();
+    let sequence = writer()
+        .ok_or("Settings writer is unavailable.")?
+        .send(move |sequence| {
+            WriteRequest::Update(Box::new(move |base| {
+                let current = base
+                    .ok_or_else(|| "Native home is unavailable.".to_owned())
+                    .and_then(|base| {
+                        let text = match std::fs::read_to_string(base.join("settings.json")) {
+                            Ok(text) => Ok(text),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(String::new())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }?;
+                        Ok((base, text))
+                    });
+                let doc = current
+                    .as_ref()
+                    .map(|(_, text)| t3_core::client_settings::ClientSettingsDoc::from_json(text))
+                    .unwrap_or(fallback);
+                let (patch, value) = prepare(&doc);
+                let result = current.and_then(|(base, _)| {
+                    if !patch.is_empty() {
+                        write_patch_result(&base, CLIENT_SETTINGS, &patch)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(ClientCommit { sequence, patch })
+                });
+                if let Err(error) = &result {
+                    tracing::warn!(%error,"settings not saved");
+                }
+                let _ = tx.send((value, result));
+            }))
+        })?;
+    Ok((sequence, rx))
+}
+/// Prepares and commits against the current file in writer order. Call off the UI thread.
+pub fn commit_client_settings_with<T: Send + 'static>(
+    fallback: t3_core::client_settings::ClientSettingsDoc,
+    prepare: impl FnOnce(
+        &t3_core::client_settings::ClientSettingsDoc,
+    ) -> (serde_json::Map<String, serde_json::Value>, T)
+    + Send
+    + 'static,
+) -> Result<(T, Result<ClientCommit, String>), String> {
+    let (_, rx) = enqueue_client_update(fallback, prepare)?;
+    rx.recv().map_err(|e| e.to_string())
+}
+fn rebase_theme_patch(
+    mut patch: serde_json::Map<String, serde_json::Value>,
+    before: Option<&serde_json::Value>,
+    current: &t3_core::client_settings::ClientSettingsDoc,
+) -> serde_json::Map<String, serde_json::Value> {
+    if let Some(after) = patch.get(t3_core::themes::LIBRARY_KEY) {
+        let library = t3_core::themes::transaction::rebase_library(
+            before,
+            after,
+            current.entries().get(t3_core::themes::LIBRARY_KEY),
+        );
+        patch.insert(t3_core::themes::LIBRARY_KEY.into(), library);
+    }
+    patch
+}
+/// Queues only the changed themes, preserving other edits that reach the writer first.
+pub fn patch_client_settings_rebased(
+    patch: serde_json::Map<String, serde_json::Value>,
+    before: Option<serde_json::Value>,
+) -> Option<u64> {
+    if patch.contains_key(t3_core::themes::LIBRARY_KEY) {
+        enqueue_client_update(Default::default(), move |doc| {
+            (rebase_theme_patch(patch, before.as_ref(), doc), ())
+        })
+        .ok()
+        .map(|(sequence, _)| sequence)
+    } else {
+        queue(CLIENT_SETTINGS, Save::Patch(patch))
+    }
+}
+pub fn commit_client_settings_rebased(
+    patch: serde_json::Map<String, serde_json::Value>,
+    before: Option<serde_json::Value>,
+) -> Result<ClientCommit, String> {
+    let (_, result) = commit_client_settings_with(Default::default(), move |doc| {
+        (rebase_theme_patch(patch, before.as_ref(), doc), ())
+    })?;
+    result
+}
 /// Keeps one save per file, in the order files were first saved: the newest replacement, with
 /// later patches merged into it or into each other.
 fn coalesce(saves: impl Iterator<Item = (String, Save)>) -> Vec<(String, Save)> {

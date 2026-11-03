@@ -205,29 +205,45 @@ impl Editor {
                 self.saving = true;
                 cx.notify();
                 let patch = save.patch.clone();
+                let before_library = store::client(cx)
+                    .entries()
+                    .get(t3_core::themes::LIBRARY_KEY)
+                    .cloned();
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_executor()
-                        .spawn(async move { t3_client::store::commit_client_settings(patch) })
+                        .spawn(async move {
+                            t3_client::store::commit_client_settings_rebased(patch, before_library)
+                        })
                         .await;
                     let _ = this.update(cx, |this, cx| {
                         this.saving = false;
-                        if let Err(e) = result {
-                            this.session.error = Some(e);
-                            cx.notify();
-                            return;
-                        }
-                        store::install_committed_client(&this.state, save.patch, cx);
+                        let receipt = match result {
+                            Ok(receipt) => receipt,
+                            Err(e) => {
+                                this.session.error = Some(e);
+                                cx.notify();
+                                return;
+                            }
+                        };
+                        store::install_client_commit(&this.state, receipt, cx);
                         let (title, description) = if let Some(dark) = save.merged_dark {
                             (
                                 format!("{} updated", save.theme.label),
-                                format!("Its {} palette was added.", if dark { "dark" } else { "light" }),
+                                format!(
+                                    "Its {} palette was added.",
+                                    if dark { "dark" } else { "light" }
+                                ),
                             )
                         } else if save.created {
-                            (format!("{} created", save.theme.label), "It’s now active.".into())
+                            (
+                                format!("{} created", save.theme.label),
+                                "It’s now active.".into(),
+                            )
                         } else {
                             let p = theme::preferences(cx);
-                            let active = p.theme.named_id() == Some(&save.theme.id) || p.halves.values().any(|id| id == &save.theme.id);
+                            let active = p.theme.named_id() == Some(&save.theme.id)
+                                || p.halves.values().any(|id| id == &save.theme.id);
                             (
                                 format!("{} saved", save.theme.label),
                                 if active {
@@ -240,7 +256,8 @@ impl Editor {
                         };
                         this.state.update(cx, |state, cx| {
                             state.show_toast(
-                                crate::toast::Toast::new(crate::toast::ToastKind::Success, title).description(description),
+                                crate::toast::Toast::new(crate::toast::ToastKind::Success, title)
+                                    .description(description),
                                 cx,
                             )
                         });
