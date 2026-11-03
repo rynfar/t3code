@@ -7,6 +7,7 @@
 mod about;
 mod access;
 mod appearance;
+pub(crate) mod theme_import;
 mod archive;
 pub(crate) mod controls;
 mod devices;
@@ -416,6 +417,10 @@ impl SettingsView {
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
         if self.dismiss_keybinding_overlay(window, cx) {
+            return;
+        }
+        if let Some(dialog)=self.appearance_ui.import.clone() && dialog.read(cx).is_open() {
+            dialog.update(cx,|dialog,cx|dialog.close(window,cx));
             return;
         }
         if self.projects.actions.dismiss() || self.secrets.dismiss() || self.maintenance.dismiss() {
@@ -859,6 +864,7 @@ impl Render for SettingsView {
             .children(action_editor)
             .children(secret_dialog)
             .children(background_dialog)
+            .children(self.appearance_ui.import.clone())
     }
 }
 
@@ -867,12 +873,4 @@ pub(crate) fn import_theme_fixture(path:&std::path::Path,state:&Entity<AppState>
     let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
     let theme=t3_core::themes::import(&text)?;
     appearance::import_theme(state,theme,true,cx);Ok(())
-}
-
-#[cfg(feature="snapshot")]
-pub(crate) fn reimport_theme_fixture(path:&std::path::Path,cx:&mut App)->Result<(),String> {
-    let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
-    let theme=t3_core::themes::import(&text)?;
-    let view=cx.global::<Host>().view.clone().ok_or("settings must be open for reimport")?;
-    view.update(cx,|view,cx|view.install_theme(theme,true,cx));Ok(())
 }

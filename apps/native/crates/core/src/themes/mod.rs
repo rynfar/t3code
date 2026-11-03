@@ -2,6 +2,8 @@
 //! `ThemeSettings.tsx`, `appearanceContrast.ts` and `index.css`.
 mod color;
 pub mod editor;
+pub mod importer;
+pub mod transaction;
 #[cfg(test)]
 mod tests;
 mod vivid;
@@ -129,7 +131,11 @@ fn overrides(v: &Value, strict: bool) -> Result<Colors, String> {
     }
     Ok(colors)
 }
+#[cfg(test)]
+thread_local! { static STORED_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
+    #[cfg(test)]
+    if stored { STORED_DECODES.with(|n|n.set(n.get()+1)); }
     let v = value.as_object().ok_or("Theme files must contain a JSON object.")?;
     if !stored && v.get("version").and_then(Value::as_u64) != Some(1) {
         return Err("This theme file uses an unsupported version. Expected 1.".into());
@@ -487,23 +493,7 @@ pub fn resolve_import(doc: &ClientSettingsDoc, theme: &ThemeDefinition, choice: 
             });
             Ok(Value::Array(stored))
         }
-        ImportChoice::KeepBoth => {
-            for copy in 1..100 {
-                let suffix = format!(" ({copy})");
-                let label = format!("{}{}", theme.label.chars().take(48 - suffix.len()).collect::<String>(), suffix);
-                let candidate = ThemeDefinition { id: id_from_name(&label), label, collection: None, ..theme.clone() };
-                if !reserved(&candidate.id)
-                    && !doc
-                        .entries()
-                        .get(LIBRARY_KEY)
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| a.iter().any(|v| v.get("id").and_then(Value::as_str) == Some(&candidate.id)))
-                {
-                    return install(doc, &candidate);
-                }
-            }
-            Err(format!("Too many copies of \"{}\".", theme.label))
-        }
+        ImportChoice::KeepBoth => install(doc, &importer::versioned_copy(doc, theme, None)?),
     }
 }
 pub fn select_collection(doc: &ClientSettingsDoc, themes: &[ThemeDefinition]) -> serde_json::Map<String, Value> {

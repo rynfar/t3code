@@ -29,6 +29,8 @@ struct PendingSave {
 
 struct ClientPrefs {
     doc: ClientSettingsDoc,
+    versions: std::collections::BTreeMap<String,u64>,
+    library_versions: t3_core::themes::transaction::LibraryVersions,
     /// The last server save that failed, shown above the settings page until the next edit.
     error: Option<SharedString>,
     saving: bool,
@@ -50,7 +52,7 @@ pub fn init(cx: &mut App) {
     crate::notifications::prepare_sounds(doc.notification_mode());
     theme::set_preferences(preferences(&doc), cx);
     terminal::set_typography(terminal::typography(doc.entries()), cx);
-    cx.set_global(ClientPrefs { doc, error: None, saving: false, queue: VecDeque::new() });
+    cx.set_global(ClientPrefs { doc, versions: Default::default(), library_versions: Default::default(), error: None, saving: false, queue: VecDeque::new() });
 }
 
 fn preferences(doc: &ClientSettingsDoc) -> Preferences {
@@ -88,25 +90,87 @@ pub fn show_error(message: impl Into<SharedString>, cx: &mut App) {
 pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: &mut App) {
     apply_client(state, change, true, cx);
 }
-pub fn install_committed_client(state: &Entity<AppState>, patch: serde_json::Map<String, serde_json::Value>, cx: &mut App) {
+#[cfg(all(test, feature = "snapshot"))]
+pub fn install_committed_client(
+    state: &Entity<AppState>,
+    patch: serde_json::Map<String, serde_json::Value>,
+    cx: &mut App,
+) {
     apply_client(state, ClientSettingChange::ThemePatch(patch), false, cx);
 }
-fn apply_client(state: &Entity<AppState>, change: ClientSettingChange, persist: bool, cx: &mut App) {
+pub fn install_client_commit(state: &Entity<AppState>, receipt: store::ClientCommit, cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
+    let mut patch = serde_json::Map::new();
+    for (key, value) in receipt.patch {
+        if key == t3_core::themes::LIBRARY_KEY {
+            let library = prefs.library_versions.committed(
+                prefs.doc.entries().get(&key),
+                &value,
+                receipt.sequence,
+            );
+            patch.insert(key, library);
+        } else if prefs.versions.get(&key).copied().unwrap_or_default() <= receipt.sequence {
+            prefs.versions.insert(key.clone(), receipt.sequence);
+            patch.insert(key, value);
+        }
+    }
+    apply_client(state, ClientSettingChange::ThemePatch(patch), false, cx);
+}
+fn apply_client(
+    state: &Entity<AppState>,
+    change: ClientSettingChange,
+    persist: bool,
+    cx: &mut App,
+) {
+    let prefs = cx.global_mut::<ClientPrefs>();
+    let library_changed = matches!(&change, ClientSettingChange::ThemeLibrary(_))
+        || matches!(&change,ClientSettingChange::ThemePatch(patch) if patch.contains_key(t3_core::themes::LIBRARY_KEY));
+    let before_library = library_changed
+        .then(|| {
+            prefs
+                .doc
+                .entries()
+                .get(t3_core::themes::LIBRARY_KEY)
+                .cloned()
+        })
+        .flatten();
     let patch = prefs.doc.apply_change(&change);
     if patch.is_empty() {
         return;
     }
-    if persist { store::patch_client_settings(patch); }
+    if persist {
+        let keys = patch.keys().cloned().collect::<Vec<_>>();
+        if let Some(sequence) = store::patch_client_settings_rebased(patch, before_library.clone())
+        {
+            for key in keys {
+                prefs.versions.insert(key, sequence);
+            }
+            if library_changed
+                && let Some(after) = prefs.doc.entries().get(t3_core::themes::LIBRARY_KEY)
+            {
+                prefs
+                    .library_versions
+                    .edited(before_library.as_ref(), after, sequence);
+            }
+        }
+    }
     let (composer, next) = (prefs.doc.composer(), preferences(&prefs.doc));
     let typography = terminal::typography(prefs.doc.entries());
     state.update(cx, |state, cx| {
         state.client_settings = composer;
-        if matches!(change, ClientSettingChange::NotificationMode(_) | ClientSettingChange::InAppNotifications(_)) {
+        if matches!(
+            change,
+            ClientSettingChange::NotificationMode(_) | ClientSettingChange::InAppNotifications(_)
+        ) {
             crate::notifications::prepare_sounds(state.client_settings.notification_mode);
             state.observe_notifications(cx);
         }
-        if matches!(change, ClientSettingChange::DiffLayout(_) | ClientSettingChange::DiffFilesCollapsed(_) | ClientSettingChange::DiffIgnoreWhitespace(_)) {
+        if matches!(
+            change,
+            ClientSettingChange::DiffLayout(_)
+                | ClientSettingChange::DiffFilesCollapsed(_)
+                | ClientSettingChange::DiffIgnoreWhitespace(_)
+        ) {
             cx.emit(AppEvent::RightPanel);
         }
     });
@@ -114,7 +178,6 @@ fn apply_client(state: &Entity<AppState>, change: ClientSettingChange, persist: 
     terminal::set_typography(typography, cx);
     cx.refresh_windows();
 }
-
 /// Saves one server setting. A failure keeps the saved value on screen and says why.
 pub fn update_server(state: &Entity<AppState>, change: ServerSettingChange, cx: &mut App) {
     update_server_with(state, change, None, cx);
