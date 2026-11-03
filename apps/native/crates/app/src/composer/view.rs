@@ -370,7 +370,10 @@ impl Render for Composer {
                                 .children(self.render_attachments(cx))
                                 .children(self.render_context_chips(cx))
                                 .children(self.render_citation_chips(cx))
-                                .child(Textarea::new(&self.input).appearance(false).line_height(px(22.75))),
+                                .child(Textarea::new(&self.input).appearance(false)
+                                    .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
+                                    .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
+                                    .line_height(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx) * 1.625))),
                         )
                         .child(
                             h_flex()

@@ -285,7 +285,7 @@ Sources: `index.css:170–190, 1714–1720, 1787–1801, 1893–2137`, `appearan
 | Prompt size    | 14px (`text-sm`)                 | 12–20  | Composer. Only honored with advanced typography; otherwise `text-sm`, which still scales with the interface size |
 | Code size      | 13px                             | 10–18  | Code blocks, tool output, diffs. Fixed px                                                                        |
 | Terminal size  | 12px                             | 8–20   | Terminal                                                                                                         |
-| Font smoothing | off                              | toggle | `-webkit-font-smoothing: antialiased`                                                                            |
+| Font smoothing | on                               | toggle | Web: `-webkit-font-smoothing: antialiased`; native: n/a (GPUI exposes no override)                               |
 
 ### 3.2 Scale
 

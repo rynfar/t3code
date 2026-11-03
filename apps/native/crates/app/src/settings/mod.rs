@@ -23,6 +23,7 @@ mod secrets;
 mod source_control;
 pub(crate) mod store;
 mod threads;
+mod typography;
 mod worktrees;
 
 use gpui::{
@@ -58,6 +59,7 @@ impl Global for Host {}
 pub fn init(state: Entity<AppState>, cx: &mut App) {
     store::init(cx);
     controls::init(cx);
+    typography::init(cx);
     providers::init(cx);
     let features = Features::from_secrets_flag(std::env::var("T3CODE_FEATURE_SECRETS").ok().as_deref());
     cx.set_global(Host { state, view: None, pending: None, pending_project: None, previous_focus: None, features });
@@ -260,6 +262,7 @@ pub struct SettingsView {
     pub(crate) diagnostics: diagnostics::DiagnosticsState,
     pub(crate) devices: devices::DevicesState,
     browser: diffs_browser::BrowserState,
+    typography: typography::TypographyState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -311,6 +314,7 @@ impl SettingsView {
             diagnostics: diagnostics::DiagnosticsState::new(window, cx),
             devices: devices::DevicesState::new(cx),
             browser: diffs_browser::BrowserState::new(window, cx),
+            typography: typography::TypographyState::new(window, cx),
             state,
             focus: cx.focus_handle(),
             section,
@@ -337,6 +341,9 @@ impl SettingsView {
         self.section = section;
         self.scroll_to_target = target.is_some();
         if let Some(target) = target.as_deref() {
+            if matches!(target, "prompt-font" | "terminal-font") && !store::client(cx).separate_fonts() {
+                store::update_client(&self.state, t3_core::client_settings::ClientSettingChange::SeparateFonts(true), cx);
+            }
             self.worktrees.reveal(target);
             self.source_control.reveal(target);
         }

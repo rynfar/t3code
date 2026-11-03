@@ -323,7 +323,7 @@ pub fn mono_frame(cx: &App) -> gpui::Div {
         .w_full()
         .min_w_0()
         .font_family(gpui_component::ActiveTheme::theme(cx).mono_font_family.clone())
-        .text_size(px(crate::theme::metrics::DEFAULT_CODE_FONT_SIZE))
-        .line_height(px(crate::theme::metrics::DEFAULT_CODE_FONT_SIZE * 1.625))
+        .text_size(gpui_component::ActiveTheme::theme(cx).mono_font_size)
+        .line_height(gpui_component::ActiveTheme::theme(cx).mono_font_size * 1.625)
         .text_color(hsla(palette(cx).secondary_label))
 }

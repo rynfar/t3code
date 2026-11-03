@@ -20,7 +20,6 @@ use super::preview::{Preview, TextFile};
 use crate::theme::{hsla, palette};
 
 const LINE_HEIGHT: f32 = 20.;
-const CODE_FONT_SIZE: f32 = 13.;
 const CODE_PADDING: f32 = 8.;
 /// Longer lines draw without colors: querying the tree across them costs more than it shows.
 const MAX_HIGHLIGHT_BYTES: usize = 4096;
@@ -46,6 +45,7 @@ pub struct CodeView {
     wrap: bool,
     h_offset: Pixels,
     char_width: Option<Pixels>,
+    font: Option<(SharedString, Pixels)>,
     reveal: Option<usize>,
     /// A reveal waiting for the first layout, which knows the viewport height.
     pending_reveal: Option<usize>,
@@ -64,6 +64,7 @@ impl CodeView {
             wrap: true,
             h_offset: px(0.),
             char_width: None,
+            font: None,
             reveal: None,
             pending_reveal: None,
             centering: None,
@@ -181,10 +182,17 @@ impl Preview {
             code.dark = Some(dark);
             code.lines.clear();
         }
+        let font = (cx.theme().mono_font_family.clone(), cx.theme().mono_font_size);
+        if code.font.as_ref() != Some(&font) {
+            code.font = Some(font);
+            code.char_width = None;
+            code.h_offset = px(0.);
+            code.list.remeasure();
+        }
         if code.char_width.is_none() {
             let family = cx.theme().mono_font_family.clone();
             let font_id = window.text_system().resolve_font(&gpui::font(family));
-            let advance = window.text_system().advance(font_id, px(CODE_FONT_SIZE), 'm').map(|size| size.width);
+            let advance = window.text_system().advance(font_id, cx.theme().mono_font_size, 'm').map(|size| size.width);
             code.char_width = Some(advance.unwrap_or(px(7.8)));
         }
         code.frame += 1;
@@ -241,12 +249,12 @@ impl Preview {
         div()
             .flex()
             .w_full()
-            .when(!code.wrap, |this| this.h(px(LINE_HEIGHT)))
-            .when(code.wrap, |this| this.min_h(px(LINE_HEIGHT)))
+            .when(!code.wrap, |this| this.h(px(crate::theme::code_line_height(cx))))
+            .when(code.wrap, |this| this.min_h(px(crate::theme::code_line_height(cx))))
             .bg(if revealed { hsla(p.accent) } else { hsla(p.code_background) })
             .font_family(family)
-            .text_size(px(CODE_FONT_SIZE))
-            .line_height(px(LINE_HEIGHT))
+            .text_size(cx.theme().mono_font_size)
+            .line_height(px(crate::theme::code_line_height(cx)))
             .child(
                 div()
                     .flex_none()

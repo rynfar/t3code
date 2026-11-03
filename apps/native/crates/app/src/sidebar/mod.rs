@@ -61,6 +61,7 @@ pub struct SidebarPane {
     state: Entity<AppState>,
     menu: Entity<ContextMenu>,
     list: ListState,
+    measured_font: Option<(Pixels, gpui::SharedString)>,
     row_keys: Vec<PaneRowKey>,
     search_input: Entity<InputState>,
     search: SearchState,
@@ -188,6 +189,7 @@ impl SidebarPane {
             state,
             menu,
             list: ListState::new(0, ListAlignment::Top, px(200.)),
+            measured_font: None,
             row_keys: Vec::new(),
             search_input,
             search: SearchState::default(),
@@ -634,7 +636,12 @@ fn new_thread_label(cx: &App) -> String {
 }
 
 impl Render for SidebarPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let font = (window.rem_size(), crate::theme::font_family(t3_core::client_settings::typography::FontRole::Interface, cx));
+        if self.measured_font.as_ref() != Some(&font) {
+            self.measured_font = Some(font);
+            self.list.remeasure();
+        }
         let synchronized = self.state.read(cx).shell.synchronized;
         self.live_rendered = false;
         let p = palette(cx);

@@ -114,8 +114,10 @@ fn style(cx: &App) -> TextViewStyle {
         .pt(px(34.))
         .pb(px(12.8))
         .px(px(14.4))
-        .text_size(px(crate::theme::metrics::DEFAULT_CODE_FONT_SIZE))
-        .line_height(rems(1.375));
+        .text_size(theme.mono_font_size)
+        .line_height(theme.mono_font_size * 1.375);
+    let mut code_block = if crate::theme::preferences(cx).typography.word_wrap { code_block.whitespace_normal() } else { code_block.whitespace_nowrap() };
+    code_block.overflow.x = Some(gpui::Overflow::Scroll);
     TextViewStyle {
         paragraph_gap: rems(0.65),
         heading_base_font_size: px(14.),

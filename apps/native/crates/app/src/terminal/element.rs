@@ -16,10 +16,9 @@ use gpui::{
     ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
     px, relative, size,
 };
-use gpui_component::ActiveTheme;
-use t3_client::store;
 use t3_core::terminal::emulator::{CellView, CursorStyle, Snapshot};
-use t3_core::terminal::{FontSizeRange, Grid, TerminalTypography};
+use t3_core::terminal::{Grid, TerminalTypography};
+use t3_core::client_settings::{ClientSettingsDoc, typography::FontRole};
 
 use super::colors::{self, to_hsla};
 use super::pane::{Geometry, TerminalPane};
@@ -30,9 +29,6 @@ pub const PADDING: f32 = 4.;
 const SCROLLBAR_WIDTH: f32 = 6.;
 const SCROLLBAR_INSET: f32 = 4.;
 const MIN_THUMB: f32 = 18.;
-/// The web keeps the split-typography switch in `localStorage` as `t3code:typography-advanced`.
-const TYPOGRAPHY_ADVANCED: &str = "typography-advanced";
-
 /// The terminal typography every mounted surface paints with; panes repaint when it changes.
 pub struct TerminalFont(pub TerminalTypography);
 
@@ -40,21 +36,10 @@ impl Global for TerminalFont {}
 
 /// The terminal typography the client settings ask for.
 pub fn typography(settings: &serde_json::Map<String, serde_json::Value>) -> TerminalTypography {
-    let advanced = store::load_ui_state(TYPOGRAPHY_ADVANCED).and_then(|value| value.as_bool()).unwrap_or(false);
-    TerminalTypography::resolve(
-        settings,
-        advanced,
-        FontSizeRange {
-            default: metrics::DEFAULT_CODE_FONT_SIZE,
-            min: metrics::MIN_CODE_FONT_SIZE,
-            max: metrics::MAX_CODE_FONT_SIZE,
-        },
-        FontSizeRange {
-            default: metrics::DEFAULT_TERMINAL_FONT_SIZE,
-            min: metrics::MIN_TERMINAL_FONT_SIZE,
-            max: metrics::MAX_TERMINAL_FONT_SIZE,
-        },
-    )
+    let doc = ClientSettingsDoc::from_json(&serde_json::Value::Object(settings.clone()).to_string());
+    let typography = doc.typography();
+    let family = typography.family(FontRole::Terminal);
+    TerminalTypography { family: (!family.is_empty()).then(|| family.to_owned()), size: typography.size(FontRole::Terminal) }
 }
 
 /// Applies new typography to every mounted terminal.
@@ -65,11 +50,8 @@ pub fn set_typography(typography: TerminalTypography, cx: &mut App) {
 }
 
 fn terminal_font(cx: &App) -> (Font, f32) {
-    let (family, size) = match cx.try_global::<TerminalFont>() {
-        Some(TerminalFont(typography)) => (typography.family.clone(), typography.size),
-        None => (None, metrics::DEFAULT_CODE_FONT_SIZE),
-    };
-    let family = family.map_or_else(|| cx.theme().mono_font_family.clone(), SharedString::from);
+    let size = cx.try_global::<TerminalFont>().map_or(metrics::DEFAULT_CODE_FONT_SIZE, |TerminalFont(typography)| typography.size);
+    let family = crate::theme::font_family(FontRole::Terminal, cx);
     let mut font = gpui::font(family);
     font.features = FontFeatures(std::sync::Arc::new(vec![("liga".into(), 0), ("calt".into(), 0), ("dlig".into(), 0)]));
     (font, size)

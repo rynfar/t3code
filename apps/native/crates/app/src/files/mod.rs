@@ -107,6 +107,7 @@ pub struct FilesPanel {
     prefs: Prefs,
     /// The session's word wrap override; the web's `wordWrap` setting defaults to on.
     wrap: bool,
+    wrap_override: Option<bool>,
     connected: bool,
     checkpoints: (usize, Option<String>),
     latest_checkpoint: Option<String>,
@@ -150,6 +151,7 @@ impl FilesPanel {
             shown: None,
             prefs,
             wrap: true,
+            wrap_override: None,
             connected: false,
             checkpoints: (0, None),
             latest_checkpoint: None,
@@ -336,6 +338,7 @@ impl FilesPanel {
                         .tooltip(if self.wrap { "Disable word wrap" } else { "Enable word wrap" })
                         .on_click(toggle(|this, cx| {
                             this.wrap = !this.wrap;
+                            this.wrap_override = Some(this.wrap);
                             let wrap = this.wrap;
                             this.preview.update(cx, |preview, cx| preview.set_wrap(wrap, cx));
                             cx.notify();
@@ -398,6 +401,11 @@ impl FilesPanel {
 
 impl Render for FilesPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let wrap = self.wrap_override.unwrap_or(crate::theme::preferences(cx).typography.word_wrap);
+        if self.wrap != wrap {
+            self.wrap = wrap;
+            self.preview.update(cx, |preview, cx| preview.set_wrap(wrap, cx));
+        }
         let p = palette(cx);
         if self.root.is_none() {
             return div()
