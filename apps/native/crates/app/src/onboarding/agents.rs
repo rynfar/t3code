@@ -199,9 +199,9 @@ impl WelcomeWizard {
             .child(
                 h_flex().mt(r(24.)).justify_end().child(
                     Button::new("welcome-agents-continue", ButtonVariant::Default, ButtonSize::Default)
-                        .label("Continue")
+                        .label("Next")
                         .trailing(Icon::ArrowRight)
-                        .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.go_to(super::Step::Projects, cx))),
                 ),
             )
             .into_any_element()

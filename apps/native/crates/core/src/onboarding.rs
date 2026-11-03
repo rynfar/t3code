@@ -11,6 +11,8 @@
 //! nothing saved the wizard opens at once, since there is no workspace to inspect
 //! (`resolve_unpaired`).
 
+pub mod projects;
+
 use serde::Deserialize;
 use serde_json::Value;
 
