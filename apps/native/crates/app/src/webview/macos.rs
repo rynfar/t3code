@@ -36,7 +36,6 @@ fn block_script_windows(page: &WryWebView) {
     }
 }
 
-const PAGE_URL: &str = "t3-page://page/index.html";
 /// What the server sends with agent HTML (`http.ts`), less downloads: an opaque origin with
 /// scripts and forms. Popups reach the app as link opens and never as windows.
 const CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-forms allow-popups";
@@ -73,16 +72,15 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }
 
+/// Every response carries the sandbox, a 404 included.
 fn serve(html: &str, request: &Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
-    let response = if request.uri().path() == "/index.html" {
-        Response::builder()
-            .header(CONTENT_TYPE, "text/html; charset=utf-8")
-            .header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
-            .body(Cow::Owned(html.as_bytes().to_vec()))
+    let sandboxed = Response::builder().header("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+    let response = if request.uri() == super::PAGE_URL {
+        sandboxed.header(CONTENT_TYPE, "text/html; charset=utf-8").body(Cow::Owned(html.as_bytes().to_vec()))
     } else {
-        Response::builder().status(404).body(Cow::Borrowed(&[][..]))
+        sandboxed.status(404).body(Cow::Borrowed(&[][..]))
     };
-    response.unwrap_or_default()
+    response.unwrap_or_else(|_| Response::builder().status(500).header("Content-Security-Policy", CONTENT_SECURITY_POLICY).body(Cow::Borrowed(&[][..])).unwrap_or_default())
 }
 
 impl NativeView {
@@ -110,7 +108,7 @@ impl NativeView {
         let link_events = events.clone();
         let builder = WebViewBuilder::new()
             .with_custom_protocol(super::PAGE_SCHEME.into(), move |_, request| serve(&html, &request))
-            .with_url(PAGE_URL)
+            .with_url(super::PAGE_URL)
             .with_initialization_script_for_main_only(page.script.as_str(), true)
             .with_ipc_handler(move |request: Request<String>| {
                 // wry names the posting frame's URL; any frame can reach the handler.
@@ -210,7 +208,8 @@ impl Drop for NativeView {
 
 struct PolicyIvars {
     events: UnboundedSender<WebEvent>,
-    /// wry's own delegate, which still runs scripts queued before the page committed.
+    /// wry's own delegate: it still runs scripts queued before the page committed and reports
+    /// page loads.
     wry: Option<Retained<ProtocolObject<dyn WKNavigationDelegate>>>,
 }
 
@@ -238,6 +237,14 @@ define_class!(
             if let Some(wry) = &self.ivars().wry {
                 // SAFETY: wry's delegate implements this method with these argument types.
                 let _: () = unsafe { msg_send![&**wry, webView: webview, didCommitNavigation: navigation] };
+            }
+        }
+
+        #[unsafe(method(webView:didFinishNavigation:))]
+        fn did_finish(&self, webview: &WKWebView, navigation: &WKNavigation) {
+            if let Some(wry) = &self.ivars().wry {
+                // SAFETY: as above; wry reports the page load from here.
+                let _: () = unsafe { msg_send![&**wry, webView: webview, didFinishNavigation: navigation] };
             }
         }
     }

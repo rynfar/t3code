@@ -30,6 +30,13 @@ use gpui::{
 };
 
 pub(crate) const PAGE_SCHEME: &str = "t3-page";
+/// The page's one document; every other URL of the scheme is a 404.
+pub(crate) const PAGE_URL: &str = "t3-page://page/index.html";
+
+/// The page's document, at any fragment.
+fn is_page(url: &str) -> bool {
+    url.split('#').next() == Some(PAGE_URL)
+}
 
 fn has_scheme(url: &str, scheme: &str) -> bool {
     url.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme)) && url[scheme.len()..].starts_with(':')
@@ -38,18 +45,18 @@ fn has_scheme(url: &str, scheme: &str) -> bool {
 /// Where a frame of a page may navigate. Unlike the web's iframe, a WebKit document keeps no
 /// sandbox across a main-frame navigation (nor applies it to inherited `data:`, `blob:` or
 /// `about:` documents), and every main-frame document gets the IPC bridge, so the main frame
-/// holds only the page; the reader's links open in the browser instead. Subframes inherit the
+/// holds only the page's document; the reader's links open in the browser instead. Subframes inherit the
 /// page's sandbox, as nested frames of the web's iframe do, but never load the page's scheme.
 pub(crate) fn navigable(url: &str, main_frame: bool) -> bool {
     if main_frame {
-        return has_scheme(url, PAGE_SCHEME);
+        return is_page(url);
     }
     ["about", "data", "blob", "http", "https"].iter().any(|scheme| has_scheme(url, scheme))
 }
 
-/// Whether an IPC message came from the page itself: only its main frame has its scheme.
+/// Whether an IPC message came from the page itself: only its main frame holds its document.
 pub(crate) fn from_page(frame_url: &str) -> bool {
-    has_scheme(frame_url, PAGE_SCHEME)
+    is_page(frame_url)
 }
 
 /// A link the reader may open in the browser.
@@ -402,11 +409,24 @@ mod tests {
     /// iframe's do, but never load the page's own scheme, so only the page can post to the app.
     #[test]
     fn only_the_page_owns_the_main_frame_and_the_bridge() {
-        for url in ["t3-page://page/index.html", "T3-PAGE://page/index.html"] {
+        for url in ["t3-page://page/index.html", "t3-page://page/index.html#section"] {
             assert!(super::navigable(url, true), "{url}");
             assert!(super::from_page(url), "{url}");
         }
-        let elsewhere = ["https://attacker.example/", "data:text/html,<p>", "blob:null/1", "about:blank", "about:srcdoc", "file:///etc/hosts", "javascript:alert(1)", "t3-pag"];
+        // Any other URL of the scheme is the 404 document, not the page.
+        let elsewhere = [
+            "t3-page://page/missing",
+            "t3-page://page/index.html?x=1",
+            "t3-page://other/index.html",
+            "https://attacker.example/",
+            "data:text/html,<p>",
+            "blob:null/1",
+            "about:blank",
+            "about:srcdoc",
+            "file:///etc/hosts",
+            "javascript:alert(1)",
+            "t3-pag",
+        ];
         for url in elsewhere {
             assert!(!super::navigable(url, true), "{url}");
             assert!(!super::from_page(url), "{url}");
