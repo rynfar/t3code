@@ -282,51 +282,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A script that starts a grandchild and records its PID, then waits on it.
     #[cfg(unix)]
-    fn spawning_cli(dir: &Path) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let (script, pidfile) = (dir.join("fake-t3"), dir.join("grandchild.pid"));
-        let script_text = format!("#!/bin/sh\nsleep 60 &\necho $! > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n", pidfile.display());
-        std::fs::write(&script, script_text).expect("writes script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        (script, pidfile)
+    struct SpawningCli {
+        script: PathBuf,
+        events: tokio::io::BufReader<tokio::fs::File>,
+        startup_writer: Option<std::fs::File>,
     }
 
-    /// The grandchild's PID, once the script recorded it. Bounded, so a script killed before it
-    /// got that far fails the test instead of hanging it.
     #[cfg(unix)]
-    async fn grandchild(pidfile: &Path) -> u32 {
-        for _ in 0..200 {
-            if let Some(pid) = std::fs::read_to_string(pidfile).ok().and_then(|text| text.trim().parse::<u32>().ok()) {
-                return pid;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("the script never started its child");
-    }
+    impl SpawningCli {
+        fn new(dir: &Path) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    /// Whether the process is gone; reparented processes are reaped by launchd shortly after
-    /// they die.
-    #[cfg(unix)]
-    async fn dies(pid: u32) -> bool {
-        for _ in 0..100 {
-            if !process_alive(pid) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let fifo = dir.join("grandchild.pipe");
+            let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+            // SAFETY: `path` is a valid, NUL-terminated path in this test's scratch directory.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "creates FIFO: {}", std::io::Error::last_os_error());
+            let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).expect("opens FIFO reader");
+            // Keep the FIFO from reporting EOF before the script has opened its writer.
+            let startup_writer = Some(std::fs::OpenOptions::new().write(true).open(&fifo).expect("opens FIFO writer"));
+            drop(reader);
+            let events = tokio::io::BufReader::new(tokio::fs::File::from_std(std::fs::File::open(&fifo).expect("opens blocking FIFO reader")));
+
+            let script = dir.join("fake-t3");
+            std::fs::write(&script, "#!/bin/sh\nexec 3> \"$T3CODE_HOME/grandchild.pipe\"\nsleep 60 &\necho $! >&3\nwait\n").expect("writes script");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            Self { script, events, startup_writer }
         }
-        false
+
+        async fn grandchild(&mut self) -> u32 {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            tokio::time::timeout(PAIR_TIMEOUT, self.events.read_line(&mut line)).await.expect("the script starts its child").expect("reads PID");
+            let pid = line.trim().parse().expect("grandchild PID");
+            self.startup_writer.take();
+            assert!(process_alive(pid), "the grandchild is alive before stopping the CLI");
+            pid
+        }
+
+        async fn exits(&mut self) {
+            use tokio::io::AsyncReadExt;
+            let mut remaining = Vec::new();
+            // The shell and its grandchild both hold fd 3; EOF requires both to exit, without
+            // depending on when launchd reaps the orphan. This deadline precedes sleep's exit.
+            tokio::time::timeout(PAIR_TIMEOUT, self.events.read_to_end(&mut remaining))
+                .await
+                .expect("the CLI's own children are killed too")
+                .expect("reads EOF");
+            assert!(remaining.is_empty());
+        }
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_cli_takes_everything_it_started_with_it() {
         let dir = scratch("timeout");
-        let (script, pidfile) = spawning_cli(&dir);
-        let result = run_cli(&script, &[], &dir, Duration::from_secs(1)).await;
+        let mut cli = SpawningCli::new(&dir);
+        let script = cli.script.clone();
+        let result = run_cli(&script, &[], &dir, Duration::from_secs(1));
+        tokio::pin!(result);
+        // Spawn once, then leave the timeout future unpolled until the grandchild is ready.
+        assert!(futures::poll!(&mut result).is_pending());
+        cli.grandchild().await;
+        let result = result.await;
         assert!(matches!(result, Err(LocalPairError::CliFailed(ref message)) if message.contains("did not finish")), "{result:?}");
-        assert!(dies(grandchild(&pidfile).await).await, "the CLI's own children are killed too");
+        cli.exits().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -334,15 +355,13 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_running_cli_kills_its_process_group() {
         let dir = scratch("cancel");
-        let (script, pidfile) = spawning_cli(&dir);
-        let task = tokio::spawn({
-            let (script, dir) = (script.clone(), dir.clone());
-            async move { run_cli(&script, &[], &dir, PAIR_TIMEOUT).await }
-        });
-        let pid = grandchild(&pidfile).await;
-        task.abort();
-        assert!(task.await.is_err_and(|error| error.is_cancelled()));
-        assert!(dies(pid).await, "Cancel stops the CLI and what it started");
+        let mut cli = SpawningCli::new(&dir);
+        let script = cli.script.clone();
+        let mut task = Box::pin(run_cli(&script, &[], &dir, PAIR_TIMEOUT));
+        assert!(futures::poll!(&mut task).is_pending());
+        cli.grandchild().await;
+        drop(task);
+        cli.exits().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
