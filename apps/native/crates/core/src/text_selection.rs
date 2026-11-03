@@ -94,6 +94,13 @@ impl Selection {
     }
 }
 
+/// Byte offsets in an end-ellipsized layout still index the source's visible prefix.
+pub fn visible_prefix_end(source: &str, displayed: &str) -> Option<usize> {
+    if source == displayed { return Some(source.len()); }
+    let prefix = displayed.strip_suffix('…')?;
+    source.starts_with(prefix).then_some(prefix.len())
+}
+
 fn unit(text: &str, hit: Hit, granularity: Granularity) -> Range<usize> {
     match granularity {
         Granularity::Char => {
@@ -382,5 +389,20 @@ mod tests {
         assert_eq!(selection.text(&old), "X");
         assert_eq!(selection.remap(&old, &new, 0), None);
         assert_eq!(selection.remap(&old, &new, 2), None);
+    }
+
+    #[test]
+    fn preview_selection_maps_the_visible_prefix_without_copying_ellipsis() {
+        assert_eq!(visible_prefix_end("hello world", "hello…"), Some(5));
+        assert_eq!(visible_prefix_end("hello world", "hello world"), Some(11));
+        assert_eq!(visible_prefix_end("éclair and tea", "écl…"), Some(4));
+        assert_eq!(visible_prefix_end("hello world", "…world"), None);
+        assert_eq!(visible_prefix_end("hello world", "hel…ld"), None);
+        let source = "hello world";
+        let end = visible_prefix_end(source, "hello…").unwrap();
+        let mut selection = Selection::press(source, Hit { caret: 0, under: 0 }, Granularity::Char);
+        selection.extend(source, Hit { caret: end, under: end });
+        assert_eq!(selection.text(source), "hello");
+        assert_eq!(Selection::all(source).text(source), source);
     }
 }

@@ -41,12 +41,25 @@ pub struct SelectableText {
     highlights: Option<Highlights>,
     origin: usize,
     scroll: Option<ScrollHandle>,
+    tab_stop: bool,
+    tail_ellipsis: bool,
 }
 
 impl SelectableText {
     /// `id` keys the selection, so it stays the same while the text is on screen.
     pub fn new(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        SelectableText { id: id.into(), text: text.into(), highlights: None, origin: 0, scroll: None }
+        SelectableText { id: id.into(), text: text.into(), highlights: None, origin: 0, scroll: None, tab_stop: true, tail_ellipsis: false }
+    }
+
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
+        self
+    }
+
+    /// Selection offsets still index the source when only its tail is replaced by an ellipsis.
+    pub fn tail_ellipsis(mut self) -> Self {
+        self.tail_ellipsis = true;
+        self
     }
 
     /// Styled byte ranges, sorted and not overlapping, as `StyledText::with_highlights` takes them.
@@ -83,6 +96,7 @@ struct State {
     /// The last painted layout, the scroll offset it was painted at, and the drag position, for
     /// drag steps between paints.
     layout: Option<TextLayout>,
+    visible_end: Option<usize>,
     painted_scroll: Pixels,
     pointer: Point<Pixels>,
     autoscrolling: bool,
@@ -121,7 +135,9 @@ impl State {
         let Some(layout) = self.layout.as_ref() else { return false };
         let scrolled = self.scroll.as_ref().map_or(px(0.), |scroll| scroll.offset().y - self.painted_scroll);
         let lines = layout.line_layouts();
+        let Some(end) = self.visible_end else { return false };
         let hit = Lines::new(&lines, layout).hit_scrolled(pointer, scrolled);
+        let hit = Hit { caret: hit.caret.min(end), under: hit.under.min(end) };
         let text = self.text.clone();
         self.selection.as_mut().is_some_and(|selection| selection.extend(&text, hit))
     }
@@ -209,6 +225,7 @@ impl RenderOnce for SelectableText {
             menu: None,
             scroll: None,
             layout: None,
+            visible_end: None,
             painted_scroll: px(0.),
             pointer: Point::default(),
             autoscrolling: false,
@@ -225,6 +242,7 @@ impl RenderOnce for SelectableText {
             .id(self.id)
             .key_context(CONTEXT)
             .track_focus(&focus)
+            .tab_index(if self.tab_stop { 0 } else { -1 })
             .font_family(cx.theme().font_family.clone())
             .on_action(move |_: &Copy, _, cx| copy(&copy_state, cx))
             .on_action(move |_: &SelectAll, _, cx| {
@@ -233,7 +251,7 @@ impl RenderOnce for SelectableText {
                     cx.notify();
                 })
             })
-            .child(TextElement::new(state, self.text, self.highlights, selected, font_family))
+            .child(TextElement::new(state, self.text, self.highlights, selected, font_family, self.tail_ellipsis))
             .context_menu(move |menu, _, cx| {
                 let popup = cx.entity();
                 let selected = menu_state.update(cx, |state, cx| {
@@ -250,17 +268,18 @@ struct TextElement {
     state: Entity<State>,
     text: StyledText,
     font_family: SharedString,
+    tail_ellipsis: bool,
 }
 
 impl TextElement {
-    fn new(state: Entity<State>, text: SharedString, highlights: Option<Highlights>, selected: Option<Range<usize>>, font_family: SharedString) -> Self {
+    fn new(state: Entity<State>, text: SharedString, highlights: Option<Highlights>, selected: Option<Range<usize>>, font_family: SharedString, tail_ellipsis: bool) -> Self {
         let text = StyledText::new(text);
         let text = match (highlights, selected) {
             (Some(highlights), Some(selected)) => text.with_highlights(lift_fills(&highlights, selected)),
             (Some(highlights), None) => text.with_highlights(highlights.iter().cloned()),
             (None, _) => text,
         };
-        TextElement { state, text, font_family }
+        TextElement { state, text, font_family, tail_ellipsis }
     }
 }
 
@@ -314,6 +333,8 @@ impl Element for TextElement {
     ) {
         let text_layout = self.text.layout().clone();
         let (range, dragging, selected) = self.state.update(cx, |state, _| {
+            state.visible_end = if self.tail_ellipsis { t3_core::text_selection::visible_prefix_end(&state.text, &text_layout.text()) }
+                else if text_layout.len() == state.text.len() { Some(state.text.len()) } else { None };
             state.layout = Some(text_layout.clone());
             state.painted_scroll = state.scroll.as_ref().map_or(px(0.), |scroll| scroll.offset().y);
             (state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()), state.dragging, state.selection.is_some())
@@ -335,14 +356,15 @@ impl Element for TextElement {
         window.on_mouse_event({
             let (state, text_layout, hitbox) = (self.state.clone(), text_layout.clone(), hitbox.clone());
             move |event: &MouseDownEvent, phase, window, cx| {
-                // A truncated layout no longer indexes the text, so it is not selectable.
-                if !phase.bubble() || event.button != MouseButton::Left || !hitbox.is_hovered(window) || text_layout.len() != state.read(cx).text.len() {
+                if !phase.bubble() || event.button != MouseButton::Left || !hitbox.is_hovered(window) {
                     return;
                 }
                 // The row behind must not read the press as a click, nor the window start its own
                 // selection from it.
                 cx.stop_propagation();
+                let Some(end) = state.read(cx).visible_end else { return };
                 let hit = hit_test(&text_layout, event.position);
+                let hit = Hit { caret: hit.caret.min(end), under: hit.under.min(end) };
                 let focus = state.read(cx).focus.clone();
                 window.focus(&focus, cx);
                 state.update(cx, |state, cx| {

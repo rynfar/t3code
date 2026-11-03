@@ -11,9 +11,10 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Bounds, BoxShadow, Context, FontWeight, ListOffset, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, Window, canvas,
+    AnyElement, Bounds, BoxShadow, Context, FocusHandle, FontWeight, ListOffset, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, Subscription, Window, canvas,
     div, fill, point, prelude::*, px, size,
 };
 use t3_core::timeline::minimap::{self, MinimapItem, MinimapPreview, RailPointer, RailPointerAction, RailPointerEvent};
@@ -21,6 +22,15 @@ use t3_core::timeline::minimap::{self, MinimapItem, MinimapPreview, RailPointer,
 use super::ThreadView;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
+
+gpui::actions!(timeline_minimap, [MinimapTabNext, MinimapTabPrevious]);
+
+pub fn init(cx: &mut gpui::App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("tab", MinimapTabNext, Some("TimelineMinimap")),
+        gpui::KeyBinding::new("shift-tab", MinimapTabPrevious, Some("TimelineMinimap")),
+    ]);
+}
 
 /// What the rail last measured after layout. Render draws from it; click handlers read it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -40,9 +50,18 @@ pub struct MinimapUi {
     strip_hovered: bool,
     preview_hovered: bool,
     nav_hovered: bool,
+    nav_hovers: [bool; 2],
+    nav_tooltip: Option<usize>,
+    nav_tooltip_task: Option<gpui::Task<()>>,
+    nav_bounds: [Rc<Cell<Bounds<Pixels>>>; 2],
     pointer: RailPointer,
     rail: Rc<Cell<Bounds<Pixels>>>,
     measured: Rc<Cell<Measured>>,
+    focus: Option<FocusHandle>,
+    previous_focus: Option<FocusHandle>,
+    next_focus: Option<FocusHandle>,
+    focus_subscriptions: Vec<Subscription>,
+    preview_height: Rc<Cell<f32>>,
 }
 
 impl MinimapUi {
@@ -100,8 +119,28 @@ impl ThreadView {
                 }
             });
         }
-        self.minimap.active = None;
         cx.notify();
+    }
+
+    fn minimap_tab(&mut self, part: minimap::FocusPart, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.minimap.measured.get().current.filter(|i| *i < self.minimap.items.len());
+        let previous = current.is_some_and(|i| i > 0);
+        let next = current.is_some_and(|i| i + 1 < self.minimap.items.len());
+        if let Some(target) = minimap::tab_target(part, backwards, previous, next) {
+            let focus = match target {
+                minimap::FocusPart::Previous => self.minimap.previous_focus.as_ref(),
+                minimap::FocusPart::Rail => self.minimap.focus.as_ref(),
+                minimap::FocusPart::Next => self.minimap.next_focus.as_ref(),
+            };
+            if let Some(focus) = focus { window.focus(focus, cx); }
+            window.prevent_default();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if backwards { window.focus_prev(cx); } else { window.focus_next(cx); }
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
     /// Previous or next turn from the one being read.
@@ -137,17 +176,44 @@ impl ThreadView {
         if count < minimap::MIN_ITEMS {
             return None;
         }
+        if self.minimap.focus.is_none() {
+            let focus = cx.focus_handle();
+            self.minimap.focus_subscriptions = vec![
+                cx.on_focus(&focus, window, |view, _, cx| {
+                    let ui = &mut view.minimap;
+                    ui.active = minimap::focus_index(ui.active, ui.measured.get().current, ui.items.len());
+                    cx.notify();
+                }),
+                cx.on_focus_out(&focus, window, |view, _, _, cx| {
+                    view.minimap.active = None;
+                    cx.notify();
+                }),
+            ];
+            self.minimap.focus = Some(focus);
+            self.minimap.previous_focus = Some(cx.focus_handle());
+            self.minimap.next_focus = Some(cx.focus_handle());
+        }
+        let focus = self.minimap.focus.as_ref().unwrap().clone();
+        #[cfg(feature = "snapshot")]
+        {
+            crate::snapshot::register_focus("timeline-minimap", focus.clone(), cx);
+            crate::snapshot::register_focus("timeline-minimap-previous", self.minimap.previous_focus.as_ref().unwrap().clone(), cx);
+            crate::snapshot::register_focus("timeline-minimap-next", self.minimap.next_focus.as_ref().unwrap().clone(), cx);
+        }
         let rem_px = f32::from(window.rem_size()) / 16.;
         let measured = self.minimap.measured.get();
         let interactive = measured.hit_width > 0.;
         let navigation = interactive && minimap::navigation_interactive(measured.hit_width);
         // A rail that stops taking the pointer can no longer report a leave.
-        if !interactive {
+        if !interactive && !focus.contains_focused(window, cx) {
             (self.minimap.active, self.minimap.strip_hovered, self.minimap.preview_hovered) = (None, false, false);
             self.minimap.pointer = RailPointer::default();
         }
         if !navigation {
             self.minimap.nav_hovered = false;
+            self.minimap.nav_hovers = [false; 2];
+            self.minimap.nav_tooltip = None;
+            self.minimap.nav_tooltip_task = None;
         }
         let rail_height = minimap::rail_height(count, f32::from(window.viewport_size().height) - minimap::MAX_HEIGHT_INSET * rem_px);
         let active = self.minimap.active.filter(|index| *index < count);
@@ -156,12 +222,38 @@ impl ThreadView {
         let revealed = self.minimap.strip_hovered || self.minimap.preview_hovered || self.minimap.nav_hovered || active.is_some();
 
         let rail = self.render_minimap_rail(active, revealed, rem_px, window, cx);
+        let ring = hsla(palette(cx).ring).opacity(0.7);
         let jump = div()
             .id("timeline-minimap")
             .absolute()
             .inset_0()
             .child(rail)
-            .children(preview.map(|(index, preview)| render_preview(index, count, rail_height, preview, cx)))
+            .track_focus(&focus)
+            .key_context("TimelineMinimap")
+            .role(gpui::Role::Button)
+            .aria_label(format!("Jump to message: {}", preview.as_ref().and_then(|(_, preview)| preview.user_text.as_deref()).unwrap_or(minimap::USER_MESSAGE)))
+            .focus_visible(move |style| style.shadow(focus_ring(ring)))
+            .on_action(cx.listener(|view, _: &MinimapTabNext, window, cx| {
+                view.minimap_tab(minimap::FocusPart::Rail, false, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &MinimapTabPrevious, window, cx| {
+                view.minimap_tab(minimap::FocusPart::Rail, true, window, cx);
+            }))
+            .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
+                if !view.minimap.focus.as_ref().is_some_and(|focus| focus.is_focused(window)) { return; }
+                let key = match event.keystroke.key.as_str() {
+                    "down" => "ArrowDown", "up" => "ArrowUp", "home" => "Home", "end" => "End", "enter" => "Enter", "space" => " ", key => key,
+                };
+                match minimap::keyboard_action(view.minimap.active, view.minimap.items.len(), key) {
+                    minimap::KeyboardAction::Ignore => return,
+                    minimap::KeyboardAction::Preview(index) => view.minimap.active = Some(index),
+                    minimap::KeyboardAction::Jump(index) => view.jump_to_minimap_item(index, window, cx),
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .children(preview.map(|(index, preview)| render_preview(index, count, rail_height, preview, self.minimap.preview_height.clone(), cx)))
             .when(interactive, |this| {
                 this.cursor_pointer()
                     .occlude()
@@ -179,7 +271,8 @@ impl ThreadView {
                             cx.notify();
                         }
                     }))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|view, _, _, _| {
+                    .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, _| {
+                        window.prevent_default();
                         view.minimap.pointer.handle(RailPointerEvent::Down { on_rail: true });
                     }))
                     .on_mouse_down_out(cx.listener(|view, _, _, _| {
@@ -192,6 +285,8 @@ impl ThreadView {
                                 && let Some(index) = view.minimap.index_at(event.position.y)
                             {
                                 view.jump_to_minimap_item(index, window, cx);
+                                view.minimap.active = None;
+                                window.blur();
                             }
                         }),
                     )
@@ -205,9 +300,9 @@ impl ThreadView {
         let current = measured.current.filter(|current| *current < count);
         let previous = current.and_then(|current| current.checked_sub(1));
         let next = current.map(|current| current + 1).filter(|next| *next < count);
-        let previous = navigation.then(|| self.render_minimap_nav(-1, previous.is_some(), rail_height, cx));
-        let next = navigation.then(|| self.render_minimap_nav(1, next.is_some(), rail_height, cx));
-        let strip = div().relative().flex_none().ml(rem(12.)).w(px(width)).h(px(rail_height)).children(previous).child(jump).children(next);
+        let previous = self.render_minimap_nav(-1, previous.is_some(), navigation, rail_height, window, cx);
+        let next = self.render_minimap_nav(1, next.is_some(), navigation, rail_height, window, cx);
+        let strip = div().relative().flex_none().ml(rem(12.)).w(px(width)).h(px(rail_height)).child(previous).child(jump).child(next);
         Some(div().absolute().top_0().bottom_0().left_0().w(rem(72.)).flex().flex_col().justify_center().child(strip).into_any_element())
     }
 
@@ -246,29 +341,27 @@ impl ThreadView {
                 }
                 (range, next.persistent, rows)
             },
-            move |bounds, (range, persistent, rows), window, _| {
-                if !persistent && !revealed {
-                    return;
-                }
+            move |bounds, (range, persistent, rows), window, cx| {
                 let count = rows.len();
-                let (left, top, height) = (bounds.left(), bounds.top(), bounds.size.height);
-                window.paint_quad(fill(Bounds::new(point(left + px(12. * rem_px), top), size(px(1.), height)), line));
-                let thickness = px(2. * rem_px);
+                let mut targets = vec![if persistent || revealed { 1. } else { 0. }];
                 for (index, row) in rows.iter().enumerate() {
+                    targets.push(strip_scale(active, index));
+                    targets.push(if minimap::is_row_visible(*row, range) { 1. } else { 0. });
+                }
+                let values = transition("minimap-rail-motion", targets, view, window, cx);
+                let opacity = values[0];
+                if opacity == 0. { return; }
+                let (left, top, height) = (bounds.left(), bounds.top(), bounds.size.height);
+                window.paint_quad(fill(Bounds::new(point(left + px(12. * rem_px), top), size(px(1.), height)), line.opacity(opacity)));
+                let thickness = px(2. * rem_px);
+                for index in 0..rows.len() {
                     let distance = active.map(|active| active.abs_diff(index));
-                    let scale = match distance {
-                        Some(0) => 1.,
-                        Some(1) => 0.667,
-                        Some(2) => 0.417,
-                        _ => 0.333,
-                    };
+                    let scale = values[1 + index * 2];
                     let y = top + height * (minimap::top_percent(index, count) / 100.) - thickness / 2.;
                     let bounds = Bounds::new(point(left, y), size(px(24. * rem_px * scale), thickness));
                     let radius = thickness / 2.;
-                    window.paint_quad(fill(bounds, if distance == Some(0) { strip_active } else { strip }).corner_radii(radius));
-                    if minimap::is_row_visible(*row, range) {
-                        window.paint_quad(fill(bounds, lit).corner_radii(radius));
-                    }
+                    window.paint_quad(fill(bounds, (if distance == Some(0) { strip_active } else { strip }).opacity(opacity)).corner_radii(radius));
+                    window.paint_quad(fill(bounds, lit.opacity(opacity * values[2 + index * 2])).corner_radii(radius));
                 }
             },
         )
@@ -277,11 +370,25 @@ impl ThreadView {
 
     /// `TimelineMinimapNavigationButton`: an `icon-micro` ghost-muted button above or below the
     /// rail, shown only while hovered.
-    fn render_minimap_nav(&self, delta: isize, enabled: bool, rail_height: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn render_minimap_nav(&self, delta: isize, enabled: bool, interactive: bool, rail_height: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let previous = delta < 0;
         let label = if previous { minimap::PREVIOUS_TURN } else { minimap::NEXT_TURN };
         let icon = if previous { Icon::ChevronUp } else { Icon::ChevronDown };
+        let focus = if previous { self.minimap.previous_focus.as_ref().unwrap() } else { self.minimap.next_focus.as_ref().unwrap() };
+        let focused = focus.is_focused(window);
+        let hovered = self.minimap.nav_hovers[usize::from(!previous)];
+        let opacity = transition(if previous { "minimap-previous-fade" } else { "minimap-next-fade" }, vec![if focused || hovered { 1. } else { 0. }], cx.entity_id(), window, cx)[0];
+        let nav_index = usize::from(!previous);
+        let tooltip_opacity = transition(if previous { "minimap-previous-tooltip" } else { "minimap-next-tooltip" }, vec![if focused || self.minimap.nav_tooltip == Some(nav_index) { 1. } else { 0. }], cx.entity_id(), window, cx)[0];
+        let bounds = self.minimap.nav_bounds[nav_index].clone();
+        let tooltip_bounds = bounds.clone();
+        let tooltip = (tooltip_opacity > 0.).then(|| gpui::deferred(
+            gpui_base::TooltipPositioner::new(tooltip_bounds.get())
+                .placement(if previous { gpui_base::Placement::Top } else { gpui_base::Placement::Bottom })
+                .child(div().id("minimap-navigation-tooltip").role(gpui::Role::Tooltip).px(rem(8.)).py(rem(4.)).rounded(rem(6.)).border_1().border_color(hsla(p.border)).bg(hsla(p.popover)).text_color(hsla(p.popover_foreground)).text_size(rem(12.)).line_height(rem(16.5)).opacity(tooltip_opacity).child(label))
+        ).with_priority(140));
+        let measure = canvas(move |bounds_now, _, _| bounds.set(bounds_now), |_, _, _, _| {}).absolute().size_full();
         let button = div()
             .size(rem(20.))
             .flex()
@@ -295,23 +402,57 @@ impl ThreadView {
             .absolute()
             .left(rem(-6.))
             .map(|this| if previous { this.bottom(px(rail_height + 2.)) } else { this.top(px(rail_height + 2.)) })
-            .opacity(0.)
-            .hover(|style| style.opacity(1.))
-            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
-            .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
-                view.minimap.nav_hovered = *hovered;
+            .opacity(opacity)
+            .when(enabled, |this| this.track_focus(focus))
+            .role(gpui::Role::Button)
+            .on_action(cx.listener(move |view, _: &MinimapTabNext, window, cx| {
+                view.minimap_tab(if previous { minimap::FocusPart::Previous } else { minimap::FocusPart::Next }, false, window, cx);
+            }))
+            .on_action(cx.listener(move |view, _: &MinimapTabPrevious, window, cx| {
+                view.minimap_tab(if previous { minimap::FocusPart::Previous } else { minimap::FocusPart::Next }, true, window, cx);
+            }))
+            .key_context("TimelineMinimap")
+            .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                if !interactive { window.prevent_default(); }
+            })
+            .aria_label(label)
+            .focus_visible(move |style| style.shadow(focus_ring(hsla(p.ring))))
+            .on_hover(cx.listener(move |view, hovered: &bool, _, cx| {
+                if !interactive { return; }
+                view.minimap.nav_hovers[usize::from(!previous)] = *hovered;
+                view.minimap.nav_hovered = view.minimap.nav_hovers.iter().any(|hover| *hover);
+                view.minimap.nav_tooltip = None;
+                view.minimap.nav_tooltip_task = None;
+                if *hovered {
+                    view.minimap.nav_tooltip_task = Some(cx.spawn(async move |view, cx| {
+                        cx.background_executor().timer(Duration::from_millis(600)).await;
+                        let _ = view.update(cx, |view, cx| {
+                            if view.minimap.nav_hovers[nav_index] { view.minimap.nav_tooltip = Some(nav_index); cx.notify(); }
+                        });
+                    }));
+                }
                 cx.notify();
             }))
-            .when(enabled, |this| this.on_click(cx.listener(move |view, _, window, cx| view.step_minimap(delta, window, cx))))
+            .when(enabled, |this| this.on_click(cx.listener(move |view, event: &gpui::ClickEvent, window, cx| {
+                if interactive || event.is_keyboard() { view.step_minimap(delta, window, cx); }
+            })))
             .child(button)
+            .child(measure)
+            .children(tooltip)
             .into_any_element()
     }
 }
 
 /// The hover card: the message on one line and its turn's answer on up to three, centred on
 /// its strip (or hanging from the first and last).
-fn render_preview(index: usize, count: usize, rail_height: f32, preview: MinimapPreview, cx: &mut Context<ThreadView>) -> AnyElement {
+fn render_preview(index: usize, count: usize, rail_height: f32, preview: MinimapPreview, measured_height: Rc<Cell<f32>>, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
+    let height = measured_height.get();
+    let view = cx.entity_id();
+    let measure = canvas(move |bounds, window, _| {
+        let next = f32::from(bounds.size.height);
+        if measured_height.replace(next) != next { window.on_next_frame(move |_, cx| cx.notify(view)); }
+    }, |_, _, _, _| {}).absolute().size_full();
     let card = div()
         .id("timeline-minimap-preview")
         .relative()
@@ -326,6 +467,9 @@ fn render_preview(index: usize, count: usize, rail_height: f32, preview: Minimap
             BoxShadow { color: gpui::black().opacity(0.25), offset: point(px(0.), px(8.)), blur_radius: px(10.), spread_radius: px(-6.), inset: false },
         ])
         .occlude()
+        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| view.forward_minimap_wheel(event, cx)))
         .on_hover(cx.listener(|view, hovered: &bool, window, cx| {
             view.minimap.preview_hovered = *hovered;
@@ -333,29 +477,26 @@ fn render_preview(index: usize, count: usize, rail_height: f32, preview: Minimap
         }))
         .child(crate::glass::backdrop(12., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
         .child(crate::webview::occluder("timeline-minimap-preview-cover", crate::webview::Layer::TranscriptChrome))
+        .child(measure)
         .child(
             div()
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(hsla(p.popover_foreground))
-                .child(preview.user_text.unwrap_or_else(|| minimap::USER_MESSAGE.to_owned())),
+                .child(crate::selectable_text::SelectableText::new(("minimap-preview-user", index), preview.user_text.unwrap_or_else(|| minimap::USER_MESSAGE.to_owned())).tab_stop(false).tail_ellipsis()),
         )
-        .children(preview.assistant_text.map(|text| div().mt(rem(4.)).line_clamp(3).text_ellipsis().text_color(hsla(p.muted_foreground)).child(text)));
+        .children(preview.assistant_text.map(|text| div().mt(rem(4.)).line_clamp(3).text_ellipsis().text_color(hsla(p.muted_foreground)).child(crate::selectable_text::SelectableText::new(("minimap-preview-assistant", index), text).tab_stop(false).tail_ellipsis())));
     div()
         .absolute()
         .left(rem(32.))
-        .top(px(rail_height * minimap::top_percent(index, count) / 100.))
+        .top(px(rail_height * minimap::top_percent(index, count) / 100. + minimap::preview_offset(index, count, height)))
         .w(rem(320.))
-        .h(px(0.))
-        .flex()
-        .flex_col()
-        .map(|this| match index {
-            0 => this.justify_start(),
-            _ if index + 1 == count => this.justify_end(),
-            _ => this.justify_center(),
-        })
         .child(card)
         .into_any_element()
+}
+
+fn focus_ring(color: gpui::Hsla) -> Vec<BoxShadow> {
+    vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: true }]
 }
 
 pub(super) fn forward_wheel(list: &gpui::ListState, disclosure: &mut t3_core::timeline::anchor::DisclosureFollow, event: &ScrollWheelEvent) -> bool {
@@ -369,4 +510,52 @@ pub(super) fn forward_wheel(list: &gpui::ListState, disclosure: &mut t3_core::ti
     let top = list.scroll_px_offset_for_scrollbar();
     list.set_offset_from_scrollbar(point(px(0.), top.y + delta));
     true
+}
+
+fn strip_scale(active: Option<usize>, index: usize) -> f32 {
+    match active.map(|active| active.abs_diff(index)) {
+        Some(0) => 1., Some(1) => 0.667, Some(2) => 0.417, _ => 0.333,
+    }
+}
+
+struct Motion {
+    from: Vec<f32>,
+    target: Vec<f32>,
+    start: Instant,
+    pending: bool,
+}
+
+// A finite 150ms CSS transition, sampled at most 30 times a second; idle schedules nothing.
+fn transition(id: &'static str, target: Vec<f32>, view: gpui::EntityId, window: &mut Window, cx: &mut gpui::App) -> Vec<f32> {
+    let now = cx.background_executor().now();
+    let state = window.use_keyed_state(id, cx, |_, _| Motion { from: target.clone(), target: target.clone(), start: now, pending: false });
+    let reduced = cx.reduce_motion();
+    let (value, schedule) = state.update(cx, |state, _| {
+        if state.target.len() != target.len() || reduced {
+            state.from = target.clone();
+            state.target = target.clone();
+        }
+        let progress = (now.saturating_duration_since(state.start).as_secs_f32() / 0.15).min(1.);
+        let eased = gpui_base::animation::cubic_bezier(0.4, 0., 0.2, 1.)(progress);
+        let value: Vec<_> = if progress == 1. { state.target.clone() } else { state.from.iter().zip(&state.target).map(|(from, to)| from + (to - from) * eased).collect() };
+        if state.target != target {
+            state.from = value.clone();
+            state.target = target;
+            state.start = now;
+        }
+        let running = value != state.target;
+        let schedule = running && !state.pending;
+        state.pending |= schedule;
+        (value, schedule)
+    });
+    if schedule {
+        let weak = state.downgrade();
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(Duration::from_millis(34)).await;
+            cx.update(|cx| {
+                if weak.update(cx, |state, _| state.pending = false).is_ok() { cx.notify(view); }
+            });
+        }).detach();
+    }
+    value
 }

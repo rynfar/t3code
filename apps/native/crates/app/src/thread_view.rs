@@ -13,6 +13,7 @@ mod citations;
 mod find;
 mod limit_recovery;
 mod minimap;
+pub use minimap::init;
 mod rewind;
 mod status;
 
