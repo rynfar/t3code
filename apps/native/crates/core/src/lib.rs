@@ -53,3 +53,6 @@ pub mod wire;
 pub mod workflows;
 pub mod workspace;
 pub mod worktree_setup;
+
+pub mod connect;
+pub mod relay;

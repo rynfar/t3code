@@ -7,6 +7,7 @@ mod device;
 mod dialog;
 mod diff;
 mod environments;
+mod cloud;
 mod files;
 mod git;
 mod glass;

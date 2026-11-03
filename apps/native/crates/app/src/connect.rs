@@ -2,6 +2,7 @@
 //! add one with a pairing link or over SSH. Over a live connection it is the environment switcher.
 //! Web: `settings/SavedEnvironmentRows.tsx` (rows and their status copy),
 //! `settings/AddEnvironmentDialog.tsx` (the Remote link and SSH modes), `ConnectionStatusDot.tsx`.
+//! T3 Connect rows mirror `components/cloud/CloudEnvironmentConnectList.tsx`.
 //! The SSH host suggestions list inline under the field rather than in a popup.
 
 use gpui::{
@@ -332,6 +333,145 @@ impl ConnectView {
             .into_any_element()
     }
 
+    fn render_cloud(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cloud = &self.state.read(cx).cloud;
+        let p = palette(cx);
+        let busy = cloud.busy;
+        let signing_in = cloud.signing_in;
+        let signed_in = cloud.identity.is_some();
+        let auth = Button::new("cloud-auth", ButtonVariant::Outline, ButtonSize::Sm)
+            .label(if signing_in {
+                "Waiting for browser…"
+            } else if signed_in {
+                "Sign out"
+            } else {
+                "Sign in"
+            })
+            .disabled(busy)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.state.update(cx, |state, cx| {
+                    if signed_in {
+                        state.sign_out_cloud(cx);
+                    } else {
+                        state.sign_in_cloud(cx);
+                    }
+                })
+            }));
+        let actions = h_flex().gap(px(8.)).child(auth).when(signing_in, |this| {
+            this.child(
+                Button::new("cloud-cancel", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                    .label("Cancel")
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx)))),
+            )
+        });
+        let heading = h_flex()
+            .gap(px(8.))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.foreground))
+                            .child("T3 Connect"),
+                    )
+                    .child(muted(
+                        cloud.identity.clone().unwrap_or_else(|| "Sign in to view your T3 Connect environments.".into()),
+                        cx,
+                    )),
+            )
+            .child(
+                Button::new("cloud-refresh", ButtonVariant::GhostMuted, ButtonSize::IconSm)
+                    .icon(Icon::RefreshCw)
+                    .tooltip("Refresh T3 Connect environments")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_cloud(cx)))),
+            );
+        let mut body = card(cx)
+            .px(px(16.))
+            .py(px(14.))
+            .gap(px(12.))
+            .child(heading)
+            .child(actions)
+            .when(signed_in, |this| this.child(muted(t3_core::relay::CONNECTION_UNAVAILABLE, cx)))
+            .children(cloud.error.clone().map(|error| error_text(error, cx)));
+        if signed_in && cloud.discovery.refreshing {
+            body = body.child(muted("Loading T3 Connect environments…", cx));
+        }
+        if signed_in && cloud.discovery.listed && cloud.discovery.environments.is_empty() {
+            body = body.child(muted(
+                "No other environments are published to your account yet. Publish one from another device to connect here.",
+                cx,
+            ));
+        }
+        let count = cloud.discovery.environments.len();
+        if count > 0 {
+            body = body.child(
+                uniform_list(
+                    "cloud-environments",
+                    count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.render_cloud_row(index, cx)).collect::<Vec<_>>()),
+                )
+                .w_full()
+                .h(px((count as f32 * 64.).min(288.))),
+            );
+        }
+        body
+    }
+
+    fn render_cloud_row(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let state = self.state.read(cx);
+        let cloud = &state.cloud;
+        let Some(entry) = cloud.discovery.environments.get(index) else {
+            return div().h(px(64.)).into_any_element();
+        };
+        let environment = entry.clone();
+        let status = "T3 Connect · Connection unavailable";
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .h(px(64.))
+            .gap(px(10.))
+            .child(status_dot(None, cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(palette(cx).foreground))
+                            .child(environment.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("relay-status-{}", environment.environment_id)))
+                            .truncate()
+                            .text_xs()
+                            .text_color(hsla(palette(cx).muted_foreground))
+                            .child(status)
+                            .tooltip(crate::settings::controls::tooltip(t3_core::relay::CONNECTION_UNAVAILABLE.into())),
+                    ),
+            )
+            .child(
+                Button::new(
+                    SharedString::from(format!("relay-{}", environment.environment_id)),
+                    ButtonVariant::Outline,
+                    ButtonSize::Compact,
+                )
+                .label("Unavailable")
+                .disabled(true)
+                .tooltip(t3_core::relay::CONNECTION_UNAVAILABLE),
+            )
+            .into_any_element()
+    }
+
     fn render_saved_row(&self, environment: &SavedEnvironment, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
@@ -616,6 +756,7 @@ impl Render for ConnectView {
                         .gap(px(20.))
                         .child(self.render_header(switching, cx))
                         .children(self.render_rejected(cx))
+                        .child(self.render_cloud(cx))
                         .child(self.render_local(cx))
                         .children(self.render_saved(cx))
                         .child(self.render_add(cx)),

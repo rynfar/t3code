@@ -18,3 +18,5 @@ pub mod worktree_setup;
 
 #[cfg(test)]
 mod test_server;
+
+pub mod connect;

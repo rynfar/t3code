@@ -24,7 +24,7 @@ pub fn use_home(home: PathBuf) {
     let _ = HOME_OVERRIDE.set(home);
 }
 
-fn base() -> Option<PathBuf> {
+pub(crate) fn base() -> Option<PathBuf> {
     HOME_OVERRIDE
         .get()
         .cloned()
@@ -39,7 +39,7 @@ const ENVIRONMENTS_KEY: &str = "environments";
 const LEGACY_CONNECTION: &str = "connection.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SavedEnvironment {
     /// This device's key for the entry; stable across re-pairing.
     pub id: String,
@@ -84,7 +84,7 @@ pub struct SavedEnvironments {
     /// The environment to connect at launch; `None` after an explicit disconnect.
     #[serde(default)]
     pub active: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_environments")]
     pub environments: Vec<SavedEnvironment>,
 }
 
@@ -265,6 +265,11 @@ pub enum EnvironmentChange {
     Put(Box<SavedEnvironment>),
     Remove(String),
     SetActive(Option<String>),
+}
+
+fn deserialize_environments<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<SavedEnvironment>, D::Error> {
+    let entries = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(entries.into_iter().filter_map(|entry| serde_json::from_value(entry).ok()).collect())
 }
 
 fn decode_environments(environments: Option<&str>, legacy: Option<&str>) -> SavedEnvironments {
@@ -497,6 +502,21 @@ pub fn save(credentials: &Credentials) -> std::io::Result<()> {
     save_environments(&saved)
 }
 
+// Cloud OAuth credentials use the same owner-only, atomic secret storage as pairings.
+pub(crate) fn load_cloud_token(base: &Path) -> std::io::Result<Option<t3_core::connect::Token>> {
+    match std::fs::read(base.join("cloud-oauth.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+pub(crate) fn save_cloud_token(base: &Path, token: &t3_core::connect::Token) -> std::io::Result<()> {
+    write_private(base, "cloud-oauth.json", &serde_json::to_string(token).map_err(std::io::Error::other)?)
+}
+pub(crate) fn clear_cloud_token(base: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(base.join("cloud-oauth.json")) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), result => result }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +588,10 @@ mod tests {
         assert_eq!(decode_environments(Some(r#"{"environments":[]}"#), Some(legacy)), SavedEnvironments::default());
         assert_eq!(decode_environments(None, Some("not json")), SavedEnvironments::default());
         assert_eq!(decode_environments(Some("{}"), None), SavedEnvironments::default());
+        let mixed = decode_environments(Some(r#"{"active":"unknown","environments":[{"id":"known","label":"Mac","httpBase":"http://localhost","accessToken":"paired"},{"id":"unknown","label":"Unsupported","httpBase":"https://unused","kind":"future"},{"id":"malformed"}]}"#), None);
+        assert_eq!(mixed.environments.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(), ["known"]);
+        assert!(mixed.active().is_none());
+        assert_eq!(mixed.get("known").and_then(SavedEnvironment::credentials).map(|credentials| credentials.access_token), Some("paired".to_owned()));
     }
 
     #[test]

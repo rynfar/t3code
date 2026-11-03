@@ -6822,6 +6822,7 @@ dependencies = [
  "dirs",
  "futures",
  "libc",
+ "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
@@ -6839,6 +6840,7 @@ name = "t3-core"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "base64 0.22.1",
  "markdown",
  "serde",
  "serde_json",

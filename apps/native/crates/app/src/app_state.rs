@@ -66,6 +66,7 @@ pub struct AppState {
     /// `environments` as last handed to the store; saves send only the edits since.
     pub(crate) environments_saved: SavedEnvironments,
     pub connect: ConnectScreen,
+    pub cloud: crate::cloud::CloudState,
     pub shell: ShellState,
     pub sidebar: SidebarController,
     pub toasts: crate::toast::Toasts,
@@ -127,6 +128,7 @@ impl AppState {
             environments_saved: environments.clone(),
             environments,
             connect: ConnectScreen::default(),
+            cloud: Default::default(),
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
             toasts: Default::default(),
@@ -162,6 +164,7 @@ impl AppState {
             Some(id) => state.start_environment(&id, cx),
             None => state.refresh_local_server(cx),
         }
+        state.refresh_cloud(cx);
         state
     }
 
