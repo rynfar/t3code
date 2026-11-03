@@ -14,11 +14,11 @@ use crate::sidebar::controller::now_ms;
 
 #[derive(Default)]
 pub(super) struct Drafts {
-    store: DraftStore,
+    pub(super) store: DraftStore,
     save: Option<Task<()>>,
 }
 
-fn key(target: &Target) -> String {
+pub(super) fn key(target: &Target) -> String {
     match target {
         Target::Thread(id) => rules::thread_key(id),
         Target::Draft(project) => rules::new_thread_key(project),
@@ -76,7 +76,7 @@ impl Composer {
     }
 
     /// The prompt a target's draft holds: the text, unless the prompt shows a question's answer.
-    fn draft_prompt(&self, cx: &gpui::App) -> String {
+    pub(super) fn draft_prompt(&self, cx: &gpui::App) -> String {
         if let Some(editing) = self.editing_queued() {
             return editing.stash.clone();
         }
@@ -142,7 +142,7 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));
     }
 
-    fn schedule_draft_save(&mut self, target: &Target, cx: &mut Context<Self>) {
+    pub(super) fn schedule_draft_save(&mut self, target: &Target, cx: &mut Context<Self>) {
         if let Target::Draft(project_id) = target { cx.emit(DraftsChanged { project_id: project_id.clone() }); }
         for key in self.drafts.store.take_pruned_keys() {
             if let Some(project_id) = key.strip_prefix("draft:") { cx.emit(DraftsChanged { project_id: project_id.to_owned() }); }

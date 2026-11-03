@@ -38,7 +38,7 @@ actions!(thread_view, [FindInThread]);
 const DETAIL_CACHE_LIMIT: usize = 64;
 
 pub struct ThreadView {
-    state: Entity<AppState>,
+    pub(crate) state: Entity<AppState>,
     list: ListState,
     rows: Vec<Arc<TimelineRow>>,
     entries_cache: EntriesCache,

@@ -30,6 +30,7 @@ pub mod palette;
 pub mod project_scripts;
 pub mod project_search;
 pub mod projects;
+pub mod prompt_links;
 pub mod providers;
 pub mod pull_requests;
 pub mod requests;

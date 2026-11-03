@@ -33,6 +33,7 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
     RestoreDraft,
+    PromptLink,
     /// The connection, the saved environments, or the connect screen changed. Also sent for
     /// every new connection, so whatever follows one can check `connection_id`.
     Phase,
@@ -75,6 +76,7 @@ pub struct AppState {
     pub cloud: crate::cloud::CloudState,
     pub shell: ShellState,
     pub sidebar: SidebarController,
+    pub prompt_link_urls: VecDeque<String>,
     pub toasts: crate::toast::Toasts,
     pub composer_mentions: Vec<crate::project_files::ComposerMention>,
     pub selected_thread: Option<String>,
@@ -143,6 +145,7 @@ impl AppState {
             cloud: Default::default(),
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
+            prompt_link_urls: Default::default(),
             toasts: Default::default(),
             composer_mentions: Vec::new(),
             selected_thread: None,

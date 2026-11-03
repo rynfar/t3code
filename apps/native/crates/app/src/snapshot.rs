@@ -23,7 +23,7 @@ use t3_core::usage::{UsageMetric, UsagePeriod};
 use crate::app_state::AppState;
 
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
-[--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
+[--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
 [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
@@ -129,6 +129,10 @@ pub struct Options {
     attach: Vec<PathBuf>,
     /// Typed into the composer last, so a trigger such as `@src` or `/` opens its menu.
     prompt: Option<String>,
+    open_url: Option<String>,
+    prompt_link_repository: Option<String>,
+    prompt_link_fixture: Option<PathBuf>,
+    clipboard_output: Option<PathBuf>,
     pull_requests: bool,
     pull_request: Option<u64>,
     pull_request_code: bool,
@@ -179,6 +183,10 @@ impl Options {
             new_thread: has("--new-thread"),
             attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
             prompt: flag("--prompt"),
+            open_url: flag("--open-url"),
+            prompt_link_repository: flag("--prompt-link-repository"),
+            prompt_link_fixture: flag("--prompt-link-fixture").map(PathBuf::from),
+            clipboard_output: flag("--clipboard-output").map(PathBuf::from),
             pull_requests: has("--pull-requests"),
             pull_request: flag("--pull-request").and_then(|value| value.trim_start_matches('#').parse().ok()),
             pull_request_code: flag("--pull-request-tab").is_some_and(|tab| tab == "code"),
@@ -313,10 +321,81 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     if options.context_meter {
         state.update(&mut cx, |state, _| state.client_settings.context_window_meter = true);
     }
+    if let Some(repo) = &options.prompt_link_repository {
+        state.update(&mut cx, |state, cx| {
+            if let Some(project) = state.shell.snapshot.as_mut().and_then(|s| s.projects.first_mut()) {
+                project.repository_identity = Some(serde_json::json!({"canonicalKey": format!("github.com/{repo}")}));
+            }
+            cx.emit(crate::app_state::AppEvent::Shell);
+        });
+    }
     if let Some(thread) = &options.thread {
         state.update(&mut cx, |state, cx| state.select_thread(thread, cx));
         let loaded = state.clone();
         pump(&mut cx, options.wait, move |cx| loaded.read_with(cx, |state, _| state.thread.projection.is_some()));
+    }
+    if let Some(path) = &options.prompt_link_fixture {
+        let configured = state.clone();
+        pump(&mut cx, options.wait, move |cx| configured.read_with(cx, |state, _| state.server_config.config.is_some()));
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Fixture {
+            thread: String,
+            hidden: bool,
+            pull_request: Option<String>,
+            message: Option<String>,
+        }
+        let fixture: Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        // Mutates only this renderer's in-memory projection, never the server or saved settings.
+        let link = fixture
+            .pull_request
+            .as_deref()
+            .map(|pr| {
+                let pr = t3_core::prompt_links::parse_pull_request(pr).ok_or("invalid fixture pull request")?;
+                serde_json::from_value(serde_json::json!({
+                    "host":"github.com", "repository":format!("{}/{}",pr.repository.owner,pr.repository.name),
+                    "number":pr.number,"url":pr.url(),"source":"manual","linkedAt":"2026-01-01T00:00:00.000Z"
+                }))
+                .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        state.update(&mut cx, |state, cx| {
+            // Hold this snapshot fixture against later repository-enrichment frames.
+            state.stop_pump();
+            if let Some(thread) = state
+                .shell
+                .snapshot
+                .as_mut()
+                .and_then(|s| s.threads.iter_mut().find(|t| t.id == fixture.thread))
+            {
+                if fixture.hidden {
+                    thread.tags.push("prompt-link-fixture".into());
+                }
+                if let Some(link) = link {
+                    thread.pull_requests = vec![link];
+                }
+            }
+            if fixture.hidden
+                && let Some(config) = state.server_config.config.as_mut()
+            {
+                config.settings.hide_tagged_threads = true;
+                config.settings.hidden_thread_tags = vec!["prompt-link-fixture".into()];
+            }
+            if let Some(message) = fixture.message
+                && let Some(projection) = state.thread.projection.as_mut().filter(|p| p.thread.id == fixture.thread)
+                && let Some(item) = projection
+                    .visible_turn_items
+                    .iter_mut()
+                    .rev()
+                    .find(|i| matches!(i.item.kind, t3_core::turn_item::TurnItemKind::UserMessage { .. }))
+                && let t3_core::turn_item::TurnItemKind::UserMessage { text, .. } = &mut Arc::make_mut(&mut item.item).kind
+            {
+                *text = message;
+            }
+            state.rebuild_sidebar(cx);
+            cx.emit(crate::app_state::AppEvent::Shell);
+            cx.emit(crate::app_state::AppEvent::Thread);
+        });
     }
     if let Some(path) = &options.worktree_setup {
         let text = std::fs::read_to_string(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -382,14 +461,6 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         state.update(&mut cx, |state, cx| state.set_pull_requests_open(true, cx));
         pump(&mut cx, options.wait, |_| false);
     }
-    if options.palette {
-        // Actions bubble from the focused element; an offscreen window starts with none.
-        cx.update_window(window, |_, window, cx| {
-            window.focus_next(cx);
-            window.dispatch_action(Box::new(crate::keymap::ToggleCommandPalette), cx);
-        })
-        .map_err(|error| error.to_string())?;
-    }
     if let Some(step) = options.welcome {
         cx.update(|cx| crate::onboarding::open(step, cx));
         pump(&mut cx, options.wait.min(3.), |_| false);
@@ -415,6 +486,18 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     if let Some(prompt) = &options.prompt {
         cx.simulate_input(window, prompt);
+    }
+    if let Some(url) = &options.open_url {
+        state.update(&mut cx, |state, cx| state.open_prompt_url(url.clone(), cx));
+        pump(&mut cx, 1., |_| false);
+    }
+    if options.palette {
+        // Actions bubble from the focused element; an offscreen window starts with none.
+        cx.update_window(window, |_, window, cx| {
+            window.focus_next(cx);
+            window.dispatch_action(Box::new(crate::keymap::ToggleCommandPalette), cx);
+        })
+        .map_err(|error| error.to_string())?;
     }
     if let Some(metric) = &options.usage {
         let metric = UsageMetric::ALL.into_iter().find(|candidate| candidate.label().eq_ignore_ascii_case(metric)).ok_or_else(|| format!("unknown usage metric {metric:?}"))?;
@@ -454,6 +537,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;
     if let Some(parent) = options.out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if let Some(path) = &options.clipboard_output {
+        let link = cx.update(|cx| cx.try_global::<crate::composer::prompt_links::SnapshotClipboard>().and_then(|s| s.0.clone())).ok_or("no prompt link was copied")?;
+        std::fs::write(path, link).map_err(|e| e.to_string())?;
     }
     image.save(&options.out).map_err(|error| error.to_string())
 

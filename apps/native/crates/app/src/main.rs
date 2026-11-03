@@ -25,6 +25,7 @@ mod onboarding;
 mod palette;
 mod preview;
 mod project_files;
+mod prompt_links;
 mod projects;
 mod provider_icon;
 mod pull_requests;
@@ -82,8 +83,24 @@ fn main() {
         return;
     }
 
-    gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
+    let (urls, mut incoming) = futures::channel::mpsc::unbounded::<String>();
+    for url in command_line_urls() {
+        let _ = urls.unbounded_send(url);
+    }
+    let application = gpui_platform::application().with_assets(icons::Assets);
+    application.on_open_urls(move |links| {
+        for link in links { let _ = urls.unbounded_send(link); }
+    });
+    application.run(move |cx: &mut App| {
         let state = boot(handle.clone(), cx);
+        let receiver_state = state.clone();
+        cx.spawn(async move |cx| {
+            use futures::StreamExt;
+            while let Some(url) = incoming.next().await {
+                receiver_state.update(cx, |state, cx| state.open_prompt_url(url, cx));
+            }
+        })
+        .detach();
         cx.on_system_notification_response({
             let state = state.downgrade();
             move |response, cx| {
@@ -136,4 +153,13 @@ fn root_view(state: &Entity<app_state::AppState>, window: &mut Window, cx: &mut 
     theme::follow_system_appearance(window, cx);
     let view = cx.new(|cx| workspace::Workspace::new(state.clone(), window, cx));
     cx.new(|cx| Root::new(view, window, cx))
+}
+
+fn command_line_urls() -> Vec<String> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    args.iter()
+        .enumerate()
+        .filter(|(i, arg)| (*i > 0 && args[*i - 1] == "--open-url") || arg.starts_with("t3code-native://") || arg.starts_with("https://app.t3.codes/"))
+        .map(|(_, arg)| arg.clone())
+        .collect()
 }
