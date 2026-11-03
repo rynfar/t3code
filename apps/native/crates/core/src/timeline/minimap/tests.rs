@@ -229,18 +229,326 @@ fn tab_order_skips_disabled_turn_buttons() {
 
 #[test]
 fn navigation_tooltip_escape_survives_renders_and_delayed_hover_opens() {
-    let mut tooltip = NavigationTooltip::default();
-    assert!(tooltip.visible(false, true, false));
-    tooltip.dismiss();
-    assert!(!tooltip.visible(false, true, false));
-    assert!(!tooltip.visible(false, true, false));
-    assert!(!tooltip.visible(false, false, false));
-    assert!(tooltip.visible(false, true, false));
-    tooltip.dismiss();
-    assert!(tooltip.visible(true, true, false), "a new hover resets dismissal");
-    assert!(!tooltip.visible(true, false, false));
-    tooltip.dismiss();
-    assert!(!tooltip.visible(true, false, true), "a delayed hover open cannot undo Escape");
-    assert!(!tooltip.visible(false, false, false));
-    assert!(tooltip.visible(true, false, true));
+    use std::time::Duration;
+    let mut tooltip = NavigationTooltips::default();
+    tooltip.focus(0, true, true);
+    assert_eq!(tooltip.visible(), Some(0));
+    assert!(tooltip.escape());
+    tooltip.focus(0, true, true);
+    assert_eq!(tooltip.visible(), None);
+    tooltip.focus(0, false, true);
+    tooltip.focus(0, true, true);
+    assert_eq!(tooltip.visible(), Some(0));
+    tooltip.focus(0, false, true);
+    tooltip.hover(0, true, Duration::ZERO);
+    tooltip.pointer_move(0, 10., 20., Duration::ZERO);
+    assert!(!tooltip.escape(), "a pending label must not consume Escape");
+    tooltip.advance(Duration::from_secs(1));
+    assert_eq!(tooltip.visible(), None, "a delayed hover open cannot undo Escape");
+    assert_eq!(tooltip.deadline(), None);
+    let mut closing = NavigationTooltips::default();
+    closing.hover(0, true, Duration::ZERO);
+    closing.pointer_move(0, 10., 20., Duration::ZERO);
+    closing.advance(Duration::from_millis(600));
+    closing.hover(0, false, Duration::from_millis(600));
+    assert!(!closing.escape(), "an ending label has no Escape dismiss interaction");
+    closing.hover(0, true, Duration::from_millis(601));
+    assert_eq!(closing.visible(), Some(0), "unconsumed Escape preserves the hover-close reentry rule");
+}
+
+
+#[test]
+fn navigation_tooltips_wait_for_each_trigger_without_a_provider_grace_period() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    assert_eq!(tips.deadline(), Some(ms(600)));
+    tips.advance(ms(599));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(600));
+    assert_eq!(tips.visible(), Some(0));
+    tips.hover(0, false, ms(610));
+    tips.hover(1, true, ms(610));
+    tips.pointer_move(1, 10., 20., ms(610));
+    assert_eq!(tips.visible(), None, "TimelineMinimap has no TooltipProvider: the next trigger waits too");
+    tips.advance(ms(1209));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(1210));
+    assert_eq!(tips.visible(), Some(1));
+    assert_eq!(tips.deadline(), None, "settled tooltips schedule no work");
+}
+
+#[test]
+fn navigation_tooltip_scroll_cancels_pending_and_open_hover_but_preserves_focus() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for open in [false, true] {
+        let mut tips = NavigationTooltips::default();
+        tips.hover(0, true, ms(0));
+        tips.pointer_move(0, 10., 20., ms(0));
+        if open { tips.advance(ms(600)); }
+        tips.scroll();
+        tips.advance(ms(900));
+        assert_eq!(tips.visible(), None, "scroll cancels pending opens as well as visible hover tips");
+        assert_eq!(tips.deadline(), None);
+        tips.hover(0, false, ms(900));
+        tips.hover(0, true, ms(901));
+        tips.pointer_move(0, 10., 20., ms(901));
+        tips.advance(ms(1501));
+        assert_eq!(tips.visible(), Some(0), "leaving and reentering restores hover");
+    }
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true, true);
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    tips.scroll();
+    assert_eq!(tips.visible(), Some(0), "the web scroll tracker preserves the focused trigger");
+}
+
+#[test]
+fn navigation_tooltip_press_and_escape_do_not_reopen_until_a_new_interaction() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for (focused, pending, escape) in [
+        (false, true, false), (false, false, false), (true, false, false),
+        (false, true, true), (false, false, true), (true, false, true),
+    ] {
+        let mut tips = NavigationTooltips::default();
+        tips.hover(0, true, ms(0));
+        tips.pointer_move(0, 10., 20., ms(0));
+        tips.focus(0, focused, true);
+        if !pending { tips.advance(ms(600)); }
+        if escape { tips.escape(); } else { tips.press(0); }
+        tips.advance(ms(1000));
+        tips.hover(0, true, ms(1000));
+        tips.pointer_move(0, 10., 20., ms(1000));
+        tips.focus(0, focused, true);
+        assert_eq!(tips.visible(), None);
+        assert_eq!(tips.deadline(), None);
+        tips.hover(0, false, ms(1001));
+        tips.hover(0, true, ms(1002));
+        tips.pointer_move(0, 10., 20., ms(1002));
+        assert_eq!(tips.visible(), None, "unchanged focus cannot bypass re-arming, escape={escape}");
+        tips.advance(ms(1601));
+        assert_eq!(tips.visible(), None);
+        tips.advance(ms(1602));
+        assert_eq!(tips.visible(), Some(0));
+        tips.escape();
+        tips.advance(ms(2000));
+        assert_eq!(tips.visible(), None);
+    }
+}
+
+#[test]
+fn navigation_tooltips_arbitrate_focus_and_hover_without_reopening_the_displaced_tip() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true, true);
+    assert_eq!(tips.visible(), Some(0));
+    tips.hover(1, true, ms(1));
+    tips.pointer_move(1, 10., 20., ms(1));
+    tips.advance(ms(601));
+    assert_eq!(tips.visible(), Some(1));
+    tips.hover(1, false, ms(602));
+    tips.focus(0, false, true);
+    tips.hover(1, true, ms(650));
+    assert_eq!(tips.visible(), Some(1), "blurring the displaced trigger preserves its neighbor's close-fade reentry");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(1, false, ms(651));
+    tips.advance(ms(1500));
+    assert_eq!(tips.visible(), None, "the displaced trigger cannot reopen on a render");
+    tips.focus(0, false, true);
+    tips.focus(0, true, true);
+    assert_eq!(tips.visible(), Some(0));
+}
+
+
+#[test]
+fn navigation_tooltip_warmup_waits_for_cold_movement_but_ignores_warm_jitter() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    assert_eq!(tips.deadline(), None, "mouseenter alone does not start the rest delay");
+    tips.pointer_move(0, 10., 20., ms(10));
+    assert_eq!(tips.deadline(), Some(ms(610)), "the first move starts the rest delay");
+    tips.pointer_move(0, 10.5, 20., ms(300));
+    assert_eq!(tips.deadline(), Some(ms(900)), "even tiny cold movement restarts the wait");
+    tips.advance(ms(899));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(900));
+    assert_eq!(tips.visible(), Some(0));
+    tips.pointer_move(0, 20., 30., ms(1000));
+    assert_eq!(tips.deadline(), None, "movement of an open trigger schedules nothing");
+    tips.scroll();
+    tips.pointer_move(0, 30., 40., ms(1100));
+    tips.advance(ms(2000));
+    assert_eq!(tips.visible(), None, "movement cannot reopen a dismissed tooltip");
+    tips.hover(0, false, ms(2001));
+    tips.hover(0, true, ms(2002));
+    tips.pointer_move(0, 10., 20., ms(2010));
+    tips.pointer_move(0, 10.5, 20., ms(2300));
+    assert_eq!(tips.deadline(), Some(ms(2610)), "the active DOM reference ignores small jitter while waiting");
+    tips.pointer_move(0, 12., 20., ms(2400));
+    assert_eq!(tips.deadline(), Some(ms(3000)));
+}
+
+#[test]
+fn navigation_tooltip_focus_only_opens_on_a_new_keyboard_focus() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true, false);
+    assert_eq!(tips.visible(), None, "pointer focus does not open a label");
+    tips.focus(0, true, true);
+    assert_eq!(tips.visible(), None, "modality changes do not synthesize a new focus event");
+    tips.focus(0, false, true);
+    tips.focus(0, true, true);
+    assert_eq!(tips.visible(), Some(0));
+    assert!(tips.instant(0), "focus opens instantly");
+    tips.hover(0, true, ms(0));
+    tips.focus(0, false, true);
+    tips.pointer_move(0, 10., 20., ms(1));
+    tips.advance(ms(601));
+    assert_eq!(tips.visible(), None, "blur blocks mouse-move reopening while hover is retained");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(0, false, ms(602));
+    tips.hover(0, true, ms(603));
+    tips.pointer_move(0, 10., 20., ms(603));
+    tips.advance(ms(1202));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(1203));
+    tips.focus(0, true, false);
+    assert_eq!(tips.visible(), Some(0), "pointer focus does not change an already open hover label");
+    let mut pending = NavigationTooltips::default();
+    pending.hover(0, true, ms(0));
+    pending.pointer_move(0, 10., 20., ms(0));
+    pending.focus(0, true, false);
+    assert_eq!(pending.deadline(), Some(ms(600)), "pointer focus preserves hover rest");
+    pending.advance(ms(600));
+    assert_eq!(pending.visible(), Some(0));
+}
+
+#[test]
+fn navigation_tooltip_focus_dismiss_and_arbitration_are_instant() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true, true);
+    assert!(tips.instant(0), "focus opens instantly");
+    tips.hover(1, true, ms(0));
+    tips.pointer_move(1, 10., 20., ms(0));
+    tips.advance(ms(600));
+    assert_eq!(tips.visible(), Some(1));
+    assert!(tips.instant(0) && tips.instant(1), "the delay-group switch closes and opens instantly");
+    tips.hover(1, false, ms(601));
+    assert!(!tips.instant(1), "a hover close uses its finite fade");
+    tips.hover(1, true, ms(602));
+    assert_eq!(tips.visible(), Some(1));
+    assert!(!tips.instant(1), "same-trigger closing reentry reverses the fade");
+    tips.press(1);
+    assert!(tips.instant(1), "a reference press closes instantly");
+    tips.focus(0, false, true);
+    tips.focus(0, true, true);
+    assert!(tips.escape());
+    assert_eq!(tips.visible(), None);
+    assert!(tips.instant(0), "Escape closes instantly");
+}
+
+
+#[test]
+fn navigation_tooltip_reentry_only_skips_warmup_during_its_own_hover_close_transition() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for (reduced, reentry, expected) in [(false, 749, Some(0)), (false, 750, None), (true, 601, None)] {
+        let mut tips = NavigationTooltips::default();
+        tips.set_reduced_motion(reduced);
+        tips.hover(0, true, ms(0));
+        tips.pointer_move(0, 10., 20., ms(0));
+        tips.advance(ms(600));
+        tips.hover(0, false, ms(600));
+        tips.outside_press();
+        tips.press(1);
+        tips.hover(0, true, ms(reentry));
+        assert_eq!(tips.visible(), expected, "reentry={reentry}, reduced={reduced}");
+    }
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    tips.advance(ms(600));
+    tips.press(0);
+    tips.hover(0, false, ms(601));
+    tips.hover(0, true, ms(602));
+    tips.pointer_move(0, 10., 20., ms(602));
+    assert_eq!(tips.visible(), None, "press dismissal does not get the hover-close grace");
+}
+
+#[test]
+fn navigation_tooltip_focused_hover_leave_closes_and_reentry_waits() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.focus(0, true, true);
+    tips.hover(0, true, ms(0));
+    tips.hover(0, false, ms(1));
+    assert_eq!(tips.visible(), None, "hover leave closes even when focus remains");
+    tips.hover(0, true, ms(151));
+    tips.pointer_move(0, 10., 20., ms(151));
+    assert_eq!(tips.visible(), None, "retained focus does not bypass hover rest");
+    tips.advance(ms(750));
+    assert_eq!(tips.visible(), None);
+    tips.advance(ms(751));
+    assert_eq!(tips.visible(), Some(0));
+    assert!(!tips.instant(0), "a hover open replaces focus instant mode");
+}
+
+#[test]
+fn navigation_tooltip_hover_dismissal_uses_the_press_escape_instant_reason() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for escape in [false, true] {
+        let mut tips = NavigationTooltips::default();
+        tips.hover(0, true, ms(0));
+        tips.pointer_move(0, 10., 20., ms(0));
+        tips.advance(ms(600));
+        assert_eq!(tips.visible(), Some(0));
+        assert!(!tips.instant(0));
+        if escape { assert!(tips.escape()); } else {
+            tips.outside_press();
+            assert!(!tips.instant(0));
+            tips.press(0);
+        }
+        assert_eq!(tips.visible(), None);
+        assert!(tips.instant(0), "a hover-opened label dismisses instantly, escape={escape}");
+        assert_eq!(tips.deadline(), None);
+    }
+}
+
+#[test]
+fn navigation_tooltip_close_fades_belong_to_each_trigger() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    tips.advance(ms(600));
+    tips.hover(0, false, ms(601));
+    tips.focus(1, true, true);
+    tips.hover(1, true, ms(602));
+    tips.hover(1, false, ms(603));
+    tips.hover(0, true, ms(650));
+    assert_eq!(tips.visible(), Some(0), "opening and closing the other root does not erase this root's fade");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(0, false, ms(651));
+    tips.hover(1, true, ms(652));
+    assert_eq!(tips.visible(), Some(1), "both roots retain their own closing deadlines");
+    assert_eq!(tips.deadline(), None);
+    tips.hover(1, false, ms(653));
+    tips.set_reduced_motion(true);
+    tips.hover(0, true, ms(654));
+    tips.hover(1, true, ms(655));
+    assert_eq!(tips.visible(), None, "reduced motion ends both close fades immediately");
 }
