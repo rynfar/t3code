@@ -26,6 +26,7 @@ pub struct PromptLinks {
     fallback: Option<NewThreadLink>,
     scratch: bool,
     sequence: u64,
+    connecting: Option<String>,
     _subscription: Subscription,
 }
 impl PromptLinks {
@@ -43,6 +44,7 @@ impl PromptLinks {
             fallback: None,
             scratch: false,
             sequence: 0,
+            connecting: None,
             _subscription: subscription,
         };
         this.process(window, cx);
@@ -55,6 +57,7 @@ impl PromptLinks {
     fn process(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(url) = self.state.update(cx, |s, _| s.prompt_link_urls.pop_front()) {
             self.sequence += 1;
+            self.connecting = None;
             self.scratch = false;
             self.pending = Some(url);
             self.page = Some(("Opening the link...".into(), String::new()));
@@ -72,33 +75,37 @@ impl PromptLinks {
                 return;
             };
             let app = self.state.read(cx);
-            if !app.shell.synchronized || app.shell.snapshot.is_none() || app.server_config.config.is_none() {
-                return;
-            }
             let current = app.active_environment().and_then(|e| e.environment_id.as_deref());
-            if current != Some(env) {
-                let saved = app
-                    .environments
-                    .environments
-                    .iter()
-                    .find(|e| e.environment_id.as_deref() == Some(env))
-                    .map(|e| e.id.clone());
-                if let Some(id) = saved {
-                    self.state.update(cx, |s, cx| s.connect_environment(&id, cx));
+            let saved = app
+                .environments
+                .environments
+                .iter()
+                .find(|e| e.environment_id.as_deref() == Some(env))
+                .map(|e| e.id.as_str());
+            let ready = app.shell.synchronized && app.shell.snapshot.is_some() && app.server_config.config.is_some();
+            match rules::thread_link_route(env, current, saved, ready) {
+                rules::ThreadLinkRoute::Connect(id) => {
+                    let id = id.to_owned();
+                    if self.connecting.as_deref() != Some(&id) {
+                        self.connecting = Some(id.clone());
+                        self.state.update(cx, |s, cx| s.connect_environment(&id, cx));
+                    }
                     return;
                 }
-                self.pending = None;
-                return self.fail("Could not open the link", "Connect to the machine named by this link first.".into(), cx);
+                rules::ThreadLinkRoute::Wait => return,
+                rules::ThreadLinkRoute::MissingEnvironment => {
+                    self.pending = None;
+                    return self.fail("Could not open the link", "Connect to the machine named by this link first.".into(), cx);
+                }
+                rules::ThreadLinkRoute::Select => {}
             }
             self.pending = None;
-            self.state.update(cx, |s, cx| s.select_thread(thread, cx));
-            self.page = None;
-            match rules::parse_thread_link_prompt(query) {
-                Ok(Some(prompt)) => self.composer.update(cx, |c, cx| c.place_linked_prompt(prompt, vec![], window, cx)),
-                Ok(None) => {}
-                Err(error) => self.state.update(cx, |s, cx| {
+            let parsed = rules::parse_thread_link_prompt(query);
+            self.open_thread(env, thread, parsed.as_ref().ok().and_then(|p| p.as_ref()), window, cx);
+            if let Err(error) = parsed {
+                self.state.update(cx, |s, cx| {
                     s.show_toast(Toast::new(ToastKind::Error, "Could not open the linked prompt").description(error), cx)
-                }),
+                });
             }
             cx.notify();
             return;
@@ -117,11 +124,8 @@ impl PromptLinks {
             && let Some(thread) = rules::find_prompt_link_pull_request_thread(&snapshot.threads, pull_request)
         {
             let id = thread.id.clone();
-            self.page = None;
-            self.state.update(cx, |s, cx| s.select_thread(&id, cx));
-            if let Some(prompt) = link.prompt().cloned() {
-                self.composer.update(cx, |c, cx| c.place_linked_prompt(prompt, vec![], window, cx));
-            }
+            let environment = app.active_environment().and_then(|e| e.environment_id.clone()).unwrap_or_default();
+            self.open_thread(&environment, &id, link.prompt(), window, cx);
             cx.notify();
             return;
         }
@@ -155,6 +159,25 @@ impl PromptLinks {
             self.open_scratch(link, window, cx);
         }
         cx.notify();
+    }
+    fn open_thread(&mut self, environment: &str, thread: &str, prompt: Option<&rules::LinkedPrompt>, window: &mut Window, cx: &mut Context<Self>) {
+        use t3_core::sidebar::tag_filter::ThreadKey;
+        self.state.update(cx, |s, cx| s.select_thread(thread, cx));
+        let app = self.state.read(cx);
+        let selected = app
+            .active_environment()
+            .and_then(|e| e.environment_id.as_deref())
+            .zip(app.selected_thread.as_deref())
+            .map(|(env, id)| ThreadKey::new(env, id));
+        match rules::prompt_for_selected_thread(&ThreadKey::new(environment, thread), selected.as_ref(), prompt) {
+            Ok(prompt) => {
+                self.page = None;
+                if let Some(prompt) = prompt.cloned() {
+                    self.composer.update(cx, |c, cx| c.place_linked_prompt(prompt, vec![], window, cx));
+                }
+            }
+            Err(message) => self.fail("Could not open the linked prompt", message.into(), cx),
+        }
     }
     fn open_draft(&mut self, project: &str, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |s, cx| s.start_draft(project, cx));

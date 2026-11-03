@@ -23,7 +23,7 @@ use t3_core::usage::{UsageMetric, UsagePeriod};
 use crate::app_state::AppState;
 
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
-[--open-url <url>] [--prompt-link-repository <owner/name>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
+[--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] \
 [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
@@ -131,6 +131,7 @@ pub struct Options {
     prompt: Option<String>,
     open_url: Option<String>,
     prompt_link_repository: Option<String>,
+    prompt_link_fixture: Option<PathBuf>,
     clipboard_output: Option<PathBuf>,
     pull_requests: bool,
     pull_request: Option<u64>,
@@ -183,6 +184,7 @@ impl Options {
             prompt: flag("--prompt"),
             open_url: flag("--open-url"),
             prompt_link_repository: flag("--prompt-link-repository"),
+            prompt_link_fixture: flag("--prompt-link-fixture").map(PathBuf::from),
             clipboard_output: flag("--clipboard-output").map(PathBuf::from),
             pull_requests: has("--pull-requests"),
             pull_request: flag("--pull-request").and_then(|value| value.trim_start_matches('#').parse().ok()),
@@ -329,6 +331,69 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         state.update(&mut cx, |state, cx| state.select_thread(thread, cx));
         let loaded = state.clone();
         pump(&mut cx, options.wait, move |cx| loaded.read_with(cx, |state, _| state.thread.projection.is_some()));
+    }
+    if let Some(path) = &options.prompt_link_fixture {
+        let configured = state.clone();
+        pump(&mut cx, options.wait, move |cx| configured.read_with(cx, |state, _| state.server_config.config.is_some()));
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Fixture {
+            thread: String,
+            hidden: bool,
+            pull_request: Option<String>,
+            message: Option<String>,
+        }
+        let fixture: Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        // Mutates only this renderer's in-memory projection, never the server or saved settings.
+        let link = fixture
+            .pull_request
+            .as_deref()
+            .map(|pr| {
+                let pr = t3_core::prompt_links::parse_pull_request(pr).ok_or("invalid fixture pull request")?;
+                serde_json::from_value(serde_json::json!({
+                    "host":"github.com", "repository":format!("{}/{}",pr.repository.owner,pr.repository.name),
+                    "number":pr.number,"url":pr.url(),"source":"manual","linkedAt":"2026-01-01T00:00:00.000Z"
+                }))
+                .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        state.update(&mut cx, |state, cx| {
+            // Hold this snapshot fixture against later repository-enrichment frames.
+            state.stop_pump();
+            if let Some(thread) = state
+                .shell
+                .snapshot
+                .as_mut()
+                .and_then(|s| s.threads.iter_mut().find(|t| t.id == fixture.thread))
+            {
+                if fixture.hidden {
+                    thread.tags.push("prompt-link-fixture".into());
+                }
+                if let Some(link) = link {
+                    thread.pull_requests = vec![link];
+                }
+            }
+            if fixture.hidden
+                && let Some(config) = state.server_config.config.as_mut()
+            {
+                config.settings.hide_tagged_threads = true;
+                config.settings.hidden_thread_tags = vec!["prompt-link-fixture".into()];
+            }
+            if let Some(message) = fixture.message
+                && let Some(projection) = state.thread.projection.as_mut().filter(|p| p.thread.id == fixture.thread)
+                && let Some(item) = projection
+                    .visible_turn_items
+                    .iter_mut()
+                    .rev()
+                    .find(|i| matches!(i.item.kind, t3_core::turn_item::TurnItemKind::UserMessage { .. }))
+                && let t3_core::turn_item::TurnItemKind::UserMessage { text, .. } = &mut Arc::make_mut(&mut item.item).kind
+            {
+                *text = message;
+            }
+            state.rebuild_sidebar(cx);
+            cx.emit(crate::app_state::AppEvent::Shell);
+            cx.emit(crate::app_state::AppEvent::Thread);
+        });
     }
     if let Some(path) = &options.worktree_setup {
         let text = std::fs::read_to_string(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;

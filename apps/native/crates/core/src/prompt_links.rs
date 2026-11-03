@@ -242,6 +242,47 @@ pub fn prompt_link_for(prompt: &str, repo: Option<&Repository>, provider: Option
     let prompt = trim(prompt);
     (!prompt.is_empty() && prompt.encode_utf16().count() <= MAX_PROMPT_LENGTH).then(|| build_new_thread_link(prompt, repo, provider, model))
 }
+/// The saved destination is resolved before its shell is used for a thread link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadLinkRoute<'a> {
+    Connect(&'a str),
+    Wait,
+    Select,
+    MissingEnvironment,
+}
+pub fn thread_link_route<'a>(destination: &str, current: Option<&str>, saved: Option<&'a str>, ready: bool) -> ThreadLinkRoute<'a> {
+    if current != Some(destination) {
+        return saved.map(ThreadLinkRoute::Connect).unwrap_or(ThreadLinkRoute::MissingEnvironment);
+    }
+    if ready { ThreadLinkRoute::Select } else { ThreadLinkRoute::Wait }
+}
+
+/// Only the selected destination may receive a linked prompt after navigation.
+pub fn prompt_for_selected_thread<'a>(
+    destination: &crate::sidebar::tag_filter::ThreadKey,
+    selected: Option<&crate::sidebar::tag_filter::ThreadKey>,
+    prompt: Option<&'a LinkedPrompt>,
+) -> Result<Option<&'a LinkedPrompt>, &'static str> {
+    if selected != Some(destination) {
+        return Err("This thread is not available. T3 Code did not add the linked prompt.");
+    }
+    Ok(prompt)
+}
+
+/// User message links share readable context labels (`TimelineUserMessageRow.tsx`).
+pub fn user_message_prompt_link(text: &str) -> Option<String> {
+    use crate::composer::menu::{context_references, sanitize_context_label};
+    let mut plain = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for reference in context_references(text) {
+        plain.push_str(&text[cursor..reference.start]);
+        plain.push_str(&sanitize_context_label(reference.label, reference.kind));
+        cursor = reference.end;
+    }
+    plain.push_str(&text[cursor..]);
+    prompt_link_for(&plain, None, None, None)
+}
+
 fn thread_path(path: &str) -> bool {
     let Some(rest) = path.strip_prefix('/') else {
         return false;

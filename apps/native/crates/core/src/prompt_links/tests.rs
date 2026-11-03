@@ -257,3 +257,54 @@ fn earlier_pending_pr_lookups_hold_back_later_threads() {
     };
     assert_eq!(pick_prompt_link_pull_request_thread(&[archived, Failed]), Some(None));
 }
+
+#[test]
+fn rejected_thread_navigation_cannot_stage_into_a_home_or_other_thread_draft() {
+    use crate::sidebar::tag_filter::{ThreadKey, route_visible};
+    let prompt = sanitize_linked_prompt("linked prompt");
+    let destination = ThreadKey::new("env", "hidden");
+    let hidden = std::collections::HashSet::from(["hidden".into()]);
+    let selected = route_visible("hidden", true, &hidden, true).then_some(destination.clone());
+    assert!(prompt_for_selected_thread(&destination, selected.as_ref(), Some(&prompt)).is_err());
+    assert!(prompt_for_selected_thread(&destination, selected.as_ref(), None).is_err());
+    for other in [ThreadKey::new("env", "other"), ThreadKey::new("other-env", "hidden")] {
+        assert!(prompt_for_selected_thread(&destination, Some(&other), Some(&prompt)).is_err());
+    }
+    assert_eq!(prompt_for_selected_thread(&destination, Some(&destination), Some(&prompt)), Ok(Some(&prompt)));
+}
+
+#[test]
+fn explicit_thread_links_connect_the_saved_destination_before_waiting_for_its_shell() {
+    use ThreadLinkRoute::*;
+    for current in [None, Some("unreachable-a")] {
+        assert_eq!(thread_link_route("b", current, Some("saved-b"), false), Connect("saved-b"));
+        assert_eq!(thread_link_route("b", current, None, false), MissingEnvironment);
+    }
+    assert_eq!(thread_link_route("b", Some("b"), Some("saved-b"), false), Wait);
+    assert_eq!(thread_link_route("b", Some("b"), Some("saved-b"), true), Select);
+}
+
+#[test]
+fn context_only_message_links_roundtrip_as_portable_prose_without_local_records() {
+    use crate::composer::{context::TerminalSend, menu::context_references};
+    for (text, expected) in [
+        ("[Terminal 1 lines 4-9](t3-context://v1/terminal/terminal_1)", "Terminal 1 lines 4-9"),
+        (
+            "Inspect [  Terminal   1  ](t3-context://v1/terminal/terminal_1)\nand [Bug report](t3-context://v1/thread/thread_2)",
+            "Inspect Terminal 1\nand Bug report",
+        ),
+        ("![Screenshot](t3-context://v1/image/image_1)", "Screenshot"),
+    ] {
+        let url = user_message_prompt_link(text).unwrap();
+        let parsed = parse_new_thread_link(Url::parse(&url).unwrap().query().unwrap()).unwrap();
+        let prompt = &parsed.prompt().unwrap().text;
+        assert_eq!(prompt, expected);
+        assert!(context_references(prompt).is_empty());
+        assert!(
+            TerminalSend::of(prompt, &[]).has_content(0, 0),
+            "the received prompt can send with no local context records"
+        );
+    }
+    let oversized_source = format!("{}[Terminal](t3-context://v1/terminal/terminal_1)", "a".repeat(7980));
+    assert!(user_message_prompt_link(&oversized_source).is_some(), "check length after flattening");
+}

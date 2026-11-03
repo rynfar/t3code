@@ -146,7 +146,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
             )))
         });
     let copy_text = text.to_string();
-    let prompt_link = t3_core::prompt_links::prompt_link_for(&text, None, None, None);
+    let prompt_link = t3_core::prompt_links::user_message_prompt_link(&text);
     let actions = h_flex()
         .justify_end()
         .gap(px(8.))
