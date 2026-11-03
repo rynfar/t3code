@@ -60,7 +60,7 @@ impl Chip {
 
 /// How a chip's ink and icon read (`contextChipVariants` `kind` and `state`).
 #[derive(Clone, Copy)]
-enum Ink {
+pub(super) enum Ink {
     Accent(u32),
     Invalid,
     /// `unresolved`: the surrounding text color.
@@ -171,7 +171,8 @@ impl Composer {
 
     /// Repaints only when the prompt's links change; called on every edit.
     pub(super) fn sync_context_chips(&mut self, text: &str, cx: &mut Context<Self>) {
-        let linked: Vec<String> = context_references(text).into_iter().map(|reference| reference.context_id.to_owned()).collect();
+        let linked: Vec<String> = context_references(text).into_iter().map(|reference| reference.context_id.to_owned())
+            .chain(t3_core::assistant_citations::collect(text).into_iter().map(|(range, _)| format!("{}:{}", range.start, &text[range.clone()]))).collect();
         if linked != self.context.linked {
             if self.context.open.as_ref().is_some_and(|open| !linked.contains(open)) {
                 self.context.open = None;
@@ -416,7 +417,7 @@ fn text_tooltip(text: String) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView
 /// `ContextChipShell`: icon and label in the kind's ink at the prompt's size, medium weight. A
 /// chip that opens something is a tab stop (Enter and Space click it) with a 2px ring in its ink,
 /// and underlines its label on hover.
-fn chip_shell(context_id: &str, icon: Icon, label: String, ink: Ink, clickable: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
+pub(super) fn chip_shell(context_id: &str, icon: Icon, label: String, ink: Ink, clickable: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let color = ink_color(ink, cx);
     let group = SharedString::from(format!("context-chip-{context_id}"));
     h_flex()

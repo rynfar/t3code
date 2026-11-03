@@ -230,7 +230,7 @@ impl ThreadView {
 
     /// Opens whatever hides `entry_id` (turn fold, superseded attempt, tool group), scrolls its
     /// row into view, or pages history in when the entry is older than the loaded window.
-    fn reveal_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn reveal_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
         for _ in 0..3 {
             if let Some(index) = self.rows.iter().position(|row| row_holds(row, entry_id)) {
                 let row = self.rows[index].clone();

@@ -54,6 +54,8 @@ pub enum AppEvent {
     ComposerRestore,
     /// A terminal selection is waiting for the composer (`take_terminal_context`).
     ComposerTerminalContext,
+    ComposerCitation,
+    CitationSource,
     /// A side subscription (side chat tab, child approval) changed, or an action on one did.
     SideThread,
     /// An SSH password prompt arrived or was answered (`ssh_prompts`).
@@ -94,6 +96,8 @@ pub struct AppState {
     composer_restore: Option<(String, String)>,
     /// A terminal selection added to a thread's chat, as the drawer hands it over.
     composer_terminal_context: Option<(String, t3_core::composer::context::TerminalSelection)>,
+    pub composer_citation: Option<t3_core::assistant_citations::Citation>,
+    pub citation_source: Option<t3_core::assistant_citations::Citation>,
     client: Option<ClientHandle>,
     /// Counts clients started, so state tied to one never outlives a switch to the next.
     connection: u64,
@@ -149,6 +153,8 @@ impl AppState {
             select_when_listed: None,
             composer_restore: None,
             composer_terminal_context: None,
+            composer_citation: None,
+            citation_source: None,
             client: None,
             connection: 0,
             runtime,
@@ -195,6 +201,8 @@ impl AppState {
         self.pull_requests_open = false;
         self.composer_mentions.clear();
         self.composer_terminal_context = None;
+        self.composer_citation = None;
+        self.citation_source = None;
         self.last_error = None;
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::Selection);

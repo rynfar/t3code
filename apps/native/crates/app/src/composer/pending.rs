@@ -74,6 +74,7 @@ impl Composer {
         if active == self.answering {
             return;
         }
+        self.close_citation_comment("outside-press", window, cx);
         if self.answering.is_none() {
             self.stash = Some(self.prompt(cx));
         }

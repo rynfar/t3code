@@ -142,6 +142,7 @@ icons! {
     PanelsTopLeft => "icons/lucide/panels-top-left.svg",
     Paperclip => "icons/lucide/paperclip.svg",
     PenLine => "icons/lucide/pen-line.svg",
+    Quote => "icons/lucide/quote.svg",
     Pencil => "icons/lucide/pencil.svg",
     PencilRuler => "icons/lucide/pencil-ruler.svg",
     Pilcrow => "icons/lucide/pilcrow.svg",
