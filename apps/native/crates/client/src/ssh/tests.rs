@@ -63,8 +63,32 @@ fi"#;
 
 const AGENT_FAILURE: &str = "sign_and_send_pubkey: signing failed for ED25519 \"/home/julius/.ssh/id_ed25519\" from agent: communication with agent failed\njulius@devbox: Permission denied (publickey,password).";
 
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("t3-ssh-{name}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&path).expect("scratch dir");
+        Self(path)
+    }
+}
+
+impl std::ops::Deref for ScratchDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Fixture {
-    dir: PathBuf,
+    dir: ScratchDir,
     program: PathBuf,
     status: TcpListener,
     nonce: String,
@@ -103,9 +127,7 @@ impl Fixture {
 
     fn with_launch(name: &str, auth: &str, tunnel: &str, launch: &str) -> Fixture {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("t3-ssh-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = ScratchDir::new(name);
         let status = std::net::TcpListener::bind("127.0.0.1:0").expect("binds fake ssh status");
         let port = status.local_addr().expect("status address").port();
         status.set_nonblocking(true).expect("nonblocking listener");
@@ -114,11 +136,11 @@ impl Fixture {
         let program = dir.join("ssh");
         let script = FAKE_SSH
             .replace("@@DIR@@", &dir.display().to_string())
-            .replace("@@STATUS_PORT@@", &port.to_string())
             .replace("@@NONCE@@", &nonce)
             .replace("@@AUTH@@", auth)
             .replace("@@TUNNEL@@", tunnel)
-            .replace("@@LAUNCH@@", launch);
+            .replace("@@LAUNCH@@", launch)
+            .replace("@@STATUS_PORT@@", &port.to_string());
         std::fs::write(&program, script).expect("writes the fake ssh");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         Fixture { dir, program, status, nonce }
@@ -128,7 +150,20 @@ impl Fixture {
         std::fs::read_to_string(self.dir.join(file)).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
-    async fn started(&self, role: &str) -> FakeProcess {
+    async fn started<F: Future>(&self, role: &str, finished: F) -> Result<FakeProcess, F::Output> {
+        tokio::select! {
+            biased;
+            result = finished => Err(result),
+            process = self.startup_event(role) => Ok(process),
+        }
+    }
+
+    async fn tunnel(&self, ssh: &SshEnvironments) -> FakeProcess {
+        let mut exit = ssh.state().tunnels.values().next().expect("a connected tunnel").exit.clone();
+        self.started("tunnel", async move { exit.wait_for(Option::is_some).await.map(|code| *code) }).await.expect("tunnel exited before announcing startup")
+    }
+
+    async fn startup_event(&self, role: &str) -> FakeProcess {
         let mut readers = tokio::task::JoinSet::new();
         let prefix = format!("{} {role} ", self.nonce);
         loop {
@@ -156,12 +191,6 @@ impl Fixture {
 
     fn manager(&self, prompts: Option<mpsc::UnboundedSender<PasswordRequest>>) -> SshEnvironments {
         SshEnvironments::with_program(self.program.clone(), prompts, Some("0.1.7".to_owned()))
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -224,7 +253,7 @@ async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
     assert_eq!(ssh.prepare(&pairing.target, Some("env-devbox"), "http://127.0.0.1:1").await, Err(PrepareError::Moved(address.clone())));
 
     // Disconnect stops the tunnel the app spawned and the remote server.
-    let tunnel = fixture.started("tunnel").await;
+    let tunnel = fixture.tunnel(&ssh).await;
     let pid = tunnel.pid;
     assert!(alive(pid));
     ssh.disconnect(&pairing.target).await.expect("disconnects");
@@ -234,7 +263,7 @@ async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
 
     // Quitting stops tunnels and leaves the remote server for the next launch.
     ssh.ensure(&pairing.target, false).await.expect("connects again");
-    let tunnel = fixture.started("tunnel").await;
+    let tunnel = fixture.tunnel(&ssh).await;
     let pid = tunnel.pid;
     ssh.shutdown().await;
     tunnel.stopped().await;
@@ -342,6 +371,36 @@ fn the_askpass_helper_prints_the_cached_answer() {
 }
 
 #[tokio::test]
+async fn startup_returns_the_operation_error_when_the_fake_exits_before_announcing() {
+    for (name, role, launch, tunnel, diagnostic) in [
+        ("launch-exit", "launch", "printf 'fixture exited before startup\\n' >&2; exit 73", TUNNEL_WAITS, "fixture exited before startup"),
+        ("tunnel-exit", "tunnel", "", "printf 'fixture exited before startup\\n' >&2; exit 73", "fixture exited before startup"),
+        ("startup-eof", "launch", "exec 3<>/dev/tcp/127.0.0.1/@@STATUS_PORT@@; exit 73", TUNNEL_WAITS, "73"),
+        ("startup-invalid", "launch", "exec 3<>/dev/tcp/127.0.0.1/@@STATUS_PORT@@; printf 'not a startup event\\n' >&3; exit 73", TUNNEL_WAITS, "73"),
+        ("spawn-failure", "launch", "", TUNNEL_WAITS, "Failed to spawn SSH command"),
+    ] {
+        let fixture = Fixture::with_launch(name, "", tunnel, launch);
+        if name == "spawn-failure" {
+            std::fs::write(&fixture.program, "#!/nonexistent/ssh-test-interpreter\n").expect("writes missing interpreter");
+        }
+        let ssh = fixture.manager(None);
+        let result = ssh.ensure(&devbox(), false).await;
+        assert!(result.is_err(), "fake must exit before startup");
+        let mut startup = Box::pin(fixture.started(role, std::future::ready(result)));
+        let std::task::Poll::Ready(Err(Err(SshError(message)))) = futures::poll!(&mut startup) else {
+            panic!("startup must return the completed operation's error instead of waiting forever");
+        };
+        assert!(message.contains(diagnostic), "{message}");
+        drop(startup);
+
+        let Err(Err(SshError(message))) = fixture.started(role, ssh.ensure(&devbox(), false)).await else {
+            panic!("startup must also drive and report an in-flight operation's error");
+        };
+        assert!(message.contains(diagnostic), "{message}");
+    }
+}
+
+#[tokio::test]
 async fn quitting_stops_ssh_still_starting_the_server() {
     let fixture = Fixture::with_launch("quit", "", TUNNEL_WAITS, LAUNCH_HANGS);
     let address = fixture.status.local_addr().expect("status address");
@@ -349,11 +408,11 @@ async fn quitting_stops_ssh_still_starting_the_server() {
     unrelated.write_all(b"HEAD / HTTP/1.1\r\n").await.expect("unrelated request");
     let _silent = TcpStream::connect(address).await.expect("silent peer");
     let ssh = fixture.manager(None);
-    let starting = tokio::spawn({
+    let mut starting = tokio::spawn({
         let ssh = ssh.clone();
         async move { ssh.ensure(&devbox(), false).await }
     });
-    let launch = fixture.started("launch").await;
+    let launch = fixture.started("launch", &mut starting).await.expect("launch operation ended before announcing startup");
     ssh.shutdown().await;
     launch.stopped().await;
     assert_eq!(starting.await.expect("joins").err(), Some(quitting()));
@@ -361,11 +420,11 @@ async fn quitting_stops_ssh_still_starting_the_server() {
     // A tunnel still waiting to answer stops too, and nothing new starts after the quit.
     let fixture = Fixture::new("quit-tunnel", "", TUNNEL_WAITS);
     let ssh = fixture.manager(None);
-    let starting = tokio::spawn({
+    let mut starting = tokio::spawn({
         let ssh = ssh.clone();
         async move { ssh.ensure(&devbox(), false).await }
     });
-    let tunnel = fixture.started("tunnel").await;
+    let tunnel = fixture.started("tunnel", &mut starting).await.expect("tunnel operation ended before announcing startup");
     ssh.shutdown().await;
     tunnel.stopped().await;
     assert!(starting.await.expect("joins").is_err());
@@ -397,7 +456,7 @@ async fn disconnect_stops_the_tunnel_it_started_after_the_config_moves_the_alias
         let ssh = fixture.manager(None);
         forward_to(&ssh, &devbox(), &server);
         let bootstrap = ssh.ensure(&devbox(), false).await.expect("connects");
-        let tunnel = fixture.started("tunnel").await;
+        let tunnel = fixture.tunnel(&ssh).await;
         let pid = tunnel.pid;
         std::fs::write(fixture.dir.join("hostname"), "devbox-new.example.com").expect("writes");
         ssh.disconnect(&bootstrap.target).await.expect("disconnects");
@@ -417,7 +476,7 @@ async fn quitting_kills_a_tunnel_that_ignores_sigterm_before_returning() {
     let ssh = fixture.manager(None);
     forward_to(&ssh, &devbox(), &server);
     ssh.ensure(&devbox(), false).await.expect("connects");
-    let tunnel = fixture.started("tunnel").await;
+    let tunnel = fixture.tunnel(&ssh).await;
     drop(ssh.shutdown());
     tunnel.stopped_without_runtime();
 }
@@ -425,8 +484,7 @@ async fn quitting_kills_a_tunnel_that_ignores_sigterm_before_returning() {
 #[test]
 fn the_stop_script_signals_only_the_server_it_started() {
     use std::io::Write;
-    let home = std::env::temp_dir().join(format!("t3-ssh-stop-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
+    let home = ScratchDir::new("stop");
     let state = home.join(".t3/ssh-launch/native-k");
     std::fs::create_dir_all(&state).expect("state dir");
     let mut server = std::process::Command::new("/bin/sh").args(["-c", "read -r release"]).stdin(Stdio::piped()).spawn().expect("server runs");
@@ -449,7 +507,7 @@ fn the_stop_script_signals_only_the_server_it_started() {
         if let Some(path) = path {
             command.env("PATH", format!("{}:/usr/bin:/bin", path.display()));
         }
-        let mut sh = command.arg("-s").env("HOME", &home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("sh runs");
+        let mut sh = command.arg("-s").env("HOME", &home.0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("sh runs");
         sh.stdin.take().expect("stdin").write_all(scripts::stop_script("native-k").as_bytes()).expect("writes");
         sh.wait_with_output().expect("sh exits")
     };
@@ -467,5 +525,4 @@ fn the_stop_script_signals_only_the_server_it_started() {
     assert!(!running(pid), "its own server is stopped");
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(reaped.join().expect("reaps server").signal(), Some(libc::SIGTERM));
-    let _ = std::fs::remove_dir_all(&home);
 }
