@@ -56,11 +56,11 @@ impl AppState {
         let Some((editor, label)) = preferred_editor(&available, None) else { return false };
         let request = self.rpc(OPEN_IN_EDITOR, open_in_editor_request(&editor_target(cwd, relative_path, line), editor));
         cx.spawn(async move |this, cx| {
-            if let Err(error) = request.await {
-                let _ = this.update(cx, |state, cx| {
-                    state.show_toast(Toast::new(ToastKind::Error, format!("Could not open in {label}")).description(error.to_string()), cx);
-                });
-            }
+            let result = request.await;
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(_) => state.announce(format!("Opened in {label}"), None, cx),
+                Err(error) => state.show_toast(Toast::new(ToastKind::Error, format!("Could not open in {label}")).description(error.to_string()), cx),
+            });
         })
         .detach();
         true

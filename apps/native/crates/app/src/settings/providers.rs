@@ -446,6 +446,7 @@ impl SettingsView {
                 None => view.headline.clone(),
             },
         };
+        let denial = if enabled { None } else { t3_core::managed_policy::driver_denial(self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), &row.driver, model::find_driver(&row.driver).map_or(row.driver.as_str(), |d| d.label)) };
         let toggle = cx.listener(move |this, checked: &bool, _, cx| this.update_instance(&toggle_id, model::InstanceEdit::Enabled(*checked), cx));
         h_flex()
             .id(("provider-row", index))
@@ -506,7 +507,7 @@ impl SettingsView {
                             ),
                     ),
             )
-            .child(h_flex().h(r(20.)).flex_none().child(Switch::new(("provider-enabled", index), enabled).on_change(move |checked, window, cx| toggle(&checked, window, cx))))
+            .child(h_flex().h(r(20.)).flex_none().child(crate::components::managed::ManagedControl::new(("managed-provider", index), denial, Switch::new(("provider-enabled", index), enabled).on_change(move |checked, window, cx| toggle(&checked, window, cx)))))
             .into_any_element()
     }
 
@@ -919,6 +920,13 @@ impl SettingsView {
 
     /// Saves an edit of one instance as an upsert.
     fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
+        if matches!(edit, model::InstanceEdit::Enabled(true)) {
+            let app = self.state.read(cx);
+            if let Some(c) = app.server_config.config.as_ref() {
+                let driver = c.provider(instance_id).map(|p| p.driver.as_str()).or_else(|| c.settings.provider_instances.get(instance_id).map(|i| i.driver.as_str())).unwrap_or(instance_id);
+                if t3_core::managed_policy::driver_denial(c.managed_policy.as_ref(), driver, driver).is_some() { return; }
+            }
+        }
         store::update_server(&self.state, ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
     }
 

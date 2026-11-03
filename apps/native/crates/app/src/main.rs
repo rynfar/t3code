@@ -1,4 +1,6 @@
 mod app_state;
+mod announcements;
+mod components;
 mod chat_header;
 mod composer;
 mod connect;

@@ -59,3 +59,5 @@ pub mod worktree_setup;
 pub mod connect;
 pub mod relay;
 pub mod updates;
+pub mod announcements;
+pub mod managed_policy;

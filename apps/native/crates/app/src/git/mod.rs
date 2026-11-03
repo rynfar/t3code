@@ -661,13 +661,15 @@ impl GitStore {
     pub fn open_in_editor(&self, editor: &str, cx: &mut Context<Self>) {
         let Some(target) = self.target.as_ref() else { return };
         if let Some(task) = self.state.read(cx).request(method::SHELL_OPEN_IN_EDITOR, vcs::open_in_editor(&target.cwd, editor), Ok) {
-            cx.background_executor()
-                .spawn(async move {
-                    if let Ok(Err(error)) = task.await {
-                        tracing::warn!(%error, "open in editor failed");
-                    }
-                })
-                .detach();
+            let label = vcs::editor_label(editor, cfg!(target_os = "macos"));
+            let state = self.state.clone();
+            cx.spawn(async move |_, cx| {
+                match task.await {
+                    Ok(Ok(_)) => { state.update(cx, |state, cx| state.announce(format!("Opened in {label}"), None, cx)); }
+                    Ok(Err(error)) => tracing::warn!(%error, "open in editor failed"),
+                    Err(error) => tracing::warn!(%error, "open in editor task failed"),
+                }
+            }).detach();
         }
     }
 

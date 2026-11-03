@@ -263,15 +263,15 @@ impl RenderOnce for Switch {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
-        let focus = focus_handle(&self.id, window, cx);
-        let focused = focus.is_focused(window);
+        let focus = (!self.disabled).then(|| focus_handle(&self.id, window, cx));
+        let focused = focus.as_ref().is_some_and(|focus| focus.is_focused(window));
         let thumb = if dark && !self.checked { hsla(p.muted_foreground) } else { hsla(p.background) };
         let next = !self.checked;
         let disabled = self.disabled;
         let handler = self.on_change.filter(|_| !disabled);
         h_flex()
             .id(self.id)
-            .track_focus(&focus)
+            .when_some(focus, |this, focus| this.track_focus(&focus))
             .flex_none()
             .w(r(30.))
             .h(r(18.))

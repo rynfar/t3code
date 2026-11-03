@@ -247,6 +247,12 @@ impl Render for UpdateControl {
             .flex_col()
             .gap(rem(6.))
             .px(rem(8.));
+        let denial = self.state.read(cx).server_config.config.as_ref().and_then(|c| updates::managed_denial(c.managed_policy.as_ref(), Some(target_version())));
+        if let Some(reason) = denial {
+            use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
+            body = body.child(crate::components::managed::ManagedControl::new("managed-server-update", Some(reason.clone()), Button::new("managed-server-update-button", ButtonVariant::Outline, ButtonSize::Compact).label("Update T3 Code")))
+                .child(crate::components::managed::notice(reason, cx));
+        }
         if let Some(view) = &self.pill {
             let (fill, color, icon) = match view.tone {
                 Tone::Loading => (

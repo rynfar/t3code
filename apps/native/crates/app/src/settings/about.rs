@@ -37,6 +37,7 @@ impl SettingsView {
                 Row::new("remote-environments", label)
                     .description(if address.is_empty() { "This device's paired environment.".to_owned() } else { address })
                     .highlighted(self.is_target("remote-environments"))
+                    .below(div().children(state.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()).map(|policy| crate::components::managed::attribution(policy, cx))))
                     .control(value(status))
                     .into_any_element(),
                 Row::new("server-version", "Server version")

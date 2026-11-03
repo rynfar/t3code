@@ -115,6 +115,10 @@ fn project_options(config_projects: &[t3_core::shell::ProjectShell], selected: &
 }
 
 impl SettingsView {
+    fn webhook_denial(&self, cx: &App) -> Option<String> {
+        t3_core::managed_policy::capability_denial(self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), t3_core::managed_policy::Capability::WebhookTasks)
+    }
+
     fn shell_projects(&self, cx: &App) -> Vec<t3_core::shell::ProjectShell> {
         self.state.read(cx).shell.snapshot.as_ref().map(|snapshot| snapshot.projects.clone()).unwrap_or_default()
     }
@@ -142,6 +146,8 @@ impl SettingsView {
     }
 
     fn task_rpc(&mut self, id: &str, rpc: &'static str, payload: Value, cx: &mut Context<Self>) {
+        if rpc == method::SET_ENABLED && payload["enabled"] == true && self.webhook_denial(cx).is_some()
+            && self.scheduled.tasks.as_ref().and_then(|tasks| tasks.as_ref().ok()).is_some_and(|tasks| tasks.iter().any(|task| task.id == id && task.is_webhook())) { return; }
         let task = self.state.read(cx).rpc(rpc, payload);
         let id = id.to_owned();
         self.scheduled.busy.insert(id.clone());
@@ -237,6 +243,7 @@ impl SettingsView {
         let once = config.environment.capabilities.one_time_schedules == Some(true);
         let ceiling = scheduled_tasks::max_runtime_mode(config.managed_policy.as_ref()).map(str::to_owned);
         let Some(draft) = self.scheduled.editor.clone() else { return };
+        if draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some() { return; }
         let input = match draft.upsert_input(once, ceiling.as_deref(), field_to_iso) {
             Ok(input) => input,
             Err(invalid) => {
@@ -318,9 +325,10 @@ impl SettingsView {
             tone_badge(text, tone, cx)
         });
         let (id, enabled, view) = (task.id.clone(), task.enabled, cx.entity().downgrade());
-        let toggle = Switch::new(SharedString::from(format!("scheduled-task-enabled-{}", task.id)), task.enabled).disabled(busy).on_change(move |_, _, cx| {
+        let denial = (!task.enabled && task.is_webhook()).then(|| self.webhook_denial(cx)).flatten();
+        let toggle = crate::components::managed::ManagedControl::new(SharedString::from(format!("managed-task-enabled-{}", task.id)), denial, Switch::new(SharedString::from(format!("scheduled-task-enabled-{}", task.id)), task.enabled).disabled(busy).on_change(move |_, _, cx| {
             let _ = view.update(cx, |this, cx| this.task_rpc(&id, method::SET_ENABLED, scheduled_tasks::set_enabled_payload(&id, !enabled), cx));
-        });
+        }));
         h_flex()
             .px(r(16.))
             .py(r(12.))
@@ -488,9 +496,11 @@ impl SettingsView {
 
         let modes = h_flex().gap(r(4.)).children(ScheduleMode::ALL.into_iter().filter(|mode| *mode != ScheduleMode::Once || once_supported || draft.schedule_mode == ScheduleMode::Once).map(|mode| {
             let selected = draft.schedule_mode == mode;
-            Button::new(SharedString::from(format!("scheduled-task-mode-{}", mode.label())), if selected { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Compact)
+            let denial = (mode == ScheduleMode::Webhook && !selected).then(|| self.webhook_denial(cx)).flatten();
+            crate::components::managed::ManagedControl::new(SharedString::from(format!("managed-task-mode-{}", mode.label())), denial, Button::new(SharedString::from(format!("scheduled-task-mode-{}", mode.label())), if selected { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Compact)
                 .label(mode.label())
                 .on_click(cx.listener(move |this, _, window, cx| {
+                    if mode == ScheduleMode::Webhook && this.webhook_denial(cx).is_some() { return; }
                     this.edit_draft(|draft| draft.choose_schedule(mode, next_full_hour), cx);
                     let (prompt, run_at) = this.scheduled.editor.as_ref().map(|draft| (draft.prompt.clone(), draft.run_at.clone())).unwrap_or_default();
                     this.scheduled.inputs.prompt.clone().update(cx, |input, cx| {
@@ -503,7 +513,7 @@ impl SettingsView {
                             input.set_value(run_at, window, cx)
                         }
                     });
-                }))
+                })))
         }));
         let schedule_detail: AnyElement = match draft.schedule_mode {
             ScheduleMode::Fixed => h_flex()
@@ -568,7 +578,7 @@ impl SettingsView {
         .chain([
             Row::new("scheduled-task-prompt", "Prompt").below(div().mt(r(12.)).pb(r(14.)).child(Textarea::new(&inputs.prompt))).into_any_element(),
             Row::new("scheduled-task-model-row", "Model").control(model).into_any_element(),
-            Row::new("scheduled-task-schedule", "Schedule").control(modes).below(div().mt(r(12.)).pb(r(14.)).child(schedule_detail)).into_any_element(),
+            Row::new("scheduled-task-schedule", "Schedule").control(modes).below(div().mt(r(12.)).pb(r(14.)).children(self.webhook_denial(cx).map(|reason| crate::components::managed::notice(if draft.schedule_mode == ScheduleMode::Webhook { format!("{reason} Switch this task to a time or an interval, or turn it off, to save it.") } else { reason }, cx))).child(schedule_detail)).into_any_element(),
             Row::new("scheduled-task-enabled", "Enabled")
                 .description("Disabled tasks stay saved but do not run.")
                 .control(Switch::new("scheduled-task-enabled-switch", draft.enabled).on_change(move |on, _, cx| {
@@ -619,7 +629,7 @@ impl SettingsView {
                     .child(
                         Button::new("scheduled-task-save", ButtonVariant::Default, ButtonSize::Sm)
                             .label(if editing { "Save task" } else { "Create task" })
-                            .disabled(self.scheduled.saving || !connected)
+                            .disabled(self.scheduled.saving || !connected || (draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some()))
                             .on_click(cx.listener(|this, _, window, cx| this.save_task(window, cx))),
                     ),
             )

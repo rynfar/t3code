@@ -130,6 +130,10 @@ fn qr_element(matrix: Rc<QrMatrix>) -> AnyElement {
 }
 
 impl SettingsView {
+    fn pairing_denial(&self, cx: &App) -> Option<String> {
+        t3_core::managed_policy::capability_denial(self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), t3_core::managed_policy::Capability::RemoteClients)
+    }
+
     pub(super) fn session(&self, cx: &App) -> Option<AuthSessionState> {
         let handle = self.state.read(cx).client_handle()?;
         handle.session_state().borrow().clone()
@@ -195,6 +199,7 @@ impl SettingsView {
     }
 
     fn create_pairing_link(&mut self, cx: &mut Context<Self>) {
+        if self.pairing_denial(cx).is_some() { return; }
         let Some(create) = self.access.create.as_mut().filter(|create| !create.creating && !create.scopes.is_empty()) else { return };
         create.creating = true;
         create.error = None;
@@ -265,7 +270,9 @@ impl SettingsView {
             cx.notify();
         });
         let permissions = disclosure("access-permissions", "Permissions", self.access.permissions_open, vec![self.permissions_row(cx)], toggle, cx);
-        let machine = section(label, vec![version, permissions], cx);
+        let mut machine_rows = vec![version, permissions];
+        if let Some(policy) = &config.managed_policy { machine_rows.push(div().px(r(16.)).py(r(12.)).child(crate::components::managed::attribution(policy, cx)).into_any_element()); }
+        let machine = section(label, machine_rows, cx);
         let mut blocks = vec![Block::new(&["connections-environment"], machine)];
         if self.may(ACCESS_READ, cx) || self.may(ACCESS_WRITE, cx) {
             blocks.push(Block::new(&["authorized-clients"], self.authorized_clients(&address, now, window, cx)));
@@ -314,18 +321,19 @@ impl SettingsView {
                         .on_click(cx.listener(|this, _, _, cx| this.revoke_others(cx))),
                 )
                 .child(
-                    Button::new("access-create-link", ButtonVariant::Outline, ButtonSize::Compact)
+                    crate::components::managed::ManagedControl::new("managed-create-link", self.pairing_denial(cx), Button::new("access-create-link", ButtonVariant::Outline, ButtonSize::Compact)
                         .icon(Icon::Plus)
                         .label("Create link")
                         .disabled(self.access.create.is_some())
                         .on_click(cx.listener(|this, _, window, cx| {
+                            if this.pairing_denial(cx).is_some() { return; }
                             let grants = this.session(cx);
                             let allowed = |scope: &str| grants.as_ref().is_none_or(|session| session.grants(scope));
                             let scopes = standard_scopes().into_iter().filter(|scope| allowed(scope)).collect();
                             this.access.label.update(cx, |input, cx| input.set_value("", window, cx));
                             this.access.create = Some(CreateLink { scopes, creating: false, error: None });
                             cx.notify();
-                        })),
+                        }))),
                 )
         });
         let header = h_flex()
@@ -340,7 +348,8 @@ impl SettingsView {
             .children(actions);
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        if let Some(create) = &self.access.create {
+        if let Some(reason) = self.pairing_denial(cx) { rows.push(div().px(r(16.)).py(r(12.)).child(crate::components::managed::notice(reason, cx)).into_any_element()); }
+        if let Some(create) = &self.access.create && self.pairing_denial(cx).is_none() {
             rows.push(self.create_link_panel(create, cx));
         }
         if !can_read {
