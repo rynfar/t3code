@@ -942,11 +942,7 @@ impl Render for ChatGptSetup {
         };
         let mut content = v_flex().child(account);
         if !self.onboarding && managed {
-            content = content.child(Row::new("chatgpt-runtime", "Codex runtime").description(self.state.runtime_description())).child(
-                Row::new("chatgpt-binary", "Binary path")
-                    .description("Selected by T3 Code.")
-                    .control(div().text_xs().child(self.state.install.as_ref().and_then(|i| i.executable_path.clone()).unwrap_or_else(|| "Not installed".into()))),
-            );
+            content = content.child(Row::new("chatgpt-runtime", "Codex runtime").description(self.state.runtime_description()));
         }
         if self.state.auth.as_ref().is_some_and(|a| a.phase == "waiting") && !self.state.handoff {
             let page_label = self.state.auth.as_ref().map(model::authorization_page_label).unwrap_or_default();

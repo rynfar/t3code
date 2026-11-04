@@ -1,7 +1,7 @@
 //! The selected instance's editor (`ProviderInstanceCard.tsx` in editor mode): its header, the
 //! Status and Display name rows, Setup (`ProviderSetupSection.tsx`'s runtime and
 //! `ProviderAuthenticationSection.tsx`'s account), and Models (`ProviderModelsSection.tsx`). The
-//! Runtime forms and environment variables remain partial. Managed Codex uses `chatgpt_setup`;
+//! Runtime and environment fields use `form`. Managed Codex uses `chatgpt_setup`;
 //! existing Codex keeps the generic Account row.
 
 use gpui::{AnyElement, AppContext, Context, FontWeight, IntoElement, ParentElement, PromptLevel, SharedString, Styled, Window, div, list, prelude::*, px, relative};
@@ -60,6 +60,8 @@ impl SettingsView {
         if let Some(setup) = self.render_setup(selected, environment_label, window, cx) {
             sections.push(setup.into_any_element());
         }
+        if let Some(runtime)=self.render_runtime_form(selected,cx) {sections.push(runtime);}
+        sections.extend(self.render_environment_form(selected,cx));
         if model::find_driver(&selected.row.driver).is_none() {
             let description = format!(
                 "This instance uses {}, which is not available in this build. Its configuration is preserved.",
@@ -201,6 +203,7 @@ impl SettingsView {
             let connection = self.state.read(cx).connection_id();
             if self.providers.chatgpt.as_ref().is_none_or(|(id, view)| *id != connection || view.read(cx).instance() != selected.row.instance_id) {
                 let view = cx.new(|cx| crate::chatgpt_setup::ChatGptSetup::new(self.state.clone(), selected.row.instance_id.clone(), false, window, cx));
+                self.providers.form.runtime_observer=Some(cx.observe(&view,|_,_,cx|cx.notify()));
                 self.providers.chatgpt = Some((connection, view));
             }
             rows.push(div().child(self.providers.chatgpt.as_ref().unwrap().1.clone()).into_any_element());
@@ -247,6 +250,7 @@ impl SettingsView {
                     .into_any_element(),
             );
         }
+        if let Some(field)=self.render_dedicated_environment(selected,cx) {rows.push(field);}
         (!rows.is_empty()).then(|| flat_section("Setup", rows, cx))
     }
 
