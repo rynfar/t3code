@@ -417,6 +417,9 @@ impl SettingsView {
     }
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismiss_provider_removal(window, cx) {
+            return;
+        }
         if self.dismiss_project_icon_picker(window, cx) {
             return;
         }
@@ -453,6 +456,9 @@ impl SettingsView {
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.provider_removal_open() {
+            return;
+        }
         if self.projects.picker.is_some() {
             return;
         }
@@ -463,6 +469,9 @@ impl SettingsView {
 
     /// Tab and Shift+Tab move through the modal's controls only (the dialog's focus trap).
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cycle_provider_removal_focus(forward, window, cx) {
+            return;
+        }
         if self.cycle_icon_focus(forward, window, cx) {
             return;
         }

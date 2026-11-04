@@ -12,6 +12,7 @@ pub mod chatgpt;
 pub mod form;
 pub mod wizard;
 pub mod registry;
+pub mod removal;
 
 use std::collections::{HashMap, HashSet};
 

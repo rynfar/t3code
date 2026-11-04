@@ -528,3 +528,167 @@ fn add_provider_filters_featured_more_and_policy_changes() {
     assert!(offered_drivers(true,Some(&none)).next().is_none());
     assert!(offered_drivers(false,Some(&none)).next().is_none());
 }
+
+#[test]
+fn removal_requires_confirmation_of_the_same_live_target() {
+    use super::removal::{RemovalContext, RemovalState};
+    let mut settings = ServerSettings::default();
+    let instance = ProviderInstanceConfig {
+        driver: "codex".into(),
+        display_name: Some(" Work ".into()),
+        ..Default::default()
+    };
+    settings.provider_instances = [("codex_work".into(), instance)].into_iter().collect();
+    let context = RemovalContext {
+        connection: Some(7),
+        revision: 4,
+        settings: Some(&settings),
+        allowed: true,
+    };
+    let mut removal = RemovalState::default();
+    assert!(removal.confirm(&context).is_none());
+    assert!(removal.request("codex_work", false, &context));
+    assert!(!removal.request("codex", true, &context));
+    removal.cancel();
+    assert!(removal.confirm(&context).is_none());
+    assert!(removal.request("codex_work", false, &context));
+    assert!(!removal.stale(&context));
+    let plan = removal.confirm(&context).unwrap();
+    assert_eq!(plan.payload(), remove_payload("codex_work"));
+    assert!(!removal.request("codex_work", false, &context));
+    assert!(removal.confirm(&context).is_none());
+    assert!(removal.finish(&plan));
+    for invalid in [
+        RemovalContext {
+            connection: None,
+            ..context
+        },
+        RemovalContext {
+            connection: Some(8),
+            ..context
+        },
+        RemovalContext {
+            allowed: false,
+            ..context
+        },
+        RemovalContext {
+            revision: 5,
+            ..context
+        },
+        RemovalContext {
+            settings: None,
+            ..context
+        },
+    ] {
+        assert!(removal.request("codex_work", false, &context));
+        assert!(removal.stale(&invalid));
+        assert!(removal.confirm(&invalid).is_none());
+    }
+    assert!(removal.request("codex_work", false, &context));
+    let missing = ServerSettings::default();
+    assert!(
+        removal
+            .confirm(&RemovalContext {
+                settings: Some(&missing),
+                ..context
+            })
+            .is_none()
+    );
+    let mut changed = settings.clone();
+    changed.provider_instances = [(
+        "codex_work".into(),
+        ProviderInstanceConfig {
+            driver: "cursor".into(),
+            ..Default::default()
+        },
+    )]
+    .into_iter()
+    .collect();
+    assert!(removal.request("codex_work", false, &context));
+    assert!(
+        removal
+            .confirm(&RemovalContext {
+                settings: Some(&changed),
+                ..context
+            })
+            .is_none()
+    );
+}
+
+#[test]
+fn removal_plans_follow_enablement_defaults_and_cleanup_only_custom_managed_acp() {
+    use super::removal::{RemovalContext, RemovalState};
+    for (driver, enabled, config, turns_off) in [
+        ("codex", Some(true), json!({}), false),
+        ("claudeAgent", None, json!({}), false),
+        ("antigravity", Some(true), json!({}), true),
+        ("cursor", None, json!({"enabled":true}), true),
+        ("grok", Some(true), json!({"enabled":false}), false),
+        ("kiro", Some(false), json!({}), false),
+        ("acpRegistry", Some(true), json!({"agentId":"agent"}), false),
+    ] {
+        let settings = settings(
+            json!({"providerInstances":{driver:{"driver":driver,"enabled":enabled,"config":config}}}),
+        );
+        let context = RemovalContext {
+            connection: Some(1),
+            revision: 0,
+            settings: Some(&settings),
+            allowed: true,
+        };
+        let mut state = RemovalState::default();
+        assert!(state.request(driver, true, &context));
+        let plan = state.confirm(&context).unwrap();
+        assert_eq!(
+            plan.warning().contains("It will also be turned off."),
+            turns_off,
+            "{driver}"
+        );
+        assert!(plan.managed_agent().is_none());
+    }
+    for (driver, config, agent) in [
+        ("acpRegistry", json!({"agentId":" agent "}), Some("agent")),
+        (
+            "acpRegistry",
+            json!({"agentId":"agent","source":"local"}),
+            None,
+        ),
+        ("codex", json!({"agentId":"agent"}), None),
+        ("futureDriver", json!({}), None),
+    ] {
+        let settings = settings(
+            json!({"providerInstances":{"custom":{"driver":driver,"displayName":"  Work  ","config":config}}}),
+        );
+        let context = RemovalContext {
+            connection: Some(1),
+            revision: 0,
+            settings: Some(&settings),
+            allowed: true,
+        };
+        let mut state = RemovalState::default();
+        assert!(!state.request("missing", false, &context));
+        assert!(!state.request("custom", true, &context));
+        assert!(!state.request(
+            "custom",
+            false,
+            &RemovalContext {
+                allowed: false,
+                ..context
+            }
+        ));
+        assert!(!state.request(
+            "custom",
+            false,
+            &RemovalContext {
+                connection: None,
+                ..context
+            }
+        ));
+        assert!(state.request("custom", false, &context));
+        let plan = state.confirm(&context).unwrap();
+        assert_eq!(plan.managed_agent().as_deref(), agent);
+        assert!(state.finish(&plan));
+        assert!(!state.finish(&plan));
+        assert!(state.request("custom", false, &context));
+    }
+}
