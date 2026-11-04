@@ -109,7 +109,7 @@ impl SettingsView {
         }
     }
 
-    fn form_denial(&self, driver: &str, path: &str, cx: &App) -> Option<String> {
+    pub(super) fn form_denial(&self, driver: &str, path: &str, cx: &App) -> Option<String> {
         if !self.may(PROVIDERS_MANAGE_SCOPE, cx) {
             return Some("This connection is read-only.".into());
         }

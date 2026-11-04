@@ -1,0 +1,173 @@
+//! Ports `AddProviderInstanceDialog.tsx` and `.logic.ts`; field metadata lives in `form`.
+use super::{form, new_instance};
+use crate::server_config::ProviderInstanceConfig;
+use serde_json::Value;
+use std::collections::HashMap;
+
+#[derive(Default)]
+pub struct ConfigDraft {
+    pub value: Option<Value>,
+    errors: HashMap<String, String>,
+}
+impl ConfigDraft {
+    pub fn edit(&mut self, driver: &str, key: &str, value: Value) {
+        if !form::validate_field(driver, key, &value) {
+            self.errors.insert(
+                key.into(),
+                "Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default."
+                    .into(),
+            );
+            return;
+        }
+        self.errors.remove(key);
+        let instance = ProviderInstanceConfig {
+            driver: driver.into(),
+            config: self.value.take(),
+            ..Default::default()
+        };
+        self.value = form::with_field(&instance, key, value).config;
+    }
+    pub fn error(&self) -> Option<&str> {
+        self.errors.values().next().map(String::as_str)
+    }
+}
+
+pub const STEPS: [&str; 3] = ["Provider", "Identity", "Config"];
+
+pub fn navigation(
+    current: usize,
+    requested: usize,
+    identity_error: Option<String>,
+) -> Result<usize, (usize, String)> {
+    let target = requested.min(STEPS.len() - 1);
+    if current <= 1
+        && target > 1
+        && let Some(error) = identity_error
+    {
+        return Err((1, error));
+    }
+    Ok(target)
+}
+
+pub fn instance(
+    driver: &str,
+    label: &str,
+    accent: &str,
+    config: Option<Value>,
+    local_environment: Vec<Value>,
+) -> ProviderInstanceConfig {
+    let mut config = config
+        .and_then(|c| c.as_object().cloned())
+        .unwrap_or_default();
+    if driver == "codex" {
+        config.insert("setupMode".into(), Value::String("existing".into()));
+    }
+    let local = driver == super::ACP_REGISTRY && config.get("source").is_some_and(|s| s == "local");
+    ProviderInstanceConfig {
+        config: (!config.is_empty()).then_some(Value::Object(config)),
+        environment: (local && !local_environment.is_empty())
+            .then_some(Value::Array(local_environment)),
+        ..new_instance(driver, label, accent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::providers::create_payload;
+    use serde_json::json;
+
+    #[test]
+    fn draft_validation_keeps_the_last_valid_value_and_errors_until_corrected() {
+        let mut draft = ConfigDraft {
+            value: Some(json!({"future":true})),
+            ..Default::default()
+        };
+        draft.edit("claudeAgent", "autoCompactWindow", json!("300000"));
+        draft.edit("claudeAgent", "autoCompactWindow", json!("99999"));
+        assert!(draft.error().is_some());
+        draft.edit("claudeAgent", "binaryPath", json!("custom"));
+        assert!(draft.error().is_some());
+        assert_eq!(draft.value.as_ref().unwrap()["autoCompactWindow"], "300000");
+        draft.edit("claudeAgent", "autoCompactWindow", json!(""));
+        assert!(draft.error().is_none());
+        assert_eq!(
+            draft.value,
+            Some(json!({"future":true,"binaryPath":"custom"}))
+        );
+    }
+
+    #[test]
+    fn identity_blocks_forward_step_jumps_but_allows_back_and_identity() {
+        for (current, requested, expected) in
+            [(0, 2, 1), (1, 2, 1), (2, 0, 0), (2, 1, 1), (0, 1, 1)]
+        {
+            let result = navigation(current, requested, Some("duplicate".into()));
+            assert_eq!(
+                result.as_ref().copied().unwrap_or_else(|(step, _)| *step),
+                expected
+            );
+            assert_eq!(result.is_err(), current <= 1 && requested > 1);
+        }
+        assert_eq!(navigation(0, 99, None), Ok(2));
+    }
+
+    #[test]
+    fn create_keeps_schema_edits_secrets_and_unknown_config_without_defaults() {
+        let config = json!({"binaryPath":"custom", "launchArgs":"--verbose", "future":{"key":1}, "setupMode":"managed"});
+        let codex = instance("codex", " Side ", "#ABCDEF", Some(config), vec![]);
+        assert_eq!(
+            create_payload("codex_side", &codex),
+            json!({"patch":{},"providerInstanceMutation":{
+                "operation":"create","instanceId":"codex_side","instance":{"driver":"codex","enabled":true,
+                "displayName":"Side","accentColor":"#ABCDEF","config":{"binaryPath":"custom","launchArgs":"--verbose","future":{"key":1},"setupMode":"existing"}}
+            }})
+        );
+        let secret = instance(
+            "opencode",
+            "",
+            "",
+            Some(json!({"serverPassword":"disposable-fixture","future":true})),
+            vec![],
+        );
+        assert_eq!(
+            create_payload("open_test", &secret)["providerInstanceMutation"]["instance"]["config"],
+            json!({"serverPassword":"disposable-fixture","future":true})
+        );
+        for driver in ["cursor", "kiro", "grok"] {
+            let plain = instance(
+                driver,
+                "",
+                "",
+                Some(json!({})),
+                vec![json!({"name":"KIRO_API_KEY","value":"fixture","sensitive":true})],
+            );
+            assert_eq!(plain.config, None);
+            assert_eq!(plain.environment, None); // Web only includes environment for local ACP in this wizard.
+        }
+    }
+
+    #[test]
+    fn local_environment_uses_the_existing_secret_wire_codec() {
+        let env = vec![
+            json!({"name":"TOKEN","value":{"provider":"vault","reference":"secret/path"},"sensitive":true}),
+        ];
+        let local = instance(
+            "acpRegistry",
+            "Local ACP",
+            "",
+            Some(json!({"source":"local","commandPath":"fixture","commandArgs":["--literal",""]})),
+            env.clone(),
+        );
+        assert_eq!(
+            create_payload("acp_local", &local)["providerInstanceMutation"]["instance"]["environment"],
+            json!([
+                {"name":"TOKEN","value":"","secret":{"provider":"vault","reference":"secret/path"},"sensitive":true}
+            ])
+        );
+        assert_eq!(
+            instance("acpRegistry", "", "", Some(json!({"agentId":"test"})), env).environment,
+            None
+        );
+    }
+}
