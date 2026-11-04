@@ -3,8 +3,6 @@
 //! clears it. Right-click opens the project menu; hover shows the pin toggle where supported, and
 //! each row ends in a Project settings button.
 
-use std::collections::HashSet;
-
 use gpui::{AnyElement, Context, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point, SharedString, Styled, anchored, deferred, div, prelude::*, px};
 use t3_core::sidebar::ENVIRONMENT_ID;
 use t3_core::sidebar::grouping::{ProjectGroup, build_project_groups};
@@ -32,15 +30,11 @@ impl SidebarPane {
     }
 
     fn toggle_scope(&mut self, group: &ProjectGroup, cx: &mut Context<Self>) {
-        let members: HashSet<String> = group.member_project_ids.iter().cloned().collect();
+        let groups = self.project_groups(cx);
         self.state.update(cx, |state, cx| {
-            let mut scope = state.sidebar.project_scope.clone().unwrap_or_default();
-            if members.iter().all(|id| scope.contains(id)) {
-                scope.retain(|id| !members.contains(id));
-            } else {
-                scope.extend(members);
-            }
-            state.set_project_scope((!scope.is_empty()).then_some(scope), cx);
+            let mut scope = state.sidebar.project_filter_scope.clone();
+            scope.toggle(group, &groups, state.shell.synchronized && state.server_config.config.is_some());
+            state.set_project_scope(scope, cx);
         });
     }
 
@@ -49,10 +43,7 @@ impl SidebarPane {
     pub(super) fn render_project_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let state = self.state.read(cx);
-        let scoped: Vec<ProjectGroup> = match &state.sidebar.project_scope {
-            Some(scope) => self.project_groups(cx).into_iter().filter(|group| group.member_project_ids.iter().any(|id| scope.contains(id))).collect(),
-            None => Vec::new(),
-        };
+        let scoped: Vec<ProjectGroup> = self.project_groups(cx).into_iter().filter(|group| state.sidebar.project_filter_scope.is_selected(group)).collect();
         let label = if scoped.is_empty() {
             "Filter threads by project".to_owned()
         } else {
@@ -100,7 +91,7 @@ impl SidebarPane {
             row("project-filter-all".into(), scope.is_none())
                 .child("All projects")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.state.update(cx, |state, cx| state.set_project_scope(None, cx));
+                    this.state.update(cx, |state, cx| state.set_project_scope(Default::default(), cx));
                     this.project_filter = None;
                     cx.notify();
                 }))
@@ -108,7 +99,7 @@ impl SidebarPane {
             div().h(px(1.)).my(px(4.)).mx(px(-4.)).bg(hsla(p.border)).into_any_element(),
         ];
         for group in groups {
-            let checked = scope.as_ref().is_some_and(|scope| group.member_project_ids.iter().all(|id| scope.contains(id)));
+            let checked = state.sidebar.project_filter_scope.is_selected(&group);
             let (toggle_group, menu_project, pin_group) = (group.clone(), group.representative_id.clone(), group.clone());
             let settings_project = group.representative_id.clone();
             rows.push(

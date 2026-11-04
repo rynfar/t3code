@@ -92,6 +92,7 @@ pub struct SidebarController {
     pub history: t3_core::sidebar::history::NavHistory,
     /// Project ids the thread list is filtered to, or every project.
     pub project_scope: Option<std::collections::HashSet<String>>,
+    pub project_filter_scope: t3_core::sidebar::grouping::ProjectScope,
     pub selection: t3_core::sidebar::selection::ThreadSelection,
     /// The thread being dragged and the section it left.
     pub drag: Option<(String, t3_core::sidebar::Section)>,
@@ -128,6 +129,16 @@ impl AppState {
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
         self.sidebar.hiding_tags = tags.is_some();
         let environment_id = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or("local");
+        self.sidebar.settings.grouping = crate::settings::store::client(cx).project_grouping_settings();
+        self.sidebar.settings.grouping.environment_id = Some(environment_id.to_owned());
+        self.sidebar.project_scope = if self.sidebar.project_filter_scope.is_empty() {
+            None
+        } else {
+            let groups = self.shell.snapshot.as_ref().map(|snapshot| {
+                t3_core::sidebar::grouping::build_project_groups(environment_id, &snapshot.projects, &self.sidebar.settings.grouping)
+            }).unwrap_or_default();
+            self.sidebar.project_filter_scope.members(&groups, self.shell.synchronized && self.server_config.config.is_some())
+        };
         let threads: Vec<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter()).chain(extras.iter().copied()).collect();
         self.sidebar.hidden_thread_ids = t3_core::sidebar::tag_filter::hidden_thread_keys(
             &[t3_core::sidebar::tag_filter::Environment { environment_id, threads: &threads, hidden_tags: tags.as_deref() }],
@@ -230,10 +241,10 @@ impl AppState {
         }
     }
 
-    pub fn set_project_scope(&mut self, scope: Option<std::collections::HashSet<String>>, cx: &mut Context<Self>) {
+    pub fn set_project_scope(&mut self, scope: t3_core::sidebar::grouping::ProjectScope, cx: &mut Context<Self>) {
         // A selection made under one scope can hold threads the next scope hides.
         self.sidebar.selection.clear();
-        self.sidebar.project_scope = scope;
+        self.sidebar.project_filter_scope = scope;
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Shell);
     }

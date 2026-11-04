@@ -211,3 +211,41 @@ fn browser_custom_search_rejects_query_in_authority_and_falls_back() {
         assert!(valid_search_template(doc.browser_search_template()));
     }
 }
+
+#[test]
+fn grouping_override_record_matches_contract_and_preserves_raw_settings() {
+    use crate::sidebar::grouping::GroupingMode;
+    let raw = r#"{"sidebarProjectGroupingOverrides":{" \ufeffenv:/copy ":"separate","unknown-checkout":"repository_path"},"futureSetting":42}"#;
+    let mut doc = ClientSettingsDoc::from_json(raw);
+    assert_eq!(doc.project_grouping_settings().overrides.get("env:/copy"), Some(&GroupingMode::Separate));
+    assert_eq!(doc.project_grouping_settings().overrides.get("unknown-checkout"), Some(&GroupingMode::RepositoryPath));
+    doc.apply(&ClientSettingChange::WorkingShelf(false));
+    assert_eq!(doc.entries()["sidebarProjectGroupingOverrides"], serde_json::from_str::<Value>(raw).unwrap()["sidebarProjectGroupingOverrides"]);
+    let change = ClientSettingChange::ProjectGroupingOverride { key: "env:/copy".into(), mode: Some(ProjectGroupingMode::RepositoryPath) };
+    let patch = doc.apply_change(&change);
+    assert_eq!(patch["sidebarProjectGroupingOverrides"], serde_json::json!({"env:/copy":"repository_path","unknown-checkout":"repository_path"}));
+    assert!(doc.apply_change(&change).is_empty());
+    assert!(doc.apply_change(&ClientSettingChange::ProjectGroupingOverride { key: " env:/copy ".into(), mode: Some(ProjectGroupingMode::RepositoryPath) }).is_empty());
+    assert!(doc.apply_change(&ClientSettingChange::ProjectGroupingOverride { key: " ".into(), mode: Some(ProjectGroupingMode::Separate) }).is_empty());
+    let saved = merge_patch(Some(raw), &patch);
+    let mut reread = ClientSettingsDoc::from_json(&saved.text);
+    assert_eq!(reread.project_grouping_settings().overrides, doc.project_grouping_settings().overrides);
+    assert_eq!(reread.entries()["futureSetting"], 42);
+    reread.apply(&ClientSettingChange::ProjectGroupingOverride { key: "env:/copy".into(), mode: None });
+    assert_eq!(reread.entries()["sidebarProjectGroupingOverrides"], serde_json::json!({"unknown-checkout":"repository_path"}));
+    reread.apply(&ClientSettingChange::ProjectGroupingOverride { key: "unknown-checkout".into(), mode: None });
+    assert_eq!(reread.entries()["sidebarProjectGroupingOverrides"], serde_json::json!({}));
+    for value in [
+        serde_json::json!(null),
+        serde_json::json!([]),
+        serde_json::json!({"env:/x":"future","valid":"repository"}),
+        serde_json::json!({" ":"separate"}),
+        serde_json::json!({"env:/x":42}),
+    ] {
+        let raw = serde_json::json!({"sidebarProjectGroupingOverrides":value,"sidebarProjectGroupingMode":"separate"}).to_string();
+        let doc = ClientSettingsDoc::from_json(&raw);
+        assert!(doc.project_grouping_settings().overrides.is_empty());
+        assert_eq!(doc.project_grouping(), ProjectGroupingMode::Separate);
+        assert_eq!(doc.entries()["sidebarProjectGroupingOverrides"], value);
+    }
+}

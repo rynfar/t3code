@@ -18,6 +18,7 @@ use gpui_component::{Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::commands::method;
+use t3_core::client_settings::{ClientSettingChange, ProjectGroupingMode, PROJECT_GROUPING_MODE_LABELS, project_grouping_label};
 use t3_core::projects::PROJECTS_MUTATE;
 use t3_core::server_config::{ServerConfig, ThreadEnvMode};
 use t3_core::settings::ServerSettingChange;
@@ -30,7 +31,7 @@ use t3_core::settings::projects::{
 use t3_core::settings::ENV_MODES;
 use t3_core::shell::ProjectShell;
 use t3_core::sidebar::ENVIRONMENT_ID;
-use t3_core::sidebar::grouping::{ProjectGroup, build_project_groups};
+use t3_core::sidebar::grouping::{GroupingMode, GroupingSettings, ProjectGroup, build_project_groups, physical_project_key};
 use t3_core::workspace::{self, Source};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, icon, muted_text, r, section, tooltip};
@@ -319,9 +320,7 @@ impl SettingsView {
             Block::new(&["project-defaults"], self.project_new_threads(&shown, &config, cx)),
             Block::new(&["project-actions"], self.project_actions_section(&shown, &config, window, cx)),
         ];
-        if shown.members.len() > 1 {
-            blocks.push(Block::new(&[], self.project_checkouts(&shown, cx)));
-        }
+        blocks.push(Block::new(&[], self.project_checkouts(&shown, cx)));
         blocks.push(Block::new(&[], self.project_danger(&shown, cx)));
         blocks
     }
@@ -681,27 +680,66 @@ impl SettingsView {
         section("New threads", vec![model_row.into_any_element(), workspace_row.into_any_element()], cx).into_any_element()
     }
 
-    /// The Checkouts section: one row per member with its own Remove.
     fn project_checkouts(&self, shown: &Shown, cx: &mut Context<Self>) -> AnyElement {
         let can_edit = self.can_edit_projects(cx);
         let label = self.environment_label(cx);
-        let rows = shown
-            .members
-            .iter()
-            .map(|member| {
-                let id = member.id.clone();
+        let state = self.state.read(cx);
+        let environment_id = state.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or(ENVIRONMENT_ID);
+        let doc = store::client(cx);
+        let grouping = doc.project_grouping_settings();
+        let checkouts = build_project_groups(environment_id, &shown.members, &GroupingSettings { mode: GroupingMode::Separate, ..Default::default() });
+        let has_multiple = checkouts.len() > 1;
+        let mut rows = vec![
+            div()
+                .px(r(16.))
+                .py(r(10.))
+                .text_xs()
+                .text_color(hsla(palette(cx).muted_foreground))
+                .child("Grouping rule decides how each checkout joins project groups in the sidebar. Changing it can move a checkout to a different project.")
+                .into_any_element(),
+        ];
+        for checkout in checkouts {
+            let Some(member) = shown.members.iter().find(|member| member.id == checkout.representative_id) else { continue };
+            let key = physical_project_key(environment_id, &member.workspace_root);
+            let selection = grouping.overrides.get(&key).map(|mode| mode.as_str()).unwrap_or("inherit");
+            let trigger = if selection == "inherit" {
+                format!("Default ({})", project_grouping_label(doc.project_grouping()))
+            } else {
+                project_grouping_label(ProjectGroupingMode::parse(selection).unwrap_or_default()).to_owned()
+            };
+            let options = std::iter::once(SelectOption::new("inherit", "Use global default"))
+                .chain(PROJECT_GROUPING_MODE_LABELS.iter().map(|(mode, label)| SelectOption::new(mode.as_str(), *label)))
+                .collect();
+            let state = self.state.clone();
+            let select =
+                Select::new(SharedString::from(format!("checkout-grouping-{}", member.id)), options).selected(selection).label(trigger).width(288.).on_change(
+                    move |value, _, cx| {
+                        let mode = if value.as_ref() == "inherit" {
+                            None
+                        } else {
+                            let Some(mode) = ProjectGroupingMode::parse(&value) else { return };
+                            Some(mode)
+                        };
+                        store::update_client(&state, ClientSettingChange::ProjectGroupingOverride { key: key.clone(), mode }, cx);
+                    },
+                );
+            let ids = checkout.member_project_ids;
+            let controls = h_flex().gap(r(8.)).child(select).when(has_multiple, |controls| {
+                controls.child(
+                    Button::new(SharedString::from(format!("project-checkout-remove-{}", member.id)), ButtonVariant::Outline, ButtonSize::Sm)
+                        .label("Remove")
+                        .tooltip(format!("Remove checkout {}", member.workspace_root))
+                        .disabled(!can_edit)
+                        .on_click(cx.listener(move |this, _, _, cx| this.remove_members(ids.clone(), cx))),
+                )
+            });
+            rows.push(
                 Row::new(SharedString::from(format!("project-checkout-{}", member.id)), label.clone())
                     .description(member.workspace_root.clone())
-                    .control(
-                        Button::new(SharedString::from(format!("project-checkout-remove-{}", member.id)), ButtonVariant::Outline, ButtonSize::Sm)
-                            .label("Remove")
-                            .tooltip(format!("Remove checkout {}", member.workspace_root))
-                            .disabled(!can_edit)
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_members(vec![id.clone()], cx))),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+                    .control(controls)
+                    .into_any_element(),
+            );
+        }
         section("Checkouts", rows, cx).into_any_element()
     }
 
