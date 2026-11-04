@@ -276,7 +276,7 @@ impl MediaCache {
         let (permits, svg, source, max_edge) = (self.permits.clone(), cx.svg_renderer(), key.source.clone(), variant.max_edge());
         let job = runtime.spawn(async move {
             // Held through the decode as well, so a burst of large images is never all in memory.
-            let _permit = permits.acquire_owned().await.map_err(|_| ("Image unavailable.".to_owned(), None))?;
+            let permit = permits.acquire_owned().await.map_err(|_| ("Image unavailable.".to_owned(), None))?;
             let (bytes, dimensions) = match cached {
                 Some(bytes) => (bytes, None),
                 None => {
@@ -288,7 +288,7 @@ impl MediaCache {
                 }
             };
             let input = bytes.clone();
-            let decoded = tokio::task::spawn_blocking(move || decode::decode(&input, max_edge, &svg)).await.map_err(|_| ("Image unavailable.".to_owned(), None))?.map_err(|message| (message, None))?;
+            let decoded = t3_client::assets::decode_media(permit, move || decode::decode(&input, max_edge, &svg)).await.map_err(|message| (message, None))?;
             Ok::<_, LoadError>((bytes, dimensions, decoded))
         });
         let cancel = CancelLoad(job.abort_handle());

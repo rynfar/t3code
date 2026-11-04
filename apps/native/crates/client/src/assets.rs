@@ -104,3 +104,31 @@ async fn get(url: &str) -> Result<Vec<u8>, String> {
 fn describe(error: &reqwest::Error) -> String {
     if error.is_timeout() { "The image took too long to load.".into() } else { UNAVAILABLE.into() }
 }
+
+/// The blocking worker keeps its permit if the async caller is cancelled.
+pub async fn decode_media<T: Send + 'static>(permit: tokio::sync::OwnedSemaphorePermit, decode: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || { let _permit = permit; decode() }).await.map_err(|_| "Image unavailable.".to_owned())?
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn cancelled_decode_keeps_its_permit_until_the_worker_finishes() {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, worker) = std::sync::mpsc::channel();
+        let task = tokio::spawn(super::decode_media(permit, move || {
+            started.send(()).unwrap();
+            worker.recv().unwrap();
+            Ok(())
+        }));
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let held = permits.available_permits() == 0;
+        release.send(()).unwrap();
+        assert!(held, "cancelled async callers must not admit another blocking decode");
+        let _finished = permits.acquire_owned().await.unwrap();
+    }
+}
