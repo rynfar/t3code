@@ -7,6 +7,7 @@
 //! nothing. Logic lives in `t3_core::settings::providers`.
 
 mod dialog;
+mod registry;
 mod dialog_config;
 mod editor;
 mod form;
@@ -36,6 +37,12 @@ use crate::app_state::AppEvent;
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette};
+
+pub(super) fn fixture_active(cx: &App) -> bool {
+    #[cfg(feature = "snapshot")]
+    if std::env::var_os("T3_NATIVE_PROVIDER_WIZARD_FIXTURE").is_some() { return true; }
+    crate::chatgpt_setup::fixture_active(cx)
+}
 
 gpui::actions!(provider_settings, [CloseProviderDialog]);
 
@@ -123,6 +130,7 @@ pub(crate) struct ProvidersState {
 
 impl ProvidersState {
     pub(super) fn leave(&mut self) {
+        self.dialog=None;
         self.chatgpt=None;
         self.auth=None;
         self.install=None;
@@ -324,6 +332,7 @@ impl SettingsView {
     }
 
     pub(super) fn providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
+        if self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()) { self.providers.dialog=None; self.providers.auth=None; }
         let Some(data) = self.page_data(cx) else {
             self.providers.auth = None;
             self.providers.install = None;
@@ -716,9 +725,9 @@ impl SettingsView {
             self.providers.auth=Some(AuthSession {instance_id:fixture.provider.instance_id.clone(),state:Some(fixture.auth.clone()),load_error:None,pending:false,error:None,_stream:None});
             return;
         }
-        if crate::chatgpt_setup::fixture_active(cx) { return; }
+        if fixture_active(cx) { return; }
         if selected.is_none_or(|s| s.row.driver != "codex") { self.providers.chatgpt = None; }
-        let wants_auth = selected.filter(|selected| model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone());
+        let wants_auth = self.providers.dialog.as_ref().filter(|d|d.created).map(|d|d.instance_id.read(cx).value().to_string()).or_else(|| selected.filter(|selected| model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone()));
         if self.providers.auth.as_ref().map(|session| &session.instance_id) != wants_auth.as_ref() {
             self.providers.method_id = SharedString::default();
             self.providers.auth = wants_auth.map(|instance_id| {

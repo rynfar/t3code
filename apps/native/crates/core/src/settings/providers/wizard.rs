@@ -43,6 +43,7 @@ pub enum AcpSetup {
     #[default]
     Choices,
     Manual,
+    Registry,
 }
 impl AcpSetup {
     pub fn start(local: bool) -> (Self, ConfigDraft, &'static str) {
@@ -64,7 +65,7 @@ impl AcpSetup {
         let filled = config
             .and_then(|c| c[key].as_str())
             .is_some_and(|s| !s.trim().is_empty());
-        if self == Self::Manual && filled {
+        if (self == Self::Manual || self == Self::Registry) && filled {
             None
         } else if local {
             Some("Executable is required.")
@@ -220,6 +221,29 @@ mod tests {
                 .selection_error(config.value.as_ref())
                 .is_some()
         );
+        assert_eq!(
+            AcpSetup::Registry.selection_error(config.value.as_ref()),
+            None
+        );
+        assert_eq!(
+            AcpSetup::Registry.navigate("acpRegistry", config.value.as_ref(), 1, 0, None),
+            Ok(0)
+        );
+        assert_eq!(
+            AcpSetup::Registry.navigate("acpRegistry", config.value.as_ref(), 0, 1, None),
+            Ok(1)
+        );
+        assert_eq!(
+            AcpSetup::Registry.navigate(
+                "acpRegistry",
+                config.value.as_ref(),
+                1,
+                2,
+                Some("duplicate".into())
+            ),
+            Err((1, "duplicate".into()))
+        );
+
         let (mode, mut local, label) = AcpSetup::start(true);
         assert_eq!(label, "Local ACP");
         assert_eq!(
