@@ -70,7 +70,21 @@ fn decodes_data_urls_and_asset_results() {
     assert_eq!(decode_data_url("data:image/svg+xml,%3Csvg%3E"), Some(b"<svg>".to_vec()));
     assert_eq!(decode_data_url("data:image/png;base64,***"), None);
     let url = decode_asset_url(&json!({ "relativeUrl": "/api/assets/tok/a.png", "expiresAt": 1, "imageDimensions": { "width": 640, "height": 480 } })).unwrap();
-    assert_eq!(url, AssetUrl { relative_url: "/api/assets/tok/a.png".into(), dimensions: Some((640, 480)) });
+    assert_eq!(url, AssetUrl { relative_url: "/api/assets/tok/a.png".into(), dimensions: Some((640, 480)), expires_at: 1., file_revision: None });
+    let revisioned = decode_asset_url(&json!({ "relativeUrl": "/a", "expiresAt": 1234, "fileRevision": "inode-size-mtime", "future": {} })).unwrap();
+    assert_eq!(revisioned.file_revision.as_deref(), Some("inode-size-mtime"));
+    assert_eq!(revisioned.expires_at, 1234.);
+    let resigned = decode_asset_url(&json!({ "relativeUrl": "/signed-again", "expiresAt": 9999, "fileRevision": "inode-size-mtime" })).unwrap();
+    assert_eq!(revisioned.content_key(), resigned.content_key());
+    assert_ne!(url.content_key(), resigned.content_key());
+    let mut changed = resigned.clone();
+    changed.file_revision = Some("changed".into());
+    assert_ne!(changed.content_key(), resigned.content_key());
+    for file_revision in [json!(null), json!(42), json!(""), json!("x".repeat(257)), json!("😀".repeat(129))] {
+        let url = decode_asset_url(&json!({ "relativeUrl": "/a", "fileRevision": file_revision })).unwrap();
+        assert_eq!(url.file_revision, None);
+        assert_eq!(url.expires_at, 0.);
+    }
     assert!(decode_asset_url(&json!({ "expiresAt": 1 })).is_err());
     assert_eq!(
         AssetResource::Attachment { attachment_id: "x".into() }.create_url_request(),

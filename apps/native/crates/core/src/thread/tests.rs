@@ -156,3 +156,26 @@ fn stream_items_ignore_events_at_or_below_the_snapshot_sequence() {
     assert!(state.apply(fresh));
     assert_eq!(state.sequence, Some(8));
 }
+
+#[test]
+fn media_mutation_id_uses_visible_items_and_last_app_checkpoint() {
+    let mut thread = projection(vec![assistant("reply", 1, None, "hi")], vec![]);
+    assert_eq!(crate::media::workspace_mutation_id(&thread), None);
+    let checkpoint = |id: &str, run_id: Value, ordinal: Value, captured: &str| Entity {
+        id: id.into(), value: json!({ "id": id, "runId": run_id, "appRunOrdinal": ordinal, "capturedAt": captured }),
+    };
+    thread.checkpoints = vec![
+        checkpoint("c1", json!("r1"), json!(1), T),
+        checkpoint("c2", json!("r2"), json!(2), "2026-11-02T00:00:00.000Z"),
+        checkpoint("sub", json!("r2"), Value::Null, "2026-11-03T00:00:00.000Z"),
+        checkpoint("orphan", Value::Null, json!(3), "2026-11-04T00:00:00.000Z"),
+    ];
+    assert_eq!(crate::media::workspace_mutation_id(&thread), Some(json!([null, "2026-11-02T00:00:00.000Z"]).to_string()));
+    thread.checkpoints.truncate(1);
+    assert_eq!(crate::media::workspace_mutation_id(&thread), Some(json!([null, T]).to_string()));
+    let mut command = base_item("visible-command", 2, None);
+    command.as_object_mut().unwrap().extend(json!({ "type": "command_execution", "input": "touch image.png" }).as_object().unwrap().clone());
+    let visible = projection(vec![command], vec![]).visible_turn_items;
+    thread.visible_turn_items = visible;
+    assert_eq!(crate::media::workspace_mutation_id(&thread), Some(json!(["visible-command", T]).to_string()));
+}

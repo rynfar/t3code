@@ -260,15 +260,15 @@ pub fn preview_is_repository(value: &Value) -> bool {
 }
 
 /// `deriveWorkspaceMutationId`: changes whenever the agent may have changed the workspace, so
-/// git diffs refetch mid-turn. File tools are explicit; finished commands count because a shell
-/// command can change files without reporting them. `items` are the visible turn items in order.
+/// file views and host images refetch mid-turn. Commands, dynamic/MCP tools and subagents can
+/// change files without reporting paths. Ports `state/threadDetail.ts`; `items` are visible in order.
 pub fn workspace_mutation_id<'a>(
     items: impl DoubleEndedIterator<Item = &'a TurnItem>,
     latest_checkpoint_completed_at: Option<&str>,
 ) -> Option<String> {
     let item_id = items
         .rev()
-        .filter(|item| matches!(item.kind, TurnItemKind::CommandExecution { .. } | TurnItemKind::FileChange { .. }))
+        .filter(|item| matches!(item.kind, TurnItemKind::CommandExecution { .. } | TurnItemKind::FileChange { .. } | TurnItemKind::DynamicTool { .. } | TurnItemKind::Subagent { .. }))
         .find(|item| !matches!(item.status.as_str(), "pending" | "running" | "waiting"))
         .map(|item| item.id.as_str());
     if item_id.is_none() && latest_checkpoint_completed_at.is_none() {

@@ -36,6 +36,7 @@ impl ThreadView {
             owner: cx.entity_id(),
             thread_id: self.thread_id.clone(),
             workspace_root: self.workspace_root.clone(),
+            workspace_mutation_id: self.workspace_mutation_id.clone(),
             viewer: self.viewer.downgrade(),
         };
         crate::media::set_scope(scope, cx);
