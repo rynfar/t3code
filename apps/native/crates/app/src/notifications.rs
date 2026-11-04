@@ -3,16 +3,17 @@
 //! opens its thread; focusing the window clears the rest. `t3_core::notifications` decides what
 //! notifies. `threadNotifications.ts` sounds and the macOS desktop bridge badge use AppKit.
 
-use std::collections::HashMap;
-
 use gpui::{App, Context, SystemNotification};
 use t3_client::supervisor::ConnectionStatus;
-use t3_core::notifications::{NotificationKind, PendingNotifications, ThreadNotification, ThreadNotifications, notification_tag};
+use t3_core::notifications::{DeliveryOutcome, NotificationKind, PendingNotifications, ThreadNotification, ThreadNotifications, notification_visible, presentation};
+use t3_core::sidebar::tag_filter::ThreadKey;
 use t3_core::sidebar::ENVIRONMENT_ID;
 use t3_core::sidebar::status::ThreadStatus;
 
 use crate::app_state::{AppState, Phase};
 use crate::toast::{Toast, ToastKind};
+
+mod delivery;
 
 pub(crate) use platform::prepare_sounds;
 
@@ -21,9 +22,6 @@ pub struct NotificationCenter {
     watcher: ThreadNotifications,
     /// Delivered OS notifications that focus retires: tag to thread.
     pending: PendingNotifications,
-    /// Where each delivered notification leads, kept past retirement: a click can arrive after
-    /// the focus it caused cleared `pending`. Tags are per thread, so this is bounded by threads.
-    destinations: HashMap<String, String>,
     badge_count: Option<usize>,
 }
 
@@ -63,18 +61,23 @@ impl AppState {
         if !live {
             return;
         }
-        for notification in self.notifications.watcher.observe(&self.shell) {
+        for notification in self.notifications.watcher.observe_visible(&self.shell, &self.sidebar.hidden_thread_ids) {
             self.present_notification(notification, cx);
         }
     }
 
     fn present_notification(&mut self, notification: ThreadNotification, cx: &mut Context<Self>) {
-        platform::play_sound(notification.kind, self.client_settings.notification_mode);
-        let focused = app_focused(cx);
-        if self.client_settings.in_app_notifications_enabled
-            && focused
-            && self.selected_thread.as_deref() != Some(notification.thread_id.as_str())
-        {
+        let plan = presentation(
+            self.client_settings.notification_mode,
+            self.client_settings.in_app_notifications_enabled,
+            app_focused(cx),
+            self.selected_thread.as_deref() == Some(notification.thread_id.as_str()),
+            self.sidebar.hidden_thread_ids.contains(&notification.thread_id),
+        );
+        if plan.sound {
+            platform::play_sound(notification.kind, self.client_settings.notification_mode);
+        }
+        if plan.toast {
             let kind = match (notification.kind, notification.status) {
                 (NotificationKind::Completion, _) => ToastKind::Success,
                 (_, ThreadStatus::Failed) => ToastKind::Error,
@@ -84,27 +87,75 @@ impl AppState {
             self.show_toast(toast, cx);
             return;
         }
-        if !self.client_settings.notification_mode.has_desktop_notifications() || focused {
+        if !plan.desktop {
             return;
         }
-        let environment = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str());
-        let tag = notification_tag(environment.filter(|id| !id.is_empty()).unwrap_or(ENVIRONMENT_ID), &notification.thread_id);
-        cx.show_system_notification(SystemNotification {
-            tag: tag.clone().into(),
+        let attempt = self.notifications.pending.begin(self.notification_target(&notification.thread_id));
+        let system_notification = SystemNotification {
+            tag: attempt.tag.clone().into(),
             title: notification.title.into(),
             body: notification.body.into(),
             actions: Vec::new(),
-        });
-        self.notifications.destinations.insert(tag.clone(), notification.thread_id.clone());
-        self.notifications.pending.track(tag, notification.thread_id);
+        };
+        let connection = self.connection_id();
+        cx.spawn(async move |this, cx| {
+            let authorization = delivery::authorize().await;
+            let outcome = if matches!(authorization, DeliveryOutcome::Accepted | DeliveryOutcome::Unconfirmed) {
+                let posted = this.update(cx, |state, cx| {
+                    if state.connection_id() != connection { return None; }
+                    state.sync_notification_state(cx);
+                    state.retire_hidden_notifications(cx);
+                    state.notifications.pending.is_current(&attempt).then(|| delivery::post(system_notification, cx))
+                }).ok().flatten();
+                let Some(posted) = posted else { return };
+                posted.await
+            } else { authorization };
+            let _ = this.update(cx, |state, cx| {
+                // An old environment's callback must never change the new environment's state.
+                if state.connection_id() != connection {
+                    if !state.notifications.pending.is_outstanding(&attempt.tag) { cx.dismiss_system_notification(&attempt.tag); }
+                    return;
+                }
+                state.sync_notification_state(cx);
+                state.retire_hidden_notifications(cx);
+                state.notifications.pending.confirm(&attempt, outcome);
+                if !state.notifications.pending.is_outstanding(&attempt.tag) {
+                    cx.dismiss_system_notification(&attempt.tag);
+                }
+                tracing::debug!(tag = %attempt.tag, ?outcome, "system notification delivery completed");
+                state.update_notification_badge();
+            });
+        }).detach();
+    }
+
+    fn notification_target(&self, thread_id: &str) -> ThreadKey {
+        let environment = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str());
+        ThreadKey::new(environment.filter(|id| !id.is_empty()).unwrap_or(ENVIRONMENT_ID), thread_id)
+    }
+
+    pub(crate) fn retire_hidden_notifications(&mut self, cx: &mut Context<Self>) {
+        if self.notifications.pending.is_empty() && !self.toasts.has_thread_notifications() { return; }
+        let hidden = &self.sidebar.hidden_thread_ids;
+        let live: std::collections::HashSet<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter())
+            .chain(self.omitted.mounts.extras(&self.shell)).map(|thread| thread.id.clone()).collect();
+        let filtering = self.server_config.config.as_ref().is_some_and(|config| config.settings.hidden_tags().is_some());
+        let visible = |id: &str| notification_visible(id, hidden, filtering.then_some(&live));
+        for tag in self.notifications.pending.retire_where(|key| !visible(&key.thread_id)) {
+            cx.dismiss_system_notification(&tag);
+        }
+        self.notifications.pending.prune_destinations(|key| live.contains(&key.thread_id));
+        if self.toasts.retire_thread_notifications(visible) {
+            cx.emit(crate::app_state::AppEvent::Notice);
+        }
         self.update_notification_badge();
     }
 
     /// An OS notification was clicked: bring the app forward on its thread.
     pub fn open_notification(&mut self, tag: &str, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.notifications.destinations.get(tag).cloned() else { return };
+        let Some(target) = self.notifications.pending.destination(tag).cloned() else { return };
+        if target.environment_id != self.notification_target(&target.thread_id).environment_id { return; }
         cx.activate(true);
-        self.select_thread(&thread_id, cx);
+        self.select_thread(&target.thread_id, cx);
     }
 
     /// Focus or a mode change retires delivered notifications.
@@ -116,7 +167,7 @@ impl AppState {
     }
 
     pub(crate) fn retire_thread_notifications(&mut self, thread_id: &str, cx: &mut App) {
-        for tag in self.notifications.pending.visit(thread_id) {
+        for tag in self.notifications.pending.visit_target(&self.notification_target(thread_id)) {
             cx.dismiss_system_notification(&tag);
         }
         self.update_notification_badge();

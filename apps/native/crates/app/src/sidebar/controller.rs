@@ -169,6 +169,7 @@ impl AppState {
         let next = model.next_change_at;
         let listed_settled = model.listed_settled_count;
         self.sidebar.model = Arc::new(model);
+        self.retire_hidden_notifications(cx);
         if self.selected_thread.as_deref().is_some_and(|id| {
             t3_core::sidebar::tag_filter::route_visibility(id, self.thread_shell(id).is_some(), &self.sidebar.hidden_thread_ids, self.hiding_thread_tags())
                 == t3_core::sidebar::tag_filter::RouteVisibility::Hidden
