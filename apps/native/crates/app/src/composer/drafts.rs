@@ -90,6 +90,7 @@ impl Composer {
 
     /// Records the current target's draft and schedules a write.
     pub(super) fn draft_changed(&mut self, cx: &mut Context<Self>) {
+        if self.cancel_pending_send() { cx.notify(); }
         if let Some(target) = self.snapshot.target.clone() {
             self.record_draft(&target, cx);
         }

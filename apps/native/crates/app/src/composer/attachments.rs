@@ -1,12 +1,14 @@
 //! Composer attachments: paste, drop and the paperclip (`useComposerAttachmentIntake.ts`,
 //! `ComposerAttachButton`), the upload queue (`web/src/lib/attachmentUploadQueue.ts`), large
 //! pastes folded into a file, and the strip of thumbnails and file rows
-//! (`ComposerAttachmentStrip.tsx`). Classification, limits and payloads live in
+//! (`ComposerAttachmentStrip.tsx`, size labels from `composerContextPresentation.tsx`). Classification, limits and payloads live in
 //! `t3_core::composer::attachments`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use futures::channel::oneshot;
 
 use gpui::{
     AnyElement, App, ClipboardEntry, Context, ExternalPaths, Image, ImageFormat, IntoElement, ObjectFit, ParentElement,
@@ -31,13 +33,23 @@ pub(super) struct Staged {
     /// The bytes, kept until the upload lands so a failed one can retry.
     bytes: Option<Arc<Vec<u8>>>,
     _upload: Option<Task<()>>,
+    settled: Vec<oneshot::Sender<()>>,
     source: Option<String>,
 }
 
 #[derive(Default)]
 pub(super) struct Attachments {
     staged: HashMap<Target, Vec<Staged>>,
+    attempts: rules::UploadAttempts,
+    #[cfg(feature = "snapshot")]
+    fixture_applied: bool,
 }
+
+#[cfg(feature = "snapshot")]
+#[derive(Clone)]
+pub(crate) struct Fixture(pub serde_json::Value);
+#[cfg(feature = "snapshot")]
+impl gpui::Global for Fixture {}
 
 /// A file read for staging.
 struct Picked {
@@ -68,17 +80,19 @@ impl Composer {
 
     /// Attachments a saved draft restores: uploaded, without their bytes or preview.
     pub(super) fn seed_attachments(&mut self, target: &Target, restored: Vec<Attachment>) {
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         if restored.is_empty() {
             return;
         }
-        let staged = restored.into_iter().map(|attachment| Staged { attachment, preview: None, bytes: None, _upload: None, source: None });
+        let staged = restored.into_iter().map(|attachment| Staged { attachment, preview: None, bytes: None, _upload: None, settled: Vec::new(), source: None });
         self.attachments.staged.entry(target.clone()).or_default().extend(staged);
     }
 
     pub(super) fn stage_imported_attachment(&mut self, target: &Target, imported: super::imports::ImportedAttachment, cx: &mut Context<Self>) {
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         let id=imported.attachment.id.clone();
         let copying=imported.source.is_some();
-        self.attachments.staged.entry(target.clone()).or_default().push(Staged {attachment:imported.attachment, preview:None, bytes:None, _upload:None, source:imported.source});
+        self.attachments.staged.entry(target.clone()).or_default().push(Staged {attachment:imported.attachment, preview:None, bytes:None, _upload:None, settled:Vec::new(), source:imported.source});
         if copying {self.start_upload(target.clone(),id,cx);}
     }
 
@@ -167,6 +181,7 @@ impl Composer {
 
     /// Admits one file (`addComposerAttachments`) and starts its upload.
     fn stage(&mut self, target: &Target, name: String, bytes: Vec<u8>, pasted_text: bool, cx: &mut Context<Self>) {
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         let classified = if pasted_text { Classified::File { mime_type: "text/plain;charset=utf-8".to_owned() } } else { rules::classify(&name) };
         let staged = self.attachments.staged.get(target).map_or(0, Vec::len);
         let size = bytes.len() as u64;
@@ -189,7 +204,7 @@ impl Composer {
             attachment,
             preview,
             bytes: Some(Arc::new(bytes)),
-            _upload: None,
+            _upload: None, settled: Vec::new(),
             source: None,
         });
         self.record_draft(target, cx);
@@ -206,7 +221,10 @@ impl Composer {
             let state = self.state.read(cx);
             (state.client_handle(), state.runtime().clone())
         };
+        self.attachments.attempts.cancel(&id);
         let Some(staged) = self.find_staged(&target, &id) else { return };
+        staged._upload = None;
+        staged.settled.clear();
         let bytes = staged.bytes.clone();
         let source = staged.source.clone();
         if bytes.is_none() && source.is_none() { return; }
@@ -218,6 +236,7 @@ impl Composer {
         };
         let request = staged.attachment.upload_request();
         let mime_type = staged.attachment.mime_type.clone();
+        let attempt = self.attachments.attempts.begin(&id);
         let (task_target, task_id) = (target.clone(), id.clone());
         let task = cx.spawn(async move |this, cx| {
             let result = runtime
@@ -228,7 +247,9 @@ impl Composer {
                 .await
                 .unwrap_or_else(|_| Err("Upload failed".to_owned()));
             let _ = this.update(cx, |this, cx| {
+                if !this.attachments.attempts.finish(&task_id, attempt) { return; }
                 let Some(staged) = this.find_staged(&task_target, &task_id) else { return };
+                staged.settled.clear();
                 match result {
                     Ok(attachment_id) => {
                         staged.attachment.upload = Upload::Ready { attachment_id: attachment_id.into_id() };
@@ -245,12 +266,21 @@ impl Composer {
         }
     }
 
+    pub(super) fn wait_for_uploads(&mut self, target: &Target) -> Vec<oneshot::Receiver<()>> {
+        self.attachments.staged.get_mut(target).into_iter().flatten().filter(|staged| staged._upload.is_some() && staged.attachment.upload == Upload::Uploading).map(|staged| {
+            let (settled, receiver) = oneshot::channel();
+            staged.settled.push(settled);
+            receiver
+        }).collect()
+    }
+
     pub(super) fn release_upload(&self, attachment_id: &str, cx: &App) {
         let request = self.state.read(cx).rpc(rules::DELETE, rules::delete_request(attachment_id));
         cx.background_executor().spawn(async move { request.await.ok() }).detach();
     }
 
     pub(super) fn retry_upload(&mut self, id: String, cx: &mut Context<Self>) {
+        self.cancel_pending_send();
         if let Some(target) = self.snapshot.target.clone() {
             self.start_upload(target, id, cx);
             cx.notify();
@@ -263,6 +293,8 @@ impl Composer {
         let Some(staged) = self.attachments.staged.get_mut(&target) else { return };
         let Some(index) = staged.iter().position(|staged| staged.attachment.id == id) else { return };
         let removed = staged.remove(index);
+        self.attachments.attempts.cancel(id);
+        self.cancel_pending_send();
         if let Some(attachment_id) = removed.attachment.attachment_id() {
             self.release_upload(attachment_id, cx);
         }
@@ -272,10 +304,12 @@ impl Composer {
 
     /// Takes the target's attachments for a send; `restore_attachments` puts them back if it fails.
     pub(super) fn take_attachments(&mut self, target: &Target) -> Vec<Staged> {
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         self.attachments.staged.remove(target).unwrap_or_default()
     }
 
     pub(super) fn restore_attachments(&mut self, target: &Target, mut taken: Vec<Staged>) {
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         let current = self.attachments.staged.entry(target.clone()).or_default();
         taken.append(current);
         *current = taken;
@@ -385,6 +419,8 @@ impl Composer {
             h_flex().flex_wrap().gap(px(8.)).mb(px(12.)).children(images.into_iter().map(|staged| {
                 let attachment = &staged.attachment;
                 let id = attachment.id.clone();
+                let mut tooltip = format!("{}\n{}", attachment.name, rules::format_size(attachment.size_bytes));
+                if let Upload::Failed { reason } = &attachment.upload { tooltip.push_str(&format!("\n\n{reason}")); }
                 let thumbnail = match &staged.preview {
                     Some(image) => img(image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
                     None => div()
@@ -408,12 +444,14 @@ impl Composer {
                     .border_1()
                     .border_color(hsla(p.border).opacity(0.8))
                     .bg(hsla(p.background))
+                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
                     .child(thumbnail)
+                    .child(div().absolute().bottom_0().left_0().right_0().px(px(4.)).bg(hsla(p.background).opacity(0.85)).text_size(crate::theme::rem(crate::theme::metrics::TEXT_3XS)).text_center().text_color(hsla(p.foreground)).child(rules::format_size(attachment.size_bytes)))
                     .when(attachment.upload == Upload::Uploading, |this| {
                         this.child(
                             div()
                                 .absolute()
-                                .bottom_0()
+                                .top_0()
                                 .left_0()
                                 .right_0()
                                 .px(px(4.))
@@ -427,7 +465,7 @@ impl Composer {
                     .when_some(failed_reason(attachment), |this, reason| {
                         let id = id.clone();
                         this.child(
-                            div().absolute().bottom(px(4.)).left(px(4.)).child(
+                            div().absolute().top(px(4.)).left(px(4.)).child(
                                 media_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, cx)
                                     .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
                                     .on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx))),
@@ -447,7 +485,8 @@ impl Composer {
                 let attachment = &staged.attachment;
                 let id = attachment.id.clone();
                 let status = match &attachment.upload {
-                    Upload::Uploading => "Uploading".to_owned(),
+                    Upload::Uploading => format!("{} · Uploading", rules::format_size(attachment.size_bytes)),
+                    Upload::Failed { .. } => format!("{} · upload failed", rules::format_size(attachment.size_bytes)),
                     _ => rules::format_size(attachment.size_bytes),
                 };
                 h_flex()
@@ -528,12 +567,43 @@ fn ghost_icon_button(id: SharedString, icon: Icon, cx: &App) -> gpui::Stateful<g
 impl Composer {
     pub(super) fn take_draft_attachments(&mut self, target: &Target) -> Vec<Staged> {
         let mut staged = self.attachments.staged.remove(target).unwrap_or_default();
-        for entry in &mut staged { entry._upload = None; }
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
+        for entry in &mut staged {
+            self.attachments.attempts.cancel(&entry.attachment.id);
+            entry._upload = None;
+            entry.settled.clear();
+        }
         staged
     }
     pub(super) fn restore_draft_attachments(&mut self, target: &Target, staged: Vec<Staged>, cx: &mut Context<Self>) {
+        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         let retry: Vec<_> = staged.iter().filter(|entry| entry.attachment.attachment_id().is_none()).map(|entry| entry.attachment.id.clone()).collect();
         self.attachments.staged.insert(target.clone(), staged);
         for id in retry { self.start_upload(target.clone(), id, cx); }
+    }
+}
+
+#[cfg(feature = "snapshot")]
+impl Composer {
+    pub(super) fn attachment_fixture(&mut self, cx: &mut Context<Self>) {
+        if self.attachments.fixture_applied { return; }
+        let Some(target @ Target::Thread(_)) = self.snapshot.target.clone().filter(|_| self.snapshot.loaded) else { return };
+        let Some(fixture) = cx.try_global::<Fixture>().cloned() else { return };
+        self.attachments.fixture_applied = true;
+        let entries = fixture.0.as_array().into_iter().flatten().map(|value| {
+            let field = |name| value.get(name).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            let id = field("id");
+            let upload = match field("status").as_str() {
+                "failed" => Upload::Failed { reason: "Upload failed".into() },
+                "uploading" => Upload::Uploading,
+                _ => Upload::Ready { attachment_id: format!("fixture-{id}") },
+            };
+            let held = (upload == Upload::Uploading && value["hold"].as_bool() == Some(true)).then(|| cx.spawn(async |_, _| futures::future::pending::<()>().await));
+            Staged {
+                attachment: Attachment { id, name: field("name"), kind: if field("type") == "image" { AttachmentKind::Image } else { AttachmentKind::File }, mime_type: field("mimeType"), size_bytes: value["sizeBytes"].as_u64().unwrap_or_default(), pasted_text: false, upload },
+                preview: None, bytes: None, _upload: held, settled: Vec::new(), source: None,
+            }
+        }).collect();
+        self.attachments.staged.insert(target, entries);
     }
 }

@@ -87,6 +87,10 @@ impl Composer {
             cx.notify();
             return;
         }
+        if staged.iter().any(|attachment| attachment.attachment_id().is_none()) {
+            self.await_uploads(intent, window, cx);
+            return;
+        }
         // `/plan` or `/default` alone switches the mode instead of sending.
         if let Some(command) = t3_core::composer::menu::parse_standalone_slash_command(&text)
             && staged.is_empty()
@@ -144,6 +148,51 @@ impl Composer {
             self.set_prompt("", window, cx);
             self.draft_changed(cx);
         }
+    }
+
+    pub(super) fn question_revision(&self, cx: &App) -> Vec<(String, String)> {
+        let Some(Target::Thread(id)) = self.snapshot.target.as_ref() else { return Vec::new() };
+        self.state.read(cx).thread_state(id).projection.as_ref().map(attachments::question_revision).unwrap_or_default()
+    }
+
+    pub(super) fn cancel_pending_send(&mut self) -> bool {
+        let cancelled = self.pending_send.cancel();
+        if cancelled { self.sending = false; }
+        cancelled
+    }
+
+    fn await_uploads(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        let connection = self.state.read(cx).connection_id();
+        let transport = self.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow());
+        self.send_connection = Some((connection, transport, self.state.read(cx).phase.clone()));
+        for id in attachments::retry_on_send(&self.staged_attachments()) {
+            self.start_upload(target.clone(), id, cx);
+        }
+        let settled = self.wait_for_uploads(&target);
+        self.pending_questions = self.question_revision(cx);
+        let generation = self.pending_send.begin();
+        self.sending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            futures::future::join_all(settled).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !this.pending_send.finish(generation) { return; }
+                this.sending = false;
+                let same_connection = matches!(this.state.read(cx).phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected))
+                    && this.question_revision(cx) == this.pending_questions
+                    && this.state.read(cx).connection_id() == connection
+                    && this.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow()) == transport;
+                if same_connection {
+                    match attachments::uploaded_for_send(&this.staged_attachments()) {
+                        Ok(_) => this.submit(intent, window, cx),
+                        Err(reason) => this.error = Some(reason.into()),
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
     }
 
     fn outgoing(&self, prompt: String, staged: &[Attachment]) -> Outgoing {

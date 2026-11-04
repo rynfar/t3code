@@ -6,6 +6,8 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+#[cfg(feature = "snapshot")]
+pub(crate) use attachments::Fixture as AttachmentFixture;
 pub(crate) mod imports;
 mod citations;
 pub(crate) mod context;
@@ -150,6 +152,9 @@ pub struct Composer {
     answering: Option<String>,
     stash: Option<String>,
     sending: bool,
+    pending_send: t3_core::composer::attachments::PendingSend,
+    pending_questions: Vec<(String, String)>,
+    send_connection: Option<(Option<u64>, Option<u64>, crate::app_state::Phase)>,
     has_text: bool,
     error: Option<String>,
     auto_advance: Option<Task<()>>,
@@ -205,6 +210,15 @@ impl Composer {
                 _ => {}
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
+                if *event == AppEvent::Selection && this.fixed.is_none() && this.cancel_pending_send() { cx.notify(); }
+                if *event == AppEvent::Phase {
+                    let state = this.state.read(cx);
+                    let connection = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.phase.clone());
+                    if this.send_connection.as_ref() != Some(&connection) {
+                        this.send_connection = Some(connection);
+                        if this.cancel_pending_send() { cx.notify(); }
+                    }
+                }
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
@@ -270,6 +284,9 @@ impl Composer {
             answering: None,
             stash: None,
             sending: false,
+            pending_send: Default::default(),
+            pending_questions: Vec::new(),
+            send_connection: None,
             has_text: false,
             error: None,
             auto_advance: None,
@@ -346,6 +363,10 @@ impl Composer {
     /// Re-reads app state. Notifies only when something the composer shows changed.
     fn refresh(&mut self, config_changed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let next = self.read_snapshot(cx);
+        if self.pending_send.is_pending() && self.question_revision(cx) != self.pending_questions && self.cancel_pending_send() { cx.notify(); }
+        if next.target != self.snapshot.target || next.pending.user_inputs != self.snapshot.pending.user_inputs {
+            self.cancel_pending_send();
+        }
         if next == self.snapshot && !config_changed {
             return;
         }
@@ -376,6 +397,8 @@ impl Composer {
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
+        #[cfg(feature = "snapshot")]
+        self.attachment_fixture(cx);
         self.sync_queued_edit(window, cx);
         self.sync_answering(window, cx);
         self.sync_menu(true, cx);
@@ -591,6 +614,7 @@ impl Composer {
     }
 
     fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cancel_pending_send() { cx.notify(); }
         self.close_citation_comment("prompt-replaced", window, cx);
         self.has_text = !text.trim().is_empty();
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
@@ -623,6 +647,7 @@ impl Composer {
     /// The textarea draws itself; the composer repaints only when what it shows depends on the
     /// text: the send button's enabled state, or the active answer.
     fn on_prompt_change(&mut self, cx: &mut Context<Self>) {
+        if self.cancel_pending_send() { cx.notify(); }
         self.sync_menu(true, cx);
         self.close_stash_menu(cx);
         if self.answering.is_none() {

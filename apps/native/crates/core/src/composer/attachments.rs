@@ -7,6 +7,9 @@
 //! into a file (`client-runtime/src/textPaste.ts`), and the attachment-only prompt
 //! (`shared/src/composerContextReferences.ts`).
 
+mod lifecycle;
+pub use lifecycle::{PendingSend, UploadAttempts, question_revision};
+
 use serde_json::{Value, json};
 
 use crate::usage::format::to_fixed;
@@ -287,15 +290,18 @@ pub fn limit_error(attachments: &[Attachment]) -> Option<String> {
     })
 }
 
-/// Why Send waits: an upload still running or one that failed.
+/// Uploads are awaited by Send; only provider limits disable the action.
 pub fn send_block_reason(attachments: &[Attachment]) -> Option<String> {
-    if attachments.iter().any(|attachment| attachment.upload == Upload::Uploading) {
-        return Some("Wait for attachments to finish uploading".to_owned());
-    }
-    if let Some(Upload::Failed { reason }) = attachments.iter().map(|a| &a.upload).find(|u| matches!(u, Upload::Failed { .. })) {
-        return Some(format!("{reason}. Remove the attachment to send."));
-    }
     limit_error(attachments)
+}
+
+/// `useComposerSend`: one retry per failed attachment for each explicit Send.
+pub fn retry_on_send(attachments: &[Attachment]) -> Vec<String> {
+    attachments.iter().filter(|attachment| matches!(attachment.upload, Upload::Failed { .. })).map(|attachment| attachment.id.clone()).collect()
+}
+
+pub fn uploaded_for_send(attachments: &[Attachment]) -> Result<Vec<Value>, &'static str> {
+    chat_attachments(attachments).ok_or("Retry or remove failed uploads before sending.")
 }
 
 /// `pastedTextDisposition`: a paste of 32 KiB or more, or one that would overflow the prompt,
