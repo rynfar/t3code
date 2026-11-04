@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, BoxShadow, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Task, div, hsla as gpui_hsla, point, px,
+    StatefulInteractiveElement, Styled, Task, Window, div, hsla as gpui_hsla, point, px,
 };
 
 use crate::app_state::{AppEvent, AppState};
@@ -250,13 +250,12 @@ fn close_orb(id: u64, state: Entity<AppState>, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement {
-    let id = entry.id;
-    let toast = surface(cx).w_full().id(SharedString::from(format!("toast-{id}"))).child(entry.toast.render_content(cx));
-    let toast = if entry.toast.github_star {
-        toast.children(crate::github_star_prompt::actions(id, state, cx))
+fn render_toast(id: u64, toast_data: &Toast, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
+    let toast = surface(cx).w_full().id(SharedString::from(format!("toast-{id}"))).child(toast_data.render_content(cx));
+    let toast = if toast_data.github_star {
+        toast.children(crate::github_star_prompt::actions(id, state, window, cx))
     } else { toast };
-    let toast = if let Some(action) = entry.toast.replace_linked_prompt.clone() {
+    let toast = if let Some(action) = toast_data.replace_linked_prompt.clone() {
         toast.child(div().px(px(14.)).pb(px(12.)).child(
             div().id(SharedString::from(format!("replace-linked-{id}"))).cursor_pointer().text_sm().text_color(hsla(palette(cx).primary)).child("Replace draft").on_click({
                 let state = state.clone();
@@ -267,7 +266,7 @@ fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement
             })
         ))
     } else { toast };
-    let toast = match entry.toast.open_thread.clone() {
+    let toast = match toast_data.open_thread.clone() {
         Some(target) => {
             let state = state.clone();
             toast
@@ -287,11 +286,13 @@ fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement
 
 /// The stack, positioned by the window: top-right, inset 32, below the 52px header. It paints over
 /// the settings modal and dialogs, as toasts sit above them on the web (layer 100).
-pub fn stack(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
-    let toasts = &state.read(cx).toasts;
-    let visible: Vec<&Entry> = toasts.entries.iter().take(VISIBLE_LIMIT).collect();
+pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    let (visible, hovered) = {
+        let toasts = &state.read(cx).toasts;
+        (toasts.entries.iter().take(VISIBLE_LIMIT).map(|entry| (entry.id, entry.toast.clone())).collect::<Vec<_>>(), toasts.hovered)
+    };
     let front = visible.first()?;
-    let expanded = toasts.hovered || visible.len() == 1;
+    let expanded = hovered || visible.len() == 1;
     let peeks = if expanded { 0 } else { visible.len() - 1 };
     let hover_state = state.clone();
     let container = div()
@@ -306,7 +307,7 @@ pub fn stack(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
         .pb(px(GAP * peeks as f32))
         .on_hover(move |hovered, _, cx| hover_state.update(cx, |state, cx| state.set_toasts_hovered(*hovered, cx)));
     let container = if expanded {
-        container.children(visible.iter().map(|entry| render_toast(entry, state, cx)))
+        container.children(visible.iter().map(|(id, toast)| render_toast(*id, toast, state, window, cx)))
     } else {
         // Back toasts first so the front one paints over them; each peeks 12px lower, 10% narrower.
         container
@@ -314,7 +315,7 @@ pub fn stack(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                 let inset = WIDTH * 0.05 * index as f32;
                 surface(cx).absolute().left(px(inset)).right(px(inset)).bottom(px(GAP * (peeks - index) as f32)).h(px(GAP * 2.)).into_any_element()
             }))
-            .child(render_toast(front, state, cx))
+            .child(render_toast(front.0, &front.1, state, window, cx))
     };
     Some(gpui::deferred(container).with_priority(60).into_any_element())
 }

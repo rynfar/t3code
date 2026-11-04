@@ -50,6 +50,8 @@ pub(crate) struct GitHubStarPrompt {
     _events: Subscription,
     #[cfg(feature = "snapshot")]
     fixture: Option<bool>,
+    #[cfg(feature = "snapshot")]
+    fixture_activations: (u32, u32),
 }
 impl GitHubStarPrompt {
     pub fn new(cx: &mut Context<AppState>) -> Self {
@@ -75,6 +77,8 @@ impl GitHubStarPrompt {
             _events: events,
             #[cfg(feature = "snapshot")]
             fixture: None,
+            #[cfg(feature = "snapshot")]
+            fixture_activations: (0, 0),
         }
     }
 }
@@ -227,6 +231,7 @@ impl AppState {
             self.remove_star_toast(cx);
             #[cfg(feature = "snapshot")]
             if self.github_star.fixture.is_some() {
+                self.github_star.fixture_activations.1 += 1;
                 eprintln!(
                     "star prompt spy: explicit fallback {url}; no URL opened",
                     url = core::URL
@@ -242,6 +247,7 @@ impl AppState {
         cx.emit(AppEvent::Notice);
         #[cfg(feature = "snapshot")]
         if let Some(result) = self.github_star.fixture {
+            self.github_star.fixture_activations.0 += 1;
             eprintln!(
                 "star prompt pre-RPC spy: {} {}; no RPC",
                 core::STAR,
@@ -349,8 +355,14 @@ impl FocusObserver {
     }
 }
 
-pub(crate) fn actions(id: u64, state: &Entity<AppState>, cx: &App) -> Option<gpui::AnyElement> {
+pub(crate) fn actions(
+    id: u64,
+    state: &Entity<AppState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<gpui::AnyElement> {
     use crate::theme::{hsla, palette};
+    use gpui::prelude::FluentBuilder;
     use gpui::{
         InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px,
     };
@@ -365,8 +377,6 @@ pub(crate) fn actions(id: u64, state: &Entity<AppState>, cx: &App) -> Option<gpu
     let p = palette(cx);
     let dismiss = state.clone();
     let activate = state.clone();
-    let dismiss_key = state.clone();
-    let activate_key = state.clone();
     Some(
         div()
             .tab_group()
@@ -381,12 +391,7 @@ pub(crate) fn actions(id: u64, state: &Entity<AppState>, cx: &App) -> Option<gpu
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .aria_label("Dismiss")
-                    .on_key_down(move |event, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            cx.stop_propagation();
-                            dismiss_key.update(cx, |s, cx| s.dismiss_toast(id, cx));
-                        }
-                    })
+                    .map(|element| action_focus(element, "star-dismiss", id, true, window, cx))
                     .cursor_pointer()
                     .text_xs()
                     .rounded(px(6.))
@@ -409,12 +414,7 @@ pub(crate) fn actions(id: u64, state: &Entity<AppState>, cx: &App) -> Option<gpu
                     .tab_stop(!pending)
                     .role(gpui::Role::Button)
                     .aria_label(label)
-                    .on_key_down(move |event, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            cx.stop_propagation();
-                            activate_key.update(cx, |s, cx| s.activate_star_prompt(cx));
-                        }
-                    })
+                    .map(|element| action_focus(element, "star-activate", id, !pending, window, cx))
                     .text_xs()
                     .rounded(px(6.))
                     .px(px(7.))
@@ -432,6 +432,25 @@ pub(crate) fn actions(id: u64, state: &Entity<AppState>, cx: &App) -> Option<gpu
             )
             .into_any_element(),
     )
+}
+
+fn action_focus(
+    element: gpui::Stateful<gpui::Div>,
+    key: &'static str,
+    id: u64,
+    enabled: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Stateful<gpui::Div> {
+    #[cfg(feature = "snapshot")]
+    {
+        let handle = window
+            .use_keyed_state((key, id), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        crate::snapshot::register_focus(key, handle, cx);
+    }
+    crate::right_panel::focusable(element, (key, id).into(), enabled, window, cx)
 }
 
 #[cfg(target_os = "macos")]
@@ -483,8 +502,16 @@ pub(crate) fn activity_listener(state: Entity<AppState>) -> impl gpui::IntoEleme
 
 #[cfg(feature = "snapshot")]
 impl AppState {
+    pub(crate) fn star_fixture_audit(&self) -> (Stage, u32, u32) {
+        (
+            self.github_star.machine.stage,
+            self.github_star.fixture_activations.0,
+            self.github_star.fixture_activations.1,
+        )
+    }
     pub(crate) fn install_star_fixture(&mut self, scenario: &str, cx: &mut Context<Self>) {
         self.github_star.fixture = Some(scenario == "success");
+        self.github_star.fixture_activations = (0, 0);
         let p = &mut self.github_star.machine;
         *p = Prompt::default();
         for sent in 1..=6 {

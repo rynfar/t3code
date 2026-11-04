@@ -371,6 +371,7 @@ impl Composer {
             };
             steps.push((commands::composer_message(&message), "Failed to send message."));
         }
+        let sends_prompt = t3_core::github_star_prompt::plan_sends_prompt(steps.iter().map(|(command, _)| command));
         let failures: Vec<&'static str> = steps.iter().map(|(_, failure)| *failure).collect();
         let star_origin = self.state.read(cx).star_prompt_origin();
         let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(command, _)| command).collect());
@@ -382,7 +383,7 @@ impl Composer {
                 this.sending = false;
                 if let Some(error) = failure {
                     this.restore(taken, error, window, cx);
-                } else {
+                } else if sends_prompt {
                     this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
                 }
                 cx.notify();

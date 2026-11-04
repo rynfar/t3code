@@ -13,6 +13,13 @@ pub fn can_star(session: Option<&AuthSessionState>) -> bool {
     session.is_some_and(|s| s.grants(SOURCE_CONTROL_WRITE_SCOPE))
 }
 
+/// The send plan may contain only approval feedback, which the web returns from before counting.
+pub fn plan_sends_prompt<'a>(commands: impl IntoIterator<Item = &'a Value>) -> bool {
+    commands
+        .into_iter()
+        .any(|command| command.get("type").and_then(Value::as_str) == Some("message.dispatch"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Destination<'a> {
     pub id: &'a str,
@@ -149,6 +156,50 @@ mod tests {
             assert_eq!(p.stage, Stage::Suppressed);
         }
     }
+    #[test]
+    fn approval_feedback_is_not_a_prompt_but_message_plans_are() {
+        use crate::commands::{self, ApprovalDecision, ComposerDispatch, ComposerMessage};
+        let feedback = commands::respond_to_approval(
+            "cmd",
+            "thread",
+            "approval",
+            ApprovalDecision::Decline,
+            Some("feedback"),
+        );
+        assert!(
+            !plan_sends_prompt([&feedback]),
+            "approval-only feedback must not increment the successful-prompt count"
+        );
+        let model = crate::traits::model_selection("codex", "synthetic", &[]);
+        for dispatch in [
+            ComposerDispatch::Auto,
+            ComposerDispatch::Queue,
+            ComposerDispatch::Steer,
+        ] {
+            let message = commands::composer_message(&ComposerMessage {
+                command_id: "cmd",
+                thread_id: "thread",
+                message_id: "message",
+                text: "prompt",
+                title_seed: "Prompt",
+                model_selection: &model,
+                dispatch,
+                context: None,
+                attachments: &[],
+            });
+            assert!(plan_sends_prompt([&message]));
+            let decline = commands::respond_to_approval(
+                "decline",
+                "thread",
+                "approval",
+                ApprovalDecision::Decline,
+                None,
+            );
+            assert!(plan_sends_prompt([&decline, &message]));
+        }
+        assert!(!plan_sends_prompt(std::iter::empty()));
+    }
+
     #[test]
     fn input_navigation_focus_and_embeds_restart_a_single_deadline() {
         let mut p = waiting();

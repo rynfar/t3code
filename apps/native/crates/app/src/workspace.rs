@@ -369,7 +369,7 @@ impl Render for Workspace {
             .child(self.device_setup.clone())
             .child(self.ssh_prompt.clone())
             .child(self.welcome.clone())
-            .children(crate::toast::stack(&self.state, cx))
+            .children(crate::toast::stack(&self.state, window, cx))
             .children(crate::updates::overlay(cx))
             .children(crate::settings::overlay(window, cx))
             .children(crate::theme_editor::overlay(window, cx))
