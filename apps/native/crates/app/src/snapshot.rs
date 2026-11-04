@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--notification-fixture visible|hidden] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -168,6 +168,7 @@ pub struct Options {
     managed_policy_fixture: Option<String>,
     announcement_fixture: Option<String>,
     notification_fixture: Option<String>,
+    environment_attach_fixture: bool,
     palette: bool,
     /// Opens the new-thread draft, as `chat.new` does.
     new_thread: bool,
@@ -234,6 +235,7 @@ impl Options {
             managed_policy_fixture: flag("--managed-policy-fixture"),
             announcement_fixture: flag("--announcement-fixture"),
             notification_fixture: flag("--notification-fixture"),
+            environment_attach_fixture: has("--environment-attach-fixture"),
             palette: has("--palette"),
             new_thread: has("--new-thread"),
             attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
@@ -734,13 +736,34 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let counts = cx.update(|cx| serde_json::to_vec_pretty(&*cx.global::<RenderCounts>().0.borrow())).map_err(|error| error.to_string())?;
         std::fs::write(path, counts).map_err(|error| error.to_string())?;
     }
+    if options.environment_attach_fixture {
+        state.update(&mut cx, |state, cx| {
+            state.stop_pump();
+            let client = state.client_handle().expect("fixture needs the read-only smoke connection");
+            let mut shell = state.shell.clone();
+            let snapshot = shell.snapshot.as_mut().expect("cached shell");
+            let project = snapshot.projects.first().expect("smoke project").id.clone();
+            snapshot.older_settled = Some(t3_core::shell::OlderSettledCut {
+                before: "2026-01-01T00:00:00.000Z".into(), as_of_sequence: snapshot.snapshot_sequence,
+                counts: vec![t3_core::shell::OlderSettledCount { project_id: project.clone(), count: 6 }],
+            });
+            let config = state.server_config.clone();
+            state.clear_connection_state(cx);
+            state.install_active_environment(client, shell, config, t3_client::supervisor::ConnectionStatus::Connected, cx);
+            let older = state.omitted.older().expect("attaching an idle cached shell initializes older-settled counts");
+            assert_eq!(older.counts.get(&project), Some(&6));
+            assert!(state.omitted.pages.frontier.is_some(), "attaching initializes the paging frontier without another shell frame");
+            eprintln!("cached attach fixture: older-settled count=6; frontier initialized; no additional shell frame");
+        });
+    }
     if let Some(visibility) = &options.notification_fixture {
-        if !matches!(visibility.as_str(), "visible" | "hidden") { return Err("notification fixture must be visible or hidden".into()); }
+        if !matches!(visibility.as_str(), "visible" | "hidden" | "background") { return Err("notification fixture must be visible, hidden or background".into()); }
         state.update(&mut cx, |state, cx| {
             state.stop_pump();
             // This exercises toast retirement without requesting OS delivery or playing audio.
             state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, "Thread completed")
-                .description("Notification fixture").open_thread("snapshot-notification".into()), cx);
+                .description(if visibility == "background" { "Background environment thread" } else { "Notification fixture" })
+                .open_environment_thread(t3_core::sidebar::tag_filter::ThreadKey::new(if visibility == "background" { "fixture-background" } else { state.environments.active.as_deref().unwrap_or("local") }, "snapshot-notification")), cx);
             if visibility == "hidden" {
                 state.sidebar.hidden_thread_ids.insert("snapshot-notification".into());
                 state.retire_hidden_notifications(cx);

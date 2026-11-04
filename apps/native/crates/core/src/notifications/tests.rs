@@ -59,29 +59,29 @@ fn track(pending: &mut PendingNotifications, thread_id: &str) {
 }
 
 #[test]
-fn badge_counts_pending_threads_and_retires_on_visit_focus_mode_or_disconnect() {
+fn badge_counts_pending_threads_and_retires_on_visit_focus_or_mode_change() {
     let mut pending = PendingNotifications::default();
     let mode = NotificationMode::NotificationsAndSound;
-    assert!(pending.sync(mode, true, false).is_empty());
+    assert!(pending.sync(mode, false).is_empty());
     track(&mut pending, "a");
     track(&mut pending, "a");
     track(&mut pending, "b");
     assert_eq!(pending.badge_count(), 2, "replacing a thread's notification does not increment");
-    assert!(pending.sync(mode, true, false).is_empty());
+    assert!(pending.sync(mode, false).is_empty());
     assert!(pending.visit_target(&ThreadKey::new("env", "unrelated")).is_empty());
     assert_eq!(pending.visit_target(&ThreadKey::new("env", "a")), [notification_tag("env", "a")]);
     assert_eq!(pending.badge_count(), 1);
-    assert_eq!(pending.sync(mode, true, true), [notification_tag("env", "b")]);
+    assert_eq!(pending.sync(mode, true), [notification_tag("env", "b")]);
     assert_eq!(pending.badge_count(), 0);
 
-    for (next_mode, connected) in [(NotificationMode::Off, true), (NotificationMode::Sound, true), (NotificationMode::Notifications, true), (mode, false)] {
-        pending.sync(mode, true, false);
+    for next_mode in [NotificationMode::Off, NotificationMode::Sound, NotificationMode::Notifications] {
+        pending.sync(mode, false);
         track(&mut pending, "a");
-        assert_eq!(pending.sync(next_mode, connected, false), [notification_tag("env", "a")]);
+        assert_eq!(pending.sync(next_mode, false), [notification_tag("env", "a")]);
         assert_eq!(pending.badge_count(), 0);
-        assert!(pending.sync(next_mode, connected, false).is_empty());
+        assert!(pending.sync(next_mode, false).is_empty());
     }
-    pending.sync(mode, true, false);
+    pending.sync(mode, false);
     track(&mut pending, "a");
     assert_eq!(pending.clear(), [notification_tag("env", "a")]);
     assert_eq!(pending.badge_count(), 0);
@@ -164,7 +164,7 @@ fn presentation_matches_focus_visibility_settings_and_hidden_threads() {
 fn delivery_requires_confirmation_and_retired_callbacks_cannot_restore_badges() {
     let mut pending = PendingNotifications::default();
     let mode = NotificationMode::Notifications;
-    pending.sync(mode, true, false);
+    pending.sync(mode, false);
     let target = crate::sidebar::tag_filter::ThreadKey::new("one", "thread");
     for outcome in [DeliveryOutcome::Denied, DeliveryOutcome::Unavailable, DeliveryOutcome::Failed, DeliveryOutcome::Unconfirmed] {
         let attempt = pending.begin(target.clone());
@@ -188,10 +188,10 @@ fn delivery_requires_confirmation_and_retired_callbacks_cannot_restore_badges() 
     assert_eq!(pending.visit_target(&target).as_slice(), std::slice::from_ref(&new.tag));
     assert_eq!(pending.badge_count(), 1);
     assert_eq!(pending.destination(&new.tag), Some(&target), "focus may precede the click callback");
-    for (next_mode, connected, focused) in [(mode, true, true), (NotificationMode::Off, true, false), (mode, false, false)] {
-        pending.sync(mode, true, false);
+    for (next_mode, focused) in [(mode, true), (NotificationMode::Off, false)] {
+        pending.sync(mode, false);
         let attempt = pending.begin(target.clone());
-        pending.sync(next_mode, connected, focused);
+        pending.sync(next_mode, focused);
         assert!(!pending.is_current(&attempt), "retired before authorization, so do not post");
         assert!(!pending.confirm(&attempt, DeliveryOutcome::Accepted));
         assert!(!pending.is_outstanding(&attempt.tag));
@@ -202,7 +202,7 @@ fn delivery_requires_confirmation_and_retired_callbacks_cannot_restore_badges() 
 #[test]
 fn hiding_retires_os_and_inflight_notifications_including_missing_rows() {
     let mut pending = PendingNotifications::default();
-    pending.sync(NotificationMode::Notifications, true, false);
+    pending.sync(NotificationMode::Notifications, false);
     let target = crate::sidebar::tag_filter::ThreadKey::new("one", "a");
     let attempt = pending.begin(target.clone());
     pending.confirm(&attempt, DeliveryOutcome::Accepted);
@@ -250,4 +250,73 @@ fn completion_gate_matches_web_once_only_and_skip_cases() {
     assert_eq!(gate.observe(&key, Some(&working), &completed(1), false, false), Some(NotificationKind::Completion));
     gate.clear();
     assert_eq!(gate.observe(&key, Some(&working), &completed(1), false, false), Some(NotificationKind::Completion));
+}
+
+#[test]
+fn background_environments_keep_independent_gates_pending_and_click_destinations() {
+    let mut watched = EnvironmentNotifications::default();
+    let mut pending = PendingNotifications::default();
+    pending.sync(NotificationMode::Notifications, false);
+    let mut shell = ShellState::default();
+    let update = |shell: &mut ShellState, status, extra| {
+        shell.apply(ShellStreamItem::Snapshot { snapshot: Box::new(ShellSnapshot {
+            threads: vec![thread("same-thread-id", status, extra)], ..Default::default()
+        }), resolved_repository_identity_roots: None });
+    };
+    update(&mut shell, "running", json!({}));
+    for env in ["active", "background"] {
+        assert!(watched.observe(env, &shell, &HashSet::new()).is_empty());
+    }
+    update(&mut shell, "completed", json!({"latestRunCompletedAt":"2026-11-01T00:09:00.000Z"}));
+    for env in ["background", "active"] {
+        assert_eq!(kinds(&watched.observe(env, &shell, &HashSet::new())), [("same-thread-id", "Thread completed")]);
+        let attempt = pending.begin(ThreadKey::new(env, "same-thread-id"));
+        assert!(pending.confirm(&attempt, DeliveryOutcome::Accepted));
+    }
+    assert_eq!(pending.badge_count(), 2);
+    // Switching views and a reconnect replay don't create another notification.
+    assert!(watched.observe("background", &shell, &HashSet::new()).is_empty());
+    assert_eq!(pending.badge_count(), 2);
+    let tag = notification_tag("background", "same-thread-id");
+    assert_eq!(pending.destination(&tag), Some(&ThreadKey::new("background", "same-thread-id")));
+    let in_flight = pending.begin(ThreadKey::new("active", "later"));
+    watched.remove("active");
+    pending.retire_where(|key| key.environment_id == "active");
+    assert!(!pending.confirm(&in_flight, DeliveryOutcome::Accepted));
+    assert_eq!(pending.badge_count(), 1);
+    assert!(pending.destination(&notification_tag("active", "same-thread-id")).is_none());
+    assert_eq!(pending.destination(&tag), Some(&ThreadKey::new("background", "same-thread-id")));
+    assert!(watched.observe("background", &shell, &HashSet::new()).is_empty());
+    // Re-enabling a removed environment establishes a fresh baseline.
+    assert!(watched.observe("active", &shell, &HashSet::new()).is_empty());
+}
+
+#[test]
+fn notification_click_switches_environment_before_opening_the_thread_or_family() {
+    let target = ThreadKey::new("background", "thread");
+    assert_eq!(notification_route(&target, Some("active"), true, true), NotificationRoute::SwitchEnvironment);
+    assert_eq!(notification_route(&target, Some("background"), false, true), NotificationRoute::WaitForShell);
+    assert_eq!(notification_route(&target, Some("background"), true, true), NotificationRoute::OpenThread);
+    assert_eq!(notification_route(&target, Some("background"), true, false), NotificationRoute::ReadFamily);
+}
+
+#[test]
+fn transient_reconnect_keeps_pending_badges_and_click_destinations() {
+    let mut pending = PendingNotifications::default();
+    let mode = NotificationMode::Notifications;
+    pending.sync(mode, false);
+    for environment in ["a", "b"] {
+        let attempt = pending.begin(ThreadKey::new(environment, "same"));
+        assert!(pending.confirm(&attempt, DeliveryOutcome::Accepted));
+    }
+    let in_flight = pending.begin(ThreadKey::new("a", "next"));
+    assert!(pending.sync(mode, false).is_empty(), "a transport reconnect is not environment removal");
+    assert_eq!(pending.badge_count(), 2);
+    assert_eq!(pending.destination(&notification_tag("a", "same")), Some(&ThreadKey::new("a", "same")));
+    assert!(pending.confirm(&in_flight, DeliveryOutcome::Accepted));
+    assert_eq!(pending.badge_count(), 3);
+    pending.retire_where(|target| target.environment_id == "a");
+    assert_eq!(pending.badge_count(), 1);
+    assert!(pending.destination(&notification_tag("a", "same")).is_none());
+    assert_eq!(pending.destination(&notification_tag("b", "same")), Some(&ThreadKey::new("b", "same")));
 }
