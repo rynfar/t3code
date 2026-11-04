@@ -240,7 +240,10 @@ impl SettingsView {
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
                                     this.edit_dialog_config(driver, &key, json!(""), cx);
-                                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                                    input.update(cx, |input, cx| {
+                                        input.focus(window, cx);
+                                        input.set_value("", window, cx);
+                                    });
                                 },
                             )),
                         )
