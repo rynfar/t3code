@@ -2,7 +2,7 @@
 //! `usePendingThreadRequests.ts`. Each question owns its files independently of message drafts.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use super::{DraftAnswer, PendingUserInput, Question};
 use crate::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE};
@@ -91,29 +91,64 @@ pub fn answer_draft(
 }
 
 /// Reservations survive navigation, but clearing a resolved draft invalidates its async reads.
-#[derive(Default)]
-pub struct Preparations {
+pub struct Preparations<T = ()> {
     next: u64,
-    active: HashMap<String, HashSet<u64>>,
+    active: HashMap<String, BTreeMap<u64, Option<T>>>,
 }
-impl Preparations {
+impl<T> Default for Preparations<T> {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            active: HashMap::new(),
+        }
+    }
+}
+impl<T> Preparations<T> {
     pub fn begin(&mut self, key: &str) -> u64 {
         self.next += 1;
-        self.active.entry(key.into()).or_default().insert(self.next);
+        self.active
+            .entry(key.into())
+            .or_default()
+            .insert(self.next, None);
         self.next
     }
     pub fn count(&self, key: &str) -> usize {
-        self.active.get(key).map_or(0, HashSet::len)
+        self.active.get(key).map_or(0, BTreeMap::len)
     }
-    pub fn finish(&mut self, key: &str, token: u64) -> bool {
-        let Some(active) = self.active.get_mut(key) else {
+    pub fn complete(&mut self, key: &str, token: u64, value: T) -> bool {
+        let Some(held) = self
+            .active
+            .get_mut(key)
+            .and_then(|active| active.get_mut(&token))
+        else {
             return false;
         };
-        let found = active.remove(&token);
+        if held.is_some() {
+            return false;
+        }
+        *held = Some(value);
+        true
+    }
+    pub fn take_completed(&mut self, key: &str, eligible: bool) -> Vec<T> {
+        let mut completed = Vec::new();
+        if !eligible {
+            return completed;
+        }
+        let Some(active) = self.active.get_mut(key) else {
+            return completed;
+        };
+        active.retain(|_, value| {
+            if let Some(value) = value.take() {
+                completed.push(value);
+                false
+            } else {
+                true
+            }
+        });
         if active.is_empty() {
             self.active.remove(key);
         }
-        found
+        completed
     }
     pub fn clear(&mut self, key: &str) {
         self.active.remove(key);
@@ -262,9 +297,14 @@ mod tests {
         assert_eq!(preparations.count("question"), 1);
         preparations.clear("question");
         let current = preparations.begin("question");
-        assert!(!preparations.finish("question", old));
+        assert!(!preparations.complete("question", old, "obsolete"));
         assert_eq!(preparations.count("question"), 1);
-        assert!(preparations.finish("question", current));
+        assert!(preparations.complete("question", current, "current"));
+        assert!(!preparations.complete("question", current, "duplicate"));
+        assert_eq!(
+            preparations.take_completed("question", true),
+            vec!["current"]
+        );
         assert_eq!(preparations.count("question"), 0);
     }
 }
@@ -291,6 +331,90 @@ mod readiness_tests {
                 attachment_id: "uploaded".into(),
             },
         };
+        let mut preparations = Preparations::default();
+        let key = QuestionDraftKey {
+            environment: "env".into(),
+            thread: "original".into(),
+            request: "request".into(),
+            question: "q1".into(),
+        };
+        let storage = key.storage_key();
+        let read = preparations.begin(&storage);
+        let mut synchronized = HashMap::from([("original".into(), vec!["request".into()])]);
+        synchronized.remove("original");
+        assert!(resolved_draft_keys(std::slice::from_ref(&key), "env", &synchronized).is_empty());
+        assert!(preparations.complete(&storage, read, vec![ready.clone()]));
+        assert!(
+            preparations
+                .take_completed(&storage, synchronized.contains_key("original"))
+                .is_empty()
+        );
+        assert_eq!(
+            preparations.count(&storage),
+            1,
+            "navigation retains the completed read and its completion guard"
+        );
+        let typed = DraftAnswer {
+            custom: Some("first answer".into()),
+            ..Default::default()
+        };
+        assert!(
+            answer_draft(Some(&typed), &[], preparations.count(&storage), true).attachments_blocked
+        );
+        synchronized.insert("original".into(), vec!["request".into()]);
+        assert!(resolved_draft_keys(std::slice::from_ref(&key), "env", &synchronized).is_empty());
+        let input = PendingUserInput {
+            request_id: "request".into(),
+            created_at: String::new(),
+            questions: questions.clone(),
+            response_capability: "message".into(),
+            dismissible: true,
+        };
+        let grants = serde_json::from_value(
+            json!({"authenticated":true,"permissions":["orchestration:operate"]}),
+        )
+        .unwrap();
+        let (pending, question) = key.pending(std::slice::from_ref(&input)).unwrap();
+        let eligible = can_attach(
+            question,
+            pending,
+            true,
+            Some(&grants),
+            true,
+            IntakePhase::Preparing,
+        );
+        let restored: Vec<_> = preparations
+            .take_completed(&storage, synchronized.contains_key("original") && eligible)
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            can_attach(
+                question,
+                pending,
+                true,
+                Some(&grants),
+                false,
+                IntakePhase::Start
+            ),
+            "a failed dismissal leaves the still-pending request available"
+        );
+        assert_eq!(restored, vec![ready.clone()]);
+        assert_eq!(preparations.count(&storage), 0);
+        assert_eq!(
+            answer_draft(Some(&typed), &restored, 0, true)
+                .custom
+                .as_deref(),
+            Some("first answer")
+        );
+        let late = preparations.begin(&storage);
+        assert!(preparations.complete(&storage, late, vec![ready.clone()]));
+        synchronized.insert("original".into(), Vec::new());
+        for resolved in resolved_draft_keys(std::slice::from_ref(&key), "env", &synchronized) {
+            preparations.clear(&resolved.storage_key());
+        }
+        assert!(preparations.take_completed(&storage, true).is_empty());
+        assert!(!preparations.complete(&storage, late, vec![ready.clone()]));
         let mut drafts = HashMap::from([
             (
                 "q1".into(),

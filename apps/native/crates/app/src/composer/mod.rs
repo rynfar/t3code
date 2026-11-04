@@ -400,7 +400,7 @@ impl Composer {
             self.cancel_pending_send();
         }
         if next == self.snapshot && !config_changed {
-            if pruned { cx.notify(); }
+            if self.finish_prepared_reads(cx) || pruned { cx.notify(); }
             return;
         }
         if next.target != self.snapshot.target || next.environment != self.snapshot.environment {
@@ -436,6 +436,7 @@ impl Composer {
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
+        self.finish_prepared_reads(cx);
         #[cfg(feature = "snapshot")]
         self.attachment_fixture(cx);
         self.sync_queued_edit(window, cx);

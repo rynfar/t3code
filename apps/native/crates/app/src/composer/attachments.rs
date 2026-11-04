@@ -42,7 +42,7 @@ pub(super) struct Staged {
 pub(super) struct Attachments {
     pub(super) staged: HashMap<Target, Vec<Staged>>,
     attempts: rules::UploadAttempts,
-    pub(super) preparations: t3_core::requests::attachments::Preparations,
+    pub(super) preparations: t3_core::requests::attachments::Preparations<Vec<Result<Picked, String>>>,
     pub(super) grant_watch: Option<(u64, Task<()>)>,
     #[cfg(feature = "snapshot")]
     fixture_applied: bool,
@@ -55,7 +55,7 @@ pub(crate) struct Fixture(pub serde_json::Value);
 impl gpui::Global for Fixture {}
 
 /// A file read for staging.
-struct Picked {
+pub(super) struct Picked {
     name: String,
     bytes: Vec<u8>,
 }
@@ -182,19 +182,35 @@ impl Composer {
         cx.spawn(async move |this, cx| {
             let picked = read.await;
             let _ = this.update(cx, |this, cx| {
-                if !this.attachments.preparations.finish(&storage_key, preparation) { return; }
-                if let Target::Question(key) = &target && !this.question_can_attach(key, cx, IntakePhase::Preparing) { cx.notify(); return; }
-                for file in picked {
-                    match file {
-                        Ok(file) => this.stage(&target, file.name, file.bytes, false, cx),
-                        Err(error) if this.attachment_target().as_ref() == Some(&target) => this.error = Some(error),
-                        Err(_) => {},
-                    }
-                }
+                if !this.attachments.preparations.complete(&storage_key, preparation, picked) { return; }
+                this.finish_prepared_reads(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    pub(super) fn finish_prepared_reads(&mut self, cx: &mut Context<Self>) -> bool {
+        let keys: Vec<_> = self.attachments.preparations.keys().cloned().collect();
+        let mut changed = false;
+        for key in keys {
+            let Some(target) = super::drafts::target(&key) else { continue };
+            let eligible = match &target {
+                Target::Question(question) => self.question_can_attach(question, cx, IntakePhase::Preparing),
+                _ => true,
+            };
+            for picked in self.attachments.preparations.take_completed(&key, eligible) {
+                changed = true;
+                for file in picked {
+                    match file {
+                        Ok(file) => self.stage(&target, file.name, file.bytes, false, cx),
+                        Err(error) if self.attachment_target().as_ref() == Some(&target) => self.error = Some(error),
+                        Err(_) => {},
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Admits one file (`addComposerAttachments`) and starts its upload.

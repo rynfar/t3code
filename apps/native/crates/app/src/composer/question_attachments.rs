@@ -254,6 +254,7 @@ impl Composer {
                 while grants.changed().await.is_ok() {
                     let _ = this.update(cx, |this, cx| {
                         this.cancel_pending_send();
+                        this.finish_prepared_reads(cx);
                         cx.notify();
                     });
                 }

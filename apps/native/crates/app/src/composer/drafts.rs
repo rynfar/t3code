@@ -26,7 +26,7 @@ pub(super) fn key(target: &Target) -> String {
     }
 }
 
-fn target(key: &str) -> Option<Target> {
+pub(super) fn target(key: &str) -> Option<Target> {
     key.strip_prefix("thread:")
         .map(|id| Target::Thread(id.to_owned()))
         .or_else(|| key.strip_prefix("draft:").map(|project| Target::Draft(project.to_owned())))
