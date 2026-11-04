@@ -251,7 +251,7 @@ impl DiffPanel {
             _ => false,
         });
         if let Some(row) = row {
-            self.list.splice(row..row + 1, 1);
+            self.list.remeasure_items(row..row + 1);
         }
     }
 

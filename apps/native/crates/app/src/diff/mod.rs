@@ -123,7 +123,7 @@ impl DiffPanel {
     fn construct(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
             if *event == AppEvent::ReviewComments {
-                if let Some(view) = &this.view { let count = view.row_count(); this.list.splice(0..count, count); }
+                if let Some(view) = &this.view { this.list.remeasure_items(0..view.row_count()); }
                 cx.notify();
             }
             if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::RightPanel | AppEvent::Shell | AppEvent::Phase | AppEvent::SideThread) {
