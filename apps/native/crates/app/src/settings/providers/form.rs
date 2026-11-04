@@ -861,11 +861,17 @@ impl SettingsView {
                     let Some(instance) = this.current_form_instance(cx) else { return };
                     let name = this.provider_form().variables.iter().find(|v| v.id == id).and_then(|v| v.raw["name"].as_str()).unwrap_or("");
                     if this.form_denial(&instance.driver, &format!("environment.{name}"), cx).is_some() { return; }
-                    if let Some(v) = this.provider_form_mut().variables.iter_mut().find(|v| v.id == id) {
-                        let next = v.raw["sensitive"] != true;
-                        v.raw = form::edit_variable(&v.raw, form::VariableEdit::Sensitive(next));
-                        v.value.update(cx, |input, cx| input.set_masked(next, window, cx));
-                    }
+                    let Some(v) = this.provider_form_mut().variables.iter_mut().find(|v| v.id == id) else { return };
+                    let next = v.raw["sensitive"] != true;
+                    if !v.source.set_sensitive(&mut v.raw, next) { return; }
+                    let value = v.source.input_value(&v.raw).to_owned();
+                    let masked = form::variable_sensitive(&instance.driver, &v.raw);
+                    v.value.update(cx, |input, cx| {
+                        input.set_value(value, window, cx);
+                        input.set_placeholder("value", window, cx);
+                        input.set_masked(masked, window, cx);
+                    });
+                    if let Some(dialog) = this.providers.dialog.as_mut() { dialog.error = None; }
                     this.publish_variables(cx);
                 }))
         });

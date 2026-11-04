@@ -315,6 +315,16 @@ impl SecretSourceDraft {
         }
         Ok(())
     }
+    pub fn set_sensitive(&mut self, row: &mut Value, sensitive: bool) -> bool {
+        if row["valueRedacted"] == true || !row["value"].is_string() {
+            return false;
+        }
+        let reset = (!sensitive || row["sensitive"] != true) && self.pending_provider.take().is_some();
+        let next = edit_variable(row, VariableEdit::Sensitive(sensitive));
+        let changed = *row != next;
+        *row = next;
+        changed || reset
+    }
     pub fn select(&mut self, row: &mut Value, provider: Option<String>) -> bool {
         let stored = provider.is_none();
         self.pending_provider = provider.filter(|p| row["value"]["provider"].as_str() != Some(p.as_str()));
@@ -673,6 +683,34 @@ mod tests {
             assert!(!draft.select(&mut row, None));
             assert_eq!(draft.input_value(&row), literal["value"].as_str().unwrap());
             assert_eq!(row, literal);
+        }
+        for literal in ["", "saved literal", "replacement literal"] {
+            let mut row = json!({"name":"TOKEN","value":literal,"sensitive":true});
+            assert!(!draft.select(&mut row, Some("B".into())));
+            assert!(draft.validate_draft(&row, "unfinished", true).is_err());
+            assert!(draft.set_sensitive(&mut row, false));
+            assert_eq!(draft.provider(&row), None);
+            assert_eq!(draft.input_value(&row), literal);
+            assert!(draft.validate_draft(&row, literal, true).is_ok());
+            row = edit_variable(&row, VariableEdit::Value("plain literal".into()));
+            assert_eq!(
+                publish_environment("acpRegistry", vec![row.clone()]).unwrap(),
+                vec![json!({"name":"TOKEN","value":"plain literal","sensitive":false,"valueRedacted":false})]
+            );
+            assert!(draft.set_sensitive(&mut row, true));
+            assert_eq!(draft.provider(&row), None);
+            assert_eq!(draft.input_value(&row), "plain literal");
+            assert!(variable_sensitive("acpRegistry", &row));
+        }
+        for saved in [
+            json!({"name":"TOKEN","value":"","sensitive":true,"valueRedacted":true}),
+            json!({"name":"TOKEN","value":{"provider":"A","reference":"op://v/i/f"},"sensitive":true}),
+        ] {
+            let mut row = saved.clone();
+            assert!(!draft.select(&mut row, Some("B".into())));
+            assert!(!draft.set_sensitive(&mut row, false));
+            assert_eq!(row, saved);
+            assert_eq!(draft.provider(&row), Some("B"));
         }
     }
     #[test]
