@@ -10,6 +10,7 @@ pub mod auth;
 pub mod background;
 pub mod chatgpt;
 pub mod form;
+pub mod wizard;
 
 use std::collections::{HashMap, HashSet};
 

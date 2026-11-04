@@ -7,6 +7,7 @@
 //! nothing. Logic lives in `t3_core::settings::providers`.
 
 mod dialog;
+mod dialog_config;
 mod editor;
 mod form;
 
