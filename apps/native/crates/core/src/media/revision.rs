@@ -2,6 +2,7 @@
 use super::AssetUrl;
 
 const KEEP_URL_MIN_LIFE_MS: f64 = 5. * 60_000.;
+const MIN_RENEWAL_INTERVAL_MS: f64 = 30_000.;
 
 #[derive(Debug, PartialEq)]
 pub enum AssetFetch {
@@ -16,6 +17,7 @@ pub struct RevisionedAssetUrl {
     requested: Option<String>,
     waiting: bool,
     rejected: bool,
+    last_success_at: Option<f64>,
 }
 
 impl RevisionedAssetUrl {
@@ -26,6 +28,7 @@ impl RevisionedAssetUrl {
             requested: None,
             waiting,
             rejected: false,
+            last_success_at: None,
         }
     }
 
@@ -45,12 +48,17 @@ impl RevisionedAssetUrl {
         true
     }
 
-    /// A byte-cache miss must not reuse a rejected or nearly expired signature.
+    /// Short TTLs and clock skew must not prevent fetching a freshly signed URL.
     pub fn prepare_fetch(&mut self, now: f64) -> AssetFetch {
+        let recently_minted = self
+            .last_success_at
+            .is_some_and(|at| now - at < MIN_RENEWAL_INTERVAL_MS);
         // Older responses can omit expiresAt; a rejected fetch still forces a new mint.
         if let Some(Ok(url)) = &self.shown
             && !self.rejected
-            && (url.expires_at <= 0. || url.expires_at - now > KEEP_URL_MIN_LIFE_MS)
+            && (recently_minted
+                || url.expires_at <= 0.
+                || url.expires_at - now > KEEP_URL_MIN_LIFE_MS)
         {
             return AssetFetch::Ready(url.clone());
         }
@@ -75,6 +83,7 @@ impl RevisionedAssetUrl {
     /// Preserves the displayed URL across query results, including across revision nodes.
     /// The return value starts the mint deferred by a revision change while waiting.
     pub fn settle(&mut self, next: Result<AssetUrl, String>, now: f64) -> bool {
+        self.last_success_at = next.as_ref().ok().map(|_| now);
         let keep = match (&self.shown, &next) {
             (Some(Ok(shown)), Ok(next)) => {
                 !self.rejected
@@ -220,5 +229,33 @@ mod tests {
         assert!(!state.settle(Ok(minted(2, Some("same-file"), 3_600_000.)), 0.));
         assert_eq!(url(&state), "/a/2");
         assert!(matches!(state.prepare_fetch(0.), AssetFetch::Ready(_)));
+    }
+    #[test]
+    fn successful_short_lived_renewals_are_fetchable_without_a_mint_loop() {
+        for lifetime in [60_000., -60_000.] {
+            let mut state = RevisionedAssetUrl::new(None, false);
+            state.read(None);
+            state.settle(Ok(minted(0, Some("same-file"), 3_600_000.)), 0.);
+            let now = 3_600_000.;
+            assert_eq!(state.prepare_fetch(now), AssetFetch::Mint);
+            state.settle(Ok(minted(1, Some("same-file"), now + lifetime)), now);
+            for elapsed in [0., 0., 1., 10_000., 29_999.] {
+                assert_eq!(
+                    state.prepare_fetch(now + elapsed),
+                    AssetFetch::Ready(minted(1, Some("same-file"), now + lifetime))
+                );
+                assert!(!state.read(None));
+            }
+            let later = now + 30_000.;
+            assert_eq!(state.prepare_fetch(later), AssetFetch::Mint);
+            assert_eq!(state.prepare_fetch(later), AssetFetch::Waiting);
+            state.settle(Ok(minted(2, Some("same-file"), later + lifetime)), later);
+            assert_eq!(
+                state.prepare_fetch(later),
+                AssetFetch::Ready(minted(2, Some("same-file"), later + lifetime))
+            );
+            state.fetch_failed("/a/2");
+            assert_eq!(state.prepare_fetch(later), AssetFetch::Mint);
+        }
     }
 }
