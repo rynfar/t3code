@@ -885,6 +885,10 @@ impl Render for SettingsView {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(|this, _: &crate::thread_view::FindInThread, window, cx| {
+                cx.stop_propagation();
+                this.on_focus_search(&FocusSettingsSearch, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &FocusNextInSettings, window, cx| this.cycle_focus(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPreviousInSettings, window, cx| this.cycle_focus(false, window, cx)))
             .on_key_down(cx.listener(Self::on_key_down))
