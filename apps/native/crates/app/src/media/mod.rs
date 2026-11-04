@@ -14,8 +14,7 @@ pub use viewer::{MediaViewer, ViewerItem};
 
 use crate::app_state::AppState;
 
-/// Who draws transcript media right now: the transcript view (notified when an image arrives),
-/// its thread, and its viewer. Only the transcript calls `begin_frame`, so only it draws media.
+/// The view drawing media, its thread and image base directory, and its viewer.
 #[derive(Clone)]
 pub struct MediaScope {
     pub owner: EntityId,
@@ -86,4 +85,17 @@ pub fn open_asset(resource: &AssetResource, cx: &mut App) {
     if let Some(cache) = cx.try_global::<Media>().map(|media| media.cache.clone()) {
         cache.update(cx, |cache, cx| cache.open(resource, cx));
     }
+}
+
+/// Renews only images whose painted bounds intersect the current clip.
+pub fn observe_image(source: MediaSource, scope: MediaScope) -> impl gpui::IntoElement {
+    use gpui::{ParentElement, Styled};
+    gpui::div().absolute().inset_0().child(gpui::canvas(move |bounds, window, cx| {
+        let clip = bounds.intersect(&window.content_mask().bounds);
+        if clip.size.width > gpui::px(0.) && clip.size.height > gpui::px(0.)
+            && let Some(cache) = cx.try_global::<Media>().map(|media| media.cache.clone())
+        {
+            cache.update(cx, |cache, cx| cache.refresh_visible(&source, scope.owner, window, cx));
+        }
+    }, |_, _, _, _| {}).size_full())
 }

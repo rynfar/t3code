@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Entity, EntityId, RenderImage, SharedString, Task, Window};
-use t3_core::media::{AssetContentKey, AssetResource, CREATE_ASSET_URL, MediaSource, decode_asset_url};
+use t3_core::media::{AssetContentKey, AssetResource, MediaSource};
 
 use crate::app_state::AppState;
 
@@ -46,7 +46,7 @@ impl Variant {
 pub(super) struct Key {
     pub(super) environment: Arc<str>,
     pub(super) source: MediaSource,
-    content: Option<AssetContentKey>,
+    pub(super) content: Option<AssetContentKey>,
 }
 
 enum Slot {
@@ -73,6 +73,8 @@ struct Encoded {
 pub struct MediaCache {
     pub(super) state: Entity<AppState>,
     pub(super) revisions: Revisions,
+    pub(super) refresh_timer: Option<Task<()>>,
+    pub(super) refresh_deadline: Option<f64>,
     images: HashMap<(Key, Variant), Slot>,
     encoded: HashMap<Key, Encoded>,
     encoded_total: usize,
@@ -90,6 +92,8 @@ impl MediaCache {
         MediaCache {
             state,
             revisions: Revisions::default(),
+            refresh_timer: None,
+            refresh_deadline: None,
             images: HashMap::new(),
             encoded: HashMap::new(),
             encoded_total: 0,
@@ -104,7 +108,7 @@ impl MediaCache {
     fn key(&self, source: &MediaSource, cx: &App) -> Option<Key> {
         let environment = self.state.read(cx).environment()?;
         let mut key = Key { environment: Arc::from(environment), source: source.clone(), content: None };
-        if matches!(source, MediaSource::Asset(AssetResource::MediaFile { .. })) {
+        if matches!(source, MediaSource::Asset(_)) {
             key.content = Some(self.revisions.shown_asset(&key)?.ok()?.content_key());
         }
         Some(key)
@@ -155,12 +159,20 @@ impl MediaCache {
     pub fn open(&self, resource: &AssetResource, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(environment) = state.environment().map(str::to_owned) else { return };
-        let Some(minted) = state.request(CREATE_ASSET_URL, resource.create_url_request(), |value| decode_asset_url(&value)) else { return };
+        let Some(client) = state.client_handle() else { return };
+        let local_id = state.environments.environments.iter().find(|saved| saved.local && saved.http_base != environment).map(|saved| saved.id.clone());
+        let local = local_id.map(|id| state.connections.client(&id));
+        let resource = resource.clone();
+        let job = state.runtime().spawn(async move {
+            t3_client::assets::mint_media_url_with_fallback(&client, &resource, async move {
+                match local { Some(local) => local.await, None => None }
+            }).await
+        });
         cx.spawn(async move |_, cx| {
-            if let Ok(Ok(asset)) = minted.await
-                && let Some(url) = t3_client::asset::asset_url(&environment, &asset.relative_url)
+            if let Ok(Ok(asset)) = job.await
+                && let Some(url) = t3_core::media::resolve_asset_url(&environment, &asset.relative_url)
             {
-                cx.update(|cx| cx.open_url(url.as_str()));
+                cx.update(|cx| cx.open_url(&url));
             }
         })
         .detach();
@@ -176,7 +188,7 @@ impl MediaCache {
             encoded.bytes.clone()
         });
         let resource_key = Key { content: None, ..key.clone() };
-        let asset_url = if cached.is_none() && matches!(key.source, MediaSource::Asset(AssetResource::MediaFile { .. })) {
+        let asset_url = if cached.is_none() && matches!(key.source, MediaSource::Asset(_)) {
             Some(self.asset_for_fetch(&resource_key, owner, cx)?.relative_url)
         } else { None };
         let state = self.state.read(cx);

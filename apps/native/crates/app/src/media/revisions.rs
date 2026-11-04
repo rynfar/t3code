@@ -17,6 +17,7 @@ pub(super) struct Mint {
     waiters: Vec<EntityId>,
     used: u64,
     failed_at: Option<Instant>,
+    visible: bool,
 }
 
 #[derive(Default)]
@@ -24,7 +25,7 @@ pub(super) struct Revisions {
     records: HashMap<Key, Mint>,
 }
 
-fn now_ms() -> f64 {
+pub(super) fn now_ms() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -76,10 +77,7 @@ impl MediaCache {
         owner: EntityId,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(
-            key.source,
-            MediaSource::Asset(AssetResource::MediaFile { .. })
-        ) {
+        if !matches!(key.source, MediaSource::Asset(_)) {
             return;
         }
         if !self.revisions.records.contains_key(key) {
@@ -102,10 +100,12 @@ impl MediaCache {
                     waiters: Vec::new(),
                     used: self.frame,
                     failed_at: None,
+                    visible: false,
                 },
             );
         }
         let mint = self.revisions.records.get_mut(key).unwrap();
+        if mint.used + 1 < self.frame { mint.visible = false; }
         mint.used = self.frame;
         if mint.failed_at.is_some_and(|at| at.elapsed() >= RETRY_AFTER) {
             mint.state = RevisionedAssetUrl::new(None, false);
@@ -118,6 +118,37 @@ impl MediaCache {
         if start {
             mint.failed_at = None;
             self.start_mint(key.clone(), cx);
+        }
+    }
+
+    pub(super) fn refresh_visible(&mut self, source: &MediaSource, owner: EntityId, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        if !matches!(source, MediaSource::Asset(_)) { return; }
+        let Some(environment) = self.state.read(cx).environment() else { return };
+        let key = Key { environment: environment.into(), source: source.clone(), content: None };
+        if let Some(mint) = self.revisions.records.get_mut(&key) {
+            if mint.task.is_some() && !mint.waiters.contains(&owner) { mint.waiters.push(owner); }
+            if mint.visible { return; }
+            mint.visible = true;
+            let start = mint.state.refresh(now_ms(), true, true);
+            if start {
+                mint.waiters.push(owner);
+                self.start_mint(key.clone(), cx);
+            }
+        }
+        let now = now_ms();
+        let delay = self.revisions.records.get(&key).and_then(|mint| mint.state.refresh_delay(now, true));
+        if let Some((deadline, delay)) = t3_core::media::asset_refresh_schedule(self.refresh_deadline, now, delay) {
+            self.refresh_deadline = Some(deadline);
+            self.refresh_timer = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(delay as u64)).await;
+                let _ = this.update_in(cx, |cache, window, _cx| {
+                    cache.refresh_timer = None;
+                    cache.refresh_deadline = None;
+                    for mint in cache.revisions.records.values_mut() { mint.visible = false; }
+                    // Re-evaluate clipping before renewing; a row that left the viewport does no I/O.
+                    window.refresh();
+                });
+            }));
         }
     }
 
@@ -151,6 +182,9 @@ impl MediaCache {
             self.revisions.records.remove(&key);
             return;
         }
+        let local_id = state.environments.environments.iter().find(|environment| environment.local && environment.http_base != client.environment()).map(|environment| environment.id.clone());
+        let local = local_id.map(|id| state.connections.client(&id));
+        let local = async move { match local { Some(local) => local.await, None => None } };
         let runtime = state.runtime().clone();
         let MediaSource::Asset(resource) = key.source.clone() else {
             return;
@@ -161,7 +195,7 @@ impl MediaCache {
                 .acquire_owned()
                 .await
                 .map_err(|_| "Image unavailable.".to_owned())?;
-            t3_client::assets::mint_media_url(&client, &resource).await
+            t3_client::assets::mint_media_url_with_fallback(&client, &resource, local).await
         });
         let target = key.clone();
         let task = cx.spawn(async move |this, cx| {

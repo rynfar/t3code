@@ -44,7 +44,34 @@ pub async fn mint_media_url(client: &ClientHandle, resource: &AssetResource) -> 
     decode_asset_url(&minted)
 }
 
+/// Uses an already connected local environment only for web's three missing-host errors.
+/// The original error survives a failed fallback, including an unknown future error tag.
+pub async fn mint_media_url_with_fallback(
+    client: &ClientHandle,
+    resource: &AssetResource,
+    local: impl std::future::Future<Output = Option<ClientHandle>>,
+) -> Result<AssetUrl, String> {
+    let result = client.request(t3_core::media::CREATE_ASSET_URL, resource.create_url_request()).await;
+    let error = match result {
+        Ok(value) => return decode_asset_url(&value),
+        Err(error) => error,
+    };
+    let tag = match &error { crate::session::RpcError::Failure(error) => error.tag.as_deref(), _ => None };
+    if !t3_core::media::allows_local_media_fallback(resource, tag, true) { return Err(UNAVAILABLE.into()); }
+    if let Some(local) = local.await.filter(|local| local.environment() != client.environment())
+        && let Ok(mut asset) = mint_media_url(&local, resource).await
+        && let Some(url) = t3_core::media::resolve_asset_url(local.environment(), &asset.relative_url)
+    {
+        asset.relative_url = url;
+        return Ok(asset);
+    }
+    Err(UNAVAILABLE.into())
+}
+
 pub async fn fetch_signed_media(client: &ClientHandle, relative_url: &str) -> Result<MediaBytes, String> {
+    if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
+        return Ok(MediaBytes { bytes: get(relative_url).await?, dimensions: None });
+    }
     let bytes = crate::asset::fetch_asset(client.environment(), relative_url, MAX_BYTES).await.map_err(|error| {
         tracing::debug!(%error, "asset fetch failed");
         UNAVAILABLE.to_owned()

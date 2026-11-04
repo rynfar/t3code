@@ -18,6 +18,7 @@ pub struct RevisionedAssetUrl {
     waiting: bool,
     rejected: bool,
     last_success_at: Option<f64>,
+    last_settled_at: Option<f64>,
 }
 
 impl RevisionedAssetUrl {
@@ -29,6 +30,7 @@ impl RevisionedAssetUrl {
             waiting,
             rejected: false,
             last_success_at: None,
+            last_settled_at: None,
         }
     }
 
@@ -44,6 +46,18 @@ impl RevisionedAssetUrl {
             return false;
         }
         self.minted_under = Some(self.requested.clone());
+        self.waiting = true;
+        true
+    }
+
+    pub fn refresh_delay(&self, now: f64, visible: bool) -> Option<f64> {
+        super::asset_refresh_delay(if self.waiting { Some(now) } else { self.last_settled_at }, now, visible)
+    }
+
+    pub fn refresh(&mut self, now: f64, remount: bool, visible: bool) -> bool {
+        let stale = if remount { super::asset_is_stale(self.last_settled_at, now) }
+            else { super::asset_refresh_delay(self.last_settled_at, now, visible) == Some(0.) };
+        if !visible || self.waiting || !stale { return false; }
         self.waiting = true;
         true
     }
@@ -83,6 +97,7 @@ impl RevisionedAssetUrl {
     /// Preserves the displayed URL across query results, including across revision nodes.
     /// The return value starts the mint deferred by a revision change while waiting.
     pub fn settle(&mut self, next: Result<AssetUrl, String>, now: f64) -> bool {
+        self.last_settled_at = Some(now);
         self.last_success_at = next.as_ref().ok().map(|_| now);
         let keep = match (&self.shown, &next) {
             (Some(Ok(shown)), Ok(next)) => {
@@ -230,6 +245,32 @@ mod tests {
         assert_eq!(url(&state), "/a/2");
         assert!(matches!(state.prepare_fetch(0.), AssetFetch::Ready(_)));
     }
+    #[test]
+    fn mounted_refresh_shares_mints_and_remounts_only_after_five_minutes() {
+        let mut state = RevisionedAssetUrl::new(None, false);
+        assert!(state.read(None));
+        state.settle(Ok(minted(0, Some("same"), 7_200_000.)), 0.);
+        assert!(!state.refresh(300_000., true, false));
+        assert!(!state.refresh(299_999., true, true));
+        assert!(state.refresh(300_000., true, true));
+        assert!(!state.refresh(300_000., true, true));
+        state.settle(Ok(minted(1, Some("same"), 7_200_000.)), 300_000.);
+        assert_eq!(url(&state), "/a/0");
+        assert!(!state.refresh(2_100_000., false, false));
+        assert!(state.refresh(2_100_000., false, true));
+        assert!(!state.refresh(2_100_000., false, true));
+    }
+
+    #[test]
+    fn periodic_refresh_recovers_from_a_failed_mint_at_a_bounded_interval() {
+        let mut state = RevisionedAssetUrl::new(None, false);
+        assert!(state.read(None));
+        state.settle(Err("temporarily unavailable".into()), 0.);
+        assert!(!state.refresh(1_799_999., false, true));
+        assert!(state.refresh(1_800_000., false, true));
+        assert!(!state.refresh(1_800_000., false, true));
+    }
+
     #[test]
     fn successful_short_lived_renewals_are_fetchable_without_a_mint_loop() {
         for lifetime in [60_000., -60_000.] {

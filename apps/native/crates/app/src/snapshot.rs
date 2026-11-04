@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -460,11 +460,17 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             }
         });
     }
+    if let Some(path) = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--markdown-file-fixture").map(|pair| pair[1].clone()) {
+        let fixture: crate::files::MarkdownFixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let path = fixture.path.clone();
+        cx.update(|cx| cx.set_global(fixture));
+        state.update(&mut cx, |state, cx| state.open_file(&path, None, cx));
+    }
     if let Some(path) = &options.turn_items_fixture {
         let items: Vec<t3_core::thread::ProjectedTurnItem> = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         state.update(&mut cx, |state, cx| {
             // Freeze only this renderer's projection; fixture items never reach the server.
-            state.stop_pump();
+            state.freeze_snapshot();
             if let Some(projection) = state.thread.projection.as_mut() {
                 projection.turn_items = items.iter().map(|row| row.item.clone()).collect();
                 projection.visible_turn_items = items;

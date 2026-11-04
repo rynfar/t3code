@@ -118,6 +118,8 @@ pub struct AppState {
     pub(crate) ssh_prompt_sequence: u64,
     pub(crate) connections: t3_client::environments::Environments,
     _pump: Option<Task<()>>,
+    #[cfg(feature = "snapshot")]
+    snapshot_frozen: bool,
     pub(crate) notification_route: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     _ssh_quit: Option<Subscription>,
 }
@@ -185,6 +187,8 @@ impl AppState {
             ssh_prompt_sequence: 0,
             connections,
             _pump: Some(pump),
+            #[cfg(feature = "snapshot")]
+            snapshot_frozen: false,
             notification_route: None,
             _ssh_quit: None,
         };
@@ -214,6 +218,12 @@ impl AppState {
     #[cfg(feature = "snapshot")]
     pub(crate) fn stop_pump(&mut self) {
         self._pump = None;
+    }
+
+    /// Turn-item fixtures keep asset RPCs alive while holding their projected UI state.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn freeze_snapshot(&mut self) {
+        self.snapshot_frozen = true;
     }
 
     /// Drops the client and everything that belonged to its environment.
@@ -252,6 +262,8 @@ impl AppState {
     }
 
     fn apply_environment_event(&mut self, event: t3_client::environments::EnvironmentEvent, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        if self.snapshot_frozen { return; }
         use t3_client::environments::EnvironmentEvent;
         if !self.connections.is_current(&event) { return; }
         match event {

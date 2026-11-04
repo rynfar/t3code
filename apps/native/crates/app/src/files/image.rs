@@ -46,16 +46,17 @@ impl From<Result<Decoded, String>> for ImageState {
 }
 
 /// Mints the URL and downloads the bytes on the network runtime.
-pub fn load(state: &AppState, root: &Root, path: &str, kind: ImageKind) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
+pub fn load(state: &AppState, root: &Root, path: &str, kind: ImageKind, mutation: Option<&str>) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
     let client = state.client_handle()?;
     let request = image_asset_request(&root.workspace.thread_id, &root.workspace.cwd, &absolute_path(path, &root.workspace.cwd));
+    let mutation = mutation.map(str::to_owned);
     Some(state.runtime().spawn(async move {
         if kind == ImageKind::Unsupported {
             return Err(UNSUPPORTED.to_owned());
         }
         let value = client.request(CREATE_ASSET_URL, request).await.map_err(|_| UNSUPPORTED.to_owned())?;
         let url = decode_asset_url(&value)?;
-        client.asset_bytes(&url, MAX_IMAGE_BYTES).await
+        client.asset_bytes(&format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())), MAX_IMAGE_BYTES).await
     }))
 }
 

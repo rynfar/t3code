@@ -41,7 +41,7 @@ impl From<&MarkdownState> for MarkdownState {
     }
 }
 
-/// A state made outside the store (file previews) draws without transcript media.
+/// External states supply their own extensions, such as a file preview's media scope.
 impl From<&Entity<TextViewState>> for MarkdownState {
     fn from(entity: &Entity<TextViewState>) -> Self {
         MarkdownState { entity: entity.clone(), media: false }

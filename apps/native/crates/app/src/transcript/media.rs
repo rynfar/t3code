@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{AnyElement, App, Context, Div, EntityId, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
-use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, markdown_ast as mdast};
+use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::media::{AssetResource, ImageAttachment, MediaKind, MediaPlacement, MediaSource, resolve_media_source};
 use t3_core::timeline::AnswerAttachment;
@@ -59,6 +59,9 @@ fn image_cell(image: &ImageAttachment, Slot { width, height, corners, fill }: Sl
     let state = media::image(&source, Variant::Thumb, owner, cx);
     let p = palette(cx);
     let cell = rounded(div().relative().flex_none().w(px(width)).h(px(height)).max_w_full().overflow_hidden().bg(fill), corners);
+    let cell = if let Some(scope) = cx.try_global::<media::Media>().and_then(|media| media.scope.clone()) {
+        cell.child(media::observe_image(source.clone(), scope))
+    } else { cell };
     match state {
         ImageState::Ready(image) => cell.child(rounded(img(image).size_full().object_fit(ObjectFit::Cover), corners)),
         ImageState::Loading => cell,
@@ -184,25 +187,29 @@ struct MarkdownImage {
 
 const MEDIA_NODE: &str = "t3-media";
 
-/// A paragraph made only of images (and whitespace) draws as media; images inside running text
-/// stay with gpui-component, which shows their alt text.
 fn parse_media_paragraph(node: &mdast::Node, context: &MarkdownParseContext) -> Option<MarkdownNode> {
-    let mdast::Node::Paragraph(paragraph) = node else { return None };
-    let mut images = Vec::new();
-    for child in &paragraph.children {
-        match child {
-            mdast::Node::Image(image) => images.push(MarkdownImage { url: image.url.clone(), alt: image.alt.clone() }),
-            mdast::Node::Text(text) if text.value.trim().is_empty() => {}
-            mdast::Node::Break(_) => {}
-            _ => return None,
-        }
-    }
-    if images.is_empty() {
-        return None;
-    }
-    let source = paragraph.position.as_ref().and_then(|position| context.source().get(position.start.offset..position.end.offset)).unwrap_or_default().to_owned();
-    let text = images.iter().map(|image| image.alt.as_str()).collect::<Vec<_>>().join(" ");
-    Some(MarkdownNode::new(MEDIA_NODE, images).text(text).markdown(source))
+    let runs = t3_core::media::markdown_media_runs(node, context.source());
+    if runs.is_empty() { return None; }
+    Some(MarkdownNode::new(MEDIA_NODE, runs).text(node.to_string()).markdown(context.source().get(node.position()?.start.offset..node.position()?.end.offset).unwrap_or_default().to_owned()))
+}
+
+fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
+    use t3_core::media::MarkdownMediaRun;
+    let runs = node.data::<Vec<MarkdownMediaRun>>().cloned().unwrap_or_default();
+    let standalone = runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
+    let children = runs.into_iter().enumerate().filter_map(|(index, run)| match run {
+        MarkdownMediaRun::Prose(text) if text.trim().is_empty() => None,
+        MarkdownMediaRun::Prose(text) => Some(div().min_w_0().child(TextView::markdown(SharedString::from(format!("media-prose:{index}")), text).selectable(true)).into_any_element()),
+        MarkdownMediaRun::Image { url, alt } => Some(markdown_image(&MarkdownImage { url, alt }, index, scope, cx)),
+    }).collect::<Vec<_>>();
+    if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
+    else { h_flex().flex_wrap().gap(px(4.)).items_end().children(children).into_any_element() }
+}
+
+pub fn scoped_markdown_extensions(scope: std::sync::Arc<std::sync::Mutex<MediaScope>>) -> MarkdownExtensions {
+    MarkdownExtensions::default().block_parser(parse_media_paragraph).block_renderer(MEDIA_NODE, move |node: &MarkdownNode, _: &mut Window, cx: &mut App| {
+        render_media_runs(node, Some(&scope.lock().unwrap()), cx)
+    })
 }
 
 /// The extension registry markdown with images is parsed with. Built once: a new registry would
@@ -212,11 +219,8 @@ pub fn markdown_extensions() -> MarkdownExtensions {
     EXTENSIONS
         .get_or_init(|| {
             MarkdownExtensions::default().block_parser(parse_media_paragraph).block_renderer(MEDIA_NODE, |node: &MarkdownNode, _: &mut Window, cx: &mut App| {
-                let images = node.data::<Vec<MarkdownImage>>().cloned().unwrap_or_default();
-                // Only the transcript's markdown store parses with these extensions, so the scope is
-                // the transcript's; the block renders inside its text state's own view.
                 let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
-                v_flex().gap(px(8.)).items_start().children(images.iter().enumerate().map(|(index, image)| markdown_image(image, index, scope.as_ref(), cx)))
+                render_media_runs(node, scope.as_ref(), cx)
             })
         })
         .clone()
@@ -249,7 +253,17 @@ fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope
         return unavailable("Image unavailable", &image.alt, cx);
     };
     if resolved.kind == MediaKind::Video {
-        return unavailable("Video", if image.alt.is_empty() { &resolved.name } else { &image.alt }, cx);
+        let p = palette(cx);
+        let source = resolved.source;
+        let name = if image.alt.is_empty() { resolved.name } else { image.alt.clone() };
+        return v_flex().w(px(480.)).max_w_full().min_h(px(112.)).items_center().justify_center().gap(px(12.)).p(px(16.)).rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4)).bg(hsla(p.muted).opacity(0.4))
+            .child(unavailable("Video unavailable", &name, cx))
+            .children(source.filter(|source| match source { MediaSource::Asset(_) => true, MediaSource::Direct(url) => url.starts_with("http://") || url.starts_with("https://") }).map(|source| crate::right_panel::Button::new(SharedString::from(format!("video-open:{index}"))).variant(crate::right_panel::Variant::Secondary).size(crate::right_panel::Size::Xs).label(if matches!(&source, MediaSource::Direct(_)) { "Open original" } else { "Open in browser" }).on_click(move |_, _, cx| match &source {
+                MediaSource::Asset(resource) => media::open_asset(resource, cx),
+                MediaSource::Direct(url) if url.starts_with("http://") || url.starts_with("https://") => cx.open_url(url),
+                _ => {},
+            })))
+            .into_any_element();
     }
     let Some(source) = resolved.source else { return unavailable("Image unavailable", &image.alt, cx) };
     let name: SharedString = if image.alt.trim().is_empty() { resolved.name.into() } else { image.alt.clone().into() };
@@ -285,6 +299,7 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: 
     };
     let viewer = scope.viewer.clone();
     let item = ViewerItem { source: source.clone(), name };
+    let observer = media::observe_image(source.clone(), scope.clone());
     let frame = div()
         .id(id)
         .relative()
@@ -304,7 +319,7 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: 
         ImageState::Ready(image) => frame.child(img(image).size_full().rounded(px(8.)).object_fit(ObjectFit::Contain)),
         _ => frame,
     };
-    frame.child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
+    frame.child(observer).child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
 }
 
 pub fn other_files(names: &[t3_core::media::FileAttachment], cx: &App) -> Option<AnyElement> {
