@@ -2,6 +2,8 @@ use super::{MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Reference, clamp_height};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+const TEARDOWN_ID: &str = "t3-host-0";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
     CallTool { name: String, arguments: Value },
@@ -14,6 +16,7 @@ pub enum Action {
     Post(Value),
     Request { token: u64, operation: Operation },
     Height(u32),
+    StartTeardownTimer,
     Close,
 }
 
@@ -23,6 +26,7 @@ pub struct Host {
     version: String,
     initialized: bool,
     disposed: bool,
+    teardown_pending: bool,
     sent_context: Option<Value>,
     tool_call: Option<(Value, Option<Value>)>,
     tool_sent: bool,
@@ -61,6 +65,7 @@ impl Host {
             version: version.into(),
             initialized: false,
             disposed: false,
+            teardown_pending: false,
             sent_context: None,
             tool_call: None,
             tool_sent: false,
@@ -78,12 +83,21 @@ impl Host {
             return vec![];
         }
         let id = data.get("id").filter(|id| id.is_string() || id.is_number());
-        let Some(method) = data.get("method").and_then(Value::as_str) else {
-            return vec![];
-        };
+        let method = data.get("method").and_then(Value::as_str);
         if text.len() > MAX_MESSAGE_BYTES {
-            return id.map(|id| vec![fail(id, -32600, "Message too large.")]).unwrap_or_default();
+            return id
+                .filter(|_| method.is_some())
+                .map(|id| vec![fail(id, -32600, "Message too large.")])
+                .unwrap_or_default();
         }
+        let Some(method) = method else {
+            return if self.teardown_pending && id.and_then(Value::as_str) == Some(TEARDOWN_ID) && (data.get("result").is_some() || data.get("error").is_some())
+            {
+                self.finish_teardown()
+            } else {
+                vec![]
+            };
+        };
         let params = &data["params"];
         let Some(id) = id else {
             return match method {
@@ -94,7 +108,7 @@ impl Host {
                     actions
                 }
                 "ui/notifications/size-changed" => params["height"].as_f64().map(|h| vec![Action::Height(clamp_height(h))]).unwrap_or_default(),
-                "ui/notifications/request-teardown" => vec![Action::Close],
+                "ui/notifications/request-teardown" => self.teardown(),
                 _ => vec![],
             };
         };
@@ -216,6 +230,30 @@ impl Host {
 
     pub fn dispose(&mut self) {
         self.disposed = true;
+        self.teardown_pending = false;
         self.pending.clear();
+    }
+
+    pub fn teardown(&mut self) -> Vec<Action> {
+        if self.disposed || self.teardown_pending {
+            return vec![];
+        }
+        if !self.initialized {
+            return self.finish_teardown();
+        }
+        self.teardown_pending = true;
+        vec![
+            Action::Post(json!({"jsonrpc":"2.0","id":TEARDOWN_ID,"method":"ui/resource-teardown","params":{}})),
+            Action::StartTeardownTimer,
+        ]
+    }
+
+    pub fn teardown_timeout(&mut self) -> Vec<Action> {
+        if self.teardown_pending { self.finish_teardown() } else { vec![] }
+    }
+
+    fn finish_teardown(&mut self) -> Vec<Action> {
+        self.dispose();
+        vec![Action::Close]
     }
 }

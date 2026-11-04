@@ -14,6 +14,7 @@ pub const DEFAULT_HEIGHT: u32 = 320;
 pub const MAX_HEIGHT: u32 = 2000;
 pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_HTML_BYTES: usize = 5 * 1024 * 1024;
+pub const TEARDOWN_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reference {

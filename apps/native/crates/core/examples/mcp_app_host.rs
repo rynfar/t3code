@@ -39,7 +39,48 @@ fn main() {
                     }
                 }
                 Action::Close => println!("closed"),
+                Action::StartTeardownTimer => println!("start one cancellable 2000ms teardown deadline"),
             }
         }
     }
+    for (label, response) in [
+        ("result", Some(json!({"jsonrpc":"2.0","id":"t3-host-0","result":{}}))),
+        (
+            "error",
+            Some(json!({"jsonrpc":"2.0","id":"t3-host-0","error":{"code":-32000,"message":"fixture"}})),
+        ),
+        ("timeout", None),
+    ] {
+        let mut host = Host::new(
+            read_reference(&json!({"attachmentId":"fixture","server":"weather","tool":"get_weather","resourceUri":"ui://weather/dashboard"})).unwrap(),
+            json!({}),
+            "fixture",
+        );
+        host.receive(r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#);
+        println!("teardown scenario -> {label}");
+        let actions = host.receive(r#"{"jsonrpc":"2.0","method":"ui/notifications/request-teardown"}"#);
+        assert!(!actions.contains(&Action::Close));
+        for action in actions {
+            println!("host lifecycle -> {action:?}");
+        }
+        assert!(host.teardown().is_empty());
+        assert!(host.receive(r#"{"jsonrpc":"2.0","id":"unrelated","result":{}}"#).is_empty());
+        let actions = if let Some(response) = response {
+            host.receive(&response.to_string())
+        } else {
+            host.teardown_timeout()
+        };
+        assert_eq!(actions, vec![Action::Close]);
+        println!("settled -> {actions:?}");
+        assert!(host.receive(r#"{"jsonrpc":"2.0","id":"t3-host-0","result":{}}"#).is_empty());
+        assert!(host.teardown_timeout().is_empty());
+        println!("late acknowledgement/deadline -> ignored");
+    }
+    let mut host = Host::new(
+        read_reference(&json!({"attachmentId":"fixture","server":"weather","tool":"get_weather","resourceUri":"ui://weather/dashboard"})).unwrap(),
+        json!({}),
+        "fixture",
+    );
+    assert_eq!(host.teardown(), vec![Action::Close]);
+    println!("uninitialized -> Close without any host message");
 }
