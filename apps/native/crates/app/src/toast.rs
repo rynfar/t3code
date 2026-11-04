@@ -109,6 +109,19 @@ pub struct Toasts {
     hovered: bool,
 }
 
+impl Toasts {
+    pub(crate) fn has_thread_notifications(&self) -> bool {
+        self.entries.iter().any(|entry| entry.toast.open_thread.is_some())
+    }
+
+    pub(crate) fn retire_thread_notifications(&mut self, visible: impl Fn(&str) -> bool) -> bool {
+        let count = self.entries.len();
+        self.entries.retain(|entry| entry.toast.open_thread.as_deref().is_none_or(&visible));
+        if self.entries.is_empty() { self.hovered = false; }
+        count != self.entries.len()
+    }
+}
+
 impl AppState {
     pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
         self.toasts.next_id += 1;

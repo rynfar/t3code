@@ -3,12 +3,13 @@
 //! and pending badge set of `ThreadNotificationCoordinator.tsx`, and the sound gate and tag of
 //! `apps/web/src/threadNotifications.ts`. The app presents what this decides.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use serde::Deserialize;
 
 use crate::shell::{ShellState, ThreadShell};
+use crate::sidebar::tag_filter::ThreadKey;
 use crate::sidebar::status::{ThreadStatus, resolve_status};
 use crate::sidebar::thread::{SubagentRequest, pending_subagent_requests, present_thread};
 use crate::sidebar::time::Ms;
@@ -49,20 +50,78 @@ pub fn should_play_notification_sound(mode: NotificationMode, is_playing: bool) 
     mode.has_sound() && !is_playing
 }
 
-/// The coordinator's delivered OS notifications, keyed by tag so a thread counts once.
+/// Permission and request acceptance, not a guarantee that the OS displayed a banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Accepted,
+    Denied,
+    Unavailable,
+    Failed,
+    /// A platform posting API without a delivery result must not claim a delivered badge.
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryAttempt {
+    pub tag: String,
+    sequence: u64,
+}
+
+/// The coordinator's delivered OS notifications and requests awaiting delivery confirmation.
 #[derive(Debug, Default)]
 pub struct PendingNotifications {
-    pending: HashMap<String, String>,
+    pending: HashMap<String, ThreadKey>,
+    attempts: HashMap<String, (u64, ThreadKey)>,
+    // Focus can arrive before the click callback; keep destinations while the thread is loaded.
+    destinations: HashMap<String, ThreadKey>,
+    sequence: u64,
     applied_mode: Option<NotificationMode>,
 }
 
 impl PendingNotifications {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.attempts.is_empty() && self.destinations.is_empty()
+    }
+
     pub fn badge_count(&self) -> usize {
         self.pending.len()
     }
 
-    pub fn track(&mut self, tag: String, thread_id: String) {
-        self.pending.insert(tag, thread_id);
+    pub fn begin(&mut self, target: ThreadKey) -> DeliveryAttempt {
+        self.sequence += 1;
+        let tag = notification_tag(&target.environment_id, &target.thread_id);
+        self.destinations.insert(tag.clone(), target.clone());
+        self.attempts.insert(tag.clone(), (self.sequence, target));
+        DeliveryAttempt { tag, sequence: self.sequence }
+    }
+
+    pub fn is_current(&self, attempt: &DeliveryAttempt) -> bool {
+        self.attempts.get(&attempt.tag).is_some_and(|(sequence, _)| *sequence == attempt.sequence)
+    }
+
+    pub fn confirm(&mut self, attempt: &DeliveryAttempt, outcome: DeliveryOutcome) -> bool {
+        if !self.is_current(attempt) {
+            return false;
+        }
+        if outcome == DeliveryOutcome::Unconfirmed { return false; }
+        let (_, target) = self.attempts.remove(&attempt.tag).unwrap();
+        let delivered = outcome == DeliveryOutcome::Accepted;
+        if delivered {
+            self.pending.insert(attempt.tag.clone(), target);
+        }
+        delivered
+    }
+
+    pub fn is_outstanding(&self, tag: &str) -> bool {
+        self.pending.contains_key(tag) || self.attempts.contains_key(tag)
+    }
+
+    pub fn destination(&self, tag: &str) -> Option<&ThreadKey> {
+        self.destinations.get(tag)
+    }
+
+    pub fn prune_destinations(&mut self, loaded: impl Fn(&ThreadKey) -> bool) {
+        self.destinations.retain(|tag, target| loaded(target) || self.pending.contains_key(tag) || self.attempts.contains_key(tag));
     }
 
     /// Mode listeners are rebuilt on every mode change; focus and disconnect retire pending.
@@ -76,21 +135,48 @@ impl PendingNotifications {
         }
     }
 
-    pub fn visit(&mut self, thread_id: &str) -> Vec<String> {
-        let mut retired = Vec::new();
-        self.pending.retain(|tag, thread| {
-            if thread == thread_id {
-                retired.push(tag.clone());
-                false
-            } else {
-                true
-            }
-        });
-        retired
+    pub fn visit_target(&mut self, target: &ThreadKey) -> Vec<String> {
+        self.retire_pending(|key| key == target)
+    }
+
+    fn retire_pending(&mut self, retire: impl Fn(&ThreadKey) -> bool) -> Vec<String> {
+        let mut retired = HashSet::new();
+        self.pending.retain(|tag, target| if retire(target) { retired.insert(tag.clone()); false } else { true });
+        self.attempts.retain(|tag, (_, target)| if retire(target) { retired.insert(tag.clone()); false } else { true });
+        retired.into_iter().collect()
+    }
+
+    /// Hiding a thread closes existing notifications and invalidates delivery still in flight.
+    pub fn retire_where(&mut self, retire: impl Fn(&ThreadKey) -> bool) -> Vec<String> {
+        let mut retired: HashSet<_> = self.retire_pending(&retire).into_iter().collect();
+        self.destinations.retain(|tag, target| if retire(target) { retired.insert(tag.clone()); false } else { true });
+        retired.into_iter().collect()
     }
 
     pub fn clear(&mut self) -> Vec<String> {
-        self.pending.drain().map(|(tag, _)| tag).collect()
+        self.retire_pending(|_| true)
+    }
+
+}
+
+/// `closeHiddenPending`: with filtering active, a missing row cannot be judged and closes too.
+pub fn notification_visible(thread_id: &str, hidden: &HashSet<String>, live_when_filtering: Option<&HashSet<String>>) -> bool {
+    !hidden.contains(thread_id) && live_when_filtering.is_none_or(|live| live.contains(thread_id))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Presentation {
+    pub sound: bool,
+    pub toast: bool,
+    pub desktop: bool,
+}
+
+pub fn presentation(mode: NotificationMode, in_app: bool, focused_and_visible: bool, selected: bool, hidden: bool) -> Presentation {
+    if hidden { return Presentation::default(); }
+    Presentation {
+        sound: mode.has_sound(),
+        toast: in_app && focused_and_visible && !selected,
+        desktop: mode.has_desktop_notifications() && !focused_and_visible,
     }
 }
 
@@ -227,6 +313,11 @@ pub struct ThreadNotifications {
 }
 
 impl ThreadNotifications {
+    /// Hidden transitions still reach the gate, so revealing a thread never replays them.
+    pub fn observe_visible(&mut self, shell: &ShellState, hidden: &HashSet<String>) -> Vec<ThreadNotification> {
+        self.observe(shell).into_iter().filter(|notification| !hidden.contains(&notification.thread_id)).collect()
+    }
+
     /// Rows the shell has not replaced since the last call keep their observation untouched.
     pub fn observe(&mut self, shell: &ShellState) -> Vec<ThreadNotification> {
         let Some(snapshot) = &shell.snapshot else { return Vec::new() };

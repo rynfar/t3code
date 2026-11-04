@@ -53,32 +53,37 @@ fn sound_modes_recheck_the_current_mode_and_coalesce_playback() {
     }
 }
 
+fn track(pending: &mut PendingNotifications, thread_id: &str) {
+    let attempt = pending.begin(ThreadKey::new("env", thread_id));
+    assert!(pending.confirm(&attempt, DeliveryOutcome::Accepted));
+}
+
 #[test]
 fn badge_counts_pending_threads_and_retires_on_visit_focus_mode_or_disconnect() {
     let mut pending = PendingNotifications::default();
     let mode = NotificationMode::NotificationsAndSound;
     assert!(pending.sync(mode, true, false).is_empty());
-    pending.track("tag-a".into(), "a".into());
-    pending.track("tag-a".into(), "a".into());
-    pending.track("tag-b".into(), "b".into());
+    track(&mut pending, "a");
+    track(&mut pending, "a");
+    track(&mut pending, "b");
     assert_eq!(pending.badge_count(), 2, "replacing a thread's notification does not increment");
     assert!(pending.sync(mode, true, false).is_empty());
-    assert!(pending.visit("unrelated").is_empty());
-    assert_eq!(pending.visit("a"), ["tag-a"]);
+    assert!(pending.visit_target(&ThreadKey::new("env", "unrelated")).is_empty());
+    assert_eq!(pending.visit_target(&ThreadKey::new("env", "a")), [notification_tag("env", "a")]);
     assert_eq!(pending.badge_count(), 1);
-    assert_eq!(pending.sync(mode, true, true), ["tag-b"]);
+    assert_eq!(pending.sync(mode, true, true), [notification_tag("env", "b")]);
     assert_eq!(pending.badge_count(), 0);
 
     for (next_mode, connected) in [(NotificationMode::Off, true), (NotificationMode::Sound, true), (NotificationMode::Notifications, true), (mode, false)] {
         pending.sync(mode, true, false);
-        pending.track("tag-a".into(), "a".into());
-        assert_eq!(pending.sync(next_mode, connected, false), ["tag-a"]);
+        track(&mut pending, "a");
+        assert_eq!(pending.sync(next_mode, connected, false), [notification_tag("env", "a")]);
         assert_eq!(pending.badge_count(), 0);
         assert!(pending.sync(next_mode, connected, false).is_empty());
     }
     pending.sync(mode, true, false);
-    pending.track("tag-a".into(), "a".into());
-    assert_eq!(pending.clear(), ["tag-a"]);
+    track(&mut pending, "a");
+    assert_eq!(pending.clear(), [notification_tag("env", "a")]);
     assert_eq!(pending.badge_count(), 0);
 }
 
@@ -124,4 +129,125 @@ fn archived_stopped_and_nested_threads_stay_quiet() {
     assert!(next.is_empty(), "{next:?}");
     let failed = watcher.observe(&[thread("stopped", "failed", json!({"latestRunCompletedAt": "2026-11-01T00:10:00.000Z", "lastErrorClass": "usage_limit"}))]);
     assert_eq!(kinds(&failed), [("stopped", "Usage limit reached")]);
+}
+
+#[test]
+fn hidden_notifications_are_consumed_without_replaying_when_shown() {
+    let mut watcher = Watched::default();
+    watcher.observe(&[thread("a", "running", json!({}))]);
+    let hidden = std::collections::HashSet::from(["a".to_owned()]);
+    let finished = thread("a", "completed", json!({"latestRunCompletedAt": "2026-11-01T00:09:00.000Z"}));
+    watcher.shell.apply(ShellStreamItem::Snapshot { snapshot: Box::new(ShellSnapshot { threads: vec![finished.clone()], ..Default::default() }), resolved_repository_identity_roots: None });
+    assert!(watcher.watcher.observe_visible(&watcher.shell, &hidden).is_empty());
+    assert!(watcher.observe(&[finished]).is_empty());
+    assert_eq!(kinds(&watcher.observe(&[thread("a", "failed", json!({}))])), [("a", "Thread failed")]);
+}
+
+#[test]
+fn presentation_matches_focus_visibility_settings_and_hidden_threads() {
+    for mode in [NotificationMode::Off, NotificationMode::Notifications, NotificationMode::Sound, NotificationMode::NotificationsAndSound] {
+        for focused in [false, true] {
+            for in_app in [false, true] {
+                for selected in [false, true] {
+                    let plan = presentation(mode, in_app, focused, selected, false);
+                    assert_eq!(plan.sound, mode.has_sound());
+                    assert_eq!(plan.toast, focused && in_app && !selected);
+                    assert_eq!(plan.desktop, !focused && mode.has_desktop_notifications());
+                    assert_eq!(presentation(mode, in_app, focused, selected, true), Presentation::default());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn delivery_requires_confirmation_and_retired_callbacks_cannot_restore_badges() {
+    let mut pending = PendingNotifications::default();
+    let mode = NotificationMode::Notifications;
+    pending.sync(mode, true, false);
+    let target = crate::sidebar::tag_filter::ThreadKey::new("one", "thread");
+    for outcome in [DeliveryOutcome::Denied, DeliveryOutcome::Unavailable, DeliveryOutcome::Failed, DeliveryOutcome::Unconfirmed] {
+        let attempt = pending.begin(target.clone());
+        assert_eq!(pending.badge_count(), 0);
+        assert!(!pending.confirm(&attempt, outcome));
+        assert_eq!(pending.badge_count(), 0, "{outcome:?} never badges");
+        assert_eq!(pending.is_outstanding(&attempt.tag), outcome == DeliveryOutcome::Unconfirmed);
+    }
+    let old = pending.begin(target.clone());
+    let new = pending.begin(target.clone());
+    assert!(!pending.is_current(&old));
+    assert!(pending.is_current(&new));
+    assert!(!pending.confirm(&old, DeliveryOutcome::Accepted), "replacement ignores stale callback");
+    assert!(pending.confirm(&new, DeliveryOutcome::Accepted));
+    assert_eq!(pending.destination(&new.tag), Some(&target));
+    assert_eq!(pending.badge_count(), 1);
+    let other = crate::sidebar::tag_filter::ThreadKey::new("two", "thread");
+    let second = pending.begin(other.clone());
+    assert!(pending.confirm(&second, DeliveryOutcome::Accepted));
+    assert_eq!(pending.badge_count(), 2, "same thread id in two environments counts twice");
+    assert_eq!(pending.visit_target(&target).as_slice(), std::slice::from_ref(&new.tag));
+    assert_eq!(pending.badge_count(), 1);
+    assert_eq!(pending.destination(&new.tag), Some(&target), "focus may precede the click callback");
+    for (next_mode, connected, focused) in [(mode, true, true), (NotificationMode::Off, true, false), (mode, false, false)] {
+        pending.sync(mode, true, false);
+        let attempt = pending.begin(target.clone());
+        pending.sync(next_mode, connected, focused);
+        assert!(!pending.is_current(&attempt), "retired before authorization, so do not post");
+        assert!(!pending.confirm(&attempt, DeliveryOutcome::Accepted));
+        assert!(!pending.is_outstanding(&attempt.tag));
+        assert_eq!(pending.badge_count(), 0);
+    }
+}
+
+#[test]
+fn hiding_retires_os_and_inflight_notifications_including_missing_rows() {
+    let mut pending = PendingNotifications::default();
+    pending.sync(NotificationMode::Notifications, true, false);
+    let target = crate::sidebar::tag_filter::ThreadKey::new("one", "a");
+    let attempt = pending.begin(target.clone());
+    pending.confirm(&attempt, DeliveryOutcome::Accepted);
+    let missing = pending.begin(crate::sidebar::tag_filter::ThreadKey::new("one", "missing"));
+    let visible = pending.begin(crate::sidebar::tag_filter::ThreadKey::new("one", "visible"));
+    pending.confirm(&visible, DeliveryOutcome::Accepted);
+    let hidden = std::collections::HashSet::from(["a".to_owned()]);
+    let live = std::collections::HashSet::from(["a".to_owned(), "visible".to_owned()]);
+    assert!(notification_visible("missing", &hidden, None), "missing rows stay pending without filtering");
+    let mut retired = pending.retire_where(|key| !notification_visible(&key.thread_id, &hidden, Some(&live)));
+    retired.sort();
+    let mut expected = vec![attempt.tag.clone(), missing.tag.clone()];
+    expected.sort();
+    assert_eq!(retired, expected);
+    assert_eq!(pending.badge_count(), 1);
+    assert!(!pending.is_current(&missing));
+    assert!(!pending.confirm(&missing, DeliveryOutcome::Accepted));
+    assert_eq!(pending.destination(&attempt.tag), None);
+    pending.prune_destinations(|_| false);
+    assert_eq!(pending.destination(&visible.tag).unwrap().thread_id, "visible", "unread click remains routable");
+    pending.clear();
+    pending.prune_destinations(|_| false);
+    assert_eq!(pending.destination(&visible.tag), None);
+}
+
+#[test]
+fn completion_gate_matches_web_once_only_and_skip_cases() {
+    let working = Observation::default();
+    let completed = |at| Observation { settled: true, completed_at: Some(at), ..Default::default() };
+    let attention = Observation { attention: Some("run-1:limited".into()), ..Default::default() };
+    let mut gate = NotificationGate::default();
+    let key = "thread";
+    assert_eq!(gate.observe(&key, None, &completed(1), false, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(2), false, true), None);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(2), false, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(3), true, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(3), false, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(4), false, false), Some(NotificationKind::Completion));
+    assert_eq!(gate.observe(&key, Some(&working), &attention, false, false), Some(NotificationKind::Input));
+    assert_eq!(gate.observe(&key, Some(&attention), &attention, false, false), None);
+    assert_eq!(gate.observe(&key, Some(&attention), &completed(4), false, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(5), false, false), Some(NotificationKind::Completion));
+    assert_eq!(gate.observe(&key, Some(&working), &completed(4), false, false), None);
+    gate.retain(|_| false);
+    assert_eq!(gate.observe(&key, Some(&working), &completed(1), false, false), Some(NotificationKind::Completion));
+    gate.clear();
+    assert_eq!(gate.observe(&key, Some(&working), &completed(1), false, false), Some(NotificationKind::Completion));
 }

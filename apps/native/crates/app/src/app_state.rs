@@ -299,10 +299,6 @@ impl AppState {
         if side_changed {
             cx.emit(AppEvent::SideThread);
         }
-        if shell_changed || resynchronized {
-            // Transitions a disconnect held back are compared once the shell is live again.
-            self.observe_notifications(cx);
-        }
         if sidebar_changed || resynchronized { self.observe_background_announcements(cx); }
         if shell_changed {
             self.sync_omitted_rows(cx);
@@ -342,6 +338,9 @@ impl AppState {
             self.sync_server_config(cx);
             self.sync_environment_identity();
             cx.emit(AppEvent::ServerConfig);
+        }
+        if shell_changed || resynchronized {
+            self.observe_notifications(cx);
         }
     }
 
