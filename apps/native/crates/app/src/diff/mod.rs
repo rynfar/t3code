@@ -71,6 +71,7 @@ pub struct DiffPanel {
     session: DiffSession,
     tree_collapsed: HashSet<String>,
     list: ListState,
+    list_width: Option<Pixels>,
     tree_scroll: UniformListScrollHandle,
     wrap: bool,
     wrap_override: Option<bool>,
@@ -161,6 +162,7 @@ impl DiffPanel {
             session: DiffSession::default(),
             tree_collapsed: HashSet::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
+            list_width: None,
             tree_scroll: UniformListScrollHandle::new(),
             wrap: true,
             wrap_override: None,
@@ -502,8 +504,10 @@ impl DiffPanel {
         match &self.loaded.as_ref()?.1 { Loaded::Git { review, .. } => Some(review), _ => None }
     }
 
-    fn load_nearby(&mut self, _cx: &mut Context<Self>) {
-        let Some(review) = self.review().filter(|r| r.lazy()) else { return };
+    fn load_nearby(&mut self, cx: &mut Context<Self>) {
+        if !self.review().is_some_and(|r| r.lazy()) { return; }
+        if view::seed_height_estimates(&self.list, self.list.viewport_bounds().size.width, &mut self.list_width) { cx.notify(); }
+        let Some(review) = self.review() else { return };
         let Some(file) = review.files().iter().find(|f| review.state(f).is_none_or(|s| s.pending)) else { return };
         let Some(view) = &self.view else { return };
         let Some(index) = view.parsed.files().iter().position(|f| f.path() == file.path) else { return };

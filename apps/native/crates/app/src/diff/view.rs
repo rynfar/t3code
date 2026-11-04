@@ -193,6 +193,14 @@ impl View {
     }
 }
 
+pub fn seed_height_estimates(list: &gpui::ListState, width: gpui::Pixels, previous_width: &mut Option<gpui::Pixels>) -> bool {
+    if width <= gpui::px(0.) || *previous_width == Some(width) { return false; }
+    *previous_width = Some(width);
+    // GPUI discards all height hints on width changes, including the first layout.
+    list.clone().with_uniform_item_height(gpui::px(super::lines::LINE_HEIGHT));
+    true
+}
+
 pub fn apply_row_changes(list: &gpui::ListState, changes: Vec<(Range<usize>, usize)>) {
     for (range, count) in changes.into_iter().rev() {
         if range.len() == count { list.remeasure_items(range); } else { list.splice(range, count); }
@@ -284,6 +292,13 @@ mod tests {
         apply_row_changes(&list, vec![(0..1, 1), (1..2, 1)]);
         assert_eq!(list.offset_for_item(140), offset, "settling headers above the viewport keeps their height estimates");
         assert_eq!(list.logical_scroll_top().item_ix, 140);
+        let unmeasured = gpui::ListState::new(200, gpui::ListAlignment::Top, gpui::px(0.));
+        unmeasured.scroll_to(gpui::ListOffset { item_ix: 140, offset_in_item: gpui::px(0.) });
+        let mut width = None;
+        seed_height_estimates(&unmeasured, gpui::px(800.), &mut width);
+        assert_eq!(unmeasured.offset_for_item(140), gpui::px(2800.), "width invalidation must not leave later headers at zero distance");
+        assert_eq!(unmeasured.logical_scroll_top().item_ix, 140);
+        assert!(!seed_height_estimates(&unmeasured, gpui::px(800.), &mut width), "unchanged width does not remeasure the list again");
 
     }
 

@@ -107,6 +107,8 @@ pub fn install(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> bool {
                         }
                     }
                     this.rebuild(cx);
+                    let top = this.list.logical_scroll_top();
+                    eprintln!("diff-fixture viewport top={} offset={} total={} height={}", top.item_ix, f32::from(top.offset_in_item), f32::from(this.list.offset_for_item(this.list.item_count())), f32::from(this.list.viewport_bounds().size.height));
                     cx.notify();
                 })
                 .is_err()
