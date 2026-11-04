@@ -11,6 +11,7 @@ pub mod background;
 pub mod chatgpt;
 pub mod form;
 pub mod wizard;
+pub mod registry;
 
 use std::collections::{HashMap, HashSet};
 
@@ -927,6 +928,10 @@ pub fn proposed_instance_id(driver: &Driver, label: &str, existing: &[String]) -
     } else {
         derive_instance_id(driver.kind, label)
     };
+    available_instance_id(base,existing)
+}
+
+pub(super) fn available_instance_id(base: String, existing: &[String]) -> String {
     if base.is_empty() || !existing.contains(&base) {
         return base;
     }

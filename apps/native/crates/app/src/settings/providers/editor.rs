@@ -239,7 +239,7 @@ impl SettingsView {
                 }
             }
         }
-        if model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && shows_account(selected)
+        if model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && shows_account(selected) && self.providers.dialog.as_ref().is_none_or(|d|!d.add.created())
             && let Some(live) = live
         {
             rows.push(self.render_account(selected, live, environment_label, window, cx));
@@ -321,7 +321,7 @@ impl SettingsView {
         row.into_any_element()
     }
 
-    fn render_account(&mut self, selected: &Selected, live: &t3_core::server_config::ServerProvider, environment_label: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_account(&mut self, selected: &Selected, live: &t3_core::server_config::ServerProvider, environment_label: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let session = self.providers.auth.as_ref();
         let state = session.and_then(|session| session.state.clone());
@@ -364,7 +364,7 @@ impl SettingsView {
         }
         match view.action.clone() {
             Some(AccountAction::OpenDocs(url)) => {
-                controls = controls.child(Button::new("provider-open-docs", ButtonVariant::Outline, ButtonSize::Sm).label("Open docs").on_click(move |_, _, cx| {if !crate::chatgpt_setup::fixture_active(cx){cx.open_url(&url);}}));
+                controls = controls.child(Button::new("provider-open-docs", ButtonVariant::Outline, ButtonSize::Sm).label("Open docs").on_click(move |_, _, cx| {if !super::fixture_active(cx){cx.open_url(&url);}}));
             }
             Some(AccountAction::Cancel) => {
                 let id = instance_id.clone();
@@ -893,7 +893,12 @@ impl SettingsView {
     /// Runs one `provider.auth.*` call for the selected instance, one at a time, and shows the
     /// state it answers with at once.
     pub(super) fn auth_command(&mut self, method: &'static str, payload: Value, cx: &mut Context<Self>) {
-        if crate::chatgpt_setup::fixture_active(cx){return;}
+        if super::fixture_active(cx) || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) || self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()){return;}
+        let allowed = self.providers.auth.as_ref().is_some_and(|s| {
+            let app=self.state.read(cx);
+            app.server_config.config.as_ref().is_some_and(|c| c.provider(&s.instance_id).is_some_and(|p| t3_core::managed_policy::driver_allowed(c.managed_policy.as_ref(),&p.driver)))
+        });
+        if !allowed {return;}
         let Some(session) = self.providers.auth.as_mut() else { return };
         if session.pending {
             return;
@@ -902,10 +907,12 @@ impl SettingsView {
         session.error = None;
         let id = session.instance_id.clone();
         cx.notify();
+        let connection=self.state.read(cx).connection_id();
         let task = self.state.read(cx).rpc(method, payload);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.state.read(cx).connection_id()!=connection {return;}
                 if let Some(session) = this.providers.auth.as_mut().filter(|session| session.instance_id == id) {
                     session.pending = false;
                     match result {
@@ -926,12 +933,13 @@ impl SettingsView {
     /// Opens (or copies) the sign-in page. A browser interaction that asks for consent records
     /// it first, as the web does before opening the tab.
     fn open_auth_page(&mut self, instance_id: &str, copy: bool, cx: &mut Context<Self>) {
-        if crate::chatgpt_setup::fixture_active(cx){return;}
+        if super::fixture_active(cx) || self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()){return;}
         let Some(state) = self.providers.auth.as_ref().and_then(|session| session.state.clone()) else { return };
         let Some(url) = state.url().map(str::to_owned) else { return };
         if copy {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
         }
+        if state.requires_consent() && !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) {return;}
         if !state.requires_consent() {
             if !copy {
                 cx.open_url(&url);

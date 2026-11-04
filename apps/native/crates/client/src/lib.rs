@@ -33,3 +33,5 @@ pub mod vcs;
 
 pub mod environments;
 pub mod open_vsx;
+
+pub mod acp_registry;

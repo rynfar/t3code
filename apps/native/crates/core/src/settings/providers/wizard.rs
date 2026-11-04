@@ -38,11 +38,90 @@ impl ConfigDraft {
     }
 }
 
+#[derive(Default)]
+enum Creation {
+    #[default]
+    Editing,
+    Saving(String),
+    Created(String),
+}
+
+/// The add dialog's registry selection and Create transaction share one editing boundary.
+#[derive(Default)]
+pub struct AddState {
+    pub selected_acp: Option<super::registry::Agent>,
+    prepared: Option<super::registry::Agent>,
+    creation: Creation,
+}
+impl AddState {
+    pub fn editable(&self) -> bool {
+        matches!(self.creation, Creation::Editing)
+    }
+    pub fn saving(&self) -> bool {
+        matches!(self.creation, Creation::Saving(_))
+    }
+    pub fn created(&self) -> bool {
+        matches!(self.creation, Creation::Created(_))
+    }
+    pub fn created_instance_id(&self) -> Option<&str> {
+        match &self.creation {
+            Creation::Created(id) => Some(id),
+            _ => None,
+        }
+    }
+    pub fn begin_create(&mut self, instance_id: String) -> bool {
+        if !self.editable() {
+            return false;
+        }
+        self.prepared = None;
+        self.creation = Creation::Saving(instance_id);
+        true
+    }
+    pub fn finish_create(&mut self) {
+        if let Creation::Saving(id) = &self.creation {
+            self.creation = Creation::Created(id.clone());
+        }
+    }
+    pub fn fail_create(&mut self) {
+        if self.saving() {
+            self.creation = Creation::Editing;
+        }
+    }
+    pub fn begin_prepare(&self, search: &mut super::registry::Search, id: &str) -> Option<u64> {
+        if !self.editable() {
+            return None;
+        }
+        search.begin_prepare(id)
+    }
+    pub fn stage_prepared(&mut self, agent: super::registry::Agent) -> bool {
+        if !self.editable() {
+            return false;
+        }
+        self.prepared = Some(agent);
+        true
+    }
+    pub fn prepared(&self) -> Option<&super::registry::Agent> {
+        self.prepared.as_ref()
+    }
+    pub fn discard_prepared(&mut self) {
+        self.prepared = None;
+    }
+    pub fn apply_prepared(&mut self) -> Option<super::registry::Agent> {
+        if !self.editable() {
+            return None;
+        }
+        let agent = self.prepared.take()?;
+        self.selected_acp = Some(agent.clone());
+        Some(agent)
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpSetup {
     #[default]
     Choices,
     Manual,
+    Registry,
 }
 impl AcpSetup {
     pub fn start(local: bool) -> (Self, ConfigDraft, &'static str) {
@@ -64,7 +143,7 @@ impl AcpSetup {
         let filled = config
             .and_then(|c| c[key].as_str())
             .is_some_and(|s| !s.trim().is_empty());
-        if self == Self::Manual && filled {
+        if (self == Self::Manual || self == Self::Registry) && filled {
             None
         } else if local {
             Some("Executable is required.")
@@ -220,6 +299,29 @@ mod tests {
                 .selection_error(config.value.as_ref())
                 .is_some()
         );
+        assert_eq!(
+            AcpSetup::Registry.selection_error(config.value.as_ref()),
+            None
+        );
+        assert_eq!(
+            AcpSetup::Registry.navigate("acpRegistry", config.value.as_ref(), 1, 0, None),
+            Ok(0)
+        );
+        assert_eq!(
+            AcpSetup::Registry.navigate("acpRegistry", config.value.as_ref(), 0, 1, None),
+            Ok(1)
+        );
+        assert_eq!(
+            AcpSetup::Registry.navigate(
+                "acpRegistry",
+                config.value.as_ref(),
+                1,
+                2,
+                Some("duplicate".into())
+            ),
+            Err((1, "duplicate".into()))
+        );
+
         let (mode, mut local, label) = AcpSetup::start(true);
         assert_eq!(label, "Local ACP");
         assert_eq!(
@@ -260,6 +362,58 @@ mod tests {
             ),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn create_freezes_preparation_and_late_selection_and_keeps_the_saved_identity() {
+        let agent = |id: &str| {
+            serde_json::from_value::<super::super::registry::Agent>(json!({
+                "id":id,"name":id,"version":"1","distribution":"npx","description":"fixture",
+                "website":null,"repository":null,"icon":null
+            }))
+            .unwrap()
+        };
+        let first = agent("fixture-a");
+        let second = agent("fixture-b");
+        for queued_before_create in [false, true] {
+            let mut state = AddState::default();
+            let mut search = super::super::registry::Search::default();
+            state.stage_prepared(first.clone());
+            let selected = state.apply_prepared().unwrap();
+            let saved_id = super::super::registry::instance_id(&selected.name, &[]);
+            let saved_config = selected.config();
+            if queued_before_create {
+                state.stage_prepared(second.clone());
+            }
+            assert!(state.begin_create(saved_id.clone()));
+            let unexpected_request = state.begin_prepare(&mut search, &second.id);
+            if !queued_before_create {
+                state.stage_prepared(second.clone());
+            }
+            let unexpected_selection = state.apply_prepared();
+            assert!(
+                unexpected_selection.is_none(),
+                "a selection crossed the pending Create: {unexpected_selection:?}"
+            );
+            assert!(unexpected_request.is_none());
+            assert_eq!(state.selected_acp.as_ref(), Some(&first));
+            assert_eq!(state.selected_acp.as_ref().unwrap().config(), saved_config);
+            if queued_before_create {
+                state.fail_create();
+                assert!(state.editable());
+                assert!(state.apply_prepared().is_none());
+                assert!(state.begin_prepare(&mut search, &second.id).is_some());
+                search.retire();
+                assert!(state.begin_create(saved_id.clone()));
+            }
+            state.finish_create();
+            assert_eq!(state.created_instance_id(), Some(saved_id.as_str()));
+            assert!(!state.editable());
+            assert!(state.begin_prepare(&mut search, &second.id).is_none());
+            assert!(!state.stage_prepared(second.clone()));
+            assert!(state.apply_prepared().is_none());
+            assert_eq!(state.created_instance_id(), Some(saved_id.as_str()));
+        }
     }
 
     #[test]
