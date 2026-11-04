@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-profile-prefix <path>] [--media-select-all] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--document-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -155,14 +155,75 @@ pub(crate) fn record_render(name: &'static str, cx: &mut gpui::App) {
 }
 
 #[derive(Default)]
-struct MediaAudit(std::cell::RefCell<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>, std::cell::Cell<usize>, std::cell::Cell<usize>);
+struct MediaAudit {
+    sources: std::cell::RefCell<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>,
+    notifications: std::cell::RefCell<std::collections::BTreeMap<String, usize>>,
+    pointers: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    views: std::cell::RefCell<std::collections::BTreeMap<String, gpui::WeakEntity<gpui_component::text::TextViewState>>>,
+}
 impl gpui::Global for MediaAudit {}
-pub(crate) fn record_media_notification(cx: &mut gpui::App) {
-    if let Some(audit) = cx.try_global::<MediaAudit>() { audit.1.set(audit.1.get() + 1); }
+pub(crate) fn record_media_prose(state: &Entity<gpui_component::text::TextViewState>, text: &str, cx: &mut gpui::App) {
+    if let Some(audit) = cx.try_global::<MediaAudit>() {
+        audit.sources.borrow_mut().entry(state.entity_id().to_string()).or_default().insert(text.to_owned());
+    }
+}
+fn media_selections(cx: &gpui::App) -> std::collections::BTreeMap<String, String> {
+    cx.global::<MediaAudit>().views.borrow().iter().filter_map(|(id, view)| view.upgrade().map(|view| (id.clone(), view.read(cx).selected_text()))).collect()
 }
 
-pub(crate) fn record_media_prose(id: gpui::EntityId, text: &str, cx: &mut gpui::App) {
-    if let Some(audit) = cx.try_global::<MediaAudit>() { audit.2.set(audit.2.get() + 1); audit.0.borrow_mut().entry(id.to_string()).or_default().insert(text.to_owned()); }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentFixture { text: String, thread_id: Option<String>, base_dir: Option<String>, after_text: Option<String> }
+struct DocumentView {
+    text: Arc<str>,
+    markdown: crate::transcript::markdown::MarkdownStore,
+    scope: crate::media::MediaScope,
+    _viewer: Entity<crate::media::MediaViewer>,
+}
+impl DocumentView {
+    fn new(fixture: &DocumentFixture, cx: &mut gpui::Context<Self>) -> Self {
+        use gpui::AppContext;
+        let viewer = cx.new(crate::media::MediaViewer::new);
+        Self {
+            text: fixture.text.clone().into(), markdown: crate::transcript::markdown::MarkdownStore::new(cx.entity_id()),
+            scope: crate::media::MediaScope { owner: cx.entity_id(), thread_id: fixture.thread_id.clone(), workspace_root: fixture.base_dir.clone(), workspace_mutation_id: None, viewer: viewer.downgrade() },
+            _viewer: viewer,
+        }
+    }
+}
+impl gpui::Render for DocumentView {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{ParentElement, Styled};
+        crate::media::set_scope(self.scope.clone(), cx);
+        self.markdown.begin_frame();
+        let state = self.markdown.state("document-fixture", &self.text, cx);
+        if !self.text.contains("![") { record_media_prose(&state.entity, &self.text, cx); }
+        gpui::div().size_full().p(px(24.)).child(crate::transcript::markdown::prose(&state, cx))
+    }
+}
+
+fn media_profile_checkpoint(prefix: Option<&str>, phase: u64) -> Result<(), String> {
+    let Some(prefix) = prefix else { return Ok(()) };
+    #[cfg(unix)]
+    unsafe {
+        if const { option_env!("T3_MEDIA_COVERAGE").is_none() } { return Err("media profiling requires an instrument-coverage build".into()); }
+        unsafe extern "C" {
+            #[link_name = "__llvm_profile_set_filename"] fn set_filename(name: *const std::ffi::c_char);
+            #[link_name = "__llvm_profile_write_file"] fn write() -> std::ffi::c_int;
+            #[link_name = "__llvm_profile_reset_counters"] fn reset();
+        }
+        if phase > 0 {
+            let filename = std::ffi::CString::new(format!("{prefix}.{phase}.profraw")).map_err(|e| e.to_string())?;
+            set_filename(filename.as_ptr());
+            if write() != 0 { return Err("could not write media profile".into()); }
+        }
+        let exit = std::ffi::CString::new(format!("{prefix}.exit.profraw")).map_err(|e| e.to_string())?;
+        set_filename(exit.as_ptr());
+        reset();
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    { let _ = (prefix, phase); Err("media profiling requires Unix".into()) }
 }
 
 pub struct Options {
@@ -358,7 +419,21 @@ pub fn run(options: Options, runtime: tokio::runtime::Handle) {
 fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), String> {
     let mut cx = VisualTestAppContext::with_asset_source(gpui_platform::current_platform(false), Arc::new(crate::icons::Assets));
     let media_audit = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--media-audit").map(|pair| pair[1].clone());
-    if media_audit.is_some() { cx.update(|cx| cx.set_global(MediaAudit::default())); }
+    if media_audit.is_some() {
+        gpui::profiler::set_frame_trace_enabled(true);
+        cx.update(|cx| {
+            cx.set_global(MediaAudit::default());
+            cx.observe_new::<gpui_component::text::TextViewState>(|state, _, cx| {
+                let id = cx.entity_id().to_string();
+                cx.global::<MediaAudit>().views.borrow_mut().insert(id.clone(), cx.entity().downgrade());
+                let pointer = format!("{:#x}", std::ptr::from_ref(state) as usize);
+                cx.global::<MediaAudit>().pointers.borrow_mut().insert(pointer, id.clone());
+                cx.observe_self(move |_, cx| {
+                    *cx.global::<MediaAudit>().notifications.borrow_mut().entry(id.clone()).or_default() += 1;
+                }).detach();
+            }).detach();
+        });
+    }
     if let Some(path) = &options.chatgpt_fixture {
         let fixture: crate::chatgpt_setup::Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         cx.update(|cx| cx.set_global(fixture));
@@ -369,8 +444,21 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         cx.update(|cx| cx.set_global(crate::composer::AttachmentFixture(fixture)));
     }
     let state: Entity<AppState> = cx.update(|cx| crate::boot(runtime, cx));
+    let document_fixture = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--document-fixture").map(|pair| {
+        let bytes = std::fs::read(&pair[1]).map_err(|e| e.to_string())?;
+        serde_json::from_slice::<DocumentFixture>(&bytes).map_err(|e| e.to_string())
+    }).transpose()?;
+    let mut document_view = None;
     let window: AnyWindowHandle = cx
-        .open_offscreen_window(size(px(options.width), px(options.height)), |window, cx| crate::root_view(&state, window, cx))
+        .open_offscreen_window(size(px(options.width), px(options.height)), |window, cx| {
+            use gpui::AppContext;
+            if let Some(fixture) = &document_fixture {
+                crate::media::cache(&state, cx);
+                let document = cx.new(|cx| DocumentView::new(fixture, cx));
+                document_view = Some(document.clone());
+                cx.new(|cx| gpui_component::Root::new(document, window, cx))
+            } else { crate::root_view(&state, window, cx) }
+        })
         .map_err(|error| error.to_string())?
         .into();
     let synchronized = |state: &Entity<AppState>| {
@@ -533,7 +621,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         state.update(&mut cx, |state, cx| {
             // Hold this snapshot fixture against later repository-enrichment frames.
             state.stop_pump();
-            if let Some(id) = fixture.environment_id { if let Some(config) = state.server_config.config.as_mut() { config.environment.environment_id=id; } }
+            if let Some(id) = fixture.environment_id && let Some(config) = state.server_config.config.as_mut() { config.environment.environment_id=id; }
             if let Some(thread) = state
                 .shell
                 .snapshot
@@ -743,6 +831,9 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             cx.emit(crate::app_state::AppEvent::Phase);
         });
     }
+    if let (Some(document), Some(text)) = (&document_view, document_fixture.as_ref().and_then(|fixture| fixture.after_text.as_ref())) {
+        document.update(&mut cx, |document, cx| { document.text = text.clone().into(); cx.notify(); });
+    }
     for (index, gesture) in options.gestures.iter().enumerate() {
         pump(&mut cx, options.wait.min(options.gesture_wait), |_| false);
         if index + 1 == options.gestures.len() && options.render_counts_output.is_some() {
@@ -797,14 +888,27 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             }
         });
     }
+    if media_audit.is_some() && std::env::args().any(|arg| arg == "--media-select-all") {
+        let view = cx.update(|cx| {
+            let audit = cx.global::<MediaAudit>();
+            let id = audit.sources.borrow().keys().next().cloned().expect("media prose state");
+            audit.views.borrow().get(&id).and_then(gpui::WeakEntity::upgrade).expect("live media prose state")
+        });
+        view.update(&mut cx, |state, cx| state.select_all(cx));
+    }
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
     pump(&mut cx, 0.5, |_| false);
     let mut media_idle = Vec::new();
     if media_audit.is_some() {
-        for _ in 0..3 {
-            let before = cx.update(|cx| (cx.global::<MediaAudit>().1.get(), cx.global::<MediaAudit>().2.get()));
+        let mut frames = gpui::FrameTimingCollector::new();
+        let profile_prefix = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--media-profile-prefix").map(|pair| pair[1].clone());
+        media_profile_checkpoint(profile_prefix.as_deref(), 0)?;
+        for phase in 1..=3 {
+            let before: usize = cx.update(|cx| cx.global::<MediaAudit>().notifications.borrow().values().sum());
             pump(&mut cx, 0.5, |_| false);
-            media_idle.push(cx.update(|cx| (cx.global::<MediaAudit>().1.get() - before.0, cx.global::<MediaAudit>().2.get() - before.1)));
+            let notifications: usize = cx.update(|cx| cx.global::<MediaAudit>().notifications.borrow().values().sum::<usize>() - before);
+            media_idle.push(serde_json::json!({"notifications":notifications,"windowDraws":frames.collect_unseen().len(),"selected":cx.update(|cx| media_selections(cx))}));
+            media_profile_checkpoint(profile_prefix.as_deref(), phase)?;
         }
     }
     if let Some(path)=std::env::var_os("T3_NATIVE_THEME_EDITOR_FIXTURE") {
@@ -814,7 +918,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         }
     }
     if let Some(path) = media_audit {
-        let values = cx.update(|cx| serde_json::to_vec_pretty(&serde_json::json!({"prose":&*cx.global::<MediaAudit>().0.borrow(),"idleNotifications": media_idle.last().map(|sample| sample.0),"idleSamples":media_idle,"cache":cx.try_global::<crate::media::Media>().map(|media|media.cache.read(cx).audit())}))).map_err(|e| e.to_string())?;
+        let values = cx.update(|cx| serde_json::to_vec_pretty(&serde_json::json!({"prose":&*cx.global::<MediaAudit>().sources.borrow(),"notifications":&*cx.global::<MediaAudit>().notifications.borrow(),"entities":&*cx.global::<MediaAudit>().pointers.borrow(),"idleSamples":media_idle,"selected":media_selections(cx),"cache":cx.try_global::<crate::media::Media>().map(|media|media.cache.read(cx).audit())}))).map_err(|e| e.to_string())?;
         std::fs::write(path, values).map_err(|e| e.to_string())?;
     }
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;

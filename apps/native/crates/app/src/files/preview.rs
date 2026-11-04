@@ -350,12 +350,10 @@ impl Preview {
                 if let Some(document) = &self.media_document { *document.write().unwrap() = std::sync::Arc::new(t3_core::media::MarkdownMediaDocument::new(std::sync::Arc::from(text.as_str()))); }
                 else { self.media_document = Some(crate::transcript::media_document(std::sync::Arc::from(text.as_str()))); }
                 let state = cx.new(|cx| {
-                    #[cfg(feature = "snapshot")]
-                    if !text.contains("![") { cx.observe_self(|_, cx| crate::snapshot::record_media_notification(cx)).detach(); }
                     TextViewState::markdown(&text, cx).selectable(true)
                 });
                 #[cfg(feature = "snapshot")]
-                if !text.contains("![") { crate::snapshot::record_media_prose(state.entity_id(), &text, cx); }
+                if !text.contains("![") { crate::snapshot::record_media_prose(&state, &text, cx); }
                 self.markdown = Some((file.key.clone(), state.clone()));
                 state
             }

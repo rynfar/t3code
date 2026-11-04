@@ -228,15 +228,10 @@ impl gpui::Element for ProseElement {
     fn id(&self) -> Option<gpui::ElementId> { Some(self.id.clone().into()) }
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> { None }
     fn request_layout(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, window: &mut Window, cx: &mut App) -> (gpui::LayoutId, AnyElement) {
-        let state = window.use_keyed_state("state", cx, |_, cx| {
-            let state = TextViewState::markdown(&self.text, cx);
-            #[cfg(feature = "snapshot")]
-            cx.observe_self(|_, cx| crate::snapshot::record_media_notification(cx)).detach();
-            state
-        });
+        let state = window.use_keyed_state("state", cx, |_, cx| TextViewState::markdown(&self.text, cx));
         state.update(cx, |state, cx| state.set_text(&self.text, cx));
         #[cfg(feature = "snapshot")]
-        crate::snapshot::record_media_prose(state.entity_id(), &self.text, cx);
+        crate::snapshot::record_media_prose(&state, &self.text, cx);
         let mut child = div().min_w_0().child(super::markdown::style_markdown(TextView::new(&state), cx)).into_any_element();
         (child.request_layout(window, cx), child)
     }

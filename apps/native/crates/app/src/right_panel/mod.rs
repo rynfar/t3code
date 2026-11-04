@@ -227,7 +227,8 @@ impl Render for RightPanelView {
             Some(SurfaceKind::Diff) => self.diff.clone().cached(StyleRefinement::default().size_full()).into_any_element(),
             Some(SurfaceKind::PullRequests) => self.pull_requests.clone().into_any_element(),
             Some(SurfaceKind::Files | SurfaceKind::File { .. }) => {
-                self.files.clone().cached(StyleRefinement::default().size_full()).into_any_element()
+                // Markdown selection registrations cannot survive cached scene reuse.
+                self.files.clone().into_any_element()
             }
             Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, window, cx).into_any_element(),
             // Cached: frames repaint the page view inside, not the panel around it.

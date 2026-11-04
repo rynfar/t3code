@@ -70,8 +70,7 @@ pub struct MarkdownStore {
 }
 
 impl MarkdownStore {
-    /// `owner` is the view rendering these states. It is drawn `.cached()`, and a state's
-    /// background reparse notifies only the state, so each state re-notifies the owner.
+    /// Background parsing changes measured row heights, so it also notifies the list owner.
     pub fn new(owner: EntityId) -> Self {
         Self { states: HashMap::new(), contexts: HashMap::new(), frame: 0, owner }
     }
