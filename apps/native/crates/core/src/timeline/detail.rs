@@ -100,10 +100,30 @@ fn text_from_blocks(value: &Value, depth: usize, image_blocks: &[&Value]) -> Opt
     match keys[..] {
         ["content"] => text_from_blocks(&object["content"], depth + 1, image_blocks),
         [_, _] if keys.contains(&"content") && keys.contains(&"structuredContent") => {
-            text_from_blocks(&object["content"], depth + 1, image_blocks).filter(|text| !js_trim(text).is_empty())
+            let text = text_from_blocks(&object["content"], depth + 1, image_blocks);
+            let images: Vec<&Value> = object["content"].as_array().into_iter().flatten().filter(|block| block.get("type").and_then(Value::as_str) == Some("image")).collect();
+            if let Some(structured) = format_json_value(&object["structuredContent"])
+                && (!images.is_empty() || text.as_deref().is_none_or(|text| js_trim(text).is_empty()))
+            {
+                let markers = (depth < MAX_TEXT_BLOCK_DEPTH)
+                    .then(|| images.into_iter().map(|image| text_from_blocks(image, depth + 2, image_blocks)).collect::<Option<Vec<_>>>())
+                    .flatten()
+                    .map(|parts| parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n"));
+                return Some([Some(structured), markers.filter(|markers| !markers.is_empty())].into_iter().flatten().collect::<Vec<_>>().join("\n"));
+            }
+            text.filter(|text| !js_trim(text).is_empty())
         }
         _ => None,
     }
+}
+
+/// `formatJsonValue`: empty structured values do not displace content text.
+fn format_json_value(value: &Value) -> Option<String> {
+    if value.is_null() || value.as_str().is_some_and(|text| js_trim(text).is_empty()) {
+        return None;
+    }
+    let json = json_text::stringify_pretty(value);
+    (json != "{}" && json != "[]").then_some(json)
 }
 
 /// `prettyJsonText`: a JSON document, or JSON lines, pretty-printed; any other text as is.
@@ -132,8 +152,7 @@ pub fn format_tool_value(value: Option<&Value>, has_image_preview: bool) -> Opti
     if let Some(text) = text_from_blocks(value, 0, &tool_output_image_blocks(value)) {
         return (!js_trim(&text).is_empty()).then(|| pretty_json_text(&text));
     }
-    let json = json_text::stringify_pretty(value);
-    (json != "{}" && json != "[]").then_some(json)
+    format_json_value(value)
 }
 
 /// `toolCallLines`: a command line, or arguments as `key value` lines, or anything else as text.
