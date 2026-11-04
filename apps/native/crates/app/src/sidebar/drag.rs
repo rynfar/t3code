@@ -33,11 +33,12 @@ pub struct ThreadDragPreview {
     title: SharedString,
     project: Option<SharedString>,
     verb: Option<DropVerb>,
+    visual: crate::project_icon::ProjectVisual,
 }
 
 impl ThreadDragPreview {
-    pub fn new(title: String, project: Option<String>) -> Self {
-        ThreadDragPreview { title: title.into(), project: project.map(Into::into), verb: None }
+    pub fn new(title: String, project: Option<String>, visual: crate::project_icon::ProjectVisual) -> Self {
+        ThreadDragPreview { title: title.into(), project: project.map(Into::into), verb: None, visual }
     }
 }
 
@@ -88,6 +89,7 @@ impl Render for ThreadDragPreview {
                     .flex()
                     .items_center()
                     .gap(px(6.))
+                    .child(self.visual.render(crate::project_icon::size(16., cx), hsla(p.sidebar_icon), cx))
                     .child(div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.sidebar_secondary_label)).children(self.project.clone()))
                     .children(badge),
             )
@@ -195,7 +197,7 @@ impl SidebarPane {
 pub struct ThreadHoverCard {
     pub title: SharedString,
     pub project: Option<SharedString>,
-    pub favicon: Option<std::sync::Arc<gpui::Image>>,
+    pub favicon: crate::project_icon::ProjectVisual,
     pub branch: Option<SharedString>,
     pub model: Option<SharedString>,
     /// The error line and whether it is a usage limit.
@@ -248,10 +250,7 @@ impl Render for ThreadHoverCard {
                             .text_xs()
                             .text_color(hsla(p.muted_foreground))
                             .children(self.project.clone().map(|project| {
-                                let icon = match self.favicon.clone() {
-                                    Some(image) => gpui::img(image).size(px(12.)).flex_none().into_any_element(),
-                                    None => Icon::Folder.sized(px(12.)).flex_none().text_color(hsla(p.muted_foreground)).into_any_element(),
-                                };
+                                let icon = self.favicon.render(crate::project_icon::size(12., cx), hsla(p.icon_muted), cx);
                                 div().flex().items_center().gap(px(8.)).min_w_0().child(icon).child(div().min_w_0().truncate().text_color(hsla(p.foreground).opacity(0.75)).child(project))
                             }))
                             .children(self.branch.clone().map(|branch| line(Icon::GitBranch, branch)))

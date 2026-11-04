@@ -32,6 +32,7 @@ macro_rules! icons {
 }
 
 icons! {
+    Rocket => "icons/lucide/rocket.svg",
     Building => "icons/lucide/building.svg",
     AlarmClock => "icons/lucide/alarm-clock.svg",
     AlarmClockOff => "icons/lucide/alarm-clock-off.svg",
@@ -236,6 +237,14 @@ icons! {
 }
 
 impl Icon {
+    /// The vendored default-stroke subset; unshipped dynamic names use ProjectFavicon's folder-code fallback.
+    pub fn project_named(name: &str) -> Option<Self> {
+        let name = match name { "alert-circle" => "circle-alert", "check-circle" => "circle-check", _ => name };
+        Self::ALL.iter().copied().find(|icon| {
+            icon.path().strip_prefix("icons/lucide/").and_then(|path| path.strip_suffix(".svg")) == Some(name)
+        })
+    }
+
     /// A monochrome icon of `size` in `color`.
     pub fn render(self, size: Pixels, color: Hsla) -> Svg {
         self.sized(size).text_color(color)

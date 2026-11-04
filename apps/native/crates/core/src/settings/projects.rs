@@ -7,6 +7,8 @@
 //! native client holds one environment, so the web scope's environment and checkout axes have no
 //! counterpart here: a project's members are every checkout in the group.
 
+pub mod icon;
+
 use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
@@ -75,26 +77,27 @@ pub enum ProjectIcon {
     Lucide { name: String, color: String },
     Emoji { emoji: String },
     Monogram { text: String, color: String },
-    /// A kind this build does not know. It is still an override.
-    Unknown,
 }
 
 impl ProjectIcon {
     /// `None` for no override. A lucide icon carrying a legacy monogram reads as a monogram.
     pub fn decode(value: Option<&Value>) -> Option<ProjectIcon> {
         let value = value.filter(|value| !value.is_null())?;
-        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
-        let icon = match value.get("kind").and_then(Value::as_str) {
-            Some("lucide") => match (text("monogramText").or_else(|| text("monogram")), text("name"), text("color")) {
-                (Some(monogram), _, Some(color)) => Some(ProjectIcon::Monogram { text: monogram, color }),
-                (None, Some(name), Some(color)) => Some(ProjectIcon::Lucide { name, color }),
-                _ => None,
-            },
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned);
+        let color = || text("color").filter(|color| icon::COLORS.contains(&color.as_str()));
+        match value.get("kind").and_then(Value::as_str) {
+            Some("lucide") => {
+                let name = text("name")?;
+                let color = color()?;
+                match text("monogramText").or_else(|| text("monogram")) {
+                    Some(text) => Some(ProjectIcon::Monogram { text, color }),
+                    None => Some(ProjectIcon::Lucide { name, color }),
+                }
+            }
             Some("emoji") => text("emoji").map(|emoji| ProjectIcon::Emoji { emoji }),
-            Some("monogram") => text("text").zip(text("color")).map(|(text, color)| ProjectIcon::Monogram { text, color }),
+            Some("monogram") => text("text").zip(color()).map(|(text, color)| ProjectIcon::Monogram { text, color }),
             _ => None,
-        };
-        Some(icon.unwrap_or(ProjectIcon::Unknown))
+        }
     }
 }
 

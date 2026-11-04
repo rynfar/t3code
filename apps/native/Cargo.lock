@@ -7088,6 +7088,7 @@ dependencies = [
  "icu_locale_core",
  "jsonc-parser",
  "markdown",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

@@ -8,7 +8,7 @@ use crate::{
 };
 use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    StyledImage, div, img, prelude::*, px,
+    div, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, tooltip::Tooltip, v_flex};
 use serde_json::Value;
@@ -95,7 +95,7 @@ pub(crate) fn shell(
                     label = shell.title.trim().into();
                 }
                 thread = Some(field(record, "threadId").to_owned());
-                favicon = state.sidebar.favicons.image(&shell.project_id);
+                favicon = state.shell.project(&shell.project_id).map(|_| crate::project_icon::ProjectVisual::for_project(state, &shell.project_id));
                 if state.shell.project(&shell.project_id).is_some() {
                     icon = Icon::FolderCode;
                 }
@@ -194,13 +194,10 @@ pub(crate) fn shell(
         Ink::Accent(accent(accent_kind, cx))
     };
     let clickable = thread.is_some() || url.is_some() || has_details(record);
-    let mut shell = if let Some(image) = favicon {
+    let mut shell = if let Some(visual) = favicon {
         chip_shell_with_icon(
             field(record, "contextId"),
-            img(image)
-                .size(px(14.))
-                .object_fit(gpui::ObjectFit::Contain)
-                .into_any_element(),
+            visual.render(crate::project_icon::size(14., cx), crate::theme::hsla(crate::theme::palette(cx).icon_muted), cx),
             label,
             ink,
             clickable,

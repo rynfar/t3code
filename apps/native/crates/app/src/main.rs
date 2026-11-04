@@ -27,6 +27,7 @@ mod chatgpt_setup;
 mod palette;
 mod preview;
 mod project_files;
+mod project_icon;
 mod prompt_links;
 mod projects;
 mod provider_icon;
