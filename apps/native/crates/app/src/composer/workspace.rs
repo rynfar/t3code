@@ -104,7 +104,6 @@ impl Composer {
         cx.notify();
         let origin = scope.clone();
         self.workspace.loading = true;
-        self.workspace.error = None;
         let net = runtime.spawn(async move {
             let file = if configured.is_none() {
                 client
@@ -139,6 +138,7 @@ impl Composer {
                     }
                     Err(error) => this.workspace.error = Some(error),
                 }
+                if !this.workspace_enabled() {this.workspace.open = false;}
                 cx.notify();
             });
         }));
@@ -146,6 +146,7 @@ impl Composer {
 
     pub(crate) fn open_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.workspace_enabled() {
+            if self.workspace.open {self.workspace.open = false; cx.notify();}
             return;
         }
         self.workspace.open = !self.workspace.open;
@@ -161,6 +162,7 @@ impl Composer {
     pub(super) fn workspace_key(&mut self, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.workspace.open {return false;}
         self.sync_workspace(false, cx);
+        if !self.workspace.open || !self.workspace_enabled() {self.workspace.open = false; cx.notify(); return false;}
         let previous = self.workspace.previous.is_some();
         let count = 2 + usize::from(previous) + usize::from(self.workspace.error.is_some());
         self.workspace.highlighted = self.workspace.highlighted.min(count - 1);
@@ -179,8 +181,12 @@ impl Composer {
         true
     }
 
-    fn workspace_enabled(&self) -> bool {
-        rules::can_use_previous_worktree(!matches!(self.snapshot.target, Some(Target::Draft(_))), self.sending, false) && self.workspace.scope.is_some()
+    fn workspace_visible(&self) -> bool {
+        self.workspace.scope.is_some() && (self.workspace.is_repo || self.workspace.error.is_some())
+    }
+
+    pub(super) fn workspace_enabled(&self) -> bool {
+        rules::can_use_previous_worktree(!matches!(self.snapshot.target, Some(Target::Draft(_))), self.sending, false) && self.workspace_visible()
     }
 
     fn choose_workspace(&mut self, mode: ThreadEnvMode, previous: Option<PreviousWorktreeSeed>, window: &mut Window, cx: &mut Context<Self>) {
@@ -216,8 +222,7 @@ impl Composer {
     }
 
     pub(super) fn render_workspace(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.workspace.scope.as_ref()?;
-        if !self.workspace.is_repo && self.workspace.error.is_none() {
+        if !self.workspace_visible() {
             return None;
         }
         let p = palette(cx);
@@ -312,5 +317,40 @@ impl Composer {
                 .when(self.workspace.open && enabled, |this| this.child(floating(Float::AboveStart, div().mb(px(4.)).child(popup))))
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(feature = "snapshot")]
+impl Composer {
+    pub(crate) fn verify_workspace_availability(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.workspace.scope.is_none() {return Err("availability fixture requires a connected draft".into());}
+        self.workspace.task = None;
+        self.workspace.previous = None;
+        self.workspace.is_repo = false;
+        self.workspace.error = None;
+        self.workspace.open = false;
+        self.set_prompt("", window, cx);
+        self.open_workspace(window, cx);
+        if self.workspace.open || self.render_workspace(cx).is_some() {return Err("non-repository shortcut opened an invisible workspace popup".into());}
+        if self.workspace_key(MenuKey::Down, window, cx) || self.workspace_key(MenuKey::Accept, window, cx) {return Err("hidden workspace popup captured prompt keys".into());}
+        self.on_enter(false, window, cx);
+        if cx.global::<super::SnapshotAudit>().submissions.replace(0) != 1 {return Err("hidden workspace popup suppressed ordinary empty Enter".into());}
+        self.workspace.error = Some("fixture read failed".into());
+        self.open_workspace(window, cx);
+        if !self.workspace.open || self.render_workspace(cx).is_none() || !self.workspace_key(MenuKey::Down, window, cx) {return Err("visible error/retry popup lost keyboard access while refreshing".into());}
+        self.workspace_key(MenuKey::Dismiss, window, cx);
+        self.workspace.is_repo = true;
+        self.workspace.error = None;
+        self.open_workspace(window, cx);
+        if !self.workspace.open {return Err("repository popup did not open".into());}
+        self.workspace.is_repo = false;
+        if self.workspace_key(MenuKey::Accept, window, cx) || self.workspace.open {return Err("workspace popup retained keys after repository availability changed".into());}
+        self.workspace.open = true;
+        self.on_enter(false, window, cx);
+        if cx.global::<super::SnapshotAudit>().submissions.replace(0) != 1 {return Err("stale hidden popup suppressed empty Enter fallback".into());}
+        self.workspace.open = false;
+        self.workspace.task = None;
+        eprintln!("workspace availability: hidden non-repo shortcut/keys refused; empty Enter reached submit spy; error/retry and repository menus remained accessible; loss of availability released keys; no launch RPC");
+        Ok(())
     }
 }

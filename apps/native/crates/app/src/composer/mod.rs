@@ -654,7 +654,7 @@ impl Composer {
     }
 
     fn on_enter(&mut self, modifier: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.open {return;}
+        if self.workspace.open && self.workspace_enabled() {return;}
         let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
         let key = EnterKey { modifier, repeat: std::mem::take(&mut self.enter_repeat), composing };
         let prompt = self.prompt(cx);
