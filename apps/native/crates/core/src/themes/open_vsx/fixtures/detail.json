@@ -1,0 +1,14 @@
+{
+  "namespace": "demo",
+  "name": "theme",
+  "displayName": "Demo Theme",
+  "version": "1.0.0",
+  "license": "MIT",
+  "downloadCount": 123456,
+  "repository": { "url": "https://github.com/demo/theme" },
+  "files": {
+    "manifest": "https://open-vsx.org/api/demo/theme/1.0.0/file/package.json",
+    "sha256": "https://open-vsx.org/api/demo/theme/1.0.0/file/theme.sha256",
+    "download": "https://open-vsx.org/api/demo/theme/1.0.0/file/theme.vsix"
+  }
+}

@@ -369,6 +369,7 @@ pub struct Select {
     width: Option<f32>,
     popup_width: f32,
     show_check: bool,
+    disabled: bool,
     on_change: Option<ValueHandler<SharedString>>,
 }
 
@@ -382,9 +383,12 @@ impl Select {
             width: None,
             popup_width: 160.,
             show_check: false,
+            disabled: false,
             on_change: None,
         }
     }
+
+    pub fn disabled(mut self, disabled: bool) -> Self { self.disabled = disabled; self }
 
     pub fn selected(mut self, value: impl Into<SharedString>) -> Self {
         self.selected = Some(value.into());
@@ -422,6 +426,7 @@ impl Select {
 
 impl RenderOnce for Select {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let disabled = self.disabled;
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let focus = focus_handle(&self.id, window, cx);
@@ -429,7 +434,7 @@ impl RenderOnce for Select {
         let state = window.use_keyed_state((self.id.clone(), "state"), cx, |_, _| SelectState::default());
         let (open, highlighted) = {
             let state = state.read(cx);
-            (state.open, state.highlighted)
+            (state.open && !disabled, state.highlighted)
         };
         let selected_index = self.options.iter().position(|option| Some(&option.value) == self.selected.as_ref());
         let trigger_label = self
@@ -470,6 +475,7 @@ impl RenderOnce for Select {
         let on_key = {
             let (state, options, pick) = (state.clone(), options.clone(), pick.clone());
             move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
+                if disabled { return; }
                 let count = options.len();
                 let (open, highlighted) = {
                     let state = state.read(cx);
@@ -505,7 +511,8 @@ impl RenderOnce for Select {
 
         let trigger = h_flex()
             .id(self.id.clone())
-            .track_focus(&focus)
+            .when(!disabled, |view| view.track_focus(&focus))
+            .when(disabled, |v| v.opacity(DISABLED_OPACITY))
             .min_h(r(28.))
             .when_some(self.width, |this, width| this.w(r(width)))
             .px(r(9.))
@@ -534,7 +541,7 @@ impl RenderOnce for Select {
             })
             // Keys are handled on keydown; GPUI's keyup click would toggle the popup back.
             .on_click(move |event, _, cx| {
-                if !event.is_keyboard() {
+                if !disabled && !event.is_keyboard() {
                     toggle(cx)
                 }
             })

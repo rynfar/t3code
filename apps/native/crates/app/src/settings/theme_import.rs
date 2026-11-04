@@ -1,4 +1,7 @@
 //! Add a theme: file, pasted JSON, batch and conflict flows from `ThemeImportDialog.tsx`.
+#[path = "theme_search.rs"]
+mod search_impl;
+use search_impl as theme_search;
 use super::{
     SettingsView,
     controls::{Button, ButtonSize, ButtonVariant, DialogFrame, r},
@@ -37,6 +40,8 @@ pub(super) struct ThemeImportDialog {
     saving: bool,
     save_error: Option<String>,
     _subscription: Subscription,
+    search: theme_search::SearchUi,
+    marketplace: Option<t3_core::themes::open_vsx::MarketplaceImport>,
     #[cfg(all(test, feature = "snapshot"))]
     install_gates: Option<(futures::channel::oneshot::Receiver<()>, futures::channel::oneshot::Receiver<()>)>,
 }
@@ -53,7 +58,9 @@ impl ThemeImportDialog {
         input.update(cx, |s, cx| s.focus(window, cx));
         #[cfg(feature = "snapshot")]
         crate::snapshot::register_focus("theme-json", input.read(cx).focus_handle(cx), cx);
+        let search = theme_search::SearchUi::new(window, cx);
         Self {
+            search, marketplace: None,
             state,
             input,
             session: ImportSession::default(),
@@ -70,6 +77,7 @@ impl ThemeImportDialog {
     }
     #[cfg(feature = "snapshot")]
     fn fixture(&mut self, value: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
+        if value.get("search").is_some() { self.search_fixture(&value["search"], window, cx); }
         if let Some(json) = value["json"].as_str() {
             self.session.json = json.into();
             self.sync_input(window, cx);
@@ -95,6 +103,7 @@ impl ThemeImportDialog {
         if self.saving {
             return;
         }
+        self.search.cancel();
         self.session.cancel();
         self.open = false;
         if let Some(focus) = self.previous.take() {
@@ -142,6 +151,7 @@ impl ThemeImportDialog {
         if self.saving || paths.is_empty() {
             return;
         }
+        self.search.cancel();
         let request = self.session.begin_read();
         let batch = paths.len() > 1;
         cx.notify();
@@ -183,7 +193,7 @@ impl ThemeImportDialog {
         });
     }
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.session.reading || self.session.json.trim().is_empty() {
+        if self.saving || self.search.session_installing() || self.session.reading || self.session.json.trim().is_empty() {
             return;
         }
         if let Some(error) = importer::oversized(self.session.json.encode_utf16().count() as u64) {
@@ -343,7 +353,7 @@ impl ThemeImportDialog {
         .detach();
     }
     fn focus_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session.conflicts.is_empty() {
+        if self.session.conflicts.is_empty() && self.marketplace.is_none() {
             self.input.update(cx, |input, cx| input.focus(window, cx));
         } else {
             self.conflict_focus.focus(window, cx);
@@ -353,8 +363,10 @@ impl ThemeImportDialog {
         if self.saving {
             return;
         }
+        let marketplace = self.marketplace.take().is_some();
+        self.save_error = None;
         self.session.conflicts.clear();
-        self.focus_form(window, cx);
+        if marketplace { self.search.focus(window, cx); self.settle_search(false, window, cx); } else { self.focus_form(window, cx); }
         cx.notify();
     }
     fn resolve(
@@ -363,10 +375,13 @@ impl ThemeImportDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.install(InstallOperation::Conflicts(choice), window, cx);
+        if let Some(import) = self.marketplace.clone() {
+            self.install(InstallOperation::Marketplace(import, choice), window, cx);
+        } else { self.install(InstallOperation::Conflicts(choice), window, cx); }
     }
 }
 enum InstallOperation {
+    Marketplace(t3_core::themes::open_vsx::MarketplaceImport, themes::ImportChoice),
     Single(ThemeDefinition),
     Batch(importer::Batch),
     Conflicts(themes::ImportChoice),
@@ -389,6 +404,12 @@ fn prepare_import(
         InstallOperation::Conflicts(themes::ImportChoice::Update)
     );
     let mut result = match operation {
+        InstallOperation::Marketplace(import, choice) => {
+            return match import.prepare(doc, choice) {
+                Ok((patch, installed)) => PreparedImport {session, result: Installed {library: None, installed, close: true}, patch, updated: !import.expected.is_empty(), single: false},
+                Err(error) => { session.error = Some(error); PreparedImport {session, result: Installed {library: None, installed: Vec::new(), close: false}, patch: Default::default(), updated: false, single: false} }
+            };
+        }
         InstallOperation::Single(theme) => {
             let request = session.begin_read();
             session
@@ -437,7 +458,7 @@ impl Render for ThemeImportDialog {
         }
         let p = palette(cx);
         let mut body = v_flex().gap(r(16.));
-        if !self.session.conflicts.is_empty() {
+        if !self.session.conflicts.is_empty() || self.marketplace.is_some() {
             body = body
                 .child(
                     v_flex()
@@ -451,19 +472,16 @@ impl Render for ThemeImportDialog {
                             div()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .child("Already installed"),
+                                .child(if self.marketplace.is_some() {"Update installed themes?"} else {"Already installed"}),
                         )
                         .child(
                             div().text_xs().text_color(hsla(p.muted_foreground)).child(
-                                self.session
-                                    .conflicts
-                                    .iter()
-                                    .map(|t| t.label.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
+                                self.marketplace.as_ref().map(|import| &import.themes).unwrap_or(&self.session.conflicts)
+                                    .iter().map(|t| t.label.as_str()).collect::<Vec<_>>().join(", "),
                             ),
                         ),
                 )
+                .when(self.marketplace.is_some(), |body| body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Update existing replaces installed variants, including local edits, and removes retired variants. Keep both adds copies.")))
                 .child(
                     h_flex()
                         .flex_wrap()
@@ -509,6 +527,7 @@ impl Render for ThemeImportDialog {
                         ),
                 );
         } else {
+            body = body.child(self.search_section(window, cx)).child(div().text_xs().text_color(hsla(p.muted_foreground)).child("or import a file"));
             body = body
                 .child(
                     h_flex()
@@ -559,7 +578,7 @@ impl Render for ThemeImportDialog {
                             } else {
                                 "Choose files"
                             })
-                            .disabled(self.session.reading || self.saving)
+                            .disabled(self.session.reading || self.saving || self.search.session_installing())
                             .on_click(cx.listener(|this, _, window, cx| this.pick(window, cx))),
                         ),
                 )
@@ -574,7 +593,7 @@ impl Render for ThemeImportDialog {
                         )
                         .child(ThemeJsonField {
                             input: self.input.clone(),
-                            disabled: self.saving,
+                            disabled: self.saving || self.search.session_installing(),
                         }),
                 )
                 .child(
@@ -602,7 +621,7 @@ impl Render for ThemeImportDialog {
                             .disabled(
                                 self.session.json.trim().is_empty()
                                     || self.session.reading
-                                    || self.saving,
+                                    || self.saving || self.search.session_installing(),
                             )
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                         ),
@@ -860,6 +879,7 @@ mod tests {
                 let patch=serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), library)]);
                 t3_client::store::commit_client_settings(patch.clone()).unwrap();
                 store::install_committed_client(&state,patch,cx);
+                view.input.update(cx, |input, cx| input.focus(window, cx));
             })
             .unwrap();
         cx.run_until_parked();
@@ -1023,7 +1043,7 @@ mod tests {
         let (_runtime, state, home) = setup(cx);
         std::fs::create_dir_all(home.join("settings.json")).unwrap();
         let mut last = None;
-        for mode in 0..3 {
+        for mode in [3, 0, 1, 2] {
             cx.update(store::init);
             let before = cx.read(|cx| store::client(cx).clone());
             let window =
@@ -1037,6 +1057,12 @@ mod tests {
                             let batch =
                                 importer::parse_batch(vec![("dusk.json".into(), Ok(source()))]);
                             view.install(InstallOperation::Batch(batch), window, cx);
+                        }
+                        3 => {
+                            let mut theme = theme;
+                            theme.collection = Some(themes::Collection {id: "open-vsx:demo.theme".into(), label: "Demo".into()});
+                            let import = themes::open_vsx::MarketplaceImport {collection_id: "open-vsx:demo.theme".into(), expected: Vec::new(), themes: vec![theme]};
+                            view.install(InstallOperation::Marketplace(import, themes::ImportChoice::Update), window, cx);
                         }
                         _ => {
                             let library = themes::install(store::client(cx), &theme).unwrap();

@@ -516,3 +516,5 @@ pub fn select_collection(doc: &ClientSettingsDoc, themes: &[ThemeDefinition]) ->
 pub fn wireframe(colors:&Colors)->[u32;7] {
     ["canvas","sidebar","surface","accentSurface","messageSurface","messageAction","text"].map(|role|color::packed(color::parse(&colors[role]).unwrap_or([0.;4])))
 }
+
+pub mod open_vsx;

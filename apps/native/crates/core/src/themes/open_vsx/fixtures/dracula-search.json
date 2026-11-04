@@ -1,0 +1,324 @@
+{
+  "extensions": [
+    {
+      "averageRating": 5.0,
+      "deprecated": false,
+      "description": "The official Dracula Theme: a dark theme for many editors, shells, and more. 🦇",
+      "displayName": "Dracula Theme Official",
+      "downloadCount": 453108,
+      "files": {
+        "download": "https://open-vsx.org/api/dracula-theme/theme-dracula/2.25.1/file/dracula-theme.theme-dracula-2.25.1.vsix",
+        "signature": "https://open-vsx.org/api/dracula-theme/theme-dracula/2.25.1/file/dracula-theme.theme-dracula-2.25.1.sigzip",
+        "icon": "https://open-vsx.org/api/dracula-theme/theme-dracula/2.25.1/file/icon.png",
+        "sha256": "https://open-vsx.org/api/dracula-theme/theme-dracula/2.25.1/file/dracula-theme.theme-dracula-2.25.1.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "theme-dracula",
+      "namespace": "dracula-theme",
+      "reviewCount": 3,
+      "timestamp": "2024-09-06T03:29:53.212374Z",
+      "url": "https://open-vsx.org/api/dracula-theme/theme-dracula",
+      "verified": true,
+      "version": "2.25.1"
+    },
+    {
+      "averageRating": 5.0,
+      "deprecated": false,
+      "description": "A refined dark theme with purple and pink colors, enhanced semantic highlighting, and modern VS Code integration.",
+      "displayName": "Dracula Remastered",
+      "downloadCount": 123032,
+      "files": {
+        "download": "https://open-vsx.org/api/Dracula-2/dracula-2/0.3.8/file/Dracula-2.dracula-2-0.3.8.vsix",
+        "signature": "https://open-vsx.org/api/Dracula-2/dracula-2/0.3.8/file/Dracula-2.dracula-2-0.3.8.sigzip",
+        "icon": "https://open-vsx.org/api/Dracula-2/dracula-2/0.3.8/file/icon.png",
+        "sha256": "https://open-vsx.org/api/Dracula-2/dracula-2/0.3.8/file/Dracula-2.dracula-2-0.3.8.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "dracula-2",
+      "namespace": "Dracula-2",
+      "reviewCount": 1,
+      "timestamp": "2025-08-09T23:58:40.511034Z",
+      "url": "https://open-vsx.org/api/Dracula-2/dracula-2",
+      "verified": false,
+      "version": "0.3.8"
+    },
+    {
+      "averageRating": 5.0,
+      "deprecated": false,
+      "description": "Dark theme based on mixing swatch of Ayu Theme, Andromeda Theme, Monokai, Material Colors, Original Gruvbox Darktooth Colors, and Dracula Colors.",
+      "displayName": "Mayukai Theme",
+      "downloadCount": 61627,
+      "files": {
+        "download": "https://open-vsx.org/api/GulajavaMinistudio/mayukaithemevsc/3.3.0/file/GulajavaMinistudio.mayukaithemevsc-3.3.0.vsix",
+        "signature": "https://open-vsx.org/api/GulajavaMinistudio/mayukaithemevsc/3.3.0/file/GulajavaMinistudio.mayukaithemevsc-3.3.0.sigzip",
+        "icon": "https://open-vsx.org/api/GulajavaMinistudio/mayukaithemevsc/3.3.0/file/color-guide-mayukai.png",
+        "sha256": "https://open-vsx.org/api/GulajavaMinistudio/mayukaithemevsc/3.3.0/file/GulajavaMinistudio.mayukaithemevsc-3.3.0.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "mayukaithemevsc",
+      "namespace": "GulajavaMinistudio",
+      "reviewCount": 5,
+      "timestamp": "2026-07-01T07:08:09.327181Z",
+      "url": "https://open-vsx.org/api/GulajavaMinistudio/mayukaithemevsc",
+      "verified": true,
+      "version": "3.3.0"
+    },
+    {
+      "deprecated": false,
+      "description": "Sweet Dracula — A beautiful, darker - Dracula fork",
+      "displayName": "Sweet Dracula",
+      "downloadCount": 28946,
+      "files": {
+        "download": "https://open-vsx.org/api/PROxZIMA/sweetdracula/1.0.9/file/PROxZIMA.sweetdracula-1.0.9.vsix",
+        "icon": "https://open-vsx.org/api/PROxZIMA/sweetdracula/1.0.9/file/sweetdracula.png",
+        "sha256": "https://open-vsx.org/api/PROxZIMA/sweetdracula/1.0.9/file/PROxZIMA.sweetdracula-1.0.9.sha256",
+        "signature": "https://open-vsx.org/api/PROxZIMA/sweetdracula/1.0.9/file/PROxZIMA.sweetdracula-1.0.9.sigzip",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "sweetdracula",
+      "namespace": "PROxZIMA",
+      "timestamp": "2022-12-19T09:51:28.956149Z",
+      "url": "https://open-vsx.org/api/PROxZIMA/sweetdracula",
+      "verified": true,
+      "version": "1.0.9"
+    },
+    {
+      "deprecated": false,
+      "description": "A vibrant variant of Dracula theme with bold accents, colorful brackets, and balanced contrast for comfortable long coding sessions",
+      "displayName": "Dracula Colorful",
+      "downloadCount": 22623,
+      "files": {
+        "download": "https://open-vsx.org/api/nszihan/vscode-dracula-colorful/2.2.2/file/nszihan.vscode-dracula-colorful-2.2.2.vsix",
+        "signature": "https://open-vsx.org/api/nszihan/vscode-dracula-colorful/2.2.2/file/nszihan.vscode-dracula-colorful-2.2.2.sigzip",
+        "icon": "https://open-vsx.org/api/nszihan/vscode-dracula-colorful/2.2.2/file/icon.png",
+        "sha256": "https://open-vsx.org/api/nszihan/vscode-dracula-colorful/2.2.2/file/nszihan.vscode-dracula-colorful-2.2.2.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "vscode-dracula-colorful",
+      "namespace": "nszihan",
+      "timestamp": "2026-10-23T19:54:58.129893Z",
+      "url": "https://open-vsx.org/api/nszihan/vscode-dracula-colorful",
+      "verified": true,
+      "version": "2.2.2"
+    },
+    {
+      "deprecated": false,
+      "description": "Dracula At Night — A Dracula fork, with a darker flavor",
+      "displayName": "Dracula At Night",
+      "downloadCount": 18629,
+      "files": {
+        "sha256": "https://open-vsx.org/api/bceskavich/theme-dracula-at-night/2.6.0/file/bceskavich.theme-dracula-at-night-2.6.0.sha256",
+        "signature": "https://open-vsx.org/api/bceskavich/theme-dracula-at-night/2.6.0/file/bceskavich.theme-dracula-at-night-2.6.0.sigzip",
+        "download": "https://open-vsx.org/api/bceskavich/theme-dracula-at-night/2.6.0/file/bceskavich.theme-dracula-at-night-2.6.0.vsix",
+        "icon": "https://open-vsx.org/api/bceskavich/theme-dracula-at-night/2.6.0/file/dracula-at-night.png",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "theme-dracula-at-night",
+      "namespace": "bceskavich",
+      "timestamp": "2020-10-02T03:40:52.131125Z",
+      "url": "https://open-vsx.org/api/bceskavich/theme-dracula-at-night",
+      "verified": true,
+      "version": "2.6.0"
+    },
+    {
+      "averageRating": 5.0,
+      "deprecated": false,
+      "description": "Yet another Dracula Official Theme fork, but with colors switched to resemble Dark+",
+      "displayName": "Dracula Dark+",
+      "downloadCount": 17220,
+      "files": {
+        "sha256": "https://open-vsx.org/api/MateuszDrewniak/theme-dracula-dark-plus/2.24.4/file/MateuszDrewniak.theme-dracula-dark-plus-2.24.4.sha256",
+        "signature": "https://open-vsx.org/api/MateuszDrewniak/theme-dracula-dark-plus/2.24.4/file/MateuszDrewniak.theme-dracula-dark-plus-2.24.4.sigzip",
+        "download": "https://open-vsx.org/api/MateuszDrewniak/theme-dracula-dark-plus/2.24.4/file/MateuszDrewniak.theme-dracula-dark-plus-2.24.4.vsix",
+        "icon": "https://open-vsx.org/api/MateuszDrewniak/theme-dracula-dark-plus/2.24.4/file/icon.png",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "theme-dracula-dark-plus",
+      "namespace": "MateuszDrewniak",
+      "reviewCount": 1,
+      "timestamp": "2022-08-14T10:25:56.562629Z",
+      "url": "https://open-vsx.org/api/MateuszDrewniak/theme-dracula-dark-plus",
+      "verified": true,
+      "version": "2.24.4"
+    },
+    {
+      "averageRating": 4.5,
+      "deprecated": false,
+      "description": "Sweet Dracula + Monokai syntax highlighting",
+      "displayName": "Sweet Dracula Monokai",
+      "downloadCount": 13386,
+      "files": {
+        "icon": "https://open-vsx.org/api/lefd/sweetdracula-monokai/1.1.14/file/icon.png",
+        "download": "https://open-vsx.org/api/lefd/sweetdracula-monokai/1.1.14/file/lefd.sweetdracula-monokai-1.1.14.vsix",
+        "signature": "https://open-vsx.org/api/lefd/sweetdracula-monokai/1.1.14/file/lefd.sweetdracula-monokai-1.1.14.sigzip",
+        "sha256": "https://open-vsx.org/api/lefd/sweetdracula-monokai/1.1.14/file/lefd.sweetdracula-monokai-1.1.14.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "sweetdracula-monokai",
+      "namespace": "lefd",
+      "reviewCount": 2,
+      "timestamp": "2024-09-28T21:30:08.421136Z",
+      "url": "https://open-vsx.org/api/lefd/sweetdracula-monokai",
+      "verified": false,
+      "version": "1.1.14"
+    },
+    {
+      "deprecated": false,
+      "description": "Provides a dracula theme tailored towards the rust programming language. Use this extension in combination with the rust-analyzer plugin.",
+      "displayName": "Dracula For Rust Theme",
+      "downloadCount": 12536,
+      "files": {
+        "sha256": "https://open-vsx.org/api/dlahmad/dracula-for-rust-theme/0.0.4/file/dlahmad.dracula-for-rust-theme-0.0.4.sha256",
+        "signature": "https://open-vsx.org/api/dlahmad/dracula-for-rust-theme/0.0.4/file/dlahmad.dracula-for-rust-theme-0.0.4.sigzip",
+        "download": "https://open-vsx.org/api/dlahmad/dracula-for-rust-theme/0.0.4/file/dlahmad.dracula-for-rust-theme-0.0.4.vsix",
+        "icon": "https://open-vsx.org/api/dlahmad/dracula-for-rust-theme/0.0.4/file/icon.png",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "dracula-for-rust-theme",
+      "namespace": "dlahmad",
+      "timestamp": "2021-08-27T16:28:43.107256Z",
+      "url": "https://open-vsx.org/api/dlahmad/dracula-for-rust-theme",
+      "verified": true,
+      "version": "0.0.4"
+    },
+    {
+      "deprecated": false,
+      "description": "Dracula theme with Darker and Cleaner!",
+      "displayName": "Dracula Midnight",
+      "downloadCount": 9572,
+      "files": {
+        "download": "https://open-vsx.org/api/realeinar/theme-dracula-midnight/1.0.0/file/realeinar.theme-dracula-midnight-1.0.0.vsix",
+        "icon": "https://open-vsx.org/api/realeinar/theme-dracula-midnight/1.0.0/file/icon.png",
+        "sha256": "https://open-vsx.org/api/realeinar/theme-dracula-midnight/1.0.0/file/realeinar.theme-dracula-midnight-1.0.0.sha256",
+        "signature": "https://open-vsx.org/api/realeinar/theme-dracula-midnight/1.0.0/file/realeinar.theme-dracula-midnight-1.0.0.sigzip",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "theme-dracula-midnight",
+      "namespace": "realeinar",
+      "timestamp": "2024-05-05T17:48:38.527922Z",
+      "url": "https://open-vsx.org/api/realeinar/theme-dracula-midnight",
+      "verified": true,
+      "version": "1.0.0"
+    },
+    {
+      "averageRating": 5.0,
+      "deprecated": false,
+      "description": "A series of simple VSCode Theme",
+      "displayName": "Owlet",
+      "downloadCount": 8665,
+      "files": {
+        "sha256": "https://open-vsx.org/api/itsjonq/owlet/0.1.22/file/itsjonq.owlet-0.1.22.sha256",
+        "signature": "https://open-vsx.org/api/itsjonq/owlet/0.1.22/file/itsjonq.owlet-0.1.22.sigzip",
+        "download": "https://open-vsx.org/api/itsjonq/owlet/0.1.22/file/itsjonq.owlet-0.1.22.vsix",
+        "icon": "https://open-vsx.org/api/itsjonq/owlet/0.1.22/file/owlet.png",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "owlet",
+      "namespace": "itsjonq",
+      "reviewCount": 2,
+      "timestamp": "2021-02-16T03:39:02.187325Z",
+      "url": "https://open-vsx.org/api/itsjonq/owlet",
+      "verified": true,
+      "version": "0.1.22"
+    },
+    {
+      "averageRating": 5.0,
+      "deprecated": false,
+      "description": "Just another Dracula theme fork, optimized for ligatures and italic fonts.",
+      "displayName": "Draculinho",
+      "downloadCount": 6922,
+      "files": {
+        "download": "https://open-vsx.org/api/eduardoborges/draculinho/1.11.0/file/eduardoborges.draculinho-1.11.0.vsix",
+        "signature": "https://open-vsx.org/api/eduardoborges/draculinho/1.11.0/file/eduardoborges.draculinho-1.11.0.sigzip",
+        "icon": "https://open-vsx.org/api/eduardoborges/draculinho/1.11.0/file/logo.png",
+        "sha256": "https://open-vsx.org/api/eduardoborges/draculinho/1.11.0/file/eduardoborges.draculinho-1.11.0.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "draculinho",
+      "namespace": "eduardoborges",
+      "reviewCount": 1,
+      "timestamp": "2026-10-26T02:44:20.489925Z",
+      "url": "https://open-vsx.org/api/eduardoborges/draculinho",
+      "verified": true,
+      "version": "1.11.0"
+    },
+    {
+      "deprecated": false,
+      "description": "Extending dracula with purple colors",
+      "displayName": "Dracula Purple",
+      "downloadCount": 6175,
+      "files": {
+        "download": "https://open-vsx.org/api/cbasdev/dracula-purple/1.5.3/file/cbasdev.dracula-purple-1.5.3.vsix",
+        "signature": "https://open-vsx.org/api/cbasdev/dracula-purple/1.5.3/file/cbasdev.dracula-purple-1.5.3.sigzip",
+        "icon": "https://open-vsx.org/api/cbasdev/dracula-purple/1.5.3/file/dracula.ico",
+        "sha256": "https://open-vsx.org/api/cbasdev/dracula-purple/1.5.3/file/cbasdev.dracula-purple-1.5.3.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "dracula-purple",
+      "namespace": "cbasdev",
+      "timestamp": "2025-11-15T04:36:07.231966Z",
+      "url": "https://open-vsx.org/api/cbasdev/dracula-purple",
+      "verified": false,
+      "version": "1.5.3"
+    },
+    {
+      "deprecated": false,
+      "description": "Ether Themes — 25 WCAG-validated dark color themes, 496 React/Next.js/TypeScript snippets, and bundled Astro, Vue, Svelte, MDX, Angular, Kotlin, AIDL, ProGuard & Dotenv syntax highlighting for VS Code and Cursor.",
+      "displayName": "Ether Themes",
+      "downloadCount": 5616,
+      "files": {
+        "sha256": "https://open-vsx.org/api/Priyaank/ether-theme/1.0.21/file/Priyaank.ether-theme-1.0.21.sha256",
+        "download": "https://open-vsx.org/api/Priyaank/ether-theme/1.0.21/file/Priyaank.ether-theme-1.0.21.vsix",
+        "signature": "https://open-vsx.org/api/Priyaank/ether-theme/1.0.21/file/Priyaank.ether-theme-1.0.21.sigzip",
+        "icon": "https://open-vsx.org/api/Priyaank/ether-theme/1.0.21/file/icon.png",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "ether-theme",
+      "namespace": "Priyaank",
+      "timestamp": "2026-07-10T12:20:47.866510Z",
+      "url": "https://open-vsx.org/api/Priyaank/ether-theme",
+      "verified": true,
+      "version": "1.0.21"
+    },
+    {
+      "deprecated": false,
+      "description": "Patched syntax highlighting for default themes in VSCode.",
+      "displayName": "Dracula Highlighting",
+      "downloadCount": 5212,
+      "files": {
+        "download": "https://open-vsx.org/api/Mopsgamer/dracula-highlighting/0.3.0/file/Mopsgamer.dracula-highlighting-0.3.0.vsix",
+        "signature": "https://open-vsx.org/api/Mopsgamer/dracula-highlighting/0.3.0/file/Mopsgamer.dracula-highlighting-0.3.0.sigzip",
+        "icon": "https://open-vsx.org/api/Mopsgamer/dracula-highlighting/0.3.0/file/icon.png",
+        "sha256": "https://open-vsx.org/api/Mopsgamer/dracula-highlighting/0.3.0/file/Mopsgamer.dracula-highlighting-0.3.0.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "dracula-highlighting",
+      "namespace": "Mopsgamer",
+      "timestamp": "2026-08-16T15:48:05.820232Z",
+      "url": "https://open-vsx.org/api/Mopsgamer/dracula-highlighting",
+      "verified": true,
+      "version": "0.3.0"
+    },
+    {
+      "deprecated": false,
+      "description": "My personal take on classic/famous themes",
+      "displayName": "GrayJack Themes",
+      "downloadCount": 4824,
+      "files": {
+        "download": "https://open-vsx.org/api/GrayJack/monokai-grayjack/1.4.0/file/GrayJack.monokai-grayjack-1.4.0.vsix",
+        "signature": "https://open-vsx.org/api/GrayJack/monokai-grayjack/1.4.0/file/GrayJack.monokai-grayjack-1.4.0.sigzip",
+        "icon": "https://open-vsx.org/api/GrayJack/monokai-grayjack/1.4.0/file/icon.png",
+        "sha256": "https://open-vsx.org/api/GrayJack/monokai-grayjack/1.4.0/file/GrayJack.monokai-grayjack-1.4.0.sha256",
+        "publicKey": "https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a"
+      },
+      "name": "monokai-grayjack",
+      "namespace": "GrayJack",
+      "timestamp": "2025-03-01T00:12:03.297690Z",
+      "url": "https://open-vsx.org/api/GrayJack/monokai-grayjack",
+      "verified": true,
+      "version": "1.4.0"
+    }
+  ],
+  "offset": 0,
+  "totalSize": 56
+}

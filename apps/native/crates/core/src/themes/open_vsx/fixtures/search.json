@@ -1,0 +1,8 @@
+{
+  "extensions": [
+    { "namespace": "demo", "name": "theme" },
+    { "namespace": "icons", "name": "theme" },
+    { "name": "missing publisher" },
+    null
+  ]
+}
