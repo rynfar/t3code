@@ -48,7 +48,7 @@ impl TerminalPreview {
         let visible_rows = transcript.split("\r\n").count() as u16;
         let mut emulator = Emulator::new(Grid::new(100, visible_rows), colors::theme_colors(cx));
         emulator.feed(transcript.as_bytes());
-        let focus = cx.focus_handle();
+        let focus = cx.focus_handle().tab_stop(true);
         #[cfg(feature = "snapshot")]
         crate::snapshot::register_focus("terminal-font-preview", focus.clone(), cx);
         Self {
@@ -77,6 +77,19 @@ impl TerminalPreview {
         if stroke.key == "tab" {
             return;
         }
+        self.key_input(stroke, cx);
+        if stroke.modifiers.platform
+            || stroke.modifiers.control
+            || matches!(
+                stroke.key.as_str(),
+                "enter" | "backspace" | "left" | "right" | "up" | "down"
+            )
+        {
+            cx.stop_propagation();
+        }
+    }
+
+    fn key_input(&mut self, stroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
         let key = KeyInput {
             key: &stroke.key,
             key_char: stroke.key_char.as_deref(),
@@ -87,15 +100,20 @@ impl TerminalPreview {
         };
         if let Some(bytes) = encode_key(&key, false) {
             self.input(&String::from_utf8_lossy(&bytes), cx);
+            true
+        } else {
+            false
         }
-        if stroke.modifiers.platform
-            || stroke.modifiers.control
-            || matches!(
-                stroke.key.as_str(),
-                "enter" | "backspace" | "left" | "right" | "up" | "down"
-            )
+    }
+
+    pub(super) fn bound_key(&mut self, stroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+        if !self.key_input(stroke, cx)
+            && !stroke.modifiers.platform
+            && !stroke.modifiers.control
+            && !stroke.modifiers.alt
+            && let Some(text) = &stroke.key_char
         {
-            cx.stop_propagation();
+            self.input(text, cx);
         }
     }
 }
@@ -133,6 +151,7 @@ impl Render for TerminalPreview {
         let p = palette(cx);
         div()
             .id("terminal-font-preview")
+            .key_context(super::keys::CONTEXT)
             .track_focus(&self.focus)
             .w_full()
             .h(px(line_height * self.visible_rows as f32
@@ -248,3 +267,7 @@ impl EntityInputHandler for TerminalPreview {
         None
     }
 }
+
+#[cfg(all(test, feature = "snapshot"))]
+#[path = "font_preview_tests.rs"]
+mod tests;

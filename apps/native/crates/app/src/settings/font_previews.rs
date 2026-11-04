@@ -22,6 +22,9 @@ use crate::{
     theme::{self, hsla, palette},
 };
 
+#[path = "font_preview_keys.rs"]
+mod keys;
+
 #[path = "font_preview_terminal.rs"]
 mod terminal;
 
@@ -33,6 +36,7 @@ pub(super) struct FontPreviews {
     terminal: Entity<terminal::TerminalPreview>,
     lines: Vec<(DiffLine, SyntaxHighlighter)>,
     _prompt_change: Subscription,
+    _keys: Subscription,
 }
 
 impl FontPreviews {
@@ -57,6 +61,7 @@ impl FontPreviews {
             }
         });
         let terminal = cx.new(|cx| terminal::TerminalPreview::new(window, cx));
+        let keys = keys::install(prompt.clone(), terminal.clone(), cx);
         let ParsedPatch::Files(files) = parse_patch(PATCH) else {
             unreachable!("preview patch")
         };
@@ -74,6 +79,7 @@ impl FontPreviews {
             terminal,
             lines,
             _prompt_change: repaint,
+            _keys: keys,
         }
     }
 
@@ -83,34 +89,22 @@ impl FontPreviews {
     }
 
     pub fn render(&self, role: FontRole, cx: &App) -> AnyElement {
-        let p = palette(cx);
         match role {
             FontRole::Interface | FontRole::Prompt => {
                 let size = theme::font_size(FontRole::Prompt, cx);
-                // The native composer edits skills and serialized file links as plain text too.
-                div()
-                    .mt(theme::rem(4.))
-                    .mb(theme::rem(8.))
-                    .rounded(theme::rem(8.))
-                    .border_1()
-                    .border_color(hsla(p.border))
-                    .bg(hsla(p.background))
-                    .px(theme::rem(12.))
-                    .py(theme::rem(8.))
-                    .capture_action(|_: &Copy, _, cx| cx.stop_propagation())
-                    .capture_action(|_: &Cut, _, cx| cx.stop_propagation())
-                    .capture_action(|_: &Paste, _, cx| cx.stop_propagation())
-                    .child(
-                        Textarea::new(&self.prompt)
-                            .appearance(false)
-                            .aria_label("Prompt font preview")
-                            .context_menu(|menu, _, _| menu)
-                            .font_family(theme::font_family(FontRole::Prompt, cx))
-                            .text_size(px(size))
-                            .line_height(px(size * 1.625)),
-                    )
-                    .into_any_element()
+                prompt_surface(
+                    Textarea::new(&self.prompt)
+                        .appearance(false)
+                        .aria_label("Prompt font preview")
+                        .context_menu(|menu, _, _| menu)
+                        .font_family(theme::font_family(FontRole::Prompt, cx))
+                        .text_size(px(size))
+                        .line_height(px(size * 1.625)),
+                    cx,
+                )
+                .into_any_element()
             }
+
             FontRole::Code => self.code(cx),
             FontRole::Terminal => div()
                 .mt(theme::rem(4.))
@@ -208,61 +202,20 @@ impl FontPreviews {
     }
 }
 
-#[cfg(all(test, feature = "snapshot"))]
-mod tests {
-    use super::*;
-    use gpui::TestAppContext;
-
-    #[gpui::test]
-    fn typing_paths_in_previews_keeps_focus_out_of_settings_search(cx: &mut TestAppContext) {
-        let home = std::env::temp_dir().join(format!("t3-font-previews-{}", uuid::Uuid::new_v4()));
-        t3_client::store::use_home(home);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let state = cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::theme::init(cx);
-            let state = cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx));
-            crate::settings::init(state.clone(), cx);
-            state
-        });
-        let window = cx.add_window(|_, _| gpui::Empty);
-        let view = window
-            .update(cx, |_, window, cx| {
-                cx.new(|cx| {
-                    SettingsView::new(
-                        state,
-                        t3_core::settings::search::Section::Appearance,
-                        None,
-                        window,
-                        cx,
-                    )
-                })
-            })
-            .unwrap();
-        window
-            .update(cx, |_, window, cx| {
-                view.update(cx, |view, cx| {
-                    let slash = gpui::KeyDownEvent {
-                        keystroke: gpui::Keystroke::parse("/").unwrap(),
-                        is_held: false,
-                        prefer_character_input: false,
-                    };
-                    let prompt = view.typography.previews.prompt.read(cx).focus_handle(cx);
-                    let terminal = view.typography.previews.terminal.read(cx).focus_handle(cx);
-                    for focus in [prompt, terminal] {
-                        focus.focus(window, cx);
-                        view.on_key_down(&slash, window, cx);
-                        assert!(
-                            focus.is_focused(window),
-                            "typing a path must keep preview focus"
-                        );
-                        assert!(!view.search.read(cx).focus_handle(cx).is_focused(window));
-                    }
-                })
-            })
-            .unwrap();
-    }
+pub(super) fn prompt_surface(editor: impl IntoElement, cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    div()
+        .key_context(keys::CONTEXT)
+        .mt(theme::rem(4.))
+        .mb(theme::rem(8.))
+        .rounded(theme::rem(8.))
+        .border_1()
+        .border_color(hsla(p.border))
+        .bg(hsla(p.background))
+        .px(theme::rem(12.))
+        .py(theme::rem(8.))
+        .capture_action(|_: &Copy, _, cx| cx.stop_propagation())
+        .capture_action(|_: &Cut, _, cx| cx.stop_propagation())
+        .capture_action(|_: &Paste, _, cx| cx.stop_propagation())
+        .child(editor)
 }
