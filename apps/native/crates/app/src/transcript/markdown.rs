@@ -80,14 +80,14 @@ pub struct MarkdownState {
 }
 
 impl MarkdownState {
-    pub(crate) fn owns_selection(&self, source: &str, quote: &str, cx: &App) -> bool {
-        if quote.trim().is_empty() { return false; }
+    pub(crate) fn selection_text(&self, source: &str, quote: &str, cx: &App) -> Option<String> {
+        if quote.trim().is_empty() { return None; }
         let document = self.document.as_ref().filter(|_| self.media).map(|document| document.read().unwrap().clone());
-        if document.as_ref().is_some_and(|document| &**document.source() != source) { return false; }
+        if document.as_ref().is_some_and(|document| &**document.source() != source) { return None; }
         let parent = self.entity.read(cx).selected_text();
         match document {
-            Some(document) => self.selections.matches_quote(&document, parent, quote, cx),
-            None => parent == quote,
+            Some(document) => self.selections.selection_text(&document, parent, quote, cx),
+            None => (parent == quote).then_some(parent),
         }
     }
 }
@@ -328,6 +328,39 @@ mod context_tests {
         state.entity.update(cx, |parent, cx| parent.clear_selection(cx));
         drop(child);
         cx.update(|cx| assert!(cite(&state, &source, "right\n", cx).is_none()));
+        for (source, parent_text, parts, expected, range) in [
+            ("Body before.\n\n## left ![chart](a.png) right", "Body before.", vec![("## left", 0, "left ")], "Body before. left", (0, 17)),
+            ("🦀 before.\n\n## left ![chart](a.png) right", "🦀 before.", vec![("## left", 0, "left ")], "🦀 before. left", (0, 15)),
+            ("left\n\n## left ![chart](a.png) right", "left", vec![("## left", 0, "left "), ("## left", 2, " right")], "left left right", (0, 15)),
+            ("Before.\n\n## left ![chart](a.png) right\n\nAfter.", "Before.\n\nleft  right\n\nAfter.", vec![("## left", 0, "left "), ("## left", 2, " right")], "Before. left right After.", (0, 25)),
+            ("## one ![chart](a.png) tail\n\nBody between.\n\n## next ![chart](a.png) end", "", vec![("## one", 2, " tail"), ("## next", 0, "next ")], "tail Body between. next", (4, 27)),
+            ("## one ![chart](a.png) tail\n\nBody between.\n\n## next ![chart](a.png) end", "Body between.", vec![("## one", 2, " tail"), ("## next", 0, "next ")], "tail Body between. next", (4, 27)),
+        ] {
+            let source: Arc<str> = source.into();
+            let parent = cx.update(|cx| cx.new(|cx| TextViewState::markdown(parent_text, cx)));
+            let children: Vec<_> = parts.iter().map(|(_, _, text)| cx.update(|cx| cx.new(|cx| TextViewState::markdown(text, cx)))).collect();
+            cx.run_until_parked();
+            let selections = super::super::media::MediaSelections::default();
+            for ((block, run, text), child) in parts.iter().zip(&children) {
+                selections.register((source.find(block).unwrap(), *run), child, text);
+                child.update(cx, |child, cx| child.select_all(cx));
+            }
+            parent.update(cx, |parent, cx| parent.select_all(cx));
+            let document = super::super::media::media_document(source.clone());
+            let state = MarkdownState { entity: parent, media: true, extensions: None, selections, document: Some(document) };
+            cx.update(|cx| {
+                let mut participants: Vec<_> = children.iter().map(|child| child.read(cx).selected_text()).collect();
+                let parent = state.entity.read(cx).selected_text();
+                if !parent.trim().is_empty() { participants.push(parent); }
+                let quote = participants.join("\n");
+                let citation = cite(&state, &source, &quote, cx).unwrap_or_else(|| panic!("Cite must restore source order: {source:?}; {quote:?}"));
+                assert_eq!(t3_core::assistant_citations::normalize(&citation.text), expected);
+                assert_eq!((citation.start, citation.end), range);
+                assert!(citation.valid());
+                assert_eq!((&*citation.environment_id, &*citation.thread_id, &*citation.message_id), ("environment", "thread", "message"));
+                assert!(cite(&state, &source, &format!("{quote}\nother message"), cx).is_none());
+            });
+        }
     }
     #[test]
     fn user_rows_reuse_context_parsing_across_renders_and_refresh_record_payloads() {

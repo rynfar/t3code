@@ -29,8 +29,8 @@ impl CitationUi {
 
 impl ThreadView {
     pub(crate) fn citation_from_markdown_selection(selected: &MarkdownState, source: &str, quote: &str, identity: (String, String, String), cx: &gpui::App) -> Option<Citation> {
-        if !selected.owns_selection(source, quote, cx) { return None; }
-        Citation::from_rendered_selection(identity.0, identity.1, identity.2, &rules::markdown_text(source), quote)
+        let quote = selected.selection_text(source, quote, cx)?;
+        Citation::from_rendered_selection(identity.0, identity.1, identity.2, &rules::markdown_text(source), &quote)
     }
 
     pub(crate) fn capture_citation_selection(
