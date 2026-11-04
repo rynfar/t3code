@@ -53,7 +53,7 @@ impl Composer {
     }
 
     fn question_index(&self, input: &PendingUserInput) -> usize {
-        let index = self.answers.get(&input.request_id).map(|answers| answers.index).unwrap_or(0);
+        let index = self.answers.get(&self.answer_key(&input.request_id)).map(|answers| answers.index).unwrap_or(0);
         index.min(input.questions.len().saturating_sub(1))
     }
 
@@ -62,15 +62,15 @@ impl Composer {
         Some((input.request_id.clone(), input.questions.get(self.question_index(input))?.clone()))
     }
 
-    pub(super) fn progress(&self) -> Option<requests::Progress> {
+    pub(super) fn progress(&self, cx: &gpui::App) -> Option<requests::Progress> {
         let input = self.active_input()?;
-        let answers = self.answers.get(&input.request_id)?;
-        Some(requests::progress(&input.questions, &answers.drafts, answers.index))
+        let answers = self.answers.get(&self.answer_key(&input.request_id))?;
+        Some(requests::progress(&input.questions, &self.question_answer_drafts(input, cx), answers.index))
     }
 
     /// Enters or leaves answering when the first pending question changes.
     pub(super) fn sync_answering(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.active_input().map(|input| input.request_id.clone());
+        let active = self.active_input().map(|input| self.answer_key(&input.request_id));
         if active == self.answering {
             return;
         }
@@ -97,8 +97,9 @@ impl Composer {
 
     /// Every question change lands here, so it also drops a pending auto-advance.
     fn show_active_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_send();
         self.auto_advance = None;
-        let text = self.progress().map(|progress| progress.custom_answer).unwrap_or_default();
+        let text = self.progress(cx).map(|progress| progress.custom_answer).unwrap_or_default();
         self.set_prompt(&text, window, cx);
         if self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer()) {
             window.focus(&self.question_focus, cx);
@@ -108,13 +109,15 @@ impl Composer {
     /// `onAdvanceActivePendingUserInput`: next question, or submit on the last.
     pub(super) fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(input) = self.active_input().cloned() else { return };
-        if !input.can_respond() || self.responding.contains(&input.request_id) {
+        if !input.can_respond() || self.question_responding(&input.request_id, cx) {
             return;
         }
-        let Some(answers) = self.answers.get_mut(&input.request_id) else { return };
-        let progress = requests::progress(&input.questions, &answers.drafts, answers.index);
+        let drafts = self.question_answer_drafts(&input, cx);
+        let key = self.answer_key(&input.request_id);
+        let Some(answers) = self.answers.get_mut(&key) else { return };
+        let progress = requests::progress(&input.questions, &drafts, answers.index);
         if progress.is_last_question {
-            if let Some(built) = requests::build_answers(&input.questions, &answers.drafts) {
+            if let Some(built) = requests::build_answers(&input.questions, &drafts) {
                 self.submit_answers(input.request_id, built, cx);
             }
             return;
@@ -127,6 +130,7 @@ impl Composer {
     }
 
     pub(super) fn previous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
         let Some(answers) = self.answering.as_ref().and_then(|request_id| self.answers.get_mut(request_id)) else { return };
         answers.index = answers.index.saturating_sub(1);
         self.show_active_answer(window, cx);
@@ -136,10 +140,11 @@ impl Composer {
     /// Picks an option. Single-select questions move on once the pick settles, as the web does.
     pub(super) fn toggle_option(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some((request_id, question)) = self.active_question() else { return };
-        if self.responding.contains(&request_id) {
+        if self.question_responding(&request_id, cx) {
             return;
         }
-        let Some(answers) = self.answers.get_mut(&request_id) else { return };
+        let key = self.answer_key(&request_id);
+        let Some(answers) = self.answers.get_mut(&key) else { return };
         let draft = answers.drafts.get(&question.id);
         let displaced = draft.and_then(|draft| draft.custom.clone()).unwrap_or_default();
         let next = requests::toggle_option(&question, draft, &value);
@@ -149,13 +154,13 @@ impl Composer {
         }
         self.set_prompt("", window, cx);
         if !question.multi_select {
-            let picked = (request_id, question.id);
+            let picked = (self.answer_key(&request_id), question.id);
             self.auto_advance = Some(cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.auto_advance = None;
-                    let active = this.active_question().map(|(request_id, question)| (request_id, question.id));
-                    if active.as_ref() == Some(&picked) && !this.responding.contains(&picked.0) {
+                    let active = this.active_question().map(|(request_id, question)| (this.answer_key(&request_id), question.id));
+                    if active.as_ref() == Some(&picked) {
                         this.advance(window, cx);
                     }
                 });
@@ -166,20 +171,22 @@ impl Composer {
 
     fn submit_answers(&mut self, request_id: String, answers: serde_json::Map<String, serde_json::Value>, cx: &mut Context<Self>) {
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
-        if !self.responding.insert(request_id.clone()) {
-            return;
-        }
-        let command = commands::respond_to_user_input(&uuid_v4(), &thread_id, &request_id, answers);
-        self.run_request(request_id, command, "Failed to submit user input.", cx);
+        let Some(input) = self.active_input().filter(|input| input.request_id == request_id && input.can_respond()).cloned() else { return };
+        if !self.can_answer(cx) || self.question_responding(&request_id, cx) { return; }
+        let Some(attachments) = self.question_response_attachments(&input, cx) else { return };
+        let key = self.answer_key(&request_id);
+        self.responding.insert(key.clone());
+        let command = commands::respond_to_user_input_with_attachments(&uuid_v4(), &thread_id, &request_id, answers, attachments);
+        self.run_question_request(key, command, "Failed to submit user input.", cx);
     }
 
     fn dismiss(&mut self, request_id: String, cx: &mut Context<Self>) {
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
-        if !self.responding.insert(request_id.clone()) {
-            return;
-        }
+        if !self.can_answer(cx) || self.question_responding(&request_id, cx) || !self.active_input().is_some_and(|input| input.request_id == request_id && input.can_respond() && input.dismissible) { return; }
+        let key = self.answer_key(&request_id);
+        self.responding.insert(key.clone());
         let command = commands::dismiss_user_input(&uuid_v4(), &thread_id, &request_id);
-        self.run_request(request_id, command, "Failed to dismiss the question.", cx);
+        self.run_question_request(key, command, "Failed to dismiss the question.", cx);
     }
 
     /// The digit shortcuts (1–9) pick options while the prompt is not focused.
@@ -320,8 +327,8 @@ impl Composer {
         let p = palette(cx);
         let index = self.question_index(input);
         let Some(question) = input.questions.get(index) else { return div().into_any_element() };
-        let responding = self.responding.contains(&input.request_id) || !input.can_respond();
-        let drafts = self.answers.get(&input.request_id).map(|answers| &answers.drafts);
+        let responding = self.question_responding(&input.request_id, cx) || !input.can_respond();
+        let drafts = self.answers.get(&self.answer_key(&input.request_id)).map(|answers| &answers.drafts);
         let draft = drafts.and_then(|drafts| drafts.get(&question.id));
         let request_id = input.request_id.clone();
         let content = v_flex()

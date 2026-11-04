@@ -102,6 +102,11 @@ fn runtime_request_responses_match_the_respond_schema() {
     let answer = respond_to_user_input("c2", "t1", "r2", answers);
     assert_eq!(answer["answers"], json!({ "q1": ["a", "b"] }));
     assert!(answer.get("decision").is_none());
+    assert!(answer.get("attachmentsByQuestionId").is_none());
+    let uploaded = json!({"type":"file","id":"uploaded","name":"answer.txt","mimeType":"text/plain","sizeBytes":12});
+    let answer = respond_to_user_input_with_attachments("c2", "t1", "r2", serde_json::from_value(json!({"q":""})).unwrap(), serde_json::from_value(json!({"q":[uploaded.clone()]})).unwrap());
+    assert_eq!(answer["answers"], json!({"q":""}));
+    assert_eq!(answer["attachmentsByQuestionId"], json!({"q":[uploaded]}));
     assert_eq!(dismiss_user_input("c3", "t1", "r2")["type"], "thread.user-input.dismiss");
 }
 

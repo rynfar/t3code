@@ -6,6 +6,9 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+mod question_attachments;
+#[cfg(feature = "snapshot")]
+pub(crate) use question_attachments::QuestionCommandSpy;
 #[cfg(feature = "snapshot")]
 pub(crate) use attachments::Fixture as AttachmentFixture;
 pub(crate) mod imports;
@@ -74,6 +77,7 @@ pub(crate) fn runtime_mode_icon(mode: RuntimeMode) -> Icon {
 enum Target {
     Thread(String),
     Draft(String),
+    Question(requests::attachments::QuestionDraftKey),
 }
 
 /// The user's choices for one target, before they are sent.
@@ -88,6 +92,7 @@ struct Choices {
 /// do not repaint it.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Snapshot {
+    environment: String,
     target: Option<Target>,
     project_id: Option<String>,
     running: bool,
@@ -341,6 +346,7 @@ impl Composer {
 
     fn read_snapshot(&self, cx: &App) -> Snapshot {
         let state = self.state.read(cx);
+        let environment = state.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).filter(|id| !id.is_empty()).or_else(|| state.environment().map(str::to_owned)).unwrap_or_default();
         let target = match (self.fixed.as_ref().or(state.selected_thread.as_ref()), &state.draft_project) {
             (Some(id), _) => Some(Target::Thread(id.clone())),
             (None, Some(project)) => Some(Target::Draft(project.clone())),
@@ -348,12 +354,12 @@ impl Composer {
         };
         let Some(Target::Thread(thread_id)) = &target else {
             let project_id = state.draft_project.clone();
-            return Snapshot { target, project_id, ..Snapshot::default() };
+            return Snapshot { environment, target, project_id, ..Snapshot::default() };
         };
         let shell = state.thread_shell(thread_id);
         let projection = state.thread_state(thread_id).projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
         let pending_key = projection.map(PendingKey::of).unwrap_or_default();
-        let pending = if pending_key == self.snapshot.pending_key {
+        let pending = if pending_key == self.snapshot.pending_key && environment == self.snapshot.environment && target == self.snapshot.target {
             self.snapshot.pending.clone()
         } else {
             projection.map(requests::pending_requests).unwrap_or_default()
@@ -362,6 +368,7 @@ impl Composer {
         let setup = self.setup.as_ref().and_then(|setup| setup.read(cx).view_for(Some(thread_id)));
         let (setup_blocks_send, setup_queues) = setup.map_or((false, false), |view| (view.blocks_send, view.queues_behind_setup));
         Snapshot {
+            environment,
             setup_blocks_send,
             setup_queues,
             project_id: shell.map(|thread| thread.project_id.clone()),
@@ -385,15 +392,18 @@ impl Composer {
 
     /// Re-reads app state. Notifies only when something the composer shows changed.
     fn refresh(&mut self, config_changed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.watch_question_grants(cx);
         let next = self.read_snapshot(cx);
+        let pruned = self.prune_question_attachments(&next.environment, cx);
         if self.pending_send.is_pending() && self.question_revision(cx) != self.pending_questions && self.cancel_pending_send() { cx.notify(); }
         if next.target != self.snapshot.target || next.pending.user_inputs != self.snapshot.pending.user_inputs {
             self.cancel_pending_send();
         }
         if next == self.snapshot && !config_changed {
+            if pruned { cx.notify(); }
             return;
         }
-        if next.target != self.snapshot.target {
+        if next.target != self.snapshot.target || next.environment != self.snapshot.environment {
             if matches!(next.target, Some(Target::Draft(_))) && matches!(self.snapshot.target, Some(Target::Thread(_))) {
                 let resolved = self.resolve(cx);
                 self.carry = (resolved.model, Some(resolved.interaction_mode));
@@ -414,9 +424,15 @@ impl Composer {
         // `pruneResolvedUserInputDrafts`: only this thread's resolved drafts go; others wait.
         let pending_ids: Vec<&String> = next.pending.user_inputs.iter().map(|input| &input.request_id).collect();
         if let (Some(Target::Thread(thread_id)), true) = (&next.target, next.loaded) {
-            self.answers.retain(|request_id, answers| answers.thread_id != *thread_id || pending_ids.contains(&request_id));
+            self.answers.retain(|key, answers| {
+                let same_environment = serde_json::from_str::<Vec<String>>(key).ok().is_some_and(|parts| parts.first() == Some(&next.environment));
+                !same_environment || answers.thread_id != *thread_id || pending_ids.iter().any(|id| key == &Self::answer_key_for(&next.environment, thread_id, id))
+            });
         }
         self.responding.retain(|request_id| {
+            if let Ok(parts) = serde_json::from_str::<Vec<String>>(request_id) {
+                return parts.len() == 3 && (!next.loaded || parts[0] != next.environment || Some(&parts[1]) != next.target.as_ref().and_then(|target| if let Target::Thread(id) = target { Some(id) } else { None }) || pending_ids.iter().any(|id| **id == parts[2]));
+            }
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
@@ -684,7 +700,8 @@ impl Composer {
         let answering = self.active_question();
         if let Some((request_id, question)) = &answering {
             let thread_id = self.thread_id().unwrap_or_default();
-            let answers = self.answers.entry(request_id.clone()).or_insert_with(|| Answers { thread_id, ..Answers::default() });
+            let answer_key = self.answer_key(request_id);
+            let answers = self.answers.entry(answer_key).or_insert_with(|| Answers { thread_id, ..Answers::default() });
             let next = requests::set_custom_answer(question, answers.drafts.get(&question.id), &text);
             answers.drafts.insert(question.id.clone(), next);
         }
@@ -712,6 +729,6 @@ const AUTO_ADVANCE: Duration = Duration::from_millis(200);
 #[cfg(feature = "snapshot")]
 impl Composer {
     pub(crate) fn snapshot_audit(&self, submissions: usize, cx: &App) -> serde_json::Value {
-        serde_json::json!({"submissions": submissions, "prompt": self.prompt(cx), "workspace": self.selected_workspace(), "menuCwd": self.menu_cwd(cx)})
+        serde_json::json!({"submissions": submissions, "prompt": self.prompt(cx), "workspace": self.selected_workspace(), "menuCwd": self.menu_cwd(cx), "questionProgress": self.progress(cx).map(|progress| serde_json::json!({"index":progress.question_index,"complete":progress.is_complete,"advance":progress.can_advance})), "regularAttachmentCount": self.snapshot.target.as_ref().map_or(0, |target| self.staged_for(target).len()), "activeAttachmentCount":self.staged().len(), "regularPrompt":self.draft_prompt(cx)})
     }
 }

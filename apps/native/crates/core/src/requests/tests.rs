@@ -212,3 +212,18 @@ fn the_pending_key_changes_only_with_what_pending_requests_read() {
     let prompt = item("i1", json!({"type": "approval_request", "requestId": "a1", "requestKind": "command", "prompt": "rm -rf"}));
     assert_ne!(PendingKey::of(&projection(requests(), vec![prompt])), key);
 }
+
+#[test]
+fn attachments_complete_only_custom_questions_and_block_even_selected_answers_until_ready() {
+    for multi in [false, true] {
+        let mut q = question(multi, None, None);
+        let mut draft = DraftAnswer { attachment_count: 1, ..Default::default() };
+        assert_eq!(resolve_answer(&q, Some(&draft)), Some(Answer::Text(String::new())));
+        draft = toggle_option(&q, Some(&draft), "Red");
+        draft.attachments_blocked = true;
+        assert_eq!(resolve_answer(&q, Some(&draft)), None);
+        q.allow_custom_answer = Some(false);
+        draft = DraftAnswer { attachment_count: 1, ..Default::default() };
+        assert_eq!(resolve_answer(&q, Some(&draft)), None);
+    }
+}
