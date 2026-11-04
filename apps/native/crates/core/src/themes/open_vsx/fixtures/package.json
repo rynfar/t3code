@@ -1,0 +1,15 @@
+{
+  "name": "theme",
+  "version": "1.0.0",
+  "license": "MIT",
+  "publisher": "demo",
+  "contributes": {
+    "themes": [
+      {
+        "label": "Demo Dark",
+        "uiTheme": "vs-dark",
+        "path": "theme.json"
+      }
+    ]
+  }
+}

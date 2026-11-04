@@ -2,6 +2,9 @@
 use super::*;
 
 pub fn pair_vscode_themes(themes: Vec<ThemeDefinition>) -> Vec<ThemeDefinition> {
+    pair_vscode_themes_with(themes, |_, _, theme| theme.id.clone())
+}
+pub(super) fn pair_vscode_themes_with(themes: Vec<ThemeDefinition>, paired_id: impl Fn(&ThemeDefinition, &ThemeDefinition, &ThemeDefinition) -> String) -> Vec<ThemeDefinition> {
     struct Group {
         label: String,
         order: usize,
@@ -60,7 +63,8 @@ pub fn pair_vscode_themes(themes: Vec<ThemeDefinition>) -> Vec<ThemeDefinition> 
     {
         if light.len() == 1 && dark.len() == 1 {
             let file = serde_json::json!({"version":1,"name":key,"appearance":"light","colors":light[0].colors,"variants":{"dark":dark[0].colors}});
-            if let Ok(paired) = decode(&file, false) {
+            if let Ok(mut paired) = decode(&file, false) {
+                paired.id = paired_id(&light[0], &dark[0], &paired);
                 out.push((order, paired));
                 continue;
             }
