@@ -22,12 +22,16 @@ fn tool_input(input: Value) -> ToolCallLines {
 /// `itemDetail.test.ts`: detail responses keep image markers after the server strips the bytes.
 #[test]
 fn images_past_the_served_positions_keep_their_markers() {
-    for shape in ["array", "content"] {
-        let wrap = |content: Value| if shape == "array" { content } else { json!({ "content": content }) };
+    for shape in ["array", "content", "structured"] {
+        let wrap = |content: Value| match shape {
+            "array" => content,
+            "structured" => json!({ "content": content, "structuredContent": { "temp": 21 } }),
+            _ => json!({ "content": content }),
+        };
         let image = json!({ "type": "image", "mimeType": "image/png" });
         let blocks: Vec<Value> = (0..8).map(|_| image.clone()).collect();
         let within = tool(wrap(Value::Array(blocks.clone())));
-        assert_eq!(turn_item_output_text(&within), None, "{shape}");
+        assert_eq!(turn_item_output_text(&within).as_deref(), (shape == "structured").then_some("{\n  \"temp\": 21\n}"), "{shape}");
         assert_eq!(turn_item_output_images(&within).len(), 8, "{shape}");
         assert_eq!(
             turn_item_output_images(&within)[3],
@@ -41,7 +45,8 @@ fn images_past_the_served_positions_keep_their_markers() {
         overflow.push(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg" } }));
         let overflow = tool(wrap(Value::Array(overflow)));
         assert_eq!(turn_item_output_images(&overflow).len(), 8, "{shape}");
-        assert_eq!(turn_item_output_text(&overflow).as_deref(), Some("Two additional screenshots:\n[image]\n[image]"), "{shape}");
+        let heading = if shape == "structured" { "{\n  \"temp\": 21\n}" } else { "Two additional screenshots:" };
+        assert_eq!(turn_item_output_text(&overflow), Some(format!("{heading}\n[image]\n[image]")), "{shape}");
     }
 }
 
@@ -65,11 +70,9 @@ fn tool_output_reads_content_blocks_and_pretty_prints_json() {
     assert_eq!(text(json!([{ "type": "resource_link", "uri": "file:///a" }, { "type": "resource", "resource": { "uri": "file:///b" } }])).as_deref(), Some("file:///a\nfile:///b"));
     assert_eq!(text(json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false })).as_deref(), Some("ok"));
     assert_eq!(text(json!({ "content": [{ "type": "text", "text": "done" }], "structuredContent": { "x": 1 } })).as_deref(), Some("done"));
-    assert_eq!(
-        text(json!({ "content": [{ "type": "text", "text": " " }], "structuredContent": { "x": 1 } })).as_deref(),
-        Some("{\n  \"content\": [\n    {\n      \"type\": \"text\",\n      \"text\": \" \"\n    }\n  ],\n  \"structuredContent\": {\n    \"x\": 1\n  }\n}"),
-        "blank text falls back to the whole value"
-    );
+    for content in [json!([]), json!([{ "type": "text", "text": " \u{feff}" }]), Value::Null, json!([{ "unexpected": true }])] {
+        assert_eq!(text(json!({ "content": content, "structuredContent": { "x": 1 } })).as_deref(), Some("{\n  \"x\": 1\n}"), "blank or unreadable content: {content}");
+    }
     assert_eq!(text(json!({ "rows": 3 })).as_deref(), Some("{\n  \"rows\": 3\n}"));
     assert_eq!(text(json!({})), None);
     assert_eq!(text(json!([])), None);
@@ -79,6 +82,35 @@ fn tool_output_reads_content_blocks_and_pretty_prints_json() {
     assert_eq!(turn_item_output_text(&viewed), None, "a viewed image shows as the preview");
     let omitted = item(json!({ "type": "dynamic_tool", "toolName": "x", "input": {}, "output": "kept", "outputOmitted": true }));
     assert_eq!(turn_item_output_text(&omitted), None);
+}
+
+#[test]
+fn structured_output_keeps_image_identity_and_uses_json_without_unwrapping_it() {
+    let png = json!({ "type": "image", "mimeType": "image/png" });
+    let unsupported = json!({ "type": "image", "source": { "type": "url", "media_type": "image/png" } });
+    for structured in [json!({ "temp": 21 }), json!({ "type": "text", "text": "Sunny", "temp": 21 }), json!({ "content": [{ "type": "text", "text": "Sunny" }], "temp": 21 })] {
+        let item = tool(json!({ "content": [unsupported, png, { "type": "text", "text": "summary" }, png], "structuredContent": structured, "isError": true }));
+        assert_eq!(turn_item_output_text(&item), Some(format!("{}\n[image]", json_text::stringify_pretty(&structured))));
+        assert_eq!(turn_item_output_images(&item), vec![
+            AssetResource::ToolOutputImage { thread_id: "thread".into(), item_id: "item".into(), index: 0 },
+            AssetResource::ToolOutputImage { thread_id: "thread".into(), item_id: "item".into(), index: 1 },
+        ]);
+    }
+    for structured in [Value::Null, json!({}), json!([]), json!(" \u{feff}")] {
+        let output = tool(json!({ "content": [{ "type": "text", "text": "Sunny" }, png], "structuredContent": structured }));
+        assert_eq!(turn_item_output_text(&output).as_deref(), Some("Sunny"), "empty structured value: {structured}");
+    }
+    for structured in [json!(false), json!(0), json!("Sunny"), json!([1])] {
+        let output = tool(json!({ "content": [png], "structuredContent": structured }));
+        assert_eq!(turn_item_output_text(&output), Some(json_text::stringify_pretty(&structured)));
+    }
+    let mut nested = json!({ "content": [], "structuredContent": { "x": 1 } });
+    for _ in 0..4 { nested = json!({ "content": nested }); }
+    assert_eq!(format_tool_value(Some(&nested), false).as_deref(), Some("{\n  \"x\": 1\n}"), "structured values remain usable at the text depth limit");
+    nested = json!({ "content": nested });
+    assert_eq!(format_tool_value(Some(&nested), false), Some(json_text::stringify_pretty(&nested)), "past the depth limit the whole value is retained");
+    let extra = json!({ "content": [], "structuredContent": { "x": 1 }, "other": true });
+    assert_eq!(format_tool_value(Some(&extra), false), Some(json_text::stringify_pretty(&extra)), "unknown envelope fields are retained");
 }
 
 #[test]

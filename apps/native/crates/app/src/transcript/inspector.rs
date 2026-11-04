@@ -114,7 +114,7 @@ enum Runs {
     Keys(Vec<Range<usize>>),
     /// JSON, by the capture the web's highlighter gives each run.
     Json(Vec<(Range<usize>, JsonToken)>),
-    /// TypeScript, by its parsed tree.
+    /// HTML or TypeScript, by its parsed tree.
     Code(Box<SyntaxHighlighter>),
 }
 
@@ -196,13 +196,13 @@ enum CallPart {
     Key(SharedString),
     /// `StructuredValue` inside the call.
     Structured(Text),
-    Output { images: Vec<MediaSource>, line: Option<Line> },
+    Images(Vec<MediaSource>),
+    Output { line: Option<Line> },
     Exit(SharedString),
 }
 
-#[derive(Clone)]
 enum Line {
-    Text(SharedString),
+    Text(Text),
     Note(SharedString),
     Failed(SharedString),
 }
@@ -539,27 +539,33 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
     let (fetches, detail) = fetched_detail(fetch);
     let (item, output) = fetched_turn_item(wire, fetches, detail);
     let output_part = || CallPart::Output {
-        images: output.images.iter().cloned().map(MediaSource::Asset).collect(),
         line: output.line().map(|line| match line {
-            OutputLine::Text(text) => Line::Text(text.to_owned().into()),
+            OutputLine::Text(text) => Line::Text(json(text.to_owned())),
             OutputLine::Failed(_) => Line::Failed(line.copy().into()),
             OutputLine::Loading | OutputLine::Empty => Line::Note(line.copy().into()),
         }),
     };
+    let images = || {
+        (!output.images.is_empty()).then(|| CallPart::Images(output.images.iter().cloned().map(MediaSource::Asset).collect())).into_iter().collect::<Vec<_>>()
+    };
     if mode == Mode::OutputOnly {
-        return vec![Block::Call(vec![output_part()])];
+        let mut parts = images();
+        parts.push(output_part());
+        return vec![Block::Call(parts)];
     }
     let structured = |value: Option<&str>| value.filter(|text| !text.is_empty()).map(|text| Block::Structured(Text::plain(text.to_owned())));
     match &item.kind {
         TurnItemKind::CommandExecution { input, exit_code, .. } => {
-            let mut parts = call_parts(ToolCallLines::command(input), None);
+            let mut parts = images();
+            parts.extend(call_parts(ToolCallLines::command(input), None));
             // The streamed panel stands in for the output; `render_block` puts it here.
-            parts.push(if streamed { CallPart::Output { images: Vec::new(), line: None } } else { output_part() });
+            parts.push(if streamed { CallPart::Output { line: None } } else { output_part() });
             parts.extend(exit_code.filter(|code| *code != 0).map(|code| CallPart::Exit(format!("exit {code}").into())));
             vec![Block::Call(parts)]
         }
         TurnItemKind::DynamicTool { tool_name, input, .. } => {
-            let mut parts = call_parts(ToolCallLines::args(input), tool_name.as_deref());
+            let mut parts = images();
+            parts.extend(call_parts(ToolCallLines::args(input), tool_name.as_deref()));
             parts.push(output_part());
             vec![Block::Call(parts)]
         }
@@ -609,8 +615,7 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
     }
 }
 
-/// `ToolCallBody`'s command and arguments: a JavaScript REPL's `code` highlighted as TypeScript,
-/// anything that is not a record of arguments as highlighted JSON when it parses.
+/// `ToolCallBody`: HTML, JavaScript REPL code and JSON values use capped structured blocks.
 fn call_parts(call: ToolCallLines, tool_name: Option<&str>) -> Vec<CallPart> {
     let mut parts = Vec::new();
     if let Some(command) = call.command {
@@ -624,10 +629,14 @@ fn call_parts(call: ToolCallLines, tool_name: Option<&str>) -> Vec<CallPart> {
         }
     };
     for (key, value) in call.args.into_iter().flatten() {
-        if key == "code" && is_javascript_repl_tool(tool_name) {
+        let language = if key == "html" { Some("html") } else if key == "code" && is_javascript_repl_tool(tool_name) { Some("typescript") } else { None };
+        if language.is_some() || is_json_tool_text(&value) {
             flush(&mut lines, &mut keys, &mut parts);
             parts.push(CallPart::Key(key.into()));
-            parts.push(CallPart::Structured(typescript(value)));
+            parts.push(CallPart::Structured(match language {
+                Some(language) => code(value, language),
+                None => json(value),
+            }));
             continue;
         }
         if !lines.is_empty() {
@@ -645,20 +654,42 @@ fn call_parts(call: ToolCallLines, tool_name: Option<&str>) -> Vec<CallPart> {
     parts
 }
 
+/// `isJsonToolText`: one document, or pretty documents separated by a blank line.
+fn is_json_tool_text(text: &str) -> bool {
+    if is_json_text(text) {
+        return true;
+    }
+    let text = js_trim(text);
+    let (mut start, mut at, mut documents) = (0, 0, 0);
+    for line in text.split_inclusive('\n') {
+        if js_trim(line).is_empty() {
+            if at > start {
+                if !is_json_text(&text[start..at]) {
+                    return false;
+                }
+                documents += 1;
+            }
+            start = at + line.len();
+        }
+        at += line.len();
+    }
+    documents > 0 && is_json_text(&text[start..])
+}
+
 /// JSON in the runs the web's highlighter gives it; anything else, or too much of it, plain.
 fn json(text: String) -> Text {
-    if text.len() > HIGHLIGHT_BUDGET || !is_json_text(&text) {
+    if text.len() > HIGHLIGHT_BUDGET || !is_json_tool_text(&text) {
         return Text::plain(text);
     }
     let tokens = json_tokens(&text);
     Text::new(text, Runs::Json(tokens))
 }
 
-fn typescript(code: String) -> Text {
+fn code(code: String, language: &str) -> Text {
     if code.len() > HIGHLIGHT_BUDGET {
         return Text::plain(code);
     }
-    let mut highlighter = SyntaxHighlighter::new("typescript");
+    let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &Rope::from_str(&code), None);
     Text::new(code, Runs::Code(Box::new(highlighter)))
 }
@@ -791,22 +822,22 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
             }
             div().text_color(hsla(p.foreground).opacity(0.85)).child(lines).into_any_element()
         }
-        CallPart::Key(key) => div().text_color(hsla(p.muted_foreground)).child(key.clone()).into_any_element(),
+        CallPart::Key(key) => div().text_color(hsla(p.muted_foreground)).child(selectable(id, key.clone())).into_any_element(),
         CallPart::Structured(text) => structured(id, text, cx),
-        CallPart::Output { images, line } => {
+        CallPart::Images(images) => {
+            let images = images.iter().enumerate().map(|(index, source)| tool_output_image(SharedString::from(format!("{id}:image:{index}")), source.clone(), TOOL_OUTPUT_IMAGE, cx)).collect::<Vec<_>>();
+            v_flex().w_full().min_w_0().gap(px(6.)).items_start().children(images).into_any_element()
+        }
+        CallPart::Output { line } => {
             if let Some(slot) = output_slot.take() {
                 return slot.unwrap_or_else(|| div().into_any_element());
             }
-            let images: Vec<AnyElement> =
-                images.iter().enumerate().map(|(index, source)| tool_output_image(SharedString::from(format!("{id}:image:{index}")), source.clone(), TOOL_OUTPUT_IMAGE, cx)).collect();
             let line = line.as_ref().map(|line| match line {
-                Line::Text(text) => {
-                    Capped { id: SharedString::from(format!("{id}:output")), text: text.clone(), highlights: None, max_height: 320., color: hsla(p.muted_foreground) }.into_any_element()
-                }
+                Line::Text(text) => structured(&format!("{id}:output"), text, cx),
                 Line::Note(note) => div().italic().text_color(hsla(p.muted_foreground)).child(selectable(&format!("{id}:note"), note.clone())).into_any_element(),
                 Line::Failed(error) => div().text_color(hsla(p.destructive)).child(selectable(&format!("{id}:error"), error.clone())).into_any_element(),
             });
-            v_flex().w_full().min_w_0().gap(px(6.)).items_start().children(images).children(line).into_any_element()
+            v_flex().w_full().min_w_0().gap(px(6.)).items_start().children(line).into_any_element()
         }
         CallPart::Exit(text) => div().text_color(hsla(p.destructive)).child(selectable(id, text.clone())).into_any_element(),
     }
@@ -983,12 +1014,41 @@ mod tests {
     }
 
     #[test]
+    fn structured_arguments_and_output_images_are_prepared_for_both_inspectors() {
+        let mut item = (*tool("{}")).clone();
+        if let TurnItemKind::DynamicTool { input, output, .. } = &mut item.kind {
+            *input = serde_json::json!({ "html": "<b>ready</b>", "options": { "ready": true }, "message": "plain" });
+            *output = Some(serde_json::json!([{ "type": "image", "mimeType": "image/png" }, { "type": "text", "text": "{\"ready\":true}" }]));
+        }
+        let blocks = derive_blocks(&item, &Fetch::None, Mode::Full, None, false);
+        let Block::Call(parts) = &blocks[0] else { panic!("tool call") };
+        let arguments = parts.iter().filter(|part| matches!(part, CallPart::Structured(_))).count();
+        assert_eq!(arguments, 2, "HTML and JSON arguments get their own structured blocks");
+        assert!(matches!(parts.first(), Some(CallPart::Images(_))), "images precede arguments and output");
+        for mode in [Mode::Full, Mode::OutputOnly] {
+            let blocks = derive_blocks(&item, &Fetch::Loaded(Arc::new(item.clone())), mode, None, true);
+            let Block::Call(parts) = &blocks[0] else { panic!("tool call") };
+            assert!(matches!(parts.first(), Some(CallPart::Images(_))), "a streamed output slot cannot consume the images");
+            assert!(matches!(parts.last(), Some(CallPart::Output { line: Some(Line::Text(Text { runs: Runs::Json(_), .. })) })), "fetched JSON output is prepared once with its syntax runs");
+        }
+    }
+
+    #[test]
     fn text_past_the_budget_draws_plain() {
         assert!(matches!(json("{\"a\": 1}".into()).runs, Runs::Json(_)));
+        assert!(matches!(json("{\"a\": 1}\n \n{\"b\": 2}".into()).runs, Runs::Json(_)), "pretty JSON documents retain highlighting");
         let big = format!("[{}0]", "0,".repeat(HIGHLIGHT_BUDGET / 2));
-        assert!(matches!(json(big).runs, Runs::Plain));
+        assert!(matches!(json(big.clone()).runs, Runs::Plain));
+        let parts = call_parts(ToolCallLines { args: Some(vec![("options".into(), big)]), ..ToolCallLines::default() }, None);
+        assert!(matches!(parts.last(), Some(CallPart::Structured(Text { runs: Runs::Plain, .. }))), "large JSON arguments stay capped even when highlighting is skipped");
         assert!(matches!(json("not json".into()).runs, Runs::Plain));
-        assert!(matches!(typescript("x".repeat(HIGHLIGHT_BUDGET + 1)).runs, Runs::Plain));
+        for language in ["typescript", "html"] {
+            assert!(matches!(code("x".repeat(HIGHLIGHT_BUDGET + 1), language).runs, Runs::Plain));
+        }
+        for text in ["{}\n{}", "{}\n \ninvalid", "[broken]\n\n{}", " "] {
+            assert!(matches!(json(text.into()).runs, Runs::Plain), "{text:?}");
+        }
+        assert!(matches!(json("{}\n\u{feff}\n[true]\n\nnull".into()).runs, Runs::Json(_)));
     }
 
     #[test]
