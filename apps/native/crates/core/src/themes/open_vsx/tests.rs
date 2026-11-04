@@ -507,3 +507,30 @@ fn cancellation_stops_every_extraction_stage_and_chunked_reads() {
         IMPORT_CANCELLED
     );
 }
+
+#[test]
+fn updating_needs_confirmation_before_install_starts_and_empty_query_keeps_install_alive() {
+    let mut session = SearchSession::new();
+    let extension = extension();
+    let before_prompt = session.epoch;
+    assert!(!session.request_install(extension.clone(), true, false));
+    assert_eq!(session.pending_update.as_ref(), Some(&extension));
+    assert_eq!(session.epoch, before_prompt);
+    assert!(!session.installing);
+    assert!(session.dismiss_update());
+    assert!(!session.dismiss_update());
+    assert!(!session.installing);
+    assert!(!session.request_install(extension.clone(), true, false));
+    assert!(session.request_install(extension.clone(), true, true));
+    assert!(session.pending_update.is_none());
+    let epoch = session.epoch;
+    session.set_query("");
+    assert!(!session.settle(false));
+    assert!(!session.cancel_request);
+    assert!(session.installing);
+    assert_eq!(session.epoch, epoch);
+    session.set_query("Nord");
+    session.end_install();
+    assert!(session.settle(false));
+    assert!(SearchSession::new().request_install(extension, false, false));
+}

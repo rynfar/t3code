@@ -18,8 +18,12 @@ use gpui_component::{Sizable, h_flex, v_flex};
 use std::rc::Rc;
 use t3_core::client_settings::{
     ClientSettingChange,
-    typography::{FontRole, family_options},
+    typography::{FontInventory, FontRole, advances_are_monospace, family_options},
 };
+
+#[derive(Default)]
+struct CachedFonts(FontInventory);
+impl gpui::Global for CachedFonts {}
 
 gpui::actions!(font_family_picker, [CloseFontPicker]);
 
@@ -40,7 +44,13 @@ pub(super) struct TypographyState {
 
 impl TypographyState {
     pub fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
+        if !cx.has_global::<CachedFonts>() {
+            cx.set_global(CachedFonts::default());
+        }
+
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search fonts…"));
+        #[cfg(feature = "snapshot")]
+        crate::snapshot::register_focus("font-picker-search", search.read(cx).focus_handle(cx), cx);
         let subscription = cx.subscribe(&search, |view, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 view.typography.highlighted = 0;
@@ -50,7 +60,7 @@ impl TypographyState {
         });
         Self {
             advanced: false,
-            fonts: Rc::new(Vec::new()),
+            fonts: Rc::new(cx.global::<CachedFonts>().0.families().unwrap_or_default().to_vec()),
             font_task: None,
             open: None,
             search,
@@ -208,14 +218,15 @@ impl SettingsView {
             .trailing(Icon::ChevronDown)
             .full_width()
             .on_click(cx.listener(move |this, _, window, cx| {
-                if this.typography.fonts.is_empty() && this.typography.font_task.is_none() {
+                if cx.global::<CachedFonts>().0.families().is_none() && this.typography.font_task.is_none() {
                     let text = cx.text_system().clone();
                     let names = theme::installed_font_families(cx).to_vec();
                     let task = cx.background_executor().spawn(async move { installed_fonts(text, names) });
                     this.typography.font_task = Some(cx.spawn(async move |view, cx| {
                         let fonts = task.await;
                         let _ = view.update(cx, |view, cx| {
-                            view.typography.fonts = Rc::new(fonts);
+                            cx.global_mut::<CachedFonts>().0.finish(fonts);
+                            view.typography.fonts = Rc::new(cx.global::<CachedFonts>().0.families().unwrap().to_vec());
                             view.typography.font_task = None;
                             cx.notify();
                         });
@@ -234,7 +245,7 @@ impl SettingsView {
         }
         let p = palette(cx);
         let query = self.typography.search.read(cx).value().trim().to_lowercase();
-        let mut choices = family_options(self.typography.fonts.iter().cloned(), role.monospace());
+        let mut choices = family_options(self.typography.fonts.iter().cloned(), false);
         choices.retain(|name| name.to_lowercase().contains(&query));
         if query.is_empty() {
             choices.insert(0, String::new());
@@ -354,7 +365,19 @@ impl SettingsView {
 
     fn pick_font(&mut self, role: FontRole, family: String, cx: &mut Context<Self>) {
         self.typography.open = None;
-        store::update_client(&self.state, ClientSettingChange::FontFamily(role, family), cx);
+        if !cx.global::<CachedFonts>().0.accepts(role, &family) {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    crate::toast::Toast::new(crate::toast::ToastKind::Error, format!("\"{family}\" isn't monospace"))
+                        .description("Code and terminal need a fixed-width font, so the current font was kept."),
+                    cx,
+                );
+            });
+            // GPUI can retain blank cached text after closing the multi-font popup.
+            cx.refresh_windows();
+        } else {
+            store::update_client(&self.state, ClientSettingChange::FontFamily(role, family), cx);
+        }
         cx.notify();
     }
 }
@@ -395,11 +418,13 @@ fn installed_fonts(text: std::sync::Arc<gpui::TextSystem>, names: Vec<String>) -
                     let id = text.resolve_font(&font);
                     let advances: Vec<_> = ['i', 'M', 'W', '0', '@', '#', '.', ' ']
                         .into_iter()
-                        .filter_map(|glyph| text.advance(id, px(32.), glyph).ok().map(|size| f32::from(size.width)))
+                        .map(|glyph| {
+                            text.advance(id, px(32.), glyph)
+                                .map(|size| f32::from(size.width))
+                                .unwrap_or(f32::NAN)
+                        })
                         .collect();
-                    advances
-                        .first()
-                        .is_some_and(|first| *first > 0. && advances.iter().all(|width| (width - first).abs() < 0.01))
+                    advances_are_monospace(&advances)
                 })
             });
             (family, mono)

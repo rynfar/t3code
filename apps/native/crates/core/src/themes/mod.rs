@@ -3,6 +3,7 @@
 mod color;
 pub mod editor;
 pub mod importer;
+pub mod json_field;
 pub mod transaction;
 #[cfg(test)]
 mod tests;

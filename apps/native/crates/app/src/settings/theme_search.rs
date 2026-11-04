@@ -37,6 +37,9 @@ impl SearchUi {
                     let query = input.read(cx).value().to_string();
                     this.change_search(&query, window, cx);
                 }
+                if matches!(event, InputEvent::Focus | InputEvent::Blur) {
+                    cx.notify();
+                }
                 if matches!(event, InputEvent::PressEnter { .. }) && !this.search.searching {
                     this.settle_search(true, window, cx);
                 }
@@ -59,6 +62,12 @@ impl SearchUi {
     pub(super) fn focus(&self, window: &mut Window, cx: &mut App) {
         self.input.read(cx).focus_handle(cx).focus(window, cx);
     }
+    pub(super) fn pending_update(&self) -> Option<&Extension> {
+        self.session.pending_update.as_ref()
+    }
+    pub(super) fn dismiss_update(&mut self) -> bool {
+        self.session.dismiss_update()
+    }
     pub(super) fn session_installing(&self) -> bool {
         self.session.installing
     }
@@ -78,7 +87,9 @@ impl ThemeImportDialog {
         }
         self.search.debounce = None;
         if query.trim().is_empty() {
-            self.search.cancel();
+            if !self.search.session.installing {
+                self.search.cancel();
+            }
             self.search.results = None;
             self.search.error = None;
             self.search.searching = false;
@@ -95,7 +106,12 @@ impl ThemeImportDialog {
         }));
         cx.notify();
     }
-    pub(super) fn settle_search(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn settle_search(
+        &mut self,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.saving || !self.open {
             return;
         }
@@ -155,26 +171,38 @@ impl ThemeImportDialog {
         })
         .detach();
     }
-    fn download_theme(
+    pub(super) fn download_theme(
         &mut self,
         extension: Extension,
+        allow_update: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.saving || self.search.session.installing {
             return;
         }
+        let doc = store::client(cx).clone();
+        let expected = open_vsx::stored_collection(&doc, &extension.collection_id);
+        if !self.search.session.request_install(
+            extension.clone(),
+            !expected.is_empty(),
+            allow_update,
+        ) {
+            self.conflict_focus.focus(window, cx);
+            return cx.notify();
+        }
         self.search.request = None;
-        self.search.session.begin_install();
         self.search.installing_id = Some(extension.id.clone());
         self.search.searching = false;
         self.search.error = None;
         self.save_error = None;
-        let doc = store::client(cx).clone();
+        #[cfg(feature = "snapshot")]
+        if self.search.fixture {
+            return cx.notify();
+        }
         let epoch = self.search.session.epoch;
         let task = self.state.read(cx).runtime().spawn(async move {
             let collection_id = extension.collection_id.clone();
-            let expected = open_vsx::stored_collection(&doc, &collection_id);
             let themes = t3_client::open_vsx::download(extension).await?;
             Ok::<_, String>(MarketplaceImport {
                 collection_id,
@@ -195,16 +223,11 @@ impl ThemeImportDialog {
                 this.search.installing_id = None;
                 match result {
                     Ok(import) => {
-                        if import.expected.is_empty() {
-                            this.install(
-                                InstallOperation::Marketplace(import, themes::ImportChoice::Update),
-                                window,
-                                cx,
-                            );
-                        } else {
-                            this.marketplace = Some(import);
-                            this.conflict_focus.focus(window, cx);
-                        }
+                        this.install(
+                            InstallOperation::Marketplace(import, themes::ImportChoice::Update),
+                            window,
+                            cx,
+                        );
                     }
                     Err(error) => {
                         this.search.error = Some(error);
@@ -243,7 +266,7 @@ impl ThemeImportDialog {
             )
             .child(SearchField {
                 input: self.search.input.clone(),
-                disabled: busy,
+                disabled: self.saving || self.session.reading,
                 searching: self.search.searching,
             });
         if !self.search.searching || self.search.results.is_some() {
@@ -503,7 +526,7 @@ impl ThemeImportDialog {
                                 .disabled(busy)
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
-                                        this.download_theme(e.clone(), window, cx)
+                                        this.download_theme(e.clone(), false, window, cx)
                                     },
                                 )),
                             ),
@@ -544,8 +567,26 @@ impl ThemeImportDialog {
         self.search.results = value
             .get("results")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        if value["state"] == "installing" {
+            self.search.session.begin_install();
+            self.search.installing_id = self
+                .search
+                .results
+                .as_ref()
+                .and_then(|v| v.first())
+                .map(|e| e.id.clone());
+        }
+        if value["state"] == "update" {
+            self.search.session.pending_update = self
+                .search
+                .results
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned();
+        }
         if value["state"] == "confirmation" {
-            let mut theme=themes::import(r##"{"version":1,"name":"Dracula","appearance":"dark","colors":{"accent":"#bd93f9"}}"##).unwrap();
+            let mut theme =
+                themes::import(r##"{"version":1,"name":"Dracula","appearance":"dark","colors":{"accent":"#bd93f9"}}"##).unwrap();
             theme.collection = Some(themes::Collection {
                 id: "open-vsx:dracula-theme.theme-dracula".into(),
                 label: "Dracula".into(),
@@ -587,7 +628,7 @@ impl gpui::RenderOnce for SearchField {
             .id("theme-search-input")
             .role(gpui::Role::TextInput)
             .aria_label("Search Open VSX themes")
-            .h(r(40.))
+            .h(r(36.))
             .w_full()
             .flex()
             .items_center()
@@ -596,7 +637,22 @@ impl gpui::RenderOnce for SearchField {
             .rounded(r(8.))
             .border_1()
             .border_color(hsla(if focused { p.ring } else { p.input }))
-            .bg(hsla(p.background))
+            .bg(hsla(if cx.theme().is_dark() {
+                p.input
+            } else {
+                p.background
+            })
+            .opacity(if cx.theme().is_dark() { 0.32 } else { 1. }))
+            .when(self.disabled, |v| v.opacity(0.64))
+            .when(focused, |v| {
+                v.shadow(vec![gpui::BoxShadow {
+                    color: hsla(p.ring).opacity(0.24),
+                    offset: gpui::point(gpui::px(0.), gpui::px(0.)),
+                    blur_radius: gpui::px(0.),
+                    spread_radius: gpui::px(3.),
+                    inset: true,
+                }])
+            })
             .text_sm()
             .line_height(r(20.))
             .child(

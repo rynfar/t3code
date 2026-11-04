@@ -848,6 +848,7 @@ pub struct SearchSession {
     pub shown: Option<String>,
     handled: Option<String>,
     pub installing: bool,
+    pub pending_update: Option<Extension>,
     interrupted: bool,
     pub epoch: u64,
     pub cancel_request: bool,
@@ -888,11 +889,33 @@ impl SearchSession {
         self.epoch += 1;
     }
     pub fn clear(&mut self) {
+        self.pending_update = None;
         self.retire();
         self.shown = None;
         self.handled = None;
     }
+    /// The update prompt runs before any package fetch or cancellation of the current search.
+    pub fn request_install(
+        &mut self,
+        extension: Extension,
+        installed: bool,
+        allow_update: bool,
+    ) -> bool {
+        if self.installing {
+            return false;
+        }
+        if installed && !allow_update {
+            self.pending_update = Some(extension);
+            return false;
+        }
+        self.begin_install();
+        true
+    }
+    pub fn dismiss_update(&mut self) -> bool {
+        self.pending_update.take().is_some()
+    }
     pub fn begin_install(&mut self) {
+        self.pending_update = None;
         self.retire();
         self.installing = true;
         self.interrupted = true;
