@@ -48,6 +48,7 @@ mod theme_editor;
 mod thread_details;
 mod thread_view;
 mod toast;
+mod timestamp;
 mod transcript;
 mod usage;
 mod updates;

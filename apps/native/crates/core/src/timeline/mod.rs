@@ -20,6 +20,10 @@ mod rewind;
 mod rows;
 mod status;
 mod time;
+mod locale;
+mod host_locale;
+pub use host_locale::{linux_time_locale, mac_time_locale, to_system_locale_tag};
+pub use locale::IntlTimestampClock;
 mod tool_activity;
 mod user_input;
 
@@ -75,7 +79,7 @@ pub use status::{
     error_banner_message, error_can_expand, goal_line, limit_recovery, presented_latest_run, provider_banner, relative_time_label, run_stop, status_line,
     thread_error, timeline_thread_error,
 };
-pub use time::{format_day_aware, format_duration, format_short_time, format_tokens, format_upcoming, parse_iso_ms};
+pub use time::{TimestampLocale, format_day_aware, format_duration, format_short_time, format_tokens, format_upcoming, parse_iso_ms, usage_limit_label};
 pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name, is_javascript_repl_tool, with_visible_control_characters};
 pub use user_input::{has_question_answer, question_answer_preview, question_answer_text, question_text_preview};
 

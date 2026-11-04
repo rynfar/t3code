@@ -9,7 +9,6 @@ use gpui::{AnyElement, App, Context, FontWeight, Hsla, IntoElement, ParentElemen
 use gpui_component::{h_flex, v_flex};
 use t3_core::providers::driver_label;
 use t3_core::server_config::UsageWindow;
-use t3_core::sidebar::time::parse_iso;
 use t3_core::timeline;
 use t3_core::usage::limits::{
     self, CHATGPT_USAGE_URL, LimitAccount, LimitPace, LimitPool, LimitPoolMember, LimitPoolWindow, account_hue, account_initials, account_title, accent_rgba,
@@ -471,10 +470,8 @@ impl UsageView {
                 .child(div().w(r(72.)).flex_none().text_color(hsla(p.muted_foreground)).child(label.to_owned()))
                 .child(div().min_w_0().text_color(hsla(p.foreground)).child(value))
         };
-        let resets_at = window_data.resets_at.as_deref().and_then(|at| {
-            let offset = crate::sidebar::controller::SystemZone;
-            let minutes = parse_iso(at).map(|ms| t3_core::sidebar::time::Zone::offset_seconds_at(&offset, ms) / 60).unwrap_or(0);
-            timeline::format_upcoming(at, now, minutes)
+        let resets_at = window_data.resets_at.as_deref().map(|at| {
+            timeline::format_upcoming(at, now, &crate::timestamp::viewer_zone(), crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
         });
         let credits = account.limits.reset_credits.clone().filter(|credits| credits.available_count > 0 && account.redeem.is_some());
         let redeem = account.redeem.clone();

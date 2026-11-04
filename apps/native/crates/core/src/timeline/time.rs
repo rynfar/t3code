@@ -1,5 +1,45 @@
 //! Timestamps and durations: `formatDuration` (`packages/shared/src/orchestrationTiming.ts`),
-//! `formatTokens` (`packages/shared/src/usageFormat.ts`). Wire timestamps are ISO 8601 UTC.
+//! `formatTokens` (`packages/shared/src/usageFormat.ts`), and `apps/web/src/timestampFormat.ts`.
+
+use crate::client_settings::TimestampFormat;
+use crate::sidebar::time::{LocalTime, Ms, Zone, days_from_civil, to_local};
+
+/// Locale formatting is injected, like the zone, so core never reads host preferences.
+pub trait TimestampLocale {
+    fn time(&self, local: LocalTime, format: TimestampFormat) -> String;
+    fn numeric_date(&self, local: LocalTime, include_year: bool) -> String;
+}
+
+pub fn format_day_aware(iso: &str, now: Ms, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
+    format_calendar_timestamp(iso, now, zone, format, locale, false)
+}
+
+pub fn format_upcoming(iso: &str, now: Ms, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
+    format_calendar_timestamp(iso, now, zone, format, locale, true)
+}
+
+fn format_calendar_timestamp(iso: &str, now: Ms, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale, upcoming: bool) -> String {
+    let Some(ms) = parse_iso_ms(iso) else { return String::new() };
+    let today = to_local(now, zone);
+    let target = to_local(ms, zone);
+    let day_diff = days_from_civil(target.year, target.month, target.day) - days_from_civil(today.year, today.month, today.day);
+    let time = locale.time(target, format);
+    match day_diff {
+        0 => time,
+        1 if upcoming => format!("tomorrow at {time}"),
+        1.. if !upcoming => time,
+        -1 => format!("yesterday at {time}"),
+        _ => format!("{} {time}", locale.numeric_date(target, target.year != today.year)),
+    }
+}
+
+/// `TimelineWorkEntryRow`: even a nonempty invalid reset keeps the zone suffix on the web.
+pub fn usage_limit_label(reset: Option<&str>, now: Ms, zone: &dyn Zone, zone_name: &str, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
+    match reset.filter(|reset| !reset.is_empty()) {
+        Some(reset) => format!("Usage limit reached. Retry after {} ({zone_name}).", format_upcoming(reset, now, zone, format, locale)),
+        None => "Usage limit reached.".to_owned(),
+    }
+}
 
 /// Milliseconds since the Unix epoch for an ISO 8601 timestamp such as
 /// `2026-01-01T00:00:05.250Z` or `2026-01-01T02:00:05+02:00`.
@@ -54,17 +94,6 @@ pub fn parse_iso_ms(value: &str) -> Option<i64> {
     Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) - offset_minutes * 60) * 1_000 + millis)
 }
 
-/// Howard Hinnant's `days_from_civil`.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_index = (month + 9) % 12;
-    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
 pub fn format_duration(duration_ms: f64) -> String {
     if !duration_ms.is_finite() || duration_ms < 0. {
         return "0ms".into();
@@ -116,54 +145,6 @@ pub fn format_tokens(value: u64) -> String {
         grouped.push(digit);
     }
     grouped
-}
-
-/// `formatDayAwareTimestamp` (`apps/web/src/timestampFormat.ts`): the time today,
-/// `yesterday at …` and `M/D …` (with the year when it differs) before that.
-pub fn format_day_aware(iso: &str, now_ms: i64, offset_minutes: i64) -> Option<String> {
-    let ms = parse_iso_ms(iso)?;
-    let time = format_short_time(iso, offset_minutes)?;
-    let local_day = |ms: i64| (ms + offset_minutes * 60_000).div_euclid(86_400_000);
-    let day_diff = local_day(now_ms) - local_day(ms);
-    if day_diff <= 0 {
-        return Some(time);
-    }
-    if day_diff == 1 {
-        return Some(format!("yesterday at {time}"));
-    }
-    let (year, month, day) = civil_from_days(local_day(ms));
-    let (now_year, _, _) = civil_from_days(local_day(now_ms));
-    Some(if year == now_year { format!("{month}/{day} {time}") } else { format!("{month}/{day}/{year} {time}") })
-}
-
-/// `formatUpcomingTimestamp` (`apps/web/src/timestampFormat.ts`): the time today,
-/// `tomorrow at …`, `M/D …` (with the year when it differs) after that, day-aware before today.
-pub fn format_upcoming(iso: &str, now_ms: i64, offset_minutes: i64) -> Option<String> {
-    let ms = parse_iso_ms(iso)?;
-    let time = format_short_time(iso, offset_minutes)?;
-    let local_day = |ms: i64| (ms + offset_minutes * 60_000).div_euclid(86_400_000);
-    match local_day(ms) - local_day(now_ms) {
-        ..0 => format_day_aware(iso, now_ms, offset_minutes),
-        0 => Some(time),
-        1 => Some(format!("tomorrow at {time}")),
-        _ => {
-            let (year, month, day) = civil_from_days(local_day(ms));
-            let (now_year, _, _) = civil_from_days(local_day(now_ms));
-            Some(if year == now_year { format!("{month}/{day} {time}") } else { format!("{month}/{day}/{year} {time}") })
-        }
-    }
-}
-
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
-    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
 }
 
 /// `h:mm AM` in UTC offset by `offset_minutes`; the view passes the local offset.
