@@ -278,7 +278,7 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
     let (id, show_meta, show_copy, copy_streaming) = (row.id.as_str(), *show_assistant_meta, *show_copy, *copy_streaming);
     let text: Arc<str> = if message.text.is_empty() && !message.streaming { Arc::from("(empty response)") } else { message.text.clone() };
     let state = markdown.state(&format!("assistant:{id}"), &text, cx);
-    let selection_state = state.entity.clone();
+    let selection_state = state.clone();
     let message_id = message.id.clone();
     v_flex()
         .group(ROW_GROUP)

@@ -403,7 +403,15 @@ pub fn resolve_phase(failed: bool, message: CitedMessage, row: Option<&str>) -> 
 
 /// Visible markdown text for a saved selector. Controls and destination URLs are omitted.
 pub fn markdown_text(source: &str) -> String {
-    fn visit(node: &markdown::mdast::Node, out: &mut String) {
+    markdown_projection(source, None).0
+}
+
+struct MediaTextBlock { start: usize, rendered: Range<usize>, parent: String, runs: Vec<crate::media::MarkdownMediaRun> }
+
+fn markdown_projection(source: &str, media: Option<&crate::media::MarkdownMediaDocument>) -> (String, Vec<MediaTextBlock>) {
+    fn visit(node: &markdown::mdast::Node, source: &str, out: &mut String, media: Option<&crate::media::MarkdownMediaDocument>, blocks: &mut Vec<MediaTextBlock>) {
+        let start = out.len();
+        out.push_str(crate::media::heading_literal_prefix(node, source));
         use markdown::mdast::Node;
         match node {
             Node::Text(text) => out.push_str(&text.value),
@@ -415,7 +423,7 @@ pub fn markdown_text(source: &str) -> String {
             _ => {
                 if let Some(children) = node.children() {
                     for child in children {
-                        visit(child, out);
+                        visit(child, source, out, media, blocks);
                     }
                 }
             }
@@ -425,13 +433,137 @@ pub fn markdown_text(source: &str) -> String {
         {
             out.push('\n');
         }
+        if matches!(node, Node::Paragraph(_) | Node::Heading(_)) && let Some(media) = media && let Some(position) = node.position() {
+            let runs = media.runs_at(node, 0);
+            if !runs.is_empty() { blocks.push(MediaTextBlock { start: position.start.offset, rendered: start..out.len(), parent: node.to_string(), runs }); }
+        }
     }
     let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
-        return source.to_owned();
+        return (source.to_owned(), Vec::new());
     };
     let mut out = String::new();
-    visit(&root, &mut out);
-    out.trim_end().to_owned()
+    let mut blocks = Vec::new();
+    visit(&root, source, &mut out, media, &mut blocks);
+    (out.trim_end().to_owned(), blocks)
+}
+
+fn raw_ranges(source: &str, ranges: &[Range<usize>]) -> Option<Vec<Range<usize>>> {
+    let mut out = vec![0..0; ranges.len()];
+    let (mut start, mut end, mut offset, mut space) = (0, 0, 0, false);
+    for (byte, ch) in source.char_indices() {
+        let whitespace = ch.is_whitespace() || ch == '\u{feff}';
+        let emitted = if whitespace { usize::from(!space) } else { ch.len_utf8() };
+        if emitted > 0 {
+            while start < ranges.len() && ranges[start].start == offset { out[start].start = byte; start += 1; }
+            offset += emitted;
+            while end < ranges.len() && ranges[end].end == offset { out[end].end = byte + ch.len_utf8(); end += 1; }
+        }
+        space = whitespace;
+        if start == ranges.len() && end == ranges.len() { break; }
+    }
+    (start == ranges.len() && end == ranges.len()).then_some(out)
+}
+
+fn quote_ranges(source: &str, quote: &str) -> Vec<Range<usize>> {
+    let normalized = normalize(source);
+    let quote = normalize(quote.trim());
+    let Some(first) = quote.chars().next() else { return Vec::new() };
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while let Some(start) = normalized[offset..].find(&quote) {
+        let start = offset + start;
+        ranges.push(start..start + quote.len());
+        offset = start + first.len_utf8();
+    }
+    raw_ranges(source, &ranges).unwrap_or_default()
+}
+
+/// Restore the contiguous source span after the view has validated its owned participants.
+pub fn media_selection_text(document: &crate::media::MarkdownMediaDocument, parent: &str, children: &[(usize, usize, String)]) -> Option<String> {
+    let (text, mut blocks) = markdown_projection(document.source(), Some(document));
+    blocks.sort_by_key(|block| block.rendered.start);
+    let mut parent_text = String::new();
+    let mut spans = Vec::new();
+    let mut selected = Vec::new();
+    let mut seen = 0;
+    let mut cursor = 0;
+    for block in blocks {
+        let range = block.rendered.start.min(text.len())..block.rendered.end.min(text.len());
+        let start = parent_text.len();
+        parent_text.push_str(&text[cursor..range.start]);
+        spans.push((start..parent_text.len(), cursor..range.start, false));
+        let start = parent_text.len();
+        parent_text.push_str(&block.parent);
+        if !block.parent.is_empty() { parent_text.push('\n'); }
+        spans.push((start..parent_text.len(), range.clone(), true));
+        cursor = range.end;
+        if !children.iter().any(|(start, _, _)| *start == block.start) { continue; }
+        let normalized = normalize(&text[range.clone()]);
+        let mut run_start = 0;
+        let mut selected_runs = Vec::new();
+        for (index, run) in block.runs.iter().enumerate() {
+            let crate::media::MarkdownMediaRun::Prose(prose) = run else { continue };
+            let run_text = normalize(markdown_text(prose).trim());
+            if run_text.is_empty() { continue; }
+            let tail = &normalized[run_start..];
+            run_start += tail.len() - tail.trim_start().len();
+            if !normalized[run_start..].starts_with(&run_text) { return None; }
+            if let Some((_, _, quote)) = children.iter().find(|(start, run, _)| *start == block.start && *run == index) {
+                let quote = normalize(quote.trim());
+                let offset = unique_occurrence(&run_text, &quote)?;
+                selected_runs.push(run_start + offset..run_start + offset + quote.len());
+                seen += 1;
+            }
+            run_start += run_text.len();
+        }
+        if !normalized[run_start..].trim().is_empty() { return None; }
+        selected.extend(raw_ranges(&text[range.clone()], &selected_runs)?.into_iter().map(|part| range.start + part.start..range.start + part.end));
+    }
+    let start = parent_text.len();
+    parent_text.push_str(&text[cursor..]);
+    spans.push((start..parent_text.len(), cursor..text.len(), false));
+    if seen != children.len() { return None; }
+    selected.sort_by_key(|range| range.start);
+    // The outer participant can omit ordinary blocks between two nested endpoints.
+    if let (Some(first), Some(last)) = (selected.first(), selected.last()) {
+        let bounds = first.start..last.end;
+        let enclosed: Vec<_> = spans.iter().filter(|(_, _, custom)| !custom).filter_map(|(_, range, _)| {
+            let range = range.start.max(bounds.start)..range.end.min(bounds.end);
+            (range.start < range.end).then_some(range)
+        }).collect();
+        selected.extend(enclosed);
+    }
+    let mut parents = quote_ranges(&parent_text, parent);
+    if parent.trim().is_empty() { parents.push(0..0); }
+    let mut found = None;
+    for parent in parents {
+        let whole_parent = parent_text.get(..parent.start).is_some_and(|text| text.trim().is_empty()) && parent_text.get(parent.end..).is_some_and(|text| text.trim().is_empty());
+        if parent.start < parent.end && !whole_parent && spans.iter().any(|(projection, _, custom)| *custom && (projection.contains(&parent.start) || (parent.end > 0 && projection.contains(&(parent.end - 1))))) { continue; }
+        let mut ranges = selected.clone();
+        let mut valid = true;
+        for (projection, rendered, custom) in &spans {
+            let overlap = projection.start.max(parent.start)..projection.end.min(parent.end);
+            if overlap.start >= overlap.end { continue; }
+            if *custom {
+                if !parent_text[projection.start..overlap.start].trim().is_empty() || !parent_text[overlap.end..projection.end].trim().is_empty() { valid = false; break; }
+                ranges.push(rendered.clone());
+            } else { ranges.push(rendered.start + overlap.start - projection.start..rendered.start + overlap.end - projection.start); }
+        }
+        if !valid { continue; }
+        ranges.retain(|range| range.start < range.end);
+        ranges.sort_by_key(|range| range.start);
+        let Some(first) = ranges.first() else { continue };
+        let mut range = first.clone();
+        let mut contiguous = true;
+        for next in &ranges[1..] {
+            if next.start > range.end && !text[range.end..next.start].trim().is_empty() { contiguous = false; break; }
+            range.end = range.end.max(next.end);
+        }
+        if !contiguous { continue; }
+        if found.as_ref().is_some_and(|previous| previous != &range) { return None; }
+        found = Some(range);
+    }
+    Some(text.get(found?)?.trim().to_owned()).filter(|text| !text.is_empty())
 }
 
 fn unique_occurrence(text: &str, needle: &str) -> Option<usize> {
@@ -521,6 +653,7 @@ mod tests {
     #[test]
     fn rendered_text_omits_markup_destinations_and_controls() {
         assert_eq!(markdown_text("# Hello **world**\n\n[A link](https://example.com) and `code`\n\n```rs\nlet x = 1;\n```"), "Hello world\nA link and code\nlet x = 1;");
+        assert_eq!(normalize(&markdown_text("## # left ![chart](a.png) **right**")), "# left right");
         assert_eq!(unique_quote_range("same same", "same"), None);
         for (source, quote) in [("aaa", "aa\n"), ("ééé", "éé\n")] {
             assert_eq!(unique_quote_range(source, quote), None);
