@@ -49,11 +49,8 @@ impl SidebarPane {
         } else {
             format!("Filter threads by project: {}", scoped.iter().map(|group| group.label.as_str()).collect::<Vec<_>>().join(", "))
         };
-        let size = px(if scoped.len() > 1 { 14. } else { 16. });
-        let favicon = |group: &ProjectGroup| match state.sidebar.favicons.image(&group.representative_id) {
-            Some(image) => gpui::img(image).flex_none().size(size).into_any_element(),
-            None => Icon::Folder.render(size, hsla(p.sidebar_icon)).into_any_element(),
-        };
+        let size = crate::project_icon::size(if scoped.len() > 1 { 14. } else { 16. }, cx);
+        let favicon = |group: &ProjectGroup| crate::project_icon::render(state, &group.representative_id, size, hsla(p.sidebar_icon), cx);
         let content = if scoped.is_empty() {
             Self::button_icon(Icon::ListFilter, "project-filter", cx).into_any_element()
         } else {
@@ -89,6 +86,7 @@ impl SidebarPane {
         };
         let mut rows: Vec<AnyElement> = vec![
             row("project-filter-all".into(), scope.is_none())
+                .child(Icon::Folder.render(crate::project_icon::size(16., cx), hsla(p.icon_muted)))
                 .child("All projects")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.state.update(cx, |state, cx| state.set_project_scope(Default::default(), cx));
@@ -104,6 +102,7 @@ impl SidebarPane {
             let settings_project = group.representative_id.clone();
             rows.push(
                 row(SharedString::from(format!("project-filter-{}", group.key)), checked)
+                    .child(crate::project_icon::render(state, &group.representative_id, crate::project_icon::size(16., cx), hsla(p.icon_muted), cx))
                     .child(div().flex_1().min_w_0().truncate().child(group.label.clone()))
                     .when(can_pin || group.pinned, |this| {
                         this.child(

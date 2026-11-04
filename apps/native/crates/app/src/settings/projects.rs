@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, img, list, prelude::FluentBuilder, px,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, list, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
@@ -365,6 +365,8 @@ impl SettingsView {
                 SelectOption::new(group.key.clone(), group.label.clone()).description(secondary)
             }))
             .collect();
+        let icon_state = self.state.clone();
+        let icon_projects: std::collections::HashMap<_, _> = groups.iter().map(|group| (group.key.clone(), group.representative_id.clone())).collect();
         let selected = self.projects.selected.clone().unwrap_or_default();
         let trigger_label = match &self.projects.selected {
             None => "All projects".to_owned(),
@@ -378,10 +380,15 @@ impl SettingsView {
             .text_color(hsla(p.muted_foreground))
             .child("Applying settings for")
             .child(
-                Select::new("project-scope", options).selected(selected).label(trigger_label).popup_width(288.).show_check().on_change(move |value, _, cx| {
-                    let key = (!value.is_empty()).then(|| value.to_string());
-                    let _ = view.update(cx, |this, cx| this.select_project(key, cx));
-                }),
+                Select::new("project-scope", options).selected(selected).label(trigger_label).popup_width(288.).show_check()
+                    .render_icon(move |key, cx| {
+                        let id = icon_projects.get(key)?;
+                        Some(crate::project_icon::render(icon_state.read(cx), id, crate::project_icon::size(14., cx), hsla(palette(cx).icon_muted), cx))
+                    })
+                    .on_change(move |value, _, cx| {
+                        let key = (!value.is_empty()).then(|| value.to_string());
+                        let _ = view.update(cx, |this, cx| this.select_project(key, cx));
+                    }),
             )
             .into_any_element()
     }
@@ -481,12 +488,8 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// `ProjectFavicon`: the project's image once fetched, else the folder glyph.
     pub(super) fn project_favicon(&self, project_id: &str, size: f32, cx: &App) -> AnyElement {
-        match self.state.read(cx).sidebar.favicons.image(project_id) {
-            Some(image) => img(image).flex_none().size(r(size)).into_any_element(),
-            None => icon(Icon::Folder, size, hsla(palette(cx).muted_foreground)).into_any_element(),
-        }
+        crate::project_icon::render(self.state.read(cx), project_id, crate::project_icon::size(size, cx), hsla(palette(cx).icon_muted), cx)
     }
 
     /// The untitled first section: Name, Project icon, Pin and Archive.

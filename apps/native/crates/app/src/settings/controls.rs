@@ -358,12 +358,15 @@ struct SelectState {
     closed_at: Option<Instant>,
 }
 
+type SelectIconRenderer = Rc<dyn Fn(&str, &App) -> Option<AnyElement>>;
+
 /// `select.tsx`: an input-box trigger with a 14px chevron, and a popup list below it aligned to
 /// its end. Keyboard: Enter or Space opens, arrows move, Enter picks, Escape closes.
 #[derive(IntoElement)]
 pub struct Select {
     id: ElementId,
     options: Vec<SelectOption>,
+    render_icon: Option<SelectIconRenderer>,
     selected: Option<SharedString>,
     label: Option<SharedString>,
     width: Option<f32>,
@@ -378,6 +381,7 @@ impl Select {
         Select {
             id: id.into(),
             options,
+            render_icon: None,
             selected: None,
             label: None,
             width: None,
@@ -386,6 +390,11 @@ impl Select {
             disabled: false,
             on_change: None,
         }
+    }
+
+    pub fn render_icon(mut self, render: impl Fn(&str, &App) -> Option<AnyElement> + 'static) -> Self {
+        self.render_icon = Some(Rc::new(render));
+        self
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self { self.disabled = disabled; self }
@@ -443,6 +452,7 @@ impl RenderOnce for Select {
             .or_else(|| selected_index.map(|index| self.options[index].label.clone()))
             .unwrap_or_default();
         let trigger_icon = selected_index.and_then(|index| self.options[index].icon);
+        let trigger_content = selected_index.and_then(|index| self.render_icon.as_ref().and_then(|render| render(&self.options[index].value, cx)));
         let options = Rc::new(self.options);
         let on_change = self.on_change;
 
@@ -546,6 +556,7 @@ impl RenderOnce for Select {
                 }
             })
             .on_key_down(on_key)
+            .children(trigger_content)
             .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
             .child(div().flex_1().min_w_0().truncate().child(trigger_label))
             .child(icon(Icon::ChevronDown, 14., hsla(p.foreground).opacity(0.7)));
@@ -603,6 +614,7 @@ impl RenderOnce for Select {
                                     h_flex()
                                         .gap(r(6.))
                                         .when(option.description.is_some(), |this| this.font_weight(FontWeight::MEDIUM))
+                                        .children(self.render_icon.as_ref().and_then(|render| render(&option.value, cx)))
                                         .children(option.icon.map(|glyph| icon(glyph, 14., hsla(p.muted_foreground))))
                                         .child(div().truncate().child(option.label.clone())),
                                 )

@@ -3,11 +3,13 @@
 //! session and chosen image (`faviconPath`, which the server resolves) on the network runtime and
 //! held in the bounded `FaviconCache`; GPUI decodes the bytes once and caches the texture.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{Context, Image, ImageFormat};
 use t3_core::sidebar::ENVIRONMENT_ID;
+use t3_core::{settings::projects::icon::Presentation, shell::ProjectShell};
+use crate::project_icon::ProjectVisual;
 use t3_core::sidebar::favicon::{FaviconCache, FaviconFormat, project_favicon_resource_key};
 
 use crate::app_state::{AppEvent, AppState};
@@ -15,6 +17,7 @@ use crate::app_state::{AppEvent, AppState};
 #[derive(Default)]
 pub struct FaviconStore {
     cache: FaviconCache,
+    presentations: HashMap<String, (String, Option<serde_json::Value>, Arc<Presentation>)>,
     /// Project id to its cache key and decoded image, kept only while the cache holds the key.
     images: HashMap<String, (String, Arc<Image>)>,
     /// Project id to the `faviconPath` its icon was asked for with, so choosing another image
@@ -23,7 +26,22 @@ pub struct FaviconStore {
 }
 
 impl FaviconStore {
-    pub fn image(&self, project_id: &str) -> Option<Arc<Image>> {
+    pub fn visual(&self, project_id: &str) -> ProjectVisual {
+        ProjectVisual { presentation: self.presentations.get(project_id).map(|(_, _, p)| p.clone()), image: self.image(project_id) }
+    }
+
+    fn sync_presentations(&mut self, projects: &[ProjectShell]) {
+        let listed: HashSet<_> = projects.iter().map(|project| project.id.as_str()).collect();
+        self.presentations.retain(|id, _| listed.contains(id.as_str()));
+        for project in projects {
+            let current = self.presentations.get(&project.id);
+            if current.is_some_and(|(title, icon, _)| title == &project.title && icon == &project.project_icon) { continue; }
+            let presentation = Presentation::new(project.project_icon.as_ref(), &project.title);
+            self.presentations.insert(project.id.clone(), (project.title.clone(), project.project_icon.clone(), Arc::new(presentation)));
+        }
+    }
+
+    fn image(&self, project_id: &str) -> Option<Arc<Image>> {
         self.images.get(project_id).map(|(_, image)| image.clone())
     }
 }
@@ -46,10 +64,13 @@ impl AppState {
     /// Starts a fetch for every listed project not asked about yet this session, or whose chosen
     /// image changed since.
     pub(crate) fn ensure_favicons(&mut self, cx: &mut Context<Self>) {
-        let (Some(snapshot), Some(client)) = (self.shell.snapshot.as_ref(), self.client_handle()) else { return };
+        let Some(snapshot) = self.shell.snapshot.as_ref() else { return };
+        self.sidebar.favicons.sync_presentations(&snapshot.projects);
+        let Some(client) = self.client_handle() else { return };
         let wanted: Vec<(String, String, Option<String>)> = snapshot
             .projects
             .iter()
+            .filter(|project| self.sidebar.favicons.presentations.get(&project.id).is_some_and(|(_, _, p)| p.automatic()))
             .filter(|project| self.sidebar.favicons.requested.get(&project.id) != Some(&project.favicon_path))
             .map(|project| (project.id.clone(), project.workspace_root.clone(), project.favicon_path.clone()))
             .collect();

@@ -49,13 +49,17 @@ fn project_icons_decode_describe_and_know_their_default() {
     let legacy = decode(json!({"kind": "lucide", "name": "rocket", "color": "red", "monogramText": "T3"}));
     assert_eq!(legacy, Some(ProjectIcon::Monogram { text: "T3".into(), color: "red".into() }), "a legacy monogram reads as one");
     assert_eq!(icon_description(decode(json!({"kind": "emoji", "emoji": "🚀"})).as_ref(), None), "🚀");
+    assert_eq!(decode(json!({"kind":"lucide","name":"folder-code","color":"violet","monogram":"é"})),
+        Some(ProjectIcon::Monogram { text: "é".into(), color: "violet".into() }));
+    assert_eq!(decode(json!({"kind":"lucide","name":"folder-code","color":"blue","monogramText":"T3","monogram":"OLD"})),
+        Some(ProjectIcon::Monogram { text: "T3".into(), color: "blue".into() }));
     let future = decode(json!({"kind": "sticker", "id": 4}));
-    assert_eq!(future, Some(ProjectIcon::Unknown));
+    assert_eq!(future, None, "ReceivedProjectIcon maps future kinds to the automatic path");
     assert_eq!(icon_description(future.as_ref(), Some("logo.png")), "logo.png");
     assert_eq!(icon_description(None, None), "Automatic");
 
     assert!(has_default_icon(false, None, None));
-    assert!(!has_default_icon(false, None, future.as_ref()));
+    assert!(has_default_icon(false, None, future.as_ref()));
     assert!(!has_default_icon(false, Some("logo.png"), None));
     let scratch = decode(json!({"kind": "lucide", "name": "message-square-dashed", "color": "gray"}));
     assert!(has_default_icon(true, None, scratch.as_ref()));

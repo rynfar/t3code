@@ -103,10 +103,7 @@ impl Render for ChatHeader {
         let thread_id = thread.id.clone();
         let title = thread.title.clone();
         let project = app.shell.project(&thread.project_id).map(|project| (project.id.clone(), project.title.clone()));
-        let favicon = match app.sidebar.favicons.image(&thread.project_id) {
-            Some(image) => gpui::img(image).flex_none().size(px(14.)).into_any_element(),
-            None => Icon::Folder.sized(px(14.)).text_color(hsla(p.icon_muted)).into_any_element(),
-        };
+        let favicon = crate::project_icon::render(app, &thread.project_id, crate::project_icon::size(14., cx), hsla(p.icon_muted), cx);
         let parent = (thread.lineage.relationship_to_parent.as_deref() == Some("subagent"))
             .then(|| thread.lineage.parent_thread_id.clone())
             .flatten()

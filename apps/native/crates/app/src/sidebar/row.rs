@@ -2,7 +2,7 @@
 //! `sidebar/SidebarListMarkers.tsx`): 78px cards for pinned, active and working threads, 36px slim
 //! rows for snoozed and settled ones, shelf headers, and the Settled "Show more" button.
 
-use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, img, point, prelude::*, px};
+use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, point, prelude::*, px};
 use gpui_component::Sizable as _;
 use t3_core::sidebar::settled::{self, snooze_wake_label};
 use t3_core::sidebar::status::{self, StatusIcon, StatusTone, ThreadStatus, TopStatus};
@@ -131,7 +131,7 @@ impl SidebarPane {
         let draggable = section != Section::Working && state.sidebar.capabilities.can_operate && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != thread.id);
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
         let card = (self.state.clone(), thread.id.clone(), project.clone());
-        let preview = (thread.title.clone(), project);
+        let preview = (thread.title.clone(), project, crate::project_icon::ProjectVisual::for_project(state, &thread.project_id));
         let pane = cx.entity().downgrade();
         div()
             .id(SharedString::from(format!("thread-row-{}", thread.id)))
@@ -157,7 +157,7 @@ impl SidebarPane {
             }))
             .when(draggable, |this| {
                 this.on_drag(DraggedThread { id: thread.id.clone() }, move |dragged, _, _, cx| {
-                    let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone()));
+                    let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone(), preview.2.clone()));
                     if let Some(pane) = pane.upgrade() {
                         pane.update(cx, |pane, cx| pane.begin_drag(&dragged.id, preview.clone(), cx));
                     }
@@ -478,27 +478,12 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    /// The 16px project icon, or the folder fallback. Slim rows mute it until hovered.
+    /// Slim rows mute the same project visual until hovered.
     pub(super) fn favicon(&self, project_id: &str, muted: bool, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
-        let size = px(16.);
-        let Some(image) = self.state.read(cx).sidebar.favicons.image(project_id) else {
-            return div()
-                .flex_none()
-                .when(muted, |this| this.opacity(0.4).group_hover("sidebar-row", |this| this.opacity(1.)))
-                .child(Icon::Folder.sized(size).text_color(hsla(p.sidebar_icon)))
-                .into_any_element();
-        };
-        if !muted {
-            return img(image).flex_none().size(size).into_any_element();
-        }
-        div()
-            .flex_none()
-            .relative()
-            .size(size)
-            .child(img(image.clone()).size(size).grayscale(true).opacity(0.4).group_hover("sidebar-row", |this| this.invisible()))
-            .child(div().absolute().top_0().left_0().invisible().group_hover("sidebar-row", |this| this.visible()).child(img(image).size(size)))
-            .into_any_element()
+        let size = crate::project_icon::size(16., cx);
+        let visual = crate::project_icon::ProjectVisual::for_project(self.state.read(cx), project_id);
+        let ink = hsla(palette(cx).sidebar_icon);
+        if muted { visual.render_receding(size, ink, cx) } else { visual.render(size, ink, cx) }
     }
 
     fn jump_hints_visible(&self) -> bool {
@@ -602,7 +587,7 @@ fn hover_card(state: &crate::app_state::AppState, thread_id: &str, project: Opti
     ThreadHoverCard {
         title: thread.map(|thread| thread.title.clone()).unwrap_or_default().into(),
         project: project.map(Into::into),
-        favicon: thread.and_then(|thread| state.sidebar.favicons.image(&thread.project_id)),
+        favicon: thread.map(|thread| crate::project_icon::ProjectVisual::for_project(state, &thread.project_id)).unwrap_or_default(),
         branch: thread.and_then(|thread| thread.branch.clone()).map(Into::into),
         model: model.map(Into::into),
         error,

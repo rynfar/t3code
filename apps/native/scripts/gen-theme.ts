@@ -20,6 +20,7 @@ const COMPOSER_SURFACE = "apps/web/src/components/chat/ComposerSurface.tsx";
 const INDEX_CSS = "apps/web/src/index.css";
 const WEB_PALETTE = "apps/web/src/themePalette.ts";
 const SHARED_PALETTES = "packages/shared/src/themePalettes.ts";
+const PROJECT_ICON_COLORS = "apps/web/src/projectIconColors.ts";
 const SETTINGS = "packages/contracts/src/settings.ts";
 const OUTPUT = "apps/native/crates/app/src/theme/tokens.rs";
 
@@ -886,6 +887,18 @@ function composerTokens(): ColorToken[] {
   ];
 }
 
+function projectIconTokens(): ColorToken[] {
+  return [
+    ...read(PROJECT_ICON_COLORS).matchAll(
+      /value: "([a-z]+)",[\s\S]*?className: "text-([a-z]+-\d+) dark:text-([a-z]+-\d+)"/g,
+    ),
+  ].map(([, name, light, dark]) => ({
+    name: `project_icon_${name}`,
+    web: `${PROJECT_ICON_COLORS} ${name}`,
+    css: hue(light!, dark!),
+  }));
+}
+
 const COLOR_TOKENS: readonly ColorToken[] = [
   { name: "picker_thumb_border", web: "ui/color-picker.tsx border-white", css: v("--color-white") },
   ...composerTokens(),
@@ -1100,6 +1113,7 @@ const COLOR_TOKENS: readonly ColorToken[] = [
   ...statusHue("plan", "violet", 90),
   ...statusHue("completed", "emerald", 90),
   ...usageTokens(),
+  ...projectIconTokens(),
   ...chipTokens(),
   {
     name: "glass_surface",
