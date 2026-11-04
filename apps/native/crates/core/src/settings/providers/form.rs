@@ -308,6 +308,13 @@ impl SecretSourceDraft {
             ""
         }
     }
+    pub fn validate_draft(&self, row: &Value, text: &str, one_password: bool) -> Result<(), &'static str> {
+        if self.provider(row).is_none() { return Ok(()); }
+        if !valid_reference(text) || (one_password && !valid_one_password_reference(text)) {
+            return Err(if one_password { "Use a 1Password reference like op://vault/item/field." } else { "Enter a valid secret reference." });
+        }
+        Ok(())
+    }
     pub fn select(&mut self, row: &mut Value, provider: Option<String>) -> bool {
         let stored = provider.is_none();
         self.pending_provider = provider.filter(|p| row["value"]["provider"].as_str() != Some(p.as_str()));
@@ -639,6 +646,9 @@ mod tests {
         let mut row = saved.clone();
         let mut draft = SecretSourceDraft::default();
         assert!(!draft.select(&mut row, Some("B".into())));
+        assert!(draft.validate_draft(&row, "", true).is_err());
+        assert!(draft.validate_draft(&row, "invalid", true).is_err());
+        assert!(draft.validate_draft(&row, "op://vault/item/field", true).is_ok());
         assert!(!draft.commit(&mut row, "", true).unwrap());
         assert_eq!(row, saved);
         assert!(draft.commit(&mut row, "invalid", true).is_err());

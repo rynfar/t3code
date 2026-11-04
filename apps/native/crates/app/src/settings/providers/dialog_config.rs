@@ -35,7 +35,7 @@ impl RenderOnce for FocusConfigSelect {
     }
 }
 
-struct DraftInput {
+pub(super) struct DraftInput {
     key: String,
     input: Entity<InputState>,
     _subscription: Subscription,
@@ -43,7 +43,7 @@ struct DraftInput {
 #[derive(Default)]
 pub(super) struct ConfigDraft {
     pub(super) model: wizard::ConfigDraft,
-    fields: Vec<DraftInput>,
+    pub(super) fields: Vec<DraftInput>,
 }
 impl ConfigDraft {
     pub(super) fn inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
@@ -58,23 +58,33 @@ impl SettingsView {
         };
         let driver = dialog.driver().kind;
         let draft = dialog.configs.entry(driver).or_default();
-        if !draft.fields.is_empty() {
-            return;
-        }
-        for field in form::fields(driver, draft.model.value.as_ref())
-            .into_iter()
-            .filter(|f| f.options.is_empty())
-        {
+        let fields = form::fields(driver, draft.model.value.as_ref());
+        for field in fields.into_iter().filter(|f| f.options.is_empty()) {
+            if self.providers.dialog.as_ref().unwrap().configs[driver]
+                .fields
+                .iter()
+                .any(|f| f.key == field.key)
+            {
+                continue;
+            }
             let key = field.key.clone();
+            let saved = self.providers.dialog.as_ref().unwrap().configs[driver]
+                .model
+                .value
+                .as_ref()
+                .and_then(|v| v[&key].as_str())
+                .unwrap_or("")
+                .to_owned();
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
+                    .default_value(saved)
                     .placeholder(field.placeholder)
                     .masked(field.secret)
             });
             let subscription = cx.subscribe_in(
                 &input,
                 window,
-                move |this, input, event: &InputEvent, _, cx| {
+                move |this, input, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.edit_dialog_config(
                             driver,
@@ -82,6 +92,9 @@ impl SettingsView {
                             json!(input.read(cx).value().as_ref()),
                             cx,
                         );
+                    }
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.advance_dialog(window, cx);
                     }
                 },
             );
@@ -126,6 +139,10 @@ impl SettingsView {
             return;
         };
         draft.model.edit(driver, key, value);
+        if driver == "acpRegistry" && key == "source" {
+            draft.fields.clear();
+        }
+        dialog.error = None;
         cx.notify();
     }
 
@@ -192,14 +209,15 @@ impl SettingsView {
                     .selected(current)
                     .label(label)
                     .width(224.)
-                    .on_change(move |value, _, cx| {
+                    .on_change(move |value, window, cx| {
                         let value = if value.as_ref() == fallback {
                             ""
                         } else {
                             value.as_ref()
                         };
                         let _ = view.update(cx, |this, cx| {
-                            this.edit_dialog_config(driver, &edit_key, json!(value), cx)
+                            this.edit_dialog_config(driver, &edit_key, json!(value), cx);
+                            this.sync_dialog_config(window, cx);
                         });
                     });
                     FocusConfigSelect {
