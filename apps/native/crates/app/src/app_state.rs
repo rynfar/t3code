@@ -6,11 +6,10 @@ use std::future::Future;
 
 use gpui::{Context, EventEmitter, Subscription, Task};
 use serde_json::Value;
-use t3_client::auth::Credentials;
 use t3_client::session::RpcError;
 use t3_client::ssh::{PasswordRequest, SshEnvironments};
 use t3_client::store::{self, SavedEnvironments};
-use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus, Prepare};
+use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
 use t3_core::commands::{self, method};
 use t3_core::composer::ClientSettings;
 use t3_core::history::{HistoryStep, PageOutcome};
@@ -70,6 +69,7 @@ pub struct AppState {
     pub(crate) announcements: crate::announcements::Announcements,
     pub phase: Phase,
     pub environments: SavedEnvironments,
+    pub(crate) environment_statuses: std::collections::HashMap<String, ConnectionStatus>,
     /// `environments` as last handed to the store; saves send only the edits since.
     pub(crate) environments_saved: SavedEnvironments,
     pub connect: ConnectScreen,
@@ -116,13 +116,13 @@ pub struct AppState {
     /// SSH password prompts waiting for an answer, oldest first, each with its sequence number.
     pub ssh_prompts: VecDeque<(u64, PasswordRequest)>,
     pub(crate) ssh_prompt_sequence: u64,
+    pub(crate) connections: t3_client::environments::Environments,
     _pump: Option<Task<()>>,
+    pub(crate) notification_route: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     _ssh_quit: Option<Subscription>,
 }
 
 impl EventEmitter<AppEvent> for AppState {}
-
-const MAX_BATCH: usize = 512;
 
 impl AppState {
     pub fn new(runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
@@ -136,11 +136,19 @@ impl AppState {
             }
         })
         .detach();
+        let settings = ClientSettings::from_json(&store::load_client_settings().unwrap_or_default());
+        let (connections, mut events) = t3_client::environments::Environments::start(&runtime, settings.notification_mode != t3_core::notifications::NotificationMode::Off || settings.in_app_notifications_enabled);
+        let pump = cx.spawn(async move |this, cx| {
+            while let Some(event) = events.recv().await {
+                if this.update(cx, |state, cx| state.apply_environment_event(event, cx)).is_err() { return; }
+            }
+        });
         let mut state = AppState {
             announcements: crate::announcements::Announcements::new(cx),
             phase: Phase::Unpaired,
             environments_saved: environments.clone(),
             environments,
+            environment_statuses: Default::default(),
             connect: ConnectScreen::default(),
             cloud: Default::default(),
             shell: ShellState::default(),
@@ -152,7 +160,7 @@ impl AppState {
             thread: ThreadState::default(),
             last_error: None,
             server_config: ServerConfigState::default(),
-            client_settings: ClientSettings::from_json(&store::load_client_settings().unwrap_or_default()),
+            client_settings: settings,
             draft_project: None,
             panels: Default::default(),
             pull_requests_open: false,
@@ -175,7 +183,9 @@ impl AppState {
             ssh: SshEnvironments::new(Some(prompts)),
             ssh_prompts: VecDeque::new(),
             ssh_prompt_sequence: 0,
-            _pump: None,
+            connections,
+            _pump: Some(pump),
+            notification_route: None,
             _ssh_quit: None,
         };
         // Quitting stops the tunnels this app started, by the PIDs it spawned.
@@ -190,30 +200,31 @@ impl AppState {
             state.server_config.config=serde_json::from_value(serde_json::json!({"environment":{"environmentId":"fixture-env","label":"Fixture Computer"},"cwd":"/fixture"})).ok();
             return state;
         }
-        match state.environments.active().filter(|environment| environment.credentials().is_some()).map(|environment| environment.id.clone()) {
-            Some(id) => state.start_environment(&id, cx),
+        match state.environments.active().filter(|environment| !environment.disabled && environment.credentials().is_some()).map(|environment| environment.id.clone()) {
+            Some(id) => { state.start_environment(&id, cx); state.connections.activate(Some(&id)); },
             None => state.refresh_local_server(cx),
         }
+        let watched: Vec<_> = state.environments.environments.iter().filter(|e| !e.disabled && e.access_token.is_some()).map(|e| e.id.clone()).collect();
+        for id in watched { state.start_environment(&id, cx); }
         state.refresh_cloud(cx);
         state
     }
 
-    /// Drops the event pump so a closing client's queued events never reach the next one.
-    /// Never call it from inside the pump.
+    /// Fixtures hold their UI state against later network events.
+    #[cfg(feature = "snapshot")]
     pub(crate) fn stop_pump(&mut self) {
         self._pump = None;
     }
 
     /// Drops the client and everything that belonged to its environment.
     pub(crate) fn clear_connection_state(&mut self, cx: &mut Context<Self>) {
-        self.clear_pending_notifications(cx);
+        if let Some(client) = &self.client { client.close_all_threads(); }
         self.client = None;
         self.shell = ShellState::default();
         let collapsed = self.sidebar.collapsed;
         self.sidebar = SidebarController::default();
         self.sidebar.collapsed = collapsed;
         self.omitted = Default::default();
-        self.notifications = Default::default();
         self.selected_thread = None;
         self.select_when_listed = None;
         self.restore_thread = None;
@@ -236,33 +247,56 @@ impl AppState {
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::Selection);
         cx.emit(AppEvent::Thread);
+        cx.emit(AppEvent::Phase);
     }
 
-    pub(crate) fn start_client(&mut self, credentials: Credentials, prepare: Option<Prepare>, cx: &mut Context<Self>) {
-        let (client, mut events) = t3_client::supervisor::start_prepared(&self.runtime, credentials, prepare);
-        self.client = Some(client);
-        self.connection += 1;
-        self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
-        cx.emit(AppEvent::RightPanel);
-        let connecting = Phase::Online(ConnectionStatus::Connecting);
-        if self.phase == connecting {
-            cx.emit(AppEvent::Phase);
-        }
-        self.set_phase(connecting, cx);
-        self._pump = Some(cx.spawn(async move |this, cx| {
-            while let Some(first) = events.recv().await {
-                let mut batch = vec![first];
-                while batch.len() < MAX_BATCH {
-                    match events.try_recv() {
-                        Ok(event) => batch.push(event),
-                        Err(_) => break,
-                    }
-                }
-                if this.update(cx, |state, cx| state.apply_batch(batch, cx)).is_err() {
-                    return;
+    fn apply_environment_event(&mut self, event: t3_client::environments::EnvironmentEvent, cx: &mut Context<Self>) {
+        use t3_client::environments::EnvironmentEvent;
+        if !self.connections.is_current(&event) { return; }
+        match event {
+            EnvironmentEvent::Activated { id, client, shell, config, status, .. } => {
+                if self.environments.active.as_deref() != Some(&id) { return; }
+                self.client = Some(client);
+                self.connection += 1;
+                self.shell = *shell;
+                self.server_config = *config;
+                self.panels = crate::right_panel::PanelState::load(Some(&id));
+                cx.emit(AppEvent::RightPanel);
+                self.set_phase(Phase::Online(status), cx);
+                cx.emit(AppEvent::Phase);
+                self.sync_server_config(cx);
+                self.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+                self.restore_shell_selection(cx);
+                self.finish_notification_route(cx);
+                self.land_home(cx);
+            }
+            EnvironmentEvent::Active { id, events, .. } => {
+                if self.environments.active.as_deref() == Some(&id) { self.apply_batch(events, cx); }
+            }
+            EnvironmentEvent::Status { id, status, .. } => {
+                self.environment_statuses.insert(id.clone(), status.clone());
+                if self.environments.active.as_deref() != Some(&id) { cx.emit(AppEvent::Phase); }
+                if status != ConnectionStatus::Connected { self.retire_environment_notifications(&id, cx); }
+                if let ConnectionStatus::NeedsPairing { reason } = status {
+                    self.environment_credentials_rejected(&id, reason, cx);
+                } else if self.environments.active.as_deref() == Some(&id) {
+                    self.set_phase(Phase::Online(status), cx);
                 }
             }
-        }));
+            EnvironmentEvent::Moved { id, http_base, .. } => self.environment_route_moved(&id, http_base, cx),
+            EnvironmentEvent::Identity { id, descriptor, .. } => {
+                if self.environments.update_identity(&id, &descriptor.environment_id, &descriptor.label, &descriptor.server_version) { self.persist_environments(); }
+            }
+            EnvironmentEvent::Visibility(visibility) => {
+                self.notifications.visibility = visibility;
+                self.retire_hidden_notifications(cx);
+            }
+            EnvironmentEvent::Notifications { id, notifications, .. } => {
+                if self.environments.get(&id).is_none_or(|e| e.disabled || e.access_token.is_none()) { return; }
+                for notification in notifications { self.present_notification(&id, notification, cx); }
+            }
+        }
     }
 
     fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
@@ -272,7 +306,7 @@ impl AppState {
         let mut side_changed = false;
         for event in batch {
             match event {
-                ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => self.credentials_rejected(reason, cx),
+                ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => { if let Some(id) = self.environments.active.clone() { self.environment_credentials_rejected(&id, reason, cx); } },
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
                 ClientEvent::Shell(item) => {
                     resynchronized |= matches!(item, ShellStreamItem::Synchronized);
@@ -293,7 +327,7 @@ impl AppState {
                 ClientEvent::StreamError { context, message } => {
                     self.last_error = Some(format!("Could not read {context}: {message}"));
                 }
-                ClientEvent::Moved { http_base } => self.route_moved(http_base, cx),
+                ClientEvent::Moved { http_base } => { if let Some(id) = self.environments.active.clone() { self.environment_route_moved(&id, http_base, cx); } },
             }
         }
         if side_changed {
@@ -307,23 +341,7 @@ impl AppState {
                 self.rebuild_sidebar(cx);
             }
             cx.emit(AppEvent::Shell);
-            let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-            if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
-                self.sidebar.history.replace_draft();
-                self.select_thread(&id, cx);
-            } else if self.selected_thread.is_none()
-                && self.draft_project.is_none()
-                && let Some(id) = self.restore_thread.take_if(|id| mounts.thread(shell, id).is_some())
-            {
-                self.select_thread(&id, cx);
-            } else if self.selected_thread.is_none()
-                && self.draft_project.is_none()
-                && self.shell.synchronized
-                && let Some(id) = self.restore_thread.take()
-            {
-                // A shell that omits older settled or idle threads can still hold it: ask its family.
-                self.read_family(&id, true, cx);
-            }
+            self.restore_shell_selection(cx);
         }
         if thread_changed && self.thread.deleted {
             // The web treats a deleted open thread as missing and goes home.
@@ -340,7 +358,27 @@ impl AppState {
             cx.emit(AppEvent::ServerConfig);
         }
         if shell_changed || resynchronized {
-            self.observe_notifications(cx);
+            self.finish_notification_route(cx);
+        }
+    }
+
+    fn restore_shell_selection(&mut self, cx: &mut Context<Self>) {
+        let (shell, mounts) = (&self.shell, &self.omitted.mounts);
+        if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
+            self.sidebar.history.replace_draft();
+            self.select_thread(&id, cx);
+        } else if self.selected_thread.is_none()
+            && self.draft_project.is_none()
+            && let Some(id) = self.restore_thread.take_if(|id| mounts.thread(shell, id).is_some())
+        {
+            self.select_thread(&id, cx);
+        } else if self.selected_thread.is_none()
+            && self.draft_project.is_none()
+            && self.shell.synchronized
+            && let Some(id) = self.restore_thread.take()
+        {
+            // A shell that omits older settled or idle threads can still hold it: ask its family.
+            self.read_family(&id, true, cx);
         }
     }
 
@@ -348,7 +386,7 @@ impl AppState {
     /// index route does (`_chat.index.tsx`). It waits while a thread is about to be selected.
     pub(crate) fn land_home(&mut self, cx: &mut Context<Self>) {
         let idle = self.selected_thread.is_none() && self.draft_project.is_none() && !self.pull_requests_open;
-        let waiting = self.restore_thread.is_some() || self.select_when_listed.is_some() || self.restoring_thread;
+        let waiting = self.notification_route.is_some() || self.restore_thread.is_some() || self.select_when_listed.is_some() || self.restoring_thread;
         if !idle || waiting || !self.shell.synchronized {
             return;
         }
@@ -383,6 +421,7 @@ impl AppState {
     }
 
     pub fn select_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.notification_route = None;
         if !self.thread_route_visible(thread_id) {
             self.restore_thread = None;
             self.clear_selection(cx);
@@ -477,6 +516,7 @@ impl AppState {
 
     /// Opens the new-thread draft for `project_id`, leaving the open thread.
     pub fn start_draft(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        self.notification_route = None;
         if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
             return self.set_pull_requests_open(false, cx);
         }
@@ -495,6 +535,7 @@ impl AppState {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.notification_route = None;
         if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&previous);
         }

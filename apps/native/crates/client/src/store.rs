@@ -47,6 +47,9 @@ pub struct SavedEnvironment {
     #[serde(default)]
     pub environment_id: Option<String>,
     pub label: String,
+    /// Explicitly disconnected; stays saved until the user connects it again.
+    #[serde(default)]
+    pub disabled: bool,
     pub http_base: String,
     /// `None` once the server rejected it: the entry stays until it is paired again or removed.
     #[serde(default)]
@@ -107,6 +110,7 @@ impl SavedEnvironments {
             http_base: credentials.http_base,
             access_token: Some(credentials.access_token),
             server_version: None,
+            disabled: false,
             local: false,
             ssh: None,
         };
@@ -156,6 +160,7 @@ impl SavedEnvironments {
             id: id.clone(),
             environment_id: environment_id.or_else(|| previous.as_ref().and_then(|environment| environment.environment_id.clone())),
             label,
+            disabled: false,
             http_base: http_base.clone(),
             access_token: Some(paired.credentials.access_token.clone()),
             server_version: descriptor
@@ -809,6 +814,12 @@ mod tests {
     fn revoked_and_removed_environments() {
         let mut saved = SavedEnvironments::default();
         let mac = saved.upsert(&paired("http://127.0.0.1:3773", "t", "env-mac", "MacBook Pro"), true);
+        assert!(!saved.get(&mac).unwrap().disabled, "saved environments are enabled by default");
+        saved.environments[0].disabled = true;
+        let serialized = serde_json::to_string(&saved).unwrap();
+        assert!(decode_environments(Some(&serialized), None).get(&mac).unwrap().disabled);
+        saved.upsert(&paired("http://127.0.0.1:3773", "t", "env-mac", "MacBook Pro"), true);
+        assert!(!saved.get(&mac).unwrap().disabled, "pairing again enables the environment");
         saved.revoke(&mac);
         assert_eq!(saved.get(&mac).and_then(SavedEnvironment::credentials), None);
         assert_eq!(saved.active.as_deref(), Some(mac.as_str()), "a rejected entry stays until paired again or removed");

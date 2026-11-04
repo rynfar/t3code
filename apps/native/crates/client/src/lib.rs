@@ -30,3 +30,5 @@ pub mod chatgpt;
 pub mod theme_import;
 
 pub mod vcs;
+
+pub mod environments;

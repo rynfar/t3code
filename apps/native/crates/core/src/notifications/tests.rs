@@ -251,3 +251,51 @@ fn completion_gate_matches_web_once_only_and_skip_cases() {
     gate.clear();
     assert_eq!(gate.observe(&key, Some(&working), &completed(1), false, false), Some(NotificationKind::Completion));
 }
+
+#[test]
+fn background_environments_keep_independent_gates_pending_and_click_destinations() {
+    let mut watched = EnvironmentNotifications::default();
+    let mut pending = PendingNotifications::default();
+    pending.sync(NotificationMode::Notifications, true, false);
+    let mut shell = ShellState::default();
+    let update = |shell: &mut ShellState, status, extra| {
+        shell.apply(ShellStreamItem::Snapshot { snapshot: Box::new(ShellSnapshot {
+            threads: vec![thread("same-thread-id", status, extra)], ..Default::default()
+        }), resolved_repository_identity_roots: None });
+    };
+    update(&mut shell, "running", json!({}));
+    for env in ["active", "background"] {
+        assert!(watched.observe(env, &shell, &HashSet::new()).is_empty());
+    }
+    update(&mut shell, "completed", json!({"latestRunCompletedAt":"2026-11-01T00:09:00.000Z"}));
+    for env in ["background", "active"] {
+        assert_eq!(kinds(&watched.observe(env, &shell, &HashSet::new())), [("same-thread-id", "Thread completed")]);
+        let attempt = pending.begin(ThreadKey::new(env, "same-thread-id"));
+        assert!(pending.confirm(&attempt, DeliveryOutcome::Accepted));
+    }
+    assert_eq!(pending.badge_count(), 2);
+    // Switching views and a reconnect replay don't create another notification.
+    assert!(watched.observe("background", &shell, &HashSet::new()).is_empty());
+    assert_eq!(pending.badge_count(), 2);
+    let tag = notification_tag("background", "same-thread-id");
+    assert_eq!(pending.destination(&tag), Some(&ThreadKey::new("background", "same-thread-id")));
+    let in_flight = pending.begin(ThreadKey::new("active", "later"));
+    watched.remove("active");
+    pending.retire_where(|key| key.environment_id == "active");
+    assert!(!pending.confirm(&in_flight, DeliveryOutcome::Accepted));
+    assert_eq!(pending.badge_count(), 1);
+    assert!(pending.destination(&notification_tag("active", "same-thread-id")).is_none());
+    assert_eq!(pending.destination(&tag), Some(&ThreadKey::new("background", "same-thread-id")));
+    assert!(watched.observe("background", &shell, &HashSet::new()).is_empty());
+    // Re-enabling a removed environment establishes a fresh baseline.
+    assert!(watched.observe("active", &shell, &HashSet::new()).is_empty());
+}
+
+#[test]
+fn notification_click_switches_environment_before_opening_the_thread_or_family() {
+    let target = ThreadKey::new("background", "thread");
+    assert_eq!(notification_route(&target, Some("active"), true, true), NotificationRoute::SwitchEnvironment);
+    assert_eq!(notification_route(&target, Some("background"), false, true), NotificationRoute::WaitForShell);
+    assert_eq!(notification_route(&target, Some("background"), true, true), NotificationRoute::OpenThread);
+    assert_eq!(notification_route(&target, Some("background"), true, false), NotificationRoute::ReadFamily);
+}

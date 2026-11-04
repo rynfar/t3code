@@ -1,7 +1,7 @@
 //! Saved environments and how the app reaches one: pairing with a link, with T3 Code on this
 //! Mac, or over SSH, switching, disconnecting, removing, retrying, and the re-pair prompt after a
-//! server rejects this device. One environment is connected at a time; the saved list holds the
-//! rest. The pairing, discovery and SSH work runs on the network runtime (`t3_client::local`,
+//! server rejects this device. Every enabled saved environment stays connected; selection
+//! attaches the active view to its existing supervisor. The pairing, discovery and SSH work runs on the network runtime (`t3_client::local`,
 //! `auth`, `ssh`). SSH follows the desktop's registry (`client-runtime/src/connection/registry.ts`):
 //! removing or disconnecting an SSH environment closes its tunnel and stops the remote server
 //! this app started; the SSH password prompts queue here for `ssh_prompt.rs`.
@@ -241,7 +241,10 @@ impl AppState {
         self.persist_environments();
         self.reset_connect_screen();
         self.reset_connection(cx);
+        self.connections.remove(&id);
+        self.retire_environment_notifications(&id, cx);
         self.start_environment(&id, cx);
+        self.connections.activate(Some(&id));
     }
 
     /// Saves a pairing made over SSH and connects to it through its tunnel.
@@ -251,7 +254,10 @@ impl AppState {
         self.persist_environments();
         self.reset_connect_screen();
         self.reset_connection(cx);
+        self.connections.remove(&id);
+        self.retire_environment_notifications(&id, cx);
         self.start_environment(&id, cx);
+        self.connections.activate(Some(&id));
         self.show_toast(Toast::new(ToastKind::Success, "Environment connected").description(format!("{alias} is ready over an SSH-managed tunnel.")), cx);
     }
 
@@ -261,7 +267,7 @@ impl AppState {
         let Some(environment) = self.environments.get(id).cloned() else { return };
         let Some(access_token) = environment.access_token.clone() else { return };
         let Some(target) = environment.ssh.clone() else {
-            return self.start_client(Credentials { http_base: environment.http_base, access_token }, None, cx);
+            return self.connections.watch(id, Credentials { http_base: environment.http_base, access_token }, None);
         };
         let port = match self.ssh.session_port(&target) {
             Ok(port) => port,
@@ -276,29 +282,27 @@ impl AppState {
             let (ssh, target, expected, address) = (ssh.clone(), target.clone(), expected.clone(), address.clone());
             Box::pin(async move { ssh.prepare(&target, expected.as_deref(), &address).await })
         });
-        self.start_client(Credentials { http_base, access_token }, Some(prepare), cx);
+        self.connections.watch(id, Credentials { http_base, access_token }, Some(prepare));
     }
 
     /// The SSH tunnel had to move to another local port, and its client stopped. Reconnects
     /// there once the event pump that reported it has returned.
-    pub(crate) fn route_moved(&mut self, http_base: String, cx: &mut Context<Self>) {
-        let Some(id) = self.environments.active.clone() else { return };
-        tracing::info!(%http_base, "the SSH tunnel moved to another local port");
-        let connection = self.connection_id();
-        cx.spawn(async move |this, cx| {
-            let _ = this.update(cx, |state, cx| {
-                if state.connection_id() == connection && state.environments.active.as_deref() == Some(id.as_str()) {
-                    state.reset_connection(cx);
-                    state.start_environment(&id, cx);
-                }
-            });
-        })
-        .detach();
+    pub(crate) fn environment_route_moved(&mut self, id: &str, http_base: String, cx: &mut Context<Self>) {
+        if self.environments.get(id).is_none_or(|e| e.disabled) { return; }
+        self.environments.relocate(id, &http_base);
+        self.persist_environments();
+        self.retire_environment_notifications(id, cx);
+        self.start_environment(id, cx);
+        if self.environments.active.as_deref() == Some(id) {
+            self.reset_connection(cx);
+            self.connections.activate(Some(id));
+        }
     }
 
     /// Connects a saved environment, or asks to pair it again when its credential was rejected.
     /// T3 Code on this Mac is reached where it runs now, which moves when its port does.
     pub fn connect_environment(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.notification_route.as_ref().is_some_and(|target| target.environment_id != id) { self.notification_route = None; }
         let moved = self.relocate_local(id);
         let Some(environment) = self.environments.get(id).cloned() else { return };
         if !moved && self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
@@ -314,11 +318,14 @@ impl AppState {
             let message = format!("Paste a new pairing link from {} to connect it again.", environment.label);
             return self.fail_pairing(PairingSource::Link, message, cx);
         }
+        if let Some(entry) = self.environments.environments.iter_mut().find(|e| e.id == id) { entry.disabled = false; }
+        if moved { self.connections.remove(id); self.retire_environment_notifications(id, cx); }
         self.environments.active = Some(environment.id.clone());
         self.persist_environments();
         self.reset_connect_screen();
         self.reset_connection(cx);
         self.start_environment(&environment.id, cx);
+        self.connections.activate(Some(&environment.id));
     }
 
     /// Points a saved local pairing at the address the running server recorded, when discovery
@@ -339,6 +346,14 @@ impl AppState {
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
         let ssh = self.active_environment().and_then(|environment| environment.ssh.clone());
         self.cancel_pairing();
+        if let Some(id) = self.environments.active.clone() {
+            if let Some(entry) = self.environments.environments.iter_mut().find(|e| e.id == id) { entry.disabled = true; }
+            self.connections.remove(&id);
+            self.environment_statuses.remove(&id);
+            self.retire_environment_notifications(&id, cx);
+        }
+        self.connections.activate(None);
+        self.notification_route = None;
         self.environments.active = None;
         self.persist_environments();
         self.reset_connection(cx);
@@ -369,6 +384,10 @@ impl AppState {
             return;
         }
         self.persist_environments();
+        self.connections.remove(id);
+        self.environment_statuses.remove(id);
+        self.retire_environment_notifications(id, cx);
+        if self.notification_route.as_ref().is_some_and(|key| key.environment_id == id) { self.notification_route = None; }
         self.connect.rejected = self.connect.rejected.take().filter(|rejected| rejected.id != id);
         if was_active {
             self.reset_connection(cx);
@@ -406,24 +425,21 @@ impl AppState {
 
     /// The server rejected this device: drop the credential, keep the entry, and prompt to pair
     /// again. Runs inside the event pump, which ends on its own once the client stops.
-    pub(crate) fn credentials_rejected(&mut self, reason: String, cx: &mut Context<Self>) {
-        tracing::warn!(%reason, "the server rejected this device's credential");
-        let rejected = self.environments.active().map(|environment| Rejected {
-            id: environment.id.clone(),
-            label: environment.label.clone(),
-            reason,
-            local: environment.local,
-            ssh: environment.ssh.is_some(),
+    pub(crate) fn environment_credentials_rejected(&mut self, id: &str, reason: String, cx: &mut Context<Self>) {
+        let rejected = self.environments.get(id).map(|environment| Rejected {
+            id: id.into(), label: environment.label.clone(), reason, local: environment.local, ssh: environment.ssh.is_some(),
         });
-        if let Some(rejected) = &rejected {
-            self.environments.revoke(&rejected.id);
-            self.persist_environments();
-        }
+        self.environments.revoke(id);
+        self.persist_environments();
+        self.connections.remove(id);
+        self.environment_statuses.remove(id);
+        self.retire_environment_notifications(id, cx);
+        if self.environments.active.as_deref() != Some(id) { cx.emit(AppEvent::Phase); return; }
+        self.notification_route = None;
         self.connect.rejected = rejected;
         self.connect.switching = false;
         self.clear_connection_state(cx);
         self.set_phase(Phase::Unpaired, cx);
-        self.refresh_local_server(cx);
     }
 
     /// Keeps the saved label, id, and version in step with what the server reports.
@@ -454,14 +470,13 @@ impl AppState {
 
     /// Hands the edits since the last save to the store's writer, off the UI thread. It applies
     /// them to the file as it is then, so another instance's entries survive.
-    fn persist_environments(&mut self) {
+    pub(crate) fn persist_environments(&mut self) {
         store::save_environment_changes(self.environments.changes_since(&self.environments_saved));
         self.environments_saved = self.environments.clone();
     }
 
     /// Stops the connection and drops everything that belonged to it.
     fn reset_connection(&mut self, cx: &mut Context<Self>) {
-        self.stop_pump();
         self.clear_connection_state(cx);
     }
 }

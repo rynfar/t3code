@@ -81,6 +81,7 @@ pub enum ClientEvent {
 enum Command {
     OpenThread(String),
     CloseThread(String),
+    CloseAllThreads,
     RefreshSessionState,
     RetryNow,
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>>, settled: Option<crate::vcs::OnSettled> },
@@ -109,6 +110,8 @@ impl ClientHandle {
     pub fn close_thread(&self, thread_id: &str) {
         let _ = self.commands.send(Command::CloseThread(thread_id.to_owned()));
     }
+
+    pub fn close_all_threads(&self) { let _ = self.commands.send(Command::CloseAllThreads); }
 
     /// Advances only after a new WebSocket connects; update handoffs must outlive the old one.
     pub fn connection_generation(&self) -> watch::Receiver<u64> { self.connection_generation.clone() }
@@ -228,7 +231,12 @@ pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials
     let (grants, session_state) = watch::channel(None);
     let (generations, connection_generation) = watch::channel(0);
     let handle = ClientHandle { refs: Default::default(), commands, credentials: Arc::new(credentials.clone()), session_state, connection_generation };
-    runtime.spawn(supervise(credentials, prepare, command_rx, events, grants, generations));
+    runtime.spawn(async move {
+        tokio::select! {
+            _ = events.closed() => {},
+            _ = supervise(credentials, prepare, command_rx, events.clone(), grants, generations) => {},
+        }
+    });
     (handle, event_rx)
 }
 
@@ -350,6 +358,7 @@ fn drain_command(command: Command, resume: &mut Resume) {
         Command::OpenThread(id) => {
             resume.threads.entry(id).or_insert(None);
         }
+        Command::CloseAllThreads => { resume.threads.clear(); }
         Command::CloseThread(id) => {
             resume.threads.remove(&id);
         }
@@ -436,7 +445,7 @@ async fn run_session(
         return SessionEnd::Closed("Could not subscribe to the shell.".into());
     };
     let (thread_tx, mut thread_rx) = mpsc::channel::<ThreadFrame>(256);
-    let mut forwarders: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut forwarders: HashMap<String, ThreadForwarder> = HashMap::new();
     for (thread_id, sequence) in resume.threads.clone() {
         forwarders.insert(thread_id.clone(), forward_thread(session, &thread_id, sequence, thread_tx.clone()));
     }
@@ -489,6 +498,10 @@ async fn run_session(
                         let sequence = *resume.threads.entry(thread_id.clone()).or_insert(None);
                         forwarders.insert(thread_id.clone(), forward_thread(session, &thread_id, sequence, thread_tx.clone()));
                     }
+                }
+                Some(Command::CloseAllThreads) => {
+                    resume.threads.clear();
+                    for (_, task) in forwarders.drain() { task.abort(); }
                 }
                 Some(Command::CloseThread(thread_id)) => {
                     resume.threads.remove(&thread_id);
@@ -607,12 +620,16 @@ async fn next_config(stream: &mut Option<StreamHandle>) -> Option<Result<Value, 
     }
 }
 
+struct ThreadForwarder(JoinHandle<()>);
+impl ThreadForwarder { fn abort(&self) { self.0.abort(); } }
+impl Drop for ThreadForwarder { fn drop(&mut self) { self.abort(); } }
+
 /// Keeps one thread subscribed for the life of the session. A stream that ends or fails on a
 /// healthy connection resubscribes from the last sequence it delivered, as `threads.ts` retries.
-fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx: mpsc::Sender<ThreadFrame>) -> JoinHandle<()> {
+fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx: mpsc::Sender<ThreadFrame>) -> ThreadForwarder {
     let session = session.clone();
     let thread_id = thread_id.to_owned();
-    tokio::spawn(async move {
+    ThreadForwarder(tokio::spawn(async move {
         let mut sequence = sequence;
         loop {
             let Ok(mut stream) = session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, sequence)) else {
@@ -629,7 +646,7 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
             }
             tokio::time::sleep(THREAD_RETRY).await;
         }
-    })
+    }))
 }
 
 fn shell_sequence(item: &ShellStreamItem) -> Option<u64> {

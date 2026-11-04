@@ -1,6 +1,6 @@
 //! `ConnectionStep` and `PairingForm` of `WelcomeWizard.tsx`: the computers this device can set
 //! up (T3 Code on this Mac and the saved environments), "Add a computer" with a pairing link,
-//! and the privacy line. Picking a computer connects it, since one is connected at a time.
+//! and the privacy line. Picking a computer attaches the setup view to its connection.
 
 use gpui::{
     AnyElement, App, Context, ElementId, FontWeight, InteractiveText, IntoElement, ParentElement, SharedString, StyledText, Styled, TextRun,
@@ -58,6 +58,7 @@ struct Listing<'a> {
     saved: &'a [SavedEnvironment],
     /// The connected environment's id and status.
     active: Option<(&'a str, &'a ConnectionStatus)>,
+    statuses: Option<&'a std::collections::HashMap<String, ConnectionStatus>>,
     local: Option<&'a LocalServer>,
     /// The saved entry for T3 Code on this Mac. It stands in for the local row, so it also shows
     /// the `t3 pair` that pairs it again and how that failed.
@@ -73,7 +74,8 @@ fn computers(listing: &Listing) -> Vec<Computer> {
         .saved
         .iter()
         .map(|environment| {
-            let online = listing.active.filter(|(id, _)| *id == environment.id).map(|(_, status)| status);
+            let online = listing.statuses.and_then(|s| s.get(&environment.id)).or_else(|| listing.active.filter(|(id, _)| *id == environment.id).map(|(_, status)| status));
+            let selected = listing.active.is_some_and(|(id, _)| id == environment.id);
             let local = listing.local_saved == Some(environment.id.as_str());
             let status = match online {
                 _ if local && local_pairing => "Connecting…",
@@ -88,8 +90,8 @@ fn computers(listing: &Listing) -> Vec<Computer> {
                 status,
                 detail: environment.address(),
                 note: unsupported.or_else(|| local_error.clone().filter(|_| local)),
-                checked: online.is_some(),
-                action: online.is_none().then(|| Pick::Saved(environment.id.clone())),
+                checked: selected,
+                action: (!selected).then(|| Pick::Saved(environment.id.clone())),
             }
         })
         .collect();
@@ -139,6 +141,7 @@ impl WelcomeWizard {
         computers(&Listing {
             saved: &app.environments.environments,
             active,
+            statuses: Some(&app.environment_statuses),
             local: connect.local_server.as_ref(),
             local_saved: app.local_saved_environment().map(|environment| environment.id.as_str()),
             pairing: connect.pairing,
@@ -376,6 +379,7 @@ mod tests {
             access_token: token.map(str::to_owned),
             server_version: Some("0.1.6".into()),
             local: id == "mac",
+            disabled: false,
             ssh: None,
         }
     }
@@ -395,6 +399,7 @@ mod tests {
         let listing = |pairing, error| Listing {
             saved: &environments,
             active: None,
+            statuses: None,
             local: Some(&server),
             local_saved: Some("mac"),
             pairing,
@@ -419,6 +424,7 @@ mod tests {
         let listed = computers(&Listing {
             saved: &environments,
             active: Some(("lab", &status)),
+            statuses: None,
             local: Some(&server),
             local_saved: None,
             pairing: None,

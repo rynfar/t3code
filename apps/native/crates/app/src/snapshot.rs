@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--notification-fixture visible|hidden] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
+[--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -735,12 +735,13 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         std::fs::write(path, counts).map_err(|error| error.to_string())?;
     }
     if let Some(visibility) = &options.notification_fixture {
-        if !matches!(visibility.as_str(), "visible" | "hidden") { return Err("notification fixture must be visible or hidden".into()); }
+        if !matches!(visibility.as_str(), "visible" | "hidden" | "background") { return Err("notification fixture must be visible, hidden or background".into()); }
         state.update(&mut cx, |state, cx| {
             state.stop_pump();
             // This exercises toast retirement without requesting OS delivery or playing audio.
             state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, "Thread completed")
-                .description("Notification fixture").open_thread("snapshot-notification".into()), cx);
+                .description(if visibility == "background" { "Background environment thread" } else { "Notification fixture" })
+                .open_environment_thread(t3_core::sidebar::tag_filter::ThreadKey::new(if visibility == "background" { "fixture-background" } else { state.environments.active.as_deref().unwrap_or("local") }, "snapshot-notification")), cx);
             if visibility == "hidden" {
                 state.sidebar.hidden_thread_ids.insert("snapshot-notification".into());
                 state.retire_hidden_notifications(cx);

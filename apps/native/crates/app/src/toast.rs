@@ -34,7 +34,7 @@ pub struct Toast {
     pub title: SharedString,
     pub description: Option<SharedString>,
     /// Clicking the toast opens this thread ("Open thread" on the web's thread notifications).
-    pub open_thread: Option<String>,
+    pub open_thread: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     persistent: bool,
     replace_linked_prompt: Option<crate::composer::prompt_links::ReplaceLinkedPrompt>,
 }
@@ -49,8 +49,8 @@ impl Toast {
         self
     }
 
-    pub fn open_thread(mut self, thread_id: String) -> Toast {
-        self.open_thread = Some(thread_id);
+    pub fn open_environment_thread(mut self, target: t3_core::sidebar::tag_filter::ThreadKey) -> Toast {
+        self.open_thread = Some(target);
         self
     }
 
@@ -114,9 +114,9 @@ impl Toasts {
         self.entries.iter().any(|entry| entry.toast.open_thread.is_some())
     }
 
-    pub(crate) fn retire_thread_notifications(&mut self, visible: impl Fn(&str) -> bool) -> bool {
+    pub(crate) fn retire_environment_notifications(&mut self, visible: impl Fn(&t3_core::sidebar::tag_filter::ThreadKey) -> bool) -> bool {
         let count = self.entries.len();
-        self.entries.retain(|entry| entry.toast.open_thread.as_deref().is_none_or(&visible));
+        self.entries.retain(|entry| entry.toast.open_thread.as_ref().is_none_or(&visible));
         if self.entries.is_empty() { self.hovered = false; }
         count != self.entries.len()
     }
@@ -228,14 +228,14 @@ fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement
         ))
     } else { toast };
     let toast = match entry.toast.open_thread.clone() {
-        Some(thread_id) => {
+        Some(target) => {
             let state = state.clone();
             toast
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     state.update(cx, |state, cx| {
                         state.dismiss_toast(id, cx);
-                        state.select_thread(&thread_id, cx);
+                        state.open_notification_target(target.clone(), cx);
                     })
                 })
                 .into_any_element()

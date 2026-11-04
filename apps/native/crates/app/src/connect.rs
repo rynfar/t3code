@@ -17,7 +17,7 @@ use t3_client::status::DotTone;
 use t3_client::store::SavedEnvironment;
 use t3_core::ssh::{filter_hosts, format_target, parse_manual_target};
 
-use crate::app_state::{AppEvent, AppState, Phase};
+use crate::app_state::{AppEvent, AppState};
 use crate::environments::{ConnectScreen, PairingSource};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
@@ -475,9 +475,9 @@ impl ConnectView {
     fn render_saved_row(&self, environment: &SavedEnvironment, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
-        let (tone, status, error_tone) = match &state.phase {
+        let (tone, status, error_tone) = match state.environment_statuses.get(&environment.id) {
             _ if environment.access_token.is_none() => (Some(DotTone::Destructive), "Needs pairing again".to_owned(), true),
-            Phase::Online(status) if active => {
+            Some(status) => {
                 let (text, error) = status.summary();
                 (Some(status.dot()), text, error)
             }

@@ -170,6 +170,7 @@ impl AppState {
             return;
         }
         let generation = self.shell.generation;
+        let connection = self.connection_id();
         self.omitted.family_requested.insert(thread_id.to_owned(), generation);
         self.restoring_thread |= select;
         let rpc = self.rpc(GET_THREAD_FAMILY, family_request(thread_id));
@@ -177,6 +178,7 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let read = rpc.await.map_err(|error| error.to_string()).and_then(decode_read);
             let _ = this.update(cx, |state, cx| {
+                if state.connection_id() != connection { return; }
                 if let Ok(family) = read
                     && state.shell.generation == generation
                 {

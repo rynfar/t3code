@@ -370,3 +370,48 @@ impl ThreadNotifications {
 
 #[cfg(test)]
 mod tests;
+
+/// The coordinator's `watched` map. Selection never changes these gates.
+#[derive(Debug, Default)]
+pub struct EnvironmentNotifications {
+    watched: HashMap<String, ThreadNotifications>,
+}
+
+impl EnvironmentNotifications {
+    pub fn observe(&mut self, environment: &str, shell: &ShellState, hidden: &HashSet<String>) -> Vec<ThreadNotification> {
+        self.watched.entry(environment.to_owned()).or_default().observe_visible(shell, hidden)
+    }
+
+    pub fn remove(&mut self, environment: &str) { self.watched.remove(environment); }
+    pub fn clear(&mut self) { self.watched.clear(); }
+}
+
+/// Small notification-only projection sent to the UI when visibility changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationVisibility {
+    pub hidden: HashSet<ThreadKey>,
+    pub live: HashSet<ThreadKey>,
+    pub filtering: bool,
+}
+
+impl NotificationVisibility {
+    pub fn visible(&self, target: &ThreadKey) -> bool {
+        !self.hidden.contains(target) && (!self.filtering || self.live.contains(target))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationRoute {
+    SwitchEnvironment,
+    WaitForShell,
+    OpenThread,
+    ReadFamily,
+}
+
+/// Web notification actions route by both ids; omitted threads load through their family.
+pub fn notification_route(target: &ThreadKey, active_environment: Option<&str>, live: bool, loaded: bool) -> NotificationRoute {
+    if active_environment != Some(&target.environment_id) { NotificationRoute::SwitchEnvironment }
+    else if !live { NotificationRoute::WaitForShell }
+    else if loaded { NotificationRoute::OpenThread }
+    else { NotificationRoute::ReadFamily }
+}
