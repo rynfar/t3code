@@ -74,8 +74,8 @@ impl ThemeImportDialog {
         let decorations = input.update(cx, |input, cx| {
             input.create_decorations_collection(Vec::new(), cx)
         });
-        let selection_subscription = cx.observe(&input, |this, input, cx| {
-            let selection = input.read(cx).selected_range();
+        let selection_subscription = cx.observe_in(&input, window, |this, _, window, cx| {
+            let selection = this.json_selection(window, cx);
             if this.selection != selection {
                 this.selection = selection;
                 cx.notify();
@@ -117,6 +117,18 @@ impl ThemeImportDialog {
             #[cfg(all(test, feature = "snapshot"))]
             install_gates: None,
         }
+    }
+    fn json_selection(&self, window: &mut Window, cx: &mut App) -> std::ops::Range<usize> {
+        self.input.update(cx, |input, cx| {
+            // Marked ranges are UTF-16; only emptiness is needed beside the byte-based selection.
+            if gpui::EntityInputHandler::marked_text_range(input, window, cx)
+                .is_some_and(|range| !range.is_empty())
+            {
+                0..0
+            } else {
+                input.selected_range()
+            }
+        })
     }
     #[cfg(feature = "snapshot")]
     fn fixture(&mut self, value: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
@@ -814,7 +826,7 @@ impl Render for ThemeImportDialog {
         let selection = if window.is_window_active()
             && self.input.read(cx).focus_handle(cx).is_focused(window)
         {
-            self.selection.clone()
+            self.json_selection(window, cx)
         } else {
             0..0
         };
@@ -1055,7 +1067,7 @@ pub(crate) fn fixture(
 #[cfg(all(test, feature = "snapshot"))]
 mod tests {
     use super::*;
-    use gpui::{KeyBinding, TestAppContext};
+    use gpui::{EntityInputHandler, KeyBinding, TestAppContext};
     use serde_json::json;
     fn setup(
         cx: &mut TestAppContext,
@@ -1110,6 +1122,86 @@ mod tests {
             .unwrap();
             cx.run_until_parked();
         }
+    }
+    #[gpui::test]
+    fn ime_clause_selection_is_hidden_until_composition_ends(cx: &mut TestAppContext) {
+        let (_runtime, state, _home) = setup(cx);
+        let text = r#"{"name":"é😀"}"#;
+        let byte_start = text.find('😀').unwrap();
+        let clause = byte_start..byte_start + '😀'.len_utf8();
+        let utf16_start = text[..byte_start].encode_utf16().count();
+        let window = cx.add_window(|window, cx| ThemeImportDialog::new(state.clone(), window, cx));
+        window
+            .update(cx, |view, window, cx| {
+                view.session.json = text.into();
+                view.sync_input(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_selected_range(clause.clone(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.selection, clause);
+                view.input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(
+                        Some(utf16_start..utf16_start + 2),
+                        "😀",
+                        Some(0..2),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(input.selected_range(), clause);
+                    assert_eq!(
+                        input.marked_text_range(window, cx),
+                        Some(utf16_start..utf16_start + 2)
+                    );
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    view.selection.is_empty(),
+                    "IME clause selection has no selection background"
+                );
+                view.input.update(cx, |input, cx| {
+                    input.unmark_text(window, cx);
+                    input.set_selected_range(clause.clone(), cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.selection, clause);
+                view.input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(
+                        Some(utf16_start..utf16_start + 2),
+                        "😀",
+                        Some(0..2),
+                        window,
+                        cx,
+                    );
+                    input.replace_text_in_range(None, "😀", window, cx);
+                    assert!(input.marked_text_range(window, cx).is_none());
+                    assert!(input.selected_range().is_empty());
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.selection.is_empty());
+                assert_eq!(view.input.read(cx).value().as_str(), text);
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn tab_leaves_json_and_keyboard_conflict_back_restores_editor(cx: &mut TestAppContext) {
