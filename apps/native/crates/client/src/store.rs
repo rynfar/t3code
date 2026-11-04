@@ -396,6 +396,53 @@ pub fn save_ui_state<T: serde::Serialize>(name: &str, value: &T) {
     let _ = queue(name, Save::Replace(text));
 }
 
+#[derive(Clone, Copy)]
+pub enum StarPromptStorage {
+    Count,
+    Read,
+    Dismiss,
+}
+
+/// Confirmed, ordered storage; dismissal has its own file so a stale count cannot undo it.
+pub async fn github_star_prompt(action: StarPromptStorage) -> Result<(u64, bool), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    writer().ok_or("UI writer unavailable")?.send(|_| {
+        WriteRequest::Update(Box::new(move |base| {
+            let result = base
+                .ok_or_else(|| "Native home unavailable".to_owned())
+                .and_then(|base| update_star_prompt(&base, action).map_err(|e| e.to_string()));
+            let _ = tx.send(result);
+        }))
+    })?;
+    rx.await.map_err(|e| e.to_string())?
+}
+fn update_star_prompt(base: &Path, action: StarPromptStorage) -> std::io::Result<(u64, bool)> {
+    fn read<T: serde::de::DeserializeOwned + Default>(
+        base: &Path,
+        key: &str,
+    ) -> std::io::Result<T> {
+        match std::fs::read_to_string(base.join(format!("{key}.json"))) {
+            Ok(text) => serde_json::from_str(&text).map_err(std::io::Error::other),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+            Err(e) => Err(e),
+        }
+    }
+    const COUNT: &str = "github-star-prompt-sent";
+    const DISMISSED: &str = "github-star-prompt-dismissed";
+    // Dismiss must still work if the unrelated count was corrupted.
+    if matches!(action, StarPromptStorage::Dismiss) {
+        write_atomically_result(base, DISMISSED, "true")?;
+        return Ok((0, true));
+    }
+    let dismissed = read::<bool>(base, DISMISSED)?;
+    let mut sent = read::<u64>(base, COUNT)?;
+    if matches!(action, StarPromptStorage::Count) && !dismissed {
+        sent = sent.saturating_add(1);
+        write_atomically_result(base, COUNT, &sent.to_string())?;
+    }
+    Ok((sent, dismissed))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Save {
     Replace(String),
@@ -725,6 +772,36 @@ mod tests {
             serde_json::Value::Object(map) => Save::Patch(map),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn star_prompt_dismissal_survives_counts_reload_corruption_and_write_failure() {
+        let dir = std::env::temp_dir().join(format!("t3-star-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sent in 1..=6 {
+            assert_eq!(
+                update_star_prompt(&dir, StarPromptStorage::Count).unwrap(),
+                (sent, false)
+            );
+        }
+        assert_eq!(
+            update_star_prompt(&dir, StarPromptStorage::Read).unwrap(),
+            (6, false)
+        );
+        update_star_prompt(&dir, StarPromptStorage::Dismiss).unwrap();
+        std::fs::write(dir.join("github-star-prompt-sent.json"), "1").unwrap();
+        assert_eq!(
+            update_star_prompt(&dir, StarPromptStorage::Count).unwrap(),
+            (1, true)
+        );
+        std::fs::write(dir.join("github-star-prompt-sent.json"), "bad").unwrap();
+        assert!(update_star_prompt(&dir, StarPromptStorage::Read).is_err());
+        assert!(update_star_prompt(&dir, StarPromptStorage::Dismiss).is_ok());
+        std::fs::remove_file(dir.join("github-star-prompt-dismissed.json")).unwrap();
+        std::fs::create_dir(dir.join("github-star-prompt-dismissed.json")).unwrap();
+        assert!(update_star_prompt(&dir, StarPromptStorage::Count).is_err());
+        assert!(update_star_prompt(&dir, StarPromptStorage::Dismiss).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

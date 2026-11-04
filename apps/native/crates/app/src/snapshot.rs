@@ -879,6 +879,9 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     if let (Some(document), Some(text)) = (&document_view, document_fixture.as_ref().and_then(|fixture| fixture.after_text.as_ref())) {
         document.update(&mut cx, |document, cx| { document.text = text.clone().into(); cx.notify(); });
     }
+    if let Some(scenario) = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--star-prompt-fixture").map(|pair| pair[1].clone()) {
+        state.update(&mut cx, |state, cx| state.install_star_fixture(&scenario, cx));
+    }
     for (index, gesture) in options.gestures.iter().enumerate() {
         pump(&mut cx, options.wait.min(options.gesture_wait), |_| false);
         if index + 1 == options.gestures.len() && options.render_counts_output.is_some() {

@@ -36,12 +36,13 @@ pub struct Toast {
     /// Clicking the toast opens this thread ("Open thread" on the web's thread notifications).
     pub open_thread: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     persistent: bool,
+    github_star: bool,
     replace_linked_prompt: Option<crate::composer::prompt_links::ReplaceLinkedPrompt>,
 }
 
 impl Toast {
     pub fn new(kind: ToastKind, title: impl Into<SharedString>) -> Toast {
-        Toast { kind, title: title.into(), description: None, open_thread: None, persistent: false, replace_linked_prompt: None }
+        Toast { kind, title: title.into(), description: None, open_thread: None, persistent: false, github_star: false, replace_linked_prompt: None }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Toast {
@@ -63,14 +64,19 @@ impl Toast {
         self.persistent()
     }
 
+    pub(crate) fn github_star(mut self) -> Self {
+        self.github_star = true;
+        self.persistent()
+    }
+
     fn render_content(&self, cx: &App) -> AnyElement {
         let p = palette(cx);
-        let (icon, color) = match self.kind {
+        let (icon, color) = if self.github_star && self.kind != ToastKind::Success { (Icon::Star, p.warning_foreground) } else { match self.kind {
             ToastKind::Success => (Icon::CircleCheck, p.success),
             ToastKind::Error => (Icon::CircleAlert, p.destructive),
             ToastKind::Warning => (Icon::CircleAlert, p.warning),
             ToastKind::Info => (Icon::Info, p.info),
-        };
+        }};
         div()
             .relative()
             .w_full()
@@ -131,6 +137,9 @@ impl AppState {
     }
 
     pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.toasts.entries.iter().any(|entry| entry.id == id && entry.toast.github_star) {
+            self.close_star_prompt(cx);
+        }
         let before = self.toasts.entries.len();
         self.toasts.entries.retain(|entry| entry.id != id);
         // The stack unmounts with its last toast, so no hover-out will arrive.
@@ -139,6 +148,34 @@ impl AppState {
         }
         if self.toasts.entries.len() != before {
             cx.emit(AppEvent::Notice);
+        }
+    }
+
+    pub(crate) fn remove_star_toast(&mut self, cx: &mut Context<Self>) {
+        let before = self.toasts.entries.len();
+        self.toasts.entries.retain(|entry| !entry.toast.github_star);
+        if self.toasts.entries.is_empty() {
+            self.toasts.hovered = false;
+        }
+        if self.toasts.entries.len() != before {
+            cx.emit(AppEvent::Notice);
+        }
+    }
+    pub(crate) fn thank_star_toast(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self
+            .toasts
+            .entries
+            .iter_mut()
+            .find(|entry| entry.toast.github_star)
+        {
+            entry.toast.kind = ToastKind::Success;
+            entry.toast.title = "Thanks for the star!".into();
+            entry.toast.description = Some("It really helps T3 Code grow.".into());
+            let id = entry.id;
+            entry._timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let _ = this.update(cx, |state, cx| state.expire_toast(id, cx));
+            }));
         }
     }
 
@@ -216,6 +253,9 @@ fn close_orb(id: u64, state: Entity<AppState>, cx: &App) -> AnyElement {
 fn render_toast(entry: &Entry, state: &Entity<AppState>, cx: &App) -> AnyElement {
     let id = entry.id;
     let toast = surface(cx).w_full().id(SharedString::from(format!("toast-{id}"))).child(entry.toast.render_content(cx));
+    let toast = if entry.toast.github_star {
+        toast.children(crate::github_star_prompt::actions(id, state, cx))
+    } else { toast };
     let toast = if let Some(action) = entry.toast.replace_linked_prompt.clone() {
         toast.child(div().px(px(14.)).pb(px(12.)).child(
             div().id(SharedString::from(format!("replace-linked-{id}"))).cursor_pointer().text_sm().text_color(hsla(palette(cx).primary)).child("Replace draft").on_click({

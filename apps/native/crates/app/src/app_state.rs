@@ -66,6 +66,7 @@ pub enum AppEvent {
 }
 
 pub struct AppState {
+    pub(crate) github_star: crate::github_star_prompt::GitHubStarPrompt,
     pub(crate) announcements: crate::announcements::Announcements,
     pub phase: Phase,
     pub environments: SavedEnvironments,
@@ -147,6 +148,7 @@ impl AppState {
         });
         let mut state = AppState {
             announcements: crate::announcements::Announcements::new(cx),
+            github_star: crate::github_star_prompt::GitHubStarPrompt::new(cx),
             phase: Phase::Unpaired,
             environments_saved: environments.clone(),
             environments,

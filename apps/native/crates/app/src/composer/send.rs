@@ -228,6 +228,7 @@ impl Composer {
             return;
         };
         let state = self.state.read(cx);
+        let star_origin = state.star_prompt_origin();
         let config = state.server_config.config.as_ref();
         let root = state.shell.project(&project_id).map(|project| project.workspace_root.clone());
         let configured = config.and_then(|config| workspace::configured_env_mode(&config.settings, &project_id));
@@ -296,6 +297,9 @@ impl Composer {
                 Err(_) => return,
             };
             let _ = this.update_in(cx, |this, window, cx| {
+                if result.is_ok() {
+                    this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
+                }
                 this.finish_launch(intent, (result, worktree_launch), taken, window, cx);
             });
         })
@@ -368,6 +372,7 @@ impl Composer {
             steps.push((commands::composer_message(&message), "Failed to send message."));
         }
         let failures: Vec<&'static str> = steps.iter().map(|(_, failure)| *failure).collect();
+        let star_origin = self.state.read(cx).star_prompt_origin();
         let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(command, _)| command).collect());
         let target = Target::Thread(thread_id);
         let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
@@ -377,6 +382,8 @@ impl Composer {
                 this.sending = false;
                 if let Some(error) = failure {
                     this.restore(taken, error, window, cx);
+                } else {
+                    this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
                 }
                 cx.notify();
             });
