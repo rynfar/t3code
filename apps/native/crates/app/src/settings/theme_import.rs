@@ -1039,7 +1039,12 @@ mod tests {
         }
     }
     #[gpui::test]
-    fn single_batch_and_conflict_stay_open_when_the_settings_write_fails(cx: &mut TestAppContext) {
+    fn single_batch_marketplace_and_conflict_stay_open_when_the_settings_write_fails(cx: &mut TestAppContext) {
+        fn marketplace() -> themes::open_vsx::MarketplaceImport {
+            let mut theme = themes::import(&source()).unwrap();
+            theme.collection = Some(themes::Collection { id: "open-vsx:demo.theme".into(), label: "Demo".into() });
+            themes::open_vsx::MarketplaceImport { collection_id: "open-vsx:demo.theme".into(), expected: Vec::new(), themes: vec![theme] }
+        }
         let (_runtime, state, home) = setup(cx);
         std::fs::create_dir_all(home.join("settings.json")).unwrap();
         let mut last = None;
@@ -1058,12 +1063,7 @@ mod tests {
                                 importer::parse_batch(vec![("dusk.json".into(), Ok(source()))]);
                             view.install(InstallOperation::Batch(batch), window, cx);
                         }
-                        3 => {
-                            let mut theme = theme;
-                            theme.collection = Some(themes::Collection {id: "open-vsx:demo.theme".into(), label: "Demo".into()});
-                            let import = themes::open_vsx::MarketplaceImport {collection_id: "open-vsx:demo.theme".into(), expected: Vec::new(), themes: vec![theme]};
-                            view.install(InstallOperation::Marketplace(import, themes::ImportChoice::Update), window, cx);
-                        }
+                        3 => view.install(InstallOperation::Marketplace(marketplace(), themes::ImportChoice::Update), window, cx),
                         _ => {
                             let library = themes::install(store::client(cx), &theme).unwrap();
                             store::install_committed_client(
@@ -1091,6 +1091,22 @@ mod tests {
                     }
                 })
                 .unwrap();
+            if mode == 3 {
+                std::fs::remove_dir_all(home.join("settings.json")).unwrap();
+                window.update(cx, |view, window, cx| {
+                    view.install(InstallOperation::Marketplace(marketplace(), themes::ImportChoice::Update), window, cx);
+                }).unwrap();
+                cx.run_until_parked();
+                window.update(cx, |view, _, cx| {
+                    assert!(!view.open);
+                    assert!(view.save_error.is_none());
+                    assert_eq!(themes::library(store::client(cx)).len(), 1);
+                }).unwrap();
+                let stored = t3_core::client_settings::ClientSettingsDoc::from_json(&t3_client::store::load_client_settings().unwrap());
+                assert_eq!(themes::open_vsx::stored_collection(&stored, "open-vsx:demo.theme").len(), 1);
+                std::fs::remove_file(home.join("settings.json")).unwrap();
+                std::fs::create_dir_all(home.join("settings.json")).unwrap();
+            }
             last = Some(window);
         }
         std::fs::remove_dir_all(home.join("settings.json")).unwrap();

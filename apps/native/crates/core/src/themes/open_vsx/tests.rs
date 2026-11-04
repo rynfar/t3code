@@ -9,10 +9,13 @@ fn manifest() -> Value {
     json!({"publisher":"demo","name":"theme","version":"1.0.0","license":"MIT","contributes":{"themes":[{"label":"Demo Light","uiTheme":"vs","path":"./light.json"},{"label":"Demo Dark","uiTheme":"vs-dark","path":"./dark.json"}]}})
 }
 fn archive(m: &Value, files: &[(&str, &str)]) -> Vec<u8> {
+    archive_manifest(&m.to_string(), files)
+}
+fn archive_manifest(manifest: &str, files: &[(&str, &str)]) -> Vec<u8> {
     let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let o = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     z.start_file("extension/package.json", o).unwrap();
-    z.write_all(m.to_string().as_bytes()).unwrap();
+    z.write_all(manifest.as_bytes()).unwrap();
     for (p, s) in files {
         z.start_file(*p, o).unwrap();
         z.write_all(s.as_bytes()).unwrap();
@@ -344,7 +347,7 @@ fn oversized_theme_reads_and_duplicate_source_ids_are_guarded() {
     let b = archive(&manifest(), &[("extension/large.json", &large)]);
     let mut zip = zip::ZipArchive::new(Cursor::new(inspect_directory(&b).unwrap())).unwrap();
     assert!(
-        read_text(&mut zip, "extension/large.json")
+        read_text(&mut zip, "extension/large.json", &|| false)
             .unwrap_err()
             .contains("too large")
     );
@@ -361,4 +364,146 @@ fn oversized_theme_reads_and_duplicate_source_ids_are_guarded() {
     .unwrap();
     assert_eq!(t.len(), 2);
     assert_ne!(t[0].id, t[1].id);
+}
+
+#[test]
+fn manifests_reject_excessive_depth_even_in_unused_properties() {
+    std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(|| {
+        let quoted_comment = format!("{{\"comment\":'//',\"nested\":{}0{}}}", "[".repeat(100), "]".repeat(100));
+        assert!(json_object(quoted_comment.as_bytes(), "Manifest").is_err());
+        for depth in [100, 5000] {
+            let nested = format!("{{\"unused\":{}0{}}}", "[".repeat(depth), "]".repeat(depth));
+            assert!(eligible(&extension(), nested.as_bytes(), None).unwrap_err().contains("nested too deeply"));
+            let advertised = manifest().to_string();
+            for bytes in [
+                archive_manifest(&nested, &[]),
+                archive(&manifest(), &[("extension/light.json", &nested)]),
+                archive(&manifest(), &[("extension/light.json", r##"{"include":"base.json","colors":{"editor.background":"#ffffff"}}"##), ("extension/base.json", &nested)]),
+            ] {
+                assert!(extract(&extension(), advertised.as_bytes(), &bytes, format!("{:x}", Sha256::digest(&bytes)).as_bytes()).is_err());
+            }
+        }
+        let quoted = serde_json::to_string(&format!("{}\\\"{}", "[".repeat(5000), "}".repeat(5000))).unwrap();
+        let harmless = format!("{{/* {} */\"quoted\":{quoted},// {}\n\"ok\":true}}", "[".repeat(5000), "{".repeat(5000));
+        assert_eq!(json_object(harmless.as_bytes(), "Theme").unwrap()["ok"], true);
+        let boundary = format!("{{\"value\":{}0{}}}", "[".repeat(MAX_JSON_DEPTH - 1), "]".repeat(MAX_JSON_DEPTH - 1));
+        assert!(json_object(boundary.as_bytes(), "Theme").is_ok());
+    }).unwrap().join().unwrap();
+}
+
+fn redirected_zip64_directory(count: u64) -> Vec<u8> {
+    fn central(name: &[u8], comment: &[u8]) -> Vec<u8> {
+        let mut header = vec![0; 46];
+        header[..4].copy_from_slice(b"PK\x01\x02");
+        header[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        header[32..34].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        header.extend_from_slice(name);
+        header.extend_from_slice(comment);
+        header
+    }
+    let mut bytes = vec![0; 30];
+    bytes[..4].copy_from_slice(b"PK\x03\x04");
+    bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bytes.push(b'x');
+    let alternate_start = bytes.len() as u64;
+    for _ in 0..5001 {
+        bytes.extend(central(b"x", &[]));
+    }
+    let alternate_size = bytes.len() as u64 - alternate_start;
+    let zip64_offset = bytes.len() as u64;
+    let mut zip64 = vec![0; 56];
+    zip64[..4].copy_from_slice(b"PK\x06\x06");
+    zip64[4..12].copy_from_slice(&44u64.to_le_bytes());
+    zip64[24..32].copy_from_slice(&count.to_le_bytes());
+    zip64[32..40].copy_from_slice(&count.to_le_bytes());
+    zip64[40..48].copy_from_slice(&alternate_size.to_le_bytes());
+    zip64[48..56].copy_from_slice(&alternate_start.to_le_bytes());
+    bytes.extend(zip64);
+    let mut locator = vec![0; 20];
+    locator[..4].copy_from_slice(b"PK\x06\x07");
+    locator[8..16].copy_from_slice(&zip64_offset.to_le_bytes());
+    locator[16..20].copy_from_slice(&1u32.to_le_bytes());
+    let directory_start = bytes.len() as u32;
+    let directory = central(b"checked", &locator);
+    let directory_size = directory.len() as u32;
+    bytes.extend(directory);
+    let mut end = vec![0; 22];
+    end[..4].copy_from_slice(b"PK\x05\x06");
+    end[8..10].copy_from_slice(&1u16.to_le_bytes());
+    end[10..12].copy_from_slice(&1u16.to_le_bytes());
+    end[12..16].copy_from_slice(&directory_size.to_le_bytes());
+    end[16..20].copy_from_slice(&directory_start.to_le_bytes());
+    bytes.extend(end);
+    bytes
+}
+#[test]
+fn zip64_cannot_redirect_the_reader_away_from_the_inspected_directory() {
+    let bytes = redirected_zip64_directory(5001);
+    assert_eq!(
+        zip::ZipArchive::new(Cursor::new(bytes.clone()))
+            .unwrap()
+            .len(),
+        5001
+    );
+    assert!(inspect_directory(&bytes).is_err());
+    let mut record_only = bytes.clone();
+    let end = record_only.len() - 22;
+    record_only[end - 20..end - 16].fill(0);
+    assert!(inspect_directory(&record_only).is_err());
+    assert!(inspect_directory(&redirected_zip64_directory(100_000_000)).is_err());
+    let mut mismatch = inspect_directory(include_bytes!("fixtures/theme.vsix")).unwrap();
+    let end = mismatch.len() - 22;
+    mismatch[end + 8..end + 10].copy_from_slice(&3u16.to_le_bytes());
+    assert!(inspect_directory(&mismatch).is_err());
+}
+
+#[test]
+fn cancellation_stops_every_extraction_stage_and_chunked_reads() {
+    let bytes = include_bytes!("fixtures/theme.vsix");
+    let advertised = include_bytes!("fixtures/package.json");
+    let checksum = format!("{:x}", Sha256::digest(bytes));
+    let checks = std::cell::Cell::new(0);
+    extract_cancellable(
+        &extension(),
+        advertised,
+        bytes,
+        checksum.as_bytes(),
+        &|| {
+            checks.set(checks.get() + 1);
+            false
+        },
+    )
+    .unwrap();
+    for budget in 0..checks.get() {
+        let seen = std::cell::Cell::new(0);
+        assert_eq!(
+            extract_cancellable(
+                &extension(),
+                advertised,
+                bytes,
+                checksum.as_bytes(),
+                &|| {
+                    let n = seen.get();
+                    seen.set(n + 1);
+                    n >= budget
+                }
+            )
+            .unwrap_err(),
+            IMPORT_CANCELLED,
+            "checkpoint {budget}"
+        );
+    }
+    let payload = "x".repeat(80_000);
+    let bytes = archive(&manifest(), &[("extension/large.json", &payload)]);
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let reads = std::cell::Cell::new(0);
+    assert_eq!(
+        read_text(&mut zip, "extension/large.json", &|| {
+            let n = reads.get();
+            reads.set(n + 1);
+            n >= 3
+        })
+        .unwrap_err(),
+        IMPORT_CANCELLED
+    );
 }

@@ -1,10 +1,17 @@
 //! Network transport for `web/src/openVsxThemes.ts`; parsing lives in core.
 use futures::future::join_all;
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use t3_core::themes::{
     ThemeDefinition,
     open_vsx::{self, Extension, MAX_JSON_BYTES, MAX_SEARCH_BYTES, MAX_VSIX_BYTES},
 };
+use tokio::sync::Semaphore;
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -126,7 +133,75 @@ pub async fn download(e: Extension) -> Result<Vec<ThemeDefinition>, String> {
         "That Open VSX checksum response is invalid.",
     )
     .await?;
-    tokio::task::spawn_blocking(move || open_vsx::extract(&e, &manifest, &bytes, &checksum))
-        .await
-        .map_err(|e| e.to_string())?
+    run_extraction(EXTRACTION.clone(), move |cancelled| {
+        open_vsx::extract_cancellable(&e, &manifest, &bytes, &checksum, &|| {
+            cancelled.load(Ordering::Acquire)
+        })
+    })
+    .await
+}
+
+static EXTRACTION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+struct CancelOnDrop(Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+async fn run_extraction<T: Send + 'static>(
+    semaphore: Arc<Semaphore>,
+    operation: impl FnOnce(Arc<AtomicBool>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let permit = semaphore.acquire_owned().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        // Aborting the awaiter must not release the lease before its blocking job actually stops.
+        let _permit = permit;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(open_vsx::IMPORT_CANCELLED.into());
+        }
+        operation(cancelled)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelled_extraction_keeps_its_lease_until_it_stops_and_queued_work_is_retired() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let (stopped, stop) = tokio::sync::oneshot::channel();
+        let running = tokio::spawn(run_extraction(semaphore.clone(), move |cancelled| {
+            started.send(cancelled.clone()).unwrap();
+            gate.recv().unwrap();
+            stopped.send(cancelled.load(Ordering::Acquire)).unwrap();
+            Ok(())
+        }));
+        let cancelled = start.await.unwrap();
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        let cancellation_observed = cancelled.load(Ordering::Acquire);
+        let lease_held = semaphore.clone().try_acquire_owned().is_err();
+        let queued_started = Arc::new(AtomicBool::new(false));
+        let marker = queued_started.clone();
+        {
+            let mut queued = Box::pin(run_extraction(semaphore.clone(), move |_| {
+                marker.store(true, Ordering::Release);
+                Ok(())
+            }));
+            let _ = futures::poll!(&mut queued);
+        }
+        release.send(()).unwrap();
+        let worker_cancelled = stop.await.unwrap();
+        run_extraction(semaphore, move |_| Ok(())).await.unwrap();
+        assert!(cancellation_observed);
+        assert!(worker_cancelled);
+        assert!(lease_held);
+        assert!(!queued_started.load(Ordering::Acquire));
+    }
 }

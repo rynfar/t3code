@@ -174,17 +174,109 @@ pub fn detail(bytes: &[u8]) -> Result<Option<Extension>, String> {
         license: license.into(),
     }))
 }
+pub const IMPORT_CANCELLED: &str = "Theme import was cancelled.";
+const MAX_JSON_DEPTH: usize = 64;
+type Cancel<'a> = &'a dyn Fn() -> bool;
+fn checkpoint(cancelled: Cancel<'_>) -> Result<(), String> {
+    if cancelled() {
+        Err(IMPORT_CANCELLED.into())
+    } else {
+        Ok(())
+    }
+}
+fn check_json_depth(bytes: &[u8], description: &str, cancelled: Cancel<'_>) -> Result<(), String> {
+    enum Lex {
+        Normal,
+        String,
+        Escape,
+        LineComment,
+        BlockComment,
+    }
+    let mut lex = Lex::Normal;
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        if index % 4096 == 0 {
+            checkpoint(cancelled)?;
+        }
+        let byte = bytes[index];
+        match lex {
+            Lex::String => match byte {
+                b'\\' => lex = Lex::Escape,
+                b'"' => lex = Lex::Normal,
+                _ => {}
+            },
+            Lex::Escape => lex = Lex::String,
+            Lex::LineComment => {
+                if byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) {
+                    lex = Lex::Normal;
+                }
+            }
+            Lex::BlockComment => {
+                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    lex = Lex::Normal;
+                    index += 1;
+                }
+            }
+            Lex::Normal => match byte {
+                b'\'' => return Err(format!("{description} is not valid JSON.")),
+                b'"' => lex = Lex::String,
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    lex = Lex::LineComment;
+                    index += 1;
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    lex = Lex::BlockComment;
+                    index += 1;
+                }
+                b'{' | b'[' => {
+                    depth += 1;
+                    if depth > MAX_JSON_DEPTH {
+                        return Err(format!("{description} is nested too deeply."));
+                    }
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    checkpoint(cancelled)
+}
 pub fn json_object(bytes: &[u8], description: &str) -> Result<Value, String> {
+    json_object_cancellable(bytes, description, &|| false)
+}
+fn json_object_cancellable(
+    bytes: &[u8],
+    description: &str,
+    cancelled: Cancel<'_>,
+) -> Result<Value, String> {
+    checkpoint(cancelled)?;
     if bytes.len() > MAX_JSON_BYTES {
         return Err(format!("{description} is too large."));
     }
+    check_json_depth(bytes, description, cancelled)?;
     let source = String::from_utf8_lossy(bytes);
-    jsonc_parser::parse_to_serde_value(&source, &Default::default())
-        .ok()
-        .flatten()
-        .filter(Value::is_object)
-        .ok_or_else(|| format!("{description} is not valid JSON."))
+    let value = jsonc_parser::parse_to_serde_value(
+        &source,
+        &jsonc_parser::ParseOptions {
+            allow_comments: true,
+            allow_trailing_commas: true,
+            allow_loose_object_property_names: false,
+            allow_missing_commas: false,
+            allow_single_quoted_strings: false,
+            allow_hexadecimal_numbers: false,
+            allow_unary_plus_numbers: false,
+        },
+    )
+    .ok()
+    .flatten()
+    .filter(Value::is_object)
+    .ok_or_else(|| format!("{description} is not valid JSON."))?;
+    checkpoint(cancelled)?;
+    Ok(value)
 }
+
 fn contributions(v: &Value) -> Vec<&Value> {
     v["contributes"]["themes"]
         .as_array()
@@ -261,6 +353,17 @@ pub fn package_path(path: &str, relative: &str) -> Result<String, String> {
     Ok(segments.join("/"))
 }
 pub fn inspect_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    inspect_directory_cancellable(bytes, &|| false).map(|directory| directory.bytes)
+}
+struct InspectedDirectory {
+    bytes: Vec<u8>,
+    entries: usize,
+}
+fn inspect_directory_cancellable(
+    bytes: &[u8],
+    cancelled: Cancel<'_>,
+) -> Result<InspectedDirectory, String> {
+    checkpoint(cancelled)?;
     let bad = "That extension package has an invalid ZIP directory.";
     if bytes.len() > MAX_VSIX_BYTES {
         return Err("That theme extension is too large to import safely.".into());
@@ -269,14 +372,32 @@ pub fn inspect_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
         |o: usize| -> usize { u16::from_le_bytes(bytes[o..o + 2].try_into().unwrap()) as usize };
     let u32at =
         |o: usize| -> usize { u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize };
-    let end = (bytes.len().saturating_sub(65557)..=bytes.len().saturating_sub(22))
-        .rev()
-        .find(|&o| {
-            o + 22 <= bytes.len()
-                && bytes[o..o + 4] == [0x50, 0x4b, 5, 6]
-                && o + 22 + u16at(o + 20) == bytes.len()
-        })
-        .ok_or("That extension package has no ZIP directory.")?;
+    let mut end = None;
+    for offset in (bytes.len().saturating_sub(65557)..=bytes.len().saturating_sub(22)).rev() {
+        if offset % 256 == 0 {
+            checkpoint(cancelled)?;
+        }
+        if offset + 22 <= bytes.len()
+            && bytes[offset..offset + 4] == *b"PK\x05\x06"
+            && offset + 22 + u16at(offset + 20) == bytes.len()
+        {
+            end = Some(offset);
+            break;
+        }
+    }
+    let end = end.ok_or("That extension package has no ZIP directory.")?;
+    // zip 0.6 follows a locator here even when it is hidden inside an ordinary entry comment.
+    if end >= 20 && bytes[end - 20..end - 16] == *b"PK\x06\x07" {
+        return Err("That extension package has unsupported ZIP64 metadata.".into());
+    }
+    for (offset, signature) in bytes[..end].windows(4).enumerate() {
+        if offset % 4096 == 0 {
+            checkpoint(cancelled)?;
+        }
+        if signature == b"PK\x06\x06" {
+            return Err("That extension package has unsupported ZIP64 metadata.".into());
+        }
+    }
     let start = u32at(end + 16);
     if start.checked_add(u32at(end + 12)) != Some(end) {
         return Err(bad.into());
@@ -285,6 +406,7 @@ pub fn inspect_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut count = 0;
     let mut total = 0u64;
     while offset < end {
+        checkpoint(cancelled)?;
         if offset + 46 > end || bytes[offset..offset + 4] != [0x50, 0x4b, 1, 2] {
             return Err(bad.into());
         }
@@ -309,11 +431,23 @@ pub fn inspect_directory(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if offset != end {
         return Err(bad.into());
     }
+    if u16at(end + 8) != count || u16at(end + 10) != count {
+        return Err(bad.into());
+    }
+    checkpoint(cancelled)?;
     let mut stripped = bytes[..end + 22].to_vec();
     stripped[end + 20..end + 22].fill(0);
-    Ok(stripped)
+    Ok(InspectedDirectory {
+        bytes: stripped,
+        entries: count,
+    })
 }
-fn read_text(zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>, path: &str) -> Result<Vec<u8>, String> {
+fn read_text(
+    zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
+    path: &str,
+    cancelled: Cancel<'_>,
+) -> Result<Vec<u8>, String> {
+    checkpoint(cancelled)?;
     let mut file = zip
         .by_name(path)
         .map_err(|_| format!("{path} is missing from the extension package."))?;
@@ -321,22 +455,31 @@ fn read_text(zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>, path: &str) -> Result<V
         return Err(format!("{path} is too large."));
     }
     let mut out = Vec::new();
-    (&mut file)
-        .take(MAX_JSON_BYTES as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| e.to_string())?;
-    if out.len() > MAX_JSON_BYTES {
-        return Err(format!("{path} is too large."));
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        checkpoint(cancelled)?;
+        let read = file.read(&mut chunk).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if out.len() + read > MAX_JSON_BYTES {
+            return Err(format!("{path} is too large."));
+        }
+        out.extend_from_slice(&chunk[..read]);
     }
+    checkpoint(cancelled)?;
     Ok(out)
 }
+
 fn load_theme(
     zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
     path: &str,
     cache: &mut BTreeMap<String, Value>,
     ancestors: &mut BTreeSet<String>,
     files: &mut usize,
+    cancelled: Cancel<'_>,
 ) -> Result<Value, String> {
+    checkpoint(cancelled)?;
     if ancestors.len() >= 8 {
         return Err("Theme includes are nested too deeply.".into());
     }
@@ -350,7 +493,7 @@ fn load_theme(
     if *files > 320 {
         return Err("That extension references too many theme files.".into());
     }
-    let value = json_object(&read_text(zip, path)?, path)?;
+    let value = json_object_cancellable(&read_text(zip, path, cancelled)?, path, cancelled)?;
     let mut colors = serde_json::Map::new();
     if let Some(c) = value["colors"].as_object() {
         for (key, color) in c {
@@ -364,7 +507,7 @@ fn load_theme(
     if let Some(include) = value["include"].as_str() {
         ancestors.insert(path.into());
         let include = package_path(include, path)?;
-        let base = load_theme(zip, &include, cache, ancestors, files)?;
+        let base = load_theme(zip, &include, cache, ancestors, files, cancelled)?;
         ancestors.remove(path);
         let mut merged = base["colors"].as_object().cloned().unwrap_or_default();
         merged.extend(colors);
@@ -379,7 +522,17 @@ pub fn extract(
     bytes: &[u8],
     checksum: &[u8],
 ) -> Result<Vec<ThemeDefinition>, String> {
-    let advertised = json_object(advertised, "Extension manifest")?;
+    extract_cancellable(e, advertised, bytes, checksum, &|| false)
+}
+pub fn extract_cancellable(
+    e: &Extension,
+    advertised: &[u8],
+    bytes: &[u8],
+    checksum: &[u8],
+    cancelled: Cancel<'_>,
+) -> Result<Vec<ThemeDefinition>, String> {
+    checkpoint(cancelled)?;
+    let advertised = json_object_cancellable(advertised, "Extension manifest", cancelled)?;
     check_contributions(&advertised)?;
     let checksum = String::from_utf8_lossy(checksum);
     let expected = checksum.split_whitespace().next().unwrap_or("");
@@ -389,21 +542,34 @@ pub fn extract(
     {
         return Err("That Open VSX theme has an invalid checksum.".into());
     }
-    if !format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(expected) {
+    let mut hash = Sha256::new();
+    for chunk in bytes.chunks(64 * 1024) {
+        checkpoint(cancelled)?;
+        hash.update(chunk);
+    }
+    checkpoint(cancelled)?;
+    if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected) {
         return Err("That Open VSX theme failed its integrity check.".into());
     }
-    let stripped = inspect_directory(bytes)?;
-    let mut zip = zip::ZipArchive::new(Cursor::new(stripped))
+    let inspected = inspect_directory_cancellable(bytes, cancelled)?;
+    checkpoint(cancelled)?;
+    let mut zip = zip::ZipArchive::new(Cursor::new(inspected.bytes))
         .map_err(|_| "That Open VSX extension package could not be opened.")?;
+    checkpoint(cancelled)?;
+    if zip.len() != inspected.entries {
+        return Err("That extension package has an invalid ZIP directory.".into());
+    }
     for i in 0..zip.len() {
+        checkpoint(cancelled)?;
         let file = zip
             .by_index(i)
             .map_err(|_| "That Open VSX extension package could not be opened.")?;
         package_path(file.name(), "extension/")?;
     }
-    let manifest = json_object(
-        &read_text(&mut zip, "extension/package.json")?,
+    let manifest = json_object_cancellable(
+        &read_text(&mut zip, "extension/package.json", cancelled)?,
         "Extension manifest",
+        cancelled,
     )?;
     if !text(&manifest, "publisher").eq_ignore_ascii_case(&e.publisher)
         || !format!(
@@ -425,6 +591,7 @@ pub fn extract(
     let mut cache = BTreeMap::new();
     let mut files = 0;
     for c in contributions(&manifest) {
+        checkpoint(cancelled)?;
         let parsed = (|| {
             let path = package_path(
                 c["path"].as_str().ok_or("theme path is missing")?,
@@ -436,6 +603,7 @@ pub fn extract(
                 &mut cache,
                 &mut BTreeSet::new(),
                 &mut files,
+                cancelled,
             )?;
             value["displayName"] = json!(
                 c["label"]
@@ -450,12 +618,21 @@ pub fn extract(
                 "hc-black" | "hc-light" => value["type"] = c["uiTheme"].clone(),
                 _ => {}
             }
-            Ok::<_, String>((super::vscode::convert(&value)?, path))
+            let theme = super::vscode::convert(&value)?;
+            checkpoint(cancelled)?;
+            Ok::<_, String>((theme, path))
         })()
-        .map_err(|_| "One or more color themes in that extension could not be imported safely.")?;
+        .map_err(|_| {
+            if cancelled() {
+                IMPORT_CANCELLED.to_string()
+            } else {
+                "One or more color themes in that extension could not be imported safely.".into()
+            }
+        })?;
         entries.push((parsed.0, parsed.1.rsplit('/').next().map(str::to_owned)));
         paths.push(parsed.1);
     }
+    checkpoint(cancelled)?;
     let extension = e.id.to_lowercase();
     let mut occurrences = BTreeMap::<String, usize>::new();
     let resolved = importer::resolve_label_collisions(entries)
@@ -478,7 +655,8 @@ pub fn extract(
         ids.sort();
         theme_id(&extension, &ids.join(":"))
     });
-    Ok(
+    checkpoint(cancelled)?;
+    let result =
         importer::resolve_label_collisions(paired.into_iter().map(|t| (t, None)).collect())
             .into_iter()
             .map(|mut t| {
@@ -488,8 +666,9 @@ pub fn extract(
                 });
                 t
             })
-            .collect(),
-    )
+            .collect();
+    checkpoint(cancelled)?;
+    Ok(result)
 }
 fn check_contributions(v: &Value) -> Result<(), String> {
     match contributions(v).len() {
