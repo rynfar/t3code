@@ -50,7 +50,7 @@ pub(super) struct AddDialog {
     pub(super) id_overridden: bool,
     pub(super) attempted: bool,
     pub(super) error: Option<String>,
-    focus: FocusHandle,
+    pub(super) focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -496,6 +496,9 @@ impl SettingsView {
         } else {
             wizard::FocusTarget::Dialog
         };
+        if focus_step && target == wizard::FocusTarget::Dialog {
+            self.providers.dialog.as_ref()?.focus.focus(window, cx);
+        }
         if focus_step && target == wizard::FocusTarget::Identity {
             self.providers
                 .dialog
@@ -696,7 +699,7 @@ impl SettingsView {
                 None => this.border_color(hsla(p.border)),
             });
             v_flex()
-                .children(dialog.add.selected_acp.as_ref().filter(|_|driver.kind==model::ACP_REGISTRY).map(|agent|v_flex().pb(r(12.)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(agent.name.clone())).child(div().text_xs().text_color(hsla(p.muted_foreground)).child(format!("v{} · {}",agent.version,agent.distribution)))))
+                .children(dialog.add.selected_acp.as_ref().filter(|_|driver.kind==model::ACP_REGISTRY).map(|agent|self.registry_identity(agent,window,cx)))
                 .child(Row::new("add-provider-label", "Label").description("Shown in the provider list.").control(div().w(r(224.)).child(Input::new(&dialog.label).small().disabled(saving || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx)))))
                 .child(
                     div().border_t_1().border_color(hsla(p.border).opacity(0.5)).child(

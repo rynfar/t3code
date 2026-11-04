@@ -19,19 +19,46 @@ use gpui_component::{
 use serde_json::{Value, json};
 use t3_core::settings::providers::{form, wizard};
 
+enum ConfigSelect {
+    Editable(Select),
+    Locked(AnyElement),
+}
 #[derive(IntoElement)]
 struct FocusConfigSelect {
     id: gpui::ElementId,
-    select: Select,
+    control: ConfigSelect,
     focus: bool,
+    fallback: gpui::FocusHandle,
+    view: gpui::WeakEntity<SettingsView>,
+    token: u64,
 }
 impl RenderOnce for FocusConfigSelect {
     fn render(self, window: &mut Window, cx: &mut gpui::App) -> impl IntoElement {
         // Select's focus handle is keyed in its element scope.
-        if self.focus {
-            focus_handle(&self.id, window, cx).focus(window, cx);
+        let handle = focus_handle(&self.id, window, cx);
+        let disabled = matches!(&self.control, ConfigSelect::Locked(_));
+        if disabled && handle.contains_focused(window, cx) {
+            self.fallback.focus(window, cx);
+            cx.defer(move |cx| {
+                let _ = self.view.update(cx, |view, cx| {
+                    if let Some(dialog) = view
+                        .providers
+                        .dialog
+                        .as_mut()
+                        .filter(|d| d.token == self.token)
+                    {
+                        dialog.focus_step = true;
+                    }
+                    cx.notify();
+                });
+            });
+        } else if self.focus && !disabled {
+            handle.focus(window, cx);
         }
-        self.select.render(window, cx)
+        match self.control {
+            ConfigSelect::Editable(select) => select.render(window, cx).into_any_element(),
+            ConfigSelect::Locked(content) => content,
+        }
     }
 }
 
@@ -187,17 +214,27 @@ impl SettingsView {
                     .iter()
                     .find(|(v, _)| v == &current)
                     .map_or(current.clone(), |(_, l)| l.clone());
+                let id: gpui::ElementId =
+                    SharedString::from(format!("wizard-config-{driver}-{key}")).into();
                 if disabled {
-                    div()
-                        .w(r(224.))
-                        .opacity(0.64)
-                        .child(label)
-                        .into_any_element()
+                    FocusConfigSelect {
+                        id,
+                        control: ConfigSelect::Locked(
+                            div()
+                                .w(r(224.))
+                                .opacity(0.64)
+                                .child(label)
+                                .into_any_element(),
+                        ),
+                        focus: false,
+                        fallback: dialog.focus.clone(),
+                        view: cx.entity().downgrade(),
+                        token: dialog.token,
+                    }
+                    .into_any_element()
                 } else {
                     let edit_key = key.clone();
                     let view = cx.entity().downgrade();
-                    let id: gpui::ElementId =
-                        SharedString::from(format!("wizard-config-{driver}-{key}")).into();
                     let select = Select::new(
                         id.clone(),
                         field
@@ -222,8 +259,11 @@ impl SettingsView {
                     });
                     FocusConfigSelect {
                         id,
-                        select,
+                        control: ConfigSelect::Editable(select),
                         focus: focus_key == Some(key.as_str()),
+                        fallback: dialog.focus.clone(),
+                        view: cx.entity().downgrade(),
+                        token: dialog.token,
                     }
                     .into_any_element()
                 }
@@ -276,6 +316,28 @@ impl SettingsView {
                 .description(denial.unwrap_or(field.description))
                 .control(control)
                 .into_any_element(),
+            );
+        }
+        #[cfg(feature = "snapshot")]
+        if let Some(policy) = cx
+            .try_global::<super::registry::LivePolicy>()
+            .map(|p| p.0.clone())
+        {
+            rows.push(
+                div()
+                    .id("fixture-live-policy")
+                    .text_xs()
+                    .child("Apply fixture policy")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.update(cx, |state, _| {
+                            if let Some(config) = state.server_config.config.as_mut() {
+                                config.managed_policy = Some(policy.clone());
+                            }
+                        });
+                        cx.remove_global::<super::registry::LivePolicy>();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
             );
         }
         v_flex()
