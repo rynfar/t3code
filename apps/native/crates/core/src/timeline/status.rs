@@ -417,8 +417,7 @@ pub fn status_line(thread: &SidebarThread, now: i64) -> Option<StatusLine> {
     is_woke_unseen(Some(woke), false, thread.last_visited_at, completed).then_some(StatusLine::Woke { woke_at: woke })
 }
 
-/// `ProviderStatusBanner`: the banner for the thread's provider when it is not ready. Version
-/// compatibility advisories and provider setup actions are not presented here yet.
+/// `ProviderStatusBanner`: availability and compatibility notices for the thread's provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderBanner {
     pub instance_id: String,
@@ -430,23 +429,32 @@ pub struct ProviderBanner {
 }
 
 pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
-    if provider.status == "disabled" || provider.status == "ready" {
+    if provider.status == "disabled" {
         return None;
     }
-    if provider.driver == "antigravity" && provider.installed && provider.status == "warning" && provider.auth.status == "unknown" {
-        return None;
-    }
-    let message_text = provider.message.clone().unwrap_or_default();
-    let key = [provider.instance_id.as_str(), &provider.status, &provider.auth.status, &message_text].join("\u{0}");
-    let name = provider.display_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map_or_else(|| driver_label(&provider.driver), str::to_owned);
     let unauthenticated = provider.status == "error" && provider.auth.status == "unauthenticated";
+    let incompatible = provider.compatibility_advisory.as_ref().filter(|advisory| {
+        !unauthenticated && (advisory.status == "broken" || (provider.status == "ready" && advisory.status == "unsupported"))
+    });
+    if incompatible.is_none() && (provider.status == "ready" || (provider.driver == "antigravity" && provider.installed && provider.status == "warning" && provider.auth.status == "unknown")) {
+        return None;
+    }
+    let key = match incompatible {
+        Some(advisory) => [provider.instance_id.as_str(), &advisory.status, provider.version.as_deref().unwrap_or_default(), advisory.message.as_deref().unwrap_or_default()].join("\u{0}"),
+        None => [provider.instance_id.as_str(), &provider.status, &provider.auth.status, provider.message.as_deref().unwrap_or_default()].join("\u{0}"),
+    };
+    let name = provider.display_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map_or_else(|| driver_label(&provider.driver), str::to_owned);
     let setup = provider.driver == "antigravity";
-    let message = if !message_text.is_empty() {
-        message_text
+    let message = if let Some(message) = incompatible.and_then(|advisory| advisory.message.as_ref()) {
+        message.clone()
+    } else if let Some(message) = provider.message.as_ref().filter(|message| !message.is_empty()) {
+        message.clone()
     } else if !provider.installed && setup {
         format!("Open provider setup to install {} on this environment.", driver_label(&provider.driver))
     } else if provider.auth.status == "unauthenticated" {
         if setup { "Open provider setup to sign in with Google.".into() } else { "Sign in via the CLI to authenticate again.".into() }
+    } else if provider.status == "ready" {
+        "No models are available for this provider.".into()
     } else if provider.status == "error" {
         format!("{name} provider is unavailable.")
     } else {
@@ -456,8 +464,16 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
         instance_id: provider.instance_id.clone(),
         refresh_tooltip: format!("Refresh {name} provider status"),
         key,
-        title: if unauthenticated { format!("{name} is unauthenticated") } else { format!("{name} provider status") },
+        title: if unauthenticated {
+            format!("{name} is unauthenticated")
+        } else if let Some(advisory) = incompatible {
+            let version = provider.version.as_deref().unwrap_or_default();
+            let status = if advisory.status == "broken" { "known to be broken" } else { "unsupported" };
+            format!("{name} {version} is {status}")
+        } else {
+            format!("{name} provider status")
+        },
         message,
-        warning: provider.status == "warning",
+        warning: incompatible.map_or(provider.status == "warning", |advisory| advisory.status != "broken"),
     })
 }
