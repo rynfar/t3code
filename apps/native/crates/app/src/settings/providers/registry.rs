@@ -10,22 +10,44 @@ use crate::{
     theme::{hsla, palette},
 };
 use gpui::{
-    AnyElement, AppContext, Context, Entity, FontWeight, IntoElement, ListAlignment, ListState,
-    ParentElement, Styled, Subscription, Task, Window, div, list, px,
+    AnyElement, App, AppContext, Context, Entity, FontWeight, Global, IntoElement, ListAlignment,
+    ListState, ParentElement, Styled, StyledImage, Subscription, Task, Window, div, img, list, px,
 };
 use gpui_component::{
     Sizable, h_flex,
     input::{Input, InputEvent, InputState},
     v_flex,
 };
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 use t3_core::settings::providers::{
     self as model, registry as logic,
     wizard::{self, AcpSetup},
 };
 
+#[cfg(feature = "snapshot")]
+pub(super) struct LivePolicy(pub serde_json::Value);
+#[cfg(feature = "snapshot")]
+impl Global for LivePolicy {}
+
+struct Recent {
+    cache: logic::RecentSearches,
+    clock: std::time::Instant,
+}
+impl Default for Recent {
+    fn default() -> Self {
+        Self {
+            cache: Default::default(),
+            clock: std::time::Instant::now(),
+        }
+    }
+}
+#[derive(Default)]
+struct RecentCache(Rc<RefCell<Recent>>);
+impl Global for RecentCache {}
+
 pub(super) struct Registry {
     pub model: logic::Search,
+    recent: Rc<RefCell<Recent>>,
     input: Entity<InputState>,
     list: ListState,
     enabled: bool,
@@ -35,6 +57,9 @@ pub(super) struct Registry {
 }
 impl Registry {
     pub fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
+        if !cx.has_global::<RecentCache>() {
+            cx.set_global(RecentCache::default());
+        }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search agents…"));
         let subscription = cx.subscribe_in(
             &input,
@@ -68,7 +93,7 @@ impl Registry {
                                 .as_ref()
                                 .is_some_and(|d| d.token == token)
                             {
-                                this.search_registry(cx);
+                                this.search_registry(false, cx);
                             }
                         });
                     }));
@@ -80,6 +105,7 @@ impl Registry {
         );
         Self {
             model: Default::default(),
+            recent: cx.global::<RecentCache>().0.clone(),
             input,
             list: ListState::new(0, ListAlignment::Top, px(128.)),
             enabled: false,
@@ -92,10 +118,20 @@ impl Registry {
         &self.input
     }
     pub fn stop(&mut self) {
+        if self.enabled {
+            let mut recent = self.recent.borrow_mut();
+            let now = recent.clock.elapsed().as_millis() as u64;
+            recent.cache.touch(&self.model, now);
+        }
         self.enabled = false;
         self.debounce = None;
         self.work = None;
         self.model.retire();
+    }
+}
+impl Drop for Registry {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 impl AddDialog {
@@ -107,6 +143,9 @@ impl AddDialog {
 }
 impl SettingsView {
     fn registry_visible(&self, cx: &gpui::App) -> bool {
+        if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) {
+            return false;
+        }
         if self
             .add_driver_denial(model::find_driver(model::ACP_REGISTRY).unwrap(), cx)
             .is_some()
@@ -117,7 +156,31 @@ impl SettingsView {
             d.registry_step() && d.connection == self.state.read(cx).connection_id()
         })
     }
+    fn registry_scope(&self, cx: &App) -> Option<logic::SearchScope> {
+        let state = self.state.read(cx);
+        let client = state.client_handle()?;
+        Some(logic::SearchScope {
+            environment: client.environment().into(),
+            connection: state.connection_id()?,
+            session: *client.connection_generation().borrow(),
+            permitted: self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx)
+                && self
+                    .add_driver_denial(model::find_driver(model::ACP_REGISTRY).unwrap(), cx)
+                    .is_none(),
+        })
+    }
     pub(super) fn sync_registry(&mut self, cx: &mut Context<Self>) {
+        if !cx.has_global::<RecentCache>() {
+            cx.set_global(RecentCache::default());
+        }
+        let changed = self
+            .registry_scope(cx)
+            .is_some_and(|scope| cx.global::<RecentCache>().0.borrow_mut().cache.scope(scope));
+        if changed && let Some(dialog) = self.providers.dialog.as_mut() {
+            dialog.registry.stop();
+            dialog.registry.model.agents = None;
+            dialog.registry.model.error = None;
+        }
         let visible = self.registry_visible(cx);
         let Some(dialog) = self.providers.dialog.as_mut() else {
             return;
@@ -130,7 +193,7 @@ impl SettingsView {
         }
         if !dialog.registry.enabled {
             dialog.registry.enabled = true;
-            self.search_registry(cx);
+            self.search_registry(false, cx);
         }
     }
     fn registry_allowed(&self, cx: &gpui::App) -> bool {
@@ -163,14 +226,14 @@ impl SettingsView {
         if d.registry.model.preparing.is_some() {
             return;
         }
-        let query = d.registry.model.query.trim().to_owned();
-        d.registry.model.query = query.clone();
+        let refresh = d.registry.model.submit();
+        let query = d.registry.model.query.clone();
         d.registry
             .input
             .update(cx, |input, cx| input.set_value(query, window, cx));
-        self.search_registry(cx);
+        self.search_registry(refresh, cx);
     }
-    fn search_registry(&mut self, cx: &mut Context<Self>) {
+    fn search_registry(&mut self, refresh: bool, cx: &mut Context<Self>) {
         if !self.registry_visible(cx) || super::fixture_active(cx) {
             return;
         }
@@ -181,12 +244,29 @@ impl SettingsView {
             };
             (client, app.runtime().clone())
         };
+        let scope = self.registry_scope(cx);
         let dialog = self.providers.dialog.as_mut().unwrap();
         if dialog.registry.model.preparing.is_some() {
             return;
         }
         dialog.registry.debounce = None;
         dialog.registry.work = None;
+        let store = cx.global::<RecentCache>().0.clone();
+        let mut recent = store.borrow_mut();
+        let now = recent.clock.elapsed().as_millis() as u64;
+        if dialog.registry.model.agents.is_some() || dialog.registry.model.error.is_some() {
+            recent.cache.touch(&dialog.registry.model, now);
+        }
+        let fresh = recent.cache.restore(&mut dialog.registry.model, now);
+        drop(recent);
+        dialog
+            .registry
+            .list
+            .reset(dialog.registry.model.agents.as_ref().map_or(0, Vec::len));
+        if fresh && !refresh {
+            cx.notify();
+            return;
+        }
         let epoch = dialog.registry.model.begin_search();
         let query = dialog.registry.model.submitted.clone();
         let token = dialog.token;
@@ -200,7 +280,7 @@ impl SettingsView {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                if !this.registry_visible(cx) {
+                if !this.registry_visible(cx) || this.registry_scope(cx) != scope {
                     return;
                 }
                 if let Some(d) = this
@@ -210,6 +290,10 @@ impl SettingsView {
                     .filter(|d| d.token == token && d.connection == connection)
                     && d.registry.model.searched(epoch, result)
                 {
+                    let store = cx.global::<RecentCache>().0.clone();
+                    let mut recent = store.borrow_mut();
+                    let now = recent.clock.elapsed().as_millis() as u64;
+                    recent.cache.remember(&d.registry.model, now);
                     d.registry
                         .list
                         .reset(d.registry.model.agents.as_ref().map_or(0, Vec::len));
@@ -420,7 +504,9 @@ impl SettingsView {
                 content = content.child(
                     list(
                         d.registry.list.clone(),
-                        cx.processor(|this, index, _, cx| this.render_registry_agent(index, cx)),
+                        cx.processor(|this, index, window, cx| {
+                            this.render_registry_agent(index, window, cx)
+                        }),
                     )
                     .h(r((agents.len() as f32 * 64.).min(256.)))
                     .w_full(),
@@ -429,7 +515,12 @@ impl SettingsView {
         }
         content.into_any_element()
     }
-    fn render_registry_agent(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_registry_agent(
+        &self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let d = self.providers.dialog.as_ref().unwrap();
         let Some(agent) = d
             .registry
@@ -453,22 +544,20 @@ impl SettingsView {
         } else {
             "Add"
         };
-        let about = agent.website.clone().or(agent.repository.clone());
+        let about = logic::external_url(
+            agent
+                .website
+                .as_deref()
+                .filter(|url| !url.is_empty())
+                .or(agent.repository.as_deref()),
+        );
+        let mark = self.registry_icon(&agent, window, cx);
         h_flex()
             .w_full()
             .h(r(64.))
             .gap(r(12.))
             .py(r(10.))
-            .child(
-                ProviderIcon::new(ProviderMark::configured(
-                    model::ACP_REGISTRY,
-                    &agent.name,
-                    None,
-                ))
-                .size(px(
-                    24. * crate::theme::preferences(cx).interface_font_size / 16.
-                )),
-            )
+            .child(mark)
             .child(
                 v_flex()
                     .flex_1()
@@ -518,6 +607,113 @@ impl SettingsView {
                     cx.listener(move |this, _, _, cx| this.prepare_registry(agent.clone(), cx)),
                 ),
             )
+            .into_any_element()
+    }
+    pub(super) fn registry_icon(
+        &self,
+        agent: &logic::Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let runtime = self.state.read(cx).runtime().clone();
+        let image = super::registry_icons::image(agent, p.muted_foreground, runtime, window, cx);
+        div()
+            .size(r(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(r(6.))
+            .overflow_hidden()
+            .bg(hsla(p.muted))
+            .text_color(hsla(p.muted_foreground))
+            .child(match image {
+                Some(image) => img(image)
+                    .size(r(24.))
+                    .object_fit(gpui::ObjectFit::Contain)
+                    .into_any_element(),
+                None => ProviderIcon::new(ProviderMark::configured(
+                    model::ACP_REGISTRY,
+                    &agent.name,
+                    None,
+                ))
+                .size(px(
+                    24. * crate::theme::preferences(cx).interface_font_size / 16.
+                ))
+                .into_any_element(),
+            })
+            .into_any_element()
+    }
+    pub(super) fn registry_identity(
+        &self,
+        agent: &logic::Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let links = [
+            ("wizard-selected-docs", "Docs", agent.website.as_deref()),
+            (
+                "wizard-selected-source",
+                "Source",
+                agent.repository.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(id, label, url)| {
+            logic::external_url(url).map(|url| {
+                Button::new(id, ButtonVariant::GhostMuted, ButtonSize::Xs)
+                    .label(label)
+                    .tooltip(format!(
+                        "Open {} for {} ({})",
+                        if label == "Docs" {
+                            "documentation"
+                        } else {
+                            "source"
+                        },
+                        agent.name,
+                        agent.id
+                    ))
+                    .on_click(move |_, _, cx| {
+                        if !super::fixture_active(cx) {
+                            cx.open_url(&url);
+                        }
+                    })
+            })
+        });
+        h_flex()
+            .items_start()
+            .justify_between()
+            .gap(r(12.))
+            .mb(r(16.))
+            .pb(r(12.))
+            .border_b_1()
+            .border_color(hsla(p.border).opacity(0.7))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(r(12.))
+                    .child(self.registry_icon(agent, window, cx))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(agent.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(hsla(p.muted_foreground))
+                                    .child(format!("v{} · {}", agent.version, agent.distribution)),
+                            ),
+                    ),
+            )
+            .child(h_flex().flex_none().gap(r(8.)).children(links))
             .into_any_element()
     }
     pub(super) fn render_wizard_auth(
@@ -601,7 +797,19 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         use serde_json::json;
-        if fixture.get("registry").is_some() {
+        if let Some(icons) = fixture
+            .get("icons")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            cx.set_global(super::registry_icons::FixtureIcons(icons));
+        }
+        if let Some(policy) = fixture.get("livePolicy") {
+            cx.set_global(LivePolicy(policy.clone()));
+        }
+        if let Some(driver) = fixture["driver"].as_str().and_then(model::find_driver) {
+            self.select_dialog_driver(driver, window, cx);
+            self.providers.dialog.as_mut().unwrap().focus_step = true;
+        } else if fixture.get("registry").is_some() {
             let d = self.providers.dialog.as_mut().unwrap();
             d.show_more = true;
             d.registry.enabled = true;

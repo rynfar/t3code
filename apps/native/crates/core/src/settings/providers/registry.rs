@@ -3,6 +3,7 @@ use super::{ACP_REGISTRY, auth::AuthState};
 use crate::server_config::{ProviderInstanceConfig, ServerProvider};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 
 pub const SEARCH: &str = "server.searchAcpRegistry";
 pub const PREPARE: &str = "server.prepareAcpRegistryAgent";
@@ -71,6 +72,24 @@ pub fn official_icon(icon: &str) -> Option<String> {
         && url.password().is_none())
     .then(|| url.into())
 }
+pub fn icon_url(agent: &Agent) -> Option<String> {
+    agent.icon.as_deref().and_then(official_icon).or_else(|| {
+        let id = agent.id.trim();
+        let mut chars = id.chars();
+        (chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars.all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            }))
+        .then(|| format!("https://cdn.agentclientprotocol.com/registry/v1/latest/{id}.svg"))
+    })
+}
+/// Registry website/repository are HTTP(S) links, not executable OS URL schemes.
+pub fn external_url(value: Option<&str>) -> Option<String> {
+    let url = url::Url::parse(value?).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.into())
+}
 pub fn configured<'a>(
     mut instances: impl Iterator<Item = &'a ProviderInstanceConfig>,
     id: &str,
@@ -91,6 +110,137 @@ pub fn search_payload(query: &str) -> Value {
         json!({"query":"","limit":MAX_AGENTS})
     } else {
         json!({"query":query.trim()})
+    }
+}
+
+// server.ts `searchAcpRegistry` and runtime.ts: five-minute SWR and idle retention.
+pub const SEARCH_TTL_MS: u64 = 5 * 60_000;
+const RECENT_QUERIES: usize = 16;
+const RECENT_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchScope {
+    pub environment: String,
+    pub connection: u64,
+    pub session: u64,
+    pub permitted: bool,
+}
+#[derive(Default)]
+pub struct RecentSearches {
+    scope: Option<SearchScope>,
+    entries: VecDeque<RecentSearch>,
+}
+struct RecentSearch {
+    query: String,
+    agents: Option<Vec<Agent>>,
+    error: Option<String>,
+    answered: Option<u64>,
+    used: u64,
+    bytes: usize,
+}
+impl RecentSearches {
+    pub fn scope(&mut self, scope: SearchScope) -> bool {
+        if self.scope.as_ref() == Some(&scope) {
+            return false;
+        }
+        let changed = self.scope.is_some();
+        self.entries.clear();
+        self.scope = Some(scope);
+        changed
+    }
+    pub fn touch(&mut self, search: &Search, now: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.query == search.submitted)
+        {
+            entry.used = now;
+        }
+    }
+    pub fn restore(&mut self, search: &mut Search, now: u64) -> bool {
+        self.entries
+            .retain(|e| now.saturating_sub(e.used) < SEARCH_TTL_MS);
+        let query = search.query.trim();
+        if query != search.submitted {
+            search.agents = None;
+        }
+        search.submitted = query.to_owned();
+        search.error = None;
+        search.retire();
+        if self.scope.as_ref().is_none_or(|s| !s.permitted) {
+            search.agents = None;
+            return false;
+        }
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.query == search.submitted)
+        else {
+            return false;
+        };
+        entry.used = now;
+        search.agents = entry.agents.clone();
+        search.error = entry.error.clone();
+        entry
+            .answered
+            .is_some_and(|at| now.saturating_sub(at) < SEARCH_TTL_MS)
+    }
+    pub fn remember(&mut self, search: &Search, now: u64) {
+        if search.pending || self.scope.as_ref().is_none_or(|s| !s.permitted) {
+            return;
+        }
+        let answered = if search.error.is_none() {
+            Some(now)
+        } else {
+            self.entries
+                .iter()
+                .find(|e| e.query == search.submitted)
+                .and_then(|e| e.answered)
+        };
+        self.entries.retain(|e| e.query != search.submitted);
+        let bytes = search.submitted.len()
+            + search.error.as_ref().map_or(0, String::len)
+            + search
+                .agents
+                .iter()
+                .flatten()
+                .map(|a| {
+                    std::mem::size_of::<Agent>()
+                        + a.id.len()
+                        + a.name.len()
+                        + a.description.len()
+                        + a.version.len()
+                        + a.distribution.len()
+                        + [&a.icon, &a.website, &a.repository]
+                            .into_iter()
+                            .flatten()
+                            .map(String::len)
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        if bytes > RECENT_BYTES {
+            return;
+        }
+        self.entries.push_back(RecentSearch {
+            query: search.submitted.clone(),
+            agents: search.agents.clone(),
+            error: search.error.clone(),
+            answered,
+            used: now,
+            bytes,
+        });
+        while self.entries.len() > RECENT_QUERIES
+            || self.entries.iter().map(|e| e.bytes).sum::<usize>() > RECENT_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(i, _)| i)
+                .unwrap();
+            self.entries.remove(oldest);
+        }
     }
 }
 
@@ -115,6 +265,11 @@ impl Search {
     pub fn typed(&mut self, text: String) {
         self.query = text;
         self.prepare_error = None;
+    }
+    pub fn submit(&mut self) -> bool {
+        self.query = self.query.trim().to_owned();
+        self.prepare_error = None;
+        self.query == self.submitted
     }
     pub fn begin_search(&mut self) -> u64 {
         self.retire();

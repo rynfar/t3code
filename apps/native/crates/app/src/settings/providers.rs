@@ -8,6 +8,7 @@
 
 mod dialog;
 mod registry;
+mod registry_icons;
 mod dialog_config;
 mod editor;
 mod form;

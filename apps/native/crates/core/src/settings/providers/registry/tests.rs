@@ -96,6 +96,24 @@ fn prepare_merges_server_identity_before_defaults_and_cannot_cross_hidden_step()
         },
     );
     assert!(configured(instances.values(), "canonical"));
+    assert_eq!(
+        icon_url(&agent("fixture")).as_deref(),
+        Some("https://cdn.agentclientprotocol.com/agent.svg")
+    );
+    let mut fallback = agent("valid-agent");
+    fallback.icon = Some("https://example.com/unsafe.svg".into());
+    assert_eq!(
+        icon_url(&fallback).as_deref(),
+        Some("https://cdn.agentclientprotocol.com/registry/v1/latest/valid-agent.svg")
+    );
+    fallback.id = "../invalid".into();
+    assert!(icon_url(&fallback).is_none());
+    assert!(external_url(Some("javascript:alert(1)")).is_none());
+    assert!(external_url(None).is_none());
+    assert_eq!(
+        external_url(Some("https://example.com/docs")).as_deref(),
+        Some("https://example.com/docs")
+    );
     for url in [
         "http://cdn.agentclientprotocol.com/x",
         "https://cdn.agentclientprotocol.com.evil/x",
@@ -124,4 +142,92 @@ fn wizard_discovery_and_finish_follow_auth_state() {
         Some(&provider),
         Some(&state("succeeded", json!([])))
     ));
+}
+
+#[test]
+fn recent_queries_survive_dialog_reopen_but_not_expiry_refresh_or_session_changes() {
+    let mut cache = RecentSearches::default();
+    let scope = SearchScope {
+        environment: "https://one".into(),
+        connection: 1,
+        session: 1,
+        permitted: true,
+    };
+    cache.scope(scope.clone());
+    let mut first = Search::default();
+    let epoch = first.begin_search();
+    first.searched(
+        epoch,
+        Ok(SearchResult {
+            agents: vec![agent("fixture")],
+        }),
+    );
+    cache.remember(&first, 0);
+    let mut reopened = Search::default();
+    assert!(cache.restore(&mut reopened, 1));
+    assert_eq!(reopened.agents, first.agents);
+    reopened.typed("other".into());
+    assert!(!cache.restore(&mut reopened, 2));
+    assert!(reopened.agents.is_none());
+    let epoch = reopened.begin_search();
+    reopened.searched(epoch, Ok(SearchResult { agents: vec![] }));
+    cache.remember(&reopened, 2);
+    reopened.typed("  ".into());
+    assert!(!reopened.submit());
+    assert_eq!(reopened.query, "");
+    assert!(cache.restore(&mut reopened, SEARCH_TTL_MS - 1));
+    assert!(reopened.submit());
+    assert!(!cache.restore(&mut reopened, SEARCH_TTL_MS));
+    assert!(reopened.agents.is_some());
+    let epoch = reopened.begin_search();
+    reopened.searched(epoch, Err("offline".into()));
+    cache.remember(&reopened, SEARCH_TTL_MS);
+    assert!(!cache.restore(&mut reopened, SEARCH_TTL_MS + 1));
+    assert_eq!(reopened.error.as_deref(), Some("offline"));
+    cache.touch(&reopened, SEARCH_TTL_MS * 2);
+    let mut stale = Search::default();
+    assert!(!cache.restore(&mut stale, SEARCH_TTL_MS * 2 + 1));
+    assert!(stale.agents.is_some());
+    for changed in [
+        SearchScope {
+            environment: "https://two".into(),
+            ..scope.clone()
+        },
+        SearchScope {
+            connection: 2,
+            ..scope.clone()
+        },
+        SearchScope {
+            session: 2,
+            ..scope.clone()
+        },
+        SearchScope {
+            permitted: false,
+            ..scope.clone()
+        },
+    ] {
+        cache.scope(scope.clone());
+        cache.remember(&first, 0);
+        cache.scope(changed);
+        assert!(!cache.restore(&mut Search::default(), 1));
+    }
+    cache.scope(scope);
+    cache.remember(&first, 0);
+    assert!(!cache.restore(&mut Search::default(), SEARCH_TTL_MS));
+    for n in 0..RECENT_QUERIES + 1 {
+        first.typed(n.to_string());
+        let epoch = first.begin_search();
+        first.searched(epoch, Ok(SearchResult { agents: vec![] }));
+        cache.remember(&first, 0);
+    }
+    assert_eq!(cache.entries.len(), RECENT_QUERIES);
+    let mut huge = agent("huge");
+    huge.description = "x".repeat(RECENT_BYTES + 1);
+    first.typed("huge".into());
+    let epoch = first.begin_search();
+    first.searched(epoch, Ok(SearchResult { agents: vec![huge] }));
+    cache.remember(&first, 0);
+    assert!(!cache.restore(&mut first, 1));
+    first.typed("0".into());
+    assert!(!cache.restore(&mut first, 1));
 }
