@@ -5,7 +5,7 @@
 
 mod comments;
 mod header;
-mod lines;
+pub(crate) mod lines;
 mod source;
 mod tree;
 mod view;

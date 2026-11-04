@@ -1,5 +1,7 @@
 //! `TypographySettings.tsx`, `FontFamilyPicker.tsx`, `appearanceFonts.ts` and `contracts/src/settings.ts`.
 
+pub mod preview;
+
 use super::{ClientSettingsDoc, DEFAULT_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE, MIN_INTERFACE_FONT_SIZE};
 use serde_json::Value;
 

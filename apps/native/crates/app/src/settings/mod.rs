@@ -526,6 +526,7 @@ impl SettingsView {
     }
 
     fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.typography.text_field_focused(window, cx) { return true; }
         [&self.search, &self.threads.base_directory, &self.threads.auto_settle_days, &self.keybindings.filter, &self.keybindings.when_input]
             .into_iter()
             .chain(self.threads.time_inputs())

@@ -5,12 +5,12 @@
 //! terminal is focused); the clipboard keys the web's surface handles itself are bound here.
 //! "Add to chat" hands a selection to the thread's composer as a terminal excerpt.
 
-mod colors;
+pub(crate) mod colors;
 mod drawer;
 mod drawer_view;
-mod element;
-mod pane;
-mod session;
+pub(crate) mod element;
+pub(crate) mod pane;
+pub(crate) mod session;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{

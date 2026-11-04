@@ -22,14 +22,14 @@ const HEADER_HEIGHT: f32 = 32.;
 const SEPARATOR_HEIGHT: f32 = 24.;
 const CODE_PADDING: f32 = 8.;
 
-struct LineColors {
-    row: Hsla,
-    gutter: Hsla,
-    number: Hsla,
-    bar: Option<Hsla>,
+pub(crate) struct LineColors {
+    pub(crate) row: Hsla,
+    pub(crate) gutter: Hsla,
+    pub(crate) number: Hsla,
+    pub(crate) bar: Option<Hsla>,
 }
 
-fn line_colors(kind: LineKind, p: Palette) -> LineColors {
+pub(crate) fn line_colors(kind: LineKind, p: Palette) -> LineColors {
     match kind {
         LineKind::Addition => LineColors {
             row: hsla(p.diff_row_addition),
@@ -53,7 +53,7 @@ fn line_colors(kind: LineKind, p: Palette) -> LineColors {
 }
 
 /// Pierre's number column: at least 3ch of digits, 2ch before and 1ch after.
-fn gutter_width(digits: usize, char_width: Pixels) -> Pixels {
+pub(crate) fn gutter_width(digits: usize, char_width: Pixels) -> Pixels {
     char_width * (digits.max(3) + 3) as f32
 }
 
@@ -184,16 +184,7 @@ impl DiffPanel {
     }
 
     fn code_row(&self, fill: Hsla, cx: &App) -> Div {
-        let family = cx.theme().mono_font_family.clone();
-        div()
-            .flex()
-            .w_full()
-            .when(!self.wrap, |this| this.h(px(crate::theme::code_line_height(cx))))
-            .when(self.wrap, |this| this.min_h(px(crate::theme::code_line_height(cx))))
-            .bg(fill)
-            .font_family(family)
-            .text_size(cx.theme().mono_font_size)
-            .line_height(px(crate::theme::code_line_height(cx)))
+        code_row(fill, self.wrap, cx)
     }
 
     /// One side of a row: a gutter with the line number and change bar, then the code. In the
@@ -341,6 +332,15 @@ impl DiffPanel {
             .child(stat_label(u64::from(file.additions), u64::from(file.deletions), cx))
             .into_any_element()
     }
+}
+
+/// The shared diff row surface, also used by the embedded typography sample.
+pub(crate) fn code_row(fill: Hsla, wrap: bool, cx: &App) -> Div {
+    div().flex().w_full()
+        .when(!wrap, |this| this.h(px(crate::theme::code_line_height(cx))))
+        .when(wrap, |this| this.min_h(px(crate::theme::code_line_height(cx))))
+        .bg(fill).font_family(cx.theme().mono_font_family.clone())
+        .text_size(cx.theme().mono_font_size).line_height(px(crate::theme::code_line_height(cx)))
 }
 
 /// A line as shown: a trailing `\r` (CRLF content) is invisible on the web too, so it is kept
