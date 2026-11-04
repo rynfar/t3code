@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, div, px, rems};
+use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, Task, div, px, rems};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
 
@@ -27,6 +27,44 @@ struct Cached {
     document: super::media::MediaDocument,
     extensions: gpui_component::text::MarkdownExtensions,
     _repaint: Subscription,
+    updates: Option<MediaUpdates>,
+}
+
+struct MediaUpdates {
+    source: tokio::sync::watch::Sender<Arc<str>>,
+    _task: Task<()>,
+}
+
+impl MediaUpdates {
+    fn new(state: &Entity<TextViewState>, document: super::media::MediaDocument, baseline: Arc<str>, requested: Arc<str>, cx: &App) -> Self {
+        let (source, mut receiver) = tokio::sync::watch::channel(requested);
+        let state = state.downgrade();
+        let task = cx.spawn(async move |cx| {
+            let mut analyzed = Arc::new(cx.background_executor().spawn(async move { t3_core::media::MarkdownMediaDocument::new(baseline).prepare() }).await);
+            let mut displayed = analyzed.clone();
+            loop {
+                let source = receiver.borrow_and_update().clone();
+                let previous = analyzed;
+                let rendered = displayed.clone();
+                let (next, delta) = cx.background_executor().spawn(async move {
+                    let next = Arc::new(previous.updated(source));
+                    let delta = rendered.append_delta(&next).map(str::to_owned);
+                    (next, delta)
+                }).await;
+                analyzed = next;
+                // One worker and one latest source prevent stale parses or a chunk backlog from reaching the view.
+                if !Arc::ptr_eq(&receiver.borrow(), analyzed.source()) { continue; }
+                let next = analyzed.clone();
+                if state.update(cx, |state, cx| {
+                    *document.write().unwrap() = next.clone();
+                    match delta { Some(delta) => state.push_str(&delta, cx), None => state.set_text(next.source(), cx) }
+                }).is_err() { return; }
+                displayed = next;
+                if receiver.changed().await.is_err() { return; }
+            }
+        });
+        Self { source, _task: task }
+    }
 }
 
 /// A message's markdown state, and whether it parses images as media (`super::media`). Only
@@ -96,21 +134,26 @@ impl MarkdownStore {
             if !Arc::ptr_eq(&cached.text, text) && *cached.text != **text {
                 let previous = cached.text.clone();
                 cached.text = text.clone();
-                *cached.document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new(text.clone()));
-                cached.state.update(cx, |state, cx| match text.strip_prefix(&*previous) {
-                    Some(delta) if !previous.is_empty() && !(cached.media && cached.document.read().unwrap().may_have_definitions()) => state.push_str(delta, cx),
-                    _ => state.set_text(text, cx),
-                });
+                if cached.media {
+                    if let Some(updates) = &cached.updates { updates.source.send_replace(text.clone()); }
+                    else { cached.updates = Some(MediaUpdates::new(&cached.state, cached.document.clone(), previous, text.clone(), cx)); }
+                } else {
+                    cached.state.update(cx, |state, cx| match text.strip_prefix(&*previous) {
+                        Some(delta) if !previous.is_empty() => state.push_str(delta, cx),
+                        _ => state.set_text(text, cx),
+                    });
+                }
             }
             return MarkdownState { entity: cached.state.clone(), media: cached.media, extensions: Some(cached.extensions.clone()) };
         }
-        let state = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
+        let media = has_image_syntax(text);
+        let state = cx.new(|cx| TextViewState::markdown(if media { "" } else { text }, cx).selectable(true));
         let owner = self.owner;
         let repaint = cx.observe(&state, move |_, cx| cx.notify(owner));
-        let media = has_image_syntax(text);
         let document = super::media::media_document(text.clone());
         let extensions = super::media::markdown_extensions(document.clone(), None);
-        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, document, extensions: extensions.clone(), _repaint: repaint });
+        let updates = media.then(|| MediaUpdates::new(&state, document.clone(), Arc::from(""), text.clone(), cx));
+        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, document, extensions: extensions.clone(), _repaint: repaint, updates });
         MarkdownState { entity: state, media, extensions: Some(extensions) }
     }
 

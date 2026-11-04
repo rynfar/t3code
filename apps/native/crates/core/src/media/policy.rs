@@ -80,11 +80,21 @@ pub fn markdown_image_action(link: Option<&str>, modified: bool) -> MarkdownImag
     MarkdownImageAction::OpenLink(link)
 }
 
-struct MarkdownDefinition { source: String, url: String }
+#[derive(Clone, PartialEq, Eq)]
+struct MarkdownDefinition { source: String, url: String, title: Option<String>, start: usize }
+
+#[derive(Default)]
+struct MarkdownMediaIndex {
+    definitions: std::sync::Arc<std::collections::HashMap<String, MarkdownDefinition>>,
+    paragraphs: std::collections::HashMap<usize, std::sync::Arc<Vec<MarkdownMediaRun>>>,
+    tail: usize,
+    #[cfg(test)]
+    parsed_from: usize,
+}
 
 pub struct MarkdownMediaDocument {
     source: std::sync::Arc<str>,
-    definitions: std::sync::OnceLock<std::collections::HashMap<String, MarkdownDefinition>>,
+    index: std::sync::OnceLock<MarkdownMediaIndex>,
 }
 
 fn node_source<'a>(node: &markdown::mdast::Node, source: &'a str) -> Option<&'a str> {
@@ -108,31 +118,113 @@ fn wrap_prose(text: &str, prefix: &str, suffix: &str) -> String {
     format!("{}{prefix}{trimmed}{suffix}{}", &text[..start], &text[end..])
 }
 
-impl MarkdownMediaDocument {
-    pub fn new(source: std::sync::Arc<str>) -> Self { Self { source, definitions: Default::default() } }
+fn escaped_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() { if ch.is_ascii_punctuation() { out.push('\\'); } out.push(ch); }
+    out
+}
 
-    fn definitions(&self) -> &std::collections::HashMap<String, MarkdownDefinition> {
-        self.definitions.get_or_init(|| {
-            let Ok(root) = markdown::to_mdast(&self.source, &markdown::ParseOptions::gfm()) else { return Default::default() };
-            fn collect(node: &markdown::mdast::Node, source: &str, out: &mut std::collections::HashMap<String, MarkdownDefinition>) {
-                if let markdown::mdast::Node::Definition(definition) = node {
-                    if let Some(text) = node_source(node, source) {
-                        out.entry(definition.identifier.clone()).or_insert_with(|| MarkdownDefinition { source: text.to_owned(), url: definition.url.clone() });
-                    }
-                } else if let Some(children) = node.children() {
-                    for child in children { collect(child, source, out); }
+fn inline_source(node: &markdown::mdast::Node, source: &str) -> String {
+    let raw = node_source(node, source).unwrap_or_default();
+    match node {
+        markdown::mdast::Node::Text(text) if raw != text.value => escaped_text(&text.value),
+        markdown::mdast::Node::InlineCode(code) if raw.contains('\n') => {
+            let fence = "`".repeat(code.value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0) + 1);
+            format!("{fence} {} {fence}", code.value)
+        }
+        _ => raw.to_owned(),
+    }
+}
+
+fn markdown_destination(url: &str, title: Option<&str>) -> String {
+    let url = url.replace('\\', "\\\\").replace('>', "\\>").replace('<', "\\<");
+    let title = title.map(|title| format!(" \"{}\"", title.replace('\\', "\\\\").replace('"', "\\\""))).unwrap_or_default();
+    format!("<{url}>{title}")
+}
+
+fn same_definitions(a: &std::collections::HashMap<String, MarkdownDefinition>, b: &std::collections::HashMap<String, MarkdownDefinition>) -> bool {
+    a.len() == b.len() && a.iter().all(|(id, a)| b.get(id).is_some_and(|b| a.url == b.url && a.title == b.title))
+}
+
+impl MarkdownMediaIndex {
+    fn parse(source: &str, start: usize, previous: Option<&Self>) -> Self {
+        use markdown::mdast::Node;
+        if source.is_empty() { return Self::default(); }
+        let mut definitions: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|index| index.definitions.iter())
+            .filter(|(_, definition)| definition.start < start).map(|(id, definition)| (id.clone(), definition.clone())).collect();
+        let mut fragment = source[start..].to_owned();
+        let real_end = fragment.len();
+        for definition in definitions.values() { fragment.push_str("\n\n"); fragment.push_str(&definition.source); }
+        let Ok(root) = markdown::to_mdast(&fragment, &markdown::ParseOptions::gfm()) else { return Self::default() };
+        fn collect(node: &Node, source: &str, start: usize, end: usize, out: &mut std::collections::HashMap<String, MarkdownDefinition>) {
+            if let Node::Definition(definition) = node {
+                if let Some(position) = &definition.position && position.start.offset < end && let Some(text) = node_source(node, source) {
+                    out.entry(definition.identifier.clone()).or_insert_with(|| MarkdownDefinition {
+                        source: if text.contains('\n') { format!("[{}]: {}", definition.identifier, markdown_destination(&definition.url, definition.title.as_deref())) } else { text.to_owned() },
+                        url: definition.url.clone(), title: definition.title.clone(), start: start + position.start.offset,
+                    });
                 }
-            }
-            let mut out = std::collections::HashMap::new(); collect(&root, &self.source, &mut out); out
-        })
+            } else if let Some(children) = node.children() { for child in children { collect(child, source, start, end, out); } }
+        }
+        collect(&root, &fragment, start, real_end, &mut definitions);
+        // A changed effective definition can resolve an earlier literal reference, or change its target.
+        if start > 0 && previous.is_some_and(|previous| !same_definitions(&previous.definitions, &definitions)) {
+            return Self::parse(source, 0, None);
+        }
+        let definitions = match previous.filter(|previous| *previous.definitions == definitions) {
+            Some(previous) => previous.definitions.clone(),
+            None => std::sync::Arc::new(definitions),
+        };
+        let mut paragraphs: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|index| index.paragraphs.iter())
+            .filter(|(position, _)| **position < start).map(|(position, runs)| (*position, runs.clone())).collect();
+        let parser = MarkdownMediaParser { definitions: &definitions };
+        fn paragraphs_in(node: &Node, parser: &MarkdownMediaParser<'_>, source: &str, start: usize, end: usize, out: &mut std::collections::HashMap<usize, std::sync::Arc<Vec<MarkdownMediaRun>>>) {
+            if let Node::Paragraph(paragraph) = node && let Some(position) = &paragraph.position && position.start.offset < end {
+                let runs = parser.runs(node, source);
+                if !runs.is_empty() { out.insert(start + position.start.offset, std::sync::Arc::new(runs)); }
+            } else if let Some(children) = node.children() { for child in children { paragraphs_in(child, parser, source, start, end, out); } }
+        }
+        paragraphs_in(&root, &parser, &fragment, start, real_end, &mut paragraphs);
+        let tail = root.children().into_iter().flatten().filter_map(Node::position).rfind(|position| position.start.offset < real_end).map_or(source.len(), |position| start + position.start.offset);
+        Self { definitions, paragraphs, tail, #[cfg(test)] parsed_from: start }
+    }
+}
+
+impl MarkdownMediaDocument {
+    pub fn new(source: std::sync::Arc<str>) -> Self { Self { source, index: Default::default() } }
+    fn index(&self) -> &MarkdownMediaIndex { self.index.get_or_init(|| MarkdownMediaIndex::parse(&self.source, 0, None)) }
+    pub fn prepare(self) -> Self { self.index(); self }
+    pub fn source(&self) -> &std::sync::Arc<str> { &self.source }
+
+    /// Called on the background worker; completed paragraphs and reference definitions are retained.
+    pub fn updated(&self, source: std::sync::Arc<str>) -> Self {
+        let previous = self.index();
+        let index = if source.starts_with(&*self.source) { MarkdownMediaIndex::parse(&source, previous.tail, Some(previous)) }
+            else { MarkdownMediaIndex::parse(&source, 0, None) };
+        Self { source, index: std::sync::OnceLock::from(index) }
     }
 
-    // Appending only the last parsed block cannot update earlier references when definitions arrive.
-    pub fn may_have_definitions(&self) -> bool { self.source.contains("]:") }
+    pub fn append_delta<'a>(&self, next: &'a Self) -> Option<&'a str> {
+        if self.source.is_empty() || !same_definitions(&self.index().definitions, &next.index().definitions) { return None; }
+        next.source.strip_prefix(&*self.source)
+    }
 
     pub fn prose(&self, fragment: &str, references: &[String]) -> String {
+        MarkdownMediaParser { definitions: &self.index().definitions }.prose(fragment, references)
+    }
+
+    pub fn runs_at(&self, node: &markdown::mdast::Node, offset: usize) -> Vec<MarkdownMediaRun> {
+        if !matches!(node, markdown::mdast::Node::Paragraph(_)) { return Vec::new(); }
+        node.position().and_then(|position| self.index().paragraphs.get(&(offset + position.start.offset))).map(|runs| (**runs).clone()).unwrap_or_default()
+    }
+}
+
+struct MarkdownMediaParser<'a> { definitions: &'a std::collections::HashMap<String, MarkdownDefinition> }
+
+impl MarkdownMediaParser<'_> {
+    pub fn prose(&self, fragment: &str, references: &[String]) -> String {
         if references.is_empty() { return fragment.to_owned(); }
-        let definitions = self.definitions();
+        let definitions = self.definitions;
         let mut out = fragment.to_owned();
         let mut seen = std::collections::HashSet::new();
         for reference in references {
@@ -159,23 +251,22 @@ impl MarkdownMediaDocument {
 
     fn split(&self, node: &markdown::mdast::Node, source: &str) -> Vec<MarkdownMediaRun> {
         use markdown::mdast::Node;
-        let original = node_source(node, source).unwrap_or_default();
+        let original = inline_source(node, source);
         let image = match node {
             Node::Image(image) => Some((image.url.clone(), image.alt.clone())),
-            Node::ImageReference(image) => self.definitions().get(&image.identifier).map(|definition| (definition.url.clone(), image.alt.clone())),
+            Node::ImageReference(image) => self.definitions.get(&image.identifier).map(|definition| (definition.url.clone(), image.alt.clone())),
             _ => None,
         };
         if let Some((url, alt)) = image { return vec![MarkdownMediaRun::Image { url, alt, link: None }]; }
         if !matches!(node, Node::Paragraph(_) | Node::Emphasis(_) | Node::Strong(_) | Node::Delete(_) | Node::Link(_) | Node::LinkReference(_)) {
-            return vec![MarkdownMediaRun::Prose(original.into())];
+            return vec![MarkdownMediaRun::Prose(original)];
         }
         let children = node.children().unwrap();
         let mut runs = Vec::new();
         for child in children { for run in self.split(child, source) { push_run(&mut runs, run); } }
-        if !runs.iter().any(|run| matches!(run, MarkdownMediaRun::Image { .. })) { return vec![MarkdownMediaRun::Prose(original.into())]; }
         let link = match node {
             Node::Link(link) => Some(link.url.clone()),
-            Node::LinkReference(link) => Some(self.definitions().get(&link.identifier).map(|definition| definition.url.clone()).unwrap_or_default()),
+            Node::LinkReference(link) => Some(self.definitions.get(&link.identifier).map(|definition| definition.url.clone()).unwrap_or_default()),
             _ => None,
         };
         if !matches!(node, Node::Paragraph(_)) {
@@ -184,9 +275,14 @@ impl MarkdownMediaDocument {
             let last = children.last().and_then(Node::position).unwrap();
             let prefix = source.get(position.start.offset..first.start.offset).unwrap_or_default();
             let suffix = source.get(last.end.offset..position.end.offset).unwrap_or_default();
+            let suffix = match node {
+                Node::Link(link) if suffix.contains('\n') => format!("]({})", markdown_destination(&link.url, link.title.as_deref())),
+                Node::LinkReference(link) if suffix.contains('\n') => format!("][{}]", link.identifier),
+                _ => suffix.to_owned(),
+            };
             for run in &mut runs {
                 match run {
-                    MarkdownMediaRun::Prose(text) => *text = wrap_prose(text, prefix, suffix),
+                    MarkdownMediaRun::Prose(text) => *text = wrap_prose(text, prefix, &suffix),
                     MarkdownMediaRun::Image { link: owner, .. } => if link.is_some() { *owner = link.clone(); },
                 }
             }
@@ -307,7 +403,41 @@ mod paragraph_tests {
     use super::*;
     fn runs(text: &str) -> Vec<MarkdownMediaRun> {
         let root = markdown::to_mdast(text, &markdown::ParseOptions::gfm()).unwrap();
-        MarkdownMediaDocument::new(text.into()).runs(&root.children().unwrap()[0], text)
+        MarkdownMediaDocument::new(text.into()).runs_at(&root.children().unwrap()[0], 0)
+    }
+
+    #[test]
+    fn streaming_body_appends_do_not_invalidate_reference_context() {
+        let text = "![x][pic]\n\n[pic]: a.png\n\nBody.\n\nTail";
+        let document = MarkdownMediaDocument::new(text.into()).prepare();
+        let next = document.updated(format!("{text} more body").into());
+        assert_eq!(document.append_delta(&next), Some(" more body"));
+        assert_eq!(next.index().parsed_from, text.rfind("Tail").unwrap());
+        assert!(std::sync::Arc::ptr_eq(&document.index().definitions, &next.index().definitions));
+        let literal = MarkdownMediaDocument::new("`]:` ![x](a.png)\n\n```md\n[pic]: fake.png\n```\n\nTail".into()).prepare();
+        let next = literal.updated(format!("{} body", literal.source()).into());
+        assert_eq!(literal.append_delta(&next), Some(" body"));
+        assert!(next.index().definitions.is_empty());
+        assert!(std::sync::Arc::ptr_eq(&literal.index().definitions, &next.index().definitions));
+        let missing = MarkdownMediaDocument::new("![x][pic]\n\n[pi".into()).prepare();
+        let split = missing.updated("![x][pic]\n\n[pic]:".into());
+        assert_eq!(missing.append_delta(&split), Some("c]:"));
+        let resolved = split.updated("![x][pic]\n\n[pic]: a.png\n\n".into());
+        assert!(split.append_delta(&resolved).is_none());
+        assert_eq!(resolved.index().parsed_from, 0);
+        assert!(matches!(&resolved.index().paragraphs[&0][0], MarkdownMediaRun::Image { url, .. } if url == "a.png"));
+        let body = resolved.updated(format!("{}More ![x][pic]", resolved.source()).into());
+        assert_eq!(resolved.append_delta(&body), Some("More ![x][pic]"));
+        assert_eq!(body.index().paragraphs.len(), 2);
+        let changed = body.updated("![x][pic]\n\n[pic]: b.png".into());
+        assert!(body.append_delta(&changed).is_none());
+        assert!(matches!(&changed.index().paragraphs[&0][0], MarkdownMediaRun::Image { url, .. } if url == "b.png"));
+        let removed = changed.updated("![x][pic]".into());
+        assert!(changed.append_delta(&removed).is_none());
+        assert!(removed.index().paragraphs.is_empty());
+        let duplicate = body.updated(format!("{}\n\n[pic]: ignored.png", body.source()).into());
+        assert!(body.append_delta(&duplicate).is_some());
+        assert!(std::sync::Arc::ptr_eq(&body.index().definitions, &duplicate.index().definitions));
     }
 
     #[test]
@@ -317,6 +447,25 @@ mod paragraph_tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], MarkdownMediaRun::Prose("Before **bold _left_** ".into()));
         assert_eq!(result[2], MarkdownMediaRun::Prose(" **_right_ end** after".into()));
+        fn prose_html(node: &markdown::mdast::Node, doc: &MarkdownMediaDocument) -> String {
+            let result = doc.runs_at(node, 0);
+            if !result.is_empty() { return result.into_iter().filter_map(|run| match run { MarkdownMediaRun::Prose(text) => Some(markdown::to_html_with_options(&text, &markdown::Options::gfm()).unwrap()), _ => None }).collect(); }
+            node.children().map(|children| children.iter().map(|node| prose_html(node, doc)).collect()).unwrap_or_default()
+        }
+        for text in ["> **left\n> ![x](a.png)\n> right**", "> - **left\n>   ![x](a.png)\n>   right**", "> > **left\n> > ![x](a.png)\n> > right**"] {
+            let root = markdown::to_mdast(text, &markdown::ParseOptions::gfm()).unwrap();
+            let html = prose_html(&root, &MarkdownMediaDocument::new(text.into()));
+            assert_eq!(html.replace('\n', ""), "<p><strong>left</strong></p><p><strong>right</strong></p>", "{text}");
+        }
+        for (text, expected) in [
+            ("> **left\n> ![x](a.png)\n> right &amp; \\*literal\\***", "<p><strong>left</strong></p><p><strong>right &amp; *literal*</strong></p>"),
+            ("> left ![x](a.png) `code\n> right`", "<p>left</p><p><code>code right</code></p>"),
+            ("> ![x](a.png)\n> **left\n> right**", "<p><strong>leftright</strong></p>"),
+            ("> [left ![x](a.png) right](\n> https://example.com\n> )", "<p><a href=\"https://example.com\">left</a></p><p><a href=\"https://example.com\">right</a></p>"),
+        ] {
+            let root = markdown::to_mdast(text, &markdown::ParseOptions::gfm()).unwrap();
+            assert_eq!(prose_html(&root, &MarkdownMediaDocument::new(text.into())).replace('\n', ""), expected, "{text}");
+        }
         // Link ownership is checked without invoking an opener.
         assert_eq!(runs("[![chart](a.png)](https://example.com)"), vec![MarkdownMediaRun::Image { url: "a.png".into(), alt: "chart".into(), link: Some("https://example.com".into()) }]);
     }
@@ -367,7 +516,7 @@ mod paragraph_tests {
         let text = "Before **bold** ![chart](img/a.png) and ![two](b.svg) after.";
         let root = markdown::to_mdast(text, &markdown::ParseOptions::gfm()).unwrap();
         let paragraph = &root.children().unwrap()[0];
-        assert_eq!(MarkdownMediaDocument::new(text.into()).runs(paragraph, text), vec![
+        assert_eq!(MarkdownMediaDocument::new(text.into()).runs_at(paragraph, 0), vec![
             MarkdownMediaRun::Prose("Before **bold** ".into()),
             MarkdownMediaRun::Image { url: "img/a.png".into(), alt: "chart".into(), link: None },
             MarkdownMediaRun::Prose(" and ".into()),

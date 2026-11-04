@@ -194,7 +194,7 @@ pub fn media_document(text: Arc<str>) -> MediaDocument {
 #[derive(Clone)]
 struct MediaParagraph { start: usize, runs: Vec<t3_core::media::MarkdownMediaRun> }
 fn parse_media_paragraph(node: &mdast::Node, context: &MarkdownParseContext, document: &t3_core::media::MarkdownMediaDocument) -> Option<MarkdownNode> {
-    let runs = document.runs(node, context.source());
+    let runs = document.runs_at(node, context.offset());
     if runs.is_empty() { return None; }
     let start = context.offset() + node.position()?.start.offset;
     Some(MarkdownNode::new(MEDIA_NODE, MediaParagraph { start, runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
