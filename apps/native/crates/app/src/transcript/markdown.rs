@@ -26,6 +26,7 @@ struct Cached {
     media: bool,
     document: super::media::MediaDocument,
     extensions: gpui_component::text::MarkdownExtensions,
+    selections: super::media::MediaSelections,
     _repaint: Subscription,
     updates: Option<MediaUpdates>,
 }
@@ -74,6 +75,17 @@ pub struct MarkdownState {
     pub entity: Entity<TextViewState>,
     media: bool,
     extensions: Option<gpui_component::text::MarkdownExtensions>,
+    selections: super::media::MediaSelections,
+    document: Option<super::media::MediaDocument>,
+}
+
+impl MarkdownState {
+    pub(crate) fn owns_selection(&self, source: &str, quote: &str, cx: &App) -> bool {
+        if quote.trim().is_empty() { return false; }
+        let document = self.document.as_ref().filter(|_| self.media).map(|document| document.read().unwrap().clone());
+        if document.as_ref().is_some_and(|document| &**document.source() != source) { return false; }
+        self.entity.read(cx).selected_text() == quote || document.is_some_and(|document| self.selections.matches_quote(&document, quote, cx))
+    }
 }
 
 impl From<&MarkdownState> for MarkdownState {
@@ -85,7 +97,7 @@ impl From<&MarkdownState> for MarkdownState {
 /// External states supply their own extensions, such as a file preview's media scope.
 impl From<&Entity<TextViewState>> for MarkdownState {
     fn from(entity: &Entity<TextViewState>) -> Self {
-        MarkdownState { entity: entity.clone(), media: false, extensions: None }
+        MarkdownState { entity: entity.clone(), media: false, extensions: None, selections: Default::default(), document: None }
     }
 }
 
@@ -144,17 +156,18 @@ impl MarkdownStore {
                     });
                 }
             }
-            return MarkdownState { entity: cached.state.clone(), media: cached.media, extensions: Some(cached.extensions.clone()) };
+            return MarkdownState { entity: cached.state.clone(), media: cached.media, extensions: Some(cached.extensions.clone()), selections: cached.selections.clone(), document: Some(cached.document.clone()) };
         }
         let media = has_image_syntax(text);
         let state = cx.new(|cx| TextViewState::markdown(if media { "" } else { text }, cx).selectable(true));
         let owner = self.owner;
         let repaint = cx.observe(&state, move |_, cx| cx.notify(owner));
         let document = super::media::media_document(text.clone());
-        let extensions = super::media::markdown_extensions(document.clone(), None);
+        let selections = super::media::MediaSelections::default();
+        let extensions = super::media::markdown_extensions_with_selections(document.clone(), None, selections.clone());
         let updates = media.then(|| MediaUpdates::new(&state, document.clone(), Arc::from(""), text.clone(), cx));
-        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, document, extensions: extensions.clone(), _repaint: repaint, updates });
-        MarkdownState { entity: state, media, extensions: Some(extensions) }
+        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, document: document.clone(), extensions: extensions.clone(), selections: selections.clone(), _repaint: repaint, updates });
+        MarkdownState { entity: state, media, extensions: Some(extensions), selections, document: Some(document) }
     }
 
     pub fn user_context(&mut self, key: &str, text: &Arc<str>) -> Arc<t3_core::composer::records::SentPresentation> {
@@ -174,6 +187,8 @@ impl MarkdownStore {
         self.contexts.clear();
     }
 }
+
+pub(super) const PARAGRAPH_GAP: f32 = 0.65;
 
 pub(super) fn heading_font_size(level: u8) -> gpui::Pixels {
     px(match level { 1 => 20., 2 => 18., 3 => 16., _ => 14. })
@@ -195,7 +210,7 @@ fn style(cx: &App) -> TextViewStyle {
     let mut code_block = if crate::theme::preferences(cx).typography.word_wrap { code_block.whitespace_normal() } else { code_block.whitespace_nowrap() };
     code_block.overflow.x = Some(gpui::Overflow::Scroll);
     TextViewStyle {
-        paragraph_gap: rems(0.65),
+        paragraph_gap: rems(PARAGRAPH_GAP),
         heading_base_font_size: px(14.),
         highlight_theme: theme.highlight_theme.clone(),
         code_block,
@@ -261,6 +276,40 @@ pub fn prose(state: &MarkdownState, cx: &App) -> impl IntoElement {
 #[cfg(test)]
 mod context_tests {
     use super::*;
+    #[gpui::test]
+    fn heading_child_selection_reaches_the_message_citation_action(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let source: Arc<str> = "## left ![chart](a.png) **right**".into();
+        let parent = cx.update(|cx| cx.new(|cx| TextViewState::markdown("", cx)));
+        let child = cx.update(|cx| cx.new(|cx| TextViewState::markdown(" **right**", cx)));
+        cx.run_until_parked();
+        let selections = super::super::media::MediaSelections::default();
+        selections.register((0, 2), &child, " **right**");
+        let document = super::super::media::media_document(source.clone());
+        let state = MarkdownState { entity: parent, media: true, extensions: None, selections, document: Some(document.clone()) };
+        child.update(cx, |child, cx| child.select_all(cx));
+        let cite = |state: &MarkdownState, source: &str, quote: &str, cx: &App| {
+            crate::thread_view::ThreadView::citation_from_markdown_selection(state, source, quote, ("environment".into(), "thread".into(), "message".into()), cx)
+        };
+        cx.update(|cx| {
+            assert!(state.entity.read(cx).selected_text().is_empty());
+            let quote = child.read(cx).selected_text();
+            let citation = cite(&state, &source, &quote, cx).expect("heading prose must reach Cite");
+            assert_eq!((&*citation.environment_id, &*citation.thread_id, &*citation.message_id, &*citation.text), ("environment", "thread", "message", "right"));
+            assert!(citation.valid());
+            assert!(cite(&state, &source, "another message", cx).is_none());
+            *document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new("replacement".into()));
+            assert!(cite(&state, &source, &quote, cx).is_none());
+            let replacement = "## left ![chart](a.png) **replacement**";
+            *document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new(replacement.into()));
+            assert!(cite(&state, replacement, &quote, cx).is_none());
+            let unrelated = MarkdownState::from(&state.entity);
+            assert!(cite(&unrelated, &source, &quote, cx).is_none());
+            *document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new(source.clone()));
+        });
+        drop(child);
+        cx.update(|cx| assert!(cite(&state, &source, "right\n", cx).is_none()));
+    }
     #[test]
     fn user_rows_reuse_context_parsing_across_renders_and_refresh_record_payloads() {
         let mut store=MarkdownStore::new(EntityId::from(1u64));

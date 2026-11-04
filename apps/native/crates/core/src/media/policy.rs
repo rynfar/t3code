@@ -87,6 +87,7 @@ struct MarkdownDefinition { source: String, url: String, title: Option<String>, 
 struct MarkdownMediaIndex {
     definitions: std::sync::Arc<std::collections::HashMap<String, MarkdownDefinition>>,
     paragraphs: std::collections::HashMap<usize, std::sync::Arc<Vec<MarkdownMediaRun>>>,
+    heading_gaps: std::collections::HashMap<usize, bool>,
     tail: usize,
     multiline_titles: Vec<(usize, usize)>,
     #[cfg(test)]
@@ -125,9 +126,24 @@ fn escaped_text(text: &str) -> String {
     out
 }
 
-fn inline_source(node: &markdown::mdast::Node, source: &str) -> String {
+pub fn heading_literal_prefix<'a>(node: &markdown::mdast::Node, source: &'a str) -> &'a str {
+    if !matches!(node, markdown::mdast::Node::Heading(_)) { return ""; }
+    let Some((position, first)) = node.position().zip(node.children().and_then(|children| children.first()).and_then(markdown::mdast::Node::position)) else { return "" };
+    let prefix = source.get(position.start.offset..first.start.offset).unwrap_or_default().trim_start_matches([' ', '\t']);
+    if !prefix.starts_with('#') { return ""; }
+    prefix.trim_start_matches('#').trim_start_matches([' ', '\t'])
+}
+
+fn inline_source(node: &markdown::mdast::Node, source: &str, heading: bool) -> String {
     let raw = node_source(node, source).unwrap_or_default();
     match node {
+        markdown::mdast::Node::Text(text) if heading => escaped_text(&text.value).split_inclusive('\n').map(|line| {
+            let indent: String = line.chars().take_while(|ch| matches!(ch, ' ' | '\t')).collect();
+            if indent.len() >= 4 || indent.contains('\t') {
+                let first = line.chars().next().unwrap();
+                format!("&#{};{}", first as u32, &line[first.len_utf8()..])
+            } else { line.to_owned() }
+        }).collect(),
         markdown::mdast::Node::Text(text) if raw != text.value => escaped_text(&text.value),
         markdown::mdast::Node::InlineCode(code) if raw.contains('\n') => {
             let fence = "`".repeat(code.value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0) + 1);
@@ -180,14 +196,27 @@ impl MarkdownMediaIndex {
         };
         let mut paragraphs: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|index| index.paragraphs.iter())
             .filter(|(position, _)| **position < start).map(|(position, runs)| (*position, runs.clone())).collect();
+        let mut heading_gaps: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|index| index.heading_gaps.iter())
+            .filter(|(position, _)| **position < start).map(|(position, gap)| (*position, *gap)).collect();
         let parser = MarkdownMediaParser { definitions: &definitions };
-        fn paragraphs_in(node: &Node, parser: &MarkdownMediaParser<'_>, source: &str, start: usize, end: usize, out: &mut std::collections::HashMap<usize, std::sync::Arc<Vec<MarkdownMediaRun>>>) {
+        fn paragraphs_in(node: &Node, parser: &MarkdownMediaParser<'_>, source: &str, range: (usize, usize), last: bool, out: &mut std::collections::HashMap<usize, std::sync::Arc<Vec<MarkdownMediaRun>>>, gaps: &mut std::collections::HashMap<usize, bool>) {
+            let (start, end) = range;
             if matches!(node, Node::Paragraph(_) | Node::Heading(_)) && let Some(position) = node.position() && position.start.offset < end {
                 let runs = parser.runs(node, source);
-                if !runs.is_empty() { out.insert(start + position.start.offset, std::sync::Arc::new(runs)); }
-            } else if let Some(children) = node.children() { for child in children { paragraphs_in(child, parser, source, start, end, out); } }
+                if !runs.is_empty() {
+                    out.insert(start + position.start.offset, std::sync::Arc::new(runs));
+                    if matches!(node, Node::Heading(_)) { gaps.insert(start + position.start.offset, !last); }
+                }
+            } else if let Some(children) = node.children() {
+                let mut children = children.iter().filter(|child| child.position().is_some_and(|position| position.start.offset < end)).peekable();
+                while let Some(child) = children.next() {
+                    // TextView renders each direct list-item block as last, including headings.
+                    let last = matches!(node, Node::ListItem(_)) || children.peek().is_none();
+                    paragraphs_in(child, parser, source, range, last, out, gaps);
+                }
+            }
         }
-        paragraphs_in(&root, &parser, &fragment, start, real_end, &mut paragraphs);
+        paragraphs_in(&root, &parser, &fragment, (start, real_end), true, &mut paragraphs, &mut heading_gaps);
         let mut blocks = root.children().into_iter().flatten().filter(|node| node.position().is_some_and(|position| position.start.offset < real_end)).rev();
         let last = blocks.next();
         let mut tail = last.and_then(Node::position).map_or(source.len(), |position| start + position.start.offset);
@@ -200,7 +229,7 @@ impl MarkdownMediaIndex {
         {
             tail = start + definition.start.offset;
         }
-        Self { definitions, paragraphs, tail, multiline_titles, #[cfg(test)] parsed_from: start }
+        Self { definitions, paragraphs, heading_gaps, tail, multiline_titles, #[cfg(test)] parsed_from: start }
     }
 }
 
@@ -229,6 +258,17 @@ impl MarkdownMediaDocument {
         MarkdownMediaParser { definitions: &self.index().definitions }.prose(fragment, references)
     }
 
+    pub fn prose_run_at(&self, start: usize, run: usize) -> Option<&str> {
+        match self.index().paragraphs.get(&start)?.get(run)? {
+            MarkdownMediaRun::Prose(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn heading_has_paragraph_gap(&self, node: &markdown::mdast::Node, offset: usize) -> bool {
+        node.position().and_then(|position| self.index().heading_gaps.get(&(offset + position.start.offset))).copied().unwrap_or(false)
+    }
+
     pub fn runs_at(&self, node: &markdown::mdast::Node, offset: usize) -> Vec<MarkdownMediaRun> {
         if !matches!(node, markdown::mdast::Node::Paragraph(_) | markdown::mdast::Node::Heading(_)) { return Vec::new(); }
         node.position().and_then(|position| self.index().paragraphs.get(&(offset + position.start.offset))).map(|runs| (**runs).clone()).unwrap_or_default()
@@ -251,7 +291,7 @@ impl MarkdownMediaParser<'_> {
 
     pub fn runs(&self, node: &markdown::mdast::Node, source: &str) -> Vec<MarkdownMediaRun> {
         if !matches!(node, markdown::mdast::Node::Paragraph(_) | markdown::mdast::Node::Heading(_)) { return Vec::new(); }
-        let runs = self.split(node, source);
+        let runs = self.split(node, source, matches!(node, markdown::mdast::Node::Heading(_)));
         if !runs.iter().any(|run| matches!(run, MarkdownMediaRun::Image { .. })) { return Vec::new(); }
         let mut refs = Vec::new();
         fn references(node: &markdown::mdast::Node, refs: &mut Vec<String>) {
@@ -265,9 +305,9 @@ impl MarkdownMediaParser<'_> {
         }).collect()
     }
 
-    fn split(&self, node: &markdown::mdast::Node, source: &str) -> Vec<MarkdownMediaRun> {
+    fn split(&self, node: &markdown::mdast::Node, source: &str, heading: bool) -> Vec<MarkdownMediaRun> {
         use markdown::mdast::Node;
-        let original = inline_source(node, source);
+        let original = inline_source(node, source, heading);
         let image = match node {
             Node::Image(image) => Some((image.url.clone(), image.alt.clone())),
             Node::ImageReference(image) => self.definitions.get(&image.identifier).map(|definition| (definition.url.clone(), image.alt.clone())),
@@ -280,7 +320,9 @@ impl MarkdownMediaParser<'_> {
         let children = node.children().unwrap();
         if children.is_empty() { return vec![MarkdownMediaRun::Prose(original)]; }
         let mut runs = Vec::new();
-        for child in children { for run in self.split(child, source) { push_run(&mut runs, run); } }
+        // markdown-rs consumes repeated opening ATX groups; the later groups are authored inline text.
+        push_run(&mut runs, MarkdownMediaRun::Prose(escaped_text(heading_literal_prefix(node, source))));
+        for child in children { for run in self.split(child, source, heading) { push_run(&mut runs, run); } }
         let link = match node {
             Node::Link(link) => Some(link.url.clone()),
             Node::LinkReference(link) => Some(self.definitions.get(&link.identifier).map(|definition| definition.url.clone()).unwrap_or_default()),
@@ -556,6 +598,14 @@ mod paragraph_tests {
         }
         for text in ["## Plain **heading**", "## `![code](a.png)`", "```md\n## ![code](a.png)\n```", "## ![missing][unknown]"] {
             assert!(runs(text).is_empty(), "{text}");
+        }
+        for literal in ["# right", "## right", "> right", "1. right", "- right", "---", "    indented", "\tindented"] {
+            for heading in [format!("## ![x](a.png) {literal}"), format!("## {literal} ![x](a.png)")] {
+                let prose: String = runs(&heading).into_iter().filter_map(|run| match run { MarkdownMediaRun::Prose(text) => Some(text), _ => None }).collect();
+                let root = markdown::to_mdast(&prose, &markdown::ParseOptions::gfm()).unwrap();
+                assert!(root.children().unwrap().iter().all(|node| matches!(node, markdown::mdast::Node::Paragraph(_))), "{heading}: {root:?}");
+                assert_eq!(crate::assistant_citations::markdown_text(&prose).trim(), literal.trim(), "{heading}: {prose:?}; {root:?}");
+            }
         }
     }
 

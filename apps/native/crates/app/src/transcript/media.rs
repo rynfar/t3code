@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
-use gpui::{AnyElement, App, Context, Div, EntityId, FontWeight, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
+use gpui::{AnyElement, App, Context, Div, EntityId, FontWeight, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative, rems};
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::media::{AssetResource, ImageAttachment, MediaKind, MediaPlacement, MediaSource, resolve_media_source};
@@ -191,32 +191,55 @@ pub type MediaDocument = Arc<std::sync::RwLock<Arc<t3_core::media::MarkdownMedia
 pub fn media_document(text: Arc<str>) -> MediaDocument {
     Arc::new(std::sync::RwLock::new(Arc::new(t3_core::media::MarkdownMediaDocument::new(text))))
 }
+#[derive(Clone, Default)]
+pub(super) struct MediaSelections(Arc<std::sync::Mutex<std::collections::BTreeMap<(usize, usize), ProseSelection>>>);
+struct ProseSelection { state: gpui::WeakEntity<TextViewState>, source: String }
+impl MediaSelections {
+    pub(super) fn register(&self, key: (usize, usize), state: &gpui::Entity<TextViewState>, source: &str) {
+        let mut states = self.0.lock().unwrap();
+        if states.get(&key).is_some_and(|selection| selection.state.entity_id() == state.entity_id() && selection.source == source) { return; }
+        states.retain(|_, selection| selection.state.upgrade().is_some());
+        states.insert(key, ProseSelection { state: state.downgrade(), source: source.to_owned() });
+    }
+    pub(super) fn matches_quote(&self, document: &t3_core::media::MarkdownMediaDocument, quote: &str, cx: &App) -> bool {
+        let selected: Vec<_> = self.0.lock().unwrap().iter().filter_map(|(&(start, run), selection)| {
+            if document.prose_run_at(start, run) != Some(selection.source.as_str()) { return None; }
+            selection.state.upgrade().map(|state| state.read(cx).selected_text()).filter(|text| !text.trim().is_empty())
+        }).collect();
+        selected.iter().any(|text| text == quote) || (!selected.is_empty() && selected.join("\n") == quote)
+    }
+}
+
 #[derive(Clone)]
-struct MediaBlock { start: usize, heading: Option<u8>, runs: Vec<t3_core::media::MarkdownMediaRun> }
+struct MediaBlock { start: usize, heading: Option<u8>, paragraph_gap: bool, runs: Vec<t3_core::media::MarkdownMediaRun> }
 fn parse_media_block(node: &mdast::Node, context: &MarkdownParseContext, document: &t3_core::media::MarkdownMediaDocument) -> Option<MarkdownNode> {
     let runs = document.runs_at(node, context.offset());
     if runs.is_empty() { return None; }
     let start = context.offset() + node.position()?.start.offset;
     let heading = match node { mdast::Node::Heading(heading) => Some(heading.depth), _ => None };
-    Some(MarkdownNode::new(MEDIA_NODE, MediaBlock { start, heading, runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
+    Some(MarkdownNode::new(MEDIA_NODE, MediaBlock { start, heading, paragraph_gap: document.heading_has_paragraph_gap(node, context.offset()), runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
 }
 
-fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, window: &mut Window, cx: &mut App) -> AnyElement {
+fn render_media_runs(node: &MarkdownNode, selections: &MediaSelections, scope: Option<&MediaScope>, window: &mut Window, cx: &mut App) -> AnyElement {
     use t3_core::media::MarkdownMediaRun;
     let Some(block) = node.data::<MediaBlock>().cloned() else { return div().into_any_element() };
     let block_id = format!("media-block:{}:{}", window.current_view(), block.start);
     let standalone = block.runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
     let children = block.runs.into_iter().enumerate().filter_map(|(index, run)| match run {
         MarkdownMediaRun::Prose(text) if text.trim().is_empty() => None,
-        MarkdownMediaRun::Prose(text) => Some(ProseElement { id: format!("{block_id}:prose:{index}").into(), text, heading: block.heading }.into_any_element()),
+        MarkdownMediaRun::Prose(text) => Some(ProseElement { id: format!("{block_id}:prose:{index}").into(), text, heading: block.heading, selection: selections.clone(), key: (block.start, index) }.into_any_element()),
         MarkdownMediaRun::Image { url, alt, link } => Some(markdown_image(&MarkdownImage { url, alt, link }, index, scope, cx)),
     }).collect::<Vec<_>>();
     let content = if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
         else { h_flex().flex_wrap().gap(px(4.)).items_end().children(children).into_any_element() };
-    div().id(SharedString::from(block_id)).child(content).into_any_element()
+    div().id(SharedString::from(block_id))
+        .when(block.heading.is_some(), |element| {
+            // Custom blocks receive paragraph padding outside this renderer; cancel only that padding.
+            element.pb(rems(0.3)).when(block.paragraph_gap, |element| element.mb(rems(-super::markdown::PARAGRAPH_GAP)))
+        }).child(content).into_any_element()
 }
 
-struct ProseElement { id: SharedString, text: String, heading: Option<u8> }
+struct ProseElement { id: SharedString, text: String, heading: Option<u8>, selection: MediaSelections, key: (usize, usize) }
 impl IntoElement for ProseElement { type Element = Self; fn into_element(self) -> Self { self } }
 impl gpui::Element for ProseElement {
     type RequestLayoutState = AnyElement;
@@ -226,6 +249,7 @@ impl gpui::Element for ProseElement {
     fn request_layout(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, window: &mut Window, cx: &mut App) -> (gpui::LayoutId, AnyElement) {
         let state = window.use_keyed_state("state", cx, |_, cx| TextViewState::markdown(&self.text, cx));
         state.update(cx, |state, cx| state.set_text(&self.text, cx));
+        self.selection.register(self.key, &state, &self.text);
         #[cfg(feature = "snapshot")]
         crate::snapshot::record_media_prose(&state, &self.text, cx);
         let mut child = div().min_w_0().when_some(self.heading, |element, level| {
@@ -243,13 +267,17 @@ impl gpui::Element for ProseElement {
 }
 
 pub fn markdown_extensions(document: MediaDocument, scope: Option<Arc<std::sync::Mutex<MediaScope>>>) -> MarkdownExtensions {
+    markdown_extensions_with_selections(document, scope, MediaSelections::default())
+}
+
+pub(super) fn markdown_extensions_with_selections(document: MediaDocument, scope: Option<Arc<std::sync::Mutex<MediaScope>>>, selections: MediaSelections) -> MarkdownExtensions {
     MarkdownExtensions::default().block_parser(move |node, context| {
         let document = document.read().unwrap().clone();
         parse_media_block(node, context, &document)
     }).block_renderer(MEDIA_NODE, move |node: &MarkdownNode, window: &mut Window, cx: &mut App| {
         let scope = scope.as_ref().map(|scope| scope.lock().unwrap().clone())
             .or_else(|| cx.try_global::<media::Media>().and_then(|media| media.scope.clone()));
-        render_media_runs(node, scope.as_ref(), window, cx)
+        render_media_runs(node, &selections, scope.as_ref(), window, cx)
     })
 }
 

@@ -403,7 +403,8 @@ pub fn resolve_phase(failed: bool, message: CitedMessage, row: Option<&str>) -> 
 
 /// Visible markdown text for a saved selector. Controls and destination URLs are omitted.
 pub fn markdown_text(source: &str) -> String {
-    fn visit(node: &markdown::mdast::Node, out: &mut String) {
+    fn visit(node: &markdown::mdast::Node, source: &str, out: &mut String) {
+        out.push_str(crate::media::heading_literal_prefix(node, source));
         use markdown::mdast::Node;
         match node {
             Node::Text(text) => out.push_str(&text.value),
@@ -415,7 +416,7 @@ pub fn markdown_text(source: &str) -> String {
             _ => {
                 if let Some(children) = node.children() {
                     for child in children {
-                        visit(child, out);
+                        visit(child, source, out);
                     }
                 }
             }
@@ -430,7 +431,7 @@ pub fn markdown_text(source: &str) -> String {
         return source.to_owned();
     };
     let mut out = String::new();
-    visit(&root, &mut out);
+    visit(&root, source, &mut out);
     out.trim_end().to_owned()
 }
 
@@ -521,6 +522,7 @@ mod tests {
     #[test]
     fn rendered_text_omits_markup_destinations_and_controls() {
         assert_eq!(markdown_text("# Hello **world**\n\n[A link](https://example.com) and `code`\n\n```rs\nlet x = 1;\n```"), "Hello world\nA link and code\nlet x = 1;");
+        assert_eq!(normalize(&markdown_text("## # left ![chart](a.png) **right**")), "# left right");
         assert_eq!(unique_quote_range("same same", "same"), None);
         for (source, quote) in [("aaa", "aa\n"), ("ééé", "éé\n")] {
             assert_eq!(unique_quote_range(source, quote), None);

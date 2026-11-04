@@ -6,15 +6,16 @@ use crate::app_state::AppEvent;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
-use gpui::{AnyElement, Context, Entity, FocusHandle, IntoElement, ParentElement, Pixels, Point, Styled, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, FocusHandle, IntoElement, ParentElement, Pixels, Point, Styled, Window, div, prelude::*, px};
 use gpui_base::TextSelection;
-use gpui_component::text::TextViewState;
+use crate::transcript::markdown::MarkdownState;
 use std::sync::Arc;
 use t3_core::assistant_citations::{self as rules, Citation, CitedMessage, HistoryAction};
 use t3_core::timeline::Role;
 
 pub(super) struct CitationUi {
     selection: Option<(Citation, Point<Pixels>)>,
+    selection_connection: Option<u64>,
     focus: FocusHandle,
     pub(super) selection_focus: FocusHandle,
     pending: Option<(Citation, rules::CitationProcedure)>,
@@ -22,14 +23,19 @@ pub(super) struct CitationUi {
 }
 impl CitationUi {
     pub fn new(cx: &mut Context<ThreadView>) -> Self {
-        Self { selection: None, focus: cx.focus_handle(), selection_focus: cx.focus_handle(), pending: None, highlighted: None }
+        Self { selection: None, selection_connection: None, focus: cx.focus_handle(), selection_focus: cx.focus_handle(), pending: None, highlighted: None }
     }
 }
 
 impl ThreadView {
+    pub(crate) fn citation_from_markdown_selection(selected: &MarkdownState, source: &str, quote: &str, identity: (String, String, String), cx: &gpui::App) -> Option<Citation> {
+        if !selected.owns_selection(source, quote, cx) { return None; }
+        Citation::from_rendered_selection(identity.0, identity.1, identity.2, &rules::markdown_text(source), quote)
+    }
+
     pub(crate) fn capture_citation_selection(
         &mut self,
-        selected: Entity<TextViewState>,
+        selected: MarkdownState,
         message: String,
         source: Arc<str>,
         pointer: Point<Pixels>,
@@ -38,20 +44,21 @@ impl ThreadView {
     ) {
         let owner = cx.entity().downgrade();
         let thread = self.thread_id.clone();
+        let connection = self.state.read(cx).connection_id();
+        let environment = self.state.read(cx).server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).unwrap_or_default();
         // Selection ranges settle during paint. Read once on the next frame, never on a timer.
         window.on_next_frame(move |window, cx| {
             let _ = owner.update(cx, |this, cx| {
-                if thread != this.thread_id {
+                if thread != this.thread_id || connection.is_none() || connection != this.state.read(cx).connection_id() {
                     return;
                 }
-                let quote = selected.read(cx).selected_text();
-                if quote.trim().is_empty() || TextSelection::selected_text(window, cx) != quote {
-                    return;
-                }
-                let rendered = rules::markdown_text(&source);
-                let environment = this.state.read(cx).server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).unwrap_or_default();
-                let Some(citation) = Citation::from_rendered_selection(environment, thread.unwrap_or_default(), message, &rendered, &quote) else { return };
+                let current = this.entries_cache.entries().iter().any(|entry| matches!(&entry.kind,
+                    t3_core::timeline::EntryKind::Message(current) if current.id == message && *current.text == *source));
+                if !current { return; }
+                let quote = TextSelection::selected_text(window, cx);
+                let Some(citation) = Self::citation_from_markdown_selection(&selected, &source, &quote, (environment, thread.unwrap_or_default(), message), cx) else { return };
                 this.citation_ui.selection = Some((citation, pointer));
+                this.citation_ui.selection_connection = connection;
                 window.focus(&this.citation_ui.selection_focus, cx);
                 cx.notify();
             });
@@ -67,7 +74,7 @@ impl ThreadView {
 
     pub(super) fn render_citation_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (citation, pointer) = self.citation_ui.selection.as_ref()?;
-        if self.thread_id.as_deref() != Some(&citation.thread_id) {
+        if self.thread_id.as_deref() != Some(&citation.thread_id) || self.citation_ui.selection_connection != self.state.read(cx).connection_id() {
             return None;
         }
         let too_long = rules::utf16_len(&citation.text) > rules::MAX_TEXT;
@@ -174,7 +181,8 @@ impl ThreadView {
     }
 
     fn cite_selection(&mut self, citation: &Citation, window: &mut Window, cx: &mut Context<Self>) {
-        if !citation.valid() { return; }
+        if !citation.valid() || self.thread_id.as_deref() != Some(&citation.thread_id)
+            || self.citation_ui.selection_connection.is_none() || self.citation_ui.selection_connection != self.state.read(cx).connection_id() { return; }
         self.state.update(cx, |state, cx| { state.composer_citation = Some(citation.clone()); cx.emit(AppEvent::ComposerCitation); });
         TextSelection::clear(window, cx);
         self.dismiss_citation_selection(cx);
