@@ -113,7 +113,7 @@ fn shell_runtime(thread: &ThreadShell) -> Option<RuntimeSummary> {
     let status = if park_at_idle {
         "idle".to_owned()
     } else {
-        thread.activity_run_status.clone().unwrap_or_else(|| thread.status.clone())
+        thread.activity_run_status.clone().flatten().unwrap_or_else(|| thread.status.clone())
     };
     Some(RuntimeSummary {
         status,
@@ -205,7 +205,7 @@ pub fn same_apart_from_streaming(previous: &ThreadShell, next: &ThreadShell) -> 
 
 fn is_child_run_live(thread: &ThreadShell) -> bool {
     match &thread.activity_run_status {
-        Some(_) => true,
+        Some(status) => status.is_some(),
         None => matches!(thread.status.as_str(), "preparing" | "starting" | "running" | "waiting"),
     }
 }
@@ -231,6 +231,10 @@ pub(crate) fn side_chat_request(thread: &ThreadShell) -> Option<SubagentRequest>
 
 /// `pendingSubagentRequestsByThread`: which listed threads to flag for a child's request.
 pub fn pending_subagent_requests(threads: &[ThreadShell]) -> HashMap<String, SubagentRequest> {
+    pending_subagent_requests_with_delegated(threads, &[])
+}
+
+pub(crate) fn pending_subagent_requests_with_delegated(threads: &[ThreadShell], delegated: &[(&str, SubagentRequest)]) -> HashMap<String, SubagentRequest> {
     let mut requests: HashMap<String, SubagentRequest> = HashMap::new();
     let by_id: HashMap<&str, &ThreadShell> = threads.iter().map(|thread| (thread.id.as_str(), thread)).collect();
     for child in threads {
@@ -248,16 +252,22 @@ pub fn pending_subagent_requests(threads: &[ThreadShell]) -> HashMap<String, Sub
         }
         // The coordinator answers child questions; only approvals need user attention.
         let Some(SubagentRequest::Approval) = subagent_request(child) else { continue };
-        let mut seen = vec![child.id.clone()];
-        let mut next = parent_id;
-        while let Some(parent_id) = next.filter(|id| !seen.contains(id)) {
-            seen.push(parent_id.clone());
-            requests.insert(parent_id.clone(), SubagentRequest::Approval);
-            next = by_id.get(parent_id.as_str()).and_then(|parent| {
-                let nested = parent.lineage.relationship_to_parent.as_deref() == Some("subagent") || parent.lineage.side_chat == Some(true);
-                nested.then(|| parent.lineage.parent_thread_id.clone()).flatten()
-            });
-        }
+        flag_approval(parent_id.as_deref(), &by_id, &mut requests, vec![child.id.as_str()]);
+    }
+    for (parent_id, request) in delegated {
+        if *request == SubagentRequest::Approval { flag_approval(Some(parent_id), &by_id, &mut requests, Vec::new()); }
     }
     requests
+}
+
+fn flag_approval<'a>(parent_id: Option<&'a str>, by_id: &HashMap<&str, &'a ThreadShell>, requests: &mut HashMap<String, SubagentRequest>, mut seen: Vec<&'a str>) {
+    let mut next = parent_id;
+    while let Some(parent_id) = next.filter(|id| !seen.contains(id)) {
+        seen.push(parent_id);
+        requests.insert(parent_id.to_owned(), SubagentRequest::Approval);
+        next = by_id.get(parent_id).and_then(|parent| {
+            let nested = parent.lineage.relationship_to_parent.as_deref() == Some("subagent") || parent.lineage.side_chat == Some(true);
+            if nested { parent.lineage.parent_thread_id.as_deref() } else { None }
+        });
+    }
 }

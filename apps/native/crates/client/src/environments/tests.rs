@@ -4,11 +4,20 @@ use serde_json::{Value, json};
 use t3_core::commands::method;
 
 async fn shell(connection: &mut Connection) -> Value {
+    shell_config(connection, json!({})).await
+}
+
+async fn shell_config(connection: &mut Connection, value: Value) -> Value {
+    shell_streams(connection, value).await.1
+}
+
+async fn shell_streams(connection: &mut Connection, value: Value) -> (Value, Value) {
     let config = connection.request(method::SUBSCRIBE_SERVER_CONFIG).await;
     connection
-        .chunk(&config, json!([{"type":"snapshot","config":{}}]))
+        .chunk(&config, json!([{"type":"snapshot","config":value}]))
         .await;
-    connection.request(method::SUBSCRIBE_SHELL).await
+    let shell = connection.request(method::SUBSCRIBE_SHELL).await;
+    (config, shell)
 }
 
 async fn activated(
@@ -30,6 +39,119 @@ async fn activated(
             _ => {}
         }
     }
+}
+
+async fn notification_batch(events: &mut mpsc::Receiver<EnvironmentEvent>, expected: &str) -> Vec<(String, String, &'static str)> {
+    let mut notified = Vec::new();
+    loop {
+        match events.recv().await.unwrap() {
+            EnvironmentEvent::Notifications { id, notifications, .. } => {
+                notified.extend(notifications.into_iter().map(|n| (id.clone(), n.thread_id, n.title)));
+            }
+            EnvironmentEvent::Active { id, .. } if id == expected => return notified,
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn delegated_requests_reobserve_the_unchanged_parent_and_suppress_the_task() {
+    let (mut a, mut b) = (FakeServer::start().await, FakeServer::start().await);
+    let (mut owner, mut events) = Environments::start(&tokio::runtime::Handle::current(), true);
+    owner.watch("a", a.credentials(), None);
+    owner.watch("b", b.credentials(), None);
+    let (mut ca, mut cb) = (a.connection().await, b.connection().await);
+    let sa = shell_config(&mut ca, json!({"environment":{"environmentId":"canonical-a"}})).await;
+    let sb = shell(&mut cb).await;
+    let row = |delegated: bool, asking: bool| json!({
+        "id":"same", "projectId":"p", "title":"Task", "tags":["hidden"], "providerInstanceId":"replay",
+        "modelSelection":{"instanceId":"replay","model":"replay"},"runtimeMode":"auto","interactionMode":"default",
+        "lineage":{"rootThreadId":"same"}, "status":"running", "activityRunStatus":"running", "latestRunId":"r",
+        "delegatedFrom":if delegated { json!({"environmentId":"canonical-a","threadId":"same"}) } else { Value::Null },
+        "pendingRuntimeRequest":if asking { json!({"id":"ask","kind":"command","createdAt":"2026-11-01T00:00:00Z"}) } else { Value::Null },
+        "hasActionableProposedPlan":false,"itemCount":1,"visibleItemCount":1, "createdAt":"2026-11-01T00:00:00Z", "updatedAt":"2026-11-01T00:00:00Z"
+    });
+    ca.chunk(&sa, json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[row(false,false)]}},{"kind":"synchronized"}])).await;
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && v.live.len() == 1 { break; }
+    }
+    cb.chunk(&sb, json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[row(true,false)]}},{"kind":"synchronized"}])).await;
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && v.live.len() == 2 { break; }
+    }
+    owner.activate(Some("b"));
+    activated(&mut events, "b").await;
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":2,"location":"active","thread":row(true,true)}])).await;
+    assert_eq!(notification_batch(&mut events, "b").await, [("a".into(), "same".into(), "Approval needed")]);
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":3,"location":"active","thread":row(true,false)}])).await;
+    assert!(notification_batch(&mut events, "b").await.is_empty());
+    drop(ca);
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && v.delegated_under_parent.is_empty() {
+            assert_eq!(v.live.len(), 2, "cached click destinations survive disconnect");
+            break;
+        }
+    }
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":4,"location":"active","thread":row(true,true)}])).await;
+    assert_eq!(notification_batch(&mut events, "b").await, [("b".into(), "same".into(), "Approval needed")]);
+    let mut ca = a.connection().await;
+    let (config_a, sa) = shell_streams(&mut ca, json!({"environment":{"environmentId":"canonical-a"}})).await;
+    ca.chunk(&sa, json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[row(false,false)]}},{"kind":"synchronized"}])).await;
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && !v.delegated_under_parent.is_empty() { break; }
+    }
+    owner.activate(Some("b"));
+    let mut notifications = Vec::new();
+    loop {
+        match events.recv().await.unwrap() {
+            EnvironmentEvent::Notifications { id, notifications: next, .. } => notifications.extend(next.into_iter().map(|n| (id.clone(), n.title))),
+            EnvironmentEvent::Activated { id, .. } if id == "b" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(notifications, [("a".into(), "Approval needed")]);
+    ca.chunk(&config_a, json!([{"type":"snapshot","config":{"environment":{"environmentId":"canonical-a"},"settings":{"hideTaggedThreads":true,"hiddenThreadTags":["hidden"]}}}])).await;
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && v.hidden.len() == 2 { break; }
+    }
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":5,"location":"active","thread":row(true,false)}])).await;
+    assert!(notification_batch(&mut events, "b").await.is_empty());
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":6,"location":"active","thread":row(true,true)}])).await;
+    assert!(notification_batch(&mut events, "b").await.is_empty(), "tag-hidden parent consumes delegated attention");
+    ca.chunk(&config_a, json!([{"type":"snapshot","config":{"environment":{"environmentId":"canonical-a"}}}])).await;
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && !v.filtering { break; }
+    }
+    owner.activate(Some("b"));
+    activated(&mut events, "b").await;
+    let mut moved = FakeServer::start().await;
+    owner.watch("a", moved.credentials(), None);
+    ca.closed().await;
+    let mut ca = moved.connection().await;
+    let sa = shell_config(&mut ca, json!({"environment":{"environmentId":"canonical-a"}})).await;
+    ca.chunk(&sa, json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[row(false,false)]}},{"kind":"synchronized"}])).await;
+    loop {
+        match events.recv().await.unwrap() {
+            EnvironmentEvent::Notifications { .. } => panic!("route replacement replayed attention"),
+            EnvironmentEvent::Visibility(v) if !v.delegated_under_parent.is_empty() => break,
+            _ => {}
+        }
+    }
+    owner.activate(Some("b"));
+    activated(&mut events, "b").await;
+    owner.remove("a");
+    loop {
+        if let EnvironmentEvent::Visibility(v) = events.recv().await.unwrap() && v.live.len() == 1 {
+            assert!(v.delegated_under_parent.is_empty());
+            break;
+        }
+    }
+    ca.closed().await;
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":7,"location":"active","thread":row(true,false)}])).await;
+    assert!(notification_batch(&mut events, "b").await.is_empty());
+    cb.chunk(&sb, json!([{"kind":"thread.updated","sequence":8,"location":"active","thread":row(true,true)}])).await;
+    assert_eq!(notification_batch(&mut events, "b").await, [("b".into(), "same".into(), "Approval needed")]);
+    eprintln!("fixture: canonical delegated link notified saved parent only; disconnect exposed child without replay; reconnect restored parent rollup; tag reveal and route replacement stayed quiet; removal retired only parent and exposed child");
 }
 
 #[tokio::test]

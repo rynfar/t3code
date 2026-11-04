@@ -320,3 +320,97 @@ fn transient_reconnect_keeps_pending_badges_and_click_destinations() {
     assert!(pending.destination(&notification_tag("a", "same")).is_none());
     assert_eq!(pending.destination(&notification_tag("b", "same")), Some(&ThreadKey::new("b", "same")));
 }
+
+#[test]
+fn delegated_tasks_only_hide_beneath_a_present_unarchived_parent() {
+    let task = vec![thread("same", "running", json!({"delegatedFrom":{"environmentId":"canonical-a","threadId":"same"}}))];
+    for (parents, connected, suppressed) in [
+        (vec![thread("same", "running", json!({}))], true, true),
+        (vec![], true, false),
+        (vec![thread("same", "running", json!({"archivedAt":"2026-11-01T00:00:00Z"}))], true, false),
+        (vec![thread("same", "running", json!({}))], false, false),
+    ] {
+        let mut environments = vec![LinkedEnvironment { saved_id:"saved-b", canonical_id:"canonical-b", threads:&task }];
+        if connected { environments.push(LinkedEnvironment { saved_id:"saved-a", canonical_id:"canonical-a", threads:&parents }); }
+        let requests = LinkedRequests::build(&environments);
+        assert_eq!(requests.delegated_under_parent.contains(&ThreadKey::new("saved-b", "same")), suppressed);
+        assert!(!requests.delegated_under_parent.contains(&ThreadKey::new("saved-a", "same")));
+    }
+}
+
+#[test]
+fn linked_approvals_cross_local_ancestry_and_delegated_cycles_with_web_precedence() {
+    use SubagentRequest::{Approval, UserInput};
+    let mut a = vec![thread("root", "running", json!({})), thread("side", "completed", json!({
+        "lineage":{"rootThreadId":"root","parentThreadId":"root","relationshipToParent":"fork","sideChat":true},
+        "pendingRuntimeRequest":{"id":"ask","kind":"user_input","createdAt":"2026-11-01T00:00:00Z"}
+    }))];
+    let b = vec![thread("task", "running", json!({"delegatedFrom":{"environmentId":"a","threadId":"side"}}))];
+    let mut c = vec![thread("task", "running", json!({"delegatedFrom":{"environmentId":"b","threadId":"task"}})), thread("helper", "running", json!({
+        "lineage":{"rootThreadId":"task","parentThreadId":"task","relationshipToParent":"subagent"}, "creationSource":"mcp",
+        "pendingRuntimeRequest":{"id":"ask","kind":"command","createdAt":"2026-11-01T00:00:00Z"}
+    }))];
+    let rollup = |a: &[ThreadShell], c: &[ThreadShell]| LinkedRequests::build(&[
+        LinkedEnvironment { saved_id:"a", canonical_id:"a", threads:a },
+        LinkedEnvironment { saved_id:"b", canonical_id:"b", threads:&b },
+        LinkedEnvironment { saved_id:"c", canonical_id:"c", threads:c },
+    ]);
+    let request = |r: &LinkedRequests, env: &str, id: &str| r.requests.get(env).and_then(|r| r.get(id)).copied();
+    let r = rollup(&a, &c);
+    for (env,id) in [("a","root"),("a","side"),("b","task"),("c","task")] { assert_eq!(request(&r,env,id), Some(Approval)); }
+    c[1].pending_runtime_request.as_mut().unwrap().kind = "user_input".into();
+    let r = rollup(&a, &c);
+    assert_eq!(request(&r,"a","root"), Some(UserInput));
+    assert_eq!(request(&r,"b","task"), None, "coordinator answers subagent questions");
+    c[1].pending_runtime_request.as_mut().unwrap().kind = "command".into();
+    c[1].creation_source = Some("provider".into());
+    assert_eq!(request(&rollup(&a,&c),"b","task"), None);
+    c[1].creation_source = Some("mcp".into());
+    c[1].status = "completed".into();
+    assert_eq!(request(&rollup(&a,&c),"b","task"), None, "ended child runs no longer ask");
+    // A return edge makes the environments cyclic; local ancestry is cyclic too.
+    a[0].delegated_from = Some(json!({"environmentId":"c","threadId":"task"}));
+    a[1].lineage.parent_thread_id = Some("side".into());
+    a[1].pending_runtime_request.as_mut().unwrap().kind = "command".into();
+    a[1].lineage.relationship_to_parent = Some("subagent".into());
+    a[1].lineage.side_chat = Some(false);
+    a[1].status = "running".into();
+    a[1].delegated_from = Some(json!({"environmentId":"b","threadId":"task"}));
+    let r = rollup(&a,&c);
+    assert_eq!(request(&r,"b","task"), Some(Approval));
+    assert_eq!(request(&r,"a","side"), Some(Approval));
+    a[1].pending_runtime_request = None;
+    assert!(rollup(&a,&c).requests.values().all(HashMap::is_empty), "retirement clears a cyclic fixed point");
+}
+
+#[test]
+fn child_activity_status_distinguishes_absent_from_explicit_null() {
+    let mut child = thread("child", "running", json!({
+        "delegatedFrom":{"environmentId":"a","threadId":"root"},
+        "lineage":{"rootThreadId":"root","parentThreadId":"root","relationshipToParent":"subagent"},
+        "pendingRuntimeRequest":{"id":"ask","kind":"command","createdAt":"2026-11-01T00:00:00Z"},
+        "activityRunStatus":null
+    }));
+    assert!(pending_subagent_requests(&[child.clone()]).is_empty());
+    let mut wire = serde_json::to_value(&child).unwrap();
+    wire.as_object_mut().unwrap().remove("activityRunStatus");
+    child = serde_json::from_value(wire).unwrap();
+    assert_eq!(pending_subagent_requests(&[child]).get("root"), Some(&SubagentRequest::Approval));
+}
+
+#[test]
+fn newly_linked_parent_retires_only_child_delivery_and_ignores_late_confirmation() {
+    let mut pending = PendingNotifications::default();
+    let child = ThreadKey::new("b", "same");
+    let parent = ThreadKey::new("a", "same");
+    let delivered = pending.begin(child.clone());
+    pending.confirm(&delivered, DeliveryOutcome::Accepted);
+    let in_flight = pending.begin(child.clone());
+    let other = pending.begin(parent.clone());
+    pending.confirm(&other, DeliveryOutcome::Accepted);
+    let visible = NotificationVisibility { delegated_under_parent: [child].into(), ..Default::default() };
+    assert_eq!(pending.retire_where(|key| !visible.visible(key)), std::slice::from_ref(&in_flight.tag));
+    assert!(!pending.confirm(&in_flight, DeliveryOutcome::Accepted));
+    assert_eq!(pending.badge_count(), 1);
+    assert_eq!(pending.destination(&other.tag), Some(&parent));
+}

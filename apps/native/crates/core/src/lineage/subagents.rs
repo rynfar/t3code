@@ -468,7 +468,7 @@ impl Subagent {
     /// runs again, or ran since, takes that run's status and times.
     pub fn current(&self, child: Option<&crate::shell::ThreadShell>) -> Subagent {
         let Some(child) = child.filter(|_| !is_active_status(&self.status)) else { return self.clone() };
-        let live = child.activity_run_status.clone().or_else(|| (child.status == "queued").then(|| "queued".to_owned()));
+        let live = child.activity_run_status.clone().flatten().or_else(|| (child.status == "queued").then(|| "queued".to_owned()));
         let since = self.completed_at.as_deref().or(self.started_at.as_deref()).unwrap_or(&self.updated_at);
         let newer = child.latest_run_requested_at.as_deref().and_then(parse_iso_ms).zip(parse_iso_ms(since)).is_some_and(|(run, task)| run > task);
         if live.is_none() && !newer {

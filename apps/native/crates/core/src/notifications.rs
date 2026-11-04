@@ -14,6 +14,9 @@ use crate::sidebar::status::{ThreadStatus, resolve_status};
 use crate::sidebar::thread::{SubagentRequest, pending_subagent_requests, present_thread};
 use crate::sidebar::time::Ms;
 
+mod linked;
+pub use linked::{LinkedEnvironment, LinkedRequests};
+
 /// `ClientSettings.notificationMode`; off by default, as on the web.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -321,11 +324,16 @@ impl ThreadNotifications {
     /// Rows the shell has not replaced since the last call keep their observation untouched.
     pub fn observe(&mut self, shell: &ShellState) -> Vec<ThreadNotification> {
         let Some(snapshot) = &shell.snapshot else { return Vec::new() };
+        let requests = pending_subagent_requests(&snapshot.threads);
+        self.observe_requests(shell, &requests, |thread| thread.lineage.is_listed())
+    }
+
+    fn observe_requests(&mut self, shell: &ShellState, requests: &HashMap<String, SubagentRequest>, listed: impl Fn(&ThreadShell) -> bool) -> Vec<ThreadNotification> {
+        let Some(snapshot) = &shell.snapshot else { return Vec::new() };
         let threads = &snapshot.threads;
-        let requests = pending_subagent_requests(threads);
         let mut previous = std::mem::take(&mut self.previous);
         let mut changed: Vec<(&ThreadShell, Option<Observation>)> = Vec::new();
-        for raw in threads.iter().filter(|thread| thread.lineage.is_listed()) {
+        for raw in threads.iter().filter(|thread| listed(thread)) {
             let request = requests.get(&raw.id).copied();
             let revision = shell.revision(&raw.id);
             let (key, prior) = match previous.remove_entry(raw.id.as_str()) {
@@ -382,6 +390,13 @@ impl EnvironmentNotifications {
         self.watched.entry(environment.to_owned()).or_default().observe_visible(shell, hidden)
     }
 
+    pub fn observe_linked(&mut self, environment: &str, shell: &ShellState, visibility: &NotificationVisibility, linked: &LinkedRequests) -> Vec<ThreadNotification> {
+        let Some(requests) = linked.requests.get(environment) else { return Vec::new() };
+        self.watched.entry(environment.to_owned()).or_default().observe_requests(shell, requests, |thread| {
+            thread.lineage.is_listed() && !linked.delegated_under_parent.contains(&ThreadKey::new(environment, &thread.id))
+        }).into_iter().filter(|notification| visibility.visible(&ThreadKey::new(environment, &notification.thread_id))).collect()
+    }
+
     pub fn remove(&mut self, environment: &str) { self.watched.remove(environment); }
     pub fn clear(&mut self) { self.watched.clear(); }
 }
@@ -392,11 +407,12 @@ pub struct NotificationVisibility {
     pub hidden: HashSet<ThreadKey>,
     pub live: HashSet<ThreadKey>,
     pub filtering: bool,
+    pub delegated_under_parent: HashSet<ThreadKey>,
 }
 
 impl NotificationVisibility {
     pub fn visible(&self, target: &ThreadKey) -> bool {
-        !self.hidden.contains(target) && (!self.filtering || self.live.contains(target))
+        !self.hidden.contains(target) && !self.delegated_under_parent.contains(target) && (!self.filtering || self.live.contains(target))
     }
 }
 
