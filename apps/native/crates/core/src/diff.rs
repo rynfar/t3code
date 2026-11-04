@@ -7,6 +7,7 @@
 //! (`apps/web/src/lib/toolCallDiff.ts`).
 
 mod parse;
+mod review;
 mod rows;
 mod scope;
 mod session;
@@ -17,6 +18,7 @@ mod whitespace;
 use std::sync::Arc;
 
 pub use parse::parse_patch;
+pub use review::{ReviewScope, ReviewFile, ReviewModel, PatchTicket, FilePatchState};
 pub use session::DiffSession;
 pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{

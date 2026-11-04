@@ -131,7 +131,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                             .size(Size::IconSm)
                             .icon(Icon::RefreshCw)
                             .icon_size(14.)
-                            .tooltip(if panel.pending { "Refreshing diff…" } else { "Refresh diff" })
+                            .tooltip(if panel.pending || panel.review().is_some_and(|r| r.states.values().any(|s| s.pending)) { "Refreshing diff…" } else { "Refresh diff" })
                             .on_click(act(DiffPanel::refresh)),
                     )
                 })

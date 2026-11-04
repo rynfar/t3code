@@ -394,6 +394,8 @@ fn diff_preview_picks_the_requested_source() {
     let branch = decode_diff_preview(&result, PreviewSourceKind::BranchRange).expect("branch source");
     assert_eq!((branch.diff.as_str(), branch.truncated, branch.totals), ("b", true, Some((5, 1))));
     assert_eq!(branch.head_ref.as_deref(), Some("feat"));
+    assert_eq!(branch.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+
     let tree = decode_diff_preview(&result, PreviewSourceKind::WorkingTree).expect("working tree");
     assert_eq!((tree.diff.as_str(), tree.totals), ("w", None));
 }
@@ -774,4 +776,101 @@ fn session_fold_defaults_follow_current_files_until_an_explicit_action() {
     assert_eq!(session.resolve_folds("scope-a", &appended, true), vec![false, false, false], "expand-all is an explicit override");
     assert!(session.resolve_folds("scope-b", &[], true).is_empty());
     assert_eq!(session.resolve_folds("scope-b", &appended, true), vec![true, true, true], "an empty loading scope does not pin an empty override");
+}
+
+fn review_scope() -> ReviewScope {
+    ReviewScope { environment: "smoke".into(), connection: 1, cwd: "/repo".into(), kind: PreviewSourceKind::WorkingTree, base_ref: None, ignore_whitespace: true }
+}
+
+fn metadata(paths: &[&str], revision: &str, incomplete: bool) -> serde_json::Value {
+    json!({"cwd":"/repo", "generatedAt":revision, "incomplete":incomplete, "sources":[{
+        "id":"working-tree", "kind":"working-tree", "baseRef":"HEAD", "headRef":null,
+        "diff":"", "diffHash":revision, "truncated":false, "patchesDeferred":true,
+        "files":paths.iter().map(|path| json!({"path":path,"previousPath":null,"additions":3,"deletions":2})).collect::<Vec<_>>()
+    }]})
+}
+
+#[test]
+fn lazy_review_tracks_paths_across_complete_metadata_and_bounds_revision_reads() {
+    let mut review = ReviewModel::new(review_scope());
+    assert_eq!(review.scope.request(true).1, json!({"cwd":"/repo","ignoreWhitespace":true,"sourceKind":"working-tree","metadataOnly":true,"trackedOnly":true}));
+    review.accept_preview(&metadata(&["b","c","d","e","f","g","h","i","j"], "tracked", true));
+    assert!(review.incomplete && !review.has_complete_preview());
+    let ParsedPatch::Files(placeholders) = review.patch() else { panic!("metadata must remain visible") };
+    assert_eq!(placeholders.len(), 9);
+    assert!(placeholders.iter().all(|f| f.hunks.is_empty()));
+    use crate::composer::review::{build_diff_comment, Selection, Side};
+    let selection = Selection { start: 1, end: 1, side: Side::Additions, end_side: Side::Additions };
+    assert!(build_diff_comment("id".into(), "unstaged".into(), "Uncommitted".into(), &placeholders[0], selection, "comment").is_none(), "an unloaded placeholder has no selectable line");
+    let initial = review.take_requests();
+    assert_eq!(initial.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["b","c","d","e"]);
+    review.request_file("j");
+    review.load_next();
+    assert!(review.take_requests().is_empty(), "no fifth concurrent read");
+    assert!(review.accept_patch(&initial[0], Err("offline".into())));
+    assert_eq!(review.revision, 1, "patch failure cannot refresh the preview revision");
+    assert_eq!(review.take_requests().len(), 1, "on-demand file uses the released permit");
+    review.accept_preview(&metadata(&["a","b","c","d","e","f","g","h","i","j"], "complete", false));
+    assert!(review.has_complete_preview());
+    assert!(!review.accept_patch(&initial[1], Err("late failure".into())));
+    let first = review.take_requests();
+    assert_eq!(first.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["a","b","c","d"]);
+    for ticket in &first { review.accept_patch(ticket, Err("failed".into())); }
+    let rest = review.take_requests();
+    assert_eq!(rest.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["e","j"], "automatic and explicitly selected paths survive insertion");
+    for ticket in &rest { review.accept_patch(ticket, Err("failed".into())); }
+    assert!(review.take_requests().is_empty(), "errors await explicit retry");
+    review.retry("b");
+    let retry = review.take_requests().pop().unwrap();
+    assert_eq!(retry.file.path, "b");
+    assert_eq!(retry.request().1["file"], json!({"path":"b","previousPath":null,"sourceKind":"working-tree"}));
+    review.accept_patch(&retry, Err("failed again".into()));
+    review.load_next();
+    let next = review.take_requests();
+    assert_eq!(next.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["f","g","h","i"]);
+    for scope in [
+        ReviewScope { environment:"elsewhere".into(), ..review_scope() },
+        ReviewScope { connection:2, ..review_scope() },
+        ReviewScope { cwd:"/other".into(), ..review_scope() },
+        ReviewScope { kind:PreviewSourceKind::BranchRange, ..review_scope() },
+        ReviewScope { base_ref:Some("main".into()), ..review_scope() },
+        ReviewScope { ignore_whitespace:false, ..review_scope() },
+    ] {
+        let ticket = PatchTicket { scope, ..next[0].clone() };
+        assert!(!review.accept_patch(&ticket, Err("stale scope".into())));
+    }
+}
+
+#[test]
+fn review_accepts_legacy_complete_patch_and_preserves_rename_and_replaced_file_identity() {
+    let mut review = ReviewModel::new(review_scope());
+    let mut legacy = metadata(&["src/main.rs"], "old-server", false);
+    let source = &mut legacy["sources"][0];
+    source.as_object_mut().unwrap().remove("patchesDeferred");
+    source["diff"] = json!(MODIFIED);
+    review.accept_preview(&legacy);
+    assert!(review.has_complete_preview() && !review.lazy());
+    assert!(review.take_requests().is_empty(), "a complete old-server patch needs no file requests or second metadata read");
+    assert_eq!(review.patch(), parse_patch(MODIFIED));
+    let mut renamed = metadata(&["canonical/new.rs"], "rename", false);
+    renamed["sources"][0]["files"][0]["previousPath"] = json!("canonical/old.rs");
+    review.accept_preview(&renamed);
+    let placeholder = review.files()[0].placeholder();
+    let ticket = review.take_requests().pop().unwrap();
+    assert_eq!(ticket.request().1["file"]["previousPath"], "canonical/old.rs");
+    let mut reply = renamed.clone();
+    reply["sources"][0]["diff"] = json!("diff --git a/old.rs b/new.rs\nrename from old.rs\nrename to new.rs\n--- a/old.rs\n+++ b/new.rs\n@@ -1 +1 @@\n-before\n+after\n");
+    review.accept_patch(&ticket, Ok(decode_diff_preview(&reply, PreviewSourceKind::WorkingTree).unwrap()));
+    let ParsedPatch::Files(files) = review.patch() else { panic!("files") };
+    assert_eq!((files[0].path(), files[0].previous_path()), (placeholder.path(), placeholder.previous_path()));
+    assert_eq!(files[0].hunks.len(), 1);
+    let comment = crate::composer::review::build_diff_comment("id".into(), "unstaged".into(), "Uncommitted".into(), &files[0], crate::composer::review::Selection { start:1, end:1, side:crate::composer::review::Side::Additions, end_side:crate::composer::review::Side::Additions }, "review").unwrap();
+    assert_eq!(comment.file_path, "canonical/new.rs");
+    let mut replacement = metadata(&["entry"], "symlink", false);
+    review.accept_preview(&replacement);
+    let ticket = review.take_requests().pop().unwrap();
+    replacement["sources"][0]["diff"] = json!("diff --git a/entry b/entry\ndeleted file mode 100644\n--- a/entry\n+++ /dev/null\n@@ -1 +0,0 @@\n-before\ndiff --git a/entry b/entry\nnew file mode 120000\n--- /dev/null\n+++ b/entry\n@@ -0,0 +1 @@\n+target\n");
+    review.accept_patch(&ticket, Ok(decode_diff_preview(&replacement, PreviewSourceKind::WorkingTree).unwrap()));
+    let ParsedPatch::Files(files) = review.patch() else { panic!("files") };
+    assert_eq!(files.iter().map(|f| f.change).collect::<Vec<_>>(), [ChangeKind::Deleted, ChangeKind::New]);
 }

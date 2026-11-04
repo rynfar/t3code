@@ -59,6 +59,8 @@ pub(crate) fn gutter_width(digits: usize, char_width: Pixels) -> Pixels {
 
 impl DiffPanel {
     pub(super) fn render_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity().downgrade();
+        cx.defer(move |cx| { if let Some(entity) = entity.upgrade() { entity.update(cx, |panel, cx| panel.load_nearby(cx)); } });
         let p = palette(cx);
         let font = (cx.theme().mono_font_family.clone(), cx.theme().mono_font_size);
         if self.measured_font.as_ref() != Some(&font) {
@@ -273,7 +275,8 @@ impl DiffPanel {
             return div().into_any_element();
         };
         let p = palette(cx);
-        let collapsed = self.is_collapsed(file_ix);
+        let patch_state = self.file_patch_state(file.path());
+        let collapsed = self.is_collapsed(file_ix) || patch_state.as_ref().is_some_and(|state| state.files.is_none());
         let (icon, icon_color) = change_icon(file, p);
         let title = match file.change {
             ChangeKind::RenamePure | ChangeKind::RenameChanged => format!("{} → {}", file.previous_path(), file.path()),
@@ -329,6 +332,12 @@ impl DiffPanel {
                     .on_click(move |event, window, cx| copy(event, window, cx)),
             )
             .child(div().flex_1())
+            .children(patch_state.as_ref().filter(|state| state.files.is_none() && state.error.is_none()).map(|_| div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Loading diff…")))
+            .children(patch_state.as_ref().filter(|state| state.error.is_some()).map(|_| {
+                let path = file.path().to_owned();
+                Button::new(("diff-file-retry", file_ix)).variant(Variant::GhostMuted).size(Size::IconMicro).icon(Icon::RefreshCw).tooltip("Retry loading diff").on_click(cx.listener(move |this, _, _, _| this.patch_command(super::source::Command::Retry(path.clone()))))
+            }))
+            .children(patch_state.as_ref().filter(|state| state.truncated).map(|_| div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Partial diff preview")))
             .child(stat_label(u64::from(file.additions), u64::from(file.deletions), cx))
             .into_any_element()
     }

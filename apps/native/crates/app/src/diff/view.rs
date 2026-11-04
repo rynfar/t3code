@@ -59,9 +59,17 @@ pub struct View {
 }
 
 impl View {
-    pub fn new(parsed: Arc<Parsed>, scope_key: String, layout: Layout, session: &DiffSession, files_collapsed_default: bool, tree_collapsed: &HashSet<String>) -> View {
+    pub fn new(parsed: Arc<Parsed>, scope_key: String, layout: Layout, session: &DiffSession, files_collapsed_default: bool, tree_collapsed: &HashSet<String>, review: bool) -> View {
         let files = parsed.files();
-        let keys: Vec<String> = files.iter().map(FileDiff::key).collect();
+        let mut occurrences = std::collections::HashMap::new();
+        let keys: Vec<String> = files.iter().map(|file| {
+            if !review { return file.key(); }
+            let path_key = serde_json::json!([file.previous_path(), file.path()]).to_string();
+            let count = occurrences.entry(path_key.clone()).or_insert(0);
+            let key = format!("{path_key}:{count}");
+            *count += 1;
+            key
+        }).collect();
         let folded = session.resolve_folds(&scope_key, &keys, files_collapsed_default);
         let rows: Vec<Vec<DiffRow>> =
             files.iter().enumerate().map(|(index, file)| file_rows(index, file, folded[index], layout)).collect();
@@ -166,4 +174,28 @@ fn gutter_digits(file: &FileDiff) -> usize {
         .max()
         .unwrap_or(1);
     largest.max(1).ilog10() as usize + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use t3_core::diff::{ChangeKind, ReviewFile};
+
+    #[test]
+    fn lazy_file_keys_keep_folds_when_metadata_changes_type_and_inserts_a_path() {
+        let stat = ReviewFile { path: "new.rs".into(), previous_path: Some("old.rs".into()), additions: 1, deletions: 0 };
+        let placeholder = stat.placeholder();
+        let parsed = |files| Parsed::from_patch(ParsedPatch::Files(files), false, None, None, None);
+        let mut session = DiffSession::default();
+        let initial = View::new(parsed(vec![placeholder.clone()]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
+        let key = initial.key(0).unwrap().to_owned();
+        session.set_file_fold("scope".into(), key.clone(), false, || initial.folded_keys());
+        let loaded = FileDiff { change: ChangeKind::RenamePure, ..placeholder };
+        let inserted = ReviewFile { path: "a.rs".into(), previous_path: None, additions: 1, deletions: 0 }.placeholder();
+        let next = View::new(parsed(vec![inserted, loaded.clone()]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
+        assert_eq!(next.key(1), Some(key.as_str()));
+        assert!(!next.is_folded(1));
+        let pair = View::new(parsed(vec![loaded.clone(), loaded]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
+        assert_ne!(pair.key(0), pair.key(1), "same-path delete/add entries remain distinct");
+    }
 }
