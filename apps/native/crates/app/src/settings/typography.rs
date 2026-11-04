@@ -1,5 +1,8 @@
 //! `TypographySettings.tsx` and `FontFamilyPicker.tsx`: device typography with installed fonts.
 
+#[path = "font_previews.rs"]
+mod previews;
+
 use super::{
     SettingsView,
     controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, muted_text, r, section},
@@ -40,9 +43,14 @@ pub(super) struct TypographyState {
     highlighted: usize,
     scroll: UniformListScrollHandle,
     _subscription: Subscription,
+    previews: previews::FontPreviews,
 }
 
 impl TypographyState {
+    pub(super) fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.previews.focused(window, cx)
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         if !cx.has_global::<CachedFonts>() {
             cx.set_global(CachedFonts::default());
@@ -59,6 +67,7 @@ impl TypographyState {
             }
         });
         Self {
+            previews: previews::FontPreviews::new(window, cx),
             advanced: false,
             fonts: Rc::new(cx.global::<CachedFonts>().0.families().unwrap_or_default().to_vec()),
             font_task: None,
@@ -185,9 +194,9 @@ impl SettingsView {
         if role == FontRole::Interface && separate {
             return row.into_any_element();
         }
-        let mut previews = v_flex().gap(r(4.)).child(font_preview(preview_role, cx));
+        let mut previews = v_flex().gap(r(4.)).child(self.typography.previews.render(preview_role, cx));
         if !separate && role == FontRole::Code {
-            previews = previews.child(font_preview(FontRole::Terminal, cx));
+            previews = previews.child(self.typography.previews.render(FontRole::Terminal, cx));
         }
         row.below(previews).into_any_element()
     }
@@ -380,30 +389,6 @@ impl SettingsView {
         }
         cx.notify();
     }
-}
-
-fn font_preview(role: FontRole, cx: &App) -> impl IntoElement {
-    let p = palette(cx);
-    let text = match role {
-        FontRole::Interface | FontRole::Prompt => {
-            "Use $frontend-design to fix the flaky test in surface.test.ts and align the header with SettingsPanels.tsx before shipping."
-        }
-        FontRole::Code => "export function formatUser(user: User) {\n  return `${user.name} <${user.email}>`; // 0O 1lI\n}",
-        FontRole::Terminal => "$ bun test\n✓ surface.test.ts (3 tests)\n3 passed, 0 failed",
-    };
-    div()
-        .my(r(4.))
-        .px(r(12.))
-        .py(r(8.))
-        .rounded(r(8.))
-        .border_1()
-        .border_color(hsla(p.border))
-        .bg(hsla(p.background))
-        .font_family(theme::font_family(role, cx))
-        .text_size(px(theme::font_size(role, cx)))
-        .line_height(px(theme::font_size(role, cx) * if role == FontRole::Prompt { 1.625 } else { 1.375 }))
-        .text_color(hsla(p.foreground))
-        .child(text)
 }
 
 fn installed_fonts(text: std::sync::Arc<gpui::TextSystem>, names: Vec<String>) -> Vec<(String, bool)> {

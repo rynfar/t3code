@@ -11,7 +11,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    App, Bounds, Context, EntityInputHandler, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFeatures, FontStyle,
     FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
     px, relative, size,
@@ -82,8 +82,18 @@ impl RowCache {
     }
 }
 
-pub struct TerminalElement {
-    pane: Entity<TerminalPane>,
+pub(crate) trait TerminalSurface: EntityInputHandler {
+    fn fit(&mut self, grid: Grid, cell: (f32, f32), cx: &mut Context<Self>);
+    fn set_geometry(&mut self, geometry: Geometry);
+}
+
+impl TerminalSurface for TerminalPane {
+    fn fit(&mut self, grid: Grid, cell: (f32, f32), cx: &mut Context<Self>) { self.fit(grid, cell, cx); }
+    fn set_geometry(&mut self, geometry: Geometry) { self.set_geometry(geometry); }
+}
+
+pub(crate) struct TerminalElement<T: TerminalSurface> {
+    pane: Entity<T>,
     front: Front,
     frame: Rc<RefCell<Frame>>,
     rows: Rc<RefCell<RowCache>>,
@@ -92,9 +102,9 @@ pub struct TerminalElement {
     marked: Option<SharedString>,
 }
 
-impl TerminalElement {
+impl<T: TerminalSurface> TerminalElement<T> {
     pub fn new(
-        pane: Entity<TerminalPane>,
+        pane: Entity<T>,
         front: Front,
         frame: Rc<RefCell<Frame>>,
         rows: Rc<RefCell<RowCache>>,
@@ -117,7 +127,7 @@ pub struct Prepainted {
     line_height: Pixels,
 }
 
-impl IntoElement for TerminalElement {
+impl<T: TerminalSurface> IntoElement for TerminalElement<T> {
     type Element = Self;
 
     fn into_element(self) -> Self {
@@ -125,7 +135,7 @@ impl IntoElement for TerminalElement {
     }
 }
 
-impl Element for TerminalElement {
+impl<T: TerminalSurface> Element for TerminalElement<T> {
     type RequestLayoutState = ();
     type PrepaintState = Prepainted;
 
