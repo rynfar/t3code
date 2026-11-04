@@ -277,6 +277,8 @@ impl Render for Composer {
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
                 // Each composer takes its own shortcuts, so a side chat's never reach the open thread's.
                 .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
+                .on_action(cx.listener(|this, _: &super::OpenWorkspace, window, cx| this.open_workspace(window, cx)))
+                .on_action(cx.listener(|this, _: &super::UsePreviousWorktree, window, cx| this.use_previous_worktree(window, cx)))
                 .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| this.open_permissions(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).
                 .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
@@ -324,7 +326,8 @@ impl Render for Composer {
                     if this.close_context_details(cx) {
                         return;
                     }
-                    if this.permissions_open || this.approval_menu_open {
+                    if this.workspace.open || this.permissions_open || this.approval_menu_open {
+                        this.workspace.open = false;
                         this.permissions_open = false;
                         this.approval_menu_open = false;
                         cx.notify();
@@ -402,7 +405,8 @@ impl Render for Composer {
                                 .child(self.render_primary(&resolved, cx)),
                         ),
                     ),
-                ),
+                )
+                .children(self.render_workspace(cx).map(|control| h_flex().pt(px(8.)).px(px(8.)).child(control))),
         )
     }
 }

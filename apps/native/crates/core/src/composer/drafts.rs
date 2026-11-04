@@ -86,6 +86,7 @@ pub struct SavedThread {
 pub struct Draft {
     pub prompt: String,
     pub model_selection: Option<ModelSelection>,
+    pub workspace: Option<crate::workspace::DraftWorkspace>,
     pub runtime_mode: Option<RuntimeMode>,
     pub interaction_mode: Option<InteractionMode>,
     pub threads: Vec<SavedThread>,
@@ -112,6 +113,7 @@ impl Draft {
             && self.pending_attachment_count == 0
             && self.terminals.is_empty()
             && self.review_comments.is_empty()
+            && self.workspace.is_none()
             && self.model_selection.is_none()
             && self.runtime_mode.is_none()
             && self.interaction_mode.is_none()

@@ -223,6 +223,8 @@ impl Composer {
         let config = state.server_config.config.as_ref();
         let root = state.shell.project(&project_id).map(|project| project.workspace_root.clone());
         let configured = config.and_then(|config| workspace::configured_env_mode(&config.settings, &project_id));
+        let workspace_choice = self.selected_workspace();
+        let origin = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
         let new_projects_root = config.and_then(|config| config.new_projects_root.clone());
         // Settled threads the shell left out still count, as `readUnloadedThreadCount` does.
         let has_threads = state.shell.snapshot.as_ref().is_some_and(|shell| {
@@ -232,24 +234,31 @@ impl Composer {
         let start_from_origin = config.is_some_and(|config| workspace::start_from_origin(&config.settings, &project_id, ThreadEnvMode::Worktree));
         let cwd = root.clone().unwrap_or_default();
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
-        let refs = state.rpc(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd));
+        let refs = workspace_choice.as_ref().and_then(workspace::DraftWorkspace::strategy).is_none().then(|| state.request(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd), |value| serde_json::from_value::<VcsRefs>(value).map_err(|error| error.to_string()))).flatten();
         let target = Target::Draft(project_id.clone());
+        self.record_draft(&target, cx);
         let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let file_mode = match (&configured, &root) {
-                (None, Some(_)) => project_file
+                (None, Some(_)) if workspace_choice.is_none() => project_file
                     .await
                     .ok()
                     .and_then(|result| workspace::project_file_contents(&result).and_then(workspace::project_file_env_mode)),
                 _ => None,
             };
-            let mode = workspace::new_thread_env_mode(configured, file_mode, root.as_deref(), new_projects_root.as_deref(), has_threads);
+            let mode = workspace_choice.as_ref().map_or_else(|| workspace::new_thread_env_mode(configured, file_mode, root.as_deref(), new_projects_root.as_deref(), has_threads), |choice| choice.mode);
+            let selected = workspace_choice.as_ref().and_then(workspace::DraftWorkspace::strategy);
             let refs = match (mode, &root) {
-                (ThreadEnvMode::Worktree, Some(_)) => refs.await.ok().and_then(|value| serde_json::from_value::<VcsRefs>(value).ok()),
+                (ThreadEnvMode::Worktree, Some(_)) if selected.is_none() => match refs {Some(task) => task.await.ok().and_then(Result::ok), None => None},
                 _ => None,
             };
-            let strategy = workspace::launch_strategy(mode, refs.as_ref(), start_from_origin);
+            let strategy = selected.map(Ok).unwrap_or_else(|| workspace::launch_strategy(mode, refs.as_ref(), start_from_origin));
             let launch = this.update_in(cx, |this, _, cx| {
+                let state = this.state.read(cx);
+                let current = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
+                if current != origin || state.selected_thread.is_some() || state.draft_project.as_deref() != Some(project_id.as_str()) || this.snapshot.target.as_ref() != Some(&target) || state.shell.project(&project_id).map(|project| &project.workspace_root) != root.as_ref() {
+                    return Err("The destination changed before launch. Select the workspace again.".to_owned());
+                }
                 let strategy = strategy.map_err(str::to_owned)?;
                 let (thread_id, command_id, message_id) = (uuid_v4(), uuid_v4(), uuid_v4());
                 let payload = commands::launch_thread(&LaunchThread {
@@ -280,6 +289,8 @@ impl Composer {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
+                let state = this.state.read(cx);
+                if state.environment() != origin.2.as_deref() || this.snapshot.target.as_ref() != Some(&target) { cx.notify(); return; }
                 // A background launch leaves the draft open for the next thread.
                 if result.is_ok() && intent != SubmitIntent::Background {
                     this.discard_draft(&target, cx);

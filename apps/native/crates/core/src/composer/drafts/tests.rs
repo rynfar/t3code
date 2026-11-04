@@ -56,6 +56,7 @@ fn the_store_round_trips_and_skips_bad_entries() {
     let machine=super::super::records::environment_record("env-build","Build Mac");
     let prompt = format!("see {} and {} on {}", thread.reference(), excerpt.reference(), super::super::records::reference(&machine).unwrap());
     let full = Draft {
+        workspace: None,
         context_records: vec![machine.into()],
         prompt: prompt.clone(),
         model_selection: Some(ModelSelection { instance_id: "codex".into(), model: "gpt-5".into(), options: None }),
@@ -123,4 +124,32 @@ fn the_oldest_drafts_go_first() {
     let mut store = DraftStore::from_value(Some(&json!({"version":1,"drafts":oversized})));
     store.set(&thread_key("new"), draft("new", MAX_DRAFTS as i64 + 2));
     assert_eq!(store.take_pruned_keys(), [new_thread_key("0"), new_thread_key("1"), new_thread_key("2")]);
+}
+
+#[test]
+fn workspace_only_draft_survives_restart_with_its_destination_scope() {
+    let workspace = crate::workspace::DraftWorkspace {
+        environment_id: "env-a".into(),
+        project_root: "/repo".into(),
+        mode: crate::server_config::ThreadEnvMode::Worktree,
+        previous: Some(crate::workspace::PreviousWorktreeSeed {
+            branch: Some("feature".into()),
+            worktree_path: "/wt/feature".into(),
+        }),
+    };
+    let draft = Draft {
+        workspace: Some(workspace.clone()),
+        ..Draft::default()
+    };
+    let mut store = DraftStore::default();
+    assert!(store.set(&new_thread_key("p1"), draft));
+    let restored = DraftStore::from_value(Some(&store.to_value()));
+    let saved = restored
+        .get(&new_thread_key("p1"))
+        .unwrap()
+        .workspace
+        .as_ref()
+        .unwrap();
+    assert_eq!(saved, &workspace);
+    assert!(!saved.in_scope("env-b", "/repo"));
 }

@@ -240,6 +240,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FocusPrompt, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.focus(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &crate::composer::OpenWorkspace, window, cx| this.composer.update(cx, |composer, cx| composer.open_workspace(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::UsePreviousWorktree, window, cx| this.composer.update(cx, |composer, cx| composer.use_previous_worktree(window, cx))))
             .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
             }))

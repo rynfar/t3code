@@ -23,6 +23,7 @@ mod send;
 mod stash;
 pub(crate) use pending::banner_surface;
 mod view;
+mod workspace;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -45,7 +46,7 @@ use crate::sidebar::controller::now_ms;
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt]);
+actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt, OpenWorkspace, UsePreviousWorktree]);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
@@ -177,6 +178,7 @@ pub struct Composer {
     context: context::ContextChips,
     citation_editor: Option<citations::CommentEditor>,
     drafts: drafts::Drafts,
+    workspace: workspace::Workspace,
     queue: queue::Queue,
     stash_state: stash::Stashed,
     /// The open thread's worktree setup; a side chat's composer has none.
@@ -221,6 +223,9 @@ impl Composer {
                 }
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
+                }
+                if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase) {
+                    this.sync_workspace(*event == AppEvent::ServerConfig, cx);
                 }
                 if matches!(event, AppEvent::SidebarSelection | AppEvent::Shell | AppEvent::Phase) && !this.context.linked.is_empty() { cx.notify(); }
                 if *event == AppEvent::ComposerMention {
@@ -301,6 +306,7 @@ impl Composer {
             context: Default::default(),
             citation_editor: None,
             drafts: Default::default(),
+            workspace: Default::default(),
             queue: Default::default(),
             stash_state: Default::default(),
             setup,
@@ -309,6 +315,7 @@ impl Composer {
         composer.load_drafts(cx);
         composer.load_stash();
         composer.refresh(true, window, cx);
+        composer.sync_workspace(true, cx);
         composer
     }
 

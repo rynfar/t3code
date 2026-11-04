@@ -65,3 +65,139 @@ fn project_file_results_skip_missing_and_truncated_files() {
     assert_eq!(project_file_contents(&json!({"contents": "", "truncated": false, "exists": false})), None);
     assert_eq!(project_file_contents(&json!({"contents": "{", "truncated": true})), None);
 }
+
+#[test]
+fn previous_worktree_uses_the_latest_eligible_project_thread_and_keeps_first_ties() {
+    let threads = [
+        (
+            "p1",
+            Some("old"),
+            Some("/wt/old"),
+            "2026-01-01T00:00:00Z",
+            None,
+        ),
+        (
+            "p1",
+            Some("feature"),
+            Some("/wt/feature"),
+            "2026-02-01T01:00:00+01:00",
+            None,
+        ),
+        (
+            "p1",
+            Some("tie"),
+            Some("/wt/tie"),
+            "2026-02-01T00:00:00Z",
+            None,
+        ),
+        (
+            "p2",
+            Some("other"),
+            Some("/wt/other"),
+            "2026-03-01T00:00:00Z",
+            None,
+        ),
+        (
+            "p1",
+            Some("current"),
+            Some("/wt/current"),
+            "2026-04-01T00:00:00Z",
+            None,
+        ),
+        (
+            "p1",
+            Some("archived"),
+            Some("/wt/archived"),
+            "2026-05-01T00:00:00Z",
+            Some("archived"),
+        ),
+        ("p1", Some("invalid"), Some("/wt/invalid"), "invalid", None),
+        ("p1", None, Some(""), "2026-06-01T00:00:00Z", None),
+    ];
+    let select = |current| {
+        previous_worktree_seed(
+            threads.iter().map(
+                |(project, branch, path, updated, archived)| PreviousThread {
+                    project_id: project,
+                    branch: *branch,
+                    worktree_path: *path,
+                    updated_at: updated,
+                    archived_at: *archived,
+                },
+            ),
+            "p1",
+            current,
+        )
+    };
+    let seed = select(Some("/wt/current")).unwrap();
+    assert_eq!(seed.branch.as_deref(), Some("feature"));
+    assert_eq!(seed.worktree_path, "/wt/feature");
+    assert_eq!(seed.label(), "Previous worktree (feature)");
+    assert_eq!(select(None).unwrap().branch.as_deref(), Some("current"));
+    let seed = previous_worktree_seed(
+        [PreviousThread {
+            project_id: "p1",
+            branch: None,
+            worktree_path: Some("/wt/detached"),
+            updated_at: "2026-01-01T00:00:00Z",
+            archived_at: None,
+        }],
+        "p1",
+        None,
+    )
+    .unwrap();
+    assert_eq!(seed.label(), "Previous worktree");
+    assert!(previous_worktree_seed(std::iter::empty(), "p1", None).is_none());
+}
+
+#[test]
+fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
+    let choice = DraftWorkspace {
+        environment_id: "env-a".into(),
+        project_root: "/repo".into(),
+        mode: ThreadEnvMode::Worktree,
+        previous: Some(PreviousWorktreeSeed {
+            branch: Some("feature".into()),
+            worktree_path: "/wt/feature".into(),
+        }),
+    };
+    assert!(choice.in_scope("env-a", "/repo"));
+    assert!(!choice.in_scope("env-b", "/repo"));
+    assert!(!choice.in_scope("env-a", "/other"));
+    assert_eq!(
+        choice.strategy().unwrap().to_json(),
+        json!({"type":"existing_worktree", "worktreePath":"/wt/feature", "branch":"feature"})
+    );
+    let current = DraftWorkspace { mode: ThreadEnvMode::Local, ..choice.clone() };
+    assert_eq!(current.strategy(), choice.strategy());
+    let detached = DraftWorkspace {
+        previous: Some(PreviousWorktreeSeed {
+            branch: None,
+            worktree_path: "/wt/detached".into(),
+        }),
+        ..choice.clone()
+    };
+    assert_eq!(
+        detached.strategy().unwrap().to_json(),
+        json!({"type":"existing_worktree", "worktreePath":"/wt/detached"})
+    );
+    let local = DraftWorkspace {
+        mode: ThreadEnvMode::Local,
+        previous: None,
+        ..choice.clone()
+    };
+    assert_eq!(local.strategy(), Some(Strategy::Root));
+    let new = DraftWorkspace {
+        previous: None,
+        ..choice
+    };
+    assert_eq!(new.strategy(), None);
+    assert!(can_use_previous_worktree(false, false, false));
+    for (server, locked, force) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        assert!(!can_use_previous_worktree(server, locked, force));
+    }
+}
