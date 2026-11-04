@@ -78,10 +78,85 @@ pub fn markdown_media_runs(node: &markdown::mdast::Node, source: &str) -> Vec<Ma
     runs
 }
 
+pub struct MarkdownMediaDocument {
+    source: std::sync::Arc<str>,
+    definitions: std::sync::OnceLock<std::collections::HashMap<String, String>>,
+}
+
+impl MarkdownMediaDocument {
+    pub fn new(source: std::sync::Arc<str>) -> Self { Self { source, definitions: Default::default() } }
+    pub fn prose(&self, fragment: &str, references: &[String]) -> String {
+        if references.is_empty() { return fragment.to_owned(); }
+        let definitions = self.definitions.get_or_init(|| {
+            let Ok(root) = markdown::to_mdast(&self.source, &markdown::ParseOptions::gfm()) else { return Default::default() };
+            fn collect(node: &markdown::mdast::Node, source: &str, out: &mut std::collections::HashMap<String, String>) {
+                if let markdown::mdast::Node::Definition(definition) = node {
+                    if let Some(position) = &definition.position && let Some(text) = source.get(position.start.offset..position.end.offset) {
+                        out.entry(definition.identifier.clone()).or_insert_with(|| text.to_owned());
+                    }
+                } else if let Some(children) = node.children() {
+                    for child in children { collect(child, source, out); }
+                }
+            }
+            let mut out = std::collections::HashMap::new(); collect(&root, &self.source, &mut out); out
+        });
+        let mut out = fragment.to_owned();
+        for reference in references { if let Some(definition) = definitions.get(reference) { out.push_str("\n\n"); out.push_str(definition); } }
+        out
+    }
+}
+
+pub struct MediaVisibility<K> { consumers: std::collections::HashMap<u64, K> }
+impl<K> Default for MediaVisibility<K> {
+    fn default() -> Self { Self { consumers: Default::default() } }
+}
+impl<K: Eq + Clone> MediaVisibility<K> {
+    pub fn set(&mut self, consumer: u64, key: Option<K>) -> bool {
+        if self.consumers.get(&consumer) == key.as_ref() { return false; }
+        if let Some(key) = key { self.consumers.insert(consumer, key); }
+        else { self.consumers.remove(&consumer); }
+        true
+    }
+    pub fn get(&self, consumer: u64) -> Option<&K> { self.consumers.get(&consumer) }
+    pub fn contains(&self, key: &K) -> bool { self.consumers.values().any(|value| value == key) }
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &K)> { self.consumers.iter().map(|(id, key)| (*id, key)) }
+    pub fn keys(&self) -> impl Iterator<Item = &K> { self.consumers.values() }
+    pub fn is_empty(&self) -> bool { self.consumers.is_empty() }
+    pub fn len(&self) -> usize { self.consumers.len() }
+}
+
+pub fn media_cache_evictions<K>(mut residents: Vec<(K, usize, u64, bool)>, budget: usize, max_entries: usize) -> Vec<K> {
+    let mut count = residents.len();
+    let mut bytes: usize = residents.iter().map(|(_, bytes, _, _)| bytes).sum();
+    residents.sort_by_key(|(_, _, used, _)| *used);
+    let mut evict = Vec::new();
+    for (key, size, _, protected) in residents {
+        if bytes <= budget && count <= max_entries { break; }
+        if !protected { bytes -= size; count -= 1; evict.push(key); }
+    }
+    evict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::media::{AssetResource, MarkdownImageSource, classify_markdown_image_source};
+
+    #[test]
+    fn viewport_consumers_release_resources_and_bound_inactive_decodes() {
+        let mut visibility = MediaVisibility::default();
+        assert!(visibility.set(1, Some("a")));
+        assert!(!visibility.set(1, Some("a")));
+        visibility.set(2, Some("a"));
+        visibility.set(1, None);
+        assert!(visibility.contains(&"a"));
+        visibility.set(2, None);
+        assert!(visibility.is_empty());
+        let residents = (0..100).map(|key| (key, 10, key as u64, key == 99)).collect();
+        let evicted = media_cache_evictions(residents, 20, 100);
+        assert_eq!(evicted, (0..98).collect::<Vec<_>>());
+        assert_eq!(media_cache_evictions((0..100).map(|key| (key, 1, key as u64, key == 99)).collect(), 1000, 2), (0..98).collect::<Vec<_>>());
+    }
 
     #[test]
     fn file_images_resolve_beside_the_document_on_both_host_platforms() {
@@ -153,6 +228,10 @@ mod paragraph_tests {
             MarkdownMediaRun::Image { url: "b.svg".into(), alt: "two".into() },
             MarkdownMediaRun::Prose(" after.".into()),
         ]);
+        let document = MarkdownMediaDocument::new("See [guide][g] ![chart](chart.png)\n\n[g]: https://example.com".into());
+        let fragment = "See [guide][g] ";
+        assert!(document.prose(fragment, &["g".into()]).contains("[g]: https://example.com"));
+        assert!(document.prose(fragment, &["g".into()]).starts_with(fragment));
         assert_eq!(resolve_asset_url("http://host:1/base", "/api/assets/a"), Some("http://host:1/api/assets/a".into()));
         assert_eq!(resolve_asset_url("http://host:1", "https://local:2/api/assets/a"), Some("https://local:2/api/assets/a".into()));
         assert_eq!(resolve_asset_url("http://host:1", "javascript:bad"), None);

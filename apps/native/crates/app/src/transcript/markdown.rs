@@ -24,6 +24,8 @@ struct Cached {
     drawn: u64,
     /// Set once the text holds image syntax; it stays on so the parse is not redone.
     media: bool,
+    document: super::media::MediaDocument,
+    extensions: gpui_component::text::MarkdownExtensions,
     _repaint: Subscription,
 }
 
@@ -33,6 +35,7 @@ struct Cached {
 pub struct MarkdownState {
     pub entity: Entity<TextViewState>,
     media: bool,
+    extensions: Option<gpui_component::text::MarkdownExtensions>,
 }
 
 impl From<&MarkdownState> for MarkdownState {
@@ -44,7 +47,7 @@ impl From<&MarkdownState> for MarkdownState {
 /// External states supply their own extensions, such as a file preview's media scope.
 impl From<&Entity<TextViewState>> for MarkdownState {
     fn from(entity: &Entity<TextViewState>) -> Self {
-        MarkdownState { entity: entity.clone(), media: false }
+        MarkdownState { entity: entity.clone(), media: false, extensions: None }
     }
 }
 
@@ -94,19 +97,22 @@ impl MarkdownStore {
             if !Arc::ptr_eq(&cached.text, text) && *cached.text != **text {
                 let previous = cached.text.clone();
                 cached.text = text.clone();
+                *cached.document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new(text.clone()));
                 cached.state.update(cx, |state, cx| match text.strip_prefix(&*previous) {
                     Some(delta) if !previous.is_empty() => state.push_str(delta, cx),
                     _ => state.set_text(text, cx),
                 });
             }
-            return MarkdownState { entity: cached.state.clone(), media: cached.media };
+            return MarkdownState { entity: cached.state.clone(), media: cached.media, extensions: Some(cached.extensions.clone()) };
         }
         let state = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
         let owner = self.owner;
         let repaint = cx.observe(&state, move |_, cx| cx.notify(owner));
         let media = has_image_syntax(text);
-        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, _repaint: repaint });
-        MarkdownState { entity: state, media }
+        let document = super::media::media_document(text.clone());
+        let extensions = super::media::markdown_extensions(document.clone(), None);
+        self.states.insert(key.to_owned(), Cached { text: text.clone(), state: state.clone(), drawn: self.frame, media, document, extensions: extensions.clone(), _repaint: repaint });
+        MarkdownState { entity: state, media, extensions: Some(extensions) }
     }
 
     pub fn user_context(&mut self, key: &str, text: &Arc<str>) -> Arc<t3_core::composer::records::SentPresentation> {
@@ -163,7 +169,11 @@ fn style(cx: &App) -> TextViewStyle {
 pub fn markdown_view(state: impl Into<MarkdownState>, cx: &App) -> TextView {
     let state = state.into();
     let view = TextView::new(&state.entity);
-    let view = if state.media { view.markdown_extensions(super::media::markdown_extensions()) } else { view };
+    let view = if state.media { view.markdown_extensions(state.extensions.unwrap()) } else { view };
+    style_markdown(view, cx)
+}
+
+pub fn style_markdown(view: TextView, cx: &App) -> TextView {
     view.style(style(cx))
         .selectable(true)
         .code_block_actions(|block, _window, cx| {

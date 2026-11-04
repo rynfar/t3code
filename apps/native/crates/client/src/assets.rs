@@ -45,7 +45,7 @@ pub async fn mint_media_url(client: &ClientHandle, resource: &AssetResource) -> 
 }
 
 /// Uses an already connected local environment only for web's three missing-host errors.
-/// The original error survives a failed fallback, including an unknown future error tag.
+/// Unknown error tags and failed fallbacks use the same unavailable presentation.
 pub async fn mint_media_url_with_fallback(
     client: &ClientHandle,
     resource: &AssetResource,

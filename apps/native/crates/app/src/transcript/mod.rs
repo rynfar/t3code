@@ -9,7 +9,7 @@ pub mod mcp_app;
 mod inspector;
 pub mod markdown;
 mod media;
-pub(crate) use media::scoped_markdown_extensions;
+pub(crate) use media::{markdown_extensions, media_document, MediaDocument};
 mod messages;
 mod notices;
 mod parts;

@@ -1,14 +1,11 @@
-//! Decoded transcript images, bounded. The web leans on the browser's image cache and lazy
-//! `<img>`; here a fetched image is decoded on the network runtime's blocking pool, downscaled to
-//! the size it can be drawn at, and kept while it is drawn. Over budget, images the transcript
-//! has not drawn for a few frames (rows scrolled away) are dropped together with their GPU atlas
-//! tiles, and come back from the encoded-bytes cache, or the network, when scrolled back to.
+//! Bounded decoded media. Visible consumers protect pixels; inactive entries are evicted by
+//! access order independently of transcript renders. Decode work runs on the network runtime.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, Entity, EntityId, RenderImage, SharedString, Task, Window};
+use gpui::{AnyWindowHandle, App, Context, Entity, EntityId, RenderImage, SharedString, Task, Window};
 use t3_core::media::{AssetContentKey, AssetResource, MediaSource};
 
 use crate::app_state::AppState;
@@ -20,8 +17,6 @@ use super::revisions::Revisions;
 const DECODED_BUDGET: usize = 160 * 1024 * 1024;
 /// Encoded bytes kept so scrolling back re-decodes without another round trip.
 const ENCODED_BUDGET: usize = 64 * 1024 * 1024;
-/// Frames an image survives undrawn before it may be evicted.
-const KEEP_FRAMES: u64 = 2;
 /// A failed load is shown until then, and retried the next time it is drawn after.
 pub(super) const RETRY_AFTER: Duration = Duration::from_secs(30);
 
@@ -57,6 +52,9 @@ enum Slot {
 
 /// A finished load: the encoded bytes, the size the server reported, and the decoded image.
 type LoadError = (String, Option<String>);
+struct CancelLoad(tokio::task::AbortHandle);
+impl Drop for CancelLoad { fn drop(&mut self) { self.0.abort(); } }
+
 type Loaded = Result<(Arc<[u8]>, Option<(u32, u32)>, Decoded), LoadError>;
 
 pub enum ImageState {
@@ -72,7 +70,15 @@ struct Encoded {
 
 pub struct MediaCache {
     pub(super) state: Entity<AppState>,
+    #[cfg(feature = "snapshot")]
+    loads: Vec<String>,
+    #[cfg(feature = "snapshot")]
+    decoded_high_water: usize,
     pub(super) revisions: Revisions,
+    pub(super) visibility: t3_core::media::MediaVisibility<(Key, Variant)>,
+    pub(super) consumer_owners: HashMap<u64, EntityId>,
+    pub(super) refresh_window: Option<AnyWindowHandle>,
+    decoded_budget: usize,
     pub(super) refresh_timer: Option<Task<()>>,
     pub(super) refresh_deadline: Option<f64>,
     images: HashMap<(Key, Variant), Slot>,
@@ -88,10 +94,28 @@ pub struct MediaCache {
 }
 
 impl MediaCache {
+    #[cfg(feature = "snapshot")]
+    pub fn audit(&self) -> serde_json::Value {
+        serde_json::json!({"loads":self.loads,"decodedBytes":self.decoded_total,"decodedHighWater":self.decoded_high_water,"decodedBudget":self.decoded_budget,"consumers":self.visibility.len(),"images":self.images.len(),"timerArmed":self.refresh_timer.is_some()})
+    }
+
     pub fn new(state: Entity<AppState>) -> Self {
         MediaCache {
             state,
+            #[cfg(feature = "snapshot")]
+            loads: Vec::new(),
+            #[cfg(feature = "snapshot")]
+            decoded_high_water: 0,
             revisions: Revisions::default(),
+            visibility: Default::default(),
+            consumer_owners: Default::default(),
+            refresh_window: None,
+            decoded_budget: {
+                #[cfg(feature = "snapshot")]
+                { std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--media-cache-budget").and_then(|pair| pair[1].parse::<usize>().ok()).unwrap_or(DECODED_BUDGET).clamp(65536, DECODED_BUDGET) }
+                #[cfg(not(feature = "snapshot"))]
+                { DECODED_BUDGET }
+            },
             refresh_timer: None,
             refresh_deadline: None,
             images: HashMap::new(),
@@ -114,9 +138,61 @@ impl MediaCache {
         Some(key)
     }
 
+    pub fn peek(&self, source: &MediaSource, variant: Variant, cx: &App) -> ImageState {
+        let Some(resource) = self.resource_key(source, cx) else { return ImageState::Loading };
+        if let Some(Err(message)) = self.revisions.shown_url(&resource) { return ImageState::Failed(message.to_owned().into()); }
+        let Some(key) = self.key(source, cx) else { return ImageState::Loading };
+        match self.images.get(&(key, variant)) {
+            Some(Slot::Ready { image, .. }) => ImageState::Ready(image.clone()),
+            Some(Slot::Failed { message, .. }) => ImageState::Failed(message.clone()),
+            _ => ImageState::Loading,
+        }
+    }
+
+    pub(super) fn resource_key(&self, source: &MediaSource, cx: &App) -> Option<Key> {
+        Some(Key { environment: self.state.read(cx).environment()?.into(), source: source.clone(), content: None })
+    }
+
+    pub(super) fn source_visible(&self, key: &Key) -> bool {
+        self.visibility.keys().any(|(visible, _)| visible.environment == key.environment && visible.source == key.source)
+    }
+
+    pub fn visible_image(&mut self, source: &MediaSource, variant: Variant, scope: &super::MediaScope, consumer: u64, window: &mut Window, cx: &mut Context<Self>) -> ImageState {
+        let Some(resource) = self.resource_key(source, cx) else { return ImageState::Loading };
+        let remount = !self.source_visible(&resource);
+        self.refresh_window = Some(window.window_handle());
+        let image = self.image(source, variant, scope.owner, super::revision_for(source, scope), cx);
+        let key = self.key(source, cx).unwrap_or_else(|| resource.clone());
+        let previous = self.visibility.get(consumer).cloned();
+        let changed = self.visibility.set(consumer, Some((key, variant)));
+        self.release_unused(previous);
+        self.consumer_owners.insert(consumer, scope.owner);
+        if remount { self.refresh_remount(&resource, scope.owner, cx); }
+        if changed { self.schedule_refresh(window, cx); }
+        image
+    }
+
+    fn release_unused(&mut self, previous: Option<(Key, Variant)>) {
+        if let Some(key) = previous && !self.visibility.contains(&key) && !self.pinned.contains(&key)
+            && matches!(self.images.get(&key), Some(Slot::Loading { .. } | Slot::Failed { .. }))
+        { self.images.remove(&key); }
+    }
+
+    pub fn remove_consumer(&mut self, consumer: u64, cx: &mut Context<Self>) {
+        let previous = self.visibility.get(consumer).cloned();
+        if !self.visibility.set(consumer, None) { return; }
+        self.consumer_owners.remove(&consumer);
+        self.release_unused(previous);
+        self.trim(cx);
+        self.refresh_timer = None;
+        self.refresh_deadline = None;
+        if !self.visibility.is_empty() { self.defer_refresh_timer(cx); }
+    }
+
     /// The image for `source`, loading it on first ask. `owner` is the view drawing it, notified
     /// when it arrives.
     pub fn image(&mut self, source: &MediaSource, variant: Variant, owner: EntityId, revision: Option<&str>, cx: &mut Context<Self>) -> ImageState {
+        self.frame += 1;
         let Some(environment) = self.state.read(cx).environment() else { return ImageState::Loading };
         let resource_key = Key { environment: Arc::from(environment), source: source.clone(), content: None };
         self.refresh_asset(&resource_key, revision, owner, cx);
@@ -137,6 +213,7 @@ impl MediaCache {
             Some(Slot::Failed { message, at }) if at.elapsed() < RETRY_AFTER => return ImageState::Failed(message.clone()),
             _ => {}
         }
+        self.trim(cx);
         if self.images.len() >= 1024 { return ImageState::Loading; }
         let Some(task) = self.load(slot_key.clone(), owner, cx) else { return ImageState::Loading };
         self.images.insert(slot_key, Slot::Loading { waiters: vec![owner], _task: task });
@@ -183,6 +260,8 @@ impl MediaCache {
     }
 
     fn load(&mut self, (key, variant): (Key, Variant), owner: EntityId, cx: &mut Context<Self>) -> Option<Task<()>> {
+        #[cfg(feature = "snapshot")]
+        self.loads.push(match &key.source { MediaSource::Asset(AssetResource::MediaFile { path, .. }) => path.clone(), _ => "<other>".into() });
         let cached = self.encoded.get_mut(&key).map(|encoded| {
             encoded.used = self.frame;
             encoded.bytes.clone()
@@ -212,7 +291,9 @@ impl MediaCache {
             let decoded = tokio::task::spawn_blocking(move || decode::decode(&input, max_edge, &svg)).await.map_err(|_| ("Image unavailable.".to_owned(), None))?.map_err(|message| (message, None))?;
             Ok::<_, LoadError>((bytes, dimensions, decoded))
         });
+        let cancel = CancelLoad(job.abort_handle());
         Some(cx.spawn(async move |this, cx| {
+            let _cancel = cancel;
             let result = job.await.unwrap_or_else(|_| Err(("Image unavailable.".to_owned(), None)));
             let _ = this.update(cx, |cache, cx| cache.finish(key, variant, result, cx));
         }))
@@ -236,7 +317,16 @@ impl MediaCache {
             }
             Err((message, _)) => Slot::Failed { message: message.into(), at: Instant::now() },
         };
-        self.images.insert((key, variant), slot);
+        let inserted = (key, variant);
+        self.images.insert(inserted.clone(), slot);
+        self.trim(cx);
+        if self.decoded_total > self.decoded_budget && let Some(Slot::Ready { image, bytes, .. }) = self.images.remove(&inserted) {
+            self.decoded_total -= bytes;
+            Self::drop_pixels(vec![image], cx);
+            self.images.insert(inserted, Slot::Failed { message: "The visible images exceed the image cache budget.".into(), at: Instant::now() });
+        }
+        #[cfg(feature = "snapshot")]
+        { self.decoded_high_water = self.decoded_high_water.max(self.decoded_total); }
         let app: &mut App = cx;
         for owner in waiters {
             app.notify(owner);
@@ -259,37 +349,37 @@ impl MediaCache {
         }
     }
 
-    /// Called once per transcript render, before rows draw: over budget, drops what the last
-    /// frames did not draw, oldest first, freeing the atlas tiles with it.
-    pub fn begin_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.frame += 1;
-        self.images.retain(|_, slot| !matches!(slot, Slot::Failed { at, .. } if at.elapsed() >= RETRY_AFTER));
+    fn trim(&mut self, cx: &mut Context<Self>) {
+        let residents = self.images.iter().filter_map(|(key, slot)| {
+            if let Slot::Ready { bytes, drawn, .. } = slot {
+                Some((key.clone(), *bytes, *drawn, self.pinned.contains(key) || self.visibility.contains(key)))
+            } else { None }
+        }).collect();
+        let mut dropped = Vec::new();
+        for key in t3_core::media::media_cache_evictions(residents, self.decoded_budget, 1023) {
+            if let Some(Slot::Ready { image, bytes, .. }) = self.images.remove(&key) {
+                self.decoded_total -= bytes;
+                dropped.push(image);
+            }
+        }
+        Self::drop_pixels(dropped, cx);
         if self.dimensions.len() > 1536 {
             let live: HashSet<_> = self.encoded.keys().chain(self.images.keys().map(|(key, _)| key)).collect();
             self.dimensions.retain(|key, _| live.contains(key));
         }
-        if self.decoded_total <= DECODED_BUDGET && self.images.len() < 1024 {
-            return;
-        }
-        let frame = self.frame;
-        let mut stale: Vec<(u64, (Key, Variant))> = self
-            .images
-            .iter()
-            .filter(|(key, _)| !self.pinned.contains(*key))
-            .filter_map(|(key, slot)| match slot {
-                Slot::Ready { drawn, .. } if drawn + KEEP_FRAMES < frame => Some((*drawn, key.clone())),
-                _ => None,
-            })
-            .collect();
-        stale.sort_by_key(|(drawn, _)| *drawn);
-        for (_, key) in stale {
-            if self.decoded_total <= DECODED_BUDGET && self.images.len() < 1024 {
-                break;
-            }
-            if let Some(Slot::Ready { image, bytes, .. }) = self.images.remove(&key) {
-                self.decoded_total -= bytes;
-                cx.drop_image(image, Some(window));
-            }
-        }
+    }
+
+    fn drop_pixels(images: Vec<Arc<RenderImage>>, cx: &mut Context<Self>) {
+        if images.is_empty() { return; }
+        // Prepaint temporarily removes its window from App; evict after that lease returns.
+        cx.defer(move |cx| {
+            for image in images { cx.drop_image(image, None); }
+            cx.refresh_windows();
+        });
+    }
+
+    pub fn begin_frame(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.images.retain(|_, slot| !matches!(slot, Slot::Failed { at, .. } if at.elapsed() >= RETRY_AFTER));
+        self.trim(cx);
     }
 }

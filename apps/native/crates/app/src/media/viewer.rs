@@ -281,6 +281,10 @@ impl Render for MediaViewer {
             }
             _ => state_box("Loading image…".into()),
         };
+        let observer = cx.try_global::<super::Media>().and_then(|media| media.scope.clone()).map(|mut scope| {
+            scope.owner = owner;
+            super::observe_image(item.source.clone(), scope)
+        });
         let backdrop = div()
             .id("media-viewer")
             .track_focus(&self.focus)
@@ -297,6 +301,7 @@ impl Render for MediaViewer {
             .justify_center()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(media)
+            .children(observer)
             .child(
                 div()
                     .h(px(CAPTION_HEIGHT))

@@ -92,6 +92,7 @@ pub struct Preview {
     markdown_scroll: ScrollHandle,
     mutation: Option<String>,
     media_scope: Option<std::sync::Arc<std::sync::Mutex<crate::media::MediaScope>>>,
+    media_document: Option<crate::transcript::MediaDocument>,
     media_extensions: Option<gpui_component::text::MarkdownExtensions>,
     viewer: Entity<crate::media::MediaViewer>,
     handled_reveal: Option<(String, u64)>,
@@ -117,6 +118,7 @@ impl Preview {
             markdown_scroll: ScrollHandle::new(),
             mutation: None,
             media_scope: None,
+            media_document: None,
             media_extensions: None,
             viewer,
             handled_reveal: None,
@@ -345,7 +347,15 @@ impl Preview {
             Some((key, state)) if *key == file.key => state.clone(),
             _ => {
                 let text = mask_frontmatter(&file.contents).into_owned();
-                let state = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                if let Some(document) = &self.media_document { *document.write().unwrap() = std::sync::Arc::new(t3_core::media::MarkdownMediaDocument::new(std::sync::Arc::from(text.as_str()))); }
+                else { self.media_document = Some(crate::transcript::media_document(std::sync::Arc::from(text.as_str()))); }
+                let state = cx.new(|cx| {
+                    #[cfg(feature = "snapshot")]
+                    if !text.contains("![") { cx.observe_self(|_, cx| crate::snapshot::record_media_notification(cx)).detach(); }
+                    TextViewState::markdown(&text, cx).selectable(true)
+                });
+                #[cfg(feature = "snapshot")]
+                if !text.contains("![") { crate::snapshot::record_media_prose(state.entity_id(), &text, cx); }
                 self.markdown = Some((file.key.clone(), state.clone()));
                 state
             }
@@ -361,7 +371,7 @@ impl Preview {
         if let Some(current) = &self.media_scope { *current.lock().unwrap() = scope; }
         else {
             let scope = std::sync::Arc::new(std::sync::Mutex::new(scope));
-            self.media_extensions = Some(crate::transcript::scoped_markdown_extensions(scope.clone()));
+            self.media_extensions = Some(crate::transcript::markdown_extensions(self.media_document.clone().unwrap(), Some(scope.clone())));
             self.media_scope = Some(scope);
         }
         let p = palette(cx);

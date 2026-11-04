@@ -2,11 +2,11 @@
 //! and images authored in markdown (`ChatMarkdownMedia.tsx`). Both draw from the bounded media
 //! cache and open the viewer on click. File rows port `chat/GuestMessageAttachments.tsx`.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{AnyElement, App, Context, Div, EntityId, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
-use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, markdown_ast as mdast};
+use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::media::{AssetResource, ImageAttachment, MediaKind, MediaPlacement, MediaSource, resolve_media_source};
 use t3_core::timeline::AnswerAttachment;
@@ -186,44 +186,76 @@ struct MarkdownImage {
 }
 
 const MEDIA_NODE: &str = "t3-media";
-
-fn parse_media_paragraph(node: &mdast::Node, context: &MarkdownParseContext) -> Option<MarkdownNode> {
-    let runs = t3_core::media::markdown_media_runs(node, context.source());
+pub type MediaDocument = Arc<std::sync::RwLock<Arc<t3_core::media::MarkdownMediaDocument>>>;
+pub fn media_document(text: Arc<str>) -> MediaDocument {
+    Arc::new(std::sync::RwLock::new(Arc::new(t3_core::media::MarkdownMediaDocument::new(text))))
+}
+#[derive(Clone)]
+struct MediaParagraph { start: usize, runs: Vec<t3_core::media::MarkdownMediaRun> }
+fn parse_media_paragraph(node: &mdast::Node, context: &MarkdownParseContext, document: &t3_core::media::MarkdownMediaDocument) -> Option<MarkdownNode> {
+    let mut runs = t3_core::media::markdown_media_runs(node, context.source());
     if runs.is_empty() { return None; }
-    Some(MarkdownNode::new(MEDIA_NODE, runs).text(node.to_string()).markdown(context.source().get(node.position()?.start.offset..node.position()?.end.offset).unwrap_or_default().to_owned()))
+    fn references(node: &mdast::Node, out: &mut Vec<String>) {
+        if let mdast::Node::LinkReference(link) = node { out.push(link.identifier.clone()); }
+        if let Some(children) = node.children() { for child in children { references(child, out); } }
+    }
+    let mut refs = Vec::new(); references(node, &mut refs);
+    for run in &mut runs { if let t3_core::media::MarkdownMediaRun::Prose(text) = run && !text.trim().is_empty() { *text = document.prose(text, &refs); } }
+    let start = context.offset() + node.position()?.start.offset;
+    Some(MarkdownNode::new(MEDIA_NODE, MediaParagraph { start, runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
 }
 
-fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
+fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, window: &mut Window, cx: &mut App) -> AnyElement {
     use t3_core::media::MarkdownMediaRun;
-    let runs = node.data::<Vec<MarkdownMediaRun>>().cloned().unwrap_or_default();
-    let standalone = runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
-    let children = runs.into_iter().enumerate().filter_map(|(index, run)| match run {
+    let Some(paragraph) = node.data::<MediaParagraph>().cloned() else { return div().into_any_element() };
+    let block_id = format!("media-block:{}:{}", window.current_view(), paragraph.start);
+    let standalone = paragraph.runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
+    let children = paragraph.runs.into_iter().enumerate().filter_map(|(index, run)| match run {
         MarkdownMediaRun::Prose(text) if text.trim().is_empty() => None,
-        MarkdownMediaRun::Prose(text) => Some(div().min_w_0().child(TextView::markdown(SharedString::from(format!("media-prose:{index}")), text).selectable(true)).into_any_element()),
+        MarkdownMediaRun::Prose(text) => Some(prose_run(format!("{block_id}:prose:{index}"), text, window, cx)),
         MarkdownMediaRun::Image { url, alt } => Some(markdown_image(&MarkdownImage { url, alt }, index, scope, cx)),
     }).collect::<Vec<_>>();
-    if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
-    else { h_flex().flex_wrap().gap(px(4.)).items_end().children(children).into_any_element() }
+    let content = if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
+        else { h_flex().flex_wrap().gap(px(4.)).items_end().children(children).into_any_element() };
+    div().id(SharedString::from(block_id)).child(content).into_any_element()
 }
 
-pub fn scoped_markdown_extensions(scope: std::sync::Arc<std::sync::Mutex<MediaScope>>) -> MarkdownExtensions {
-    MarkdownExtensions::default().block_parser(parse_media_paragraph).block_renderer(MEDIA_NODE, move |node: &MarkdownNode, _: &mut Window, cx: &mut App| {
-        render_media_runs(node, Some(&scope.lock().unwrap()), cx)
+struct ProseElement { id: SharedString, text: String }
+impl IntoElement for ProseElement { type Element = Self; fn into_element(self) -> Self { self } }
+impl gpui::Element for ProseElement {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+    fn id(&self) -> Option<gpui::ElementId> { Some(self.id.clone().into()) }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> { None }
+    fn request_layout(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, window: &mut Window, cx: &mut App) -> (gpui::LayoutId, AnyElement) {
+        let state = window.use_keyed_state("state", cx, |_, cx| {
+            let state = TextViewState::markdown(&self.text, cx);
+            #[cfg(feature = "snapshot")]
+            cx.observe_self(|_, cx| crate::snapshot::record_media_notification(cx)).detach();
+            state
+        });
+        state.update(cx, |state, cx| state.set_text(&self.text, cx));
+        #[cfg(feature = "snapshot")]
+        crate::snapshot::record_media_prose(state.entity_id(), &self.text, cx);
+        let mut child = div().min_w_0().child(super::markdown::style_markdown(TextView::new(&state), cx)).into_any_element();
+        (child.request_layout(window, cx), child)
+    }
+    fn prepaint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, child: &mut AnyElement, window: &mut Window, cx: &mut App) { child.prepaint(window, cx); }
+    fn paint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, child: &mut AnyElement, _: &mut (), window: &mut Window, cx: &mut App) { child.paint(window, cx); }
+}
+fn prose_run(id: String, text: String, _: &mut Window, _: &mut App) -> AnyElement {
+    ProseElement { id: id.into(), text }.into_any_element()
+}
+
+pub fn markdown_extensions(document: MediaDocument, scope: Option<Arc<std::sync::Mutex<MediaScope>>>) -> MarkdownExtensions {
+    MarkdownExtensions::default().block_parser(move |node, context| {
+        let document = document.read().unwrap().clone();
+        parse_media_paragraph(node, context, &document)
+    }).block_renderer(MEDIA_NODE, move |node: &MarkdownNode, window: &mut Window, cx: &mut App| {
+        let scope = scope.as_ref().map(|scope| scope.lock().unwrap().clone())
+            .or_else(|| cx.try_global::<media::Media>().and_then(|media| media.scope.clone()));
+        render_media_runs(node, scope.as_ref(), window, cx)
     })
-}
-
-/// The extension registry markdown with images is parsed with. Built once: a new registry would
-/// make every message reparse.
-pub fn markdown_extensions() -> MarkdownExtensions {
-    static EXTENSIONS: OnceLock<MarkdownExtensions> = OnceLock::new();
-    EXTENSIONS
-        .get_or_init(|| {
-            MarkdownExtensions::default().block_parser(parse_media_paragraph).block_renderer(MEDIA_NODE, |node: &MarkdownNode, _: &mut Window, cx: &mut App| {
-                let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
-                render_media_runs(node, scope.as_ref(), cx)
-            })
-        })
-        .clone()
 }
 
 /// `ChatMarkdownImageFallback`: a small chip naming what could not be shown.
@@ -256,7 +288,7 @@ fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope
         let p = palette(cx);
         let source = resolved.source;
         let name = if image.alt.is_empty() { resolved.name } else { image.alt.clone() };
-        return v_flex().w(px(480.)).max_w_full().min_h(px(112.)).items_center().justify_center().gap(px(12.)).p(px(16.)).rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4)).bg(hsla(p.muted).opacity(0.4))
+        return v_flex().w(rem(480.)).max_w_full().min_h(rem(112.)).items_center().justify_center().gap(rem(12.)).p(rem(16.)).rounded(rem(8.)).border_1().border_color(hsla(p.border).opacity(0.4)).bg(hsla(p.muted).opacity(0.4))
             .child(unavailable("Video unavailable", &name, cx))
             .children(source.filter(|source| match source { MediaSource::Asset(_) => true, MediaSource::Direct(url) => url.starts_with("http://") || url.starts_with("https://") }).map(|source| crate::right_panel::Button::new(SharedString::from(format!("video-open:{index}"))).variant(crate::right_panel::Variant::Secondary).size(crate::right_panel::Size::Xs).label(if matches!(&source, MediaSource::Direct(_)) { "Open original" } else { "Open in browser" }).on_click(move |_, _, cx| match &source {
                 MediaSource::Asset(resource) => media::open_asset(resource, cx),
@@ -283,10 +315,10 @@ pub fn tool_output_image(id: SharedString, source: MediaSource, alt: &str, cx: &
 /// border. A 16:9 frame holds its place until the size is known.
 fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: &str, max_height: f32, scope: &MediaScope, cx: &mut App) -> AnyElement {
     let p = palette(cx);
-    let state = media::scoped_image(&source, Variant::Thumb, scope, cx);
-    if let ImageState::Failed(_) = state {
-        return unavailable("Image unavailable", alt, cx);
+    if matches!(media::peek(&source, cx), ImageState::Failed(_)) {
+        return div().id(id).relative().child(unavailable("Image unavailable", alt, cx)).child(media::observe_image(source, scope.clone())).into_any_element();
     }
+
     let (width, height) = match media::dimensions(&source, cx) {
         Some((width, height)) => {
             let fit = (480. / width.max(1) as f32).min(max_height / height.max(1) as f32).min(1.);
@@ -299,7 +331,7 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: 
     };
     let viewer = scope.viewer.clone();
     let item = ViewerItem { source: source.clone(), name };
-    let observer = media::observe_image(source.clone(), scope.clone());
+    let pixels = media::scoped_image(&source, scope);
     let frame = div()
         .id(id)
         .relative()
@@ -315,11 +347,7 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: 
             let item = item.clone();
             let _ = viewer.update(cx, |viewer, cx| viewer.open(vec![item], 0, window, cx));
         });
-    let frame = match state {
-        ImageState::Ready(image) => frame.child(img(image).size_full().rounded(px(8.)).object_fit(ObjectFit::Contain)),
-        _ => frame,
-    };
-    frame.child(observer).child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
+    frame.child(pixels).child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
 }
 
 pub fn other_files(names: &[t3_core::media::FileAttachment], cx: &App) -> Option<AnyElement> {
@@ -351,7 +379,8 @@ pub fn answer_attachment(id: SharedString, attachment: &AnswerAttachment, cx: &m
         },
         None => None,
     };
-    let frame = div().id(id).flex_none().cursor_pointer().on_click(move |_, _, cx| {
+    let observer = cx.try_global::<media::Media>().and_then(|media| media.scope.clone()).filter(|_| attachment.image).map(|scope| media::observe_image(source.clone(), scope));
+    let frame = div().id(id).relative().children(observer).flex_none().cursor_pointer().on_click(move |_, _, cx| {
         cx.stop_propagation();
         media::open_asset(&resource, cx);
     });

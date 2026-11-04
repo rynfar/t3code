@@ -50,6 +50,10 @@ impl RevisionedAssetUrl {
         true
     }
 
+    pub fn refresh_at(&self) -> Option<f64> {
+        if self.waiting { None } else { self.last_settled_at.map(|at| at + super::ASSET_URL_REFRESH_INTERVAL_MS) }
+    }
+
     pub fn refresh_delay(&self, now: f64, visible: bool) -> Option<f64> {
         super::asset_refresh_delay(if self.waiting { Some(now) } else { self.last_settled_at }, now, visible)
     }
@@ -259,6 +263,18 @@ mod tests {
         assert!(!state.refresh(2_100_000., false, false));
         assert!(state.refresh(2_100_000., false, true));
         assert!(!state.refresh(2_100_000., false, true));
+    }
+
+    #[test]
+    fn a_shared_timer_respects_each_resources_periodic_deadline() {
+        let mut older = RevisionedAssetUrl::new(None, false);
+        older.read(None); older.settle(Ok(minted(0, Some("a"), 9_000_000.)), 0.);
+        let mut newer = RevisionedAssetUrl::new(None, false);
+        newer.read(None); newer.settle(Ok(minted(1, Some("b"), 9_000_000.)), 25. * 60_000.);
+        assert!(older.refresh(30. * 60_000., false, true));
+        assert!(!newer.refresh(30. * 60_000., false, true));
+        assert_eq!(newer.refresh_at(), Some(55. * 60_000.));
+        assert!(newer.refresh(55. * 60_000., false, true));
     }
 
     #[test]

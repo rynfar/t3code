@@ -455,3 +455,31 @@ async fn stacked_action_exits_invalidate_refs_on_success_failure_and_interruptio
         assert!(pending.await.unwrap().unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn media_fallback_uses_the_local_rpc_origin_and_preserves_optional_metadata() {
+    fn client(base: &str) -> (ClientHandle, mpsc::UnboundedReceiver<Command>) {
+        let (commands, rx) = mpsc::unbounded_channel();
+        (ClientHandle { refs: Default::default(), commands, credentials: Arc::new(Credentials { http_base: base.into(), access_token: "fixture".into() }), session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 }, rx)
+    }
+    for tag in ["AssetWorkspaceAssetNotFoundError", "FutureAssetError"] {
+        let (remote, mut remote_rx) = client("https://remote.example");
+        let (local, mut local_rx) = client("http://local.example:1234");
+        let resource = t3_core::media::AssetResource::MediaFile { thread_id: "t".into(), path: "/tmp/image.png".into() };
+        let run = tokio::spawn(async move { crate::assets::mint_media_url_with_fallback(&remote, &resource, async { Some(local) }).await });
+        let Some(Command::Request { method, reply, .. }) = remote_rx.recv().await else { panic!("missing primary mint") };
+        assert_eq!(method, t3_core::media::CREATE_ASSET_URL);
+        reply.send(Err(RpcError::Failure(t3_core::rpc::RpcFailure { tag: Some(tag.into()), message: "missing".into(), error: json!({"_tag":tag}) }))).unwrap();
+        if tag == "AssetWorkspaceAssetNotFoundError" {
+            let Some(Command::Request { reply, .. }) = local_rx.recv().await else { panic!("missing fallback mint") };
+            reply.send(Ok(json!({"relativeUrl":"/api/assets/signed/image.png","expiresAt":42,"fileRevision":"rev","futureField":true}))).unwrap();
+            let asset = run.await.unwrap().unwrap();
+            assert_eq!(asset.relative_url, "http://local.example:1234/api/assets/signed/image.png");
+            assert_eq!(asset.file_revision.as_deref(), Some("rev"));
+            assert_eq!(asset.expires_at, 42.);
+        } else {
+            assert!(run.await.unwrap().is_err());
+            assert!(local_rx.try_recv().is_err());
+        }
+    }
+}

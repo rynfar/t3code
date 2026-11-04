@@ -28,7 +28,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
-[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
+[--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
 /// Input replayed in command-line order once everything else is open, at window points.
 enum Gesture {
@@ -152,6 +152,17 @@ impl gpui::Global for RenderCounts {}
 
 pub(crate) fn record_render(name: &'static str, cx: &mut gpui::App) {
     if let Some(counts) = cx.try_global::<RenderCounts>() { *counts.0.borrow_mut().entry(name).or_default() += 1; }
+}
+
+#[derive(Default)]
+struct MediaAudit(std::cell::RefCell<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>, std::cell::Cell<usize>, std::cell::Cell<usize>);
+impl gpui::Global for MediaAudit {}
+pub(crate) fn record_media_notification(cx: &mut gpui::App) {
+    if let Some(audit) = cx.try_global::<MediaAudit>() { audit.1.set(audit.1.get() + 1); }
+}
+
+pub(crate) fn record_media_prose(id: gpui::EntityId, text: &str, cx: &mut gpui::App) {
+    if let Some(audit) = cx.try_global::<MediaAudit>() { audit.2.set(audit.2.get() + 1); audit.0.borrow_mut().entry(id.to_string()).or_default().insert(text.to_owned()); }
 }
 
 pub struct Options {
@@ -346,6 +357,8 @@ pub fn run(options: Options, runtime: tokio::runtime::Handle) {
 
 fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), String> {
     let mut cx = VisualTestAppContext::with_asset_source(gpui_platform::current_platform(false), Arc::new(crate::icons::Assets));
+    let media_audit = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--media-audit").map(|pair| pair[1].clone());
+    if media_audit.is_some() { cx.update(|cx| cx.set_global(MediaAudit::default())); }
     if let Some(path) = &options.chatgpt_fixture {
         let fixture: crate::chatgpt_setup::Fixture = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         cx.update(|cx| cx.set_global(fixture));
@@ -786,12 +799,25 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
     pump(&mut cx, 0.5, |_| false);
+    let mut media_idle = Vec::new();
+    if media_audit.is_some() {
+        for _ in 0..3 {
+            let before = cx.update(|cx| (cx.global::<MediaAudit>().1.get(), cx.global::<MediaAudit>().2.get()));
+            pump(&mut cx, 0.5, |_| false);
+            media_idle.push(cx.update(|cx| (cx.global::<MediaAudit>().1.get() - before.0, cx.global::<MediaAudit>().2.get() - before.1)));
+        }
+    }
     if let Some(path)=std::env::var_os("T3_NATIVE_THEME_EDITOR_FIXTURE") {
         let value:serde_json::Value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
         if let Some(exit)=value.get("pendingExit").and_then(serde_json::Value::as_str) {
             cx.update(|cx|crate::theme_editor::verify_pending_exit_fixture(exit,cx))?;
         }
     }
+    if let Some(path) = media_audit {
+        let values = cx.update(|cx| serde_json::to_vec_pretty(&serde_json::json!({"prose":&*cx.global::<MediaAudit>().0.borrow(),"idleNotifications": media_idle.last().map(|sample| sample.0),"idleSamples":media_idle,"cache":cx.try_global::<crate::media::Media>().map(|media|media.cache.read(cx).audit())}))).map_err(|e| e.to_string())?;
+        std::fs::write(path, values).map_err(|e| e.to_string())?;
+    }
+    cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
     let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;
     if let Some(parent) = options.out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;

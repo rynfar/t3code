@@ -17,7 +17,6 @@ pub(super) struct Mint {
     waiters: Vec<EntityId>,
     used: u64,
     failed_at: Option<Instant>,
-    visible: bool,
 }
 
 #[derive(Default)]
@@ -57,8 +56,8 @@ impl Revisions {
 
 impl MediaCache {
     pub(super) fn refresh_scope(&mut self, scope: &super::MediaScope, cx: &mut Context<Self>) {
-        let keys: Vec<_> = self.revisions.records.iter().filter(|(key, mint)| {
-            mint.used + 2 >= self.frame && matches!(&key.source, MediaSource::Asset(AssetResource::MediaFile { thread_id, .. }) if Some(thread_id) == scope.thread_id.as_ref())
+        let keys: Vec<_> = self.revisions.records.iter().filter(|(key, _mint)| {
+            self.source_visible(key) && matches!(&key.source, MediaSource::Asset(AssetResource::MediaFile { thread_id, .. }) if Some(thread_id) == scope.thread_id.as_ref())
         }).map(|(key, _)| key.clone()).collect();
         for key in keys {
             self.refresh_asset(
@@ -100,12 +99,10 @@ impl MediaCache {
                     waiters: Vec::new(),
                     used: self.frame,
                     failed_at: None,
-                    visible: false,
                 },
             );
         }
         let mint = self.revisions.records.get_mut(key).unwrap();
-        if mint.used + 1 < self.frame { mint.visible = false; }
         mint.used = self.frame;
         if mint.failed_at.is_some_and(|at| at.elapsed() >= RETRY_AFTER) {
             mint.state = RevisionedAssetUrl::new(None, false);
@@ -121,35 +118,50 @@ impl MediaCache {
         }
     }
 
-    pub(super) fn refresh_visible(&mut self, source: &MediaSource, owner: EntityId, window: &mut gpui::Window, cx: &mut Context<Self>) {
-        if !matches!(source, MediaSource::Asset(_)) { return; }
-        let Some(environment) = self.state.read(cx).environment() else { return };
-        let key = Key { environment: environment.into(), source: source.clone(), content: None };
-        if let Some(mint) = self.revisions.records.get_mut(&key) {
-            if mint.task.is_some() && !mint.waiters.contains(&owner) { mint.waiters.push(owner); }
-            if mint.visible { return; }
-            mint.visible = true;
-            let start = mint.state.refresh(now_ms(), true, true);
-            if start {
-                mint.waiters.push(owner);
-                self.start_mint(key.clone(), cx);
-            }
+    pub(super) fn refresh_remount(&mut self, key: &Key, owner: EntityId, cx: &mut Context<Self>) {
+        if let Some(mint) = self.revisions.records.get_mut(key) && mint.state.refresh(now_ms(), true, true) {
+            if !mint.waiters.contains(&owner) { mint.waiters.push(owner); }
+            self.start_mint(key.clone(), cx);
         }
-        let now = now_ms();
-        let delay = self.revisions.records.get(&key).and_then(|mint| mint.state.refresh_delay(now, true));
-        if let Some((deadline, delay)) = t3_core::media::asset_refresh_schedule(self.refresh_deadline, now, delay) {
-            self.refresh_deadline = Some(deadline);
-            self.refresh_timer = Some(cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor().timer(std::time::Duration::from_millis(delay as u64)).await;
-                let _ = this.update_in(cx, |cache, window, _cx| {
-                    cache.refresh_timer = None;
-                    cache.refresh_deadline = None;
-                    for mint in cache.revisions.records.values_mut() { mint.visible = false; }
-                    // Re-evaluate clipping before renewing; a row that left the viewport does no I/O.
-                    window.refresh();
-                });
-            }));
-        }
+    }
+
+    pub(super) fn defer_refresh_timer(&mut self, cx: &mut Context<Self>) {
+        let Some(window) = self.refresh_window else { return };
+        let cache = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = cache.update(cx, |cache, cx| cache.schedule_refresh(window, cx));
+            });
+        });
+    }
+
+    pub(super) fn schedule_refresh(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let next = self.revisions.records.iter().filter(|(key, _)| self.source_visible(key))
+            .filter_map(|(_, mint)| mint.state.refresh_at()).reduce(f64::min);
+        if next == self.refresh_deadline { return; }
+        self.refresh_timer = None;
+        self.refresh_deadline = next;
+        let Some(deadline) = next else { return };
+        let delay = std::time::Duration::from_secs_f64(((deadline - now_ms()) / 1000.).max(0.));
+        self.refresh_timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update_in(cx, |cache, window, cx| {
+                cache.refresh_timer = None;
+                cache.refresh_deadline = None;
+                let now = now_ms();
+                let visible: Vec<_> = cache.revisions.records.keys().filter(|key| cache.source_visible(key)).cloned().collect();
+                for key in visible {
+                    let owners: Vec<_> = cache.visibility.iter().filter(|(_, (image, _))| image.environment == key.environment && image.source == key.source)
+                        .filter_map(|(id, _)| cache.consumer_owners.get(&id).copied()).collect();
+                    let mint = cache.revisions.records.get_mut(&key).unwrap();
+                    if mint.state.refresh(now, false, true) {
+                        for owner in owners { if !mint.waiters.contains(&owner) { mint.waiters.push(owner); } }
+                        cache.start_mint(key, cx);
+                    }
+                }
+                cache.schedule_refresh(window, cx);
+            });
+        }));
     }
 
     pub(super) fn asset_for_fetch(
@@ -216,6 +228,7 @@ impl MediaCache {
                 if again {
                     cache.start_mint(target, cx);
                 }
+                cache.defer_refresh_timer(cx);
                 let app: &mut gpui::App = cx;
                 for owner in waiters {
                     app.notify(owner);
