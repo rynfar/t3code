@@ -364,6 +364,7 @@ pub struct ArgumentPublication {
 pub struct ArgumentsDraft {
     pub rows: Vec<ArgumentRow>,
     seen: Vec<String>,
+    seen_echo: Option<usize>,
     outstanding: Vec<ArgumentPublication>,
     next_id: usize,
     next_publication: usize,
@@ -378,20 +379,24 @@ impl ArgumentsDraft {
         if self.seen == incoming {
             return;
         }
-        let echo = self
+        self.seen_echo = self
             .outstanding
             .iter()
-            .any(|publication| publication.values == incoming);
-        self.seen = incoming.clone();
-        if echo {
+            .rfind(|publication| publication.values == incoming)
+            .map(|publication| publication.id);
+        self.seen = incoming;
+        if self.seen_echo.is_some() {
             return;
         }
-        self.rows = incoming
-            .into_iter()
+        self.reseed();
+    }
+    fn reseed(&mut self) {
+        self.rows = self.seen
+            .iter()
             .map(|value| {
                 let id = self.next_id;
                 self.next_id += 1;
-                ArgumentRow { id, value }
+                ArgumentRow { id, value: value.clone() }
             })
             .collect();
     }
@@ -406,9 +411,18 @@ impl ArgumentsDraft {
         };
         if let Some(incoming) = saved {
             self.reconcile(incoming);
+            if self.outstanding[..=index].iter().any(|publication| publication.values == self.seen) {
+                self.seen_echo = None;
+            }
             self.outstanding.drain(..=index);
         } else {
             self.outstanding.remove(index);
+            if self.seen_echo.is_some_and(|echo| {
+                !self.outstanding.iter().any(|publication| publication.id > echo || publication.values == self.seen)
+            }) {
+                self.seen_echo = None;
+                self.reseed();
+            }
         }
     }
     pub fn edit(&mut self, edit: ArgumentEdit) -> Option<ArgumentPublication> {
@@ -672,6 +686,27 @@ mod tests {
             draft.reconcile(vec!["b".into()]);
             assert_eq!(draft.rows[0].value, "b");
             assert_eq!(draft.edit(ArgumentEdit::Add).unwrap().values, vec!["b", ""]);
+        }
+    }
+    #[test]
+    fn a_reload_before_argument_failures_is_reconsidered_without_losing_pending_edits() {
+        for (reload, first_succeeded) in [(true, false), (false, false), (true, true), (false, true)] {
+            let mut draft = ArgumentsDraft::default();
+            draft.reconcile(vec!["a".into()]);
+            let id = draft.rows[0].id;
+            let first = draft.edit(ArgumentEdit::Value(id, "b".into())).unwrap();
+            let second = draft.edit(ArgumentEdit::Value(id, "c".into())).unwrap();
+            if reload {
+                draft.reconcile(first.values.clone());
+            }
+            draft.settle(first.id, first_succeeded.then_some(first.values));
+            assert_eq!(draft.rows[0].id, id);
+            assert_eq!(draft.rows[0].value, "c");
+            draft.settle(second.id, None);
+            draft.reconcile(vec![if reload || first_succeeded { "b".into() } else { "a".into() }]);
+            let expected = if reload && !first_succeeded { "b" } else { "c" };
+            assert_eq!(draft.rows[0].value, expected);
+            assert_eq!(draft.edit(ArgumentEdit::Add).unwrap().values, vec![expected, ""]);
         }
     }
     #[test]
