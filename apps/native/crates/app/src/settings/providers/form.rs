@@ -2,6 +2,7 @@
 use super::super::{
     SettingsView,
     controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, r, section_title},
+    store,
 };
 use super::{Selected, flat_section};
 use crate::{
@@ -16,7 +17,10 @@ use gpui_component::{
 };
 use serde_json::{Value, json};
 use t3_core::{
-    settings::providers::{self as model, form},
+    settings::{
+        ServerSettingChange,
+        providers::{self as model, form},
+    },
     usage::PROVIDERS_MANAGE_SCOPE,
 };
 
@@ -42,6 +46,7 @@ struct ArgumentInput {
 #[derive(Default)]
 pub(super) struct FormState {
     instance_id: String,
+    generation: usize,
     fields: Vec<FieldInput>,
     arguments: form::ArgumentsDraft,
     argument_inputs: Vec<ArgumentInput>,
@@ -121,6 +126,7 @@ impl SettingsView {
         if switched {
             self.providers.form = FormState {
                 instance_id: selected.row.instance_id.clone(),
+                generation: self.providers.form.generation + 1,
                 ..Default::default()
             };
         }
@@ -324,17 +330,47 @@ impl SettingsView {
         self.edit_arguments(form::ArgumentEdit::Value(id, value), cx);
     }
     fn edit_arguments(&mut self, edit: form::ArgumentEdit, cx: &mut Context<Self>) {
-        let Some(instance) = self.current_form_instance(cx) else { return };
-        if self.form_denial(&instance.driver, "config.commandArgs", cx).is_some() {
+        let Some(instance) = self.current_form_instance(cx) else {
+            return;
+        };
+        if self
+            .form_denial(&instance.driver, "config.commandArgs", cx)
+            .is_some()
+        {
             return;
         }
-        if let Some(values) = self.providers.form.arguments.edit(edit) {
+        if let Some(publication) = self.providers.form.arguments.edit(edit) {
             let id = self.providers.form.instance_id.clone();
-            self.update_instance(
-                &id,
-                model::InstanceEdit::ConfigField {
-                    key: "commandArgs".into(),
-                    value: json!(values),
+            let generation = self.providers.form.generation;
+            let publication_id = publication.id;
+            let view = cx.entity().downgrade();
+            store::update_server_then(
+                &self.state,
+                ServerSettingChange::ProviderInstance {
+                    instance_id: id.clone(),
+                    edit: model::InstanceEdit::ConfigField {
+                        key: "commandArgs".into(),
+                        value: json!(publication.values),
+                    },
+                },
+                move |error, cx| {
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.providers.form.instance_id != id
+                                || this.providers.form.generation != generation
+                            {
+                                return;
+                            }
+                            let saved = if error.is_none() {
+                                this.current_form_instance(cx)
+                                    .map(|instance| form::command_args(&instance))
+                            } else {
+                                None
+                            };
+                            this.providers.form.arguments.settle(publication_id, saved);
+                            cx.notify();
+                        });
+                    });
                 },
                 cx,
             );

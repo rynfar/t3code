@@ -355,12 +355,18 @@ pub struct ArgumentRow {
     pub id: usize,
     pub value: String,
 }
+#[derive(Debug, Clone)]
+pub struct ArgumentPublication {
+    pub id: usize,
+    pub values: Vec<String>,
+}
 #[derive(Default)]
 pub struct ArgumentsDraft {
     pub rows: Vec<ArgumentRow>,
     seen: Vec<String>,
-    last_published: Option<Vec<String>>,
+    outstanding: Vec<ArgumentPublication>,
     next_id: usize,
+    next_publication: usize,
 }
 pub enum ArgumentEdit {
     Add,
@@ -372,7 +378,10 @@ impl ArgumentsDraft {
         if self.seen == incoming {
             return;
         }
-        let echo = self.last_published.take().as_ref() == Some(&incoming);
+        let echo = self
+            .outstanding
+            .iter()
+            .any(|publication| publication.values == incoming);
         self.seen = incoming.clone();
         if echo {
             return;
@@ -386,25 +395,56 @@ impl ArgumentsDraft {
             })
             .collect();
     }
-    pub fn edit(&mut self, edit: ArgumentEdit) -> Option<Vec<String>> {
+    /// Reconciles a successful reply before retiring its echo; `None` is a failed or skipped save.
+    pub fn settle(&mut self, id: usize, saved: Option<Vec<String>>) {
+        let Some(index) = self
+            .outstanding
+            .iter()
+            .position(|publication| publication.id == id)
+        else {
+            return;
+        };
+        if let Some(incoming) = saved {
+            self.reconcile(incoming);
+            self.outstanding.drain(..=index);
+        } else {
+            self.outstanding.remove(index);
+        }
+    }
+    pub fn edit(&mut self, edit: ArgumentEdit) -> Option<ArgumentPublication> {
         match edit {
             ArgumentEdit::Add => {
                 let id = self.next_id;
                 self.next_id += 1;
-                self.rows.push(ArgumentRow { id, value: String::new() });
+                self.rows.push(ArgumentRow {
+                    id,
+                    value: String::new(),
+                });
             }
             ArgumentEdit::Remove(id) => {
                 let index = self.rows.iter().position(|r| r.id == id)?;
                 self.rows.remove(index);
             }
             ArgumentEdit::Value(id, value) => {
-                let row = self.rows.iter_mut().find(|r| r.id == id && r.value != value)?;
+                let row = self
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.id == id && r.value != value)?;
                 row.value = value;
             }
         }
-        let values = self.rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>();
-        self.last_published = Some(values.clone());
-        Some(values)
+        let values = self
+            .rows
+            .iter()
+            .map(|r| r.value.clone())
+            .collect::<Vec<_>>();
+        let publication = ArgumentPublication {
+            id: self.next_publication,
+            values,
+        };
+        self.next_publication += 1;
+        self.outstanding.push(publication.clone());
+        Some(publication)
     }
 }
 
@@ -613,18 +653,30 @@ mod tests {
     }
     #[test]
     fn failed_argument_writes_do_not_hide_an_external_settings_change() {
-        let mut draft = ArgumentsDraft::default();
-        draft.reconcile(vec!["a".into()]);
-        let id = draft.rows[0].id;
-        draft.edit(ArgumentEdit::Value(id, "b".into()));
-        draft.edit(ArgumentEdit::Value(id, "c".into()));
-        draft.reconcile(vec!["b".into()]);
-        assert_eq!(draft.rows[0].value, "b");
-        assert_eq!(draft.edit(ArgumentEdit::Add), Some(vec!["b".into(), String::new()]));
+        for (fail_first, fail_second) in [(true, true), (true, false), (false, false)] {
+            let mut draft = ArgumentsDraft::default();
+            draft.reconcile(vec!["a".into()]);
+            let id = draft.rows[0].id;
+            let first = draft.edit(ArgumentEdit::Value(id, "b".into())).unwrap();
+            let second = draft.edit(ArgumentEdit::Value(id, "c".into())).unwrap();
+            if fail_first {
+                draft.settle(first.id, None);
+            }
+            if fail_second {
+                draft.settle(second.id, None);
+            } else {
+                draft.reconcile(second.values.clone());
+                assert_eq!(draft.rows[0].id, id);
+                draft.settle(second.id, Some(second.values));
+            }
+            draft.reconcile(vec!["b".into()]);
+            assert_eq!(draft.rows[0].value, "b");
+            assert_eq!(draft.edit(ArgumentEdit::Add).unwrap().values, vec!["b", ""]);
+        }
     }
     #[test]
     fn removing_an_argument_then_editing_the_displayed_next_row_keeps_the_target() {
-        for args in [vec!["a", "b"], vec!["a", "b", "c"]] {
+        for args in [vec!["a", "b", "c"], vec!["a", "b"]] {
             let original = ProviderInstanceConfig {
                 driver: "acpRegistry".into(),
                 config: Some(json!({"source":"local","commandArgs":args})),
@@ -634,24 +686,48 @@ mod tests {
             draft.reconcile(command_args(&original));
             let a = draft.rows[0].id;
             let b = draft.rows[1].id;
+            let c = draft.rows.get(2).map(|row| row.id);
             let removed_value = draft.edit(ArgumentEdit::Remove(a)).unwrap();
             let edited_value = draft.edit(ArgumentEdit::Value(b, "B".into())).unwrap();
+            draft.reconcile(removed_value.values.clone());
             assert_eq!(draft.rows[0].id, b);
             assert_eq!(draft.rows[0].value, "B");
-            let removed = with_field(&original, "commandArgs", json!(removed_value));
-            let edited = with_field(&removed, "commandArgs", json!(edited_value));
+            draft.settle(removed_value.id, Some(removed_value.values.clone()));
+            let latest = if let Some(c) = c {
+                assert_eq!(draft.rows[1].id, c);
+                let publication = draft.edit(ArgumentEdit::Value(c, "C".into())).unwrap();
+                assert_eq!(publication.values, vec!["B", "C"]);
+                publication
+            } else {
+                edited_value.clone()
+            };
+            draft.settle(edited_value.id, Some(edited_value.values.clone()));
+            draft.reconcile(edited_value.values);
+            let removed = with_field(&original, "commandArgs", json!(removed_value.values));
+            let edited = with_field(&removed, "commandArgs", json!(latest.values));
+            draft.settle(latest.id, Some(command_args(&edited)));
             draft.reconcile(command_args(&edited));
             assert_eq!(draft.rows[0].id, b);
-            assert!(draft.edit(ArgumentEdit::Value(a, "removed".into())).is_none());
-            draft.edit(ArgumentEdit::Value(b, "b".into())).unwrap();
+            assert!(
+                draft
+                    .edit(ArgumentEdit::Value(a, "removed".into()))
+                    .is_none()
+            );
+            let lower = draft.edit(ArgumentEdit::Value(b, "b".into())).unwrap();
             let upper = draft.edit(ArgumentEdit::Value(b, "B".into())).unwrap();
             draft.reconcile(command_args(&edited));
+            draft.reconcile(lower.values.clone());
             assert_eq!(draft.rows[0].id, b);
             assert_eq!(draft.rows[0].value, "B");
-            draft.reconcile(upper);
+            draft.settle(lower.id, Some(lower.values));
+            draft.reconcile(upper.values.clone());
             assert_eq!(draft.rows[0].id, b);
+            draft.settle(upper.id, Some(upper.values));
             let mut expected = args[1..].to_vec();
             expected[0] = "B";
+            if args.len() == 3 {
+                expected[1] = "C";
+            }
             assert_eq!(command_args(&edited), expected);
         }
     }
