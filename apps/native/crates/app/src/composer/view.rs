@@ -277,15 +277,17 @@ impl Render for Composer {
                 .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
                 // Each composer takes its own shortcuts, so a side chat's never reach the open thread's.
                 .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
+                .on_action(cx.listener(|this, _: &super::OpenWorkspace, window, cx| this.open_workspace(window, cx)))
+                .on_action(cx.listener(|this, _: &super::UsePreviousWorktree, window, cx| this.use_previous_worktree(window, cx)))
                 .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| this.open_permissions(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).
                 .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                    if this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {
+                    if this.workspace_key(MenuKey::Up, window, cx) || this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {
                         cx.stop_propagation();
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                    if this.stash_key(MenuKey::Down, window, cx)
+                    if this.workspace_key(MenuKey::Down, window, cx) || this.stash_key(MenuKey::Down, window, cx)
                         || this.menu_key(MenuKey::Down, window, cx)
                         || this.history_key(false, window, cx)
                     {
@@ -293,6 +295,7 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                    if this.workspace_key(MenuKey::Accept, window, cx) {cx.stop_propagation(); return;}
                     if !action.secondary
                         && !action.shift
                         && (this.stash_key(MenuKey::Accept, window, cx) || this.menu_key(MenuKey::Accept, window, cx))
@@ -306,7 +309,7 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    if this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
+                    if this.workspace_key(MenuKey::Dismiss, window, cx) || this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
                         cx.stop_propagation();
                     }
                 }))
@@ -324,7 +327,8 @@ impl Render for Composer {
                     if this.close_context_details(cx) {
                         return;
                     }
-                    if this.permissions_open || this.approval_menu_open {
+                    if this.workspace.open || this.permissions_open || this.approval_menu_open {
+                        this.workspace.open = false;
                         this.permissions_open = false;
                         this.approval_menu_open = false;
                         cx.notify();
@@ -402,7 +406,8 @@ impl Render for Composer {
                                 .child(self.render_primary(&resolved, cx)),
                         ),
                     ),
-                ),
+                )
+                .children(self.render_workspace(cx).map(|control| h_flex().pt(px(8.)).px(px(8.)).child(control))),
         )
     }
 }

@@ -3,9 +3,10 @@
 //! `resolveNewThreadEnvMode`, `resolveSendEnvMode`), the `t3.json` fallback
 //! (`web/src/lib/t3ProjectFileDefaults.ts`), `resolveNewDraftStartFromOrigin`
 //! (`web/src/lib/chatThreadActions.ts`), and the default base branch the branch toolbar picks
-//! (`BranchToolbarBranchSelector.tsx` `worktreeBaseBranchCandidate`).
+//! (`BranchToolbarBranchSelector.tsx` `worktreeBaseBranchCandidate`), plus previous-worktree
+//! selection (`BranchToolbar.logic.ts`) and launch encoding (`operations/commands.ts`).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::server_config::{ServerSettings, ThreadEnvMode};
@@ -130,6 +131,7 @@ pub fn base_branch(refs: &VcsRefs) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strategy {
     Root,
+    ExistingWorktree { worktree_path: String, branch: Option<String> },
     Worktree { base_ref: String, start_from_origin: bool },
 }
 
@@ -138,6 +140,11 @@ impl Strategy {
     pub fn to_json(&self) -> Value {
         match self {
             Strategy::Root => json!({ "type": "root" }),
+            Strategy::ExistingWorktree { worktree_path, branch } => {
+                let mut strategy = json!({"type": "existing_worktree", "worktreePath": worktree_path});
+                if let Some(branch) = branch { strategy["branch"] = json!(branch); }
+                strategy
+            }
             Strategy::Worktree { base_ref, start_from_origin } => {
                 let mut strategy = json!({ "type": "worktree", "baseRef": base_ref });
                 if *start_from_origin {
@@ -159,6 +166,105 @@ pub fn launch_strategy(mode: ThreadEnvMode, refs: Option<&VcsRefs>, start_from_o
         Some(base_ref) => Ok(Strategy::Worktree { base_ref, start_from_origin }),
         None => Err("Select a base branch before sending in New worktree mode."),
     }
+}
+
+/// `resolvePreviousWorktreeSeed` reads project-scoped shells, never a checkout history.
+pub struct PreviousThread<'a> {
+    pub project_id: &'a str,
+    pub branch: Option<&'a str>,
+    pub worktree_path: Option<&'a str>,
+    pub updated_at: &'a str,
+    pub archived_at: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousWorktreeSeed {
+    pub branch: Option<String>,
+    pub worktree_path: String,
+}
+
+impl PreviousWorktreeSeed {
+    pub fn label(&self) -> String {
+        match self.branch.as_deref().filter(|branch| !branch.is_empty()) {
+            Some(branch) => format!("Previous worktree ({branch})"),
+            None => "Previous worktree".into(),
+        }
+    }
+}
+
+pub fn previous_worktree_seed<'a>(
+    threads: impl IntoIterator<Item = PreviousThread<'a>>,
+    project_id: &str,
+    current_worktree_path: Option<&str>,
+) -> Option<PreviousWorktreeSeed> {
+    let mut latest = None;
+    for thread in threads {
+        let Some(path) = thread.worktree_path.filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        if thread.project_id != project_id
+            || Some(path) == current_worktree_path
+            || thread.archived_at.is_some()
+        {
+            continue;
+        }
+        let Some(updated) = crate::sidebar::time::parse_iso(thread.updated_at) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|(timestamp, _)| updated > *timestamp)
+        {
+            latest = Some((
+                updated,
+                PreviousWorktreeSeed {
+                    branch: thread.branch.map(str::to_owned),
+                    worktree_path: path.into(),
+                },
+            ));
+        }
+    }
+    latest.map(|(_, seed)| seed)
+}
+
+pub fn can_use_previous_worktree(
+    has_server_thread: bool,
+    env_locked: bool,
+    force_new_worktree: bool,
+) -> bool {
+    !has_server_thread && !env_locked && !force_new_worktree
+}
+
+/// The web draft's context, fenced to its destination so restored local state cannot retarget it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftWorkspace {
+    pub environment_id: String,
+    pub project_root: String,
+    pub mode: ThreadEnvMode,
+    pub previous: Option<PreviousWorktreeSeed>,
+}
+
+impl DraftWorkspace {
+    pub fn in_scope(&self, environment_id: &str, project_root: &str) -> bool {
+        self.environment_id == environment_id && self.project_root == project_root
+    }
+
+    pub fn strategy(&self) -> Option<Strategy> {
+        if let Some(seed) = &self.previous {
+            return Some(Strategy::ExistingWorktree {
+                worktree_path: seed.worktree_path.clone(),
+                branch: seed.branch.clone(),
+            });
+        }
+        (self.mode == ThreadEnvMode::Local).then_some(Strategy::Root)
+    }
+}
+
+/// Composer file/skill roots (`ChatView.tsx` gitCwd); a draft has no server thread yet.
+pub fn draft_cwd<'a>(choice: Option<&'a DraftWorkspace>, environment_id: &str, project_root: &'a str) -> &'a str {
+    choice.filter(|choice| choice.in_scope(environment_id, project_root)).and_then(|choice| choice.previous.as_ref()).map_or(project_root, |seed| seed.worktree_path.as_str())
 }
 
 #[cfg(test)]

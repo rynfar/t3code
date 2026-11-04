@@ -24,6 +24,9 @@ const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
 
 /// What a send took from the composer, put back if it fails.
 pub(super) struct Taken {
+    target: Target,
+    environment: Option<String>,
+    draft: t3_core::composer::drafts::Draft,
     attachments: Vec<super::attachments::Staged>,
     threads: Vec<ThreadContext>,
     records: Vec<std::sync::Arc<Value>>,
@@ -45,6 +48,11 @@ struct Outgoing {
 impl Composer {
     /// Submit, as the send button and Enter do.
     pub(super) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        if let Some(audit) = cx.try_global::<super::SnapshotAudit>() {
+            audit.submissions.set(audit.submissions.get() + 1);
+            return;
+        }
         if !self.close_citation_comment("outside-press", window, cx) {
             return;
         }
@@ -223,6 +231,8 @@ impl Composer {
         let config = state.server_config.config.as_ref();
         let root = state.shell.project(&project_id).map(|project| project.workspace_root.clone());
         let configured = config.and_then(|config| workspace::configured_env_mode(&config.settings, &project_id));
+        let workspace_choice = self.selected_workspace();
+        let origin = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
         let new_projects_root = config.and_then(|config| config.new_projects_root.clone());
         // Settled threads the shell left out still count, as `readUnloadedThreadCount` does.
         let has_threads = state.shell.snapshot.as_ref().is_some_and(|shell| {
@@ -232,24 +242,31 @@ impl Composer {
         let start_from_origin = config.is_some_and(|config| workspace::start_from_origin(&config.settings, &project_id, ThreadEnvMode::Worktree));
         let cwd = root.clone().unwrap_or_default();
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
-        let refs = state.rpc(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd));
+        let refs = workspace_choice.as_ref().and_then(workspace::DraftWorkspace::strategy).is_none().then(|| state.request(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd), |value| serde_json::from_value::<VcsRefs>(value).map_err(|error| error.to_string()))).flatten();
         let target = Target::Draft(project_id.clone());
+        self.record_draft(&target, cx);
         let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let file_mode = match (&configured, &root) {
-                (None, Some(_)) => project_file
+                (None, Some(_)) if workspace_choice.is_none() => project_file
                     .await
                     .ok()
                     .and_then(|result| workspace::project_file_contents(&result).and_then(workspace::project_file_env_mode)),
                 _ => None,
             };
-            let mode = workspace::new_thread_env_mode(configured, file_mode, root.as_deref(), new_projects_root.as_deref(), has_threads);
+            let mode = workspace_choice.as_ref().map_or_else(|| workspace::new_thread_env_mode(configured, file_mode, root.as_deref(), new_projects_root.as_deref(), has_threads), |choice| choice.mode);
+            let selected = workspace_choice.as_ref().and_then(workspace::DraftWorkspace::strategy);
             let refs = match (mode, &root) {
-                (ThreadEnvMode::Worktree, Some(_)) => refs.await.ok().and_then(|value| serde_json::from_value::<VcsRefs>(value).ok()),
+                (ThreadEnvMode::Worktree, Some(_)) if selected.is_none() => match refs {Some(task) => task.await.ok().and_then(Result::ok), None => None},
                 _ => None,
             };
-            let strategy = workspace::launch_strategy(mode, refs.as_ref(), start_from_origin);
+            let strategy = selected.map(Ok).unwrap_or_else(|| workspace::launch_strategy(mode, refs.as_ref(), start_from_origin));
             let launch = this.update_in(cx, |this, _, cx| {
+                let state = this.state.read(cx);
+                let current = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
+                if current != origin || state.selected_thread.is_some() || state.draft_project.as_deref() != Some(project_id.as_str()) || this.snapshot.target.as_ref() != Some(&target) || state.shell.project(&project_id).map(|project| &project.workspace_root) != root.as_ref() {
+                    return Err("The destination changed before launch. Select the workspace again.".to_owned());
+                }
                 let strategy = strategy.map_err(str::to_owned)?;
                 let (thread_id, command_id, message_id) = (uuid_v4(), uuid_v4(), uuid_v4());
                 let payload = commands::launch_thread(&LaunchThread {
@@ -279,25 +296,28 @@ impl Composer {
                 Err(_) => return,
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
-                // A background launch leaves the draft open for the next thread.
-                if result.is_ok() && intent != SubmitIntent::Background {
-                    this.discard_draft(&target, cx);
-                }
-                match result {
-                    Ok(_) if intent == SubmitIntent::Background => {}
-                    Ok(thread_id) => {
-                        if let (Some(launch), Some(setup)) = (worktree_launch, this.setup.clone()) {
-                            setup.update(cx, |setup, cx| setup.record_launch(launch, cx));
-                        }
-                        this.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx));
-                    }
-                    Err(error) => this.restore(&target, &outgoing.prompt, taken, error, window, cx),
-                }
-                cx.notify();
+                this.finish_launch(intent, (result, worktree_launch), taken, window, cx);
             });
         })
         .detach();
+    }
+
+    fn finish_launch(&mut self, intent: SubmitIntent, (result, worktree_launch): (Result<String, String>, Option<t3_core::worktree_setup::DraftLaunch>), taken: Taken, window: &mut Window, cx: &mut Context<Self>) {
+        self.sending = false;
+        let shown = self.state.read(cx).environment() == taken.environment.as_deref() && self.snapshot.target.as_ref() == Some(&taken.target);
+        match result {
+            Err(error) => self.restore(taken, error, window, cx),
+            Ok(thread_id) => {
+                if intent != SubmitIntent::Background && !self.current_draft(&taken.target, cx).has_user_content() { self.discard_draft(&taken.target, cx); }
+                if shown && intent != SubmitIntent::Background {
+                    if let (Some(launch), Some(setup)) = (worktree_launch, self.setup.clone()) {
+                        setup.update(cx, |setup, cx| setup.record_launch(launch, cx));
+                    }
+                    self.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx));
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn send(&mut self, thread_id: String, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
@@ -356,7 +376,7 @@ impl Composer {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 if let Some(error) = failure {
-                    this.restore(&target, &outgoing.prompt, taken, error, window, cx);
+                    this.restore(taken, error, window, cx);
                 }
                 cx.notify();
             });
@@ -367,39 +387,40 @@ impl Composer {
     /// Clears the prompt and takes the attachments and the context `prompt` links, as the web
     /// clears the composer on send. Whatever is added while the send is in flight stays.
     fn begin_send(&mut self, target: &Target, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> Taken {
+        let draft = self.current_draft(target, cx);
+        let environment = self.state.read(cx).environment().map(str::to_owned);
         self.sending = true;
         self.error = None;
         self.set_prompt("", window, cx);
         cx.notify();
-        Taken {
+        let taken = Taken {
+            target: target.clone(), environment, draft,
             attachments: self.take_attachments(target),
             threads: self.take_threads(target, prompt),
             records: self.take_records(target, prompt),
             terminals: self.take_terminals(target, prompt),
             reviews: self.take_reviews(target, prompt),
-        }
+        };
+        self.record_draft(target, cx);
+        taken
     }
 
-    /// A failed send puts the text back unless the user already typed something new, its
-    /// attachments back in front of any added since, and its context beside what was added since.
-    fn restore(
-        &mut self,
-        target: &Target,
-        text: &str,
-        taken: Taken,
-        error: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.prompt(cx).trim().is_empty() {
-            self.set_prompt(text, window, cx);
+    /// `useComposerSend` restores the captured target, independently of the current route.
+    fn restore(&mut self, taken: Taken, error: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target = &taken.target;
+        let shown = self.state.read(cx).environment() == taken.environment.as_deref() && self.snapshot.target.as_ref() == Some(target);
+        let live = self.current_draft(target, cx);
+        let text = taken.draft.restored_prompt();
+        if self.drafts.store.restore(&super::drafts::key(target), taken.draft, &live) {
+            self.restore_attachments(target, taken.attachments);
+            self.restore_threads(target, taken.threads);
+            self.seed_records(target, taken.records);
+            self.restore_terminals(target, taken.terminals);
+            self.seed_reviews(target, taken.reviews);
+            self.schedule_draft_save(target, cx);
+            if shown { self.set_prompt(&text, window, cx); }
         }
-        self.restore_attachments(target, taken.attachments);
-        self.restore_threads(target, taken.threads);
-        self.seed_records(target, taken.records);
-        self.restore_terminals(target, taken.terminals);
-        self.seed_reviews(target, taken.reviews);
-        self.error = Some(error);
+        if shown {self.error = Some(error);} else {tracing::warn!(%error, "Send failed; retained the original target's draft");}
     }
 
     pub(super) fn respond_to_approval(&mut self, request_id: String, decision: ApprovalDecision, cx: &mut Context<Self>) {
@@ -429,5 +450,46 @@ impl Composer {
         })
         .detach();
         cx.notify();
+    }
+}
+
+#[cfg(feature = "snapshot")]
+impl Composer {
+    pub(crate) fn verify_failed_launch_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        use t3_core::composer::attachments::{AttachmentKind, Upload};
+        use t3_core::composer::menu::ThreadContext;
+        let original = self.snapshot.target.clone().ok_or("open a draft for recovery fixture")?;
+        let other = Target::Draft("fixture-other-project".into());
+        for (error, concurrent_edit) in [("destination changed", false), ("RPC failure", false), ("RPC failure", true)] {
+            let mention = ThreadContext::new("fixture-env", "fixture-thread", "Original context");
+            let text = format!("recover original {}", mention.reference());
+            self.set_prompt(&text, window, cx);
+            self.seed_mentions(&original, vec![mention]);
+            self.seed_attachments(&original, vec![Attachment {id: "fixture-attachment".into(), kind: AttachmentKind::File, name: "notes.md".into(), mime_type: "text/markdown".into(), size_bytes: 12, pasted_text: false, upload: Upload::Ready {attachment_id: "fixture-upload".into()}}]);
+            self.record_draft(&original, cx);
+            let sent = self.drafts.store.get(&super::drafts::key(&original)).unwrap().clone();
+            let taken = self.begin_send(&original, &text, window, cx);
+            self.switch_draft(Some(&original), Some(&other), window, cx);
+            self.snapshot.target = Some(other.clone());
+            self.set_prompt("other draft edits", window, cx);
+            let mut expected = sent.clone();
+            if concurrent_edit {
+                expected.prompt = "concurrent edit in original target".into();
+                expected.attachments[0].id = "concurrent-attachment".into();
+                self.drafts.store.set(&super::drafts::key(&original), expected.clone());
+            }
+            self.finish_launch(SubmitIntent::Foreground, (Err(error.into()), None), taken, window, cx);
+            let recovered = self.drafts.store.get(&super::drafts::key(&original)).ok_or("failed send lost original draft")?;
+            if recovered.prompt != expected.prompt || recovered.attachments != expected.attachments || recovered.threads != expected.threads { return Err("failed send lost original prompt/attachments/context".into()); }
+            let persisted = t3_core::composer::drafts::DraftStore::from_value(Some(&self.drafts.store.to_value()));
+            if persisted.get(&super::drafts::key(&original)) != Some(recovered) {return Err("recovery did not survive draft persistence".into());}
+            if !concurrent_edit && (self.staged_for(&original).len() != 1 || self.mentions(&original).is_empty()) {return Err("failed send did not restore original resource ownership".into());}
+            if self.prompt(cx) != "other draft edits" {return Err("recovery overwrote selected draft".into());}
+            self.switch_draft(Some(&other), Some(&original), window, cx);
+            self.snapshot.target = Some(original.clone());
+            self.take_attachments(&original);
+        }
+        eprintln!("failed launch recovery: destination change, RPC failure, concurrent edits and persisted original attachments/context passed; no launch RPC");
+        Ok(())
     }
 }

@@ -62,6 +62,7 @@ impl Composer {
     fn capture_draft(&self, target: &Target, prompt: String) -> Draft {
         let choices = self.choices.get(target).cloned().unwrap_or_default();
         Draft {
+            workspace: self.drafts.store.get(&key(target)).and_then(|draft| draft.workspace.clone()),
             context_records: t3_core::composer::records::referenced_shared(&prompt, self.records_for(target)),
             threads: Draft::saved_threads(self.mentions(target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(target), &prompt),
@@ -96,7 +97,7 @@ impl Composer {
         }
     }
 
-    fn current_draft(&self, target: &Target, cx: &gpui::App) -> Draft {
+    pub(super) fn current_draft(&self, target: &Target, cx: &gpui::App) -> Draft {
         let prompt = match self.snapshot.target.as_ref() == Some(target) {
             true => self.draft_prompt(cx),
             false => self.drafts.store.get(&key(target)).map(|draft| draft.prompt.clone()).unwrap_or_default(),
