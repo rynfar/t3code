@@ -163,16 +163,19 @@ fn recent_queries_survive_dialog_reopen_but_not_expiry_refresh_or_session_change
         }),
     );
     cache.remember(&first, 0);
+    cache.release(&first, 0);
     let mut reopened = Search::default();
     assert!(cache.restore(&mut reopened, 1));
     assert_eq!(reopened.agents, first.agents);
     reopened.typed("other".into());
+    cache.release(&reopened, 2);
     assert!(!cache.restore(&mut reopened, 2));
     assert!(reopened.agents.is_none());
     let epoch = reopened.begin_search();
     reopened.searched(epoch, Ok(SearchResult { agents: vec![] }));
     cache.remember(&reopened, 2);
     reopened.typed("  ".into());
+    cache.release(&reopened, 3);
     assert!(!reopened.submit());
     assert_eq!(reopened.query, "");
     assert!(cache.restore(&mut reopened, SEARCH_TTL_MS - 1));
@@ -184,10 +187,15 @@ fn recent_queries_survive_dialog_reopen_but_not_expiry_refresh_or_session_change
     cache.remember(&reopened, SEARCH_TTL_MS);
     assert!(!cache.restore(&mut reopened, SEARCH_TTL_MS + 1));
     assert_eq!(reopened.error.as_deref(), Some("offline"));
-    cache.touch(&reopened, SEARCH_TTL_MS * 2);
+    cache.release(&reopened, SEARCH_TTL_MS * 2);
     let mut stale = Search::default();
     assert!(!cache.restore(&mut stale, SEARCH_TTL_MS * 2 + 1));
     assert!(stale.agents.is_some());
+    cache.release(&stale, SEARCH_TTL_MS * 2 + 2);
+    let reopened_at = SEARCH_TTL_MS * 3 + 2;
+    cache.release(&stale, reopened_at);
+    assert!(!cache.restore(&mut stale, reopened_at));
+    assert!(stale.agents.is_none());
     for changed in [
         SearchScope {
             environment: "https://two".into(),
@@ -213,7 +221,13 @@ fn recent_queries_survive_dialog_reopen_but_not_expiry_refresh_or_session_change
     }
     cache.scope(scope);
     cache.remember(&first, 0);
+    cache.release(&first, 0);
     assert!(!cache.restore(&mut Search::default(), SEARCH_TTL_MS));
+    cache.remember(&first, 0);
+    cache.release(&first, SEARCH_TTL_MS * 2);
+    let mut mounted = Search::default();
+    assert!(!cache.restore(&mut mounted, SEARCH_TTL_MS * 2 + 1));
+    assert!(mounted.agents.is_some());
     for n in 0..RECENT_QUERIES + 1 {
         first.typed(n.to_string());
         let epoch = first.begin_search();
@@ -230,4 +244,17 @@ fn recent_queries_survive_dialog_reopen_but_not_expiry_refresh_or_session_change
     assert!(!cache.restore(&mut first, 1));
     first.typed("0".into());
     assert!(!cache.restore(&mut first, 1));
+}
+
+#[test]
+fn failed_icons_retry_on_later_demand_without_refreshing_the_failure_deadline() {
+    let mut retry = IconRetry::default();
+    assert!(!retry.due(0));
+    retry.failed(10);
+    assert!(!retry.due(10));
+    assert!(!retry.due(10 + ICON_RETRY_MS - 1));
+    assert!(retry.due(10 + ICON_RETRY_MS));
+    retry.failed(10 + ICON_RETRY_MS);
+    assert!(!retry.due(10 + ICON_RETRY_MS + 1));
+    assert!(retry.due(10 + ICON_RETRY_MS * 2));
 }

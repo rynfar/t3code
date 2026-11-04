@@ -113,6 +113,20 @@ pub fn search_payload(query: &str) -> Value {
     }
 }
 
+pub const ICON_RETRY_MS: u64 = 30_000;
+#[derive(Default)]
+pub struct IconRetry {
+    retry_at: Option<u64>,
+}
+impl IconRetry {
+    pub fn failed(&mut self, now: u64) {
+        self.retry_at = Some(now.saturating_add(ICON_RETRY_MS));
+    }
+    pub fn due(&self, now: u64) -> bool {
+        self.retry_at.is_some_and(|at| now >= at)
+    }
+}
+
 // server.ts `searchAcpRegistry` and runtime.ts: five-minute SWR and idle retention.
 pub const SEARCH_TTL_MS: u64 = 5 * 60_000;
 const RECENT_QUERIES: usize = 16;
@@ -136,6 +150,7 @@ struct RecentSearch {
     error: Option<String>,
     answered: Option<u64>,
     used: u64,
+    active: bool,
     bytes: usize,
 }
 impl RecentSearches {
@@ -148,18 +163,25 @@ impl RecentSearches {
         self.scope = Some(scope);
         changed
     }
-    pub fn touch(&mut self, search: &Search, now: u64) {
+    fn expire(&mut self, now: u64) {
+        self.entries
+            .retain(|e| e.active || now.saturating_sub(e.used) < SEARCH_TTL_MS);
+    }
+    // Atom's idle TTL starts on unsubscribe; answer freshness remains independent.
+    pub fn release(&mut self, search: &Search, now: u64) {
+        self.expire(now);
         if let Some(entry) = self
             .entries
             .iter_mut()
             .find(|e| e.query == search.submitted)
+            && entry.active
         {
+            entry.active = false;
             entry.used = now;
         }
     }
     pub fn restore(&mut self, search: &mut Search, now: u64) -> bool {
-        self.entries
-            .retain(|e| now.saturating_sub(e.used) < SEARCH_TTL_MS);
+        self.expire(now);
         let query = search.query.trim();
         if query != search.submitted {
             search.agents = None;
@@ -176,8 +198,10 @@ impl RecentSearches {
             .iter_mut()
             .find(|e| e.query == search.submitted)
         else {
+            search.agents = None;
             return false;
         };
+        entry.active = true;
         entry.used = now;
         search.agents = entry.agents.clone();
         search.error = entry.error.clone();
@@ -227,6 +251,7 @@ impl RecentSearches {
             error: search.error.clone(),
             answered,
             used: now,
+            active: true,
             bytes,
         });
         while self.entries.len() > RECENT_QUERIES

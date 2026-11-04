@@ -121,7 +121,7 @@ impl Registry {
         if self.enabled {
             let mut recent = self.recent.borrow_mut();
             let now = recent.clock.elapsed().as_millis() as u64;
-            recent.cache.touch(&self.model, now);
+            recent.cache.release(&self.model, now);
         }
         self.enabled = false;
         self.debounce = None;
@@ -255,7 +255,7 @@ impl SettingsView {
         let mut recent = store.borrow_mut();
         let now = recent.clock.elapsed().as_millis() as u64;
         if dialog.registry.model.agents.is_some() || dialog.registry.model.error.is_some() {
-            recent.cache.touch(&dialog.registry.model, now);
+            recent.cache.release(&dialog.registry.model, now);
         }
         let fresh = recent.cache.restore(&mut dialog.registry.model, now);
         drop(recent);

@@ -1,8 +1,9 @@
 //! `AcpRegistryIcon.tsx`: validated CDN icons, decoded by GPUI off the UI thread.
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+mod decode;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use gpui::{App, Context, EntityId, Global, Image, ImageFormat, RenderImage, Task, Window};
-use t3_core::settings::providers::registry::{Agent, icon_url};
+use gpui::{App, Context, EntityId, Global, RenderImage, Task, Window};
+use t3_core::settings::providers::registry::{Agent, IconRetry, icon_url};
 
 use super::super::SettingsView;
 
@@ -15,12 +16,14 @@ const CAPACITY: usize = 64;
 struct Icons {
     slots: HashMap<(String, u32), Slot>,
     tick: u64,
+    clock: Instant,
     permits: Arc<tokio::sync::Semaphore>,
 }
 struct Slot {
     image: Option<Arc<RenderImage>>,
     used: u64,
     owner: EntityId,
+    retry: IconRetry,
     _task: Option<Task<()>>,
 }
 impl Default for Icons {
@@ -28,6 +31,7 @@ impl Default for Icons {
         Self {
             slots: HashMap::new(),
             tick: 0,
+            clock: Instant::now(),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
@@ -49,10 +53,14 @@ pub(super) fn image(
     let owner = cx.entity_id();
     let store = cx.global_mut::<Icons>();
     store.tick += 1;
+    let now = store.clock.elapsed().as_millis() as u64;
     if let Some(slot) = store.slots.get_mut(&key) {
         slot.used = store.tick;
         slot.owner = owner;
-        return slot.image.clone();
+        if !slot.retry.due(now) {
+            return slot.image.clone();
+        }
+        store.slots.remove(&key);
     }
     if store.slots.len() >= CAPACITY {
         let oldest = store
@@ -92,52 +100,22 @@ pub(super) fn image(
         } else {
             t3_client::acp_registry::icon(&url).await.ok()
         }?;
-        tokio::task::spawn_blocking(move || {
-            let (mime, bytes) = fetched;
-            let format = ImageFormat::from_mime_type(&mime)?;
-            if bytes.len() > 512 * 1024 {
-                return None;
-            }
-            if format != ImageFormat::Svg {
-                let reader = image::ImageReader::new(Cursor::new(&bytes))
-                    .with_guessed_format()
-                    .ok()?;
-                let (w, h) = reader.into_dimensions().ok()?;
-                if w == 0 || h == 0 || w > 2048 || h > 2048 {
-                    return None;
-                }
-            }
-            let decoded = Image::from_bytes(format, bytes).to_image_data(svg).ok()?;
-            let size = decoded.size(0);
-            let pixels = image::RgbaImage::from_raw(
-                size.width.0 as u32,
-                size.height.0 as u32,
-                decoded.as_bytes(0)?.to_vec(),
-            )?;
-            let mut pixels = image::DynamicImage::ImageRgba8(pixels)
-                .thumbnail(64, 64)
-                .into_rgba8();
-            // The web recolors the source alpha with currentColor; GPUI takes BGRA pixels.
-            for pixel in pixels.pixels_mut() {
-                pixel.0[..3].copy_from_slice(&[
-                    (color >> 8) as u8,
-                    (color >> 16) as u8,
-                    (color >> 24) as u8,
-                ]);
-                pixel.0[3] = (u16::from(pixel.0[3]) * u16::from(color as u8) / 255) as u8;
-            }
-            Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
-        })
-        .await
-        .ok()
-        .flatten()
+        tokio::task::spawn_blocking(move || decode::decode(&fetched.0, &fetched.1, color, &svg))
+            .await
+            .ok()
+            .flatten()
     });
     let loaded_key = key.clone();
     let task = cx.spawn(async move |_, cx| {
         let image = driver.await.ok().flatten();
         cx.update(|cx: &mut App| {
-            if let Some(slot) = cx.global_mut::<Icons>().slots.get_mut(&loaded_key) {
+            let store = cx.global_mut::<Icons>();
+            let now = store.clock.elapsed().as_millis() as u64;
+            if let Some(slot) = store.slots.get_mut(&loaded_key) {
                 slot.image = image;
+                if slot.image.is_none() {
+                    slot.retry.failed(now);
+                }
                 slot._task = None;
                 let owner = slot.owner;
                 cx.notify(owner);
@@ -151,6 +129,7 @@ pub(super) fn image(
             image: None,
             used: store.tick,
             owner,
+            retry: IconRetry::default(),
             _task: Some(task),
         },
     );
