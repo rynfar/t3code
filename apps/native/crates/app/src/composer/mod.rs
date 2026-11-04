@@ -6,6 +6,8 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+#[cfg(feature = "snapshot")]
+pub(crate) use attachments::Fixture as AttachmentFixture;
 pub(crate) mod imports;
 mod citations;
 pub(crate) mod context;
@@ -376,6 +378,8 @@ impl Composer {
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
+        #[cfg(feature = "snapshot")]
+        self.attachment_fixture(cx);
         self.sync_queued_edit(window, cx);
         self.sync_answering(window, cx);
         self.sync_menu(true, cx);

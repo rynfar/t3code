@@ -13,7 +13,13 @@ fn image_attachments_include_legacy_image_files_and_skip_annotations() {
     ];
     let ids: Vec<_> = image_attachments(&attachments).into_iter().map(|image| image.id).collect();
     assert_eq!(ids, ["a", "b"]);
-    assert_eq!(other_attachment_names(&attachments), ["notes.txt", "cat.png"]);
+    assert_eq!(other_attachments(&attachments), [FileAttachment { name: "notes.txt".into(), size_bytes: Some(10) }, FileAttachment { name: "cat.png".into(), size_bytes: Some(10) }]);
+    let future = vec![json!({"type":"future", "name":"new.bin", "sizeBytes":2049, "futureField":true}), json!({"name":"old.bin"}), json!({"name":"invalid.bin", "sizeBytes":-1})];
+    assert_eq!(other_attachments(&future).iter().map(|file| file.size_bytes).collect::<Vec<_>>(), [Some(2049), None, None]);
+    assert_eq!(attachment_size_label(&attachments[0], &json!({"downloadable":false})).as_deref(), Some("1 KB"));
+    assert_eq!(attachment_size_label(&attachments[2], &json!({"downloadable":false})).as_deref(), Some("Sending…"));
+    assert_eq!(attachment_size_label(&attachments[2], &json!({})).as_deref(), Some("1 KB"));
+    assert_eq!(attachment_size_label(&json!({"kind":"file"}), &json!({})), None);
     assert_eq!(image_attachments(&attachments)[1].mime_type, "image/jpeg");
 }
 

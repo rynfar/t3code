@@ -100,7 +100,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         _ => &[],
     };
     let images = t3_core::media::image_attachments(attachments);
-    let other_files = t3_core::media::other_attachment_names(attachments);
+    let other_files = t3_core::media::other_attachments(attachments);
     let inline_media = matches!(attribution, Some(Attribution::Guest | Attribution::Agent));
     let placement = t3_core::media::media_placement(images.len(), body.is_none(), other_files.len(), inline_media);
     let media = placement.map(|placement| super::media::user_media(id, &images, placement, grouped_with_previous, grouped_with_next, cx));

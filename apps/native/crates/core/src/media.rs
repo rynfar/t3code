@@ -3,7 +3,8 @@
 //! `AssetResource` that `assets.createUrl` signs. Ports `client-runtime/src/markdownImages.ts`,
 //! `mediaSource.ts`, `mediaReference.ts`, the attachment
 //! predicates in `apps/web/src/types.ts` and the media placement of `TimelineUserMessageRow.tsx`.
-//! Revision tracking ports `state/assets.ts` and `state/threadDetail.ts` in client-runtime.
+//! File rows and sent chip sizes port `chat/GuestMessageAttachments.tsx` and
+//! `chat/UserMessageContextChips.tsx`. Revision tracking ports `state/assets.ts` and `state/threadDetail.ts` in client-runtime.
 
 mod revision;
 pub use revision::{AssetFetch, RevisionedAssetUrl};
@@ -144,9 +145,27 @@ pub fn image_attachments(attachments: &[Value]) -> Vec<ImageAttachment> {
         .collect()
 }
 
-/// The names of the attachments that are not images, shown as file rows.
-pub fn other_attachment_names(attachments: &[Value]) -> Vec<String> {
-    attachments.iter().filter(|attachment| !is_image_attachment(attachment)).map(|attachment| text(attachment, "name").to_owned()).filter(|name| !name.is_empty()).collect()
+/// A transcript file row (`GuestMessageAttachments.tsx`), including legacy records without size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttachment {
+    pub name: String,
+    pub size_bytes: Option<u64>,
+}
+
+pub fn other_attachments(attachments: &[Value]) -> Vec<FileAttachment> {
+    attachments.iter().filter(|attachment| !is_image_attachment(attachment)).filter_map(|attachment| {
+        let name = text(attachment, "name");
+        (!name.is_empty()).then(|| FileAttachment { name: name.to_owned(), size_bytes: attachment.get("sizeBytes").and_then(Value::as_u64) })
+    }).collect()
+}
+
+/// Sent chips use the record's size; files without downloadable bytes say `Sending…`.
+pub fn attachment_size_label(record: &Value, attachment: &Value) -> Option<String> {
+    let kind = record.get("kind").or_else(|| record.get("type")).and_then(Value::as_str)?;
+    if kind == "file" && attachment.get("downloadable").and_then(Value::as_bool) == Some(false) {
+        return Some("Sending…".into());
+    }
+    matches!(kind, "image" | "file").then(|| record.get("sizeBytes").and_then(Value::as_u64).map(crate::composer::attachments::format_size)).flatten()
 }
 
 /// Where a user message's images draw relative to its bubble.

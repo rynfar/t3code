@@ -1,12 +1,14 @@
 //! Composer attachments: paste, drop and the paperclip (`useComposerAttachmentIntake.ts`,
 //! `ComposerAttachButton`), the upload queue (`web/src/lib/attachmentUploadQueue.ts`), large
 //! pastes folded into a file, and the strip of thumbnails and file rows
-//! (`ComposerAttachmentStrip.tsx`). Classification, limits and payloads live in
+//! (`ComposerAttachmentStrip.tsx`, size labels from `composerContextPresentation.tsx`). Classification, limits and payloads live in
 //! `t3_core::composer::attachments`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use futures::FutureExt;
 
 use gpui::{
     AnyElement, App, ClipboardEntry, Context, ExternalPaths, Image, ImageFormat, IntoElement, ObjectFit, ParentElement,
@@ -30,14 +32,22 @@ pub(super) struct Staged {
     preview: Option<Arc<Image>>,
     /// The bytes, kept until the upload lands so a failed one can retry.
     bytes: Option<Arc<Vec<u8>>>,
-    _upload: Option<Task<()>>,
+    _upload: Option<futures::future::Shared<Task<()>>>,
     source: Option<String>,
 }
 
 #[derive(Default)]
 pub(super) struct Attachments {
     staged: HashMap<Target, Vec<Staged>>,
+    #[cfg(feature = "snapshot")]
+    fixture_applied: bool,
 }
+
+#[cfg(feature = "snapshot")]
+#[derive(Clone)]
+pub(crate) struct Fixture(pub serde_json::Value);
+#[cfg(feature = "snapshot")]
+impl gpui::Global for Fixture {}
 
 /// A file read for staging.
 struct Picked {
@@ -241,8 +251,12 @@ impl Composer {
             });
         });
         if let Some(staged) = self.find_staged(&target, &id) {
-            staged._upload = Some(task);
+            staged._upload = Some(task.shared());
         }
+    }
+
+    pub(super) fn upload_tasks(&self) -> Vec<futures::future::Shared<Task<()>>> {
+        self.staged().iter().filter_map(|staged| staged._upload.clone()).collect()
     }
 
     pub(super) fn release_upload(&self, attachment_id: &str, cx: &App) {
@@ -385,6 +399,8 @@ impl Composer {
             h_flex().flex_wrap().gap(px(8.)).mb(px(12.)).children(images.into_iter().map(|staged| {
                 let attachment = &staged.attachment;
                 let id = attachment.id.clone();
+                let mut tooltip = format!("{}\n{}", attachment.name, rules::format_size(attachment.size_bytes));
+                if let Upload::Failed { reason } = &attachment.upload { tooltip.push_str(&format!("\n\n{reason}")); }
                 let thumbnail = match &staged.preview {
                     Some(image) => img(image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
                     None => div()
@@ -408,12 +424,14 @@ impl Composer {
                     .border_1()
                     .border_color(hsla(p.border).opacity(0.8))
                     .bg(hsla(p.background))
+                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
                     .child(thumbnail)
+                    .child(div().absolute().bottom_0().left_0().right_0().px(px(4.)).bg(hsla(p.background).opacity(0.85)).text_size(px(10.)).text_center().text_color(hsla(p.foreground)).child(rules::format_size(attachment.size_bytes)))
                     .when(attachment.upload == Upload::Uploading, |this| {
                         this.child(
                             div()
                                 .absolute()
-                                .bottom_0()
+                                .top_0()
                                 .left_0()
                                 .right_0()
                                 .px(px(4.))
@@ -427,7 +445,7 @@ impl Composer {
                     .when_some(failed_reason(attachment), |this, reason| {
                         let id = id.clone();
                         this.child(
-                            div().absolute().bottom(px(4.)).left(px(4.)).child(
+                            div().absolute().top(px(4.)).left(px(4.)).child(
                                 media_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, cx)
                                     .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
                                     .on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx))),
@@ -447,7 +465,8 @@ impl Composer {
                 let attachment = &staged.attachment;
                 let id = attachment.id.clone();
                 let status = match &attachment.upload {
-                    Upload::Uploading => "Uploading".to_owned(),
+                    Upload::Uploading => format!("{} · Uploading", rules::format_size(attachment.size_bytes)),
+                    Upload::Failed { .. } => format!("{} · upload failed", rules::format_size(attachment.size_bytes)),
                     _ => rules::format_size(attachment.size_bytes),
                 };
                 h_flex()
@@ -535,5 +554,29 @@ impl Composer {
         let retry: Vec<_> = staged.iter().filter(|entry| entry.attachment.attachment_id().is_none()).map(|entry| entry.attachment.id.clone()).collect();
         self.attachments.staged.insert(target.clone(), staged);
         for id in retry { self.start_upload(target.clone(), id, cx); }
+    }
+}
+
+#[cfg(feature = "snapshot")]
+impl Composer {
+    pub(super) fn attachment_fixture(&mut self, cx: &mut Context<Self>) {
+        if self.attachments.fixture_applied { return; }
+        let Some(target @ Target::Thread(_)) = self.snapshot.target.clone().filter(|_| self.snapshot.loaded) else { return };
+        let Some(fixture) = cx.try_global::<Fixture>().cloned() else { return };
+        self.attachments.fixture_applied = true;
+        let entries = fixture.0.as_array().into_iter().flatten().map(|value| {
+            let field = |name| value.get(name).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            let id = field("id");
+            let upload = match field("status").as_str() {
+                "failed" => Upload::Failed { reason: "Upload failed".into() },
+                "uploading" => Upload::Uploading,
+                _ => Upload::Ready { attachment_id: format!("fixture-{id}") },
+            };
+            Staged {
+                attachment: Attachment { id, name: field("name"), kind: if field("type") == "image" { AttachmentKind::Image } else { AttachmentKind::File }, mime_type: field("mimeType"), size_bytes: value["sizeBytes"].as_u64().unwrap_or_default(), pasted_text: false, upload },
+                preview: None, bytes: None, _upload: None, source: None,
+            }
+        }).collect();
+        self.attachments.staged.insert(target, entries);
     }
 }

@@ -227,6 +227,16 @@ pub(crate) fn shell(
     (shell, ink)
 }
 
+pub(crate) fn attachment_shell(record: &Value, attachment: &Value, state: &Entity<AppState>, cx: &mut App) -> gpui::Stateful<gpui::Div> {
+    let (mut shell, _) = shell(record, state, false, cx);
+    if let Some(size) = t3_core::media::attachment_size_label(record, attachment) {
+        let tooltip = format!("{}\n{size}", field(record, "name"));
+        shell = shell.child(div().flex_shrink_0().text_size(px(10.)).child(size))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+    }
+    shell
+}
+
 pub(crate) fn copyable_unresolved(shell: gpui::Stateful<gpui::Div>, record: &Value) -> gpui::Stateful<gpui::Div> {
     let text=rules::reference(record).unwrap_or_default();
     shell.on_action(move|_: &gpui_component::input::Copy,_,cx| {crate::composer::clipboard::write(text.clone(),String::new(),cx);cx.stop_propagation();})

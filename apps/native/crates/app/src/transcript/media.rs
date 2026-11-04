@@ -1,9 +1,10 @@
 //! Images in transcript rows: a user message's attachments (`TimelineUserMessageRow.tsx`, §7.5)
 //! and images authored in markdown (`ChatMarkdownMedia.tsx`). Both draw from the bounded media
-//! cache and open the viewer on click.
+//! cache and open the viewer on click. File rows port `chat/GuestMessageAttachments.tsx`.
 
 use std::sync::{Arc, OnceLock};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{AnyElement, App, Context, Div, EntityId, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -306,7 +307,7 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: 
     frame.child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
 }
 
-pub fn other_files(names: &[String], cx: &App) -> Option<AnyElement> {
+pub fn other_files(names: &[t3_core::media::FileAttachment], cx: &App) -> Option<AnyElement> {
     if names.is_empty() {
         return None;
     }
@@ -316,7 +317,7 @@ pub fn other_files(names: &[String], cx: &App) -> Option<AnyElement> {
             .gap(px(4.))
             .mb(px(8.))
             .children(names.iter().map(|name| {
-                h_flex().min_w_0().gap(px(8.)).text_size(px(14.)).child(Icon::Link.render(px(14.), hsla(p.muted_foreground))).child(div().min_w_0().truncate().child(name.clone()))
+                h_flex().min_w_0().gap(px(8.)).py(px(4.)).text_size(px(14.)).child(Icon::File.render(px(16.), hsla(p.muted_foreground))).child(div().min_w_0().truncate().child(name.name.clone())).when_some(name.size_bytes, |row, bytes| row.child(div().flex_shrink_0().text_xs().text_color(hsla(p.muted_foreground)).child(t3_core::composer::attachments::format_size(bytes))))
             }))
             .into_any_element(),
     )

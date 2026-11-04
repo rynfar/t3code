@@ -45,7 +45,14 @@ pub(super) fn chips(
                 .borrow_mut()
                 .insert(records::field(&record, "threadId").into(), title);
         }
-        let (shell, _) = context_chip::shell(&record, state, false, cx);
+        let attachment = source.and_then(|source| match &source.kind {
+            t3_core::turn_item::TurnItemKind::UserMessage { attachments, .. } => attachments.iter().find(|attachment| records::field(attachment, "id") == records::field(&record, "attachmentId")),
+            _ => None,
+        });
+        let shell = match attachment.filter(|_| matches!(records::field(&record, "kind"), "image" | "file")) {
+            Some(attachment) => context_chip::attachment_shell(&record, attachment, state, cx),
+            None => context_chip::shell(&record, state, false, cx).0,
+        };
         let mut shell = match source {
             Some(source) => {
                 context_chip::copyable_message(shell, id.clone(), source.clone(), state)
@@ -62,7 +69,7 @@ pub(super) fn chips(
                 cx.notify();
             }));
         }
-        let element = div().relative().child(shell).when(open, |s| {
+        let element = div().relative().flex_shrink_0().max_w_full().child(shell).when(open, |s| {
             s.child(crate::composer::controls::floating(
                 crate::composer::controls::Float::AboveStart,
                 context_chip::details(&record, cx),

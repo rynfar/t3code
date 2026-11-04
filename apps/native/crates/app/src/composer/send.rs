@@ -87,6 +87,10 @@ impl Composer {
             cx.notify();
             return;
         }
+        if staged.iter().any(|attachment| attachment.attachment_id().is_none()) {
+            self.await_uploads(intent, window, cx);
+            return;
+        }
         // `/plan` or `/default` alone switches the mode instead of sending.
         if let Some(command) = t3_core::composer::menu::parse_standalone_slash_command(&text)
             && staged.is_empty()
@@ -144,6 +148,38 @@ impl Composer {
             self.set_prompt("", window, cx);
             self.draft_changed(cx);
         }
+    }
+
+    fn await_uploads(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        let prompt = self.prompt(cx);
+        let connection = self.state.read(cx).connection_id();
+        let ids: Vec<_> = self.staged().iter().map(|staged| staged.attachment.id.clone()).collect();
+        for id in attachments::retry_on_send(&self.staged_attachments()) {
+            self.start_upload(target.clone(), id, cx);
+        }
+        let tasks = self.upload_tasks();
+        self.sending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            futures::future::join_all(tasks).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.sending = false;
+                let unchanged = this.snapshot.target.as_ref() == Some(&target)
+                    && this.state.read(cx).connection_id() == connection
+                    && this.snapshot.pending.user_inputs.is_empty()
+                    && this.prompt(cx) == prompt
+                    && this.staged().iter().map(|staged| &staged.attachment.id).eq(ids.iter());
+                if unchanged {
+                    match attachments::uploaded_for_send(&this.staged_attachments()) {
+                        Ok(_) => this.submit(intent, window, cx),
+                        Err(reason) => this.error = Some(reason.into()),
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
     }
 
     fn outgoing(&self, prompt: String, staged: &[Attachment]) -> Outgoing {

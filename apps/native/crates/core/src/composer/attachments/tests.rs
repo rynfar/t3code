@@ -87,9 +87,9 @@ fn sends_carry_uploaded_attachments_and_their_records() {
     let uploading = staged(AttachmentKind::Image, Upload::Uploading);
     assert_eq!(uploading.chat_attachment(), None);
     assert_eq!(chat_attachments(std::slice::from_ref(&uploading)), None);
-    assert_eq!(send_block_reason(std::slice::from_ref(&uploading)).as_deref(), Some("Wait for attachments to finish uploading"));
+    assert_eq!(send_block_reason(std::slice::from_ref(&uploading)).as_deref(), None);
     let failed = staged(AttachmentKind::Image, Upload::Failed { reason: "Upload failed".into() });
-    assert_eq!(send_block_reason(&[failed]).as_deref(), Some("Upload failed. Remove the attachment to send."));
+    assert_eq!(send_block_reason(&[failed]).as_deref(), None);
     let ready = staged(AttachmentKind::Image, Upload::Ready { attachment_id: "att-1".into() });
     assert_eq!(send_block_reason(std::slice::from_ref(&ready)), None);
     assert_eq!(
@@ -122,6 +122,23 @@ fn sends_carry_uploaded_attachments_and_their_records() {
         "attachmentId": "att-1", "name": "shot.png", "mimeType": "image/png", "sizeBytes": 2048,
     }));
     assert_eq!(message_context("plain", &[], &[], &[]), None);
+
+    let failed = staged(AttachmentKind::File, Upload::Failed { reason: "Upload failed".into() });
+    let mut uploading = staged(AttachmentKind::Image, Upload::Uploading);
+    uploading.id = "second".into();
+    let mut batch = vec![failed.clone(), uploading];
+    assert_eq!(retry_on_send(&batch), std::slice::from_ref(&failed.id));
+    assert_eq!(send_block_reason(&batch), None);
+    assert_eq!(uploaded_for_send(&batch), Err("Retry or remove failed uploads before sending."));
+    batch[0].upload = Upload::Ready { attachment_id: "new-file".into() };
+    assert!(retry_on_send(&batch).is_empty());
+    assert!(uploaded_for_send(&batch).is_err());
+    batch[1].upload = Upload::Ready { attachment_id: "new-image".into() };
+    assert_eq!(uploaded_for_send(&batch).unwrap()[0]["id"], "new-file");
+    batch[1].upload = Upload::Failed { reason: "Upload rejected (503)".into() };
+    assert!(uploaded_for_send(&batch).is_err());
+    assert_eq!(retry_on_send(&batch), ["second"]);
+    assert!(send_block_reason(&vec![failed; MAX_ATTACHMENTS + 1]).unwrap().contains("100"));
 }
 
 #[test]
