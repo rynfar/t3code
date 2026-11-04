@@ -138,8 +138,8 @@ fn inline_source(node: &markdown::mdast::Node, source: &str) -> String {
 }
 
 fn markdown_destination(url: &str, title: Option<&str>) -> String {
-    let url = url.replace('\\', "\\\\").replace('>', "\\>").replace('<', "\\<");
-    let title = title.map(|title| format!(" \"{}\"", title.replace('\\', "\\\\").replace('"', "\\\""))).unwrap_or_default();
+    let url = url.replace('&', "&amp;").replace('\\', "\\\\").replace('>', "\\>").replace('<', "\\<");
+    let title = title.map(|title| format!(" \"{}\"", title.replace('&', "&amp;").replace('\\', "\\\\").replace('"', "\\\""))).unwrap_or_default();
     format!("<{url}>{title}")
 }
 
@@ -555,6 +555,50 @@ mod paragraph_tests {
                 _ => None,
             }).collect();
             assert_eq!(html, "<p><a href=\"https://host\">a &amp; b</a></p>\n", "{label}");
+        }
+        fn link_targets(text: &str) -> Vec<(String, Option<String>)> {
+            use markdown::mdast::Node;
+            fn collect<'a>(node: &'a Node, nodes: &mut Vec<&'a Node>) {
+                nodes.push(node);
+                if let Some(children) = node.children() { for child in children { collect(child, nodes); } }
+            }
+            let root = markdown::to_mdast(text, &markdown::ParseOptions::gfm()).unwrap();
+            let mut nodes = Vec::new();
+            collect(&root, &mut nodes);
+            nodes.iter().filter_map(|node| match node {
+                Node::Link(link) => Some((link.url.clone(), link.title.clone())),
+                Node::LinkReference(link) => nodes.iter().find_map(|node| match node {
+                    Node::Definition(definition) if definition.identifier == link.identifier => Some((definition.url.clone(), definition.title.clone())),
+                    _ => None,
+                }),
+                _ => None,
+            }).collect()
+        }
+        for (url, title, decoded_url, decoded_title) in [
+            ("https://host/?q=&amp;amp;", "&amp;copy; and &amp;quot;", "https://host/?q=&amp;", "&copy; and &quot;"),
+            ("https://host/?q=&#x26;copy;", "&#x26;#34; &amp;#x3c;", "https://host/?q=&copy;", "&#34; &#x3c;"),
+            (r#"https://host/?a=1&b=2&amp;c=3\>d\<e\\f"#, r#"ordinary & query \"quote\" \\backslash"#, r#"https://host/?a=1&b=2&c=3>d<e\f"#, r#"ordinary & query "quote" \backslash"#),
+        ] {
+            for link in ["[a]", "[a][]", "[shown][a]", "[shown]\n[a]"] {
+                for definition in [format!("[a]: <{url}> \"{title}\""), format!("[a]:\n  <{url}>\n  \"{title}\"")] {
+                    let text = format!("![x](a.png) {link}\n\n{definition}");
+                    let expected = vec![(decoded_url.to_owned(), Some(decoded_title.to_owned()))];
+                    assert_eq!(link_targets(&text), expected, "original {text}");
+                    let actual: Vec<_> = runs(&text).into_iter().filter_map(|run| match run {
+                        MarkdownMediaRun::Prose(text) => Some(link_targets(&text)),
+                        _ => None,
+                    }).flatten().collect();
+                    assert_eq!(actual, expected, "reconstructed {text}");
+                }
+            }
+            let text = format!("![x](a.png) [a](\n<{url}>\n\"{title}\")");
+            let expected = vec![(decoded_url.to_owned(), Some(decoded_title.to_owned()))];
+            assert_eq!(link_targets(&text), expected, "original {text}");
+            let actual: Vec<_> = runs(&text).into_iter().filter_map(|run| match run {
+                MarkdownMediaRun::Prose(text) => Some(link_targets(&text)),
+                _ => None,
+            }).flatten().collect();
+            assert_eq!(actual, expected, "reconstructed {text}");
         }
         let result = runs("*![chart][A B]*\n\n[a  b]: javascript:bad\n[a b]: good.png");
         assert!(matches!(&result[0], MarkdownMediaRun::Image { url, .. } if url == "javascript:bad"));
