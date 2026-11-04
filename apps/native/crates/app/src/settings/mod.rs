@@ -17,6 +17,7 @@ mod general;
 mod keybindings;
 mod maintenance;
 mod project_actions;
+mod project_icon_picker;
 mod projects;
 mod providers;
 mod scheduled_tasks;
@@ -416,6 +417,9 @@ impl SettingsView {
     }
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismiss_project_icon_picker(window, cx) {
+            return;
+        }
         if self.dismiss_keybinding_overlay(window, cx) {
             return;
         }
@@ -449,6 +453,9 @@ impl SettingsView {
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.projects.picker.is_some() {
+            return;
+        }
         self.compact_search_open = true;
         self.search.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -456,6 +463,9 @@ impl SettingsView {
 
     /// Tab and Shift+Tab move through the modal's controls only (the dialog's focus trap).
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cycle_icon_focus(forward, window, cx) {
+            return;
+        }
         // Bounded: every control in the window is at most one step each.
         for _ in 0..512 {
             if forward {
@@ -526,7 +536,9 @@ impl SettingsView {
     }
 
     fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
-        if self.typography.text_field_focused(window, cx) { return true; }
+        if self.typography.text_field_focused(window, cx) || self.projects.picker.as_ref().is_some_and(|picker| picker.text_field_focused(window, cx)) {
+            return true;
+        }
         [&self.search, &self.threads.base_directory, &self.threads.auto_settle_days, &self.keybindings.filter, &self.keybindings.when_input]
             .into_iter()
             .chain(self.threads.time_inputs())
@@ -847,6 +859,7 @@ impl Render for SettingsView {
                 .children(blocks.into_iter().map(|block| div().w_full().max_w(r(page_width)).px(r(24.)).child(block.element)))
                 .into_any_element(),
         };
+        let icon_picker = self.project_icon_picker_overlay(window, cx);
         let action_editor = self.action_editor_overlay(window, cx);
         let secret_dialog = self.secret_dialog_overlay(window, cx);
         let background_dialog = self.background_dialog_overlay(window, cx);
@@ -862,6 +875,7 @@ impl Render for SettingsView {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_nav(layout, window, cx))
             .child(v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(content))
+            .children(icon_picker)
             .children(action_editor)
             .children(secret_dialog)
             .children(background_dialog)

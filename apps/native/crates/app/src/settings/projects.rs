@@ -4,7 +4,7 @@
 //! overrides (`ProjectDefaultsSettings` at project scope), its actions (`project_actions.rs`), its
 //! checkouts and removal. The page's project picker is the project half of the web's
 //! `SettingsScopeSentence`; this client holds one environment, so there is no environment half.
-//! Not ported: the icon and image pickers ("Choose icon", "Choose file"), and the info alert about
+//! Not ported: the image picker ("Choose file"), and the info alert about
 //! keeping the project picked on other pages, which other native pages do not scope by project.
 
 use std::rc::Rc;
@@ -61,7 +61,8 @@ pub(crate) struct ProjectsState {
     /// The Name field was typed in since it last committed.
     name_edited: bool,
     organizing: bool,
-    saving_icon: bool,
+    pub(super) saving_icon: bool,
+    pub(super) picker: Option<super::project_icon_picker::Picker>,
     /// `t3.json` of the shown project's first checkout: its folder and the read's result, `None`
     /// while it loads.
     pub(super) project_file: Option<(String, Option<ProjectFile>)>,
@@ -91,6 +92,7 @@ impl ProjectsState {
             name_edited: false,
             organizing: false,
             saving_icon: false,
+            picker: None,
             project_file: None,
             actions: ActionsState::new(window, cx),
             _subscriptions: subscriptions,
@@ -132,7 +134,7 @@ impl SettingsView {
         groups
     }
 
-    fn shown_project(&self, cx: &App) -> Option<Shown> {
+    pub(super) fn shown_project(&self, cx: &App) -> Option<Shown> {
         let key = self.projects.selected.as_deref()?;
         let groups = self.project_groups(cx);
         let group = resolve_selection(&groups, key, &self.projects.last_members)?.clone();
@@ -216,7 +218,6 @@ impl SettingsView {
     fn update_project_members(&mut self, updates: Vec<(String, ProjectUpdate)>, failure_title: &'static str, cx: &mut Context<Self>) {
         if self.project_access_denied(failure_title, cx) {
             self.projects.organizing = false;
-            self.projects.saving_icon = false;
             return;
         }
         let label = self.environment_label(cx);
@@ -232,7 +233,6 @@ impl SettingsView {
             }
             let _ = this.update(cx, |this, cx| {
                 this.projects.organizing = false;
-                this.projects.saving_icon = false;
                 cx.notify();
             });
         })
@@ -250,18 +250,74 @@ impl SettingsView {
         if self.projects.saving_icon {
             return;
         }
+        let members = self.shown_members(cx);
+        let target = self.icon_target(&members, cx);
         let scratch_root = self.scratch_root(cx);
-        let updates = self
-            .shown_members(cx)
+        let updates = members
             .into_iter()
             .map(|member| {
                 let update = ProjectUpdate::default_icon(model::is_scratch(&member.workspace_root, scratch_root.as_deref()));
                 (member.id, update)
             })
             .collect();
+        self.save_icon_updates(target, updates, cx);
+    }
+
+    pub(super) fn icon_target(&self, members: &[ProjectShell], cx: &App) -> model::picker::Target {
+        model::picker::Target {
+            environment: self
+                .state
+                .read(cx)
+                .server_config
+                .config
+                .as_ref()
+                .map(|config| config.environment.environment_id.clone())
+                .unwrap_or_default(),
+            members: members.iter().map(|member| (member.id.clone(), member.workspace_root.clone())).collect(),
+        }
+    }
+
+    pub(super) fn save_icon_updates(&mut self, target: model::picker::Target, updates: Vec<(String, ProjectUpdate)>, cx: &mut Context<Self>) {
+        let Some(shown) = self.shown_project(cx) else { return };
+        if !target.allows(&self.icon_target(&shown.members, cx), self.can_edit_projects(cx), self.projects.saving_icon) {
+            return;
+        }
+        #[cfg(feature = "snapshot")]
+        if let Some(path) = std::env::var_os("T3_NATIVE_ICON_COMMAND_SPY") {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).expect("icon command spy");
+            for (id, update) in updates {
+                writeln!(file, "{}", update.payload("snapshot-icon", &id)).expect("write icon command spy");
+            }
+            return;
+        }
         self.projects.saving_icon = true;
         cx.notify();
-        self.update_project_members(updates, "Failed to update project icon", cx);
+        cx.spawn(async move |this, cx| {
+            for (id, update) in updates {
+                let request = this
+                    .update(cx, |this, cx| {
+                        let state = this.state.read(cx);
+                        let members: Vec<_> = target.members.iter().filter_map(|(id, _)| state.shell.project(id).cloned()).collect();
+                        if !target.allows(&this.icon_target(&members, cx), this.can_edit_projects(cx), false) {
+                            return None;
+                        }
+                        Some(state.rpc(PROJECTS_MUTATE, update.payload(&uuid(), &id)))
+                    })
+                    .ok()
+                    .flatten();
+                let Some(request) = request else { break };
+                if let Err(error) = request.await {
+                    let _ = this.update(cx, |_, cx| store::show_error(format!("Failed to update project icon: {error}"), cx));
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.projects.saving_icon = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn scratch_root(&self, cx: &App) -> Option<String> {
@@ -531,8 +587,18 @@ impl SettingsView {
         rows.push(
             Row::new("project-icon", "Project icon")
                 .description(model::icon_description(project_icon.as_ref(), representative.favicon_path.as_deref()))
-                .reset(customized && can_edit && !saving_icon, cx.listener(|this, _, _, cx| this.reset_project_icon(cx)))
-                .control(div().size(r(24.)).flex().items_center().justify_center().child(self.project_favicon(&representative.id, 24., cx)))
+                .reset(
+                    customized && can_edit && !saving_icon,
+                    cx.listener(|this, _, _, cx| this.reset_project_icon(cx)),
+                )
+                .control(
+                    h_flex().gap(r(8.)).child(self.project_favicon(&representative.id, 24., cx)).child(
+                        Button::new("project-choose-icon", ButtonVariant::Outline, ButtonSize::Sm)
+                            .label("Choose icon")
+                            .disabled(!can_edit || saving_icon)
+                            .on_click(cx.listener(|this, _, window, cx| this.open_project_icon_picker(window, cx))),
+                    ),
+                )
                 .into_any_element(),
         );
 

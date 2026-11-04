@@ -8,6 +8,7 @@
 //! counterpart here: a project's members are every checkout in the group.
 
 pub mod icon;
+pub mod picker;
 
 use std::collections::HashSet;
 

@@ -117,7 +117,7 @@ fn render_source(source: Option<Source<'_>>, size: Pixels, muted: Hsla, p: Palet
     }
 }
 
-fn color_token(color: &str, p: Palette) -> Hsla {
+pub(crate) fn color_token(color: &str, p: Palette) -> Hsla {
     hsla(match color {
         "gray" => p.project_icon_gray,
         "red" => p.project_icon_red,
@@ -147,4 +147,15 @@ pub fn render(state: &AppState, id: &str, size: Pixels, muted: Hsla, cx: &App) -
 
 pub fn size(web_px: f32, cx: &App) -> Pixels {
     gpui::px(web_px * crate::theme::preferences(cx).interface_font_size / crate::theme::metrics::ROOT_FONT_SIZE)
+}
+
+pub(crate) fn preview(icon: &ProjectIcon, size: Pixels, cx: &App) -> AnyElement {
+    render_source(
+        Some(Source::Icon(icon)),
+        size,
+        hsla(palette(cx).icon_muted),
+        palette(cx),
+        false,
+        crate::theme::font_family(FontRole::Code, cx),
+    )
 }
