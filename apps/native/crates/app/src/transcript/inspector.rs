@@ -822,7 +822,7 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
             }
             div().text_color(hsla(p.foreground).opacity(0.85)).child(lines).into_any_element()
         }
-        CallPart::Key(key) => div().text_color(hsla(p.muted_foreground)).child(key.clone()).into_any_element(),
+        CallPart::Key(key) => div().text_color(hsla(p.muted_foreground)).child(selectable(id, key.clone())).into_any_element(),
         CallPart::Structured(text) => structured(id, text, cx),
         CallPart::Images(images) => {
             let images = images.iter().enumerate().map(|(index, source)| tool_output_image(SharedString::from(format!("{id}:image:{index}")), source.clone(), TOOL_OUTPUT_IMAGE, cx)).collect::<Vec<_>>();
