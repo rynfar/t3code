@@ -727,7 +727,7 @@ impl SettingsView {
         }
         if fixture_active(cx) { return; }
         if selected.is_none_or(|s| s.row.driver != "codex") { self.providers.chatgpt = None; }
-        let wants_auth = self.providers.dialog.as_ref().filter(|d|d.created).map(|d|d.instance_id.read(cx).value().to_string()).or_else(|| selected.filter(|selected| model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone()));
+        let wants_auth = self.providers.dialog.as_ref().and_then(|d|d.add.created_instance_id().map(str::to_owned)).or_else(|| selected.filter(|selected| model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone()));
         if self.providers.auth.as_ref().map(|session| &session.instance_id) != wants_auth.as_ref() {
             self.providers.method_id = SharedString::default();
             self.providers.auth = wants_auth.map(|instance_id| {

@@ -34,11 +34,9 @@ pub(super) struct AddDialog {
     pub(super) token: u64,
     pub(super) connection: Option<u64>,
     pub(super) registry: super::registry::Registry,
-    pub(super) selected_acp: Option<model::registry::Agent>,
-    pub(super) prepared: Option<model::registry::Agent>,
+    pub(super) add: wizard::AddState,
     pub(super) step: usize,
     pub(super) acp: AcpSetup,
-    pub(super) created: bool,
     pub(super) local_form: super::form::FormState,
     pub(super) focus_step: bool,
     pub(super) driver: &'static Driver,
@@ -51,7 +49,6 @@ pub(super) struct AddDialog {
     /// The user typed their own id, so the label no longer drives it.
     pub(super) id_overridden: bool,
     pub(super) attempted: bool,
-    pub(super) saving: bool,
     pub(super) error: Option<String>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -73,7 +70,7 @@ impl AddDialog {
         self.driver.kind == model::ACP_REGISTRY && self.acp.local(self.configs.get(model::ACP_REGISTRY).and_then(|c| c.model.value.as_ref()))
     }
     pub(super) fn saving(&self) -> bool {
-        self.saving
+        self.add.saving()
     }
 }
 
@@ -176,11 +173,9 @@ impl SettingsView {
             token: NEXT_DIALOG.fetch_add(1,std::sync::atomic::Ordering::Relaxed),
             connection: self.state.read(cx).connection_id(),
             registry,
-            selected_acp:None,
-            prepared:None,
+            add: Default::default(),
             step: 0,
             acp: AcpSetup::Choices,
-            created: false,
             local_form: Default::default(),
             focus_step: false,
             driver,
@@ -192,7 +187,6 @@ impl SettingsView {
             accent,
             id_overridden: false,
             attempted: false,
-            saving: false,
             error: None,
             focus: focus.clone(),
             _subscriptions: subscriptions,
@@ -229,7 +223,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.providers.dialog.as_ref().is_none_or(|d| d.saving || d.created || d.registry.model.preparing.is_some()) || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) || self.add_driver_denial(driver, cx).is_some() {
+        if self.providers.dialog.as_ref().is_none_or(|d| d.add.saving() || d.add.created() || d.registry.model.preparing.is_some()) || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) || self.add_driver_denial(driver, cx).is_some() {
             return;
         }
         let Some(dialog) = self.providers.dialog.as_mut() else {
@@ -282,12 +276,12 @@ impl SettingsView {
 
     pub(super) fn start_dialog_acp(&mut self, local: bool, window: &mut Window, cx: &mut Context<Self>) {
         let driver = model::find_driver(model::ACP_REGISTRY).unwrap();
-        if self.providers.dialog.as_ref().is_none_or(|d| d.saving || d.created || d.registry.model.preparing.is_some()) || self.add_driver_denial(driver, cx).is_some() || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) || (local && self.form_denial(model::ACP_REGISTRY, "config.source", cx).is_some()) { return; }
+        if self.providers.dialog.as_ref().is_none_or(|d| d.add.saving() || d.add.created() || d.registry.model.preparing.is_some()) || self.add_driver_denial(driver, cx).is_some() || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) || (local && self.form_denial(model::ACP_REGISTRY, "config.source", cx).is_some()) { return; }
         self.select_dialog_driver(driver, window, cx);
         let (mode, config, label) = AcpSetup::start(local);
         let dialog = self.providers.dialog.as_mut().unwrap();
         dialog.registry.stop();
-        dialog.selected_acp = None;
+        dialog.add.selected_acp = None;
         dialog.acp = mode;
         dialog.show_more = true;
         dialog.focus_step = true;
@@ -344,20 +338,20 @@ impl SettingsView {
     /// Next, or Add instance on the last step. Moving past the identity step needs a valid id
     /// (`resolveWizardNavigation`).
     pub(super) fn advance_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.providers.dialog.as_ref().is_some_and(|d| d.created) { self.close_add_dialog(window, cx); return; }
+        if self.providers.dialog.as_ref().is_some_and(|d| d.add.created()) { self.close_add_dialog(window, cx); return; }
         if !self.check_dialog_policy(cx) { return; }
         self.commit_focused_form_field(window, cx);
         let Some(step) = self
             .providers
             .dialog
             .as_ref()
-            .filter(|dialog| !dialog.saving && dialog.registry.model.preparing.is_none())
+            .filter(|dialog| !dialog.add.saving() && dialog.registry.model.preparing.is_none())
             .map(|dialog| dialog.step)
         else {
             return;
         };
         let dialog = self.providers.dialog.as_ref().unwrap();
-        if dialog.created { self.close_add_dialog(window, cx); return; }
+        if dialog.add.created() { self.close_add_dialog(window, cx); return; }
         let config = dialog.configs.get(dialog.driver.kind).and_then(|c| c.model.value.as_ref());
         let last = dialog.acp.steps(dialog.driver.kind, config).len() - 1;
         if step < last && !(dialog.driver.kind == model::ACP_REGISTRY && step == 1) {
@@ -370,10 +364,10 @@ impl SettingsView {
     fn navigate_dialog(&mut self, requested: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_focused_form_field(window, cx);
         let error = self.dialog_id_error(cx);
-        let Some(dialog) = self.providers.dialog.as_mut().filter(|d| !d.saving && d.registry.model.preparing.is_none()) else {
+        let Some(dialog) = self.providers.dialog.as_mut().filter(|d| !d.add.saving() && d.registry.model.preparing.is_none()) else {
             return;
         };
-        if dialog.created { return; }
+        if dialog.add.created() { return; }
         let config = dialog.configs.get(dialog.driver.kind).and_then(|c| c.model.value.as_ref());
         match dialog.acp.navigate(dialog.driver.kind, config, dialog.step, requested, error) {
             Ok(2) if dialog.driver.kind == model::ACP_REGISTRY => { self.save_dialog(cx); return; }
@@ -398,7 +392,7 @@ impl SettingsView {
         let Some(dialog) = self.providers.dialog.as_mut() else {
             return;
         };
-        if dialog.saving || dialog.created || dialog.registry.model.preparing.is_some() {
+        if dialog.add.saving() || dialog.add.created() || dialog.registry.model.preparing.is_some() {
             return;
         }
         dialog.attempted = true;
@@ -431,7 +425,7 @@ impl SettingsView {
         let token = dialog.token;
         let connection = dialog.connection;
         dialog.registry.stop();
-        dialog.saving = true;
+        if !dialog.add.begin_create(instance_id.clone()) {return;}
         dialog.error = None;
         cx.notify();
         let (sent_at, task) = {
@@ -453,15 +447,14 @@ impl SettingsView {
                         this.apply_settings_reply(reply, sent_at, cx);
                         this.providers.selected = Some(instance_id.clone());
                         if let Some(dialog) = this.providers.dialog.as_mut().filter(|d| d.driver.kind == model::ACP_REGISTRY && !local) {
-                            dialog.saving = false;
-                            dialog.created = true;
+                            dialog.add.finish_create();
                             dialog.step = 2;
                             dialog.focus_step = true;
                         } else { this.providers.dialog = None; }
                     }
                     Err(error) => {
                         if let Some(dialog) = this.providers.dialog.as_mut() {
-                            dialog.saving = false;
+                            dialog.add.fail_create();
                             dialog.error = Some(format!(
                                 "Could not add provider instance: {}",
                                 failure_text(&error, "The settings update failed.")
@@ -483,8 +476,8 @@ impl SettingsView {
         self.apply_prepared_registry(window,cx);
         self.sync_registry(cx);
         let focus_step = std::mem::take(&mut self.providers.dialog.as_mut()?.focus_step);
-        if focus_step && self.providers.dialog.as_ref()?.created { self.providers.dialog.as_ref()?.focus.focus(window, cx); }
-        let target = if focus_step && !self.providers.dialog.as_ref()?.created {
+        if focus_step && self.providers.dialog.as_ref()?.add.created() { self.providers.dialog.as_ref()?.focus.focus(window, cx); }
+        let target = if focus_step && !self.providers.dialog.as_ref()?.add.created() {
             let dialog = self.providers.dialog.as_ref()?;
             let app = self.state.read(cx);
             wizard::focus_target(
@@ -527,9 +520,9 @@ impl SettingsView {
         let steps_names = dialog.acp.steps(dialog.driver.kind, config);
         let acp_error = (dialog.driver.kind == model::ACP_REGISTRY && dialog.attempted).then(|| dialog.acp.selection_error(config)).flatten();
         let acp_allowed = self.add_driver_denial(model::find_driver(model::ACP_REGISTRY).unwrap(), cx).is_none();
-        let created = dialog.created;
+        let created = dialog.add.created();
         let driver = dialog.driver;
-        let saving = dialog.saving || dialog.registry.model.preparing.is_some();
+        let saving = dialog.add.saving() || dialog.registry.model.preparing.is_some();
         let id_error = self.dialog_id_error(cx).filter(|_| dialog.attempted);
         let denial = self.add_driver_denial(driver, cx);
 
@@ -602,7 +595,7 @@ impl SettingsView {
                             })
                             .child(if done && index == 0 {
                                 let summary = if driver.kind == model::ACP_REGISTRY {
-                                    if dialog.local_acp() {"Local ACP command".to_owned()} else {dialog.selected_acp.as_ref().map(|a|a.name.clone()).or_else(||config.and_then(|c|c["agentId"].as_str()).map(str::to_owned)).unwrap_or_default()}
+                                    if dialog.local_acp() {"Local ACP command".to_owned()} else {dialog.add.selected_acp.as_ref().map(|a|a.name.clone()).or_else(||config.and_then(|c|c["agentId"].as_str()).map(str::to_owned)).unwrap_or_default()}
                                 } else {driver.label.to_owned()};
                                 format!("{name}: {summary}")
                             } else if done && index == 1 {
@@ -633,7 +626,7 @@ impl SettingsView {
                 let mut content = v_flex().gap(r(8.)).child(
                     h_flex().gap(r(8.)).child(div().flex_1().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(if local { "Local ACP command" } else { "Enter manually" }))
                     .child(Button::new("wizard-acp-choices", ButtonVariant::GhostMuted, ButtonSize::Compact).label("Search registry").disabled(saving).on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(d) = this.providers.dialog.as_mut().filter(|d| !d.saving && d.registry.model.preparing.is_none()) { d.acp = AcpSetup::Choices; d.attempted = false; d.error = None; d.focus.focus(window, cx); }
+                        if let Some(d) = this.providers.dialog.as_mut().filter(|d| !d.add.saving() && d.registry.model.preparing.is_none()) { d.acp = AcpSetup::Choices; d.attempted = false; d.error = None; d.focus.focus(window, cx); }
                         cx.notify();
                     })))
                 ).child(div().text_xs().text_color(hsla(p.muted_foreground)).child(if local { format!("Run an installed ACP executable on {environment}.") } else { "Enter an official registry ID and any local executable or auth override.".into() })).child(config);
@@ -703,7 +696,7 @@ impl SettingsView {
                 None => this.border_color(hsla(p.border)),
             });
             v_flex()
-                .children(dialog.selected_acp.as_ref().filter(|_|driver.kind==model::ACP_REGISTRY).map(|agent|v_flex().pb(r(12.)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(agent.name.clone())).child(div().text_xs().text_color(hsla(p.muted_foreground)).child(format!("v{} · {}",agent.version,agent.distribution)))))
+                .children(dialog.add.selected_acp.as_ref().filter(|_|driver.kind==model::ACP_REGISTRY).map(|agent|v_flex().pb(r(12.)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(agent.name.clone())).child(div().text_xs().text_color(hsla(p.muted_foreground)).child(format!("v{} · {}",agent.version,agent.distribution)))))
                 .child(Row::new("add-provider-label", "Label").description("Shown in the provider list.").control(div().w(r(224.)).child(Input::new(&dialog.label).small().disabled(saving || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx)))))
                 .child(
                     div().border_t_1().border_color(hsla(p.border).opacity(0.5)).child(
@@ -725,7 +718,7 @@ impl SettingsView {
 
         let auth_state = self.providers.auth.as_ref().and_then(|s|s.state.as_ref());
         let active_auth = created && auth_state.is_some_and(|s|s.is_active());
-        let signed_in = created && model::registry::signed_in(self.state.read(cx).server_config.config.as_ref().and_then(|c|c.provider(dialog.instance_id.read(cx).value().as_ref())),auth_state);
+        let signed_in = created && model::registry::signed_in(self.state.read(cx).server_config.config.as_ref().and_then(|c|dialog.add.created_instance_id().and_then(|id|c.provider(id))),auth_state);
         let back: SharedString = if step == 0 {
             "Cancel".into()
         } else {

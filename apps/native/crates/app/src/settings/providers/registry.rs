@@ -101,7 +101,7 @@ impl Registry {
 impl AddDialog {
     pub(super) fn registry_step(&self) -> bool {
         self.step == 0
-            && !self.created
+            && !self.add.created()
             && !(self.driver.kind == model::ACP_REGISTRY && self.acp == AcpSetup::Manual)
     }
 }
@@ -135,6 +135,11 @@ impl SettingsView {
     }
     fn registry_allowed(&self, cx: &gpui::App) -> bool {
         self.registry_visible(cx)
+            && self
+                .providers
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.add.editable())
             && self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx)
             && self
                 .add_driver_denial(model::find_driver(model::ACP_REGISTRY).unwrap(), cx)
@@ -233,7 +238,7 @@ impl SettingsView {
             (client, app.runtime().clone())
         };
         let d = self.providers.dialog.as_mut().unwrap();
-        let Some(epoch) = d.registry.model.begin_prepare(&agent.id) else {
+        let Some(epoch) = d.add.begin_prepare(&mut d.registry.model, &agent.id) else {
             return;
         };
         d.registry.debounce = None;
@@ -266,7 +271,12 @@ impl SettingsView {
                     && !this.registry_configured(&agent.id, cx)
                 {
                     // Input entity updates need a Window; apply the prepared draft on the next render.
-                    this.providers.dialog.as_mut().unwrap().prepared = Some(agent);
+                    this.providers
+                        .dialog
+                        .as_mut()
+                        .unwrap()
+                        .add
+                        .stage_prepared(agent);
                 }
                 cx.notify();
             });
@@ -278,13 +288,24 @@ impl SettingsView {
         cx.notify();
     }
     pub(super) fn apply_prepared_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self
+        let allowed = self.registry_allowed(cx);
+        let duplicate = self
+            .providers
+            .dialog
+            .as_ref()
+            .and_then(|d| d.add.prepared())
+            .is_some_and(|a| self.registry_configured(&a.id, cx));
+        if !allowed || duplicate {
+            if let Some(d) = self.providers.dialog.as_mut() {
+                d.add.discard_prepared();
+            }
+            return;
+        }
+        let Some(agent) = self
             .providers
             .dialog
             .as_mut()
-            .and_then(|d| d.prepared.take());
-        let Some(agent) =
-            agent.filter(|a| self.registry_allowed(cx) && !self.registry_configured(&a.id, cx))
+            .and_then(|d| d.add.apply_prepared())
         else {
             return;
         };
@@ -305,7 +326,6 @@ impl SettingsView {
         d.instance_id
             .update(cx, |input, cx| input.set_value(id, window, cx));
         d.id_overridden = true;
-        d.selected_acp = Some(agent);
         d.step = 1;
         d.focus_step = true;
         d.registry.stop();
@@ -313,7 +333,7 @@ impl SettingsView {
     pub(super) fn render_registry(&self, cx: &mut Context<Self>) -> AnyElement {
         let d = self.providers.dialog.as_ref().unwrap();
         let search = &d.registry.model;
-        let preparing = search.preparing.is_some();
+        let preparing = search.preparing.is_some() || !d.add.editable();
         let p = palette(cx);
         let mut content = v_flex().gap(r(12.)).child(
             h_flex()
@@ -511,10 +531,10 @@ impl SettingsView {
             .dialog
             .as_ref()
             .unwrap()
-            .instance_id
-            .read(cx)
-            .value()
-            .to_string();
+            .add
+            .created_instance_id()
+            .unwrap()
+            .to_owned();
         let provider = self
             .state
             .read(cx)
@@ -598,7 +618,7 @@ impl SettingsView {
                 d.registry.model.begin_prepare(id);
             }
             if let Ok(selected) = serde_json::from_value(fixture["selected"].clone()) {
-                d.prepared = Some(selected);
+                d.add.stage_prepared(selected);
             }
             self.apply_prepared_registry(window, cx);
         } else {
@@ -621,6 +641,13 @@ impl SettingsView {
         }
         if let Some(step) = fixture["step"].as_u64() {
             self.providers.dialog.as_mut().unwrap().step = step as usize;
+        }
+        if fixture["saving"] == true {
+            let d = self.providers.dialog.as_mut().unwrap();
+            let id = d.instance_id.read(cx).value().to_string();
+            d.add.begin_create(id);
+            d.step = 0;
+            d.registry.stop();
         }
         if let Some(provider) = fixture.get("provider").and_then(|v| {
             serde_json::from_value::<t3_core::server_config::ServerProvider>(v.clone()).ok()
@@ -655,7 +682,8 @@ impl SettingsView {
             self.providers.selected = Some(id.clone());
             let d = self.providers.dialog.as_mut().unwrap();
             d.driver = model::find_driver(model::ACP_REGISTRY).unwrap();
-            d.created = true;
+            d.add.begin_create(id.clone());
+            d.add.finish_create();
             d.step = 2;
             d.instance_id
                 .update(cx, |input, cx| input.set_value(id.clone(), window, cx));

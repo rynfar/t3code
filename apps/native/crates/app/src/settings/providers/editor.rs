@@ -239,7 +239,7 @@ impl SettingsView {
                 }
             }
         }
-        if model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && shows_account(selected) && self.providers.dialog.as_ref().is_none_or(|d|!d.created)
+        if model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && shows_account(selected) && self.providers.dialog.as_ref().is_none_or(|d|!d.add.created())
             && let Some(live) = live
         {
             rows.push(self.render_account(selected, live, environment_label, window, cx));
