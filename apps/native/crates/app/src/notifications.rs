@@ -31,7 +31,7 @@ fn app_focused(cx: &mut App) -> bool {
 impl AppState {
     pub(crate) fn sync_notification_state(&mut self, cx: &mut App) {
         let focused = app_focused(cx);
-        for tag in self.notifications.pending.sync(self.client_settings.notification_mode, true, focused) {
+        for tag in self.notifications.pending.sync(self.client_settings.notification_mode, focused) {
             cx.dismiss_system_notification(&tag);
         }
         self.update_notification_badge();

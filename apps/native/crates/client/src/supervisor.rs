@@ -580,6 +580,10 @@ struct SessionStateFetch<'a> {
     task: Option<JoinHandle<()>>,
 }
 
+impl Drop for SessionStateFetch<'_> {
+    fn drop(&mut self) { self.stop(); }
+}
+
 impl SessionStateFetch<'_> {
     fn start(&mut self) {
         if self.task.as_ref().is_some_and(|task| !task.is_finished()) {

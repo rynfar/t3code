@@ -218,6 +218,7 @@ impl AppState {
 
     /// Drops the client and everything that belonged to its environment.
     pub(crate) fn clear_connection_state(&mut self, cx: &mut Context<Self>) {
+        self.reset_environment_announcements();
         if let Some(client) = &self.client { client.close_all_threads(); }
         self.client = None;
         self.shell = ShellState::default();
@@ -256,20 +257,7 @@ impl AppState {
         match event {
             EnvironmentEvent::Activated { id, client, shell, config, status, .. } => {
                 if self.environments.active.as_deref() != Some(&id) { return; }
-                self.client = Some(client);
-                self.connection += 1;
-                self.shell = *shell;
-                self.server_config = *config;
-                self.panels = crate::right_panel::PanelState::load(Some(&id));
-                cx.emit(AppEvent::RightPanel);
-                self.set_phase(Phase::Online(status), cx);
-                cx.emit(AppEvent::Phase);
-                self.sync_server_config(cx);
-                self.rebuild_sidebar(cx);
-                cx.emit(AppEvent::Shell);
-                self.restore_shell_selection(cx);
-                self.finish_notification_route(cx);
-                self.land_home(cx);
+                self.install_active_environment(client, *shell, *config, status, cx);
             }
             EnvironmentEvent::Active { id, events, .. } => {
                 if self.environments.active.as_deref() == Some(&id) { self.apply_batch(events, cx); }
@@ -277,7 +265,6 @@ impl AppState {
             EnvironmentEvent::Status { id, status, .. } => {
                 self.environment_statuses.insert(id.clone(), status.clone());
                 if self.environments.active.as_deref() != Some(&id) { cx.emit(AppEvent::Phase); }
-                if status != ConnectionStatus::Connected { self.retire_environment_notifications(&id, cx); }
                 if let ConnectionStatus::NeedsPairing { reason } = status {
                     self.environment_credentials_rejected(&id, reason, cx);
                 } else if self.environments.active.as_deref() == Some(&id) {
@@ -297,6 +284,21 @@ impl AppState {
                 for notification in notifications { self.present_notification(&id, notification, cx); }
             }
         }
+    }
+
+    pub(crate) fn install_active_environment(&mut self, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, cx: &mut Context<Self>) {
+        self.client = Some(client);
+        self.connection += 1;
+        self.shell = shell;
+        self.server_config = config;
+        self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
+        cx.emit(AppEvent::RightPanel);
+        self.set_phase(Phase::Online(status), cx);
+        cx.emit(AppEvent::Phase);
+        self.sync_server_config(cx);
+        self.sync_shell_views(true, true, self.shell.synchronized, cx);
+        self.finish_notification_route(cx);
+        self.land_home(cx);
     }
 
     fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
@@ -333,16 +335,7 @@ impl AppState {
         if side_changed {
             cx.emit(AppEvent::SideThread);
         }
-        if sidebar_changed || resynchronized { self.observe_background_announcements(cx); }
-        if shell_changed {
-            self.sync_omitted_rows(cx);
-            self.sync_side_threads(cx);
-            if sidebar_changed {
-                self.rebuild_sidebar(cx);
-            }
-            cx.emit(AppEvent::Shell);
-            self.restore_shell_selection(cx);
-        }
+        self.sync_shell_views(shell_changed, sidebar_changed, resynchronized, cx);
         if thread_changed && self.thread.deleted {
             // The web treats a deleted open thread as missing and goes home.
             self.close_selected_thread(cx);
@@ -359,6 +352,19 @@ impl AppState {
         }
         if shell_changed || resynchronized {
             self.finish_notification_route(cx);
+        }
+    }
+
+    fn sync_shell_views(&mut self, shell_changed: bool, sidebar_changed: bool, resynchronized: bool, cx: &mut Context<Self>) {
+        if sidebar_changed || resynchronized { self.observe_background_announcements(cx); }
+        if shell_changed {
+            self.sync_omitted_rows(cx);
+            self.sync_side_threads(cx);
+            if sidebar_changed {
+                self.rebuild_sidebar(cx);
+            }
+            cx.emit(AppEvent::Shell);
+            self.restore_shell_selection(cx);
         }
     }
 

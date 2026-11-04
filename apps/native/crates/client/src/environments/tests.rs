@@ -144,3 +144,19 @@ async fn two_environments_share_their_existing_supervisors_with_the_active_view(
         "fixture: watched a+b simultaneously; one socket each; switching reused generations {a_epoch}/{b_epoch}; background b notified once; removing a retained b; reconnect replay stayed quiet; removal closed owned sockets"
     );
 }
+
+#[tokio::test]
+async fn removing_environment_cancels_its_in_flight_session_state_fetch() {
+    let mut server = FakeServer::start().await;
+    let mut sessions = server.hold_session_requests();
+    let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(), false);
+    owner.watch("a", server.credentials(), None);
+    let mut connection = server.connection().await;
+    let fetch = sessions.request().await;
+    owner.remove("a");
+    connection.closed().await;
+    fetch.closed().await;
+    eprintln!(
+        "fixture: removing a closed its WebSocket and cancelled the in-flight authenticated HTTP fetch"
+    );
+}

@@ -124,11 +124,11 @@ impl PendingNotifications {
         self.destinations.retain(|tag, target| loaded(target) || self.pending.contains_key(tag) || self.attempts.contains_key(tag));
     }
 
-    /// Mode listeners are rebuilt on every mode change; focus and disconnect retire pending.
-    pub fn sync(&mut self, mode: NotificationMode, connected: bool, focused: bool) -> Vec<String> {
+    /// Mode changes and focus retire pending; transport reconnects leave this set untouched.
+    pub fn sync(&mut self, mode: NotificationMode, focused: bool) -> Vec<String> {
         let changed = self.applied_mode != Some(mode);
         self.applied_mode = Some(mode);
-        if changed || !connected || focused || !mode.has_desktop_notifications() {
+        if changed || focused || !mode.has_desktop_notifications() {
             self.clear()
         } else {
             Vec::new()

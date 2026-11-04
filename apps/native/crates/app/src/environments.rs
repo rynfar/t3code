@@ -291,7 +291,6 @@ impl AppState {
         if self.environments.get(id).is_none_or(|e| e.disabled) { return; }
         self.environments.relocate(id, &http_base);
         self.persist_environments();
-        self.retire_environment_notifications(id, cx);
         self.start_environment(id, cx);
         if self.environments.active.as_deref() == Some(id) {
             self.reset_connection(cx);
@@ -319,7 +318,6 @@ impl AppState {
             return self.fail_pairing(PairingSource::Link, message, cx);
         }
         if let Some(entry) = self.environments.environments.iter_mut().find(|e| e.id == id) { entry.disabled = false; }
-        if moved { self.connections.remove(id); self.retire_environment_notifications(id, cx); }
         self.environments.active = Some(environment.id.clone());
         self.persist_environments();
         self.reset_connect_screen();

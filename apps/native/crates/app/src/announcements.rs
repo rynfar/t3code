@@ -110,6 +110,13 @@ impl AppState {
             });
         }));
     }
+    pub(crate) fn reset_environment_announcements(&mut self) {
+        self.announcements.background = Background::default();
+        self.announcements.thread = None;
+        self.announcements.queue = Announcer::default();
+        self.announcements.timer = None;
+    }
+
     pub(crate) fn observe_background_announcements(&mut self, cx: &mut Context<Self>) {
         if !self.shell.synchronized
             || !matches!(
@@ -133,10 +140,7 @@ impl AppState {
             self.phase,
             Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
         ) {
-            self.announcements.background = Background::default();
-            self.announcements.thread = None;
-            self.announcements.queue = Announcer::default();
-            self.announcements.timer = None;
+            self.reset_environment_announcements();
             return;
         }
         if self

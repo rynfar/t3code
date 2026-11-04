@@ -28,10 +28,13 @@ pub struct FakeServer {
     descriptor: Arc<Mutex<Option<Value>>>,
     refusal: Refusal,
     http: HttpRequests,
+    held_sessions: HeldSessions,
 }
 
 /// What `/ws` answers instead of upgrading, when set.
 type Refusal = Arc<Mutex<Option<(u16, Value)>>>;
+type HeldSessions = Arc<Mutex<Option<mpsc::UnboundedSender<TcpStream>>>>;
+
 type HttpRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 pub struct Connection {
@@ -52,18 +55,27 @@ impl FakeServer {
         let refused = refusal.clone();
         let http=Arc::new(Mutex::new(Vec::new()));
         let requests=http.clone();
+        let held_sessions: HeldSessions = Arc::new(Mutex::new(None));
+        let sessions = held_sessions.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (tx, session, descriptor, refusal) = (tx.clone(), served.clone(), described.clone(), refused.clone());
                 let http=requests.clone();
+                let sessions = sessions.clone();
                 tokio::spawn(async move {
-                    if let Some(connection) = serve(stream, session, descriptor, refusal, http).await {
+                    if let Some(connection) = serve(stream, session, descriptor, refusal, http, sessions).await {
                         let _ = tx.send(connection);
                     }
                 });
             }
         });
-        FakeServer { addr, connections, session, descriptor, refusal, http }
+        FakeServer { addr, connections, session, descriptor, refusal, http, held_sessions }
+    }
+
+    pub fn hold_session_requests(&self) -> SessionRequests {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.held_sessions.lock().expect("held sessions") = Some(tx);
+        SessionRequests(rx)
     }
 
     /// `/ws` answers this status and JSON body instead of upgrading; `None` upgrades again.
@@ -127,7 +139,7 @@ async fn respond_status(mut stream: TcpStream, status: u16, body: Value) {
     let _ = stream.shutdown().await;
 }
 
-async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>, refusal: Refusal, http: HttpRequests) -> Option<Connection> {
+async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Arc<Mutex<Option<Value>>>, refusal: Refusal, http: HttpRequests, held_sessions: HeldSessions) -> Option<Connection> {
     let head = read_head(&mut stream).await?;
     let path = head.split_whitespace().nth(1)?.to_owned();
     let header = |name: &str| {
@@ -168,6 +180,10 @@ async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Ar
         return None;
     }
     if head.starts_with("GET /api/auth/session") {
+        if let Some(tx) = held_sessions.lock().expect("held sessions").clone() {
+            let _ = tx.send(stream);
+            return None;
+        }
         let state = session.lock().expect("session").clone();
         respond_json(stream, state).await;
         return None;
@@ -227,5 +243,23 @@ impl Connection {
 
     pub async fn chunk(&mut self, request: &Value, values: Value) {
         self.send(json!({ "_tag": "Chunk", "requestId": request["id"], "values": values })).await;
+    }
+}
+
+
+pub struct SessionRequests(mpsc::UnboundedReceiver<TcpStream>);
+pub struct SessionRequest(TcpStream);
+
+impl SessionRequests {
+    pub async fn request(&mut self) -> SessionRequest {
+        SessionRequest(tokio::time::timeout(WAIT, self.0.recv()).await.expect("session fetch starts").expect("server running"))
+    }
+}
+
+impl SessionRequest {
+    pub async fn closed(mut self) {
+        let mut byte = [0];
+        let count = tokio::time::timeout(WAIT, self.0.read(&mut byte)).await.expect("removal cancels the in-flight session fetch").expect("read HTTP connection");
+        assert_eq!(count, 0, "cancelled fetch closes its HTTP request");
     }
 }
