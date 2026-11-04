@@ -175,6 +175,40 @@ pub struct ProjectGroup {
     pub archived: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ProjectScope {
+    keys: HashSet<String>,
+}
+
+impl ProjectScope {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn toggle(&mut self, group: &ProjectGroup, groups: &[ProjectGroup], ready: bool) {
+        self.keys = self.resolved_keys(groups, ready);
+        if !self.keys.remove(&group.key) {
+            self.keys.insert(group.key.clone());
+        }
+    }
+
+    pub fn is_selected(&self, group: &ProjectGroup) -> bool {
+        !group.archived && self.keys.contains(&group.key)
+    }
+
+    /// `resolveSidebarProjectScopeKeys`: missing stored keys survive loading and can return later.
+    pub fn resolved_keys(&self, groups: &[ProjectGroup], ready: bool) -> HashSet<String> {
+        self.keys.iter().filter(|key| groups.iter().find(|group| group.key == **key).map_or(!ready, |group| !group.archived)).cloned().collect()
+    }
+
+    pub fn members(&self, groups: &[ProjectGroup], ready: bool) -> Option<HashSet<String>> {
+        let keys = self.resolved_keys(groups, ready);
+        let members: HashSet<String> =
+            groups.iter().filter(|group| keys.contains(&group.key)).flat_map(|group| group.member_project_ids.iter().cloned()).collect();
+        (!members.is_empty()).then_some(members)
+    }
+}
+
 fn freshness(project: &ProjectShell) -> Ms {
     parse_iso(&project.updated_at).or_else(|| parse_iso(&project.created_at)).unwrap_or(0)
 }
@@ -378,5 +412,34 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].key, "fork");
         assert_eq!(groups[0].label, "My fork");
+    }
+    #[test]
+    fn project_scope_follows_logical_groups_when_a_checkout_splits_and_rejoins() {
+        let projects = [project("a", "/repo"), project("b", "/copy")];
+        let grouped = build_project_groups("env", &projects, &GroupingSettings::default());
+        let separate = GroupingSettings { overrides: [("env:/copy".into(), GroupingMode::Separate)].into(), ..Default::default() };
+        let split = build_project_groups("env", &projects, &separate);
+        let mut scope = ProjectScope::default();
+        scope.toggle(&grouped[0], &grouped, true);
+        assert_eq!(scope.members(&split, true), Some(["a".into()].into()));
+        assert_eq!(scope.members(&grouped, true), Some(["a".into(), "b".into()].into()));
+        let all_separate = build_project_groups("env", &projects, &GroupingSettings { mode: GroupingMode::Separate, ..Default::default() });
+        assert_eq!(scope.members(&all_separate, true), None);
+    }
+
+    #[test]
+    fn project_scope_clears_a_missing_physical_group_on_inherit() {
+        let projects = [project("a", "/repo"), project("b", "/copy")];
+        let grouped = build_project_groups("env", &projects, &GroupingSettings::default());
+        let split = build_project_groups("env", &projects, &GroupingSettings { mode: GroupingMode::Separate, ..Default::default() });
+        let mut scope = ProjectScope::default();
+        scope.toggle(&split[1], &split, true);
+        assert_eq!(scope.members(&grouped, true), None);
+        assert_eq!(scope.resolved_keys(&grouped, false), ["env:/copy".into()].into());
+        assert!(scope.resolved_keys(&grouped, true).is_empty());
+        assert_eq!(scope.members(&split, true), Some(["b".into()].into()));
+        let mut archived = split.clone();
+        archived[1].archived = true;
+        assert_eq!(scope.members(&archived, true), None);
     }
 }

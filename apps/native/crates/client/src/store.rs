@@ -506,61 +506,75 @@ pub struct ClientCommit {
 type ClientUpdateReply<T> = mpsc::Receiver<(T, Result<ClientCommit, String>)>;
 fn enqueue_client_update<T: Send + 'static>(
     fallback: t3_core::client_settings::ClientSettingsDoc,
-    prepare: impl FnOnce(
-        &t3_core::client_settings::ClientSettingsDoc,
-    ) -> (serde_json::Map<String, serde_json::Value>, T)
-    + Send
-    + 'static,
+    prepare: impl FnOnce(&t3_core::client_settings::ClientSettingsDoc) -> (serde_json::Map<String, serde_json::Value>, T) + Send + 'static,
 ) -> Result<(u64, ClientUpdateReply<T>), String> {
     let (tx, rx) = mpsc::channel();
-    let sequence = writer()
-        .ok_or("Settings writer is unavailable.")?
-        .send(move |sequence| {
-            WriteRequest::Update(Box::new(move |base| {
-                let current = base
-                    .ok_or_else(|| "Native home is unavailable.".to_owned())
-                    .and_then(|base| {
-                        let text = match std::fs::read_to_string(base.join("settings.json")) {
-                            Ok(text) => Ok(text),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                Ok(String::new())
-                            }
-                            Err(error) => Err(error.to_string()),
-                        }?;
-                        Ok((base, text))
-                    });
-                let doc = current
-                    .as_ref()
-                    .map(|(_, text)| t3_core::client_settings::ClientSettingsDoc::from_json(text))
-                    .unwrap_or(fallback);
-                let (patch, value) = prepare(&doc);
-                let result = current.and_then(|(base, _)| {
-                    if !patch.is_empty() {
-                        write_patch_result(&base, CLIENT_SETTINGS, &patch)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    Ok(ClientCommit { sequence, patch })
-                });
-                if let Err(error) = &result {
-                    tracing::warn!(%error,"settings not saved");
-                }
-                let _ = tx.send((value, result));
-            }))
-        })?;
+    let sequence = writer().ok_or("Settings writer is unavailable.")?.send(move |sequence| client_update_request(fallback, prepare, sequence, tx))?;
     Ok((sequence, rx))
+}
+fn client_update_request<T: Send + 'static>(
+    fallback: t3_core::client_settings::ClientSettingsDoc,
+    prepare: impl FnOnce(&t3_core::client_settings::ClientSettingsDoc) -> (serde_json::Map<String, serde_json::Value>, T) + Send + 'static,
+    sequence: u64,
+    tx: mpsc::Sender<(T, Result<ClientCommit, String>)>,
+) -> WriteRequest {
+    WriteRequest::Update(Box::new(move |base| {
+        let current = base.ok_or_else(|| "Native home is unavailable.".to_owned()).and_then(|base| {
+            let text = match std::fs::read_to_string(base.join("settings.json")) {
+                Ok(text) => Ok(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+                Err(error) => Err(error.to_string()),
+            }?;
+            Ok((base, text))
+        });
+        let doc = current.as_ref().map(|(_, text)| t3_core::client_settings::ClientSettingsDoc::from_json(text)).unwrap_or(fallback);
+        let (patch, value) = prepare(&doc);
+        let result = current.and_then(|(base, _)| {
+            if !patch.is_empty() {
+                write_patch_result(&base, CLIENT_SETTINGS, &patch).map_err(|e| e.to_string())?;
+            }
+            Ok(ClientCommit { sequence, patch })
+        });
+        if let Err(error) = &result {
+            tracing::warn!(%error,"settings not saved");
+        }
+        let _ = tx.send((value, result));
+    }))
 }
 /// Prepares and commits against the current file in writer order. Call off the UI thread.
 pub fn commit_client_settings_with<T: Send + 'static>(
     fallback: t3_core::client_settings::ClientSettingsDoc,
-    prepare: impl FnOnce(
-        &t3_core::client_settings::ClientSettingsDoc,
-    ) -> (serde_json::Map<String, serde_json::Value>, T)
-    + Send
-    + 'static,
+    prepare: impl FnOnce(&t3_core::client_settings::ClientSettingsDoc) -> (serde_json::Map<String, serde_json::Value>, T) + Send + 'static,
 ) -> Result<(T, Result<ClientCommit, String>), String> {
     let (_, rx) = enqueue_client_update(fallback, prepare)?;
     rx.recv().map_err(|e| e.to_string())
 }
+fn client_setting_request(
+    fallback: t3_core::client_settings::ClientSettingsDoc,
+    change: t3_core::client_settings::ClientSettingChange,
+    sequence: u64,
+    reply: mpsc::Sender<((), Result<ClientCommit, String>)>,
+) -> WriteRequest {
+    client_update_request(
+        fallback,
+        move |current| {
+            let mut current = current.clone();
+            (current.apply_change(&change), ())
+        },
+        sequence,
+        reply,
+    )
+}
+
+/// Queues a single-key edit against the latest document in writer order.
+pub fn patch_client_setting_change(
+    fallback: t3_core::client_settings::ClientSettingsDoc,
+    change: t3_core::client_settings::ClientSettingChange,
+) -> Option<u64> {
+    let (reply, _) = mpsc::channel();
+    writer()?.send(move |sequence| client_setting_request(fallback, change, sequence, reply)).ok()
+}
+
 fn rebase_theme_patch(
     mut patch: serde_json::Map<String, serde_json::Value>,
     before: Option<&serde_json::Value>,
@@ -913,6 +927,35 @@ mod tests {
             receipt.recv().unwrap().unwrap();worker.join().unwrap();
             let value:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
             assert_eq!(value,expected);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grouping_override_edits_use_the_latest_record_and_preserve_other_instances() {
+        use t3_core::client_settings::{ClientSettingChange, ClientSettingsDoc, ProjectGroupingMode};
+        let dir = std::env::temp_dir().join(format!("t3-grouping-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cached = ClientSettingsDoc::from_json(r#"{"sidebarProjectGroupingOverrides":{"env:/a":"repository"}}"#);
+        let latest = r#"{"futureSetting":42,"sidebarProjectGroupingOverrides":{"env:/a":"separate","other-env:/x":"separate"}}"#;
+        for (mode, expected) in [
+            (Some(ProjectGroupingMode::RepositoryPath), serde_json::json!({"env:/a":"repository_path","other-env:/x":"separate"})),
+            (Some(ProjectGroupingMode::Repository), serde_json::json!({"env:/a":"repository","other-env:/x":"separate"})),
+            (None, serde_json::json!({"other-env:/x":"separate"})),
+        ] {
+            std::fs::write(dir.join("settings.json"), latest).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let (done, receipt) = mpsc::channel();
+            tx.send(client_setting_request(cached.clone(), ClientSettingChange::ProjectGroupingOverride { key: "env:/a".into(), mode }, 1, done)).unwrap();
+            drop(tx);
+            let home = dir.clone();
+            let worker = std::thread::spawn(move || run_writer(rx, || Some(home.clone())));
+            receipt.recv().unwrap().1.unwrap();
+            worker.join().unwrap();
+            let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+            assert_eq!(saved["sidebarProjectGroupingOverrides"], expected);
+            assert_eq!(saved["futureSetting"], 42);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

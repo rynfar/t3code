@@ -134,14 +134,18 @@ fn apply_client(
                 .cloned()
         })
         .flatten();
+    let grouping_override = matches!(&change, ClientSettingChange::ProjectGroupingOverride { .. }).then(|| prefs.doc.clone());
     let patch = prefs.doc.apply_change(&change);
-    if patch.is_empty() {
+    if patch.is_empty() && !(persist && grouping_override.is_some()) {
         return;
     }
     if persist {
-        let keys = patch.keys().cloned().collect::<Vec<_>>();
-        if let Some(sequence) = store::patch_client_settings_rebased(patch, before_library.clone())
-        {
+        let (keys, sequence) = if let Some(fallback) = grouping_override {
+            (vec!["sidebarProjectGroupingOverrides".to_owned()], store::patch_client_setting_change(fallback, change.clone()))
+        } else {
+            (patch.keys().cloned().collect::<Vec<_>>(), store::patch_client_settings_rebased(patch, before_library.clone()))
+        };
+        if let Some(sequence) = sequence {
             for key in keys {
                 prefs.versions.insert(key, sequence);
             }
