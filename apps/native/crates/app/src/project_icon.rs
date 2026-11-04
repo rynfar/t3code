@@ -67,7 +67,10 @@ fn render_source(source: Option<Source<'_>>, size: Pixels, muted: Hsla, p: Palet
     let ink = |color: &str| {
         let mut ink = color_token(color, p);
         if grayscale {
+            // Match the web's CSS grayscale and GPUI's image grayscale shader.
+            let rgb = ink.to_rgb();
             ink.s = 0.;
+            ink.l = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
         }
         ink
     };
