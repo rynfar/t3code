@@ -56,7 +56,8 @@ enum Slot {
 }
 
 /// A finished load: the encoded bytes, the size the server reported, and the decoded image.
-type Loaded = Result<(Arc<[u8]>, Option<(u32, u32)>, Decoded), String>;
+type LoadError = (String, Option<String>);
+type Loaded = Result<(Arc<[u8]>, Option<(u32, u32)>, Decoded), LoadError>;
 
 pub enum ImageState {
     Loading,
@@ -133,7 +134,7 @@ impl MediaCache {
             _ => {}
         }
         if self.images.len() >= 1024 { return ImageState::Loading; }
-        let Some(task) = self.load(slot_key.clone(), cx) else { return ImageState::Loading };
+        let Some(task) = self.load(slot_key.clone(), owner, cx) else { return ImageState::Loading };
         self.images.insert(slot_key, Slot::Loading { waiters: vec![owner], _task: task });
         ImageState::Loading
     }
@@ -169,36 +170,38 @@ impl MediaCache {
         self.pinned.clear();
     }
 
-    fn load(&mut self, (key, variant): (Key, Variant), cx: &mut Context<Self>) -> Option<Task<()>> {
-        let state = self.state.read(cx);
-        let client = state.client_handle()?;
-        let runtime = state.runtime().clone();
+    fn load(&mut self, (key, variant): (Key, Variant), owner: EntityId, cx: &mut Context<Self>) -> Option<Task<()>> {
         let cached = self.encoded.get_mut(&key).map(|encoded| {
             encoded.used = self.frame;
             encoded.bytes.clone()
         });
-        let (permits, svg, source, max_edge) = (self.permits.clone(), cx.svg_renderer(), key.source.clone(), variant.max_edge());
         let resource_key = Key { content: None, ..key.clone() };
-        let asset_url = self.revisions.shown_asset(&resource_key).and_then(Result::ok).map(|asset| asset.relative_url.clone());
+        let asset_url = if cached.is_none() && matches!(key.source, MediaSource::Asset(AssetResource::MediaFile { .. })) {
+            Some(self.asset_for_fetch(&resource_key, owner, cx)?.relative_url)
+        } else { None };
+        let state = self.state.read(cx);
+        let client = state.client_handle()?;
+        let runtime = state.runtime().clone();
+        let (permits, svg, source, max_edge) = (self.permits.clone(), cx.svg_renderer(), key.source.clone(), variant.max_edge());
         let job = runtime.spawn(async move {
             // Held through the decode as well, so a burst of large images is never all in memory.
-            let _permit = permits.acquire_owned().await.map_err(|_| "Image unavailable.".to_owned())?;
+            let _permit = permits.acquire_owned().await.map_err(|_| ("Image unavailable.".to_owned(), None))?;
             let (bytes, dimensions) = match cached {
                 Some(bytes) => (bytes, None),
                 None => {
                     let fetched = match asset_url {
-                        Some(url) => t3_client::assets::fetch_signed_media(&client, &url).await?,
-                        None => t3_client::assets::fetch_media(&client, &source).await?,
+                        Some(url) => t3_client::assets::fetch_signed_media(&client, &url).await.map_err(|message| (message, Some(url)))?,
+                        None => t3_client::assets::fetch_media(&client, &source).await.map_err(|message| (message, None))?,
                     };
                     (Arc::<[u8]>::from(fetched.bytes), fetched.dimensions)
                 }
             };
             let input = bytes.clone();
-            let decoded = tokio::task::spawn_blocking(move || decode::decode(&input, max_edge, &svg)).await.map_err(|_| "Image unavailable.".to_owned())??;
-            Ok::<_, String>((bytes, dimensions, decoded))
+            let decoded = tokio::task::spawn_blocking(move || decode::decode(&input, max_edge, &svg)).await.map_err(|_| ("Image unavailable.".to_owned(), None))?.map_err(|message| (message, None))?;
+            Ok::<_, LoadError>((bytes, dimensions, decoded))
         });
         Some(cx.spawn(async move |this, cx| {
-            let result = job.await.unwrap_or_else(|_| Err("Image unavailable.".to_owned()));
+            let result = job.await.unwrap_or_else(|_| Err(("Image unavailable.".to_owned(), None)));
             let _ = this.update(cx, |cache, cx| cache.finish(key, variant, result, cx));
         }))
     }
@@ -208,6 +211,10 @@ impl MediaCache {
             Some(Slot::Loading { waiters, .. }) => waiters,
             _ => Vec::new(),
         };
+        if let Err((_, Some(relative_url))) = &result {
+            let resource_key = Key { content: None, ..key.clone() };
+            self.revisions.fetch_failed(&resource_key, relative_url);
+        }
         let slot = match result {
             Ok((bytes, dimensions, decoded)) => {
                 self.dimensions.insert(key.clone(), dimensions.unwrap_or(decoded.original));
@@ -215,7 +222,7 @@ impl MediaCache {
                 self.decoded_total += decoded.bytes;
                 Slot::Ready { image: decoded.image, bytes: decoded.bytes, drawn: self.frame }
             }
-            Err(message) => Slot::Failed { message: message.into(), at: Instant::now() },
+            Err((message, _)) => Slot::Failed { message: message.into(), at: Instant::now() },
         };
         self.images.insert((key, variant), slot);
         let app: &mut App = cx;

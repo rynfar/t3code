@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{Context, EntityId, Task};
-use t3_core::media::{AssetResource, AssetUrl, MediaSource, RevisionedAssetUrl};
+use t3_core::media::{AssetFetch, AssetResource, AssetUrl, MediaSource, RevisionedAssetUrl};
 
 use super::cache::{Key, MediaCache, RETRY_AFTER};
 
@@ -24,6 +24,14 @@ pub(super) struct Revisions {
     records: HashMap<Key, Mint>,
 }
 
+fn now_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.
+}
+
 impl Revisions {
     pub fn shown_asset(&self, key: &Key) -> Option<Result<&AssetUrl, &str>> {
         self.records
@@ -32,6 +40,12 @@ impl Revisions {
             .shown
             .as_ref()
             .map(|result| result.as_ref().map_err(String::as_str))
+    }
+
+    pub fn fetch_failed(&mut self, key: &Key, relative_url: &str) {
+        if let Some(mint) = self.records.get_mut(key) {
+            mint.state.fetch_failed(relative_url);
+        }
     }
 
     pub fn shown_url(&self, key: &Key) -> Option<Result<&str, &str>> {
@@ -107,6 +121,26 @@ impl MediaCache {
         }
     }
 
+    pub(super) fn asset_for_fetch(
+        &mut self,
+        key: &Key,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+    ) -> Option<AssetUrl> {
+        let mint = self.revisions.records.get_mut(key)?;
+        let action = mint.state.prepare_fetch(now_ms());
+        if let AssetFetch::Ready(asset) = action {
+            return Some(asset);
+        }
+        if !mint.waiters.contains(&owner) {
+            mint.waiters.push(owner);
+        }
+        if action == AssetFetch::Mint {
+            self.start_mint(key.clone(), cx);
+        }
+        None
+    }
+
     fn start_mint(&mut self, key: Key, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else {
@@ -140,12 +174,7 @@ impl MediaCache {
                 };
                 mint.task = None;
                 mint.failed_at = result.as_ref().err().map(|_| Instant::now());
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64()
-                    * 1000.;
-                let again = mint.state.settle(result, now);
+                let again = mint.state.settle(result, now_ms());
                 if again {
                     mint.failed_at = None;
                 }

@@ -50,6 +50,7 @@ pub struct ThreadView {
     markdown: MarkdownStore,
     thread_id: Option<String>,
     workspace_root: Option<String>,
+    workspace_mutation_id: Option<String>,
     history: Option<HistoryControl>,
     details: HashMap<String, Detail>,
     /// Open command rows' output subscriptions, by entry; a row that closes drops its own.
@@ -162,6 +163,7 @@ impl ThreadView {
             markdown: MarkdownStore::new(cx.entity_id()),
             thread_id: None,
             workspace_root: None,
+            workspace_mutation_id: None,
             history: None,
             details: HashMap::new(),
             command_outputs: HashMap::new(),
@@ -240,6 +242,11 @@ impl ThreadView {
             self.list.reset(0);
             self.setup_env = SetupEnv::default();
             self.read_setup(cx);
+        }
+        let mutation = self.thread_state(self.state.read(cx)).projection.as_ref().and_then(t3_core::media::workspace_mutation_id);
+        if self.workspace_mutation_id != mutation {
+            self.workspace_mutation_id = mutation;
+            cx.notify();
         }
         let state = self.state.read(cx);
         match self.thread_state(state).projection.as_ref() {

@@ -6,7 +6,7 @@
 //! Revision tracking ports `state/assets.ts` and `state/threadDetail.ts` in client-runtime.
 
 mod revision;
-pub use revision::RevisionedAssetUrl;
+pub use revision::{AssetFetch, RevisionedAssetUrl};
 
 use serde_json::{Value, json};
 

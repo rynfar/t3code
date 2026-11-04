@@ -1,11 +1,21 @@
 //! Ports `packages/client-runtime/src/state/assets.ts::makeRevisionedAssetUrlFamily`.
 use super::AssetUrl;
 
+const KEEP_URL_MIN_LIFE_MS: f64 = 5. * 60_000.;
+
+#[derive(Debug, PartialEq)]
+pub enum AssetFetch {
+    Ready(AssetUrl),
+    Mint,
+    Waiting,
+}
+
 pub struct RevisionedAssetUrl {
     pub shown: Option<Result<AssetUrl, String>>,
     minted_under: Option<Option<String>>,
     requested: Option<String>,
     waiting: bool,
+    rejected: bool,
 }
 
 impl RevisionedAssetUrl {
@@ -15,6 +25,7 @@ impl RevisionedAssetUrl {
             minted_under: None,
             requested: None,
             waiting,
+            rejected: false,
         }
     }
 
@@ -34,14 +45,42 @@ impl RevisionedAssetUrl {
         true
     }
 
+    /// A byte-cache miss must not reuse a rejected or nearly expired signature.
+    pub fn prepare_fetch(&mut self, now: f64) -> AssetFetch {
+        // Older responses can omit expiresAt; a rejected fetch still forces a new mint.
+        if let Some(Ok(url)) = &self.shown
+            && !self.rejected
+            && (url.expires_at <= 0. || url.expires_at - now > KEEP_URL_MIN_LIFE_MS)
+        {
+            return AssetFetch::Ready(url.clone());
+        }
+        if self.waiting {
+            return AssetFetch::Waiting;
+        }
+        self.minted_under = Some(self.requested.clone());
+        self.waiting = true;
+        AssetFetch::Mint
+    }
+
+    pub fn fetch_failed(&mut self, relative_url: &str) {
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|shown| matches!(shown, Ok(url) if url.relative_url == relative_url))
+        {
+            self.rejected = true;
+        }
+    }
+
     /// Preserves the displayed URL across query results, including across revision nodes.
     /// The return value starts the mint deferred by a revision change while waiting.
     pub fn settle(&mut self, next: Result<AssetUrl, String>, now: f64) -> bool {
         let keep = match (&self.shown, &next) {
             (Some(Ok(shown)), Ok(next)) => {
-                next.file_revision.is_some()
+                !self.rejected
+                    && next.file_revision.is_some()
                     && next.file_revision == shown.file_revision
-                    && shown.expires_at - now > 5. * 60_000.
+                    && shown.expires_at - now > KEEP_URL_MIN_LIFE_MS
             }
             _ => false,
         };
@@ -49,6 +88,7 @@ impl RevisionedAssetUrl {
             self.shown = Some(next);
         }
         self.waiting = false;
+        self.rejected = false;
         let revision = self.requested.clone();
         self.read(revision.as_deref())
     }
@@ -134,5 +174,51 @@ mod tests {
         state.settle(Err("missing".into()), 0.);
         assert_eq!(state.shown, Some(Err("missing".into())));
         assert!(state.read(Some("retry")));
+    }
+    #[test]
+    fn cache_miss_remints_within_five_minutes_of_expiry_without_a_new_mutation() {
+        for now in [3_300_000., 3_600_000.] {
+            let mut state = RevisionedAssetUrl::new(None, false);
+            assert!(state.read(Some("mutation")));
+            state.settle(Ok(minted(1, Some("same-file"), 3_600_000.)), 0.);
+            assert!(matches!(
+                state.prepare_fetch(3_299_999.),
+                AssetFetch::Ready(_)
+            ));
+            assert_eq!(state.prepare_fetch(now), AssetFetch::Mint);
+            assert_eq!(state.prepare_fetch(now), AssetFetch::Waiting);
+            assert!(!state.read(Some("mutation")));
+            assert!(!state.settle(Ok(minted(2, Some("same-file"), now + 3_600_000.)), now));
+            assert_eq!(url(&state), "/a/2");
+            assert!(matches!(state.prepare_fetch(now), AssetFetch::Ready(_)));
+        }
+    }
+
+    #[test]
+    fn signed_fetch_failure_resigns_and_never_keeps_the_rejected_url() {
+        let mut state = RevisionedAssetUrl::new(None, false);
+        state.read(None);
+        state.settle(Ok(minted(1, Some("same-file"), 3_600_000.)), 0.);
+        state.fetch_failed("/a/1");
+        assert_eq!(state.prepare_fetch(0.), AssetFetch::Mint);
+        assert_eq!(state.prepare_fetch(0.), AssetFetch::Waiting);
+        assert!(!state.settle(Ok(minted(2, Some("same-file"), 3_600_000.)), 0.));
+        assert_eq!(url(&state), "/a/2");
+        state.fetch_failed("/a/1");
+        assert!(matches!(state.prepare_fetch(0.), AssetFetch::Ready(_)));
+        assert_eq!(url(&state), "/a/2");
+    }
+
+    #[test]
+    fn signed_fetch_failure_during_a_mutation_mint_waits_for_the_fresh_signature() {
+        let mut state = RevisionedAssetUrl::new(None, false);
+        state.read(Some("a"));
+        state.settle(Ok(minted(1, Some("same-file"), 3_600_000.)), 0.);
+        assert!(state.read(Some("b")));
+        state.fetch_failed("/a/1");
+        assert_eq!(state.prepare_fetch(0.), AssetFetch::Waiting);
+        assert!(!state.settle(Ok(minted(2, Some("same-file"), 3_600_000.)), 0.));
+        assert_eq!(url(&state), "/a/2");
+        assert!(matches!(state.prepare_fetch(0.), AssetFetch::Ready(_)));
     }
 }
