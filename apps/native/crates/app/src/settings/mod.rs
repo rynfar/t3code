@@ -417,6 +417,11 @@ impl SettingsView {
     }
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        self.removal_route_audit("route-escape", window, cx);
+        if self.dismiss_provider_removal(window, cx) {
+            return;
+        }
         if self.dismiss_project_icon_picker(window, cx) {
             return;
         }
@@ -453,6 +458,11 @@ impl SettingsView {
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        self.removal_route_audit("route-search", window, cx);
+        if self.provider_removal_open() {
+            return;
+        }
         if self.projects.picker.is_some() {
             return;
         }
@@ -463,6 +473,11 @@ impl SettingsView {
 
     /// Tab and Shift+Tab move through the modal's controls only (the dialog's focus trap).
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        self.removal_route_audit("route-tab", window, cx);
+        if self.cycle_provider_removal_focus(forward, window, cx) {
+            return;
+        }
         if self.cycle_icon_focus(forward, window, cx) {
             return;
         }
@@ -870,6 +885,10 @@ impl Render for SettingsView {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(|this, _: &crate::thread_view::FindInThread, window, cx| {
+                cx.stop_propagation();
+                this.on_focus_search(&FocusSettingsSearch, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &FocusNextInSettings, window, cx| this.cycle_focus(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPreviousInSettings, window, cx| this.cycle_focus(false, window, cx)))
             .on_key_down(cx.listener(Self::on_key_down))

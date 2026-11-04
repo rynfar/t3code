@@ -79,21 +79,23 @@ impl SettingsView {
         let view = &selected.view;
         let row = &selected.row;
         let reset = (row.is_default && row.is_dirty).then(|| {
-            let driver = row.driver.clone();
+            let id = row.instance_id.clone();
             let label = model::find_driver(&row.driver).map_or(row.driver.clone(), |driver| driver.label.to_owned());
             Button::new("reset-provider-instance", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                 .icon(Icon::Undo2)
+                .focus_handle(self.providers.removal.action_focus.clone())
+                .disabled(self.providers.removal.model.busy() || !self.removal_allowed(cx))
                 .tooltip(format!("Reset {label} provider settings"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    store::update_server(&this.state, ServerSettingChange::Prepared(model::remove_payload(&driver)), cx);
-                }))
+                .on_click(cx.listener(move |this, _, window, cx| this.request_provider_removal(&id, true, window, cx)))
         });
         let delete = (!row.is_default).then(|| {
             let id = row.instance_id.clone();
             Button::new("delete-provider-instance", ButtonVariant::GhostMuted, ButtonSize::IconSm)
                 .icon(Icon::Trash2)
+                .focus_handle(self.providers.removal.action_focus.clone())
+                .disabled(self.providers.removal.model.busy() || !self.removal_allowed(cx))
                 .tooltip(format!("Delete instance {}", row.instance_id))
-                .on_click(cx.listener(move |this, _, _, cx| this.delete_instance(&id, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.request_provider_removal(&id, false, window, cx)))
         });
         let header = h_flex()
             .min_h(r(28.))
@@ -829,44 +831,6 @@ impl SettingsView {
         if let Some(order) = order {
             store::update_server(&self.state, ServerSettingChange::Prepared(model::order_payload(instance_id, &order)), cx);
         }
-    }
-
-    /// Deletes a custom instance. A registry agent it installed is then offered for removal;
-    /// the server decides whether another instance still uses it.
-    fn delete_instance(&mut self, instance_id: &str, cx: &mut Context<Self>) {
-        let (agent, sent_at, task) = {
-            let app = self.state.read(cx);
-            let agent = app.server_config.config.as_ref().and_then(|config| config.settings.provider_instances.get(instance_id)).and_then(model::managed_acp_agent);
-            (agent, app.server_config.settings_revision(), app.rpc(t3_core::commands::method::SERVER_UPDATE_SETTINGS, model::remove_payload(instance_id)))
-        };
-        let Some(agent) = agent else {
-            drop(task);
-            store::update_server(&self.state, ServerSettingChange::Prepared(model::remove_payload(instance_id)), cx);
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let uninstall = this.update(cx, |this, cx| match result {
-                Ok(reply) => {
-                    this.apply_settings_reply(reply, sent_at, cx);
-                    Some(this.state.read(cx).rpc(model::SERVER_UNINSTALL_ACP_REGISTRY_BINARY, model::uninstall_acp_payload(&agent)))
-                }
-                Err(error) => {
-                    this.providers.notice = Some(("Could not delete provider instance", failure_text(&error, "The settings update failed.")));
-                    cx.notify();
-                    None
-                }
-            });
-            if let Ok(Some(uninstall)) = uninstall
-                && let Err(error) = uninstall.await
-            {
-                let _ = this.update(cx, |this, cx| {
-                    this.providers.notice = Some(("Provider deleted, but managed files remain", failure_text(&error, "Managed binary cleanup failed.")));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
     }
 
     fn accept_url_auth(&mut self, instance_id: &str, elicitation_id: &str, cx: &mut Context<Self>) {

@@ -11,6 +11,7 @@ mod registry;
 mod registry_icons;
 mod dialog_config;
 mod editor;
+mod removal;
 mod form;
 
 use std::collections::HashSet;
@@ -91,6 +92,7 @@ struct InstallSession {
 }
 
 pub(crate) struct ProvidersState {
+    removal: removal::Removal,
     selected: Option<String>,
     form: form::FormState,
     chatgpt: Option<(Option<u64>, Entity<crate::chatgpt_setup::ChatGptSetup>)>,
@@ -131,6 +133,7 @@ pub(crate) struct ProvidersState {
 
 impl ProvidersState {
     pub(super) fn leave(&mut self) {
+        self.removal.model.cancel();
         self.dialog=None;
         self.chatgpt=None;
         self.auth=None;
@@ -190,6 +193,7 @@ impl ProvidersState {
             }),
         ];
         ProvidersState {
+            removal: removal::Removal::new(cx),
             selected: None,
             form: form::FormState::default(),
             chatgpt: None,
@@ -334,6 +338,7 @@ impl SettingsView {
 
     pub(super) fn providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         if self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()) { self.providers.dialog=None; self.providers.auth=None; }
+        self.sync_provider_removal(window, cx);
         let Some(data) = self.page_data(cx) else {
             self.providers.auth = None;
             self.providers.install = None;
@@ -351,9 +356,10 @@ impl SettingsView {
         let providers = self.render_providers_section(&data, window, cx);
         let advanced = self.render_advanced(&data.panel, cx);
         let dialog = self.render_add_dialog(window, cx);
+        let removal = self.render_provider_removal(window, cx);
         let notice = self.render_notice(cx);
         vec![
-            Block::new(&["providers"], v_flex().gap(r(16.)).children(notice).child(providers).children(dialog)),
+            Block::new(&["providers"], v_flex().gap(r(16.)).children(notice).child(providers).children(dialog).children(removal)),
             Block::new(&["provider-health-check-interval", "compact-idle-threads"], advanced),
         ]
     }
