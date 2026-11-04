@@ -334,8 +334,10 @@ impl MarkdownMediaParser<'_> {
             let last = children.last().and_then(Node::position).unwrap();
             let prefix = source.get(position.start.offset..first.start.offset).unwrap_or_default();
             let suffix = source.get(last.end.offset..position.end.offset).unwrap_or_default();
+            let autolink = heading && matches!(node, Node::Link(_)) && !prefix.starts_with('[');
+            let prefix = if autolink { "[" } else { prefix };
             let suffix = match node {
-                Node::Link(link) if suffix.contains('\n') => format!("]({})", markdown_destination(&link.url, link.title.as_deref())),
+                Node::Link(link) if autolink || suffix.contains('\n') => format!("]({})", markdown_destination(&link.url, link.title.as_deref())),
                 // Shortcut/collapsed display labels can decode differently from their reference identifiers.
                 Node::LinkReference(link) if link.reference_kind != markdown::mdast::ReferenceKind::Full || suffix.contains('\n') => {
                     self.definitions.get(&link.identifier).map_or_else(|| suffix.to_owned(), |definition| format!("]({})", markdown_destination(&definition.url, definition.title.as_deref())))
@@ -605,6 +607,23 @@ mod paragraph_tests {
                 let root = markdown::to_mdast(&prose, &markdown::ParseOptions::gfm()).unwrap();
                 assert!(root.children().unwrap().iter().all(|node| matches!(node, markdown::mdast::Node::Paragraph(_))), "{heading}: {root:?}");
                 assert_eq!(crate::assistant_citations::markdown_text(&prose).trim(), literal.trim(), "{heading}: {prose:?}; {root:?}");
+            }
+        }
+        fn destinations(node: &markdown::mdast::Node, out: &mut Vec<(String, Option<String>)>) {
+            if let markdown::mdast::Node::Link(link) = node { out.push((link.url.clone(), link.title.clone())); }
+            if let Some(children) = node.children() { for child in children { destinations(child, out); } }
+        }
+        for link in ["<https://example.com/a?q=1&b=2#part>", "https://example.com/a", "www.example.com", "<team@example.com>", "team@example.com", "[**guide**](https://example.com/a \"title\")"] {
+            for text in [format!("## {link} ![x](a.png)"), format!("## ![x](a.png) {link}")] {
+                let original = markdown::to_mdast(&text, &markdown::ParseOptions::gfm()).unwrap();
+                let prose: String = runs(&text).into_iter().filter_map(|run| match run { MarkdownMediaRun::Prose(text) => Some(text), _ => None }).collect();
+                let reconstructed = markdown::to_mdast(&prose, &markdown::ParseOptions::gfm()).unwrap();
+                let (mut expected, mut actual) = (Vec::new(), Vec::new());
+                destinations(&original, &mut expected);
+                destinations(&reconstructed, &mut actual);
+                assert!(!expected.is_empty(), "{text}");
+                assert_eq!(actual, expected, "{text}: {prose}");
+                assert_eq!(crate::assistant_citations::normalize(&crate::assistant_citations::markdown_text(&prose)).trim(), crate::assistant_citations::normalize(&crate::assistant_citations::markdown_text(&text)).trim(), "{text}");
             }
         }
     }

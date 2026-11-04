@@ -201,12 +201,14 @@ impl MediaSelections {
         states.retain(|_, selection| selection.state.upgrade().is_some());
         states.insert(key, ProseSelection { state: state.downgrade(), source: source.to_owned() });
     }
-    pub(super) fn matches_quote(&self, document: &t3_core::media::MarkdownMediaDocument, quote: &str, cx: &App) -> bool {
-        let selected: Vec<_> = self.0.lock().unwrap().iter().filter_map(|(&(start, run), selection)| {
+    pub(super) fn matches_quote(&self, document: &t3_core::media::MarkdownMediaDocument, parent: String, quote: &str, cx: &App) -> bool {
+        let mut selected: Vec<_> = self.0.lock().unwrap().iter().filter_map(|(&(start, run), selection)| {
             if document.prose_run_at(start, run) != Some(selection.source.as_str()) { return None; }
             selection.state.upgrade().map(|state| state.read(cx).selected_text()).filter(|text| !text.trim().is_empty())
         }).collect();
-        selected.iter().any(|text| text == quote) || (!selected.is_empty() && selected.join("\n") == quote)
+        // The pinned TextView registers its outer participant after its nested prose views.
+        if !parent.trim().is_empty() { selected.push(parent); }
+        !selected.is_empty() && selected.join("\n") == quote
     }
 }
 

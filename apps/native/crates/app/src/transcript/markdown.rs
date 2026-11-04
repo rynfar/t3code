@@ -84,7 +84,11 @@ impl MarkdownState {
         if quote.trim().is_empty() { return false; }
         let document = self.document.as_ref().filter(|_| self.media).map(|document| document.read().unwrap().clone());
         if document.as_ref().is_some_and(|document| &**document.source() != source) { return false; }
-        self.entity.read(cx).selected_text() == quote || document.is_some_and(|document| self.selections.matches_quote(&document, quote, cx))
+        let parent = self.entity.read(cx).selected_text();
+        match document {
+            Some(document) => self.selections.matches_quote(&document, parent, quote, cx),
+            None => parent == quote,
+        }
     }
 }
 
@@ -279,7 +283,7 @@ mod context_tests {
     #[gpui::test]
     fn heading_child_selection_reaches_the_message_citation_action(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let source: Arc<str> = "## left ![chart](a.png) **right**".into();
+        let source: Arc<str> = "## left ![chart](a.png) **right**\n\nBody after.".into();
         let parent = cx.update(|cx| cx.new(|cx| TextViewState::markdown("", cx)));
         let child = cx.update(|cx| cx.new(|cx| TextViewState::markdown(" **right**", cx)));
         cx.run_until_parked();
@@ -307,6 +311,21 @@ mod context_tests {
             assert!(cite(&unrelated, &source, &quote, cx).is_none());
             *document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new(source.clone()));
         });
+        state.entity.update(cx, |parent, cx| parent.set_text("Body after.", cx));
+        cx.run_until_parked();
+        state.entity.update(cx, |parent, cx| parent.select_all(cx));
+        cx.update(|cx| {
+            let parent = state.entity.read(cx).selected_text();
+            let child = child.read(cx).selected_text();
+            assert!(!parent.trim().is_empty() && !child.trim().is_empty());
+            let quote = format!("{child}\n{parent}");
+            let citation = cite(&state, &source, &quote, cx).expect("one message's parent and heading child must reach Cite together");
+            assert_eq!(t3_core::assistant_citations::normalize(&citation.text), "right Body after.");
+            assert_eq!((citation.start, citation.end), (5, 22));
+            assert!(citation.valid());
+            assert!(cite(&state, &source, &format!("{quote}\noutside this message"), cx).is_none());
+        });
+        state.entity.update(cx, |parent, cx| parent.clear_selection(cx));
         drop(child);
         cx.update(|cx| assert!(cite(&state, &source, "right\n", cx).is_none()));
     }
