@@ -1,6 +1,6 @@
 // Intl oracle for apps/web/src/timestampFormat.ts; run with Node to refresh the core fixture.
 import * as NodeFS from "node:fs";
-const locales = [
+const originalLocales = [
   "en-US",
   "en-GB",
   "en-NL",
@@ -16,30 +16,143 @@ const locales = [
 ];
 const hours = ["00:30", "09:05", "12:00", "13:45", "23:59"];
 const formats = ["locale", "12-hour", "24-hour"];
-const cases = locales.flatMap((base) =>
-  ["", "-u-hc-h11", "-u-hc-h12", "-u-hc-h23", "-u-hc-h24"].flatMap((hc) =>
-    hours.flatMap((time) =>
-      formats.map((format) => {
-        const locale = base + hc;
-        const options = {
-          hour: "numeric",
-          minute: "2-digit",
-          timeZone: "UTC",
-          ...(format === "locale" ? {} : { hour12: format === "12-hour" }),
-        };
-        return {
-          locale,
-          time,
-          format,
-          expected: new Intl.DateTimeFormat(locale, options).format(
-            new Date(`2026-07-03T${time}:00.000Z`),
-          ),
-        };
-      }),
+const casesFor = (locales, hours) =>
+  locales.flatMap((base) =>
+    ["", "-u-hc-h11", "-u-hc-h12", "-u-hc-h23", "-u-hc-h24"].flatMap((hc) =>
+      hours.flatMap((time) =>
+        formats.map((format) => {
+          const locale = base + hc;
+          const options = {
+            hour: "numeric",
+            minute: "2-digit",
+            timeZone: "UTC",
+            ...(format === "locale" ? {} : { hour12: format === "12-hour" }),
+          };
+          return {
+            locale,
+            time,
+            format,
+            expected: new Intl.DateTimeFormat(locale, options).format(
+              new Date(`2026-07-03T${time}:00.000Z`),
+            ),
+          };
+        }),
+      ),
     ),
-  ),
+  );
+const regressionLocales = ["es-CO", "lt-LT", "ug-CN", "mr-IN"];
+const sweepLocales = [
+  ...originalLocales,
+  "es-CO",
+  "lt-LT",
+  "ug-CN",
+  "mr-IN",
+  "es-ES",
+  "es-AR",
+  "pt-BR",
+  "pt-PT",
+  "it-IT",
+  "nl-NL",
+  "sv-SE",
+  "nb-NO",
+  "da-DK",
+  "fi-FI",
+  "pl-PL",
+  "cs-CZ",
+  "sk-SK",
+  "hu-HU",
+  "ro-RO",
+  "bg-BG",
+  "ru-RU",
+  "uk-UA",
+  "el-GR",
+  "tr-TR",
+  "he-IL",
+  "hi-IN",
+  "bn-BD",
+  "th-TH",
+  "id-ID",
+  "ms-MY",
+];
+const check = process.argv.includes("--check");
+function emit(path, value, semantic = (text) => text) {
+  const url = new URL(path, import.meta.url);
+  if (check) {
+    if (semantic(NodeFS.readFileSync(url, "utf8")) !== semantic(value))
+      throw new Error(`Stale timestamp data: ${path}`);
+  } else NodeFS.writeFileSync(url, value);
+}
+const oracleData = (text) => JSON.stringify(JSON.parse(text).cases);
+const sweepHours = Array.from(
+  { length: 24 },
+  (_, hour) => `${String(hour).padStart(2, "0")}:${hour === 0 || hour === 12 ? "00" : "05"}`,
 );
-NodeFS.writeFileSync(
-  new URL("../crates/core/src/timeline/fixtures/timestamp-intl.json", import.meta.url),
-  JSON.stringify({ node: process.version, icu: process.versions.icu, cases }, null, 2) + "\n",
+function oracle(locales, times) {
+  const cases = casesFor(locales, times);
+  return (
+    JSON.stringify({ node: process.version, icu: process.versions.icu, cases }, null, 2) + "\n"
+  );
+}
+for (const [name, locales, times] of [
+  ["timestamp-intl", originalLocales, hours],
+  ["timestamp-intl-regressions", regressionLocales, sweepHours],
+]) {
+  emit(`../crates/core/src/timeline/fixtures/${name}.json`, oracle(locales, times), oracleData);
+  console.log(
+    `${name}: ${locales.length * 5 * times.length * formats.length} V8 Intl cases (${locales.length} base locales)`,
+  );
+}
+// Optional wider audit: --sweep-output <path>, then T3_TIMESTAMP_SWEEP=<path> cargo test -p t3-core locale_options_match_node_intl_oracle.
+const sweepOutput = process.argv.indexOf("--sweep-output");
+if (sweepOutput !== -1) {
+  const path = process.argv[sweepOutput + 1];
+  if (!path) throw new Error("--sweep-output needs a path");
+  emit(path, oracle(sweepLocales, sweepHours), oracleData);
+  console.log(
+    `42-locale sweep: ${sweepLocales.length * 5 * sweepHours.length * formats.length} cases at ${path}`,
+  );
+}
+
+// ICU4X ships regional skeletons, but not Intl's CLDR availableFormats selection.
+// Keep this supplement limited to the four locales; ICU still supplies digits and names.
+const patternRows = regressionLocales.map((locale) => {
+  const clock = (hour12) =>
+    new Intl.DateTimeFormat(locale, {
+      hour: "numeric",
+      minute: "2-digit",
+      timeZone: "UTC",
+      ...(hour12 === undefined ? {} : { hour12 }),
+    });
+  const patterns = [true, false].map((hour12) => {
+    const formatter = clock(hour12);
+    const width = formatter.resolvedOptions().hour === "2-digit" ? 2 : 1;
+    const pattern = formatter
+      .formatToParts(new Date("2026-07-03T01:05:00Z"))
+      .map((part) => {
+        switch (part.type) {
+          case "hour":
+            return (hour12 ? "h" : "H").repeat(width);
+          case "minute":
+            return "mm";
+          case "dayPeriod":
+            return "a";
+          case "literal":
+            return `'${part.value.replaceAll("'", "''")}'`;
+          default:
+            throw new Error(`Unexpected timestamp part: ${part.type}`);
+        }
+      })
+      .join("");
+    return `(${JSON.stringify(pattern)}, ${width})`;
+  });
+  return `        ${JSON.stringify(locale)} => (Cycle::${clock().resolvedOptions().hourCycle.toUpperCase()}, [${patterns.join(", ")}]),`;
+});
+emit(
+  "../crates/core/src/timeline/timestamp_patterns.rs",
+  `// @generated by scripts/gen-timestamp-oracle.mjs; Node ${process.version}, ICU ${process.versions.icu}.\n` +
+    `// Supplements only es-CO, lt-LT, ug-CN, mr-IN for web's numeric hour / 2-digit minute options.\n` +
+    `fn best_patterns(locale: &str) -> Option<(Cycle, [(&'static str, usize); 2])> {\n` +
+    `    Some(match locale {\n${patternRows.join("\n")}\n        _ => return None,\n    })\n}\n`,
+  (text) =>
+    text.replace(/^\/\/ @generated by scripts\/gen-timestamp-oracle\.mjs; Node [^\n]+\n/u, ""),
 );

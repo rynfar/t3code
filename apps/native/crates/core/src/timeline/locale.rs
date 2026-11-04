@@ -13,6 +13,8 @@ use crate::sidebar::time::LocalTime;
 #[derive(Clone, Copy)]
 enum Cycle { H11, H12, H23, H24 }
 
+include!("timestamp_patterns.rs");
+
 impl Cycle {
     fn twelve(self) -> bool { matches!(self, Self::H11 | Self::H12) }
     fn value(self, hour: i64) -> i64 {
@@ -27,6 +29,7 @@ impl Cycle {
 
 struct ClockFormat {
     formatter: NoCalendarFormatter<T>,
+    best_pattern: Option<(FixedCalendarDateTimeNames<Gregorian, T>, DateTimePattern)>,
     cycle: Cycle,
     width: usize,
     day_periods: Option<[String; 2]>,
@@ -67,7 +70,8 @@ impl IntlTimestampClock {
         });
         let prefs = DateTimeFormatterPreferences::from(&locale);
         let regional = NoCalendarFormatter::try_new(prefs, T::hm()).ok()?;
-        let base_cycle = pattern_fields(&regional).0?;
+        let best = best_patterns(&locale.id.to_string());
+        let base_cycle = best.as_ref().map(|(cycle, _)| *cycle).or_else(|| pattern_fields(&regional).0)?;
         let regional_twelve = NoCalendarFormatter::try_new({ let mut p = prefs; p.hour_cycle = Some(HourCycle::Clock12); p }, T::hm()).ok()?;
         let locale_cycle = requested.unwrap_or(base_cycle);
         let cycles = [locale_cycle, if locale_cycle.twelve() { locale_cycle } else { pattern_fields(&regional_twelve).0? }, if locale_cycle.twelve() { Cycle::H23 } else { locale_cycle }];
@@ -75,10 +79,17 @@ impl IntlTimestampClock {
             let mut p = prefs;
             p.hour_cycle = Some(if cycle.twelve() { HourCycle::Clock12 } else { HourCycle::Clock24 });
             // V8 matches against the base locale before replacing the cycle; hc doesn't change that width.
-            let width = if !cycle.twelve() && base_cycle.twelve() { 2 } else { 1 };
+            let width = best.as_ref().map(|(_, patterns)| patterns[usize::from(!cycle.twelve())].1)
+                .unwrap_or(if !cycle.twelve() && base_cycle.twelve() { 2 } else { 1 });
+            let best_pattern = if let Some((_, patterns)) = &best {
+                let pattern = DateTimePattern::try_from_pattern_str(patterns[usize::from(!cycle.twelve())].0).ok()?;
+                let mut names = FixedCalendarDateTimeNames::try_new(prefs).ok()?;
+                names.include_for_pattern(&pattern).ok()?;
+                Some((names, pattern))
+            } else { None };
             let formatter = NoCalendarFormatter::try_new(p, T::hm()).ok()?;
             // ICU4C 78 uses AM/PM for Korean; ICU4X's names differ from the web oracle.
-            let day_periods = if cycle.twelve() && locale.id.language.as_str() == "ko" {
+            let day_periods = if best_pattern.is_some() { None } else if cycle.twelve() && locale.id.language.as_str() == "ko" {
                 Some(["AM".to_owned(), "PM".to_owned()])
             } else if let Some(length) = pattern_fields(&formatter).1 {
                 let mut names: FixedCalendarDateTimeNames<Gregorian, T> = FixedCalendarDateTimeNames::try_new(prefs).ok()?;
@@ -87,7 +98,7 @@ impl IntlTimestampClock {
                 let period = DateTimePattern::try_from_pattern_str(symbol).ok()?;
                 Some([0, 12].map(|hour| names.with_pattern_unchecked(&period).format(&Time::try_new(hour, 0, 0, 0).expect("valid hour")).try_write_to_string().expect("day periods are loaded").into_owned()))
             } else { None };
-            Some(ClockFormat { formatter, cycle, width, day_periods })
+            Some(ClockFormat { formatter, best_pattern, cycle, width, day_periods })
         };
         let decimal = DecimalFormatter::try_new((&locale).into(), Default::default()).ok()?;
         Some(Self {
@@ -103,7 +114,11 @@ impl IntlTimestampClock {
         let hour = selected.cycle.value(local.hour) as usize;
         let padded = if selected.width == 2 && hour < 10 { format!("{}{}", self.hours[0], self.hours[hour]) } else { self.hours[hour].clone() };
         let mut writer = ClockParts { text: String::new(), hour: &padded, day_period: selected.day_periods.as_ref().map(|periods| periods[usize::from(local.hour >= 12)].as_str()) };
-        let _ = selected.formatter.format(&time).write_to_parts(&mut writer);
+        if let Some((names, pattern)) = &selected.best_pattern {
+            let _ = names.with_pattern_unchecked(pattern).format(&time).try_write_to_parts(&mut writer);
+        } else {
+            let _ = selected.formatter.format(&time).write_to_parts(&mut writer);
+        }
         writer.text.replace(['\u{202f}', '\u{a0}'], " ")
     }
 }
@@ -146,14 +161,21 @@ mod tests {
         struct Oracle { cases: Vec<Case> }
         let oracle: Oracle = serde_json::from_str(include_str!("fixtures/timestamp-intl.json")).unwrap();
         let mut mismatches = Vec::new();
-        for case in oracle.cases {
+        let regressions: Oracle = serde_json::from_str(include_str!("fixtures/timestamp-intl-regressions.json")).unwrap();
+        let mut cases = oracle.cases;
+        cases.extend(regressions.cases);
+        if let Some(path) = std::env::var_os("T3_TIMESTAMP_SWEEP") {
+            cases.extend(serde_json::from_str::<Oracle>(&std::fs::read_to_string(path).unwrap()).unwrap().cases);
+        }
+        for case in cases {
             let clock = IntlTimestampClock::new(&case.locale).unwrap();
             let iso = format!("2026-07-03T{}:00Z", case.time);
             let local = to_local(parse_iso(&iso).unwrap(), &FixedZone(0));
             let actual = clock.time(local, TimestampFormat::parse(&case.format).unwrap());
             if actual != case.expected {
                 let index = match TimestampFormat::parse(&case.format).unwrap() { TimestampFormat::Locale => 0, TimestampFormat::TwelveHour => 1, TimestampFormat::TwentyFourHour => 2 };
-                let pattern = clock.formats[index].formatter.format(&Time::start_of_day()).pattern();
+                let selected = &clock.formats[index];
+                let pattern = selected.best_pattern.as_ref().map(|(_, pattern)| pattern.to_string()).unwrap_or_else(|| selected.formatter.format(&Time::start_of_day()).pattern().to_string());
                 mismatches.push(format!("{} {} {}: {:?} != {:?}, pattern {pattern}", case.locale, case.time, case.format, actual, case.expected));
             }
         }
