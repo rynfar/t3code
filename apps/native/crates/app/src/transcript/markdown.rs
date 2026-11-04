@@ -98,7 +98,7 @@ impl MarkdownStore {
                 cached.text = text.clone();
                 *cached.document.write().unwrap() = Arc::new(t3_core::media::MarkdownMediaDocument::new(text.clone()));
                 cached.state.update(cx, |state, cx| match text.strip_prefix(&*previous) {
-                    Some(delta) if !previous.is_empty() => state.push_str(delta, cx),
+                    Some(delta) if !previous.is_empty() && !(cached.media && cached.document.read().unwrap().may_have_definitions()) => state.push_str(delta, cx),
                     _ => state.set_text(text, cx),
                 });
             }
@@ -198,7 +198,7 @@ pub fn style_markdown(view: TextView, cx: &App) -> TextView {
                 ))
         })
         .on_link_click(|url: &SharedString, _, _, cx| {
-            if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+            if t3_core::media::markdown_external_link(url) {
                 cx.open_url(url);
             }
         })

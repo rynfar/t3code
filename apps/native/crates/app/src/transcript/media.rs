@@ -1,6 +1,6 @@
 //! Images in transcript rows: a user message's attachments (`TimelineUserMessageRow.tsx`, §7.5)
 //! and images authored in markdown (`ChatMarkdownMedia.tsx`). Both draw from the bounded media
-//! cache and open the viewer on click. File rows port `chat/GuestMessageAttachments.tsx`.
+//! cache; linked Markdown images defer to their anchor. File rows port `chat/GuestMessageAttachments.tsx`.
 
 use std::sync::Arc;
 
@@ -183,6 +183,7 @@ pub fn user_media(
 struct MarkdownImage {
     url: String,
     alt: String,
+    link: Option<String>,
 }
 
 const MEDIA_NODE: &str = "t3-media";
@@ -193,14 +194,8 @@ pub fn media_document(text: Arc<str>) -> MediaDocument {
 #[derive(Clone)]
 struct MediaParagraph { start: usize, runs: Vec<t3_core::media::MarkdownMediaRun> }
 fn parse_media_paragraph(node: &mdast::Node, context: &MarkdownParseContext, document: &t3_core::media::MarkdownMediaDocument) -> Option<MarkdownNode> {
-    let mut runs = t3_core::media::markdown_media_runs(node, context.source());
+    let runs = document.runs(node, context.source());
     if runs.is_empty() { return None; }
-    fn references(node: &mdast::Node, out: &mut Vec<String>) {
-        if let mdast::Node::LinkReference(link) = node { out.push(link.identifier.clone()); }
-        if let Some(children) = node.children() { for child in children { references(child, out); } }
-    }
-    let mut refs = Vec::new(); references(node, &mut refs);
-    for run in &mut runs { if let t3_core::media::MarkdownMediaRun::Prose(text) = run && !text.trim().is_empty() { *text = document.prose(text, &refs); } }
     let start = context.offset() + node.position()?.start.offset;
     Some(MarkdownNode::new(MEDIA_NODE, MediaParagraph { start, runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
 }
@@ -213,7 +208,7 @@ fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, window: &m
     let children = paragraph.runs.into_iter().enumerate().filter_map(|(index, run)| match run {
         MarkdownMediaRun::Prose(text) if text.trim().is_empty() => None,
         MarkdownMediaRun::Prose(text) => Some(prose_run(format!("{block_id}:prose:{index}"), text, window, cx)),
-        MarkdownMediaRun::Image { url, alt } => Some(markdown_image(&MarkdownImage { url, alt }, index, scope, cx)),
+        MarkdownMediaRun::Image { url, alt, link } => Some(markdown_image(&MarkdownImage { url, alt, link }, index, scope, cx)),
     }).collect::<Vec<_>>();
     let content = if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
         else { h_flex().flex_wrap().gap(px(4.)).items_end().children(children).into_any_element() };
@@ -272,9 +267,29 @@ fn unavailable(label: &str, alt: &str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
+    let content = markdown_image_content(image, index, scope, cx);
+    let Some(link) = image.link.as_ref().filter(|link| t3_core::media::markdown_external_link(link)).cloned() else { return content };
+    let viewer = scope.map(|scope| scope.viewer.clone());
+    div().id(SharedString::from(format!("md-link:{index}:{}", image.url)))
+        .cursor_pointer().child(content).on_click(move |event, window, cx| {
+            use t3_core::media::{MarkdownImageAction, markdown_image_action};
+            cx.stop_propagation();
+            let modifiers = event.modifiers();
+            match markdown_image_action(Some(&link), modifiers.platform || modifiers.control || modifiers.shift || modifiers.alt) {
+                MarkdownImageAction::PreviewLink(url) if viewer.is_some() => {
+                    let item = ViewerItem { source: MediaSource::Direct(url.to_owned()), name: url.to_owned().into() };
+                    let _ = viewer.as_ref().unwrap().update(cx, |viewer, cx| viewer.open(vec![item], 0, window, cx));
+                }
+                MarkdownImageAction::OpenLink(url) | MarkdownImageAction::PreviewLink(url) => cx.open_url(url),
+                _ => {},
+            }
+        }).into_any_element()
+}
+
 /// A markdown image: at most 480 square, its own aspect, radius 8 with a 40% border. A 16:9
 /// frame holds its place until the size is known.
-fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
+fn markdown_image_content(image: &MarkdownImage, index: usize, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
     let Some(scope) = scope else { return unavailable("Image", &image.alt, cx) };
     let Some(resolved) = resolve_media_source(&image.url, scope.thread_id.as_deref(), scope.workspace_root.as_deref(), true) else {
         return unavailable("Image unavailable", &image.alt, cx);
@@ -285,7 +300,7 @@ fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope
         let name = if image.alt.is_empty() { resolved.name } else { image.alt.clone() };
         return v_flex().w(rem(480.)).max_w_full().min_h(rem(112.)).items_center().justify_center().gap(rem(12.)).p(rem(16.)).rounded(rem(8.)).border_1().border_color(hsla(p.border).opacity(0.4)).bg(hsla(p.muted).opacity(0.4))
             .child(unavailable("Video unavailable", &name, cx))
-            .children(source.filter(|source| match source { MediaSource::Asset(_) => true, MediaSource::Direct(url) => url.starts_with("http://") || url.starts_with("https://") }).map(|source| crate::right_panel::Button::new(SharedString::from(format!("video-open:{index}"))).variant(crate::right_panel::Variant::Secondary).size(crate::right_panel::Size::Xs).label(if matches!(&source, MediaSource::Direct(_)) { "Open original" } else { "Open in browser" }).on_click(move |_, _, cx| match &source {
+            .children(source.filter(|_| image.link.is_none()).filter(|source| match source { MediaSource::Asset(_) => true, MediaSource::Direct(url) => url.starts_with("http://") || url.starts_with("https://") }).map(|source| crate::right_panel::Button::new(SharedString::from(format!("video-open:{index}"))).variant(crate::right_panel::Variant::Secondary).size(crate::right_panel::Size::Xs).label(if matches!(&source, MediaSource::Direct(_)) { "Open original" } else { "Open in browser" }).on_click(move |_, _, cx| match &source {
                 MediaSource::Asset(resource) => media::open_asset(resource, cx),
                 MediaSource::Direct(url) if url.starts_with("http://") || url.starts_with("https://") => cx.open_url(url),
                 _ => {},
@@ -295,7 +310,7 @@ fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope
     let Some(source) = resolved.source else { return unavailable("Image unavailable", &image.alt, cx) };
     let name: SharedString = if image.alt.trim().is_empty() { resolved.name.into() } else { image.alt.clone().into() };
     let id = SharedString::from(format!("md-media:{index}:{}", image.url));
-    framed_image(id, source, name, &image.alt, 480., scope, cx)
+    framed_image(id, source, name, ImageFrame { alt: &image.alt, max_height: 480., preview: image.link.is_none() }, scope, cx)
 }
 
 /// `ChatMarkdownAssetImage` for an image a tool returned: within 480 wide and 256 tall
@@ -303,12 +318,14 @@ fn markdown_image(image: &MarkdownImage, index: usize, scope: Option<&MediaScope
 pub fn tool_output_image(id: SharedString, source: MediaSource, alt: &str, cx: &mut App) -> AnyElement {
     let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
     let Some(scope) = scope else { return unavailable("Image", alt, cx) };
-    framed_image(id, source, SharedString::from(alt.to_owned()), alt, 256., &scope, cx)
+    framed_image(id, source, SharedString::from(alt.to_owned()), ImageFrame { alt, max_height: 256., preview: true }, &scope, cx)
 }
+
+struct ImageFrame<'a> { alt: &'a str, max_height: f32, preview: bool }
 
 /// An image at its own aspect, at most 480 wide and `max_height` tall, radius 8 with a 40%
 /// border. A 16:9 frame holds its place until the size is known.
-fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: &str, max_height: f32, scope: &MediaScope, cx: &mut App) -> AnyElement {
+fn framed_image(id: SharedString, source: MediaSource, name: SharedString, ImageFrame { alt, max_height, preview }: ImageFrame<'_>, scope: &MediaScope, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     if matches!(media::peek(&source, cx), ImageState::Failed(_)) {
         return div().id(id).relative().child(unavailable("Image unavailable", alt, cx)).child(media::observe_image(source, scope.clone())).into_any_element();
@@ -336,12 +353,11 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: 
         .rounded(px(8.))
         .overflow_hidden()
         .bg(hsla(p.muted).opacity(0.6))
-        .cursor_pointer()
-        .on_click(move |_, window, cx| {
+        .when(preview, |frame| frame.cursor_pointer().on_click(move |_, window, cx| {
             cx.stop_propagation();
             let item = item.clone();
             let _ = viewer.update(cx, |viewer, cx| viewer.open(vec![item], 0, window, cx));
-        });
+        }));
     frame.child(pixels).child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
 }
 
