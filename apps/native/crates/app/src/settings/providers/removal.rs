@@ -25,6 +25,8 @@ pub(super) struct Removal {
     focus: FocusHandle,
     cancel_focus: FocusHandle,
     confirm_focus: FocusHandle,
+    #[cfg(feature = "snapshot")]
+    fixture_denied: bool,
 }
 
 impl Removal {
@@ -35,6 +37,8 @@ impl Removal {
             focus: cx.focus_handle(),
             cancel_focus: cx.focus_handle().tab_stop(true),
             confirm_focus: cx.focus_handle().tab_stop(true),
+            #[cfg(feature = "snapshot")]
+            fixture_denied: false,
         }
     }
 }
@@ -45,6 +49,10 @@ impl SettingsView {
     }
 
     pub(super) fn removal_allowed(&self, cx: &App) -> bool {
+        #[cfg(feature = "snapshot")]
+        if self.providers.removal.fixture_denied {
+            return false;
+        }
         matches!(
             self.state.read(cx).phase,
             Phase::Online(ConnectionStatus::Connected)
@@ -89,18 +97,49 @@ impl SettingsView {
         if !self.provider_removal_open() {
             return false;
         }
+        let target = self
+            .providers
+            .removal
+            .model
+            .confirmation()
+            .map(|plan| plan.instance_id.clone());
         #[cfg(feature = "snapshot")]
         let cancelled = self.providers.removal.model.confirmation().cloned();
         self.providers.removal.model.cancel();
-        self.providers.removal.action_focus.focus(window, cx);
+        self.restore_provider_removal_focus(target.as_deref(), window, cx);
         #[cfg(feature = "snapshot")]
         audit(
             "cancel",
             cancelled.as_ref(),
-            self.providers.removal.action_focus.is_focused(window),
+            self.focus.contains_focused(window, cx),
         );
         cx.notify();
         true
+    }
+
+    fn restore_provider_removal_focus(
+        &self,
+        target: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let trigger_available = !self.providers.removal.model.busy()
+            && self.removal_allowed(cx)
+            && self
+                .page_data(cx)
+                .and_then(|page| page.selected)
+                .is_some_and(|selected| {
+                    Some(selected.row.instance_id.as_str()) == target
+                        && (!selected.row.is_default || selected.row.is_dirty)
+                })
+            && self
+                .focus
+                .contains(&self.providers.removal.action_focus, window);
+        if trigger_available {
+            self.providers.removal.action_focus.focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
+        }
     }
 
     pub(in crate::settings) fn cycle_provider_removal_focus(
@@ -145,11 +184,11 @@ impl SettingsView {
             allowed,
         };
         let Some(plan) = self.providers.removal.model.confirm(&context) else {
-            self.providers.removal.action_focus.focus(window, cx);
+            self.restore_provider_removal_focus(None, window, cx);
             cx.notify();
             return;
         };
-        self.providers.removal.action_focus.focus(window, cx);
+        self.restore_provider_removal_focus(None, window, cx);
         cx.notify();
         // Snapshot confirmation records the plan before constructing any store or RPC future.
         #[cfg(feature = "snapshot")]
@@ -157,8 +196,13 @@ impl SettingsView {
             audit(
                 "confirmed-before-rpc",
                 Some(&plan),
-                self.providers.removal.action_focus.is_focused(window),
+                self.focus.contains_focused(window, cx),
             );
+            match std::env::var("T3_NATIVE_PROVIDER_REMOVAL_LIFECYCLE").as_deref() {
+                Ok("pending") => return,
+                Ok("success") => self.project_removal_fixture(&plan.instance_id, cx),
+                _ => {}
+            }
             self.providers.removal.model.finish(&plan);
             if std::env::var_os("T3_NATIVE_PROVIDER_REMOVAL_FAILURE").is_some() {
                 self.providers.notice =
@@ -227,6 +271,56 @@ impl SettingsView {
         .detach();
     }
 
+    #[cfg(feature = "snapshot")]
+    fn project_removal_fixture(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.settings.provider_instances = config
+                    .settings
+                    .provider_instances
+                    .iter()
+                    .filter(|(key, _)| *key != id)
+                    .map(|(key, instance)| (key.to_owned(), instance.clone()))
+                    .collect();
+            }
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn stale_removal_fixture(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self
+            .providers
+            .removal
+            .model
+            .confirmation()
+            .map(|plan| plan.instance_id.clone())
+        else {
+            return false;
+        };
+        match std::env::var("T3_NATIVE_PROVIDER_REMOVAL_LIFECYCLE").as_deref() {
+            Ok("stale-remove") => self.project_removal_fixture(&id, cx),
+            Ok("stale-deny") => self.providers.removal.fixture_denied = true,
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(in crate::settings) fn removal_route_audit(&self, event: &str, window: &Window, cx: &App) {
+        if std::env::var_os("T3_NATIVE_PROVIDER_REMOVAL_LIFECYCLE").is_none() {
+            return;
+        }
+        let selected = self.page_data(cx).and_then(|page| page.selected);
+        audit_record(
+            serde_json::json!({"event": event, "focusWithinSettings": self.focus.contains_focused(window, cx),
+            "busy": self.providers.removal.model.busy(), "allowed": self.removal_allowed(cx),
+            "selected": selected.as_ref().map(|selected| &selected.row.instance_id),
+            "dirty": selected.as_ref().map(|selected| selected.row.is_dirty)}),
+        );
+    }
+
     pub(super) fn render_provider_removal(
         &self,
         window: &Window,
@@ -269,6 +363,10 @@ impl SettingsView {
         Some(
             div()
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    #[cfg(feature = "snapshot")]
+                    if event.keystroke.key == "f8" && this.stale_removal_fixture(cx) {
+                        return;
+                    }
                     if event.keystroke.modifiers.modified()
                         || !matches!(event.keystroke.key.as_str(), "enter" | "space")
                     {
@@ -290,11 +388,17 @@ impl SettingsView {
 
 #[cfg(feature = "snapshot")]
 fn audit(event: &str, plan: Option<&RemovalPlan>, focus_restored: bool) {
+    audit_record(
+        serde_json::json!({"event":event,"instanceId":plan.map(|p| &p.instance_id),"connection":plan.map(|p| p.connection),"payload":plan.map(RemovalPlan::payload),"focusRestored":focus_restored}),
+    );
+}
+
+#[cfg(feature = "snapshot")]
+fn audit_record(record: serde_json::Value) {
     use std::io::Write;
     let Some(path) = std::env::var_os("T3_NATIVE_PROVIDER_REMOVAL_AUDIT") else {
         return;
     };
-    let record = serde_json::json!({"event":event,"instanceId":plan.map(|p| &p.instance_id),"connection":plan.map(|p| p.connection),"payload":plan.map(RemovalPlan::payload),"focusRestored":focus_restored});
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

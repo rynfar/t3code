@@ -417,6 +417,8 @@ impl SettingsView {
     }
 
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        self.removal_route_audit("route-escape", window, cx);
         if self.dismiss_provider_removal(window, cx) {
             return;
         }
@@ -456,6 +458,8 @@ impl SettingsView {
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        self.removal_route_audit("route-search", window, cx);
         if self.provider_removal_open() {
             return;
         }
@@ -469,6 +473,8 @@ impl SettingsView {
 
     /// Tab and Shift+Tab move through the modal's controls only (the dialog's focus trap).
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        self.removal_route_audit("route-tab", window, cx);
         if self.cycle_provider_removal_focus(forward, window, cx) {
             return;
         }
