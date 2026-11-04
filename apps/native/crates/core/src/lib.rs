@@ -11,6 +11,7 @@ pub mod diff;
 pub mod families;
 pub mod files;
 pub mod git_actions;
+pub mod github_star_prompt;
 pub mod history;
 pub mod json_text;
 pub mod home;

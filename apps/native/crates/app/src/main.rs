@@ -49,6 +49,7 @@ mod theme_editor;
 mod thread_details;
 mod thread_view;
 mod toast;
+mod github_star_prompt;
 mod timestamp;
 mod transcript;
 mod usage;

@@ -879,6 +879,87 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     if let (Some(document), Some(text)) = (&document_view, document_fixture.as_ref().and_then(|fixture| fixture.after_text.as_ref())) {
         document.update(&mut cx, |document, cx| { document.text = text.clone().into(); cx.notify(); });
     }
+    if let Some(scenario) = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--star-prompt-fixture").map(|pair| pair[1].clone()) {
+        state.update(&mut cx, |state, cx| state.install_star_fixture(&scenario, cx));
+    }
+    if let Some(key) = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|pair| pair[0] == "--star-keyboard-audit")
+        .map(|pair| pair[1].clone())
+    {
+        use t3_core::github_star_prompt::Stage;
+        pump(&mut cx, 0.1, |_| false);
+        cx.update_window(window, |_, window, cx| {
+            let focus = cx
+                .global::<FocusTargets>()
+                .0
+                .get("star-activate")
+                .expect("star action rendered")
+                .clone();
+            window.focus(&focus, cx);
+        })
+        .map_err(|e| e.to_string())?;
+        pump(&mut cx, 0.1, |_| false);
+        let (key, held) = key
+            .strip_suffix("-held")
+            .map_or((key.as_str(), false), |key| (key, true));
+        let stroke = gpui::Keystroke::parse(key).map_err(|e| e.to_string())?;
+        for is_held in
+            std::iter::once(false).chain(std::iter::repeat_n(true, if held { 3 } else { 0 }))
+        {
+            cx.simulate_event(
+                window,
+                gpui::KeyDownEvent {
+                    keystroke: stroke.clone(),
+                    is_held,
+                    prefer_character_input: false,
+                },
+            );
+            pump(&mut cx, 0.05, |_| false);
+        }
+        cx.simulate_event(
+            window,
+            gpui::KeyUpEvent {
+                keystroke: stroke.clone(),
+            },
+        );
+        pump(&mut cx, 0.05, |_| false);
+        let first = state.read_with(&cx, |state, _| state.star_fixture_audit());
+        eprintln!(
+            "star keyboard audit: {key}, held={held}, first gesture={first:?}; pre-RPC/no-URL spies only"
+        );
+        assert_eq!(
+            first,
+            (Stage::Fallback, 1, 0),
+            "one physical key gesture must star once and leave fallback for a separate gesture"
+        );
+        cx.simulate_event(
+            window,
+            gpui::KeyUpEvent {
+                keystroke: stroke.clone(),
+            },
+        );
+        pump(&mut cx, 0.05, |_| false);
+        assert_eq!(
+            state.read_with(&cx, |state, _| state.star_fixture_audit()),
+            first,
+            "an extra release cannot activate fallback"
+        );
+        cx.simulate_event(
+            window,
+            gpui::KeyDownEvent {
+                keystroke: stroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            },
+        );
+        cx.simulate_event(window, gpui::KeyUpEvent { keystroke: stroke });
+        pump(&mut cx, 0.05, |_| false);
+        let second = state.read_with(&cx, |state, _| state.star_fixture_audit());
+        eprintln!("star keyboard audit: separate fallback gesture={second:?}; no URL opened");
+        assert_eq!(second, (Stage::Suppressed, 1, 1));
+    }
     for (index, gesture) in options.gestures.iter().enumerate() {
         pump(&mut cx, options.wait.min(options.gesture_wait), |_| false);
         if index + 1 == options.gestures.len() && options.render_counts_output.is_some() {

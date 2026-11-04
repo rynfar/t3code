@@ -33,6 +33,7 @@ pub const SIDEBAR_WIDTH: f32 = 256.;
 pub struct Workspace {
     state: Entity<AppState>,
     focus_observer: Entity<crate::announcements::FocusObserver>,
+    _star_focus: Entity<crate::github_star_prompt::FocusObserver>,
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
@@ -86,6 +87,8 @@ impl Workspace {
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
         let ssh_prompt = cx.new(|cx| crate::ssh_prompt::SshPromptDialog::new(state.clone(), window, cx));
         let focus_observer = cx.new(|cx| crate::announcements::FocusObserver::new(state.clone(), window, cx));
+        let star_root = focus_observer.read(cx).root.clone();
+        let star_focus = cx.new(|cx| crate::github_star_prompt::FocusObserver::new(state.clone(), &star_root, window, cx));
         let subscriptions = vec![
             cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
@@ -112,6 +115,7 @@ impl Workspace {
         Workspace {
             state,
             focus_observer,
+            _star_focus: star_focus,
             sidebar,
             thread,
             composer,
@@ -212,6 +216,9 @@ impl Render for Workspace {
                 .size_full()
                 .bg(theme.background)
                 .map(crate::quit_hold::listen)
+                .capture_key_down(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.star_prompt_activity(cx))))
+                .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.star_prompt_activity(cx))))
+                .child(crate::github_star_prompt::activity_listener(self.state.clone()))
                 .child(screen)
                 .child(self.ssh_prompt.clone())
                 .children(crate::quit_hold::hint(cx))
@@ -234,6 +241,9 @@ impl Render for Workspace {
             .relative()
             .size_full()
             .map(crate::quit_hold::listen)
+            .capture_key_down(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.star_prompt_activity(cx))))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.star_prompt_activity(cx))))
+            .child(crate::github_star_prompt::activity_listener(self.state.clone()))
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.toggle_picker(window, cx));
             }))
@@ -359,7 +369,7 @@ impl Render for Workspace {
             .child(self.device_setup.clone())
             .child(self.ssh_prompt.clone())
             .child(self.welcome.clone())
-            .children(crate::toast::stack(&self.state, cx))
+            .children(crate::toast::stack(&self.state, window, cx))
             .children(crate::updates::overlay(cx))
             .children(crate::settings::overlay(window, cx))
             .children(crate::theme_editor::overlay(window, cx))
