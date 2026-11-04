@@ -1569,6 +1569,78 @@ fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
     assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
     assert!(refresh.finish(&current));
     assert!(provider_banner(&config.config.as_ref().unwrap().providers[0]).is_none());
+
+    let baseline = json!({
+        "instanceId":"work-codex", "driver":"codex", "displayName":" Work Codex ", "enabled":true,
+        "installed":true, "status":"ready", "version":"1.2.3", "auth":{"status":"authenticated"},
+        "message":"Inventory diagnostic", "compatibilityAdvisory":{"status":"unsupported","message":"Use 2.0.0."}
+    });
+    let expected = |title: &str, message: &str, warning, key: [&str; 4]| Some(ProviderBanner {
+        instance_id: key[0].into(), refresh_tooltip: "Refresh Work Codex provider status".into(),
+        key: key.join("\u{0}"), title: title.into(), message: message.into(), warning,
+    });
+    let unsupported = || expected("Work Codex 1.2.3 is unsupported", "Use 2.0.0.", true, ["work-codex", "unsupported", "1.2.3", "Use 2.0.0."]);
+    let broken = || expected("Work Codex 1.2.3 is known to be broken", "Use 2.0.0.", false, ["work-codex", "broken", "1.2.3", "Use 2.0.0."]);
+    let mut cases = vec![
+        ("ready unsupported", json!({}), unsupported()),
+        ("ready broken", json!({"compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken()),
+        ("unsupported unauthenticated ready", json!({"auth":{"status":"unauthenticated"}}), unsupported()),
+        ("disabled broken", json!({"status":"disabled","compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), None),
+        ("disabled unsupported", json!({"status":"disabled"}), None),
+        ("absent advisory", json!({"compatibilityAdvisory":null}), None),
+        ("absent advisory message", json!({"compatibilityAdvisory":{"status":"unsupported"}}),
+            expected("Work Codex 1.2.3 is unsupported", "Inventory diagnostic", true, ["work-codex", "unsupported", "1.2.3", ""])),
+        ("empty advisory message is retained", json!({"compatibilityAdvisory":{"status":"broken","message":""}}),
+            expected("Work Codex 1.2.3 is known to be broken", "", false, ["work-codex", "broken", "1.2.3", ""])),
+        ("null advisory and empty status message", json!({"message":"","compatibilityAdvisory":{"status":"unsupported","message":null}}),
+            expected("Work Codex 1.2.3 is unsupported", "No models are available for this provider.", true, ["work-codex", "unsupported", "1.2.3", ""])),
+        ("absent messages", json!({"message":null,"compatibilityAdvisory":{"status":"broken"}}),
+            expected("Work Codex 1.2.3 is known to be broken", "No models are available for this provider.", false, ["work-codex", "broken", "1.2.3", ""])),
+        ("new version reappears", json!({"version":"1.2.4"}),
+            expected("Work Codex 1.2.4 is unsupported", "Use 2.0.0.", true, ["work-codex", "unsupported", "1.2.4", "Use 2.0.0."])),
+        ("missing version", json!({"version":null}),
+            expected("Work Codex  is unsupported", "Use 2.0.0.", true, ["work-codex", "unsupported", "", "Use 2.0.0."])),
+        ("new advisory message reappears", json!({"compatibilityAdvisory":{"status":"unsupported","message":"Use 3.0.0."}}),
+            expected("Work Codex 1.2.3 is unsupported", "Use 3.0.0.", true, ["work-codex", "unsupported", "1.2.3", "Use 3.0.0."])),
+        ("new instance reappears", json!({"instanceId":"home-codex"}),
+            expected("Work Codex 1.2.3 is unsupported", "Use 2.0.0.", true, ["home-codex", "unsupported", "1.2.3", "Use 2.0.0."])),
+        ("availability auth and diagnostic do not change advisory identity", json!({"status":"warning","auth":{"status":"unknown"},"message":"Changed","compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken()),
+        ("unsupported warning uses normal key", json!({"status":"warning"}),
+            expected("Work Codex provider status", "Inventory diagnostic", true, ["work-codex", "warning", "authenticated", "Inventory diagnostic"])),
+        ("unsupported error uses normal key", json!({"status":"error"}),
+            expected("Work Codex provider status", "Inventory diagnostic", false, ["work-codex", "error", "authenticated", "Inventory diagnostic"])),
+        ("normal empty message falls back but keeps empty key", json!({"status":"warning","message":"","compatibilityAdvisory":null}),
+            expected("Work Codex provider status", "Work Codex provider has limited availability.", true, ["work-codex", "warning", "authenticated", ""])),
+        ("normal absent message falls back", json!({"status":"error","message":null,"compatibilityAdvisory":null}),
+            expected("Work Codex provider status", "Work Codex provider is unavailable.", false, ["work-codex", "error", "authenticated", ""])),
+        ("normal version does not change key", json!({"status":"error","version":"9.0.0","compatibilityAdvisory":null}),
+            expected("Work Codex provider status", "Inventory diagnostic", false, ["work-codex", "error", "authenticated", "Inventory diagnostic"])),
+        ("normal Antigravity unknown auth suppressed", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"},"compatibilityAdvisory":null}), None),
+        ("Antigravity unsupported warning suppressed", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"}}), None),
+        ("Antigravity broken bypasses suppression", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"},"compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken()),
+    ];
+    for status in ["warning", "unknown", "error"] {
+        cases.push((status, json!({"status":status,"auth":{"status":"unknown"},"compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken()));
+    }
+    for advisory in ["supported", "graceful", "unknown"] {
+        cases.push((advisory, json!({"compatibilityAdvisory":{"status":advisory}}), None));
+    }
+    for advisory in ["broken", "unsupported"] {
+        cases.push((advisory, json!({"status":"error","auth":{"status":"unauthenticated"},"compatibilityAdvisory":{"status":advisory,"message":"Use 2.0.0."}}),
+            expected("Work Codex is unauthenticated", "Inventory diagnostic", false, ["work-codex", "error", "unauthenticated", "Inventory diagnostic"])));
+        cases.push((advisory, json!({"status":"error","auth":{"status":"unauthenticated"},"message":null,"compatibilityAdvisory":{"status":advisory,"message":"Use 2.0.0."}}),
+            expected("Work Codex is unauthenticated", "Sign in via the CLI to authenticate again.", false, ["work-codex", "error", "unauthenticated", ""])));
+    }
+    let mut failures = Vec::new();
+    for (case, patch, expected) in cases {
+        let mut value = baseline.clone();
+        value.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+        let actual = provider_banner(&serde_json::from_value(value).unwrap());
+        if actual != expected {
+            failures.push(format!("{case}: expected {expected:?}, got {actual:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 // `apps/web/src/timestampFormat.test.ts` and the usage-limit timeline browser cases.
