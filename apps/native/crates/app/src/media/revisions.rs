@@ -24,7 +24,7 @@ pub(super) struct Revisions {
     records: HashMap<Key, Mint>,
 }
 
-fn now_ms() -> f64 {
+pub(super) fn now_ms() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -56,8 +56,8 @@ impl Revisions {
 
 impl MediaCache {
     pub(super) fn refresh_scope(&mut self, scope: &super::MediaScope, cx: &mut Context<Self>) {
-        let keys: Vec<_> = self.revisions.records.iter().filter(|(key, mint)| {
-            mint.used + 2 >= self.frame && matches!(&key.source, MediaSource::Asset(AssetResource::MediaFile { thread_id, .. }) if Some(thread_id) == scope.thread_id.as_ref())
+        let keys: Vec<_> = self.revisions.records.iter().filter(|(key, _mint)| {
+            self.source_visible(key) && matches!(&key.source, MediaSource::Asset(AssetResource::MediaFile { thread_id, .. }) if Some(thread_id) == scope.thread_id.as_ref())
         }).map(|(key, _)| key.clone()).collect();
         for key in keys {
             self.refresh_asset(
@@ -76,10 +76,7 @@ impl MediaCache {
         owner: EntityId,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(
-            key.source,
-            MediaSource::Asset(AssetResource::MediaFile { .. })
-        ) {
+        if !matches!(key.source, MediaSource::Asset(_)) {
             return;
         }
         if !self.revisions.records.contains_key(key) {
@@ -121,6 +118,52 @@ impl MediaCache {
         }
     }
 
+    pub(super) fn refresh_remount(&mut self, key: &Key, owner: EntityId, cx: &mut Context<Self>) {
+        if let Some(mint) = self.revisions.records.get_mut(key) && mint.state.refresh(now_ms(), true, true) {
+            if !mint.waiters.contains(&owner) { mint.waiters.push(owner); }
+            self.start_mint(key.clone(), cx);
+        }
+    }
+
+    pub(super) fn defer_refresh_timer(&mut self, cx: &mut Context<Self>) {
+        let Some(window) = self.refresh_window else { return };
+        let cache = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = cache.update(cx, |cache, cx| cache.schedule_refresh(window, cx));
+            });
+        });
+    }
+
+    pub(super) fn schedule_refresh(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let next = self.revisions.records.iter().filter(|(key, _)| self.source_visible(key))
+            .filter_map(|(_, mint)| mint.state.refresh_at()).reduce(f64::min);
+        if next == self.refresh_deadline { return; }
+        self.refresh_timer = None;
+        self.refresh_deadline = next;
+        let Some(deadline) = next else { return };
+        let delay = std::time::Duration::from_secs_f64(((deadline - now_ms()) / 1000.).max(0.));
+        self.refresh_timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update_in(cx, |cache, window, cx| {
+                cache.refresh_timer = None;
+                cache.refresh_deadline = None;
+                let now = now_ms();
+                let visible: Vec<_> = cache.revisions.records.keys().filter(|key| cache.source_visible(key)).cloned().collect();
+                for key in visible {
+                    let owners: Vec<_> = cache.visibility.iter().filter(|(_, (image, _))| image.environment == key.environment && image.source == key.source)
+                        .filter_map(|(id, _)| cache.consumer_owners.get(&id).copied()).collect();
+                    let mint = cache.revisions.records.get_mut(&key).unwrap();
+                    if mint.state.refresh(now, false, true) {
+                        for owner in owners { if !mint.waiters.contains(&owner) { mint.waiters.push(owner); } }
+                        cache.start_mint(key, cx);
+                    }
+                }
+                cache.schedule_refresh(window, cx);
+            });
+        }));
+    }
+
     pub(super) fn asset_for_fetch(
         &mut self,
         key: &Key,
@@ -151,6 +194,9 @@ impl MediaCache {
             self.revisions.records.remove(&key);
             return;
         }
+        let local_id = state.environments.environments.iter().find(|environment| environment.local && environment.http_base != client.environment()).map(|environment| environment.id.clone());
+        let local = local_id.map(|id| state.connections.client(&id));
+        let local = async move { match local { Some(local) => local.await, None => None } };
         let runtime = state.runtime().clone();
         let MediaSource::Asset(resource) = key.source.clone() else {
             return;
@@ -161,7 +207,7 @@ impl MediaCache {
                 .acquire_owned()
                 .await
                 .map_err(|_| "Image unavailable.".to_owned())?;
-            t3_client::assets::mint_media_url(&client, &resource).await
+            t3_client::assets::mint_media_url_with_fallback(&client, &resource, local).await
         });
         let target = key.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -182,6 +228,7 @@ impl MediaCache {
                 if again {
                     cache.start_mint(target, cx);
                 }
+                cache.defer_refresh_timer(cx);
                 let app: &mut gpui::App = cx;
                 for owner in waiters {
                     app.notify(owner);

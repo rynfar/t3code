@@ -90,13 +90,20 @@ pub struct Preview {
     render_markdown: bool,
     markdown: Option<(Key, Entity<TextViewState>)>,
     markdown_scroll: ScrollHandle,
+    mutation: Option<String>,
+    media_scope: Option<std::sync::Arc<std::sync::Mutex<crate::media::MediaScope>>>,
+    media_document: Option<crate::transcript::MediaDocument>,
+    media_extensions: Option<gpui_component::text::MarkdownExtensions>,
+    viewer: Entity<crate::media::MediaViewer>,
     handled_reveal: Option<(String, u64)>,
     /// A reveal shows the source; the rendered view returns once the user asks for it.
     rendered_after_reveal: Option<(String, u64)>,
 }
 
 impl Preview {
-    pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        crate::media::cache(&state, cx);
+        let viewer = cx.new(crate::media::MediaViewer::new);
         Preview {
             state,
             target: None,
@@ -109,6 +116,11 @@ impl Preview {
             render_markdown: false,
             markdown: None,
             markdown_scroll: ScrollHandle::new(),
+            mutation: None,
+            media_scope: None,
+            media_document: None,
+            media_extensions: None,
+            viewer,
             handled_reveal: None,
             rendered_after_reveal: None,
         }
@@ -186,6 +198,14 @@ impl Preview {
     fn fetch(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
         let key = Key::of(&target);
+        #[cfg(feature = "snapshot")]
+        if let Some(fixture) = cx.try_global::<MarkdownFixture>().filter(|fixture| fixture.path == key.path).cloned() {
+            let file = FileContents { relative_path: key.path.clone(), contents: fixture.text, byte_length: 0, truncated: false };
+            self.render_markdown = true;
+            self.replace_content(Content::Text(Rc::new(build_text_file(key, file))), cx);
+            cx.notify();
+            return;
+        }
         self.generation += 1;
         let generation = self.generation;
         match image_kind(&key.path) {
@@ -194,7 +214,7 @@ impl Preview {
                     self.replace_content(Content::Image(ImageState::Loading), cx);
                 }
                 let state = self.state.read(cx);
-                let task = image::load(state, &target.root, &key.path, kind);
+                let task = image::load(state, &target.root, &key.path, kind, self.mutation.as_deref());
                 self._fetch = Some(cx.spawn(async move |this, cx| {
                     let result = match task {
                         Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
@@ -315,16 +335,43 @@ impl Preview {
         file.truncated.then(|| format!("Preview limited to the first 1 MB of a {} byte file.", group_thousands(file.byte_length)))
     }
 
+    pub fn set_mutation(&mut self, mutation: Option<String>, cx: &mut Context<Self>) {
+        if self.mutation == mutation { return; }
+        self.mutation = mutation;
+        if let Some(scope) = &self.media_scope { scope.lock().unwrap().workspace_mutation_id = self.mutation.clone(); }
+        cx.notify();
+    }
+
     fn render_markdown(&mut self, file: &Rc<TextFile>, cx: &mut Context<Self>) -> AnyElement {
         let state = match &self.markdown {
             Some((key, state)) if *key == file.key => state.clone(),
             _ => {
                 let text = mask_frontmatter(&file.contents).into_owned();
-                let state = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                if let Some(document) = &self.media_document { *document.write().unwrap() = std::sync::Arc::new(t3_core::media::MarkdownMediaDocument::new(std::sync::Arc::from(text.as_str()))); }
+                else { self.media_document = Some(crate::transcript::media_document(std::sync::Arc::from(text.as_str()))); }
+                let state = cx.new(|cx| {
+                    TextViewState::markdown(&text, cx).selectable(true)
+                });
+                #[cfg(feature = "snapshot")]
+                if !text.contains("![") { crate::snapshot::record_media_prose(&state, &text, cx); }
                 self.markdown = Some((file.key.clone(), state.clone()));
                 state
             }
         };
+        let target = self.target.as_ref().unwrap();
+        let scope = crate::media::MediaScope {
+            owner: cx.entity_id(),
+            thread_id: Some(target.root.workspace.thread_id.clone()),
+            workspace_root: Some(t3_core::media::markdown_image_base_dir(&target.root.workspace.cwd, &target.path)),
+            workspace_mutation_id: self.mutation.clone(),
+            viewer: self.viewer.downgrade(),
+        };
+        if let Some(current) = &self.media_scope { *current.lock().unwrap() = scope; }
+        else {
+            let scope = std::sync::Arc::new(std::sync::Mutex::new(scope));
+            self.media_extensions = Some(crate::transcript::markdown_extensions(self.media_document.clone().unwrap(), Some(scope.clone())));
+            self.media_scope = Some(scope);
+        }
         let p = palette(cx);
         div()
             .id("file-markdown")
@@ -342,7 +389,7 @@ impl Preview {
                         .text_size(px(14.))
                         .line_height(px(22.75))
                         .text_color(hsla(p.foreground).opacity(0.9))
-                        .child(crate::transcript::markdown::markdown_view(&state, cx)),
+                        .child(crate::transcript::markdown::markdown_view(&state, cx).markdown_extensions(self.media_extensions.clone().unwrap())),
                 ),
             )
             .vertical_scrollbar(&self.markdown_scroll)
@@ -433,6 +480,12 @@ impl Render for Preview {
                 if self.renders_markdown() { self.render_markdown(&file, cx) } else { self.render_code(window, cx) }
             }
         };
-        v_flex().size_full().min_h_0().child(body)
+        v_flex().relative().size_full().min_h_0().child(body).child(self.viewer.clone())
     }
 }
+
+#[cfg(feature = "snapshot")]
+#[derive(Clone, serde::Deserialize)]
+pub(crate) struct MarkdownFixture { pub path: String, pub text: String }
+#[cfg(feature = "snapshot")]
+impl gpui::Global for MarkdownFixture {}

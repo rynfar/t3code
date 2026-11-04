@@ -53,6 +53,7 @@ pub enum EnvironmentEvent {
 }
 
 enum Command {
+    Client { id: String, reply: tokio::sync::oneshot::Sender<Option<ClientHandle>> },
     Watch {
         id: String,
         generation: u64,
@@ -128,6 +129,12 @@ impl Environments {
             .get(id)
             .is_some_and(|(_, current)| current == generation)
     }
+    pub fn client(&self, id: &str) -> impl std::future::Future<Output = Option<ClientHandle>> + Send + 'static + use<> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(Command::Client { id: id.into(), reply });
+        async move { response.await.ok().flatten() }
+    }
+
     pub fn activate(&self, id: Option<&str>) {
         let _ = self.commands.send(Command::Activate(id.map(str::to_owned)));
     }
@@ -227,6 +234,7 @@ async fn run(
             _ = output.closed() => return,
             command = commands.recv() => match command {
                 None => return,
+                Some(Command::Client { id, reply }) => { let _ = reply.send(entries.get(&id).map(|entry| entry.client.clone())); }
                 Some(Command::Watch { id, generation, credentials, prepare }) => {
                     if entries.get(&id).is_some_and(|e| e.credentials == credentials) { continue; }
                     let prior = entries.remove(&id);

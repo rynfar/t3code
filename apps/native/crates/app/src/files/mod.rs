@@ -10,6 +10,8 @@ mod explorer;
 mod explorer_rows;
 mod image;
 mod preview;
+#[cfg(feature = "snapshot")]
+pub(crate) use preview::MarkdownFixture;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -203,7 +205,7 @@ impl FilesPanel {
         if root_changed {
             self.root = root.clone();
             self.stale = false;
-        } else if mutation != self.mutation && self.mutation.is_some() {
+        } else if t3_core::media::workspace_mutation_changed(root_changed, self.mutation.as_deref(), mutation.as_deref()) {
             self.stale = true;
         }
         self.mutation = mutation;
@@ -220,7 +222,10 @@ impl FilesPanel {
                     reveal_request_id: shown.reveal_request_id,
                 })
             });
-            self.preview.update(cx, |preview, cx| preview.set_target(target, cx));
+            self.preview.update(cx, |preview, cx| {
+                preview.set_mutation(self.mutation.clone(), cx);
+                preview.set_target(target, cx);
+            });
             if std::mem::take(&mut self.stale) {
                 self.explorer.update(cx, |explorer, cx| explorer.refresh(cx));
                 self.preview.update(cx, |preview, cx| preview.refetch(cx));

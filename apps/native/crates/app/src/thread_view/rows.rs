@@ -1,4 +1,4 @@
-//! The virtualized transcript, cached separately from minimap hover and motion.
+//! The virtualized transcript, rendered separately from the minimap.
 
 use super::*;
 use gpui::WeakEntity;

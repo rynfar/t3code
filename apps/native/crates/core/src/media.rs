@@ -6,6 +6,8 @@
 //! File rows and sent chip sizes port `chat/GuestMessageAttachments.tsx` and
 //! `chat/UserMessageContextChips.tsx`. Revision tracking ports `state/assets.ts` and `state/threadDetail.ts` in client-runtime.
 
+mod policy;
+pub use policy::*;
 mod revision;
 pub use revision::{AssetFetch, RevisionedAssetUrl};
 

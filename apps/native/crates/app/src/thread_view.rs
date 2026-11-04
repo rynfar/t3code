@@ -849,7 +849,8 @@ impl Render for ThreadView {
                 });
             });
         }
-        let transcript = self.timeline_rows.clone().cached(gpui::StyleRefinement::default().size_full());
+        // TextView selection registrations must paint each drawn frame; scene reuse makes them stale.
+        let transcript = self.timeline_rows.clone();
         div().id("citation-viewport")
             .track_focus(&self.citation_ui.selection_focus)
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))

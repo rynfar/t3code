@@ -44,7 +44,34 @@ pub async fn mint_media_url(client: &ClientHandle, resource: &AssetResource) -> 
     decode_asset_url(&minted)
 }
 
+/// Uses an already connected local environment only for web's three missing-host errors.
+/// Unknown error tags and failed fallbacks use the same unavailable presentation.
+pub async fn mint_media_url_with_fallback(
+    client: &ClientHandle,
+    resource: &AssetResource,
+    local: impl std::future::Future<Output = Option<ClientHandle>>,
+) -> Result<AssetUrl, String> {
+    let result = client.request(t3_core::media::CREATE_ASSET_URL, resource.create_url_request()).await;
+    let error = match result {
+        Ok(value) => return decode_asset_url(&value),
+        Err(error) => error,
+    };
+    let tag = match &error { crate::session::RpcError::Failure(error) => error.tag.as_deref(), _ => None };
+    if !t3_core::media::allows_local_media_fallback(resource, tag, true) { return Err(UNAVAILABLE.into()); }
+    if let Some(local) = local.await.filter(|local| local.environment() != client.environment())
+        && let Ok(mut asset) = mint_media_url(&local, resource).await
+        && let Some(url) = t3_core::media::resolve_asset_url(local.environment(), &asset.relative_url)
+    {
+        asset.relative_url = url;
+        return Ok(asset);
+    }
+    Err(UNAVAILABLE.into())
+}
+
 pub async fn fetch_signed_media(client: &ClientHandle, relative_url: &str) -> Result<MediaBytes, String> {
+    if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
+        return Ok(MediaBytes { bytes: get(relative_url).await?, dimensions: None });
+    }
     let bytes = crate::asset::fetch_asset(client.environment(), relative_url, MAX_BYTES).await.map_err(|error| {
         tracing::debug!(%error, "asset fetch failed");
         UNAVAILABLE.to_owned()
@@ -76,4 +103,32 @@ async fn get(url: &str) -> Result<Vec<u8>, String> {
 
 fn describe(error: &reqwest::Error) -> String {
     if error.is_timeout() { "The image took too long to load.".into() } else { UNAVAILABLE.into() }
+}
+
+/// The blocking worker keeps its permit if the async caller is cancelled.
+pub async fn decode_media<T: Send + 'static>(permit: tokio::sync::OwnedSemaphorePermit, decode: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || { let _permit = permit; decode() }).await.map_err(|_| "Image unavailable.".to_owned())?
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn cancelled_decode_keeps_its_permit_until_the_worker_finishes() {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, worker) = std::sync::mpsc::channel();
+        let task = tokio::spawn(super::decode_media(permit, move || {
+            started.send(()).unwrap();
+            worker.recv().unwrap();
+            Ok(())
+        }));
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let held = permits.available_permits() == 0;
+        release.send(()).unwrap();
+        assert!(held, "cancelled async callers must not admit another blocking decode");
+        let _finished = permits.acquire_owned().await.unwrap();
+    }
 }
