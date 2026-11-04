@@ -291,17 +291,58 @@ fn effective_snooze_never_hides_on_malformed_data_and_wakes_for_requests() {
 #[test]
 fn fresh_failures_wake_but_stale_ones_do_not() {
     let now = iso(NOW);
-    let failed = |completed: &str| SidebarThread {
-        runtime: Some(RuntimeSummary { updated_at: Some(iso("2026-04-10T11:00:00.000Z")), ..runtime("failed") }),
-        latest_run: Some(run("failed", None, Some(completed))),
+    let metadata_at = iso("2026-04-10T11:00:00.000Z");
+    let failed = |completed| SidebarThread {
+        runtime: Some(RuntimeSummary { updated_at: Some(metadata_at), ..runtime("failed") }),
+        latest_run: Some(run("failed", None, completed)),
         ..snoozed(FUTURE_WAKE)
     };
-    assert!(effective_snoozed(&failed("2026-04-10T08:00:00.000Z"), now));
-    assert_eq!(woke_at(&failed("2026-04-10T08:00:00.000Z"), now), None);
-    assert!(!effective_snoozed(&failed("2026-04-10T10:00:00.000Z"), now));
-    assert_eq!(woke_at(&failed("2026-04-10T10:00:00.000Z"), now), Some(iso("2026-04-10T10:00:00.000Z")));
-    let approval = SidebarThread { has_pending_approvals: true, ..failed("2026-04-10T08:00:00.000Z") };
-    assert_eq!(woke_at(&approval, now), Some(iso("2026-04-10T11:00:00.000Z")));
+    let requests: [fn(&mut SidebarThread); 6] = [
+        |t| t.has_pending_approvals = true,
+        |t| t.has_pending_user_input = true,
+        |t| t.has_pending_runtime_request = true,
+        |t| t.pending_subagent_request = Some(SubagentRequest::Approval),
+        |t| t.pending_subagent_request = Some(SubagentRequest::UserInput),
+        |t| t.pending_guest_message_count = 1,
+    ];
+    for (completed, failure_wake) in [
+        (Some("2026-04-10T08:00:00.000Z"), None),
+        (None, None),
+        (Some(SNOOZED_AT), None),
+        (Some("2026-04-10T09:30:00.000Z"), Some(iso("2026-04-10T09:30:00.000Z"))),
+    ] {
+        let thread = failed(completed);
+        assert_eq!(effective_snoozed(&thread, now), failure_wake.is_none(), "completion: {completed:?}");
+        assert_eq!(woke_at(&thread, now), failure_wake, "completion: {completed:?}");
+        let timer = SidebarThread { snoozed_until: Some(iso(PAST_WAKE)), ..thread.clone() };
+        assert!(!effective_snoozed(&timer, now));
+        assert_eq!(woke_at(&timer, now), failure_wake.or(Some(iso(PAST_WAKE))));
+        for request in requests {
+            let mut blocked = thread.clone();
+            request(&mut blocked);
+            assert!(!effective_snoozed(&blocked, now));
+            assert_eq!(woke_at(&blocked, now), failure_wake.or(Some(metadata_at)));
+            blocked.snoozed_until = Some(iso(PAST_WAKE));
+            assert_eq!(woke_at(&blocked, now), failure_wake.or(Some(metadata_at)));
+        }
+    }
+    let unstamped = SidebarThread { snoozed_at: None, ..failed(None) };
+    assert!(!effective_snoozed(&unstamped, now));
+    assert_eq!(woke_at(&unstamped, now), Some(metadata_at));
+    for status in ["error", "failed"] {
+        for latest_run in [None, Some(run("completed", None, Some("2026-04-10T08:00:00.000Z")))] {
+            for updated_at in [None, Some(iso("2026-04-10T08:00:00.000Z")), Some(iso(SNOOZED_AT)), Some(metadata_at)] {
+                let legacy = SidebarThread {
+                    runtime: Some(RuntimeSummary { updated_at, ..runtime(status) }),
+                    latest_run: latest_run.clone(),
+                    ..snoozed(FUTURE_WAKE)
+                };
+                let wake = updated_at.filter(|at| *at > iso(SNOOZED_AT));
+                assert_eq!(effective_snoozed(&legacy, now), wake.is_none());
+                assert_eq!(woke_at(&legacy, now), wake);
+            }
+        }
+    }
     assert_eq!(woke_at(&snoozed(PAST_WAKE), now), Some(iso(PAST_WAKE)));
 }
 

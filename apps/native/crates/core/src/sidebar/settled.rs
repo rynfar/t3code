@@ -35,7 +35,6 @@ fn failure_edge_at(thread: &SidebarThread) -> Option<Option<Ms>> {
     }
     if let Some(run) = &thread.latest_run
         && run.status == "failed"
-        && run.completed_at.is_some()
     {
         return Some(run.completed_at);
     }
