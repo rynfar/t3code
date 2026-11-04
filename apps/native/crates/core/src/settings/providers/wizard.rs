@@ -10,6 +10,12 @@ pub struct ConfigDraft {
     errors: HashMap<String, String>,
 }
 impl ConfigDraft {
+    pub fn from_value(value: Value) -> Self {
+        Self {
+            value: Some(value),
+            ..Default::default()
+        }
+    }
     pub fn edit(&mut self, driver: &str, key: &str, value: Value) {
         if !form::validate_field(driver, key, &value) {
             self.errors.insert(
@@ -29,6 +35,69 @@ impl ConfigDraft {
     }
     pub fn error(&self) -> Option<&str> {
         self.errors.values().next().map(String::as_str)
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSetup {
+    #[default]
+    Choices,
+    Manual,
+}
+impl AcpSetup {
+    pub fn start(local: bool) -> (Self, ConfigDraft, &'static str) {
+        (
+            Self::Manual,
+            ConfigDraft {
+                value: local.then(|| serde_json::json!({"source":"local","commandArgs":[]})),
+                ..Default::default()
+            },
+            if local { "Local ACP" } else { "" },
+        )
+    }
+    pub fn local(self, config: Option<&Value>) -> bool {
+        self == Self::Manual && config.is_some_and(|c| c["source"] == "local")
+    }
+    pub fn selection_error(self, config: Option<&Value>) -> Option<&'static str> {
+        let local = self.local(config);
+        let key = if local { "commandPath" } else { "agentId" };
+        let filled = config
+            .and_then(|c| c[key].as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if self == Self::Manual && filled {
+            None
+        } else if local {
+            Some("Executable is required.")
+        } else {
+            Some("Select an ACP or configure one manually.")
+        }
+    }
+    pub fn steps(self, driver: &str, config: Option<&Value>) -> &'static [&'static str] {
+        if driver != super::ACP_REGISTRY {
+            &STEPS
+        } else if self.local(config) {
+            &["Provider", "Identity"]
+        } else {
+            &["Provider", "Identity", "Sign in"]
+        }
+    }
+    pub fn navigate(
+        self,
+        driver: &str,
+        config: Option<&Value>,
+        current: usize,
+        requested: usize,
+        identity_error: Option<String>,
+    ) -> Result<usize, (usize, String)> {
+        let target = requested.min(self.steps(driver, config).len() - 1);
+        if driver == super::ACP_REGISTRY
+            && current == 0
+            && target > 0
+            && let Some(error) = self.selection_error(config)
+        {
+            return Err((0, error.into()));
+        }
+        navigation(current, target, identity_error)
     }
 }
 
@@ -63,6 +132,9 @@ pub fn focus_target(
     policy: Option<&Value>,
     can_manage: bool,
 ) -> FocusTarget {
+    if !can_manage || !crate::managed_policy::driver_allowed(policy, driver) {
+        return FocusTarget::Dialog;
+    }
     if step == 1 {
         return FocusTarget::Identity;
     }
@@ -108,6 +180,87 @@ mod tests {
     use super::*;
     use crate::settings::providers::create_payload;
     use serde_json::json;
+
+    #[test]
+    fn manual_and_local_paths_reset_only_the_web_owned_drafts_and_gate_navigation() {
+        let (mode, mut config, label) = AcpSetup::start(false);
+        assert_eq!(label, "");
+        assert!(config.value.is_none());
+        assert_eq!(
+            mode.navigate("acpRegistry", None, 0, 2, None),
+            Err((0, "Select an ACP or configure one manually.".into()))
+        );
+        config.edit("acpRegistry", "agentId", json!("  devin  "));
+        config.edit("acpRegistry", "commandPath", json!("/override"));
+        config.edit("acpRegistry", "authMethodId", json!("token"));
+        assert_eq!(mode.selection_error(config.value.as_ref()), None);
+        let manual = instance(
+            "acpRegistry",
+            " Registry Agent ",
+            "",
+            config.value.clone(),
+            vec![json!({"name":"IGNORED","value":"local only"})],
+        );
+        assert_eq!(
+            create_payload("registry_agent", &manual)["providerInstanceMutation"]["instance"],
+            json!({"driver":"acpRegistry","enabled":true,"displayName":"Registry Agent","config":{"agentId":"  devin  ","commandPath":"/override","authMethodId":"token"}})
+        );
+        assert_eq!(
+            mode.navigate(
+                "acpRegistry",
+                config.value.as_ref(),
+                0,
+                2,
+                Some("duplicate".into())
+            ),
+            Err((1, "duplicate".into()))
+        );
+        assert!(
+            AcpSetup::Choices
+                .selection_error(config.value.as_ref())
+                .is_some()
+        );
+        let (mode, mut local, label) = AcpSetup::start(true);
+        assert_eq!(label, "Local ACP");
+        assert_eq!(
+            local.value,
+            Some(json!({"source":"local","commandArgs":[]}))
+        );
+        assert_eq!(
+            mode.selection_error(local.value.as_ref()),
+            Some("Executable is required.")
+        );
+        local.edit("acpRegistry", "commandPath", json!("  dsh  "));
+        assert_eq!(
+            mode.steps("acpRegistry", local.value.as_ref()),
+            ["Provider", "Identity"]
+        );
+        assert_eq!(
+            mode.navigate(
+                "acpRegistry",
+                local.value.as_ref(),
+                0,
+                99,
+                Some("duplicate".into())
+            ),
+            Ok(1)
+        );
+        local.edit("acpRegistry", "source", json!(""));
+        assert_eq!(
+            mode.selection_error(local.value.as_ref()),
+            Some("Select an ACP or configure one manually.")
+        );
+        assert_eq!(
+            mode.navigate(
+                "acpRegistry",
+                local.value.as_ref(),
+                1,
+                0,
+                Some("duplicate".into())
+            ),
+            Ok(0)
+        );
+    }
 
     #[test]
     fn draft_validation_keeps_the_last_valid_value_and_errors_until_corrected() {
@@ -180,6 +333,10 @@ mod tests {
         }
         assert_eq!(
             focus_target(navigation(2, 0, None).unwrap(), "codex", None, None, true),
+            FocusTarget::Dialog
+        );
+        assert_eq!(
+            focus_target(1, "codex", None, None, false),
             FocusTarget::Dialog
         );
         assert_eq!(
