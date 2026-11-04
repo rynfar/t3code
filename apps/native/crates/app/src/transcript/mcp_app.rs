@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
@@ -12,7 +13,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme;
 use serde_json::{Value, json};
-use t3_core::mcp_apps::{Action, DEFAULT_HEIGHT, Host, MAX_HEIGHT, Operation};
+use t3_core::mcp_apps::{Action, DEFAULT_HEIGHT, Host, MAX_HEIGHT, Operation, TEARDOWN_TIMEOUT_MS};
 use t3_core::timeline::McpAppEntry;
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
@@ -111,6 +112,7 @@ struct McpFrame {
     load: Option<Task<()>>,
     detail_task: Option<Task<()>>,
     events: Option<Task<()>>,
+    teardown_timer: Option<Task<()>>,
 }
 
 impl McpFrame {
@@ -135,9 +137,14 @@ impl McpFrame {
             load: None,
             detail_task: None,
             events: None,
+            teardown_timer: None,
         };
         frame.load(cx);
         frame.fetch_detail(cx);
+        #[cfg(feature = "snapshot")]
+        if webview::is_offscreen() && fixture::page(&frame.entry.reference.attachment_id).is_some() && fixture::audit_enabled() {
+            frame.audit_teardown(cx);
+        }
         frame
     }
 
@@ -255,10 +262,63 @@ impl McpFrame {
         }
     }
 
+    fn dispose_host(&mut self) {
+        self.generation += 1;
+        self.teardown_timer = None;
+        self.events = None;
+        self.view = Weak::new();
+        if let Some(mut host) = self.host.take() {
+            host.dispose();
+        }
+    }
+
+    fn install_host(&mut self, cx: &mut Context<Self>) {
+        self.dispose_host();
+        self.host = Some(Host::new(self.entry.reference.clone(), self.context.clone(), env!("CARGO_PKG_VERSION")));
+        self.deliver_tool(cx);
+    }
+
+    fn detach_host(&mut self, cx: &mut Context<Self>) {
+        if self.teardown_timer.is_some() {
+            self.closed = true;
+            cx.notify();
+        }
+        // The viewport owns the WebView; a detached document cannot acknowledge cleanup.
+        self.dispose_host();
+    }
+
+    fn reopen(&mut self, cx: &mut Context<Self>) {
+        self.closed = false;
+        self.height = DEFAULT_HEIGHT;
+        cx.notify();
+    }
+
+    fn receive_message(&mut self, generation: u64, text: &str, cx: &mut Context<Self>) {
+        if self.generation == generation
+            && let Some(host) = &mut self.host
+        {
+            let actions = host.receive(text);
+            self.actions(actions, cx);
+        }
+    }
+
+    fn teardown_timeout(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.generation == generation
+            && let Some(host) = &mut self.host
+        {
+            let actions = host.teardown_timeout();
+            self.actions(actions, cx);
+        }
+    }
+
     fn actions(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) {
         for action in actions {
             match action {
                 Action::Post(message) => {
+                    #[cfg(feature = "snapshot")]
+                    if webview::is_offscreen() && fixture::audit_enabled() {
+                        eprintln!("MCP bridge host -> {message}");
+                    }
                     if let Some(view) = self.view.upgrade() {
                         view.evaluate(&format!("window.__t3McpReceive({message});"));
                     }
@@ -271,11 +331,15 @@ impl McpFrame {
                 }
                 Action::Close => {
                     self.closed = true;
-                    if let Some(host) = &mut self.host {
-                        host.dispose();
-                    }
-                    self.host = None;
+                    self.dispose_host();
                     cx.notify();
+                }
+                Action::StartTeardownTimer => {
+                    let generation = self.generation;
+                    self.teardown_timer = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_millis(TEARDOWN_TIMEOUT_MS)).await;
+                        let _ = this.update(cx, |frame, cx| frame.teardown_timeout(generation, cx));
+                    }));
                 }
                 Action::Request {
                     token,
@@ -330,6 +394,12 @@ impl McpFrame {
         if let Some(view) = self.view.upgrade() {
             return Some(view);
         }
+        if self.host.is_some() {
+            self.detach_host(cx);
+            if self.closed {
+                return None;
+            }
+        }
         if !webview::available(window) || !window.is_window_active() {
             return None;
         }
@@ -352,30 +422,78 @@ impl McpFrame {
         };
         let (events, mut received) = mpsc::unbounded();
         let view = WebView::new(page, Layer::Transcript, events, window, cx)?;
-        self.generation += 1;
+        self.install_host(cx);
+        let generation = self.generation;
         self.view = Rc::downgrade(&view);
         cx.global_mut::<Frames>().views.push(self.view.clone());
-        self.host = Some(Host::new(self.entry.reference.clone(), self.context.clone(), env!("CARGO_PKG_VERSION")));
-        self.deliver_tool(cx);
         self.events = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = received.next().await {
                 if this
-                    .update(cx, |frame, cx| match event {
-                        WebEvent::Message(text) => {
-                            if let Some(host) = &mut frame.host {
-                                let actions = host.receive(&text);
-                                frame.actions(actions, cx);
-                            }
+                    .update(cx, |frame, cx| {
+                        if frame.generation != generation {
+                            return;
                         }
-                        WebEvent::OpenUrl(url) => cx.open_url(&url),
+                        match event {
+                            WebEvent::Message(text) => frame.receive_message(generation, &text, cx),
+                            WebEvent::OpenUrl(url) => cx.open_url(&url),
+                        }
                     })
                     .is_err()
                 {
                     break;
                 }
             }
+            let _ = this.update(cx, |frame, cx| {
+                if frame.generation == generation {
+                    frame.detach_host(cx);
+                }
+            });
         }));
         Some(view)
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn audit_teardown(&mut self, cx: &mut Context<Self>) {
+        let initialized = r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#;
+        let teardown = r#"{"jsonrpc":"2.0","method":"ui/notifications/request-teardown"}"#;
+        let ack = r#"{"jsonrpc":"2.0","id":"t3-host-0","result":{}}"#;
+        let mut old_generation = self.generation;
+        for response in [
+            Some(ack),
+            Some(r#"{"jsonrpc":"2.0","id":"t3-host-0","error":{"code":-32000,"message":"fixture"}}"#),
+            None,
+        ] {
+            self.reopen(cx);
+            self.install_host(cx);
+            let generation = self.generation;
+            self.receive_message(generation, initialized, cx);
+            self.receive_message(generation, teardown, cx);
+            assert!(!self.closed && self.host.is_some() && self.teardown_timer.is_some());
+            self.receive_message(old_generation, ack, cx);
+            self.teardown_timeout(old_generation, cx);
+            assert!(!self.closed && self.teardown_timer.is_some());
+            eprintln!("MCP bridge audit: awaiting acknowledgement; stale message/deadline ignored");
+            if let Some(response) = response {
+                self.receive_message(generation, response, cx);
+            } else {
+                self.teardown_timeout(generation, cx);
+            }
+            assert!(self.closed && self.host.is_none() && self.teardown_timer.is_none());
+            old_generation = generation;
+            eprintln!(
+                "MCP bridge audit: {} -> closed, host/deadline released",
+                if response.is_some() { "response" } else { "explicit deadline" }
+            );
+        }
+        self.reopen(cx);
+        self.install_host(cx);
+        let generation = self.generation;
+        self.receive_message(generation, initialized, cx);
+        self.receive_message(generation, teardown, cx);
+        self.detach_host(cx);
+        assert!(self.closed && self.host.is_none() && self.teardown_timer.is_none());
+        eprintln!("MCP bridge audit: detach disposes immediately; graceful detached cleanup remains a gap");
+        eprintln!("MCP bridge audit: offscreen only; WebKit transport not exercised");
     }
 }
 
@@ -401,9 +519,7 @@ impl Render for McpFrame {
                     "Show app",
                     None,
                     cx.listener(|this, _, _, cx| {
-                        this.closed = false;
-                        this.height = DEFAULT_HEIGHT;
-                        cx.notify();
+                        this.reopen(cx);
                     }),
                     cx,
                 ))
@@ -560,6 +676,10 @@ pub mod fixture {
 
     pub(super) fn page(attachment_id: &str) -> Option<&'static PathBuf> {
         path().filter(|_| attachment_id == ATTACHMENT_ID)
+    }
+
+    pub(super) fn audit_enabled() -> bool {
+        std::env::var("T3_NATIVE_MCP_TEARDOWN_AUDIT").as_deref() == Ok("1")
     }
 
     fn item() -> Option<Arc<TurnItem>> {

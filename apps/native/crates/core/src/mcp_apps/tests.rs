@@ -147,6 +147,94 @@ fn catches_up_context_and_clamps_size_notifications() {
 }
 
 #[test]
+fn inline_close_waits_for_the_matching_teardown_response() {
+    for response in [
+        json!({"result":{}}),
+        json!({"error":{"code":-32000,"message":"Cannot save"}}),
+        json!({"error":null}),
+    ] {
+        let mut h = host();
+        receive(&mut h, Value::Null, "ui/notifications/initialized", json!({}));
+        assert!(h.receive(r#"{"jsonrpc":"2.0","id":"t3-host-0","result":{}}"#).is_empty());
+        let pending = receive(&mut h, json!(7), "tools/call", json!({"name":"slow"}));
+        let Action::Request { token, .. } = pending[0] else { panic!() };
+        let sent = receive(&mut h, Value::Null, "ui/notifications/request-teardown", json!({}));
+        assert!(!sent.contains(&Action::Close), "initialized app must finish before close");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], Action::StartTeardownTimer);
+        assert!(h.teardown().is_empty());
+        let request = message(&sent[0]);
+        assert_eq!(request["method"], "ui/resource-teardown");
+        assert_eq!(request["params"], json!({}));
+        assert_eq!(request["id"], "t3-host-0");
+        assert!(receive(&mut h, Value::Null, "ui/notifications/request-teardown", json!({})).is_empty());
+        for invalid in [
+            "not-json".to_owned(),
+            json!({"jsonrpc":"1.0","id":"t3-host-0","result":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":"t3-host-0"}).to_string(),
+            json!({"jsonrpc":"2.0","id":"t3-host-1","result":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":0,"result":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":null,"result":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":"t3-host-0","result":{"padding":"x".repeat(MAX_MESSAGE_BYTES)}}).to_string(),
+        ] {
+            assert!(h.receive(&invalid).is_empty());
+        }
+        let ping = receive(&mut h, json!("t3-host-0"), "ping", json!({}));
+        assert_eq!(message(&ping[0])["result"], json!({}));
+        let mut response = response;
+        response["jsonrpc"] = json!("2.0");
+        response["id"] = request["id"].clone();
+        assert_eq!(h.receive(&response.to_string()), vec![Action::Close]);
+        assert!(h.receive(&response.to_string()).is_empty());
+        assert!(h.teardown_timeout().is_empty());
+        assert!(h.teardown().is_empty());
+        assert!(h.complete(token, Ok(json!({"content":[]}))).is_empty());
+        assert!(h.set_tool_call(json!({}), Some(json!({"content":[]}))).is_empty());
+        assert!(h.update_context(context()).is_empty());
+        assert!(receive(&mut h, json!(1), "ping", json!({})).is_empty());
+    }
+}
+
+#[test]
+fn teardown_timeout_and_disposal_are_explicit_and_idempotent() {
+    assert_eq!(TEARDOWN_TIMEOUT_MS, 2000);
+    for dispose in [false, true] {
+        let mut h = host();
+        assert!(h.teardown_timeout().is_empty());
+        receive(&mut h, Value::Null, "ui/notifications/initialized", json!({}));
+        let pending = receive(&mut h, json!(7), "resources/read", json!({"uri":"ui://slow"}));
+        let Action::Request { token, .. } = pending[0] else { panic!() };
+        assert_eq!(h.teardown().len(), 2);
+        if dispose {
+            h.dispose();
+            assert!(h.teardown_timeout().is_empty());
+        } else {
+            assert_eq!(h.teardown_timeout(), vec![Action::Close]);
+        }
+        assert!(h.complete(token, Err("late failure".into())).is_empty());
+        assert!(h.teardown_timeout().is_empty());
+        assert!(h.receive(r#"{"jsonrpc":"2.0","id":"t3-host-0","result":{}}"#).is_empty());
+        assert!(h.teardown().is_empty());
+    }
+}
+
+#[test]
+fn uninitialized_close_disposes_without_a_teardown_message() {
+    for initialize in [false, true] {
+        let mut h = host();
+        if initialize {
+            receive(&mut h, json!(1), "ui/initialize", json!({}));
+        }
+        assert_eq!(
+            receive(&mut h, Value::Null, "ui/notifications/request-teardown", json!({})),
+            vec![Action::Close]
+        );
+        assert!(receive(&mut h, json!(2), "ping", json!({})).is_empty());
+        assert!(receive(&mut h, Value::Null, "ui/notifications/initialized", json!({})).is_empty());
+    }
+}
+
+#[test]
 fn references_match_source_and_keep_policy_narrow() {
     let value = json!({"t3McpApp":{"attachmentId":"app", "server":"weather", "tool":"get_weather", "resourceUri":"ui://weather/dashboard", "csp":{"connectDomains":["https://ok.test","https://bad.test/; script-src *","*"],"resourceDomains":["https://*.cdn.test:443"]}}});
     for output in [
