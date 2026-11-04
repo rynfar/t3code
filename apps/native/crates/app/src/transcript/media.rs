@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
-use gpui::{AnyElement, App, Context, Div, EntityId, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
+use gpui::{AnyElement, App, Context, Div, EntityId, FontWeight, Hsla, InteractiveElement, IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, hsla as gpui_hsla, img, px, relative};
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::media::{AssetResource, ImageAttachment, MediaKind, MediaPlacement, MediaSource, resolve_media_source};
@@ -178,7 +178,7 @@ pub fn user_media(
     rounded(div().relative().w(px(320.)).max_w_full().bg(edge_color(cx)), corners).child(body).child(ring(corners, cx)).into_any_element()
 }
 
-/// An image paragraph found while parsing markdown.
+/// An authored markdown image, with its enclosing link if present.
 #[derive(Clone, Debug)]
 struct MarkdownImage {
     url: String,
@@ -192,22 +192,23 @@ pub fn media_document(text: Arc<str>) -> MediaDocument {
     Arc::new(std::sync::RwLock::new(Arc::new(t3_core::media::MarkdownMediaDocument::new(text))))
 }
 #[derive(Clone)]
-struct MediaParagraph { start: usize, runs: Vec<t3_core::media::MarkdownMediaRun> }
-fn parse_media_paragraph(node: &mdast::Node, context: &MarkdownParseContext, document: &t3_core::media::MarkdownMediaDocument) -> Option<MarkdownNode> {
+struct MediaBlock { start: usize, heading: Option<u8>, runs: Vec<t3_core::media::MarkdownMediaRun> }
+fn parse_media_block(node: &mdast::Node, context: &MarkdownParseContext, document: &t3_core::media::MarkdownMediaDocument) -> Option<MarkdownNode> {
     let runs = document.runs_at(node, context.offset());
     if runs.is_empty() { return None; }
     let start = context.offset() + node.position()?.start.offset;
-    Some(MarkdownNode::new(MEDIA_NODE, MediaParagraph { start, runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
+    let heading = match node { mdast::Node::Heading(heading) => Some(heading.depth), _ => None };
+    Some(MarkdownNode::new(MEDIA_NODE, MediaBlock { start, heading, runs }).text(node.to_string()).markdown(context.node_source(node).unwrap_or_default().to_owned()))
 }
 
 fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, window: &mut Window, cx: &mut App) -> AnyElement {
     use t3_core::media::MarkdownMediaRun;
-    let Some(paragraph) = node.data::<MediaParagraph>().cloned() else { return div().into_any_element() };
-    let block_id = format!("media-block:{}:{}", window.current_view(), paragraph.start);
-    let standalone = paragraph.runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
-    let children = paragraph.runs.into_iter().enumerate().filter_map(|(index, run)| match run {
+    let Some(block) = node.data::<MediaBlock>().cloned() else { return div().into_any_element() };
+    let block_id = format!("media-block:{}:{}", window.current_view(), block.start);
+    let standalone = block.runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
+    let children = block.runs.into_iter().enumerate().filter_map(|(index, run)| match run {
         MarkdownMediaRun::Prose(text) if text.trim().is_empty() => None,
-        MarkdownMediaRun::Prose(text) => Some(prose_run(format!("{block_id}:prose:{index}"), text, window, cx)),
+        MarkdownMediaRun::Prose(text) => Some(ProseElement { id: format!("{block_id}:prose:{index}").into(), text, heading: block.heading }.into_any_element()),
         MarkdownMediaRun::Image { url, alt, link } => Some(markdown_image(&MarkdownImage { url, alt, link }, index, scope, cx)),
     }).collect::<Vec<_>>();
     let content = if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
@@ -215,7 +216,7 @@ fn render_media_runs(node: &MarkdownNode, scope: Option<&MediaScope>, window: &m
     div().id(SharedString::from(block_id)).child(content).into_any_element()
 }
 
-struct ProseElement { id: SharedString, text: String }
+struct ProseElement { id: SharedString, text: String, heading: Option<u8> }
 impl IntoElement for ProseElement { type Element = Self; fn into_element(self) -> Self { self } }
 impl gpui::Element for ProseElement {
     type RequestLayoutState = AnyElement;
@@ -227,20 +228,24 @@ impl gpui::Element for ProseElement {
         state.update(cx, |state, cx| state.set_text(&self.text, cx));
         #[cfg(feature = "snapshot")]
         crate::snapshot::record_media_prose(&state, &self.text, cx);
-        let mut child = div().min_w_0().child(super::markdown::style_markdown(TextView::new(&state), cx)).into_any_element();
+        let mut child = div().min_w_0().when_some(self.heading, |element, level| {
+            // Match the pinned TextView heading wrapper while keeping image bounds independent.
+            element.text_size(super::markdown::heading_font_size(level)).font_weight(match level {
+                1 => FontWeight::BOLD,
+                6 => FontWeight::MEDIUM,
+                _ => FontWeight::SEMIBOLD,
+            })
+        }).child(super::markdown::style_markdown(TextView::new(&state), cx)).into_any_element();
         (child.request_layout(window, cx), child)
     }
     fn prepaint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, child: &mut AnyElement, window: &mut Window, cx: &mut App) { child.prepaint(window, cx); }
     fn paint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, child: &mut AnyElement, _: &mut (), window: &mut Window, cx: &mut App) { child.paint(window, cx); }
 }
-fn prose_run(id: String, text: String, _: &mut Window, _: &mut App) -> AnyElement {
-    ProseElement { id: id.into(), text }.into_any_element()
-}
 
 pub fn markdown_extensions(document: MediaDocument, scope: Option<Arc<std::sync::Mutex<MediaScope>>>) -> MarkdownExtensions {
     MarkdownExtensions::default().block_parser(move |node, context| {
         let document = document.read().unwrap().clone();
-        parse_media_paragraph(node, context, &document)
+        parse_media_block(node, context, &document)
     }).block_renderer(MEDIA_NODE, move |node: &MarkdownNode, window: &mut Window, cx: &mut App| {
         let scope = scope.as_ref().map(|scope| scope.lock().unwrap().clone())
             .or_else(|| cx.try_global::<media::Media>().and_then(|media| media.scope.clone()));

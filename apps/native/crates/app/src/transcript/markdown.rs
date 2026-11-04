@@ -175,6 +175,10 @@ impl MarkdownStore {
     }
 }
 
+pub(super) fn heading_font_size(level: u8) -> gpui::Pixels {
+    px(match level { 1 => 20., 2 => 18., 3 => 16., _ => 14. })
+}
+
 fn style(cx: &App) -> TextViewStyle {
     let p = palette(cx);
     let theme = cx.theme();
@@ -199,12 +203,7 @@ fn style(cx: &App) -> TextViewStyle {
         is_dark: theme.mode.is_dark(),
         ..TextViewStyle::default()
     }
-    .heading_font_size(|level, _| px(match level {
-        1 => 20.,
-        2 => 18.,
-        3 => 16.,
-        _ => 14.,
-    }))
+    .heading_font_size(|level, _| heading_font_size(level))
 }
 
 /// The prose view: §7.6 rhythm, §7.8 code blocks with a language label and Copy.
