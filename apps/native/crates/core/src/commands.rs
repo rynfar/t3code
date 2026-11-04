@@ -253,13 +253,19 @@ pub fn respond_to_approval(
 }
 
 pub fn respond_to_user_input(command_id: &str, thread_id: &str, request_id: &str, answers: Map<String, Value>) -> Value {
-    json!({
+    respond_to_user_input_with_attachments(command_id, thread_id, request_id, answers, Map::new())
+}
+
+pub fn respond_to_user_input_with_attachments(command_id: &str, thread_id: &str, request_id: &str, answers: Map<String, Value>, attachments: Map<String, Value>) -> Value {
+    let mut command = json!({
         "type": "runtime-request.respond",
         "commandId": command_id,
         "threadId": thread_id,
         "requestId": request_id,
         "answers": answers,
-    })
+    });
+    if !attachments.is_empty() { command["attachmentsByQuestionId"] = Value::Object(attachments); }
+    command
 }
 
 pub fn dismiss_user_input(command_id: &str, thread_id: &str, request_id: &str) -> Value {

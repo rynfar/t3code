@@ -21,6 +21,7 @@ use t3_core::composer::attachments::{
 use t3_core::composer::menu::serialize_file_link;
 
 use super::{Composer, Target};
+use t3_core::requests::attachments::IntakePhase;
 use crate::app_state::uuid_v4;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -39,8 +40,10 @@ pub(super) struct Staged {
 
 #[derive(Default)]
 pub(super) struct Attachments {
-    staged: HashMap<Target, Vec<Staged>>,
+    pub(super) staged: HashMap<Target, Vec<Staged>>,
     attempts: rules::UploadAttempts,
+    pub(super) preparations: t3_core::requests::attachments::Preparations<Vec<Result<Picked, String>>>,
+    pub(super) grant_watch: Option<(u64, Task<()>)>,
     #[cfg(feature = "snapshot")]
     fixture_applied: bool,
 }
@@ -52,7 +55,7 @@ pub(crate) struct Fixture(pub serde_json::Value);
 impl gpui::Global for Fixture {}
 
 /// A file read for staging.
-struct Picked {
+pub(super) struct Picked {
     name: String,
     bytes: Vec<u8>,
 }
@@ -71,7 +74,7 @@ impl Composer {
         if self.editing_queued().is_some() {
             return &[];
         }
-        self.snapshot.target.as_ref().map(|target| self.staged_for(target)).unwrap_or_default()
+        self.attachment_target().as_ref().map(|target| self.staged_for(target)).unwrap_or_default()
     }
 
     pub(super) fn staged_for(&self, target: &Target) -> &[Staged] {
@@ -106,25 +109,33 @@ impl Composer {
         rules::file_staging_limit(config.environment.capabilities.file_attachments.map(|files| files.max_upload_bytes))
     }
 
-    /// Attachments go with a message, not with an answer to the agent's question.
-    fn can_attach(&self) -> bool {
-        self.snapshot.target.is_some()
-            && self.answering.is_none()
-            && self.snapshot.pending.user_inputs.is_empty()
-            && self.editing_queued().is_none()
+    pub(super) fn attachment_target(&self) -> Option<Target> {
+        if let Some((request, question)) = self.active_question() {
+            return self.question_target(&request, &question.id);
+        }
+        self.snapshot.target.clone()
+    }
+
+    fn can_attach(&self, cx: &App) -> bool {
+        if self.editing_queued().is_some() { return false; }
+        if let Some(Target::Question(key)) = self.attachment_target() { return self.question_can_attach(&key, cx, IntakePhase::Start); }
+        self.snapshot.target.is_some() && self.snapshot.pending.user_inputs.is_empty()
     }
 
     /// `showComposerAttachAction`.
     pub(super) fn shows_attach_button(&self, cx: &App) -> bool {
-        self.can_attach() && self.file_limit(cx).is_some()
+        self.can_attach(cx) && self.file_limit(cx).is_some()
     }
 
     /// The paperclip: a file dialog for any number of files.
     pub(super) fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_attach(cx) { return; }
+        let target = self.attachment_target();
         let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.attachment_target() != target { return; }
                 this.attach_paths(paths, window, cx);
                 this.focus(window, cx);
             });
@@ -135,7 +146,7 @@ impl Composer {
     /// Files dropped, pasted from Finder, or picked. Folders become mentions when the server
     /// runs on this machine, as the web's `addComposerFolders` allows.
     pub(super) fn attach_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_attach() {
+        if !self.can_attach(cx) {
             return;
         }
         let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|path| path.is_dir());
@@ -154,7 +165,11 @@ impl Composer {
         if files.is_empty() {
             return;
         }
-        let Some(target) = self.snapshot.target.clone() else { return };
+        let Some(target) = self.attachment_target() else { return };
+        let storage_key = super::drafts::key(&target);
+        let preparation = self.attachments.preparations.begin(&storage_key);
+        self.cancel_pending_send();
+        cx.notify();
         let read = cx.background_executor().spawn(async move {
             files
                 .into_iter()
@@ -167,26 +182,46 @@ impl Composer {
         cx.spawn(async move |this, cx| {
             let picked = read.await;
             let _ = this.update(cx, |this, cx| {
-                for file in picked {
-                    match file {
-                        Ok(file) => this.stage(&target, file.name, file.bytes, false, cx),
-                        Err(error) => this.error = Some(error),
-                    }
-                }
+                if !this.attachments.preparations.complete(&storage_key, preparation, picked) { return; }
+                this.finish_prepared_reads(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    pub(super) fn finish_prepared_reads(&mut self, cx: &mut Context<Self>) -> bool {
+        let keys: Vec<_> = self.attachments.preparations.keys().cloned().collect();
+        let mut changed = false;
+        for key in keys {
+            let Some(target) = super::drafts::target(&key) else { continue };
+            let eligible = match &target {
+                Target::Question(question) => self.question_can_attach(question, cx, IntakePhase::Preparing),
+                _ => true,
+            };
+            for picked in self.attachments.preparations.take_completed(&key, eligible) {
+                changed = true;
+                for file in picked {
+                    match file {
+                        Ok(file) => self.stage(&target, file.name, file.bytes, false, cx),
+                        Err(error) if self.attachment_target().as_ref() == Some(&target) => self.error = Some(error),
+                        Err(_) => {},
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Admits one file (`addComposerAttachments`) and starts its upload.
     fn stage(&mut self, target: &Target, name: String, bytes: Vec<u8>, pasted_text: bool, cx: &mut Context<Self>) {
-        if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
+        if let Target::Question(key) = target && !self.question_can_attach(key, cx, IntakePhase::Preparing) { return; }
+        if self.attachment_target().as_ref() == Some(target) { self.cancel_pending_send(); }
         let classified = if pasted_text { Classified::File { mime_type: "text/plain;charset=utf-8".to_owned() } } else { rules::classify(&name) };
-        let staged = self.attachments.staged.get(target).map_or(0, Vec::len);
+        let staged = self.reserved_attachment_count(target);
         let size = bytes.len() as u64;
         if let Some(error) = rules::admission_error(staged, &name, &classified, size, self.file_limit(cx)) {
-            self.error = Some(error);
+            if self.attachment_target().as_ref() == Some(target) { self.error = Some(error); }
             return;
         }
         let (kind, mime_type) = match classified {
@@ -280,8 +315,9 @@ impl Composer {
     }
 
     pub(super) fn retry_upload(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.can_attach(cx) { return; }
         self.cancel_pending_send();
-        if let Some(target) = self.snapshot.target.clone() {
+        if let Some(target) = self.attachment_target() {
             self.start_upload(target, id, cx);
             cx.notify();
         }
@@ -289,7 +325,8 @@ impl Composer {
 
     /// Removes a tile. An uploaded file the message never carried is deleted on the server.
     pub(super) fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(target) = self.snapshot.target.clone() else { return };
+        if self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
+        let Some(target) = self.attachment_target() else { return };
         let Some(staged) = self.attachments.staged.get_mut(&target) else { return };
         let Some(index) = staged.iter().position(|staged| staged.attachment.id == id) else { return };
         let removed = staged.remove(index);
@@ -298,7 +335,7 @@ impl Composer {
         if let Some(attachment_id) = removed.attachment.attachment_id() {
             self.release_upload(attachment_id, cx);
         }
-        self.draft_changed(cx);
+        self.record_draft(&target, cx);
         cx.notify();
     }
 
@@ -319,13 +356,13 @@ impl Composer {
     /// the paste was handled, so plain text still reaches the prompt.
     pub(super) fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(item) = cx.read_from_clipboard() else { return false };
-        if !self.can_attach() {
+        if !self.can_attach(cx) {
             return false;
         }
-        let Some(target) = self.snapshot.target.clone() else { return false };
-        if let (Some(text), Some(fragment)) = (item.text(), item.metadata())
+        let Some(target) = self.attachment_target() else { return false };
+        if !matches!(target, Target::Question(_)) && let (Some(text), Some(fragment)) = (item.text(), item.metadata())
             && self.paste_context(&text, fragment, window, cx) { return true; }
-        if let (Some(text), Some(fragment)) = (item.text(), super::clipboard::read_html_fragment())
+        if !matches!(target, Target::Question(_)) && let (Some(text), Some(fragment)) = (item.text(), super::clipboard::read_html_fragment())
             && self.paste_context(&text, &fragment, window, cx) { return true; }
         for entry in item.entries() {
             match entry {
@@ -347,6 +384,7 @@ impl Composer {
             }
         }
         let Some(text) = item.text() else { return false };
+        if self.active_question().is_some_and(|(_, question)| question.initial_answer.is_some()) { return false; }
         self.fold_paste(&target, text, cx)
     }
 
@@ -357,7 +395,7 @@ impl Composer {
         if !rules::folds_into_file(&text, false, exceeds) {
             return false;
         }
-        let staged = self.attachments.staged.get(target).map_or(0, Vec::len);
+        let staged = self.reserved_attachment_count(target);
         let limit = self.file_limit(cx).filter(|_| staged < rules::MAX_ATTACHMENTS);
         let toast = |state: &mut crate::app_state::AppState, title: &str, description: &str, cx: &mut Context<crate::app_state::AppState>| {
             state.show_toast(Toast::new(ToastKind::Error, title.to_owned()).description(description.to_owned()), cx)
@@ -392,6 +430,7 @@ impl Composer {
 
     /// ⌘⇧V: the clipboard's text goes into the prompt as is, however large.
     pub(super) fn paste_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_question().is_some_and(|(request, question)| !question.allows_custom_answer() || self.question_responding(&request, cx)) { return; }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
         self.input.update(cx, |input, cx| input.insert(text, window, cx));
     }
@@ -409,7 +448,8 @@ impl Composer {
     /// `ComposerAttachmentMediaRow` and `ComposerAttachmentFileList`.
     pub(super) fn render_attachments(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let staged = self.staged();
-        if staged.is_empty() {
+        let preparing = self.attachment_target().is_some_and(|target| self.attachments.preparations.count(&super::drafts::key(&target)) > 0);
+        if staged.is_empty() && !preparing {
             return None;
         }
         let p = palette(cx);
@@ -512,7 +552,7 @@ impl Composer {
                     )
             }))
         });
-        Some(gpui_component::v_flex().children(tiles).children(rows).into_any_element())
+        Some(gpui_component::v_flex().children(tiles).children(rows).when(preparing, |this| this.child(div().mb(px(12.)).text_xs().text_color(hsla(p.muted_foreground)).child("Preparing attachments…"))).into_any_element())
     }
 
     /// Drop target for files from Finder.

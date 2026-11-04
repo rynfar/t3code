@@ -120,7 +120,7 @@ impl Composer {
         match self.snapshot.target.clone() {
             Some(Target::Draft(project_id)) => self.launch(project_id, outgoing, intent, window, cx),
             Some(Target::Thread(thread_id)) => self.send(thread_id, outgoing, intent, window, cx),
-            None => {}
+            _ => {}
         }
     }
 

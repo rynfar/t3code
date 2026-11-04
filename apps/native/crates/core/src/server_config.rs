@@ -499,6 +499,8 @@ pub struct EnvironmentCapabilities {
     #[serde(default, deserialize_with = "lenient_option")]
     pub file_attachments: Option<FileAttachmentsCapability>,
     #[serde(default)]
+    pub question_attachments: Option<bool>,
+    #[serde(default)]
     pub thread_auto_settlement_scope: Option<bool>,
     #[serde(default)]
     pub thread_stop: Option<bool>,

@@ -3,6 +3,8 @@
 //! `client-runtime/src/state/threadRequests.ts`, the answer drafting in
 //! `client-runtime/src/state/pendingUserInput.ts`, and the progress in `web/src/pendingUserInput.ts`.
 
+pub mod attachments;
+
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -260,12 +262,14 @@ pub fn pending_requests(projection: &ThreadProjection) -> PendingRequests {
     pending
 }
 
-/// `PendingUserInputDraftAnswer` without attachments. `custom` keeps "typed nothing" (`Some("")`)
+/// `PendingUserInputDraftAnswer`. `custom` keeps "typed nothing" (`Some("")`)
 /// apart from "never typed" (`None`), which matters for questions with a suggested answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DraftAnswer {
     pub selected: Vec<String>,
     pub custom: Option<String>,
+    pub attachment_count: usize,
+    pub attachments_blocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +315,7 @@ fn trimmed_custom(draft: Option<&DraftAnswer>) -> Option<String> {
 
 /// `resolvePendingUserInputAnswer`: the answer to submit, or `None` while unanswered.
 pub fn resolve_answer(question: &Question, draft: Option<&DraftAnswer>) -> Option<Answer> {
+    if draft.is_some_and(|draft| draft.attachments_blocked) { return None; }
     let custom = if !question.allows_custom_answer() {
         None
     } else if question.initial_answer.is_some() {
@@ -321,6 +326,7 @@ pub fn resolve_answer(question: &Question, draft: Option<&DraftAnswer>) -> Optio
     if let Some(custom) = custom.as_ref().filter(|custom| !custom.is_empty()) {
         return Some(Answer::Text(custom.clone()));
     }
+    let custom = custom.or_else(|| (question.allows_custom_answer() && draft.is_some_and(|draft| draft.attachment_count > 0)).then(String::new));
     let selected = selected_values(question, draft);
     if question.multi_select {
         return if selected.is_empty() { custom.map(Answer::Text) } else { Some(Answer::Choices(selected)) };
@@ -337,6 +343,7 @@ pub fn set_custom_answer(question: &Question, draft: Option<&DraftAnswer>, text:
     DraftAnswer {
         custom: Some(text.to_owned()),
         selected: if keep_selection { selected_values(question, draft) } else { Vec::new() },
+        ..Default::default()
     }
 }
 
@@ -352,7 +359,7 @@ pub fn is_option_selected(question: &Question, draft: Option<&DraftAnswer>, valu
 pub fn toggle_option(question: &Question, draft: Option<&DraftAnswer>, value: &str) -> DraftAnswer {
     let Some(value) = resolve_option_value(question, value) else { return draft.cloned().unwrap_or_default() };
     if !question.multi_select {
-        return DraftAnswer { custom: Some(String::new()), selected: vec![value] };
+        return DraftAnswer { custom: Some(String::new()), selected: vec![value], ..Default::default() };
     }
     let mut selected = selected_values(question, draft);
     match selected.iter().position(|existing| *existing == value) {
@@ -361,7 +368,7 @@ pub fn toggle_option(question: &Question, draft: Option<&DraftAnswer>, value: &s
         }
         None => selected.push(value),
     }
-    DraftAnswer { custom: Some(String::new()), selected }
+    DraftAnswer { custom: Some(String::new()), selected, ..Default::default() }
 }
 
 /// `seedUserInputDraftAnswers`: suggested answers show until the user edits them.
@@ -372,7 +379,7 @@ pub fn seed_drafts(questions: &[Question], drafts: &mut HashMap<String, DraftAns
         {
             drafts
                 .entry(question.id.clone())
-                .or_insert_with(|| DraftAnswer { custom: Some(initial.clone()), selected: Vec::new() });
+                .or_insert_with(|| DraftAnswer { custom: Some(initial.clone()), ..Default::default() });
         }
     }
 }

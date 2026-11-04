@@ -25,7 +25,7 @@ fn snapshot(settings: Value) -> ServerConfigStreamEvent {
         "version": 1, "type": "snapshot",
         "config": {
             "environment": {"environmentId": "e1", "label": "Mac", "serverVersion": "0.1.0",
-                            "platform": {"os": "darwin"}, "capabilities": {"threadStop": true}},
+                            "platform": {"os": "darwin"}, "capabilities": {"threadStop": true, "questionAttachments": true}},
             "auth": {}, "cwd": "/w", "keybindingsConfigPath": "/k.json",
             "keybindings": [{"key": "mod+n", "command": "chat.new"}], "issues": [],
             "providers": [provider("devReplay", "acp"), {"instanceId": "half"}],
@@ -41,6 +41,8 @@ fn snapshot_decodes_providers_and_drops_what_it_cannot_read() {
     assert!(state.apply(snapshot(json!({}))));
     let config = state.config.as_ref().unwrap();
     assert!(config.environment.capabilities.thread_stop == Some(true));
+    assert_eq!(config.environment.capabilities.question_attachments, Some(true));
+    assert_eq!(serde_json::from_value::<EnvironmentCapabilities>(json!({})).unwrap().question_attachments, None);
     assert_eq!(config.providers.len(), 1);
     let provider = &config.providers[0];
     assert_eq!(provider.supported_runtime_modes, Some(vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess]));

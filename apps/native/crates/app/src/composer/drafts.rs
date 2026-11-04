@@ -22,13 +22,15 @@ pub(super) fn key(target: &Target) -> String {
     match target {
         Target::Thread(id) => rules::thread_key(id),
         Target::Draft(project) => rules::new_thread_key(project),
+        Target::Question(key) => key.storage_key(),
     }
 }
 
-fn target(key: &str) -> Option<Target> {
+pub(super) fn target(key: &str) -> Option<Target> {
     key.strip_prefix("thread:")
         .map(|id| Target::Thread(id.to_owned()))
         .or_else(|| key.strip_prefix("draft:").map(|project| Target::Draft(project.to_owned())))
+        .or_else(|| t3_core::requests::attachments::QuestionDraftKey::parse(key).map(Target::Question))
 }
 
 impl Composer {

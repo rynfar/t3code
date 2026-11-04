@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] [--composer-recovery-fixture] [--workspace-availability-fixture] [--composer-audit <json>] \
+[--question-request-fixture <json>] [--question-staged-fixture <json>] [--question-command-output <json>] [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] [--composer-recovery-fixture] [--workspace-availability-fixture] [--composer-audit <json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-profile-prefix <path>] [--media-select-all] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--document-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -574,6 +574,25 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let path = fixture.path.clone();
         cx.update(|cx| cx.set_global(fixture));
         state.update(&mut cx, |state, cx| state.open_file(&path, None, cx));
+    }
+    if let Some(path) = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--question-request-fixture").map(|pair| pair[1].clone()) {
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        state.update(&mut cx, |state, cx| {
+            state.freeze_snapshot();
+            if let Some(supports) = fixture["questionAttachments"].as_bool() && let Some(config) = state.server_config.config.as_mut() { config.environment.capabilities.question_attachments = Some(supports); }
+            if let Some(projection) = state.thread.projection.as_mut() {
+                projection.runtime_requests = serde_json::from_value(fixture["runtimeRequests"].clone()).expect("fixture requests");
+                projection.turn_items = serde_json::from_value(fixture["turnItems"].clone()).expect("fixture items");
+                cx.emit(crate::app_state::AppEvent::Thread);
+            }
+        });
+    }
+    if let Some(path) = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--question-command-output").map(|pair| pair[1].clone()) {
+        cx.update(|cx| cx.set_global(crate::composer::QuestionCommandSpy { output:PathBuf::from(path), count:Default::default() }));
+    }
+    if let Some(path) = std::env::args().collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--question-staged-fixture").map(|pair| pair[1].clone()) {
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        cx.update(|cx| crate::composer::snapshot_composer(cx).update(cx, |composer, cx| composer.seed_question_fixture(&fixture, cx)));
     }
     if let Some(path) = &options.turn_items_fixture {
         let items: Vec<t3_core::thread::ProjectedTurnItem> = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;

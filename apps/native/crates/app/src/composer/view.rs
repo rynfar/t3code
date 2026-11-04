@@ -53,7 +53,7 @@ impl Composer {
     pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placeholder = self.placeholder();
         let disabled = self.active_question().is_some_and(|(request_id, question)| {
-            !question.allows_custom_answer() || self.responding.contains(&request_id)
+            !question.allows_custom_answer() || self.question_responding(&request_id, cx)
         });
         if self.input_state == Some((placeholder, disabled)) {
             return;
@@ -181,8 +181,8 @@ impl Composer {
                     })
                 }))
         };
-        if let (Some(input), Some(progress)) = (self.active_input(), self.progress()) {
-            let responding = self.responding.contains(&input.request_id) || !input.can_respond();
+        if let (Some(input), Some(progress)) = (self.active_input(), self.progress(cx)) {
+            let responding = self.question_responding(&input.request_id, cx) || !input.can_respond();
             let enabled = if progress.is_last_question { progress.is_complete } else { progress.can_advance };
             return h_flex()
                 .gap(px(8.))
