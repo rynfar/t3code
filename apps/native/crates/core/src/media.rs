@@ -3,6 +3,10 @@
 //! `AssetResource` that `assets.createUrl` signs. Ports `client-runtime/src/markdownImages.ts`,
 //! `mediaSource.ts`, `mediaReference.ts`, the attachment
 //! predicates in `apps/web/src/types.ts` and the media placement of `TimelineUserMessageRow.tsx`.
+//! Revision tracking ports `state/assets.ts` and `state/threadDetail.ts` in client-runtime.
+
+mod revision;
+pub use revision::RevisionedAssetUrl;
 
 use serde_json::{Value, json};
 
@@ -57,16 +61,33 @@ pub enum MediaSource {
 }
 
 /// `AssetCreateUrlResult`, reduced to what the client loads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AssetUrl {
     pub relative_url: String,
     pub dimensions: Option<(u32, u32)>,
+    pub expires_at: f64,
+    pub file_revision: Option<String>,
+}
+
+/// Re-signing a URL does not change decoded pixels when the file revision is known.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AssetContentKey {
+    FileRevision(String),
+    Url(String),
+}
+
+impl AssetUrl {
+    pub fn content_key(&self) -> AssetContentKey {
+        self.file_revision.as_ref().map(|revision| AssetContentKey::FileRevision(revision.clone())).unwrap_or_else(|| AssetContentKey::Url(self.relative_url.clone()))
+    }
 }
 
 pub fn decode_asset_url(value: &Value) -> Result<AssetUrl, String> {
     let relative_url = value.get("relativeUrl").and_then(Value::as_str).filter(|url| !url.trim().is_empty()).ok_or("The server sent an asset without a URL.")?;
     let dimension = |key: &str| value.get("imageDimensions")?.get(key)?.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
-    Ok(AssetUrl { relative_url: relative_url.to_owned(), dimensions: dimension("width").zip(dimension("height")) })
+    let expires_at = value.get("expiresAt").and_then(Value::as_f64).unwrap_or_default();
+    let file_revision = value.get("fileRevision").and_then(Value::as_str).map(str::trim).filter(|revision| !revision.is_empty() && revision.encode_utf16().count() <= 256).map(str::to_owned);
+    Ok(AssetUrl { relative_url: relative_url.to_owned(), dimensions: dimension("width").zip(dimension("height")), expires_at, file_revision })
 }
 
 /// One image attachment of a user message (`ChatImageAttachment`, or a legacy image file).
@@ -398,6 +419,14 @@ pub fn fit_within(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
     let scale = f64::from(max_edge) / f64::from(longest);
     let scaled = |edge: u32| ((f64::from(edge) * scale).round() as u32).clamp(1, max_edge);
     (scaled(width), scaled(height))
+}
+
+/// `threadDetail.ts::workspaceMutationIdAtom`: checkpoints are in projection order.
+pub fn workspace_mutation_id(projection: &crate::thread::ThreadProjection) -> Option<String> {
+    let checkpoint = projection.checkpoints.iter().rev().find(|checkpoint| {
+        checkpoint.value.get("appRunOrdinal").is_some_and(Value::is_number) && checkpoint.value.get("runId").is_some_and(Value::is_string)
+    }).and_then(|checkpoint| checkpoint.value.get("capturedAt")).and_then(Value::as_str);
+    crate::diff::workspace_mutation_id(projection.visible_turn_items.iter().map(|row| row.item.as_ref()), checkpoint)
 }
 
 #[cfg(test)]

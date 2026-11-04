@@ -268,7 +268,7 @@ pub fn tool_output_image(id: SharedString, source: MediaSource, alt: &str, cx: &
 /// border. A 16:9 frame holds its place until the size is known.
 fn framed_image(id: SharedString, source: MediaSource, name: SharedString, alt: &str, max_height: f32, scope: &MediaScope, cx: &mut App) -> AnyElement {
     let p = palette(cx);
-    let state = media::image(&source, Variant::Thumb, scope.owner, cx);
+    let state = media::scoped_image(&source, Variant::Thumb, scope, cx);
     if let ImageState::Failed(_) = state {
         return unavailable("Image unavailable", alt, cx);
     }

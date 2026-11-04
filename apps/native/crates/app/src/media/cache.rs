@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Entity, EntityId, RenderImage, SharedString, Task, Window};
-use t3_core::media::{AssetResource, CREATE_ASSET_URL, MediaSource, decode_asset_url};
+use t3_core::media::{AssetContentKey, AssetResource, CREATE_ASSET_URL, MediaSource, decode_asset_url};
 
 use crate::app_state::AppState;
 
 use super::decode::{self, Decoded};
+use super::revisions::Revisions;
 
 /// Decoded pixels kept across frames before offscreen images are dropped.
 const DECODED_BUDGET: usize = 160 * 1024 * 1024;
@@ -22,7 +23,7 @@ const ENCODED_BUDGET: usize = 64 * 1024 * 1024;
 /// Frames an image survives undrawn before it may be evicted.
 const KEEP_FRAMES: u64 = 2;
 /// A failed load is shown until then, and retried the next time it is drawn after.
-const RETRY_AFTER: Duration = Duration::from_secs(30);
+pub(super) const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// How large an image decodes: thumbnails for the transcript, full size for the viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,9 +43,10 @@ impl Variant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key {
-    environment: Arc<str>,
-    source: MediaSource,
+pub(super) struct Key {
+    pub(super) environment: Arc<str>,
+    pub(super) source: MediaSource,
+    content: Option<AssetContentKey>,
 }
 
 enum Slot {
@@ -68,7 +70,8 @@ struct Encoded {
 }
 
 pub struct MediaCache {
-    state: Entity<AppState>,
+    pub(super) state: Entity<AppState>,
+    pub(super) revisions: Revisions,
     images: HashMap<(Key, Variant), Slot>,
     encoded: HashMap<Key, Encoded>,
     encoded_total: usize,
@@ -77,14 +80,15 @@ pub struct MediaCache {
     /// before its pixels arrive.
     dimensions: HashMap<Key, (u32, u32)>,
     pinned: HashSet<(Key, Variant)>,
-    frame: u64,
-    permits: Arc<tokio::sync::Semaphore>,
+    pub(super) frame: u64,
+    pub(super) permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl MediaCache {
     pub fn new(state: Entity<AppState>) -> Self {
         MediaCache {
             state,
+            revisions: Revisions::default(),
             images: HashMap::new(),
             encoded: HashMap::new(),
             encoded_total: 0,
@@ -98,12 +102,20 @@ impl MediaCache {
 
     fn key(&self, source: &MediaSource, cx: &App) -> Option<Key> {
         let environment = self.state.read(cx).environment()?;
-        Some(Key { environment: Arc::from(environment), source: source.clone() })
+        let mut key = Key { environment: Arc::from(environment), source: source.clone(), content: None };
+        if matches!(source, MediaSource::Asset(AssetResource::MediaFile { .. })) {
+            key.content = Some(self.revisions.shown_asset(&key)?.ok()?.content_key());
+        }
+        Some(key)
     }
 
     /// The image for `source`, loading it on first ask. `owner` is the view drawing it, notified
     /// when it arrives.
-    pub fn image(&mut self, source: &MediaSource, variant: Variant, owner: EntityId, cx: &mut Context<Self>) -> ImageState {
+    pub fn image(&mut self, source: &MediaSource, variant: Variant, owner: EntityId, revision: Option<&str>, cx: &mut Context<Self>) -> ImageState {
+        let Some(environment) = self.state.read(cx).environment() else { return ImageState::Loading };
+        let resource_key = Key { environment: Arc::from(environment), source: source.clone(), content: None };
+        self.refresh_asset(&resource_key, revision, owner, cx);
+        if let Some(Err(message)) = self.revisions.shown_url(&resource_key) { return ImageState::Failed(message.to_owned().into()); }
         let Some(key) = self.key(source, cx) else { return ImageState::Loading };
         let slot_key = (key, variant);
         match self.images.get_mut(&slot_key) {
@@ -120,6 +132,7 @@ impl MediaCache {
             Some(Slot::Failed { message, at }) if at.elapsed() < RETRY_AFTER => return ImageState::Failed(message.clone()),
             _ => {}
         }
+        if self.images.len() >= 1024 { return ImageState::Loading; }
         let Some(task) = self.load(slot_key.clone(), cx) else { return ImageState::Loading };
         self.images.insert(slot_key, Slot::Loading { waiters: vec![owner], _task: task });
         ImageState::Loading
@@ -165,13 +178,18 @@ impl MediaCache {
             encoded.bytes.clone()
         });
         let (permits, svg, source, max_edge) = (self.permits.clone(), cx.svg_renderer(), key.source.clone(), variant.max_edge());
+        let resource_key = Key { content: None, ..key.clone() };
+        let asset_url = self.revisions.shown_asset(&resource_key).and_then(Result::ok).map(|asset| asset.relative_url.clone());
         let job = runtime.spawn(async move {
             // Held through the decode as well, so a burst of large images is never all in memory.
             let _permit = permits.acquire_owned().await.map_err(|_| "Image unavailable.".to_owned())?;
             let (bytes, dimensions) = match cached {
                 Some(bytes) => (bytes, None),
                 None => {
-                    let fetched = t3_client::assets::fetch_media(&client, &source).await?;
+                    let fetched = match asset_url {
+                        Some(url) => t3_client::assets::fetch_signed_media(&client, &url).await?,
+                        None => t3_client::assets::fetch_media(&client, &source).await?,
+                    };
                     (Arc::<[u8]>::from(fetched.bytes), fetched.dimensions)
                 }
             };
@@ -214,7 +232,7 @@ impl MediaCache {
             self.encoded_total -= old.bytes.len();
         }
         self.encoded_total += bytes.len();
-        while self.encoded_total > ENCODED_BUDGET {
+        while self.encoded_total > ENCODED_BUDGET || self.encoded.len() > 512 {
             let Some(oldest) = self.encoded.iter().min_by_key(|(_, encoded)| encoded.used).map(|(key, _)| key.clone()) else { break };
             if let Some(evicted) = self.encoded.remove(&oldest) {
                 self.encoded_total -= evicted.bytes.len();
@@ -226,7 +244,12 @@ impl MediaCache {
     /// frames did not draw, oldest first, freeing the atlas tiles with it.
     pub fn begin_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.frame += 1;
-        if self.decoded_total <= DECODED_BUDGET {
+        self.images.retain(|_, slot| !matches!(slot, Slot::Failed { at, .. } if at.elapsed() >= RETRY_AFTER));
+        if self.dimensions.len() > 1536 {
+            let live: HashSet<_> = self.encoded.keys().chain(self.images.keys().map(|(key, _)| key)).collect();
+            self.dimensions.retain(|key, _| live.contains(key));
+        }
+        if self.decoded_total <= DECODED_BUDGET && self.images.len() < 1024 {
             return;
         }
         let frame = self.frame;
@@ -241,7 +264,7 @@ impl MediaCache {
             .collect();
         stale.sort_by_key(|(drawn, _)| *drawn);
         for (_, key) in stale {
-            if self.decoded_total <= DECODED_BUDGET {
+            if self.decoded_total <= DECODED_BUDGET && self.images.len() < 1024 {
                 break;
             }
             if let Some(Slot::Ready { image, bytes, .. }) = self.images.remove(&key) {

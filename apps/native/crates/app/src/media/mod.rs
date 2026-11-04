@@ -3,6 +3,7 @@
 
 mod cache;
 mod decode;
+mod revisions;
 mod viewer;
 
 use gpui::{App, AppContext, Entity, EntityId, Global, WeakEntity};
@@ -20,6 +21,7 @@ pub struct MediaScope {
     pub owner: EntityId,
     pub thread_id: Option<String>,
     pub workspace_root: Option<String>,
+    pub workspace_mutation_id: Option<String>,
     pub viewer: WeakEntity<MediaViewer>,
 }
 
@@ -43,20 +45,36 @@ pub fn cache(state: &Entity<AppState>, cx: &mut App) -> Entity<MediaCache> {
 pub fn set_scope(scope: MediaScope, cx: &mut App) {
     if let Some(media) = cx.try_global::<Media>()
         && media.scope.as_ref().is_some_and(|current| {
-            current.owner == scope.owner && current.thread_id == scope.thread_id && current.workspace_root == scope.workspace_root
+            current.owner == scope.owner && current.thread_id == scope.thread_id && current.workspace_root == scope.workspace_root && current.workspace_mutation_id == scope.workspace_mutation_id
         })
     {
         return;
     }
     if cx.has_global::<Media>() {
-        cx.global_mut::<Media>().scope = Some(scope);
+        let cache = cx.global::<Media>().cache.clone();
+        cx.global_mut::<Media>().scope = Some(scope.clone());
+        cache.update(cx, |cache, cx| cache.refresh_scope(&scope, cx));
     }
 }
 
 /// The image for `source`, as drawn by `owner`.
 pub fn image(source: &MediaSource, variant: Variant, owner: EntityId, cx: &mut App) -> ImageState {
     let Some(cache) = cx.try_global::<Media>().map(|media| media.cache.clone()) else { return ImageState::Loading };
-    cache.update(cx, |cache, cx| cache.image(source, variant, owner, cx))
+    let scope = cx.try_global::<Media>().and_then(|media| media.scope.as_ref());
+    let revision = scope.and_then(|scope| revision_for(source, scope)).map(str::to_owned);
+    cache.update(cx, |cache, cx| cache.image(source, variant, owner, revision.as_deref(), cx))
+}
+
+fn revision_for<'a>(source: &MediaSource, scope: &'a MediaScope) -> Option<&'a str> {
+    match source {
+        MediaSource::Asset(AssetResource::MediaFile { thread_id, .. }) if Some(thread_id) == scope.thread_id.as_ref() => scope.workspace_mutation_id.as_deref(),
+        _ => None,
+    }
+}
+
+pub fn scoped_image(source: &MediaSource, variant: Variant, scope: &MediaScope, cx: &mut App) -> ImageState {
+    let Some(cache) = cx.try_global::<Media>().map(|media| media.cache.clone()) else { return ImageState::Loading };
+    cache.update(cx, |cache, cx| cache.image(source, variant, scope.owner, revision_for(source, scope), cx))
 }
 
 pub fn dimensions(source: &MediaSource, cx: &App) -> Option<(u32, u32)> {

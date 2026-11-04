@@ -452,6 +452,8 @@ fn tool_item(id: &str, kind: &str, status: &str) -> crate::turn_item::TurnItem {
     let body = match kind {
         "command_execution" => json!({ "input": "ls" }),
         "file_change" => json!({ "fileName": "a.rs" }),
+        "dynamic_tool" => json!({ "toolName": "mcp", "input": {} }),
+        "subagent" => json!({ "subagentId": "sub" }),
         _ => json!({ "text": "hi", "messageId": "msg", "streaming": false }),
     };
     let mut value = json!({ "id": id, "threadId": "t", "runId": "r", "nodeId": null, "parentItemId": null,
@@ -475,6 +477,20 @@ fn workspace_mutation_id_tracks_finished_file_tools_and_checkpoints() {
     assert_ne!(workspace_mutation_id(done.iter(), None), Some(id.clone()));
     assert_ne!(workspace_mutation_id(items.iter(), Some("2026-01-01T00:00:00Z")), Some(id));
     assert_eq!(workspace_mutation_id(items[2..].iter(), None), None);
+    let checkpoint = "2026-01-01T00:00:00.000Z";
+    let upstream = [tool_item("edit", "file_change", "completed"), tool_item("reply", "assistant_message", "completed"), tool_item("command", "command_execution", "running")];
+    assert_eq!(workspace_mutation_id(upstream.iter(), Some(checkpoint)), Some(json!(["edit", checkpoint]).to_string()));
+    for kind in ["command_execution", "file_change", "dynamic_tool", "subagent"] {
+        for status in ["completed", "failed", "cancelled"] {
+            let finished = [tool_item("edit", "file_change", "completed"), tool_item("latest", kind, status)];
+            assert_eq!(workspace_mutation_id(finished.iter(), None), Some(json!(["latest", null]).to_string()), "{kind}/{status}");
+        }
+        for status in ["pending", "running", "waiting"] {
+            let unfinished = [tool_item("edit", "file_change", "completed"), tool_item("latest", kind, status)];
+            assert_eq!(workspace_mutation_id(unfinished.iter(), None), Some(json!(["edit", null]).to_string()), "{kind}/{status}");
+        }
+    }
+    assert_eq!(workspace_mutation_id([].iter(), Some(checkpoint)), Some(json!([null, checkpoint]).to_string()));
 }
 
 fn file_change(file_name: &str, diff_str: Option<&str>, changes: &[(&str, &str, Option<&str>)]) -> crate::turn_item::TurnItemKind {

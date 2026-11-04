@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use t3_core::media::{AssetUrl, MediaSource, decode_asset_url, decode_data_url};
+use t3_core::media::{AssetResource, AssetUrl, MediaSource, decode_asset_url, decode_data_url};
 
 use crate::supervisor::ClientHandle;
 
@@ -27,18 +27,29 @@ pub async fn fetch_media(client: &ClientHandle, source: &MediaSource) -> Result<
         }
         MediaSource::Direct(uri) => Ok(MediaBytes { bytes: get(uri).await?, dimensions: None }),
         MediaSource::Asset(resource) => {
-            let minted = client.request(t3_core::media::CREATE_ASSET_URL, resource.create_url_request()).await.map_err(|error| {
-                tracing::debug!(%error, "assets.createUrl failed");
-                UNAVAILABLE.to_owned()
-            })?;
-            let AssetUrl { relative_url, dimensions } = decode_asset_url(&minted)?;
-            let bytes = crate::asset::fetch_asset(client.environment(), &relative_url, MAX_BYTES).await.map_err(|error| {
-                tracing::debug!(%error, "asset fetch failed");
-                UNAVAILABLE.to_owned()
-            })?;
-            Ok(MediaBytes { bytes, dimensions })
+            let minted = mint_media_url(client, resource).await?;
+            let mut media = fetch_signed_media(client, &minted.relative_url).await?;
+            media.dimensions = minted.dimensions;
+            Ok(media)
         }
     }
+}
+
+/// The mint and fetch are separate so an unchanged file keeps its already decoded image.
+pub async fn mint_media_url(client: &ClientHandle, resource: &AssetResource) -> Result<AssetUrl, String> {
+    let minted = client.request(t3_core::media::CREATE_ASSET_URL, resource.create_url_request()).await.map_err(|error| {
+        tracing::debug!(%error, "assets.createUrl failed");
+        UNAVAILABLE.to_owned()
+    })?;
+    decode_asset_url(&minted)
+}
+
+pub async fn fetch_signed_media(client: &ClientHandle, relative_url: &str) -> Result<MediaBytes, String> {
+    let bytes = crate::asset::fetch_asset(client.environment(), relative_url, MAX_BYTES).await.map_err(|error| {
+        tracing::debug!(%error, "asset fetch failed");
+        UNAVAILABLE.to_owned()
+    })?;
+    Ok(MediaBytes { bytes, dimensions: None })
 }
 
 async fn get(url: &str) -> Result<Vec<u8>, String> {
