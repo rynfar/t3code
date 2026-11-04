@@ -58,7 +58,9 @@ fn observed_previous_install_cannot_clear_the_owned_busy_state() {
         assert!(state.install_active());
         assert_eq!(state.install.as_ref().unwrap().operation_id.as_deref(), Some("mine"));
     }
+    state.install_load_error=true;
     state.observe_install(decode_install_state(json!({"phase":"succeeded","operationId":"mine","installedVersion":"1"})).unwrap());
+    assert!(!state.install_load_error);
     assert!(!state.install_active());
     state.observe_install(decode_install_state(json!({"phase":"downloading","operationId":"old"})).unwrap());
     assert!(!state.install_active());

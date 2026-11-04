@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod background;
 pub mod chatgpt;
+pub mod form;
 
 use std::collections::{HashMap, HashSet};
 
@@ -482,6 +483,8 @@ pub fn upsert_payload(settings: &ServerSettings, instance_id: &str, previous: &P
 /// edits queued before an earlier save answers build on that save rather than undo it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceEdit {
+    ConfigField { key: String, value: Value },
+    Environment(Vec<Value>),
     Enabled(bool),
     DisplayName(String),
     Accent(String),
@@ -492,6 +495,8 @@ pub enum InstanceEdit {
 impl InstanceEdit {
     pub fn apply(&self, instance: &ProviderInstanceConfig) -> ProviderInstanceConfig {
         match self {
+            InstanceEdit::ConfigField {key,value} => form::with_field(instance,key,value.clone()),
+            InstanceEdit::Environment(rows) => form::with_environment(instance,rows.clone()),
             InstanceEdit::Enabled(enabled) => with_enabled(instance, *enabled),
             InstanceEdit::DisplayName(name) => with_display_name(instance, name),
             InstanceEdit::Accent(accent) => with_accent(instance, accent),

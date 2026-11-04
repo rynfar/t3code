@@ -328,6 +328,8 @@ pub struct ServerProvider {
     #[serde(default, deserialize_with = "lenient_option")]
     pub setup: Option<ProviderSetup>,
     #[serde(default)]
+    pub runtime_paths: Option<Value>,
+    #[serde(default)]
     pub checked_at: CheckedAt,
 }
 
@@ -578,8 +580,8 @@ pub struct ModelPreferences {
     pub model_order: Vec<String>,
 }
 
-/// `ProviderInstanceConfig`. `environment` and `config` stay raw: the provider settings write
-/// them back untouched (redacted secrets included, which the server keeps), so nothing is lost.
+/// `ProviderInstanceConfig`: config stays raw; environment references use the contracts' wire
+/// codec. Redacted secrets remain present so unrelated edits preserve them on the server.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInstanceConfig {
@@ -589,7 +591,7 @@ pub struct ProviderInstanceConfig {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accent_color: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with="crate::settings::providers::form::decode_environment", serialize_with="crate::settings::providers::form::encode_environment")]
     pub environment: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -797,6 +799,8 @@ pub struct ServerConfig {
     /// Settings patches may carry `secretProviders`.
     #[serde(default)]
     pub secret_provider_settings: Option<bool>,
+    #[serde(default)]
+    pub secret_references: bool,
 }
 
 impl ServerConfig {

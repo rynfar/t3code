@@ -130,6 +130,7 @@ icons! {
     ListTree => "icons/lucide/list-tree.svg",
     LoaderCircle => "icons/lucide/loader-circle.svg",
     Lock => "icons/lucide/lock.svg",
+    LockOpen => "icons/lucide/lock-open.svg",
     MailOpen => "icons/lucide/mail-open.svg",
     Maximize2 => "icons/lucide/maximize-2.svg",
     MessageCircle => "icons/lucide/message-circle.svg",

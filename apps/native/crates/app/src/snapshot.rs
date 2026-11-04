@@ -391,6 +391,10 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             if let Some(config) = state.server_config.config.as_mut() {
                 config.providers.retain(|provider| !fixture.providers.iter().any(|replacement| replacement.instance_id == provider.instance_id));
                 config.providers.extend(fixture.providers);
+                if fixture.secret_references {
+                    config.secret_references=true;
+                    config.settings.secret_providers=fixture.settings.secret_providers;
+                }
                 config.settings.provider_instances = config.settings.provider_instances.iter()
                     .filter(|(id, _)| fixture.settings.provider_instances.get(id).is_none())
                     .chain(fixture.settings.provider_instances.iter())

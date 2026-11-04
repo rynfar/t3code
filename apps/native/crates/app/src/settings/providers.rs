@@ -8,6 +8,7 @@
 
 mod dialog;
 mod editor;
+mod form;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -82,6 +83,7 @@ struct InstallSession {
 
 pub(crate) struct ProvidersState {
     selected: Option<String>,
+    form: form::FormState,
     chatgpt: Option<(Option<u64>, Entity<crate::chatgpt_setup::ChatGptSetup>)>,
     refreshing: bool,
     /// Instances whose `server.updateProvider` call this client has in flight.
@@ -179,6 +181,7 @@ impl ProvidersState {
         ];
         ProvidersState {
             selected: None,
+            form: form::FormState::default(),
             chatgpt: None,
             refreshing: false,
             dispatching: HashSet::new(),
@@ -212,6 +215,7 @@ impl ProvidersState {
     /// The text fields a `/` keystroke must not steal focus from.
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
         let mut inputs = vec![&self.display_name, &self.accent, &self.custom_model, &self.model_filter, &self.health_interval, &self.callback_url, &self.terminal_line];
+        inputs.extend(self.form.inputs());
         inputs.extend(self.credentials.iter().flat_map(|(_, fields)| fields.iter().map(|(_, input)| input)));
         if let Some(dialog) = &self.dialog {
             inputs.extend(dialog.inputs());
@@ -326,6 +330,7 @@ impl SettingsView {
         };
         self.sync_streams(data.selected.as_ref(), cx);
         self.sync_editor_inputs(data.selected.as_ref(), window, cx);
+        if let Some(selected)=&data.selected {self.sync_provider_form(selected,window,cx);}
         self.schedule_label_refresh(data.next_label_change, cx);
         let interval = data.panel.health_interval_seconds().to_string();
         if !self.providers.health_interval.focus_handle(cx).is_focused(window) && self.providers.health_interval.read(cx).value().as_ref() != interval {
@@ -935,6 +940,7 @@ impl SettingsView {
 
     /// Saves an edit of one instance as an upsert.
     fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
+        if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) {return;}
         if matches!(edit, model::InstanceEdit::Enabled(true)) {
             let app = self.state.read(cx);
             if let Some(c) = app.server_config.config.as_ref() {
@@ -995,6 +1001,7 @@ impl SettingsView {
 
     /// Saves what a commit-on-blur provider field holds before the modal closes.
     pub(super) fn commit_focused_provider_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_focused_form_field(window,cx);
         if self.providers.display_name.focus_handle(cx).is_focused(window) {
             self.commit_display_name(cx);
         }

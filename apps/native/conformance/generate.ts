@@ -10,6 +10,7 @@ import { threadCases } from "./threadCases.ts";
 import { shellCases } from "./shellCases.ts";
 import { shelfCases } from "./shelfCases.ts";
 import { notifyCases } from "./notifyCases.ts";
+import { providerFieldsFixture } from "./providerFields.ts";
 import { commandOutputCases } from "./commandOutputCases.ts";
 import { itemDetailCases } from "./itemDetailCases.ts";
 
@@ -39,6 +40,20 @@ for (const [file, cases] of Object.entries(fixtures())) {
   }
   NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
   NodeFS.writeFileSync(path, text);
+}
+const fieldsPath = NodePath.join(
+  ROOT,
+  "apps/native/crates/core/src/settings/providers/fields.json",
+);
+const fieldsText = `${JSON.stringify(providerFieldsFixture(), null, 2)}\n`;
+if (check) {
+  if (
+    JSON.stringify(JSON.parse(NodeFS.readFileSync(fieldsPath, "utf8"))) !==
+    JSON.stringify(providerFieldsFixture())
+  )
+    stale.push("provider fields");
+} else {
+  NodeFS.writeFileSync(fieldsPath, fieldsText);
 }
 if (stale.length > 0) {
   console.error(
