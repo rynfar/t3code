@@ -186,6 +186,19 @@ pub struct Composer {
     _subscriptions: Vec<Subscription>,
 }
 
+#[cfg(feature = "snapshot")]
+#[derive(Default)]
+pub(crate) struct SnapshotAudit { pub submissions: std::cell::Cell<usize> }
+#[cfg(feature = "snapshot")]
+impl gpui::Global for SnapshotAudit {}
+
+#[cfg(feature = "snapshot")]
+struct SnapshotComposer(Entity<Composer>);
+#[cfg(feature = "snapshot")]
+impl gpui::Global for SnapshotComposer {}
+#[cfg(feature = "snapshot")]
+pub(crate) fn snapshot_composer(cx: &App) -> Entity<Composer> {cx.global::<SnapshotComposer>().0.clone()}
+
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_for(state, None, window, cx)
@@ -226,6 +239,7 @@ impl Composer {
                 }
                 if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase) {
                     this.sync_workspace(*event == AppEvent::ServerConfig, cx);
+                    this.sync_menu(false, cx);
                 }
                 if matches!(event, AppEvent::SidebarSelection | AppEvent::Shell | AppEvent::Phase) && !this.context.linked.is_empty() { cx.notify(); }
                 if *event == AppEvent::ComposerMention {
@@ -312,6 +326,8 @@ impl Composer {
             setup,
             _subscriptions: subscriptions,
         };
+        #[cfg(feature = "snapshot")]
+        if composer.fixed.is_none() {cx.set_global(SnapshotComposer(cx.entity()));}
         composer.load_drafts(cx);
         composer.load_stash();
         composer.refresh(true, window, cx);
@@ -638,6 +654,7 @@ impl Composer {
     }
 
     fn on_enter(&mut self, modifier: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.open {return;}
         let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
         let key = EnterKey { modifier, repeat: std::mem::take(&mut self.enter_repeat), composing };
         let prompt = self.prompt(cx);
@@ -691,3 +708,10 @@ fn rules_placeholder() -> &'static str {
 
 /// The textarea's interval for single-select answers to settle before advancing (`200ms`).
 const AUTO_ADVANCE: Duration = Duration::from_millis(200);
+
+#[cfg(feature = "snapshot")]
+impl Composer {
+    pub(crate) fn snapshot_audit(&self, submissions: usize, cx: &App) -> serde_json::Value {
+        serde_json::json!({"submissions": submissions, "prompt": self.prompt(cx), "workspace": self.selected_workspace(), "menuCwd": self.menu_cwd(cx)})
+    }
+}

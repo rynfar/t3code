@@ -97,7 +97,7 @@ impl Composer {
         }
     }
 
-    fn current_draft(&self, target: &Target, cx: &gpui::App) -> Draft {
+    pub(super) fn current_draft(&self, target: &Target, cx: &gpui::App) -> Draft {
         let prompt = match self.snapshot.target.as_ref() == Some(target) {
             true => self.draft_prompt(cx),
             false => self.drafts.store.get(&key(target)).map(|draft| draft.prompt.clone()).unwrap_or_default(),

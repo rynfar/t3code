@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] \
+[--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] [--composer-recovery-fixture] [--composer-audit <json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-profile-prefix <path>] [--media-select-all] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--document-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -245,6 +245,8 @@ pub struct Options {
     /// Opens the new-thread draft, as `chat.new` does.
     new_thread: bool,
     draft_workspace_fixture: Option<PathBuf>,
+    composer_audit: Option<PathBuf>,
+    recovery_fixture: bool,
     /// Files dropped on the composer. They upload, so point this at a scratch server.
     attach: Vec<PathBuf>,
     /// Typed into the composer last, so a trigger such as `@src` or `/` opens its menu.
@@ -312,6 +314,8 @@ impl Options {
             palette: has("--palette"),
             new_thread: has("--new-thread"),
             draft_workspace_fixture: flag("--draft-workspace-fixture").map(PathBuf::from),
+            composer_audit: flag("--composer-audit").map(PathBuf::from),
+            recovery_fixture: has("--composer-recovery-fixture"),
             attach: args.windows(2).filter(|pair| pair[0] == "--attach").map(|pair| PathBuf::from(&pair[1])).collect(),
             prompt: flag("--prompt"),
             open_url: flag("--open-url"),
@@ -771,6 +775,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         cx.update_window(window, |_, window, cx| crate::onboarding::terminal_fixture(fixture, window, cx)).map_err(|error| error.to_string())??;
         pump(&mut cx, options.wait.min(3.), |_| false);
     }
+    if options.composer_audit.is_some() {cx.update(|cx| cx.set_global(crate::composer::SnapshotAudit::default()));}
     if options.new_thread {
         cx.update(|cx| cx.dispatch_action(&crate::new_thread::NewThread));
         pump(&mut cx, 1., |_| false);
@@ -800,6 +805,9 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             if let Some(shell) = state.shell.snapshot.as_mut() { shell.threads = threads; }
             cx.emit(crate::app_state::AppEvent::Shell);
         });
+    }
+    if options.recovery_fixture {
+        cx.update_window(window, |_, window, cx| crate::composer::snapshot_composer(cx).update(cx, |composer, cx| composer.verify_failed_launch_recovery(window, cx))).map_err(|error| error.to_string())??;
     }
     if let Some(prompt) = &options.prompt {
         cx.simulate_input(window, prompt);
@@ -863,6 +871,14 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         }
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
+    if let Some(path) = &options.composer_audit {
+        let value = cx.update(|cx| {
+            let submissions = cx.global::<crate::composer::SnapshotAudit>().submissions.get();
+            crate::composer::snapshot_composer(cx).read(cx).snapshot_audit(submissions, cx)
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        if value["submissions"] != 0 {return Err("workspace popup dispatched a submission".into());}
+    }
     if let Some(path) = &options.render_counts_output {
         let counts = cx.update(|cx| serde_json::to_vec_pretty(&*cx.global::<RenderCounts>().0.borrow())).map_err(|error| error.to_string())?;
         std::fs::write(path, counts).map_err(|error| error.to_string())?;

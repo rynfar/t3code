@@ -187,6 +187,13 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
         ..choice.clone()
     };
     assert_eq!(local.strategy(), Some(Strategy::Root));
+    let cwd = draft_cwd(Some(&choice), "env-a", "/repo");
+    assert_eq!(crate::composer::menu::search_entries_request(cwd, "only-in-worktree")["cwd"], "/wt/feature");
+    assert_eq!(crate::composer::menu::refresh_providers_request("fixture-provider", cwd)["cwd"], "/wt/feature");
+    assert_eq!(draft_cwd(Some(&choice), "env-b", "/repo"), "/repo");
+    assert_eq!(draft_cwd(Some(&choice), "env-a", "/moved"), "/moved");
+    assert_eq!(draft_cwd(Some(&local), "env-a", "/repo"), "/repo");
+
     let new = DraftWorkspace {
         previous: None,
         ..choice

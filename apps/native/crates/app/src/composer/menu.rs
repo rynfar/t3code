@@ -52,6 +52,7 @@ pub(super) struct Menu {
     loading: bool,
     /// The latest `projects.searchEntries` reply: cwd, query, entries.
     paths: Option<(String, String, Vec<PathEntry>)>,
+    scope: Option<(String, String)>,
     path_search: Option<(String, String, Task<()>)>,
     snapshots: HashMap<SnapshotKey, WorkspaceSnapshot>,
     /// When each snapshot was last asked for; one scan per TTL.
@@ -95,11 +96,30 @@ impl Composer {
         self.menu.triggers.trigger().is_some()
     }
 
-    /// The directory searches and skills resolve against: the thread's worktree, else its project.
-    fn menu_cwd(&self, cx: &App) -> Option<String> {
+    /// The same checkout as draft launch (`ChatView.tsx` gitCwd).
+    pub(super) fn menu_cwd(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let worktree = self.thread_id().and_then(|id| state.shell.thread(&id).and_then(|thread| thread.worktree_path.clone()));
-        worktree.or_else(|| Some(state.shell.project(self.snapshot.project_id.as_deref()?)?.workspace_root.clone()))
+        let root = &state.shell.project(self.snapshot.project_id.as_deref()?)?.workspace_root;
+        if let Some(id) = self.thread_id() {
+            return Some(state.shell.thread(&id).and_then(|thread| thread.worktree_path.clone()).unwrap_or_else(|| root.clone()));
+        }
+        Some(t3_core::workspace::draft_cwd(self.selected_workspace().as_ref(), state.environments.active.as_deref().unwrap_or_default(), root).to_owned())
+    }
+
+    fn sync_menu_scope(&mut self, cx: &App) -> bool {
+        let scope = self.state.read(cx).environments.active.clone().zip(self.menu_cwd(cx));
+        if self.menu.scope == scope {return false;}
+        if self.menu.scope.as_ref().map(|(environment, _)| environment) != scope.as_ref().map(|(environment, _)| environment) {
+            self.menu.snapshots.clear();
+            self.menu.requested.clear();
+            self.menu.scanning.clear();
+        }
+        self.menu.scope = scope;
+        self.menu.paths = None;
+        self.menu.path_search = None;
+        self.menu.items.clear();
+        self.menu.highlighted = None;
+        true
     }
 
     pub(super) fn environment_id(&self, cx: &App) -> String {
@@ -109,11 +129,12 @@ impl Composer {
 
     /// Re-reads the token under the caret after an edit (`force`) or a caret move.
     pub(super) fn sync_menu(&mut self, force: bool, cx: &mut Context<Self>) {
+        let scope_changed = self.sync_menu_scope(cx);
         let caret = {
             let input = self.input.read(cx);
             (input.cursor(), input.text().len())
         };
-        if !force && self.menu.caret == Some(caret) {
+        if !force && !scope_changed && self.menu.caret == Some(caret) {
             return;
         }
         self.menu.caret = Some(caret);
@@ -122,7 +143,7 @@ impl Composer {
             true => None,
             false => rules::detect_trigger(&self.prompt(cx), caret.0).filter(|trigger| trigger.kind != TriggerKind::PullRequest),
         };
-        if self.menu.triggers.set(candidate) {
+        if self.menu.triggers.set(candidate) || scope_changed {
             self.refresh_menu(cx);
             cx.notify();
         }
@@ -130,6 +151,7 @@ impl Composer {
 
     /// Rebuilds the rows for the active trigger, starting the searches it needs.
     pub(super) fn refresh_menu(&mut self, cx: &mut Context<Self>) {
+        self.sync_menu_scope(cx);
         let Some(trigger) = self.menu.triggers.trigger().cloned() else {
             self.menu.items.clear();
             self.menu.loading = false;
@@ -181,18 +203,19 @@ impl Composer {
 
     fn search_paths(&mut self, cwd: String, query: String, cx: &mut Context<Self>) {
         let (searched_cwd, searched) = (cwd.clone(), query.clone());
+        let scope = self.menu.scope.clone();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(rules::PATH_SEARCH_DEBOUNCE_MS)).await;
             let request = this.update(cx, |this, cx| {
+                if this.state.read(cx).environments.active.clone().zip(this.menu_cwd(cx)) != scope {return None;}
                 let payload = rules::search_entries_request(&searched_cwd, &searched);
                 this.state.read(cx).request(rules::SEARCH_ENTRIES, payload, |reply| Ok(rules::decode_entries(&reply)))
             });
             let Ok(Some(request)) = request else { return };
             let entries = request.await.ok().and_then(Result::ok).unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
-                if matches!(&this.menu.path_search, Some((c, q, _)) if *c == searched_cwd && *q == searched) {
-                    this.menu.path_search = None;
-                }
+                if this.menu.scope != scope || this.state.read(cx).environments.active.clone().zip(this.menu_cwd(cx)) != scope || !matches!(&this.menu.path_search, Some((c, q, _)) if *c == searched_cwd && *q == searched) {return;}
+                this.menu.path_search = None;
                 this.menu.paths = Some((searched_cwd, searched, entries));
                 this.refresh_menu(cx);
                 cx.notify();
@@ -244,10 +267,12 @@ impl Composer {
         }
         self.menu.requested.insert(key.clone(), now);
         self.menu.scanning.insert(key.clone());
+        let environment = self.state.read(cx).environments.active.clone();
         let request = self.state.read(cx).rpc(rules::REFRESH_PROVIDERS, rules::refresh_providers_request(&key.0, &key.1));
         cx.spawn(async move |this, cx| {
             let reply = request.await;
             let _ = this.update(cx, |this, cx| {
+                if this.state.read(cx).environments.active != environment {return;}
                 this.menu.scanning.remove(&key);
                 match reply.ok().and_then(|reply| rules::refreshed_snapshot(&reply, &key.0, &key.1)) {
                     Some(snapshot) => {

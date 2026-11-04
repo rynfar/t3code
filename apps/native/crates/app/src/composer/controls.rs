@@ -466,18 +466,21 @@ pub struct MenuItem {
     label: SharedString,
     icon: Option<(Icon, Hsla)>,
     checked: Option<bool>,
+    highlighted: bool,
     on_click: Option<Handler>,
 }
 
 impl MenuItem {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
-        MenuItem { id: id.into(), label: label.into(), icon: None, checked: None, on_click: None }
+        MenuItem { id: id.into(), label: label.into(), icon: None, checked: None, highlighted: false, on_click: None }
     }
 
     pub fn icon(mut self, icon: Icon, color: Hsla) -> Self {
         self.icon = Some((icon, color));
         self
     }
+
+    pub fn highlighted(mut self, highlighted: bool) -> Self {self.highlighted = highlighted; self}
 
     /// Reserves the check column and fills it when `checked`.
     pub fn checked(mut self, checked: bool) -> Self {
@@ -503,6 +506,7 @@ impl RenderOnce for MenuItem {
             .rounded(px(4.))
             .text_sm()
             .text_color(hsla(p.foreground))
+            .when(self.highlighted, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
             .cursor_pointer()
             .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
             .children(self.checked.map(|checked| {

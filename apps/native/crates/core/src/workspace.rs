@@ -262,5 +262,10 @@ impl DraftWorkspace {
     }
 }
 
+/// Composer file/skill roots (`ChatView.tsx` gitCwd); a draft has no server thread yet.
+pub fn draft_cwd<'a>(choice: Option<&'a DraftWorkspace>, environment_id: &str, project_root: &'a str) -> &'a str {
+    choice.filter(|choice| choice.in_scope(environment_id, project_root)).and_then(|choice| choice.previous.as_ref()).map_or(project_root, |seed| seed.worktree_path.as_str())
+}
+
 #[cfg(test)]
 mod tests;

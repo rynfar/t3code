@@ -9,6 +9,7 @@ use t3_core::workspace::{self as rules, DraftWorkspace, PreviousThread, Previous
 
 use super::controls::{ComposerControl, Float, MenuItem, floating, menu_surface};
 use super::{Composer, Target, drafts};
+use super::menu::MenuKey;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -28,6 +29,7 @@ pub(super) struct Workspace {
     default_mode: Option<ThreadEnvMode>,
     previous: Option<PreviousWorktreeSeed>,
     pub(super) open: bool,
+    highlighted: usize,
     loading: bool,
     error: Option<String>,
     task: Option<Task<()>>,
@@ -148,10 +150,33 @@ impl Composer {
         }
         self.workspace.open = !self.workspace.open;
         if self.workspace.open {
+            let choice = self.workspace_choice();
+            self.workspace.highlighted = usize::from(choice.map_or(self.workspace.default_mode.unwrap_or(ThreadEnvMode::Local) == ThreadEnvMode::Worktree, |choice| choice.mode == ThreadEnvMode::Worktree && choice.previous.is_none()));
             self.sync_workspace(true, cx);
         }
         self.focus(window, cx);
         cx.notify();
+    }
+
+    pub(super) fn workspace_key(&mut self, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.workspace.open {return false;}
+        self.sync_workspace(false, cx);
+        let previous = self.workspace.previous.is_some();
+        let count = 2 + usize::from(previous) + usize::from(self.workspace.error.is_some());
+        self.workspace.highlighted = self.workspace.highlighted.min(count - 1);
+        match key {
+            MenuKey::Up => self.workspace.highlighted = (self.workspace.highlighted + count - 1) % count,
+            MenuKey::Down => self.workspace.highlighted = (self.workspace.highlighted + 1) % count,
+            MenuKey::Dismiss => {self.workspace.open = false; self.focus(window, cx);}
+            MenuKey::Accept => match self.workspace.highlighted {
+                0 => { let previous = self.workspace_choice().and_then(|choice| choice.previous.clone()); self.choose_workspace(ThreadEnvMode::Local, previous, window, cx); }
+                1 => self.choose_workspace(ThreadEnvMode::Worktree, None, window, cx),
+                2 if previous => self.use_previous_worktree(window, cx),
+                _ => self.sync_workspace(true, cx),
+            },
+        }
+        cx.notify();
+        true
     }
 
     fn workspace_enabled(&self) -> bool {
@@ -175,6 +200,7 @@ impl Composer {
         self.workspace.open = false;
         self.error = None;
         self.sync_workspace(false, cx);
+        self.sync_menu(true, cx);
         self.focus(window, cx);
         cx.notify();
     }
@@ -219,6 +245,7 @@ impl Composer {
             .child(
                 MenuItem::new("workspace-local", if previous.is_some() { "Current worktree" } else { "Current checkout" })
                     .checked(mode == ThreadEnvMode::Local || previous.is_some())
+                    .highlighted(self.workspace.highlighted == 0)
                     .on_click(cx.listener(|this, _, window, cx| {
                         let previous = this.workspace_choice().and_then(|choice| choice.previous.clone());
                         this.choose_workspace(ThreadEnvMode::Local, previous, window, cx);
@@ -227,6 +254,7 @@ impl Composer {
             .child(
                 MenuItem::new("workspace-new", "New worktree")
                     .checked(mode == ThreadEnvMode::Worktree && previous.is_none())
+                    .highlighted(self.workspace.highlighted == 1)
                     .on_click(cx.listener(|this, _, window, cx| this.choose_workspace(ThreadEnvMode::Worktree, None, window, cx))),
             );
         if let Some(seed) = &self.workspace.previous {
@@ -237,6 +265,7 @@ impl Composer {
                     .py(px(4.))
                     .rounded(px(4.))
                     .cursor_pointer()
+                    .when(self.workspace.highlighted == 2, |this| this.bg(hsla(p.accent)))
                     .hover(|style| style.bg(hsla(p.accent)))
                     .on_click(cx.listener(|this, _, window, cx| this.use_previous_worktree(window, cx)))
                     .child(
@@ -256,7 +285,7 @@ impl Composer {
         if let Some(error) = &self.workspace.error {
             popup = popup
                 .child(div().px(px(8.)).py(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(error.clone()))
-                .child(MenuItem::new("workspace-retry", "Retry").on_click(cx.listener(|this, _, _, cx| this.sync_workspace(true, cx))));
+                .child(MenuItem::new("workspace-retry", "Retry").highlighted(self.workspace.highlighted == 2 + usize::from(self.workspace.previous.is_some())).on_click(cx.listener(|this, _, _, cx| this.sync_workspace(true, cx))));
         }
         Some(
             div()

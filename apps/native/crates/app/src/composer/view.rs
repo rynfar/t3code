@@ -282,12 +282,12 @@ impl Render for Composer {
                 .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| this.open_permissions(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).
                 .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                    if this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {
+                    if this.workspace_key(MenuKey::Up, window, cx) || this.stash_key(MenuKey::Up, window, cx) || this.menu_key(MenuKey::Up, window, cx) || this.history_key(true, window, cx) {
                         cx.stop_propagation();
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                    if this.stash_key(MenuKey::Down, window, cx)
+                    if this.workspace_key(MenuKey::Down, window, cx) || this.stash_key(MenuKey::Down, window, cx)
                         || this.menu_key(MenuKey::Down, window, cx)
                         || this.history_key(false, window, cx)
                     {
@@ -295,6 +295,7 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                    if this.workspace_key(MenuKey::Accept, window, cx) {cx.stop_propagation(); return;}
                     if !action.secondary
                         && !action.shift
                         && (this.stash_key(MenuKey::Accept, window, cx) || this.menu_key(MenuKey::Accept, window, cx))
@@ -308,7 +309,7 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    if this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
+                    if this.workspace_key(MenuKey::Dismiss, window, cx) || this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
                         cx.stop_propagation();
                     }
                 }))
