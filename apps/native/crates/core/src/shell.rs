@@ -142,8 +142,8 @@ pub struct ThreadShell {
     pub active_run_id: Option<String>,
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub activity_run_started_at: Option<Option<String>>,
-    #[serde(default)]
-    pub activity_run_status: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub activity_run_status: Option<Option<String>>,
     #[serde(default)]
     pub blocked_on_thread_wait: Option<bool>,
     pub status: String,
@@ -200,7 +200,7 @@ pub struct ThreadShell {
 
 impl ThreadShell {
     pub fn is_live(&self) -> bool {
-        self.activity_run_status.is_some()
+        self.activity_run_status.as_ref().is_some_and(Option::is_some)
             || matches!(self.status.as_str(), "queued" | "preparing" | "starting" | "running" | "waiting")
     }
 

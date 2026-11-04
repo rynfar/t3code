@@ -111,7 +111,7 @@ impl AppState {
     }
 
     fn notification_visible(&self, target: &ThreadKey) -> bool {
-        if self.notifications.visibility.hidden.contains(target) { return false; }
+        if self.notifications.visibility.hidden.contains(target) || self.notifications.visibility.delegated_under_parent.contains(target) { return false; }
         if self.environments.active.as_deref() == Some(&target.environment_id) {
             if self.sidebar.hidden_thread_ids.contains(&target.thread_id) { return false; }
             if self.thread_shell(&target.thread_id).is_some() { return true; }

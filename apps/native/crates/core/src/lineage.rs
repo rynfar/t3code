@@ -139,7 +139,7 @@ pub fn relationship_graph<'a>(threads: impl IntoIterator<Item = &'a ThreadShell>
             thread_id: thread.id.clone(),
             parent: parent_of(thread.forked_from.as_ref(), thread.lineage.parent_thread_id.as_deref()).map(str::to_owned),
             subagent: thread.lineage.relationship_to_parent.as_deref() == Some("subagent"),
-            status: thread.activity_run_status.clone().or_else(|| Some(thread.status.clone())),
+            status: thread.activity_run_status.clone().flatten().or_else(|| Some(thread.status.clone())),
         })
         .collect();
     if let Some(selected) = projection.map(|projection| &projection.thread)
@@ -163,7 +163,7 @@ pub fn relationship_graph<'a>(threads: impl IntoIterator<Item = &'a ThreadShell>
             let Some(child_id) = subagent.child_thread_id.clone() else { continue };
             let child = builder.nodes.get(&child_id).and_then(|node| node.thread);
             let status = child
-                .and_then(|child| child.activity_run_status.clone())
+                .and_then(|child| child.activity_run_status.clone().flatten())
                 .or_else(|| child.filter(|child| child.latest_run_id.is_some() && !is_work_active(&subagent.status)).map(|child| child.status.clone()))
                 .unwrap_or(subagent.status);
             builder.add(RelationshipEdge { source: owner.clone(), target: child_id, kind: RelationshipKind::Subagent, status: Some(status) });
@@ -210,7 +210,7 @@ pub fn row_status(graph: &RelationshipGraph, row: &RelationshipRow) -> Option<St
         return row.edge.status.clone();
     }
     let thread = graph.nodes.get(&row.thread_id).and_then(|node| node.thread)?;
-    thread.activity_run_status.clone().or_else(|| Some(thread.status.clone()))
+    thread.activity_run_status.clone().flatten().or_else(|| Some(thread.status.clone()))
 }
 
 /// `orderWebThreadLineageRows`: the parent, then the merge-back target, then newest first.

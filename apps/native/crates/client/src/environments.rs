@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use t3_core::notifications::{
-    EnvironmentNotifications, NotificationVisibility, ThreadNotification,
+    EnvironmentNotifications, LinkedEnvironment, LinkedRequests, NotificationVisibility, ThreadNotification,
 };
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
@@ -163,7 +163,7 @@ impl Drop for Entry {
     }
 }
 
-fn visibility(entries: &HashMap<String, Entry>) -> NotificationVisibility {
+fn visibility(entries: &HashMap<String, Entry>, linked: &LinkedRequests) -> NotificationVisibility {
     let rows: Vec<_> = entries
         .iter()
         .map(|(id, entry)| {
@@ -205,6 +205,7 @@ fn visibility(entries: &HashMap<String, Entry>) -> NotificationVisibility {
     );
     let mut result = NotificationVisibility {
         filtering,
+        delegated_under_parent: linked.delegated_under_parent.clone(),
         ..Default::default()
     };
     for (saved, canonical, threads, _) in rows {
@@ -217,6 +218,29 @@ fn visibility(entries: &HashMap<String, Entry>) -> NotificationVisibility {
         }
     }
     result
+}
+
+async fn reobserve(
+    entries: &HashMap<String, Entry>, watchers: &mut EnvironmentNotifications,
+    visible: &mut NotificationVisibility, output: &mpsc::Sender<EnvironmentEvent>, enabled: bool,
+) {
+    let environments = entries.iter().filter_map(|(id, entry)| {
+        if entry.status != ConnectionStatus::Connected || !entry.shell.synchronized { return None; }
+        let snapshot = entry.shell.snapshot.as_ref()?;
+        let canonical_id = entry.config.config.as_ref().map(|c| c.environment.environment_id.as_str()).filter(|id| !id.is_empty()).unwrap_or(id);
+        Some(LinkedEnvironment { saved_id: id, canonical_id, threads: &snapshot.threads })
+    }).collect::<Vec<_>>();
+    let linked = LinkedRequests::build(&environments);
+    let next = visibility(entries, &linked);
+    if next != *visible { *visible = next; let _ = output.send(EnvironmentEvent::Visibility(visible.clone())).await; }
+    if !enabled { return; }
+    for environment in environments {
+        let entry = &entries[environment.saved_id];
+        let notifications = watchers.observe_linked(environment.saved_id, &entry.shell, visible, &linked);
+        if !notifications.is_empty() {
+            let _ = output.send(EnvironmentEvent::Notifications { id: environment.saved_id.into(), generation: entry.generation, notifications }).await;
+        }
+    }
 }
 
 async fn run(
@@ -254,6 +278,7 @@ async fn run(
                     let config = prior.as_ref().map(|e| e.config.clone()).unwrap_or_default();
                     entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status: ConnectionStatus::Connecting });
                     tracing::info!(environment = %id, watched = entries.len(), "watching environment with one supervisor");
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
                 Some(Command::Activate(id)) => {
                     if active != id && let Some(prior) = active.as_ref().and_then(|id| entries.get(id)) { prior.client.close_all_threads(); }
@@ -266,19 +291,12 @@ async fn run(
                     entries.remove(&id);
                     watchers.remove(&id);
                     if active.as_ref() == Some(&id) { active = None; }
-                    let next = visibility(&entries);
-                    if next != visible { visible = next; let _ = output.send(EnvironmentEvent::Visibility(visible.clone())).await; }
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
                 Some(Command::Enabled(next)) => {
                     if next == enabled { continue; }
                     watchers.clear(); enabled = next;
-                    if enabled {
-                        for (id, entry) in &entries {
-                            if entry.status == ConnectionStatus::Connected && entry.shell.synchronized {
-                                watchers.observe(id, &entry.shell, &visible.hidden.iter().filter(|k| &k.environment_id == id).map(|k| k.thread_id.clone()).collect());
-                            }
-                        }
-                    }
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
             },
             frame = input.recv() => {
@@ -286,6 +304,7 @@ async fn run(
                 let Some(entry) = entries.get_mut(&id).filter(|e| e.generation == epoch) else { continue };
                 let mut changed = false;
                 let mut config_changed = false;
+                let mut lifecycle_changed = false;
                 for event in &batch {
                     match event {
                         ClientEvent::Shell(item) => {
@@ -296,26 +315,20 @@ async fn run(
                         }
                         ClientEvent::ServerConfig(event) => { config_changed |= entry.config.apply(*event.clone()); }
                         ClientEvent::Status(status) => {
+                            lifecycle_changed |= entry.status != *status;
                             entry.status = status.clone();
                             if *status != ConnectionStatus::Connected { entry.shell.synchronized = false; }
                             let _ = output.send(EnvironmentEvent::Status { id: id.clone(), generation: epoch, status: status.clone() }).await;
                         }
-                        ClientEvent::Moved { http_base } => { let _ = output.send(EnvironmentEvent::Moved { id: id.clone(), generation: epoch, http_base: http_base.clone() }).await; }
+                        ClientEvent::Moved { http_base } => { lifecycle_changed = true; let _ = output.send(EnvironmentEvent::Moved { id: id.clone(), generation: epoch, http_base: http_base.clone() }).await; }
                         _ => {}
                     }
                 }
                 if config_changed && let Some(config) = &entry.config.config {
                     let _ = output.send(EnvironmentEvent::Identity { id: id.clone(), generation: epoch, descriptor: Box::new(config.environment.clone()) }).await;
                 }
-                if changed || config_changed {
-                    let next = visibility(&entries);
-                    if next != visible { visible = next; let _ = output.send(EnvironmentEvent::Visibility(visible.clone())).await; }
-                }
-                let entry = &entries[&id];
-                if (changed || config_changed) && enabled && entry.status == ConnectionStatus::Connected && entry.shell.synchronized {
-                    let hidden = visible.hidden.iter().filter(|k| k.environment_id == id).map(|k| k.thread_id.clone()).collect();
-                    let notifications = watchers.observe(&id, &entry.shell, &hidden);
-                    if !notifications.is_empty() { let _ = output.send(EnvironmentEvent::Notifications { id: id.clone(), generation: epoch, notifications }).await; }
+                if changed || config_changed || lifecycle_changed {
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
                 if active.as_ref() == Some(&id) {
                     let events = batch.into_iter().filter(|e| !matches!(e, ClientEvent::Status(_) | ClientEvent::Moved { .. })).collect::<Vec<_>>();
