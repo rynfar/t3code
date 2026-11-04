@@ -32,6 +32,7 @@ struct IdentityDraft {
 
 pub(super) struct AddDialog {
     step: usize,
+    focus_step: bool,
     driver: &'static Driver,
     show_more: bool,
     identities: HashMap<&'static str, IdentityDraft>,
@@ -157,6 +158,7 @@ impl SettingsView {
         let focus = cx.focus_handle();
         self.providers.dialog = Some(AddDialog {
             step: 0,
+            focus_step: false,
             driver,
             show_more: false,
             identities: HashMap::new(),
@@ -322,9 +324,8 @@ impl SettingsView {
                 dialog.attempted = true;
             }
         }
-        if dialog.step == 1 {
-            dialog.label.update(cx, |input, cx| input.focus(window, cx));
-        }
+        dialog.focus.focus(window, cx);
+        dialog.focus_step = true;
         cx.notify();
     }
 
@@ -402,6 +403,33 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let focus_step = std::mem::take(&mut self.providers.dialog.as_mut()?.focus_step);
+        let target = if focus_step {
+            let dialog = self.providers.dialog.as_ref()?;
+            let app = self.state.read(cx);
+            wizard::focus_target(
+                dialog.step,
+                dialog.driver.kind,
+                dialog
+                    .configs
+                    .get(dialog.driver.kind)
+                    .and_then(|c| c.model.value.as_ref()),
+                app.server_config
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.managed_policy.as_ref()),
+                self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx),
+            )
+        } else {
+            wizard::FocusTarget::Dialog
+        };
+        if focus_step && target == wizard::FocusTarget::Identity {
+            self.providers
+                .dialog
+                .as_ref()?
+                .label
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
         let dialog = self.providers.dialog.as_ref()?;
         let p = palette(cx);
         let dark = cx.theme().is_dark();
@@ -477,44 +505,27 @@ impl SettingsView {
                     })
                     .child(badge)
                     .child(
-                        v_flex()
+                        div()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(if current {
-                                        hsla(p.foreground)
-                                    } else {
-                                        hsla(p.muted_foreground)
-                                    })
-                                    .child(*name),
-                            )
-                            .when(done && index < 2, |column| {
-                                let summary = if index == 0 {
-                                    driver.label.to_owned()
-                                } else {
-                                    let label = dialog.label.read(cx).value();
-                                    if label.trim().is_empty() {
-                                        format!("{} Workspace", driver.label)
-                                    } else {
-                                        label.trim().to_owned()
-                                    }
-                                };
-                                column.child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(hsla(p.muted_foreground))
-                                        .child(summary),
-                                )
-                            }),
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if current {
+                                hsla(p.foreground)
+                            } else {
+                                hsla(p.muted_foreground)
+                            })
+                            .child(*name),
                     )
             }));
 
-        let config_body =
-            (self.providers.dialog.as_ref()?.step == 2).then(|| self.render_dialog_config(cx));
+        let config_body = (self.providers.dialog.as_ref()?.step == 2).then(|| {
+            let key = match &target {
+                wizard::FocusTarget::Config(key) => Some(key.as_str()),
+                _ => None,
+            };
+            self.render_dialog_config(key, window, cx)
+        });
         let dialog = self.providers.dialog.as_ref()?;
         let body = if step == 0 {
             let app = self.state.read(cx);
@@ -627,9 +638,8 @@ impl SettingsView {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if step == 0 {
                         this.close_add_dialog(window, cx);
-                    } else if let Some(dialog) = this.providers.dialog.as_mut() {
-                        dialog.step -= 1;
-                        cx.notify();
+                    } else {
+                        this.navigate_dialog(step - 1, window, cx);
                     }
                 })),
             )

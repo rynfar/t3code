@@ -49,6 +49,38 @@ pub fn navigation(
     Ok(target)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum FocusTarget {
+    Dialog,
+    Identity,
+    Config(String),
+}
+
+pub fn focus_target(
+    step: usize,
+    driver: &str,
+    config: Option<&Value>,
+    policy: Option<&Value>,
+    can_manage: bool,
+) -> FocusTarget {
+    if step == 1 {
+        return FocusTarget::Identity;
+    }
+    if step == 2 && can_manage && crate::managed_policy::driver_allowed(policy, driver) {
+        return form::fields(driver, config)
+            .into_iter()
+            .find(|field| {
+                !crate::managed_policy::instance_field_locked(
+                    policy,
+                    driver,
+                    &format!("config.{}", field.key),
+                )
+            })
+            .map_or(FocusTarget::Dialog, |field| FocusTarget::Config(field.key));
+    }
+    FocusTarget::Dialog
+}
+
 pub fn instance(
     driver: &str,
     label: &str,
@@ -110,6 +142,50 @@ mod tests {
             assert_eq!(result.is_err(), current <= 1 && requested > 1);
         }
         assert_eq!(navigation(0, 99, None), Ok(2));
+    }
+
+    #[test]
+    fn transitions_keep_focus_inside_the_dialog_and_skip_locked_fields_in_schema_order() {
+        let locked_binary = json!({"limits":{"providers":{"lockedInstanceFields":{"codex":["config.binaryPath"]}}}});
+        let locked_runtime =
+            json!({"limits":{"providers":{"lockedInstanceFields":{"codex":["config"]}}}});
+        for (driver, policy, can_manage, expected) in [
+            (
+                "codex",
+                None,
+                true,
+                FocusTarget::Config("binaryPath".into()),
+            ),
+            (
+                "antigravity",
+                None,
+                true,
+                FocusTarget::Config("authMethod".into()),
+            ),
+            (
+                "codex",
+                Some(&locked_binary),
+                true,
+                FocusTarget::Config("homePath".into()),
+            ),
+            ("codex", Some(&locked_runtime), true, FocusTarget::Dialog),
+            ("cursor", None, true, FocusTarget::Dialog),
+            ("kiro", None, false, FocusTarget::Dialog),
+        ] {
+            let step = navigation(1, 2, None).unwrap();
+            assert_eq!(
+                focus_target(step, driver, None, policy, can_manage),
+                expected
+            );
+        }
+        assert_eq!(
+            focus_target(navigation(2, 0, None).unwrap(), "codex", None, None, true),
+            FocusTarget::Dialog
+        );
+        assert_eq!(
+            focus_target(navigation(2, 1, None).unwrap(), "codex", None, None, true),
+            FocusTarget::Identity
+        );
     }
 
     #[test]

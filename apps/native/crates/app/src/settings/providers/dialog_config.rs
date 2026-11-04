@@ -1,15 +1,15 @@
 //! Draft controls for `AddProviderInstanceDialog.tsx`; uses the editor's `form::fields` metadata.
 use super::super::{
     SettingsView,
-    controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, r},
+    controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, focus_handle, r},
 };
 use crate::{
     icons::Icon,
     theme::{hsla, palette},
 };
 use gpui::{
-    AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, SharedString, Styled,
-    Subscription, Window, div, prelude::*,
+    AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, RenderOnce, SharedString,
+    Styled, Subscription, Window, div, prelude::*,
 };
 use gpui_component::{
     Sizable, h_flex,
@@ -18,6 +18,22 @@ use gpui_component::{
 };
 use serde_json::{Value, json};
 use t3_core::settings::providers::{form, wizard};
+
+#[derive(IntoElement)]
+struct FocusConfigSelect {
+    id: gpui::ElementId,
+    select: Select,
+    focus: bool,
+}
+impl RenderOnce for FocusConfigSelect {
+    fn render(self, window: &mut Window, cx: &mut gpui::App) -> impl IntoElement {
+        // Select's focus handle is keyed in its element scope.
+        if self.focus {
+            focus_handle(&self.id, window, cx).focus(window, cx);
+        }
+        self.select.render(window, cx)
+    }
+}
 
 struct DraftInput {
     key: String,
@@ -113,7 +129,12 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub(super) fn render_dialog_config(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_dialog_config(
+        &self,
+        focus_key: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let dialog = self.providers.dialog.as_ref().unwrap();
         let driver = dialog.driver().kind;
         let draft = &dialog.configs[driver];
@@ -158,8 +179,10 @@ impl SettingsView {
                 } else {
                     let edit_key = key.clone();
                     let view = cx.entity().downgrade();
-                    Select::new(
-                        SharedString::from(format!("wizard-config-{driver}-{key}")),
+                    let id: gpui::ElementId =
+                        SharedString::from(format!("wizard-config-{driver}-{key}")).into();
+                    let select = Select::new(
+                        id.clone(),
                         field
                             .options
                             .into_iter()
@@ -178,7 +201,12 @@ impl SettingsView {
                         let _ = view.update(cx, |this, cx| {
                             this.edit_dialog_config(driver, &edit_key, json!(value), cx)
                         });
-                    })
+                    });
+                    FocusConfigSelect {
+                        id,
+                        select,
+                        focus: focus_key == Some(key.as_str()),
+                    }
                     .into_any_element()
                 }
             } else {
@@ -189,6 +217,9 @@ impl SettingsView {
                     .unwrap()
                     .input
                     .clone();
+                if focus_key == Some(key.as_str()) {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                }
                 h_flex()
                     .gap(r(8.))
                     .child(
