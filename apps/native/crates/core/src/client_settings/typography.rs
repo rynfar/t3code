@@ -1,4 +1,4 @@
-//! `TypographySettings.tsx`, `appearanceFonts.ts` and `contracts/src/settings.ts`.
+//! `TypographySettings.tsx`, `FontFamilyPicker.tsx`, `appearanceFonts.ts` and `contracts/src/settings.ts`.
 
 use super::{ClientSettingsDoc, DEFAULT_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE, MIN_INTERFACE_FONT_SIZE};
 use serde_json::Value;
@@ -119,6 +119,41 @@ pub fn family_options(families: impl IntoIterator<Item = (String, bool)>, monosp
     names
 }
 
+/// Like `queryInstalledFontFamilies`: one inventory per app session, including an empty result.
+#[derive(Default)]
+pub struct FontInventory {
+    families: Option<Vec<(String, bool)>>,
+}
+impl FontInventory {
+    pub fn families(&self) -> Option<&[(String, bool)]> {
+        self.families.as_deref()
+    }
+    pub fn finish(&mut self, families: Vec<(String, bool)>) {
+        if self.families.is_none() {
+            self.families = Some(families);
+        }
+    }
+    pub fn accepts(&self, role: FontRole, family: &str) -> bool {
+        family.is_empty()
+            || !role.monospace()
+            || self
+                .families()
+                .unwrap_or_default()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(family))
+                .is_none_or(|(_, mono)| *mono)
+    }
+}
+pub fn advances_are_monospace(advances: &[f32]) -> bool {
+    let Some(first) = advances.first() else {
+        return true;
+    };
+    if *first <= 0. || advances.iter().any(|width| !width.is_finite() || *width <= 0.) {
+        return true;
+    }
+    advances.iter().all(|width| (width - first).abs() < 0.01)
+}
+
 impl ClientSettingsDoc {
     pub fn separate_fonts(&self) -> bool {
         self.flag(ADVANCED_KEY, false)
@@ -192,6 +227,30 @@ impl Typography {
 mod tests {
     use super::*;
     use crate::client_settings::ClientSettingChange;
+
+    #[test]
+    fn picker_accepts_proportional_prompt_but_rejects_code_and_terminal() {
+        let mut inventory = FontInventory::default();
+        assert!(inventory.families().is_none());
+        inventory.finish(vec![("Arial".into(), false), ("Menlo".into(), true)]);
+        for role in FontRole::ALL {
+            assert_eq!(inventory.accepts(role, "Arial"), !role.monospace());
+            assert!(inventory.accepts(role, "Menlo"));
+            assert!(inventory.accepts(role, ""));
+        }
+        assert!(inventory.accepts(FontRole::Code, "mEnLo"));
+        inventory.finish(Vec::new());
+        assert_eq!(
+            inventory.families().unwrap().len(),
+            2,
+            "inventory stays cached until app reload, like web"
+        );
+        assert!(advances_are_monospace(&[10.; 8]));
+        assert!(!advances_are_monospace(&[10., 11., 10.]));
+        for widths in [&[][..], &[0., 10.], &[f32::NAN, 10.], &[10., f32::INFINITY]] {
+            assert!(advances_are_monospace(widths), "web permits fonts when metrics cannot be probed");
+        }
+    }
 
     #[test]
     fn web_font_stacks_resolve_case_generics_and_order() {

@@ -1,7 +1,6 @@
 //! Add a theme: file, pasted JSON, batch and conflict flows from `ThemeImportDialog.tsx`.
 #[path = "theme_search.rs"]
 mod search_impl;
-use search_impl as theme_search;
 use super::{
     SettingsView,
     controls::{Button, ButtonSize, ButtonVariant, DialogFrame, r},
@@ -12,13 +11,18 @@ use crate::{
     theme::{hsla, palette},
 };
 use gpui::Focusable;
+use gpui_base::input::{EditorState, TextDecoration, TextDecorationCollection};
+use search_impl as theme_search;
+use t3_core::themes::json_field::{JsonHighlight, JsonToken, json_highlights, json_tokens};
+#[derive(Clone)]
+struct ResizeThemeJson;
 use gpui::{
     App, AppContext, Context, Entity, ExternalPaths, FocusHandle, IntoElement, ParentElement,
     Render, Styled, Subscription, Window, div, prelude::*,
 };
 use gpui_component::{
     ActiveTheme, h_flex,
-    input::{Escape, InputEvent, TextareaState},
+    input::{Escape, InputEvent},
     v_flex,
 };
 use t3_core::{
@@ -31,8 +35,13 @@ use t3_core::{
 
 pub(super) struct ThemeImportDialog {
     state: Entity<AppState>,
-    input: Entity<TextareaState>,
+    input: Entity<EditorState>,
     session: ImportSession,
+    tokens: Vec<(std::ops::Range<usize>, JsonToken)>,
+    selection: std::ops::Range<usize>,
+    decorations: TextDecorationCollection,
+    json_height: f32,
+    resize_start: Option<(f32, f32)>,
     open: bool,
     focus: FocusHandle,
     previous: Option<FocusHandle>,
@@ -40,17 +49,43 @@ pub(super) struct ThemeImportDialog {
     saving: bool,
     save_error: Option<String>,
     _subscription: Subscription,
+    _selection_subscription: Subscription,
+    _activation_subscription: Subscription,
     search: theme_search::SearchUi,
     marketplace: Option<t3_core::themes::open_vsx::MarketplaceImport>,
     #[cfg(all(test, feature = "snapshot"))]
-    install_gates: Option<(futures::channel::oneshot::Receiver<()>, futures::channel::oneshot::Receiver<()>)>,
+    install_gates: Option<(
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Receiver<()>,
+    )>,
 }
 impl ThemeImportDialog {
     fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input=cx.new(|cx|TextareaState::new(window,cx).placeholder("{\n  \"version\": 1,\n  \"name\": \"Aurora\",\n  \"appearance\": \"light\",\n  \"colors\": { ... }\n}"));
+        let input = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .searchable(false)
+                .line_number(false)
+                .indent_guides(false)
+                .folding(false)
+                .soft_wrap(true)
+                .scroll_beyond_last_line(Some(0))
+                .placeholder("{\n  \"version\": 1,\n  \"name\": \"Aurora\",\n  \"appearance\": \"light\",\n  \"colors\": { ... }\n}")
+        });
+        let decorations = input.update(cx, |input, cx| {
+            input.create_decorations_collection(Vec::new(), cx)
+        });
+        let selection_subscription = cx.observe_in(&input, window, |this, _, window, cx| {
+            let selection = this.json_selection(window, cx);
+            if this.selection != selection {
+                this.selection = selection;
+                cx.notify();
+            }
+        });
+        let activation_subscription = cx.observe_window_activation(window, |_, _, cx| cx.notify());
         let subscription = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.session.json = input.read(cx).value().to_string();
+                this.tokens = json_tokens(&this.session.json);
             }
             cx.notify();
         });
@@ -60,10 +95,16 @@ impl ThemeImportDialog {
         crate::snapshot::register_focus("theme-json", input.read(cx).focus_handle(cx), cx);
         let search = theme_search::SearchUi::new(window, cx);
         Self {
-            search, marketplace: None,
+            search,
+            marketplace: None,
             state,
             input,
             session: ImportSession::default(),
+            tokens: Vec::new(),
+            selection: 0..0,
+            decorations,
+            json_height: 176.,
+            resize_start: None,
             open: true,
             focus: cx.focus_handle(),
             previous,
@@ -71,13 +112,29 @@ impl ThemeImportDialog {
             saving: false,
             save_error: None,
             _subscription: subscription,
+            _selection_subscription: selection_subscription,
+            _activation_subscription: activation_subscription,
             #[cfg(all(test, feature = "snapshot"))]
             install_gates: None,
         }
     }
+    fn json_selection(&self, window: &mut Window, cx: &mut App) -> std::ops::Range<usize> {
+        self.input.update(cx, |input, cx| {
+            // Marked ranges are UTF-16; only emptiness is needed beside the byte-based selection.
+            if gpui::EntityInputHandler::marked_text_range(input, window, cx)
+                .is_some_and(|range| !range.is_empty())
+            {
+                0..0
+            } else {
+                input.selected_range()
+            }
+        })
+    }
     #[cfg(feature = "snapshot")]
     fn fixture(&mut self, value: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
-        if value.get("search").is_some() { self.search_fixture(&value["search"], window, cx); }
+        if value.get("search").is_some() {
+            self.search_fixture(&value["search"], window, cx);
+        }
         if let Some(json) = value["json"].as_str() {
             self.session.json = json.into();
             self.sync_input(window, cx);
@@ -102,6 +159,10 @@ impl ThemeImportDialog {
     pub(super) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
+        }
+        if self.search.dismiss_update() {
+            self.search.focus(window, cx);
+            return cx.notify();
         }
         self.search.cancel();
         self.session.cancel();
@@ -188,12 +249,17 @@ impl ThemeImportDialog {
         .detach();
     }
     fn sync_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tokens = json_tokens(&self.session.json);
         self.input.update(cx, |input, cx| {
             input.set_value(self.session.json.clone(), window, cx)
         });
     }
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.search.session_installing() || self.session.reading || self.session.json.trim().is_empty() {
+        if self.saving
+            || self.search.session_installing()
+            || self.session.reading
+            || self.session.json.trim().is_empty()
+        {
             return;
         }
         if let Some(error) = importer::oversized(self.session.json.encode_utf16().count() as u64) {
@@ -366,7 +432,12 @@ impl ThemeImportDialog {
         let marketplace = self.marketplace.take().is_some();
         self.save_error = None;
         self.session.conflicts.clear();
-        if marketplace { self.search.focus(window, cx); self.settle_search(false, window, cx); } else { self.focus_form(window, cx); }
+        if marketplace {
+            self.search.focus(window, cx);
+            self.settle_search(false, window, cx);
+        } else {
+            self.focus_form(window, cx);
+        }
         cx.notify();
     }
     fn resolve(
@@ -377,11 +448,16 @@ impl ThemeImportDialog {
     ) {
         if let Some(import) = self.marketplace.clone() {
             self.install(InstallOperation::Marketplace(import, choice), window, cx);
-        } else { self.install(InstallOperation::Conflicts(choice), window, cx); }
+        } else {
+            self.install(InstallOperation::Conflicts(choice), window, cx);
+        }
     }
 }
 enum InstallOperation {
-    Marketplace(t3_core::themes::open_vsx::MarketplaceImport, themes::ImportChoice),
+    Marketplace(
+        t3_core::themes::open_vsx::MarketplaceImport,
+        themes::ImportChoice,
+    ),
     Single(ThemeDefinition),
     Batch(importer::Batch),
     Conflicts(themes::ImportChoice),
@@ -406,8 +482,31 @@ fn prepare_import(
     let mut result = match operation {
         InstallOperation::Marketplace(import, choice) => {
             return match import.prepare(doc, choice) {
-                Ok((patch, installed)) => PreparedImport {session, result: Installed {library: None, installed, close: true}, patch, updated: !import.expected.is_empty(), single: false},
-                Err(error) => { session.error = Some(error); PreparedImport {session, result: Installed {library: None, installed: Vec::new(), close: false}, patch: Default::default(), updated: false, single: false} }
+                Ok((patch, installed)) => PreparedImport {
+                    session,
+                    result: Installed {
+                        library: None,
+                        installed,
+                        close: true,
+                    },
+                    patch,
+                    updated: !import.expected.is_empty(),
+                    single: false,
+                },
+                Err(error) => {
+                    session.error = Some(error);
+                    PreparedImport {
+                        session,
+                        result: Installed {
+                            library: None,
+                            installed: Vec::new(),
+                            close: false,
+                        },
+                        patch: Default::default(),
+                        updated: false,
+                        single: false,
+                    }
+                }
             };
         }
         InstallOperation::Single(theme) => {
@@ -458,7 +557,32 @@ impl Render for ThemeImportDialog {
         }
         let p = palette(cx);
         let mut body = v_flex().gap(r(16.));
-        if !self.session.conflicts.is_empty() || self.marketplace.is_some() {
+        if let Some(extension) = self.search.pending_update().cloned() {
+            body = body
+                .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(
+                    "This replaces its installed variants, including any local edits. Variants no longer in the extension will be removed.",
+                ))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(r(8.))
+                        .child(
+                            Button::new("theme-update-cancel", ButtonVariant::Outline, ButtonSize::Default)
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.search.dismiss_update();
+                                    this.search.focus(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("theme-update-confirm", ButtonVariant::Default, ButtonSize::Default)
+                                .label("Update theme")
+                                .focus_handle(self.conflict_focus.clone())
+                                .on_click(cx.listener(move |this, _, window, cx| this.download_theme(extension.clone(), true, window, cx))),
+                        ),
+                );
+        } else if !self.session.conflicts.is_empty() || self.marketplace.is_some() {
             body = body
                 .child(
                     v_flex()
@@ -527,7 +651,12 @@ impl Render for ThemeImportDialog {
                         ),
                 );
         } else {
-            body = body.child(self.search_section(window, cx)).child(div().text_xs().text_color(hsla(p.muted_foreground)).child("or import a file"));
+            body = body.child(self.search_section(window, cx)).child(
+                div()
+                    .text_xs()
+                    .text_color(hsla(p.muted_foreground))
+                    .child("or import a file"),
+            );
             body = body
                 .child(
                     h_flex()
@@ -578,7 +707,11 @@ impl Render for ThemeImportDialog {
                             } else {
                                 "Choose files"
                             })
-                            .disabled(self.session.reading || self.saving || self.search.session_installing())
+                            .disabled(
+                                self.session.reading
+                                    || self.saving
+                                    || self.search.session_installing(),
+                            )
                             .on_click(cx.listener(|this, _, window, cx| this.pick(window, cx))),
                         ),
                 )
@@ -594,6 +727,47 @@ impl Render for ThemeImportDialog {
                         .child(ThemeJsonField {
                             input: self.input.clone(),
                             disabled: self.saving || self.search.session_installing(),
+                            height: self.json_height,
+                            grip: div()
+                                .id("theme-json-resize")
+                                .absolute()
+                                .bottom_0()
+                                .right_0()
+                                .size(r(16.))
+                                .cursor_row_resize()
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                                        this.resize_start =
+                                            Some((f32::from(event.position.y), this.json_height));
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_drag(ResizeThemeJson, |_, _, _, cx| cx.new(|_| gpui::EmptyView))
+                                .child(
+                                    gpui::canvas(
+                                        |_, _, _| (),
+                                        move |bounds, _, window, _| {
+                                            let scale = f32::from(window.rem_size()) / 16.;
+                                            let mut path = gpui::PathBuilder::stroke(gpui::px(1.));
+                                            for offset in [6., 10.] {
+                                                path.move_to(gpui::point(
+                                                    bounds.right() - gpui::px(offset * scale),
+                                                    bounds.bottom() - gpui::px(3. * scale),
+                                                ));
+                                                path.line_to(gpui::point(
+                                                    bounds.right() - gpui::px(3. * scale),
+                                                    bounds.bottom() - gpui::px(offset * scale),
+                                                ));
+                                            }
+                                            if let Ok(path) = path.build() {
+                                                window.paint_path(path, hsla(p.muted_foreground));
+                                            }
+                                        },
+                                    )
+                                    .size_full(),
+                                )
+                                .into_any_element(),
                         }),
                 )
                 .child(
@@ -621,7 +795,8 @@ impl Render for ThemeImportDialog {
                             .disabled(
                                 self.session.json.trim().is_empty()
                                     || self.session.reading
-                                    || self.saving || self.search.session_installing(),
+                                    || self.saving
+                                    || self.search.session_installing(),
                             )
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                         ),
@@ -648,18 +823,78 @@ impl Render for ThemeImportDialog {
                     .child(errors),
             );
         }
+        let selection = if window.is_window_active()
+            && self.input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            self.json_selection(window, cx)
+        } else {
+            0..0
+        };
+        self.decorations.set(
+            json_highlights(&self.tokens, selection)
+                .into_iter()
+                .map(|(range, kind)| {
+                    TextDecoration::new(
+                        range,
+                        gpui::HighlightStyle {
+                            color: Some(hsla(match kind {
+                                JsonHighlight::Syntax(JsonToken::Key) => p.theme_json_key,
+                                JsonHighlight::Syntax(JsonToken::String) => p.theme_json_string,
+                                JsonHighlight::Syntax(JsonToken::Number) => p.theme_json_number,
+                                JsonHighlight::Syntax(JsonToken::Literal) => p.theme_json_literal,
+                                JsonHighlight::Selection => p.primary_foreground,
+                            })),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            cx,
+        );
         let weak = cx.entity().downgrade();
         let frame = DialogFrame {
             id: "theme-import-dialog",
-            title: "Add a theme".into(),
+            title: self
+                .search
+                .pending_update()
+                .map(|extension| format!("Update “{}”?", extension.name))
+                .unwrap_or_else(|| "Add a theme".into())
+                .into(),
             description: "".into(),
-            max_width: 768.,
+            max_width: if self.search.pending_update().is_some() {
+                512.
+            } else {
+                768.
+            },
             body: body.into_any_element(),
             footer: div().into_any_element(),
             focus: self.focus.clone(),
         };
         div()
             .key_context("SettingsModal")
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<ResizeThemeJson>, window, cx| {
+                    if let Some((start_y, height)) = this.resize_start {
+                        let scale = f32::from(window.rem_size()) / 16.;
+                        this.json_height = (height
+                            + (f32::from(event.event.position.y) - start_y) / scale)
+                            .max(176.);
+                        cx.notify();
+                    }
+                },
+            ))
+            .capture_action(
+                cx.listener(|this, _: &gpui_base::input::Enter, window, cx| {
+                    if this.input.read(cx).focus_handle(cx).is_focused(window)
+                        && !this.saving
+                        && !this.search.session_installing()
+                    {
+                        this.input
+                            .update(cx, |input, cx| input.replace("\n", window, cx));
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .capture_action(
                 cx.listener(|this, _: &gpui_base::input::IndentInline, window, cx| {
                     this.cycle_focus(true, window, cx);
@@ -685,7 +920,12 @@ impl Render for ThemeImportDialog {
                 }),
             )
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                this.close(window, cx);
+                if this.search.dismiss_update() {
+                    this.search.focus(window, cx);
+                    cx.notify();
+                } else {
+                    this.close(window, cx);
+                }
                 cx.stop_propagation();
             }))
             .child(frame.render_modal(
@@ -701,8 +941,10 @@ impl Render for ThemeImportDialog {
 }
 #[derive(IntoElement)]
 struct ThemeJsonField {
-    input: Entity<TextareaState>,
+    input: Entity<EditorState>,
     disabled: bool,
+    height: f32,
+    grip: gpui::AnyElement,
 }
 impl gpui::RenderOnce for ThemeJsonField {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -734,7 +976,7 @@ impl gpui::RenderOnce for ThemeJsonField {
                 muted_foreground: hsla(p.muted_foreground),
                 background: hsla(p.background),
                 border: hsla(p.input),
-                selection: cx.theme().selection,
+                selection: hsla(p.primary),
                 caret: hsla(p.foreground),
                 ..Default::default()
             });
@@ -755,7 +997,9 @@ impl gpui::RenderOnce for ThemeJsonField {
                     }
                 })
             })
-            .h(r(176.))
+            .h(r(self.height))
+            .relative()
+            .overflow_hidden()
             .w_full()
             .rounded(r(12.))
             .border_1()
@@ -776,7 +1020,17 @@ impl gpui::RenderOnce for ThemeJsonField {
             ))
             .text_size(r(12.))
             .line_height(r(20.))
-            .child(gpui_base::input::Textarea::new(&self.input))
+            .child(
+                // GPUI reserves 10px even with line numbers hidden.
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(gpui::px(-10.))
+                    .right_0()
+                    .child(self.input.clone()),
+            )
+            .when(!self.disabled, |v| v.child(self.grip))
     }
 }
 
@@ -813,7 +1067,7 @@ pub(crate) fn fixture(
 #[cfg(all(test, feature = "snapshot"))]
 mod tests {
     use super::*;
-    use gpui::{KeyBinding, TestAppContext};
+    use gpui::{EntityInputHandler, KeyBinding, TestAppContext};
     use serde_json::json;
     fn setup(
         cx: &mut TestAppContext,
@@ -831,8 +1085,11 @@ mod tests {
         t3_client::store::use_home(home.clone());
         let _ = t3_client::store::commit_client_settings(serde_json::Map::new());
         let settings = home.join("settings.json");
-        if settings.is_dir() { std::fs::remove_dir_all(settings).unwrap(); }
-        else if settings.exists() { std::fs::remove_file(settings).unwrap(); }
+        if settings.is_dir() {
+            std::fs::remove_dir_all(settings).unwrap();
+        } else if settings.exists() {
+            std::fs::remove_file(settings).unwrap();
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -867,6 +1124,86 @@ mod tests {
         }
     }
     #[gpui::test]
+    fn ime_clause_selection_is_hidden_until_composition_ends(cx: &mut TestAppContext) {
+        let (_runtime, state, _home) = setup(cx);
+        let text = r#"{"name":"é😀"}"#;
+        let byte_start = text.find('😀').unwrap();
+        let clause = byte_start..byte_start + '😀'.len_utf8();
+        let utf16_start = text[..byte_start].encode_utf16().count();
+        let window = cx.add_window(|window, cx| ThemeImportDialog::new(state.clone(), window, cx));
+        window
+            .update(cx, |view, window, cx| {
+                view.session.json = text.into();
+                view.sync_input(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_selected_range(clause.clone(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.selection, clause);
+                view.input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(
+                        Some(utf16_start..utf16_start + 2),
+                        "😀",
+                        Some(0..2),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(input.selected_range(), clause);
+                    assert_eq!(
+                        input.marked_text_range(window, cx),
+                        Some(utf16_start..utf16_start + 2)
+                    );
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    view.selection.is_empty(),
+                    "IME clause selection has no selection background"
+                );
+                view.input.update(cx, |input, cx| {
+                    input.unmark_text(window, cx);
+                    input.set_selected_range(clause.clone(), cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.selection, clause);
+                view.input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(
+                        Some(utf16_start..utf16_start + 2),
+                        "😀",
+                        Some(0..2),
+                        window,
+                        cx,
+                    );
+                    input.replace_text_in_range(None, "😀", window, cx);
+                    assert!(input.marked_text_range(window, cx).is_none());
+                    assert!(input.selected_range().is_empty());
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.selection.is_empty());
+                assert_eq!(view.input.read(cx).value().as_str(), text);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
     fn tab_leaves_json_and_keyboard_conflict_back_restores_editor(cx: &mut TestAppContext) {
         let (_runtime, state, _home) = setup(cx);
         let window = cx.add_window(|window, cx| ThemeImportDialog::new(state.clone(), window, cx));
@@ -876,9 +1213,9 @@ mod tests {
                 view.sync_input(window, cx);
                 let theme = themes::import(&source()).unwrap();
                 let library = themes::install(store::client(cx), &theme).unwrap();
-                let patch=serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), library)]);
+                let patch = serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(), library)]);
                 t3_client::store::commit_client_settings(patch.clone()).unwrap();
-                store::install_committed_client(&state,patch,cx);
+                store::install_committed_client(&state, patch, cx);
                 view.input.update(cx, |input, cx| input.focus(window, cx));
             })
             .unwrap();
@@ -1039,11 +1376,20 @@ mod tests {
         }
     }
     #[gpui::test]
-    fn single_batch_marketplace_and_conflict_stay_open_when_the_settings_write_fails(cx: &mut TestAppContext) {
+    fn single_batch_marketplace_and_conflict_stay_open_when_the_settings_write_fails(
+        cx: &mut TestAppContext,
+    ) {
         fn marketplace() -> themes::open_vsx::MarketplaceImport {
             let mut theme = themes::import(&source()).unwrap();
-            theme.collection = Some(themes::Collection { id: "open-vsx:demo.theme".into(), label: "Demo".into() });
-            themes::open_vsx::MarketplaceImport { collection_id: "open-vsx:demo.theme".into(), expected: Vec::new(), themes: vec![theme] }
+            theme.collection = Some(themes::Collection {
+                id: "open-vsx:demo.theme".into(),
+                label: "Demo".into(),
+            });
+            themes::open_vsx::MarketplaceImport {
+                collection_id: "open-vsx:demo.theme".into(),
+                expected: Vec::new(),
+                themes: vec![theme],
+            }
         }
         let (_runtime, state, home) = setup(cx);
         std::fs::create_dir_all(home.join("settings.json")).unwrap();
@@ -1063,7 +1409,14 @@ mod tests {
                                 importer::parse_batch(vec![("dusk.json".into(), Ok(source()))]);
                             view.install(InstallOperation::Batch(batch), window, cx);
                         }
-                        3 => view.install(InstallOperation::Marketplace(marketplace(), themes::ImportChoice::Update), window, cx),
+                        3 => view.install(
+                            InstallOperation::Marketplace(
+                                marketplace(),
+                                themes::ImportChoice::Update,
+                            ),
+                            window,
+                            cx,
+                        ),
                         _ => {
                             let library = themes::install(store::client(cx), &theme).unwrap();
                             store::install_committed_client(
@@ -1093,25 +1446,51 @@ mod tests {
                 .unwrap();
             if mode == 3 {
                 std::fs::remove_dir_all(home.join("settings.json")).unwrap();
-                window.update(cx, |view, window, cx| {
-                    view.install(InstallOperation::Marketplace(marketplace(), themes::ImportChoice::Update), window, cx);
-                }).unwrap();
+                window
+                    .update(cx, |view, window, cx| {
+                        view.install(
+                            InstallOperation::Marketplace(
+                                marketplace(),
+                                themes::ImportChoice::Update,
+                            ),
+                            window,
+                            cx,
+                        );
+                    })
+                    .unwrap();
                 cx.run_until_parked();
-                window.update(cx, |view, _, cx| {
-                    assert!(!view.open);
-                    assert!(view.save_error.is_none());
-                    assert_eq!(themes::library(store::client(cx)).len(), 1);
-                }).unwrap();
-                let stored = t3_core::client_settings::ClientSettingsDoc::from_json(&t3_client::store::load_client_settings().unwrap());
-                assert_eq!(themes::open_vsx::stored_collection(&stored, "open-vsx:demo.theme").len(), 1);
+                window
+                    .update(cx, |view, _, cx| {
+                        assert!(!view.open);
+                        assert!(view.save_error.is_none());
+                        assert_eq!(themes::library(store::client(cx)).len(), 1);
+                    })
+                    .unwrap();
+                let stored = t3_core::client_settings::ClientSettingsDoc::from_json(
+                    &t3_client::store::load_client_settings().unwrap(),
+                );
+                assert_eq!(
+                    themes::open_vsx::stored_collection(&stored, "open-vsx:demo.theme").len(),
+                    1
+                );
                 std::fs::remove_file(home.join("settings.json")).unwrap();
                 std::fs::create_dir_all(home.join("settings.json")).unwrap();
             }
             last = Some(window);
         }
         std::fs::remove_dir_all(home.join("settings.json")).unwrap();
-        let baseline=cx.read(|cx|store::client(cx).entries().get(themes::LIBRARY_KEY).cloned().unwrap());
-        t3_client::store::commit_client_settings(serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(),baseline)])).unwrap();
+        let baseline = cx.read(|cx| {
+            store::client(cx)
+                .entries()
+                .get(themes::LIBRARY_KEY)
+                .cloned()
+                .unwrap()
+        });
+        t3_client::store::commit_client_settings(serde_json::Map::from_iter([(
+            themes::LIBRARY_KEY.into(),
+            baseline,
+        )]))
+        .unwrap();
         let window = last.unwrap();
         window
             .update(cx, |view, window, cx| {

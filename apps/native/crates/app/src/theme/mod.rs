@@ -117,12 +117,8 @@ pub fn set_preferences(preferences: Preferences, cx: &mut App) {
     if state.preferences == preferences {
         return;
     }
-    let families_changed = state.preferences.typography.families != preferences.typography.families;
     state.preferences = preferences;
     state.saved = None;
-    if families_changed {
-        cache_font_inventory(cx);
-    }
     install(cx);
     let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);

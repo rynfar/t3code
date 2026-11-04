@@ -894,6 +894,16 @@ const COLOR_TOKENS: readonly ColorToken[] = [
     web: "--app-chrome-background",
     css: v("--app-chrome-background"),
   },
+  ...[
+    ["key", "accent", "blue-600"],
+    ["string", "message-action", "emerald-600"],
+    ["number", "secondary-foreground", "amber-600"],
+    ["literal", "accent-surface-foreground", "violet-600"],
+  ].map(([kind, role, fallback]) => ({
+    name: `theme_json_${kind}`,
+    web: `settings/ThemeImportDialog.tsx --app-theme-${role}`,
+    css: `var(--app-theme-${role}, var(--color-${fallback}))`,
+  })),
   { name: "background", web: "--background", css: v("--background") },
   { name: "foreground", web: "--color-foreground", css: v("--contrast-foreground") },
   { name: "surface_raised", web: "--surface-raised", css: v("--surface-raised") },
