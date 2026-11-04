@@ -103,6 +103,16 @@ fn pending_questions_need_their_turn_item_and_message_mode_is_dismissible() {
     assert!(input.dismissible && input.can_respond());
     assert!(!input.questions[0].multi_select);
     assert_eq!(input.questions[0].options[1].answer_value(), "blue");
+    let mut settled = projection.clone();
+    for request in &mut settled.runtime_requests { request.value["status"] = json!("resolved"); }
+    let before = crate::composer::attachments::question_revision(&settled);
+    let mut send = crate::composer::attachments::PendingSend::default();
+    let generation = send.begin();
+    settled.runtime_requests.push(serde_json::from_value(request("q4", "user_input", "resolved", live(false), T)).unwrap());
+    assert!(pending_requests(&settled).user_inputs.is_empty());
+    assert_ne!(before, crate::composer::attachments::question_revision(&settled));
+    send.cancel();
+    assert!(!send.finish(generation));
 }
 
 fn question(multi: bool, custom: Option<bool>, initial: Option<&str>) -> Question {

@@ -7,6 +7,9 @@
 //! into a file (`client-runtime/src/textPaste.ts`), and the attachment-only prompt
 //! (`shared/src/composerContextReferences.ts`).
 
+mod lifecycle;
+pub use lifecycle::{PendingSend, UploadAttempts, question_revision};
+
 use serde_json::{Value, json};
 
 use crate::usage::format::to_fixed;

@@ -231,7 +231,7 @@ pub(crate) fn attachment_shell(record: &Value, attachment: &Value, state: &Entit
     let (mut shell, _) = shell(record, state, false, cx);
     if let Some(size) = t3_core::media::attachment_size_label(record, attachment) {
         let tooltip = format!("{}\n{size}", field(record, "name"));
-        shell = shell.child(div().flex_shrink_0().text_size(px(10.)).child(size))
+        shell = shell.child(div().flex_shrink_0().text_size(crate::theme::rem(crate::theme::metrics::TEXT_3XS)).child(size))
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
     }
     shell
