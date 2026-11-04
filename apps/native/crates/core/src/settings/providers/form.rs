@@ -13,6 +13,10 @@ pub struct Field {
     pub description: String,
     pub placeholder: String,
     pub secret: bool,
+    pub control: String,
+    #[serde(rename = "acceptsSecretReference")]
+    pub accepts_secret_reference: bool,
+    pub validation: HashMap<String, bool>,
     pub persist: bool,
     pub options: Vec<(String, String)>,
 }
@@ -42,6 +46,7 @@ pub fn managed_runtime(
     instance: &ProviderInstanceConfig,
     provider: Option<&crate::server_config::ServerProvider>,
     executable: Option<&str>,
+    install_failed: bool,
 ) -> Vec<(Field, String)> {
     let paths = provider.and_then(|p| p.runtime_paths.as_ref());
     fields(&instance.driver, instance.config.as_ref())
@@ -51,7 +56,7 @@ pub fn managed_runtime(
             let value = match field.key.as_str() {
                 "binaryPath" => {
                     field.description = "Selected by T3 Code.".into();
-                    field.placeholder = "Not installed".into();
+                    field.placeholder = if install_failed { "Could not read runtime path" } else { "Not installed" }.into();
                     executable.unwrap_or("").to_owned()
                 }
                 "homePath" => {
@@ -77,9 +82,6 @@ pub fn managed_runtime(
 }
 
 pub fn validate_field(driver: &str, key: &str, value: &Value) -> bool {
-    if key.starts_with("commandArgs:") {
-        return driver == "acpRegistry" && value.is_string();
-    }
     if key == "commandArgs" {
         return value.as_array().is_some_and(|args| args.iter().all(Value::is_string));
     }
@@ -103,19 +105,6 @@ pub fn with_field(instance: &ProviderInstanceConfig, key: &str, value: Value) ->
         return instance.clone();
     }
     let mut config = instance.config.as_ref().and_then(Value::as_object).cloned().unwrap_or_default();
-    if let Some(index) = key.strip_prefix("commandArgs:").and_then(|s| s.parse::<usize>().ok()) {
-        let mut args = command_args(instance);
-        if let Some(arg) = args.get_mut(index) {
-            *arg = value.as_str().unwrap_or("").to_owned();
-        } else {
-            return instance.clone();
-        }
-        config.insert("commandArgs".into(), json!(args));
-        return ProviderInstanceConfig {
-            config: Some(Value::Object(config)),
-            ..instance.clone()
-        };
-    }
     let persist = FIELDS.get(&instance.driver).into_iter().flatten().any(|f| f.key == key && f.persist);
     if !persist && value.as_str().is_some_and(|s| s.trim().is_empty()) {
         config.remove(key);
@@ -138,32 +127,7 @@ pub fn command_args(instance: &ProviderInstanceConfig) -> Vec<String> {
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect()
 }
-pub fn edit_command_arguments(instance: &ProviderInstanceConfig, remove: Option<usize>) -> ProviderInstanceConfig {
-    let mut args = command_args(instance);
-    match remove {
-        Some(index) if index < args.len() => {
-            args.remove(index);
-        }
-        Some(_) => return instance.clone(),
-        None => args.push(String::new()),
-    }
-    with_field(instance, "commandArgs", json!(args))
-}
-pub fn argument_field(index: usize) -> Field {
-    Field {
-        key: format!("commandArgs:{index}"),
-        label: format!("Argument {}", index + 1),
-        description: String::new(),
-        placeholder: String::new(),
-        secret: false,
-        persist: true,
-        options: vec![],
-    }
-}
 pub fn field_value(instance: &ProviderInstanceConfig, key: &str) -> Value {
-    if let Some(index) = key.strip_prefix("commandArgs:").and_then(|s| s.parse::<usize>().ok()) {
-        return command_args(instance).get(index).map_or(Value::Null, |v| json!(v));
-    }
     instance.config.as_ref().and_then(|c| c.get(key)).cloned().unwrap_or(Value::Null)
 }
 
@@ -316,6 +280,134 @@ pub fn edit_variable(row: &Value, edit: VariableEdit) -> Value {
     next
 }
 
+#[derive(Clone, Copy)]
+pub enum EditTarget {
+    Runtime,
+    Environment,
+}
+pub fn allows_edit(instance: &ProviderInstanceConfig, target: EditTarget) -> bool {
+    !(instance.driver == "codex" && super::chatgpt::managed(instance.config.as_ref()) && matches!(target, EditTarget::Runtime))
+}
+pub fn variable_sensitive(driver: &str, row: &Value) -> bool {
+    row["sensitive"] == true || dedicated_field(driver).is_some_and(|(name, _, _)| row["name"] == name)
+}
+#[derive(Default)]
+pub struct SecretSourceDraft {
+    pending_provider: Option<String>,
+}
+impl SecretSourceDraft {
+    pub fn provider<'a>(&'a self, row: &'a Value) -> Option<&'a str> {
+        self.pending_provider.as_deref().or_else(|| row["value"]["provider"].as_str())
+    }
+    pub fn reference<'a>(&self, row: &'a Value) -> &'a str {
+        if self.provider(row) == row["value"]["provider"].as_str() {
+            row["value"]["reference"].as_str().unwrap_or("")
+        } else {
+            ""
+        }
+    }
+    pub fn select(&mut self, row: &mut Value, provider: Option<String>) -> bool {
+        let stored = provider.is_none();
+        self.pending_provider = provider.filter(|p| row["value"]["provider"].as_str() != Some(p.as_str()));
+        if stored && row["value"].is_object() {
+            row["value"] = json!("");
+            if let Some(row) = row.as_object_mut() {
+                row.remove("valueRedacted");
+            }
+            return true;
+        }
+        false
+    }
+    pub fn commit(&mut self, row: &mut Value, text: &str, one_password: bool) -> Result<bool, &'static str> {
+        if text.trim().is_empty() {
+            if self.pending_provider.is_none() && row["value"].is_object() {
+                row["value"] = json!("");
+                if let Some(row) = row.as_object_mut() {
+                    row.remove("valueRedacted");
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if !valid_reference(text) || (one_password && !valid_one_password_reference(text)) {
+            return Err(if one_password {
+                "Use a 1Password reference like op://vault/item/field."
+            } else {
+                "Enter a valid secret reference."
+            });
+        }
+        let Some(provider) = self.provider(row).map(str::to_owned) else {
+            return Ok(false);
+        };
+        row["value"] = json!({"provider":provider,"reference":text.trim()});
+        if let Some(row) = row.as_object_mut() {
+            row.remove("valueRedacted");
+        }
+        self.pending_provider = None;
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArgumentRow {
+    pub id: usize,
+    pub value: String,
+}
+#[derive(Default)]
+pub struct ArgumentsDraft {
+    pub rows: Vec<ArgumentRow>,
+    seen: Vec<String>,
+    pending: Vec<Vec<String>>,
+    next_id: usize,
+}
+pub enum ArgumentEdit {
+    Add,
+    Remove(usize),
+    Value(usize, String),
+}
+impl ArgumentsDraft {
+    pub fn reconcile(&mut self, incoming: Vec<String>) {
+        if self.seen == incoming {
+            return;
+        }
+        if let Some(index) = self.pending.iter().position(|p| p == &incoming) {
+            self.pending.drain(..=index);
+            self.seen = incoming;
+            return;
+        }
+        self.seen = incoming.clone();
+        self.pending.clear();
+        self.rows = incoming
+            .into_iter()
+            .map(|value| {
+                let id = self.next_id;
+                self.next_id += 1;
+                ArgumentRow { id, value }
+            })
+            .collect();
+    }
+    pub fn edit(&mut self, edit: ArgumentEdit) -> Option<Vec<String>> {
+        match edit {
+            ArgumentEdit::Add => {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.rows.push(ArgumentRow { id, value: String::new() });
+            }
+            ArgumentEdit::Remove(id) => {
+                let index = self.rows.iter().position(|r| r.id == id)?;
+                self.rows.remove(index);
+            }
+            ArgumentEdit::Value(id, value) => {
+                let row = self.rows.iter_mut().find(|r| r.id == id && r.value != value)?;
+                row.value = value;
+            }
+        }
+        let values = self.rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>();
+        self.pending.push(values.clone());
+        Some(values)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,13 +468,18 @@ mod tests {
             json!({"patch":{},"providerInstanceMutation":{"operation":"upsert","instanceId":"cursor","instance":{"driver":"cursor","config":{"binaryPath":"legacy","unknown":7},"environment":wire_rows}}})
         );
         assert_eq!(with_environment(&next, vec![]).environment, None);
+        let managed = ProviderInstanceConfig {
+            driver: "codex".into(),
+            ..Default::default()
+        };
+        assert_eq!(managed_runtime(&managed, None, None, true)[0].0.placeholder, "Could not read runtime path");
         let provider:crate::server_config::ServerProvider=serde_json::from_value(json!({"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"ready","runtimePaths":{"homePath":"/shared/codex","shadowHomePath":"/account/codex"}})).unwrap();
         let instance = ProviderInstanceConfig {
             driver: "codex".into(),
             ..Default::default()
         };
         assert_eq!(
-            managed_runtime(&instance, Some(&provider), Some("/managed/codex"))
+            managed_runtime(&instance, Some(&provider), Some("/managed/codex"), false)
                 .iter()
                 .map(|(f, value)| (f.key.as_str(), value.as_str()))
                 .collect::<Vec<_>>(),
@@ -443,22 +540,23 @@ mod tests {
         assert!(!valid_reference("line\nbreak"));
         assert!(valid_one_password_reference("op://vault/item/field"));
         assert!(!valid_one_password_reference("op://vault//field"));
-        let local = ProviderInstanceConfig {
-            driver: "acpRegistry".into(),
-            config: Some(json!({"source":"local","commandArgs":["literal space", ""],"future":1})),
-            ..Default::default()
-        };
-        assert_eq!(
-            with_field(&local, "commandArgs:1", json!(" ")).config,
-            Some(json!({"source":"local","commandArgs":["literal space"," "],"future":1}))
-        );
-        let added = super::super::InstanceEdit::AddCommandArgument.apply(&local);
-        let twice = super::super::InstanceEdit::AddCommandArgument.apply(&added);
-        assert_eq!(command_args(&twice), vec!["literal space", "", "", ""]);
-        assert_eq!(
-            command_args(&super::super::InstanceEdit::RemoveCommandArgument(0).apply(&twice)),
-            vec!["", "", ""]
-        );
+        for (driver, fields) in FIELDS.iter() {
+            for field in fields {
+                assert!(!field.accepts_secret_reference);
+                assert!(matches!(field.control.as_str(), "text" | "password" | "select"));
+                for (input, accepted) in &field.validation {
+                    if !field.persist && input.trim().is_empty() {
+                        continue;
+                    }
+                    assert_eq!(
+                        validate_field(driver, &field.key, &json!(input)),
+                        *accepted,
+                        "{driver}.{}: {input:?}",
+                        field.key
+                    );
+                }
+            }
+        }
         assert!(fields("cursor", None).is_empty());
         assert_eq!(
             fields("acpRegistry", Some(&json!({"source":"local"})))
@@ -467,5 +565,71 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ACP source", "Executable"]
         );
+    }
+    #[test]
+    fn dedicated_keys_and_managed_environment_use_their_field_classification() {
+        for (driver, name) in [("kiro", "KIRO_API_KEY"), ("cursor", "CURSOR_API_KEY")] {
+            assert!(variable_sensitive(driver, &json!({"name":name,"value":"fake","sensitive":false})));
+        }
+        let managed = ProviderInstanceConfig {
+            driver: "codex".into(),
+            config: Some(json!({"setupMode":"managed"})),
+            ..Default::default()
+        };
+        assert!(allows_edit(&managed, EditTarget::Environment));
+        assert!(!allows_edit(&managed, EditTarget::Runtime));
+    }
+    #[test]
+    fn exploring_another_secret_source_keeps_the_saved_reference_until_commit() {
+        let saved = json!({"name":"TOKEN","value":{"provider":"A","reference":"op://v/i/f"},"sensitive":true});
+        let mut row = saved.clone();
+        let mut draft = SecretSourceDraft::default();
+        assert!(!draft.select(&mut row, Some("B".into())));
+        assert!(!draft.commit(&mut row, "", true).unwrap());
+        assert_eq!(row, saved);
+        assert!(draft.commit(&mut row, "invalid", true).is_err());
+        assert_eq!(row, saved);
+        assert!(!draft.select(&mut row, Some("A".into())));
+        assert_eq!(draft.reference(&row), "op://v/i/f");
+        assert!(!draft.select(&mut row, Some("B".into())));
+        assert!(draft.commit(&mut row, "op://other/item/field", true).unwrap());
+        assert_eq!(row["value"], json!({"provider":"B","reference":"op://other/item/field"}));
+        assert!(draft.commit(&mut row, "", true).unwrap());
+        assert_eq!(row["value"], json!(""));
+    }
+    #[test]
+    fn removing_an_argument_then_editing_the_displayed_next_row_keeps_the_target() {
+        for args in [vec!["a", "b"], vec!["a", "b", "c"]] {
+            let original = ProviderInstanceConfig {
+                driver: "acpRegistry".into(),
+                config: Some(json!({"source":"local","commandArgs":args})),
+                ..Default::default()
+            };
+            let mut draft = ArgumentsDraft::default();
+            draft.reconcile(command_args(&original));
+            let a = draft.rows[0].id;
+            let b = draft.rows[1].id;
+            let removed_value = draft.edit(ArgumentEdit::Remove(a)).unwrap();
+            let edited_value = draft.edit(ArgumentEdit::Value(b, "B".into())).unwrap();
+            draft.reconcile(removed_value.clone());
+            assert_eq!(draft.rows[0].id, b);
+            assert_eq!(draft.rows[0].value, "B");
+            let removed = with_field(&original, "commandArgs", json!(removed_value));
+            let edited = with_field(&removed, "commandArgs", json!(edited_value));
+            draft.reconcile(command_args(&edited));
+            assert_eq!(draft.rows[0].id, b);
+            assert!(draft.edit(ArgumentEdit::Value(a, "removed".into())).is_none());
+            let lower = draft.edit(ArgumentEdit::Value(b, "b".into())).unwrap();
+            let upper = draft.edit(ArgumentEdit::Value(b, "B".into())).unwrap();
+            draft.reconcile(command_args(&edited));
+            draft.reconcile(lower);
+            assert_eq!(draft.rows[0].id, b);
+            assert_eq!(draft.rows[0].value, "B");
+            draft.reconcile(upper);
+            assert_eq!(draft.rows[0].id, b);
+            let mut expected = args[1..].to_vec();
+            expected[0] = "B";
+            assert_eq!(command_args(&edited), expected);
+        }
     }
 }

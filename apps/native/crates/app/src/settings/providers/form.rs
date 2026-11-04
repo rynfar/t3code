@@ -28,16 +28,23 @@ struct FieldInput {
 }
 struct VariableInput {
     id: usize,
-    source: Option<String>,
+    source: form::SecretSourceDraft,
     raw: Value,
     name: Entity<InputState>,
     value: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
+struct ArgumentInput {
+    id: usize,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
 #[derive(Default)]
 pub(super) struct FormState {
     instance_id: String,
     fields: Vec<FieldInput>,
+    arguments: form::ArgumentsDraft,
+    argument_inputs: Vec<ArgumentInput>,
     variables: Vec<VariableInput>,
     seen: Vec<Value>,
     published: Option<Vec<Value>>,
@@ -52,6 +59,7 @@ impl FormState {
             .iter()
             .map(|f| &f.input)
             .chain(self.variables.iter().flat_map(|v| [&v.name, &v.value]))
+            .chain(self.argument_inputs.iter().map(|a| &a.input))
             .collect()
     }
 }
@@ -67,6 +75,17 @@ impl SettingsView {
             .collect::<Vec<_>>();
         for key in keys {
             self.commit_config_field(&key, window, cx);
+        }
+        let arguments = self
+            .providers
+            .form
+            .argument_inputs
+            .iter()
+            .filter(|a| a.input.focus_handle(cx).is_focused(window))
+            .map(|a| a.id)
+            .collect::<Vec<_>>();
+        for id in arguments {
+            self.commit_argument(id, cx);
         }
         let variables = self
             .providers
@@ -112,16 +131,12 @@ impl SettingsView {
             .as_ref()
             .and_then(|(_, view)| view.read(cx).state.install.as_ref())
             .and_then(|i| i.executable_path.as_deref());
-        let runtime = managed.then(|| form::managed_runtime(&instance, selected.live.as_ref(), executable));
-        let mut fields = runtime.as_ref().map_or_else(
+        let failed = self.providers.chatgpt.as_ref().is_some_and(|(_, view)| view.read(cx).state.install_load_error);
+        let runtime = managed.then(|| form::managed_runtime(&instance, selected.live.as_ref(), executable, failed));
+        let fields = runtime.as_ref().map_or_else(
             || form::fields(&instance.driver, instance.config.as_ref()),
             |fields| fields.iter().map(|(f, _)| f.clone()).collect(),
         );
-        if instance.driver == "acpRegistry" && instance.config.as_ref().is_some_and(|c| c["source"] == "local") {
-            for (index, _) in form::command_args(&instance).iter().enumerate() {
-                fields.push(form::argument_field(index));
-            }
-        }
         for field in &fields {
             if !field.options.is_empty() || self.providers.form.fields.iter().any(|input| input.key == field.key) {
                 continue;
@@ -171,6 +186,29 @@ impl SettingsView {
                 });
             }
         }
+        self.providers.form.arguments.reconcile(form::command_args(&instance));
+        let rows = self.providers.form.arguments.rows.clone();
+        self.providers.form.argument_inputs.retain(|input| rows.iter().any(|row| row.id == input.id));
+        for row in rows {
+            if let Some(input) = self.providers.form.argument_inputs.iter().find(|a| a.id == row.id) {
+                if !input.input.focus_handle(cx).is_focused(window) && input.input.read(cx).value().as_ref() != row.value {
+                    input.input.update(cx, |input, cx| input.set_value(row.value, window, cx));
+                }
+            } else {
+                let id = row.id;
+                let input = cx.new(|cx| InputState::new(window, cx).default_value(row.value));
+                let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        this.commit_argument(id, cx);
+                    }
+                });
+                self.providers.form.argument_inputs.push(ArgumentInput {
+                    id,
+                    input,
+                    _subscription: subscription,
+                });
+            }
+        }
         let incoming = form::environment(&instance);
         if switched || self.providers.form.seen != incoming {
             let echo = self.providers.form.published.as_ref() == Some(&incoming);
@@ -191,6 +229,7 @@ impl SettingsView {
     }
 
     fn add_variable_input(&mut self, raw: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let driver = self.current_form_instance(cx).map(|i| i.driver).unwrap_or_default();
         let id = self.providers.form.next_id;
         self.providers.form.next_id += 1;
         let name = cx.new(|cx| {
@@ -209,7 +248,7 @@ impl SettingsView {
                 } else {
                     "value"
                 })
-                .masked(!reference && raw["sensitive"] == true)
+                .masked(!reference && form::variable_sensitive(&driver, &raw))
                 .default_value(if redacted {
                     ""
                 } else if reference {
@@ -228,7 +267,7 @@ impl SettingsView {
                 })
             })
             .collect();
-        let source = raw["value"]["provider"].as_str().map(str::to_owned);
+        let source = form::SecretSourceDraft::default();
         self.providers.form.variables.push(VariableInput {
             id,
             source,
@@ -245,6 +284,9 @@ impl SettingsView {
             return;
         }
         let Some(instance) = self.current_form_instance(cx) else { return };
+        if !form::allows_edit(&instance, form::EditTarget::Runtime) {
+            return;
+        }
         if self
             .form_denial(&instance.driver, &format!("config.{}", key.split(':').next().unwrap_or(key)), cx)
             .is_some()
@@ -274,6 +316,32 @@ impl SettingsView {
         }
     }
 
+    fn commit_argument(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(input) = self.providers.form.argument_inputs.iter().find(|a| a.id == id) else {
+            return;
+        };
+        let value = input.input.read(cx).value().to_string();
+        self.edit_arguments(form::ArgumentEdit::Value(id, value), cx);
+    }
+    fn edit_arguments(&mut self, edit: form::ArgumentEdit, cx: &mut Context<Self>) {
+        let Some(instance) = self.current_form_instance(cx) else { return };
+        if self.form_denial(&instance.driver, "config.commandArgs", cx).is_some() {
+            return;
+        }
+        if let Some(values) = self.providers.form.arguments.edit(edit) {
+            let id = self.providers.form.instance_id.clone();
+            self.update_instance(
+                &id,
+                model::InstanceEdit::ConfigField {
+                    key: "commandArgs".into(),
+                    value: json!(values),
+                },
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
     fn current_form_instance(&self, cx: &App) -> Option<t3_core::server_config::ProviderInstanceConfig> {
         let app = self.state.read(cx);
         let c = app.server_config.config.as_ref()?;
@@ -298,7 +366,7 @@ impl SettingsView {
         let variable = &self.providers.form.variables[index];
         let name = variable.name.read(cx).value().trim().to_owned();
         let old = variable.raw["name"].as_str().unwrap_or("");
-        if instance.driver == "codex" && model::chatgpt::managed(instance.config.as_ref()) {
+        if !form::allows_edit(&instance, form::EditTarget::Environment) {
             return;
         }
         if self.form_denial(&instance.driver, &format!("environment.{old}"), cx).is_some()
@@ -308,8 +376,8 @@ impl SettingsView {
         }
         let next = if is_value { variable.value.read(cx).value().to_string() } else { name };
         let previous = if is_value {
-            if variable.source.is_some() {
-                variable.raw["value"]["reference"].as_str()
+            if variable.source.provider(&variable.raw).is_some() {
+                Some(variable.source.reference(&variable.raw))
             } else {
                 variable.raw["value"].as_str()
             }
@@ -325,7 +393,7 @@ impl SettingsView {
         if !is_value && variable.raw["valueRedacted"] == true {
             return;
         }
-        let one_password = variable.source.as_ref().is_some_and(|source| {
+        let one_password = variable.source.provider(&variable.raw).is_some_and(|source| {
             self.state
                 .read(cx)
                 .server_config
@@ -336,40 +404,30 @@ impl SettingsView {
         });
         let variable = &mut self.providers.form.variables[index];
         if is_value {
-            if let Some(source) = &variable.source {
-                if next.trim().is_empty() {
-                    if variable.raw["value"].is_object() {
-                        variable.raw["value"] = json!("");
-                        variable.source = None;
-                        variable.value.update(cx, |input, cx| {
-                            input.set_masked(true, window, cx);
-                            input.set_placeholder("value", window, cx);
-                        });
-                        self.publish_variables(cx);
+            if variable.source.provider(&variable.raw).is_some() {
+                match variable.source.commit(&mut variable.raw, &next, one_password) {
+                    Ok(false) => return,
+                    Err(error) => {
+                        self.providers.form.error = Some(error.into());
+                        cx.notify();
+                        return;
                     }
-                    return;
-                }
-                if !form::valid_reference(&next) || (one_password && !form::valid_one_password_reference(&next)) {
-                    self.providers.form.error = Some(
-                        if one_password {
-                            "Use a 1Password reference like op://vault/item/field."
-                        } else {
-                            "Enter a valid secret reference."
+                    Ok(true) => {
+                        if variable.source.provider(&variable.raw).is_none() {
+                            variable.value.update(cx, |input, cx| {
+                                input.set_masked(true, window, cx);
+                                input.set_placeholder("value", window, cx);
+                            });
                         }
-                        .into(),
-                    );
-                    cx.notify();
-                    return;
-                }
-                variable.raw["value"] = json!({"provider":source,"reference":next.trim()});
-                if let Some(raw) = variable.raw.as_object_mut() {
-                    raw.remove("valueRedacted");
+                    }
                 }
             } else {
                 variable.raw = form::edit_variable(&variable.raw, form::VariableEdit::Value(next));
             }
         } else {
             variable.raw = form::edit_variable(&variable.raw, form::VariableEdit::Name(next));
+            let masked = form::variable_sensitive(&instance.driver, &variable.raw) && variable.source.provider(&variable.raw).is_none();
+            variable.value.update(cx, |input, cx| input.set_masked(masked, window, cx));
         }
         self.publish_variables(cx);
     }
@@ -398,8 +456,9 @@ impl SettingsView {
             .as_ref()
             .and_then(|(_, view)| view.read(cx).state.install.as_ref())
             .and_then(|i| i.executable_path.as_deref());
+        let failed = self.providers.chatgpt.as_ref().is_some_and(|(_, view)| view.read(cx).state.install_load_error);
         let fields = if managed {
-            form::managed_runtime(&instance, selected.live.as_ref(), executable)
+            form::managed_runtime(&instance, selected.live.as_ref(), executable, failed)
                 .into_iter()
                 .map(|(f, _)| f)
                 .collect()
@@ -500,31 +559,28 @@ impl SettingsView {
             }
         }
         if !folded && instance.driver == "acpRegistry" && instance.config.as_ref().is_some_and(|c| c["source"] == "local") {
-            let args = form::command_args(&instance);
+            let args = self.providers.form.arguments.rows.clone();
             let disabled = self.form_denial(&instance.driver, "config.commandArgs", cx).is_some();
             let mut controls = Vec::new();
-            for index in 0..args.len() {
-                let key = format!("commandArgs:{index}");
-                let Some(input) = self.providers.form.fields.iter().find(|f| f.key == key).map(|f| f.input.clone()) else {
+            for (index, row) in args.into_iter().enumerate() {
+                let id = row.id;
+                let Some(input) = self.providers.form.argument_inputs.iter().find(|f| f.id == id).map(|f| f.input.clone()) else {
                     continue;
                 };
-                let id = selected.row.instance_id.clone();
                 controls.push(
                     h_flex()
                         .gap(r(6.))
                         .child(div().flex_1().min_w_0().child(Input::new(&input).small().disabled(disabled)))
                         .child(
-                            Button::new(("remove-provider-argument", index), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                            Button::new(("remove-provider-argument", id), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                                 .icon(Icon::X)
                                 .tooltip(format!("Remove argument {}", index + 1))
                                 .disabled(disabled)
-                                .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, model::InstanceEdit::RemoveCommandArgument(index), cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| this.edit_arguments(form::ArgumentEdit::Remove(id), cx))),
                         )
                         .into_any_element(),
                 );
             }
-            let id = selected.row.instance_id.clone();
-
             rows.push(
                 Row::new("provider-arguments", "Arguments")
                     .description("One literal argument per row, in launch order.")
@@ -533,7 +589,7 @@ impl SettingsView {
                             .icon(Icon::Plus)
                             .label("Add argument")
                             .disabled(disabled)
-                            .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, model::InstanceEdit::AddCommandArgument, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| this.edit_arguments(form::ArgumentEdit::Add, cx))),
                     )
                     .below(v_flex().gap(r(8.)).children(controls))
                     .into_any_element(),
@@ -602,9 +658,9 @@ impl SettingsView {
         sections
     }
 
-    fn variable_source(&self, index: usize, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn variable_source(&self, index: usize, driver: &str, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         let v = &self.providers.form.variables[index];
-        if v.raw["sensitive"] != true {
+        if !form::variable_sensitive(driver, &v.raw) {
             return None;
         }
         let app = self.state.read(cx);
@@ -621,22 +677,23 @@ impl SettingsView {
         } else {
             Vec::new()
         };
-        if sources.is_empty() && v.source.is_none() {
+        if sources.is_empty() && v.source.provider(&v.raw).is_none() {
             return None;
         }
-        if let Some(source) = &v.source
+        if let Some(source) = v.source.provider(&v.raw)
             && !sources.iter().any(|(id, _)| id == source)
         {
-            sources.push((source.clone(), source.clone()));
+            sources.push((source.to_owned(), source.to_owned()));
         }
         let options = std::iter::once(SelectOption::new("__stored__", "Value"))
             .chain(sources.into_iter().map(|(id, label)| SelectOption::new(id, label)))
             .collect();
-        let source = v.source.clone().unwrap_or_else(|| "__stored__".into());
+        let source = v.source.provider(&v.raw).unwrap_or("__stored__").to_owned();
         if disabled {
             return Some(div().text_xs().opacity(0.5).child(source).into_any_element());
         }
         let id = v.id;
+        let driver = driver.to_owned();
         let view = cx.entity().downgrade();
         Some(
             Select::new(("provider-env-source", id), options)
@@ -648,21 +705,24 @@ impl SettingsView {
                             return;
                         };
                         let stored = source.as_ref() == "__stored__";
-                        v.source = (!stored).then(|| source.to_string());
-                        let value = if stored {
-                            ""
-                        } else if v.raw["value"]["provider"].as_str() == Some(source.as_ref()) {
-                            v.raw["value"]["reference"].as_str().unwrap_or("")
-                        } else {
-                            ""
-                        };
+                        let changed = v.source.select(&mut v.raw, (!stored).then(|| source.to_string()));
+                        let value = if stored { "" } else { v.source.reference(&v.raw) };
                         v.value.update(cx, |input, cx| {
                             input.set_value(value, window, cx);
-                            input.set_masked(stored, window, cx);
-                            input.set_placeholder(if stored { "value" } else { "op://vault/item/field" }, window, cx);
+                            input.set_masked(stored && form::variable_sensitive(&driver, &v.raw), window, cx);
+                            input.set_placeholder(
+                                if stored && v.raw["valueRedacted"] == true {
+                                    "Stored secret, enter a new value to replace"
+                                } else if stored {
+                                    "value"
+                                } else {
+                                    "op://vault/item/field"
+                                },
+                                window,
+                                cx,
+                            );
                         });
-                        if stored && v.raw["value"].is_object() {
-                            v.raw["value"] = json!("");
+                        if changed {
                             this.publish_variables(cx);
                         }
                         cx.notify();
@@ -682,7 +742,7 @@ impl SettingsView {
         let denial = self.form_denial(driver, &format!("environment.{name}"), cx);
         let disabled = denial.is_some();
         let name_control = (!dedicated).then(|| div().flex_1().min_w_0().child(Input::new(&v.name).small().disabled(disabled || redacted)));
-        let source = self.variable_source(index, disabled, cx);
+        let source = self.variable_source(index, driver, disabled, cx);
         let v = &self.providers.form.variables[index];
         let value = Input::new(&v.value).small().disabled(disabled);
         let remove = Button::new(("remove-provider-env", id), ButtonVariant::GhostMuted, ButtonSize::IconMicro)

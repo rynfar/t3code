@@ -485,8 +485,6 @@ pub fn upsert_payload(settings: &ServerSettings, instance_id: &str, previous: &P
 pub enum InstanceEdit {
     ConfigField { key: String, value: Value },
     Environment(Vec<Value>),
-    AddCommandArgument,
-    RemoveCommandArgument(usize),
     Enabled(bool),
     DisplayName(String),
     Accent(String),
@@ -499,8 +497,6 @@ impl InstanceEdit {
         match self {
             InstanceEdit::ConfigField {key,value} => form::with_field(instance,key,value.clone()),
             InstanceEdit::Environment(rows) => form::with_environment(instance,rows.clone()),
-            InstanceEdit::AddCommandArgument => form::edit_command_arguments(instance,None),
-            InstanceEdit::RemoveCommandArgument(index) => form::edit_command_arguments(instance,Some(*index)),
             InstanceEdit::Enabled(enabled) => with_enabled(instance, *enabled),
             InstanceEdit::DisplayName(name) => with_display_name(instance, name),
             InstanceEdit::Accent(accent) => with_accent(instance, accent),

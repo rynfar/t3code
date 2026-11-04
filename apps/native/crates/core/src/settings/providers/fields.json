@@ -6,6 +6,20 @@
       "description": "Path to the Codex binary used by this instance.",
       "placeholder": "codex",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -15,6 +29,20 @@
       "description": "Custom Codex home and config directory.",
       "placeholder": "~/.codex",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -24,6 +52,20 @@
       "description": "Account-specific Codex home. Keeps auth.json separate while sharing state from CODEX_HOME.",
       "placeholder": "~/.codex-t3/personal",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -33,6 +75,20 @@
       "description": "Additional CLI arguments passed to codex app-server on session start.",
       "placeholder": "",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -44,6 +100,20 @@
       "description": "Path to the Claude binary used by this instance.",
       "placeholder": "claude",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -53,6 +123,20 @@
       "description": "Custom Claude home and config directory. Keeps .claude.json and .claude separate.",
       "placeholder": "~/.claude",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -62,6 +146,20 @@
       "description": "Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default.",
       "placeholder": "e.g. 300000",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": false,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": false,
+        "": true,
+        " ": true,
+        "sample": false,
+        "0300000": false
+      },
       "persist": false,
       "options": []
     },
@@ -71,6 +169,24 @@
       "description": "When to compact an idle thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Overrides the default in Providers > Advanced.",
       "placeholder": "",
       "secret": false,
+      "control": "select",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": false,
+        "100000": false,
+        "300000": false,
+        "999999": false,
+        "1000000": false,
+        "1000001": false,
+        "": false,
+        " ": false,
+        "sample": false,
+        "0300000": false,
+        "default": true,
+        "onReturn": true,
+        "beforeCacheExpires": true,
+        "off": true
+      },
       "persist": false,
       "options": [
         ["default", "Use default"],
@@ -85,6 +201,20 @@
       "description": "Additional CLI arguments passed on session start.",
       "placeholder": "e.g. --chrome",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -97,6 +227,20 @@
       "description": "Path to the Grok CLI binary.",
       "placeholder": "grok",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -108,6 +252,20 @@
       "description": "Path to the fx binary. All fx instances on this machine share its fx login.",
       "placeholder": "fx",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -119,6 +277,20 @@
       "description": "Path to the OpenCode binary.",
       "placeholder": "opencode",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -128,6 +300,20 @@
       "description": "Leave blank to let T3 Code spawn the server when needed.",
       "placeholder": "http://127.0.0.1:4096",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -137,6 +323,20 @@
       "description": "Stored separately on the host.",
       "placeholder": "Optional",
       "secret": true,
+      "control": "password",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -148,6 +348,24 @@
       "description": "Google accounts use your subscription; API keys and Agent Platform bill usage.",
       "placeholder": "",
       "secret": false,
+      "control": "select",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": false,
+        "100000": false,
+        "300000": false,
+        "999999": false,
+        "1000000": false,
+        "1000001": false,
+        "": false,
+        " ": false,
+        "sample": false,
+        "0300000": false,
+        "oauth-personal": true,
+        "oauth-business": true,
+        "gemini-api-key": true,
+        "agent-platform": true
+      },
       "persist": false,
       "options": [
         ["oauth-personal", "Google account"],
@@ -162,6 +380,20 @@
       "description": "Gemini or Vertex AI express key. Stored separately on the host.",
       "placeholder": "Optional",
       "secret": true,
+      "control": "password",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -171,6 +403,20 @@
       "description": "Required for Gemini Enterprise. Agent Platform uses it when no API key is set.",
       "placeholder": "my-project-id",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -180,6 +426,20 @@
       "description": "Region for Gemini Enterprise or Agent Platform.",
       "placeholder": "us-central1",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -189,6 +449,20 @@
       "description": "Custom ACP executable. Leave empty to select automatically.",
       "placeholder": "Automatic",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": true,
       "options": []
     }
@@ -200,6 +474,20 @@
       "description": "Path to the Kiro CLI binary.",
       "placeholder": "kiro-cli",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -211,6 +499,20 @@
       "description": "Path to the Muse Code binary on this environment. Sign in with muse login on that host.",
       "placeholder": "muse",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -222,6 +524,20 @@
       "description": "Path to the Pi coding agent binary.",
       "placeholder": "pi",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -231,6 +547,20 @@
       "description": "Additional CLI arguments passed to pi --mode rpc on session start.",
       "placeholder": "",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }
@@ -242,6 +572,22 @@
       "description": "",
       "placeholder": "",
       "secret": false,
+      "control": "select",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": false,
+        "100000": false,
+        "300000": false,
+        "999999": false,
+        "1000000": false,
+        "1000001": false,
+        "": false,
+        " ": false,
+        "sample": false,
+        "0300000": false,
+        "registry": true,
+        "local": true
+      },
       "persist": false,
       "options": [
         ["registry", "ACP Registry"],
@@ -254,6 +600,20 @@
       "description": "Agent identifier from the official ACP Registry, for example 'devin'.",
       "placeholder": "devin",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": true,
       "options": []
     },
@@ -263,6 +623,20 @@
       "description": "Executable on this environment. For registry agents, this overrides the distribution executable while keeping its arguments and environment.",
       "placeholder": "Registry default",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     },
@@ -272,6 +646,20 @@
       "description": "Optional ACP authentication method ID. By default, the first agent-managed method is selected.",
       "placeholder": "auto",
       "secret": false,
+      "control": "text",
+      "acceptsSecretReference": false,
+      "validation": {
+        "99999": true,
+        "100000": true,
+        "300000": true,
+        "999999": true,
+        "1000000": true,
+        "1000001": true,
+        "": true,
+        " ": true,
+        "sample": true,
+        "0300000": true
+      },
       "persist": false,
       "options": []
     }

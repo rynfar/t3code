@@ -279,7 +279,10 @@ impl ChatGptSetup {
                                     this.state.observe_install(state);
                                 }
                             }
-                            Err(()) => this.state.error = Some("Could not read Codex setup status. Reconnect and try again.".into()),
+                            Err(()) => {
+                                if method==auth::INSTALL_SUBSCRIBE {this.state.install_load_error=true;}
+                                this.state.error=Some("Could not read Codex setup status. Reconnect and try again.".into());
+                            }
                         }
                         cx.notify();
                     })

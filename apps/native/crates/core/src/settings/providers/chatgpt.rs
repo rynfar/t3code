@@ -118,6 +118,7 @@ pub fn needs_install(install: &InstallState) -> bool {
 pub struct SetupState {
     pub auth: Option<AuthState>,
     pub install: Option<InstallState>,
+    pub install_load_error:bool,
     pub install_operation: Option<String>,
     pub pending: bool,
     pub finishing: bool,
@@ -132,6 +133,7 @@ impl SetupState {
         self.install = Some(state);
     }
     pub fn observe_install(&mut self, state: InstallState) {
+        self.install_load_error=false;
         if self.install_operation.as_ref().is_some_and(|id| state.operation_id.as_ref() != Some(id)) {
             return;
         }
