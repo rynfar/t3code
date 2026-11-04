@@ -377,7 +377,7 @@ impl SettingsView {
         let next = if is_value { variable.value.read(cx).value().to_string() } else { name };
         let previous = if is_value {
             if variable.source.provider(&variable.raw).is_some() {
-                Some(variable.source.reference(&variable.raw))
+                Some(variable.source.input_value(&variable.raw))
             } else {
                 variable.raw["value"].as_str()
             }
@@ -706,7 +706,7 @@ impl SettingsView {
                         };
                         let stored = source.as_ref() == "__stored__";
                         let changed = v.source.select(&mut v.raw, (!stored).then(|| source.to_string()));
-                        let value = if stored { "" } else { v.source.reference(&v.raw) };
+                        let value = v.source.input_value(&v.raw);
                         v.value.update(cx, |input, cx| {
                             input.set_value(value, window, cx);
                             input.set_masked(stored && form::variable_sensitive(&driver, &v.raw), window, cx);

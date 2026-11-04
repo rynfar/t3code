@@ -299,8 +299,10 @@ impl SecretSourceDraft {
     pub fn provider<'a>(&'a self, row: &'a Value) -> Option<&'a str> {
         self.pending_provider.as_deref().or_else(|| row["value"]["provider"].as_str())
     }
-    pub fn reference<'a>(&self, row: &'a Value) -> &'a str {
-        if self.provider(row) == row["value"]["provider"].as_str() {
+    pub fn input_value<'a>(&self, row: &'a Value) -> &'a str {
+        if self.provider(row).is_none() {
+            row["value"].as_str().unwrap_or("")
+        } else if self.provider(row) == row["value"]["provider"].as_str() {
             row["value"]["reference"].as_str().unwrap_or("")
         } else {
             ""
@@ -357,7 +359,7 @@ pub struct ArgumentRow {
 pub struct ArgumentsDraft {
     pub rows: Vec<ArgumentRow>,
     seen: Vec<String>,
-    pending: Vec<Vec<String>>,
+    last_published: Option<Vec<String>>,
     next_id: usize,
 }
 pub enum ArgumentEdit {
@@ -370,13 +372,11 @@ impl ArgumentsDraft {
         if self.seen == incoming {
             return;
         }
-        if let Some(index) = self.pending.iter().position(|p| p == &incoming) {
-            self.pending.drain(..=index);
-            self.seen = incoming;
+        let echo = self.last_published.take().as_ref() == Some(&incoming);
+        self.seen = incoming.clone();
+        if echo {
             return;
         }
-        self.seen = incoming.clone();
-        self.pending.clear();
         self.rows = incoming
             .into_iter()
             .map(|value| {
@@ -403,7 +403,7 @@ impl ArgumentsDraft {
             }
         }
         let values = self.rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>();
-        self.pending.push(values.clone());
+        self.last_published = Some(values.clone());
         Some(values)
     }
 }
@@ -590,12 +590,37 @@ mod tests {
         assert!(draft.commit(&mut row, "invalid", true).is_err());
         assert_eq!(row, saved);
         assert!(!draft.select(&mut row, Some("A".into())));
-        assert_eq!(draft.reference(&row), "op://v/i/f");
+        assert_eq!(draft.input_value(&row), "op://v/i/f");
         assert!(!draft.select(&mut row, Some("B".into())));
         assert!(draft.commit(&mut row, "op://other/item/field", true).unwrap());
         assert_eq!(row["value"], json!({"provider":"B","reference":"op://other/item/field"}));
         assert!(draft.commit(&mut row, "", true).unwrap());
         assert_eq!(row["value"], json!(""));
+        for literal in [
+            json!({"name":"TOKEN","value":"legacy literal","sensitive":false}),
+            edit_variable(
+                &json!({"name":"TOKEN","value":"","sensitive":true,"valueRedacted":true}),
+                VariableEdit::Value("replacement literal".into()),
+            ),
+        ] {
+            let mut row = literal.clone();
+            assert!(!draft.select(&mut row, Some("B".into())));
+            assert_eq!(draft.input_value(&row), "");
+            assert!(!draft.select(&mut row, None));
+            assert_eq!(draft.input_value(&row), literal["value"].as_str().unwrap());
+            assert_eq!(row, literal);
+        }
+    }
+    #[test]
+    fn failed_argument_writes_do_not_hide_an_external_settings_change() {
+        let mut draft = ArgumentsDraft::default();
+        draft.reconcile(vec!["a".into()]);
+        let id = draft.rows[0].id;
+        draft.edit(ArgumentEdit::Value(id, "b".into()));
+        draft.edit(ArgumentEdit::Value(id, "c".into()));
+        draft.reconcile(vec!["b".into()]);
+        assert_eq!(draft.rows[0].value, "b");
+        assert_eq!(draft.edit(ArgumentEdit::Add), Some(vec!["b".into(), String::new()]));
     }
     #[test]
     fn removing_an_argument_then_editing_the_displayed_next_row_keeps_the_target() {
@@ -611,7 +636,6 @@ mod tests {
             let b = draft.rows[1].id;
             let removed_value = draft.edit(ArgumentEdit::Remove(a)).unwrap();
             let edited_value = draft.edit(ArgumentEdit::Value(b, "B".into())).unwrap();
-            draft.reconcile(removed_value.clone());
             assert_eq!(draft.rows[0].id, b);
             assert_eq!(draft.rows[0].value, "B");
             let removed = with_field(&original, "commandArgs", json!(removed_value));
@@ -619,10 +643,9 @@ mod tests {
             draft.reconcile(command_args(&edited));
             assert_eq!(draft.rows[0].id, b);
             assert!(draft.edit(ArgumentEdit::Value(a, "removed".into())).is_none());
-            let lower = draft.edit(ArgumentEdit::Value(b, "b".into())).unwrap();
+            draft.edit(ArgumentEdit::Value(b, "b".into())).unwrap();
             let upper = draft.edit(ArgumentEdit::Value(b, "B".into())).unwrap();
             draft.reconcile(command_args(&edited));
-            draft.reconcile(lower);
             assert_eq!(draft.rows[0].id, b);
             assert_eq!(draft.rows[0].value, "B");
             draft.reconcile(upper);
