@@ -4,6 +4,8 @@
 //! runtime; the view paints only the rows on screen.
 
 mod comments;
+#[cfg(feature = "snapshot")]
+mod snapshot;
 mod header;
 pub(crate) mod lines;
 mod source;
@@ -43,6 +45,10 @@ pub struct DiffPanel {
     selection: DiffSelection,
     scope: DiffScope,
     request: Option<RequestKey>,
+    patch_reads: Arc<tokio::sync::Semaphore>,
+    patch_commands: Option<tokio::sync::mpsc::Sender<source::Command>>,
+    #[cfg(feature = "snapshot")]
+    fixture: bool,
     loaded: Option<(RequestKey, Loaded)>,
     cache: Vec<(RequestKey, Loaded)>,
     pending: bool,
@@ -65,6 +71,7 @@ pub struct DiffPanel {
     session: DiffSession,
     tree_collapsed: HashSet<String>,
     list: ListState,
+    list_width: Option<Pixels>,
     tree_scroll: UniformListScrollHandle,
     wrap: bool,
     wrap_override: Option<bool>,
@@ -103,6 +110,13 @@ pub struct External {
 impl DiffPanel {
     pub fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::construct(state, cx);
+        let entity = cx.entity().downgrade();
+        panel.list.set_scroll_handler(move |_, _, cx| {
+            let entity = entity.clone();
+            cx.defer(move |cx| { if let Some(entity) = entity.upgrade() { entity.update(cx, |panel, cx| panel.load_nearby(cx)); } });
+        });
+        #[cfg(feature = "snapshot")]
+        if snapshot::install(&mut panel, cx) { return panel; }
         panel.sync(cx);
         panel
     }
@@ -110,7 +124,7 @@ impl DiffPanel {
     fn construct(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
             if *event == AppEvent::ReviewComments {
-                if let Some(view) = &this.view { let count = view.row_count(); this.list.splice(0..count, count); }
+                if let Some(view) = &this.view { this.list.remeasure_items(0..view.row_count()); }
                 cx.notify();
             }
             if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::RightPanel | AppEvent::Shell | AppEvent::Phase | AppEvent::SideThread) {
@@ -125,6 +139,10 @@ impl DiffPanel {
             selection: DiffSelection::default(),
             scope: DiffScope::Unstaged,
             request: None,
+            patch_reads: Arc::new(tokio::sync::Semaphore::new(4)),
+            patch_commands: None,
+            #[cfg(feature = "snapshot")]
+            fixture: false,
             loaded: None,
             cache: Vec::new(),
             pending: false,
@@ -144,6 +162,7 @@ impl DiffPanel {
             session: DiffSession::default(),
             tree_collapsed: HashSet::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
+            list_width: None,
             tree_scroll: UniformListScrollHandle::new(),
             wrap: true,
             wrap_override: None,
@@ -177,6 +196,8 @@ impl DiffPanel {
     /// Reconciles with app state. Runs on every thread event, so it does nothing unless the
     /// scope, the request, the connection or the workspace actually changed.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        #[cfg(feature = "snapshot")]
+        if self.fixture { cx.notify(); return; }
         if self.external.is_some() {
             let ui = (crate::settings::client_settings(cx).diff_layout(), self.state.read(cx).panels.diff_file_tree_open, crate::settings::client_settings(cx).diff_files_collapsed());
             if ui != self.ui {
@@ -197,6 +218,7 @@ impl DiffPanel {
             self.repositories.clear();
             self.git_fetched_at = None;
             self.connected = false;
+            self.comments = comments::Comments::default();
             self._grants = None;
             if let Some(client) = self.state.read(cx).client_handle() {
                 let mut grants = client.session_state();
@@ -288,6 +310,7 @@ impl DiffPanel {
         };
         let request = environment.filter(|_| can_read && source_exists).and_then(|environment| match &scope {
             DiffScope::Branch { base_ref } => cwd.clone().map(|cwd| RequestKey::Git {
+                kind: t3_core::diff::PreviewSourceKind::BranchRange,
                 environment,
                 cwd,
                 base_ref: base_ref.clone(),
@@ -295,6 +318,7 @@ impl DiffPanel {
                 revision: self.git_revision,
             }),
             DiffScope::Unstaged => cwd.clone().map(|cwd| RequestKey::Git {
+                kind: t3_core::diff::PreviewSourceKind::WorkingTree,
                 environment,
                 cwd,
                 base_ref: None,
@@ -345,6 +369,7 @@ impl DiffPanel {
                         self.cache.push(entry.clone());
                         self.loaded = Some(entry);
                         self.pending = false;
+                        if visible && connected && matches!(key, RequestKey::Git { .. }) { self.fetch(key, cx); }
                     }
                     None if visible && connected => self.fetch(key, cx),
                     None => self.pending = false,
@@ -355,7 +380,7 @@ impl DiffPanel {
             && !self.pending
             && self.error.is_none()
             && let Some(key) = self.request.clone()
-            && source::needs_fetch(&key, self.loaded.as_ref().map(|(loaded, _)| loaded))
+            && (source::needs_fetch(&key, self.loaded.as_ref().map(|(loaded, _)| loaded)) || (matches!(key, RequestKey::Git { .. }) && self.patch_commands.is_none()))
         {
             self.fetch(key, cx);
         }
@@ -382,10 +407,15 @@ impl DiffPanel {
     fn cancel_fetch(&mut self) {
         self.fetch_generation += 1;
         self._fetch = None;
+        self.patch_commands = None;
         self.pending = false;
     }
 
     fn fetch(&mut self, key: RequestKey, cx: &mut Context<Self>) {
+        if matches!(key, RequestKey::Git { .. }) {
+            self.fetch_git(key, cx);
+            return;
+        }
         let Some(task) = source::fetch(self.state.read(cx), &key) else {
             self.error = Some("Not connected to the server.".to_owned());
             return;
@@ -423,6 +453,78 @@ impl DiffPanel {
         self._fetch = Some(Fetch { network, _completion: completion });
     }
 
+    fn fetch_git(&mut self, key: RequestKey, cx: &mut Context<Self>) {
+        let RequestKey::Git { environment, cwd, kind, base_ref, ignore_whitespace, .. } = &key else { return };
+        let Some(client) = self.state.read(cx).client_handle() else { return };
+        let scope = t3_core::diff::ReviewScope { environment: environment.clone(), connection: self.connection.unwrap_or_default(), cwd: cwd.clone(), kind: *kind, base_ref: base_ref.clone(), ignore_whitespace: *ignore_whitespace };
+        let previous = self.loaded.as_ref().filter(|(old, _)| old.same_source(&key)).and_then(|(_, loaded)| match loaded {
+            Loaded::Git { review, .. } if review.scope == scope => Some((**review).clone()),
+            _ => None,
+        });
+        let (send, commands) = tokio::sync::mpsc::channel(16);
+        let (updates, mut receive) = tokio::sync::mpsc::channel(1);
+        let task = self.state.read(cx).runtime().spawn(source::run(client, scope, previous, self.patch_reads.clone(), commands, updates));
+        self.patch_commands = Some(send);
+        self.pending = true;
+        let network = task.abort_handle();
+        let generation = self.fetch_generation;
+        let connection = self.connection;
+        let completion = cx.spawn(async move |this, cx| {
+            while let Some(result) = receive.recv().await {
+                if this.update(cx, |this, cx| {
+                    if this.connection != connection || this.fetch_generation != generation || !this.visible || this.request.as_ref() != Some(&key) { return; }
+                    match result {
+                        Ok(loaded) => {
+                            if let Loaded::Git { review, repository, .. } = &loaded {
+                                this.pending = review.incomplete && this.error.is_none();
+                                let preview_changed = this.loaded.as_ref().is_none_or(|(_, old)| match old {
+                                    Loaded::Git { review: previous, .. } => previous.scope != review.scope || previous.source != review.source,
+                                    _ => true,
+                                });
+                                if preview_changed { this.git_fetched_at = Some(Instant::now()); }
+                                this.repositories.insert(review.scope.cwd.clone(), *repository);
+                            }
+                            this.cache.retain(|(cached, _)| !cached.same_source(&key));
+                            this.cache.push((key.clone(), loaded.clone()));
+                            if this.cache.len() > CACHE_LIMIT { this.cache.remove(0); }
+                            this.loaded = Some((key.clone(), loaded));
+                        }
+                        Err(error) => { this.error = Some(error); this.pending = false; }
+                    }
+                    this.rebuild(cx);
+                    cx.notify();
+                }).is_err() { break; }
+            }
+        });
+        self._fetch = Some(Fetch { network, _completion: completion });
+    }
+
+    fn review(&self) -> Option<&t3_core::diff::ReviewModel> {
+        if self.external.is_some() || !self.has_loaded() { return None; }
+        match &self.loaded.as_ref()?.1 { Loaded::Git { review, .. } => Some(review), _ => None }
+    }
+
+    fn load_nearby(&mut self, cx: &mut Context<Self>) {
+        if !self.review().is_some_and(|r| r.lazy()) { return; }
+        if view::seed_height_estimates(&self.list, self.list.viewport_bounds().size.width, &mut self.list_width) { cx.notify(); }
+        let Some(review) = self.review() else { return };
+        let Some(file) = review.files().iter().find(|f| review.state(f).is_none_or(|s| s.pending)) else { return };
+        let Some(view) = &self.view else { return };
+        let Some(index) = view.parsed.files().iter().position(|f| f.path() == file.path) else { return };
+        let Some(header) = view.header_row(index) else { return };
+        let top = self.list.logical_scroll_top();
+        let viewport = self.list.viewport_bounds();
+        let measured = self.list.bounds_for_item(header).map(|row| f32::from(row.top() - viewport.top()));
+        let estimate = self.list.offset_for_item(header) - self.list.offset_for_item(top.item_ix) - top.offset_in_item;
+        if t3_core::diff::review_boundary_near(header, top.item_ix, measured, estimate.into(), viewport.size.height.into()) {
+            self.patch_command(source::Command::Next);
+        }
+    }
+
+    fn patch_command(&self, command: source::Command) {
+        if let Some(send) = &self.patch_commands { let _ = send.try_send(command); }
+    }
+
     /// The patch for the current scope: the loaded one, or the last one of the same source
     /// while a refresh is in flight.
     fn current(&self) -> Option<Arc<Parsed>> {
@@ -433,8 +535,7 @@ impl DiffPanel {
             return None;
         }
         match (&self.loaded.as_ref()?.1, &self.scope) {
-            (Loaded::Git { branch, .. }, DiffScope::Branch { .. }) => branch.clone(),
-            (Loaded::Git { unstaged, .. }, DiffScope::Unstaged) => unstaged.clone(),
+            (Loaded::Git { parsed, .. }, DiffScope::Branch { .. } | DiffScope::Unstaged) => Some(parsed.clone()),
             (Loaded::Turn(parsed), DiffScope::Turn { .. }) => Some(parsed.clone()),
             (Loaded::ToolCall(call), DiffScope::ToolCall(_)) => call.parsed(self.ignore_whitespace),
             _ => None,
@@ -473,7 +574,7 @@ impl DiffPanel {
         };
         let scope_key = self.scope_key();
         if self.comments.scope != scope_key { self.comments = comments::Comments::default(); self.comments.scope = scope_key.clone(); }
-        if self.comments.editor.as_ref().is_some_and(|editor| !parsed.files().iter().any(|file| file.key() == editor.file_key)) { self.comments.editor = None; }
+
         let layout = crate::settings::client_settings(cx).diff_layout();
         let files_collapsed_default = crate::settings::client_settings(cx).diff_files_collapsed();
         let same = self.view.as_ref().is_some_and(|view| {
@@ -488,16 +589,37 @@ impl DiffPanel {
             .view
             .as_ref()
             .filter(|view| view.scope_key == scope_key && view.layout == layout)
-            .map(|_| self.list.logical_scroll_top());
-        let view = View::new(parsed, scope_key.clone(), layout, &self.session, files_collapsed_default, &self.tree_collapsed);
+            .and_then(|view| {
+                let top = self.list.logical_scroll_top();
+                let file = view.row(top.item_ix)?.file();
+                Some((view.key(file)?.to_owned(), top.item_ix - view.header_row(file)?, top.offset_in_item))
+            });
+        let review = self.review().is_some();
+        let compatible = self.view.as_ref().is_some_and(|view| view.scope_key == scope_key && view.layout == layout && view.files_collapsed_default == files_collapsed_default);
+        let changes = if compatible {
+            self.view.as_mut().expect("compatible view").update(parsed, &self.session, &self.tree_collapsed, review)
+        } else {
+            self.view = Some(View::new(parsed, scope_key.clone(), layout, &self.session, files_collapsed_default, &self.tree_collapsed, review));
+            None
+        };
+        let view = self.view.as_ref().expect("installed view");
+        if self.comments.editor.as_ref().is_some_and(|editor| !(0..view.parsed.files().len()).any(|i| view.key(i) == Some(editor.file_key.as_str()))) { self.comments.editor = None; }
         let count = view.row_count();
-        self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT));
-        match keep.filter(|top| top.item_ix < count) {
+        match changes {
+            Some(changes) => view::apply_row_changes(&self.list, changes),
+            None => self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT)),
+        }
+        let keep = keep.and_then(|(key, within, offset_in_item)| {
+            let file = (0..view.parsed.files().len()).find(|&i| view.key(i) == Some(&key))?;
+            let start = view.header_row(file)?;
+            let end = view.header_row(file + 1).unwrap_or(count);
+            Some(ListOffset { item_ix: start + within.min(end.saturating_sub(start + 1)), offset_in_item })
+        });
+        match keep {
             Some(top) => self.list.scroll_to(top),
             None => self.h_offset = px(0.),
         }
         self.top_file = view.row(0).map(|row| row.file());
-        self.view = Some(view);
         self.reveal_requested(cx);
     }
 
@@ -514,8 +636,10 @@ impl DiffPanel {
     }
 
     pub fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
+        let unloaded = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).is_some_and(|file| self.file_patch_state(file.path()).is_some_and(|state| state.files.is_none()));
+        if let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|f| f.path().to_owned()) { self.patch_command(source::Command::File(path)); }
         let folded = self.is_collapsed(file);
-        self.set_folded(file, !folded, cx);
+        self.set_folded(file, if unloaded { false } else { !folded }, cx);
     }
 
     /// `toggleAllDiffFiles`: expands every file when all are collapsed, else collapses all.
@@ -562,6 +686,7 @@ impl DiffPanel {
             self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
             self.top_file = Some(file);
         }
+        self.patch_command(source::Command::File(path.clone()));
         self.selected_file = Some(path);
         cx.notify();
     }
@@ -669,7 +794,10 @@ impl DiffPanel {
                 .into_any_element();
         };
         match &parsed.patch {
-            ParsedPatch::Empty => message("No net changes in this selection."),
+            ParsedPatch::Empty if self.review().is_some_and(|review| review.incomplete) => {
+                v_flex().flex_1().child(notice(if self.error.is_some() { "Showing tracked changes. Untracked changes could not be loaded. Refresh to retry." } else { "Showing tracked changes. Checking untracked files..." }, p)).child(if self.error.is_some() { message("No patch available for this selection.") } else { lines::loading_state(cx).into_any_element() }).into_any_element()
+            }
+            ParsedPatch::Empty => v_flex().flex_1().children(self.error.clone().map(|error| error_line(error, p))).child(message("No net changes in this selection.")).into_any_element(),
             ParsedPatch::Raw { text, reason } => lines::raw_patch(text, reason, self.wrap, cx).into_any_element(),
             ParsedPatch::Files(_) => self.render_files(&parsed, window, cx),
         }
@@ -685,13 +813,21 @@ impl DiffPanel {
         cwd.and_then(|cwd| self.repositories.get(cwd)) == Some(&false)
     }
 
+    fn file_patch_state(&self, path: &str) -> Option<t3_core::diff::FilePatchState> {
+        let review = self.review().filter(|review| review.lazy())?;
+        let file = review.files().iter().find(|file| file.path == path)?;
+        Some(review.state(file).cloned().unwrap_or_default())
+    }
+
     fn render_files(&mut self, parsed: &Parsed, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = palette(cx);
         let truncated = parsed.truncated.then(|| {
             let suffix = if parsed.totals.is_some() { " Totals include all changes." } else { "" };
             notice(format!("This preview exceeds the size limit. Changes shown are incomplete.{suffix}"), p)
         });
-        v_flex().flex_1().min_h_0().children(truncated).child(self.files_body(window, cx)).into_any_element()
+        let incomplete = self.review().is_some_and(|review| review.incomplete).then(|| notice(if self.error.is_some() { "Showing tracked changes. Untracked changes could not be loaded. Refresh to retry." } else { "Showing tracked changes. Checking untracked files..." }, p));
+        let error = self.error.clone().filter(|_| incomplete.is_none()).map(|error| error_line(error, p));
+        v_flex().flex_1().min_h_0().children(incomplete).children(error).children(truncated).child(self.files_body(window, cx)).into_any_element()
     }
 
     fn files_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {

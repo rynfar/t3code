@@ -7,6 +7,8 @@
 //! (`apps/web/src/lib/toolCallDiff.ts`).
 
 mod parse;
+mod hunks;
+mod review;
 mod rows;
 mod scope;
 mod session;
@@ -17,6 +19,8 @@ mod whitespace;
 use std::sync::Arc;
 
 pub use parse::parse_patch;
+pub use hunks::FileHunks;
+pub use review::{review_boundary_near, ReviewScope, ReviewFile, ReviewModel, PatchTicket, FilePatchState};
 pub use session::DiffSession;
 pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{
@@ -87,7 +91,7 @@ pub struct FileDiff {
     pub new_path: Option<String>,
     pub change: ChangeKind,
     pub binary: bool,
-    pub hunks: Vec<Hunk>,
+    pub hunks: FileHunks,
     pub additions: u32,
     pub deletions: u32,
 }
@@ -108,7 +112,7 @@ impl FileDiff {
     }
 
     pub fn line_count(&self) -> usize {
-        self.hunks.iter().map(|hunk| hunk.lines.len()).sum()
+        self.hunks.line_count()
     }
 }
 

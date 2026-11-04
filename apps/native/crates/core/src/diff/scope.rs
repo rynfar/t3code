@@ -234,7 +234,7 @@ pub enum PreviewSourceKind {
 }
 
 impl PreviewSourceKind {
-    fn wire(self) -> &'static str {
+    pub fn wire(self) -> &'static str {
         match self {
             PreviewSourceKind::WorkingTree => "working-tree",
             PreviewSourceKind::BranchRange => "branch-range",
@@ -245,6 +245,13 @@ impl PreviewSourceKind {
 /// One `ReviewDiffPreviewSource`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffPreviewSource {
+    pub id: Option<String>,
+    pub kind: PreviewSourceKind,
+    pub generated_at: Option<String>,
+    pub cwd: Option<String>,
+    pub diff_hash: Option<String>,
+    pub patches_deferred: bool,
+    pub files: Vec<super::ReviewFile>,
     pub diff: String,
     pub truncated: bool,
     pub base_ref: Option<String>,
@@ -289,7 +296,17 @@ pub fn decode_diff_preview(value: &Value, kind: PreviewSourceKind) -> Option<Dif
             )
         })
     });
+    let mut files: Vec<_> = source.get("files").and_then(Value::as_array).into_iter().flatten().filter_map(|file| {
+        Some(super::ReviewFile { path: file.get("path")?.as_str()?.to_owned(), previous_path: file.get("previousPath").and_then(Value::as_str).map(str::to_owned), additions: file.get("additions").and_then(Value::as_u64).unwrap_or(0), deletions: file.get("deletions").and_then(Value::as_u64).unwrap_or(0) })
+    }).collect();
+    files.sort_by(|a,b| crate::terminal::natural_cmp(&a.path.to_lowercase(), &b.path.to_lowercase()));
     Some(DiffPreviewSource {
+        id: text("id"), kind,
+        cwd: value.get("cwd").and_then(Value::as_str).map(str::to_owned),
+        generated_at: value.get("generatedAt").and_then(Value::as_str).map(str::to_owned),
+        diff_hash: text("diffHash"),
+        patches_deferred: source.get("patchesDeferred").and_then(Value::as_bool).unwrap_or(false),
+        files,
         diff: text("diff").unwrap_or_default(),
         truncated: source.get("truncated").and_then(Value::as_bool).unwrap_or(false),
         base_ref: text("baseRef"),

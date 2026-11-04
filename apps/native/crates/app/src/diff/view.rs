@@ -27,7 +27,7 @@ impl Parsed {
     pub fn from_patch(patch: ParsedPatch, truncated: bool, totals: Option<(u64, u64)>, base_ref: Option<String>, head_ref: Option<String>) -> Arc<Parsed> {
         let max_line_len = match &patch {
             ParsedPatch::Files(files) => {
-                files.iter().flat_map(|file| &file.hunks).flat_map(|hunk| &hunk.lines).map(|line| line.text.len()).max().unwrap_or(0)
+                files.iter().map(|file| file.hunks.max_line_len()).max().unwrap_or(0)
             }
             _ => 0,
         };
@@ -53,18 +53,17 @@ pub struct View {
     keys: Vec<String>,
     folded: Vec<bool>,
     folded_count: usize,
-    rows: Vec<Vec<DiffRow>>,
+    rows: Vec<Arc<Vec<DiffRow>>>,
     /// `starts[file]` is the file's first row; the last entry is the row count.
     starts: Vec<usize>,
 }
 
 impl View {
-    pub fn new(parsed: Arc<Parsed>, scope_key: String, layout: Layout, session: &DiffSession, files_collapsed_default: bool, tree_collapsed: &HashSet<String>) -> View {
+    pub fn new(parsed: Arc<Parsed>, scope_key: String, layout: Layout, session: &DiffSession, files_collapsed_default: bool, tree_collapsed: &HashSet<String>, review: bool) -> View {
         let files = parsed.files();
-        let keys: Vec<String> = files.iter().map(FileDiff::key).collect();
+        let keys = file_keys(files, review);
         let folded = session.resolve_folds(&scope_key, &keys, files_collapsed_default);
-        let rows: Vec<Vec<DiffRow>> =
-            files.iter().enumerate().map(|(index, file)| file_rows(index, file, folded[index], layout)).collect();
+        let rows = rows_for(files, &keys, &folded, layout, None);
         let mut view = View {
             tree: file_tree_rows(files, tree_collapsed),
             digits: files.iter().map(gutter_digits).collect(),
@@ -80,6 +79,43 @@ impl View {
         };
         view.recount(0);
         view
+    }
+
+    pub fn update(&mut self, parsed: Arc<Parsed>, session: &DiffSession, tree_collapsed: &HashSet<String>, review: bool) -> Option<Vec<(Range<usize>, usize)>> {
+        if Arc::ptr_eq(&self.parsed, &parsed) { return Some(Vec::new()); }
+        let old = self.parsed.files();
+        let files = parsed.files();
+        let same_order = files.len() == old.len() && files.iter().zip(old).all(|(a,b)| a.path() == b.path() && a.previous_path() == b.previous_path() && (review || a.change == b.change));
+        if !same_order {
+            let keys = file_keys(files, review);
+            let folded = session.resolve_folds(&self.scope_key, &keys, self.files_collapsed_default);
+            self.rows = rows_for(files, &keys, &folded, self.layout, Some(self));
+            self.tree = file_tree_rows(files, tree_collapsed);
+            self.digits = files.iter().map(gutter_digits).collect();
+            self.keys = keys;
+            self.folded_count = folded.iter().filter(|folded| **folded).count();
+            self.folded = folded;
+            self.parsed = parsed;
+            self.recount(0);
+            return None;
+        }
+        let mut changes = Vec::new();
+        for (i, (before, file)) in old.iter().zip(files).enumerate() {
+            if !same_rows(before, file) {
+                let rows = Arc::new(file_rows(0, file, self.folded[i], self.layout));
+                changes.push((self.starts[i]..self.starts[i + 1], rows.len()));
+                self.rows[i] = rows;
+                self.digits[i] = gutter_digits(file);
+            } else if before.change != file.change || before.additions != file.additions || before.deletions != file.deletions {
+                changes.push((self.starts[i]..self.starts[i] + 1, 1));
+            }
+        }
+        for row in &mut self.tree {
+            if let t3_core::diff::TreeRowKind::File { file, change } = &mut row.kind { *change = files[*file].change; }
+        }
+        self.parsed = parsed;
+        if !changes.is_empty() { self.recount(0); }
+        Some(changes)
     }
 
     fn recount(&mut self, from: usize) {
@@ -101,7 +137,7 @@ impl View {
             return None;
         }
         let file = self.starts.partition_point(|start| *start <= index).checked_sub(1)?;
-        self.rows.get(file)?.get(index - self.starts[file]).copied()
+        self.rows.get(file)?.get(index - self.starts[file]).copied().map(|row| row.at_file(file))
     }
 
     pub fn header_row(&self, file: usize) -> Option<usize> {
@@ -126,7 +162,7 @@ impl View {
             return None;
         }
         let diff = self.parsed.files().get(file)?;
-        let next = file_rows(file, diff, folded, self.layout);
+        let next = Arc::new(file_rows(0, diff, folded, self.layout));
         let old = self.starts[file]..self.starts[file + 1];
         let count = next.len();
         self.rows[file] = next;
@@ -142,7 +178,7 @@ impl View {
 
     pub fn set_all_folded(&mut self, folded: bool) {
         let files = self.parsed.files();
-        self.rows = files.iter().enumerate().map(|(index, file)| file_rows(index, file, folded, self.layout)).collect();
+        self.rows = files.iter().map(|file| Arc::new(file_rows(0, file, folded, self.layout))).collect();
         self.folded = vec![folded; files.len()];
         self.folded_count = if folded { files.len() } else { 0 };
         self.recount(0);
@@ -157,13 +193,113 @@ impl View {
     }
 }
 
-/// Digits in the largest line number a file shows.
-fn gutter_digits(file: &FileDiff) -> usize {
-    let largest = file
-        .hunks
-        .iter()
-        .map(|hunk| (hunk.old_start + hunk.old_count).max(hunk.new_start + hunk.new_count))
-        .max()
-        .unwrap_or(1);
-    largest.max(1).ilog10() as usize + 1
+pub fn seed_height_estimates(list: &gpui::ListState, width: gpui::Pixels, previous_width: &mut Option<gpui::Pixels>) -> bool {
+    if width <= gpui::px(0.) || *previous_width == Some(width) { return false; }
+    *previous_width = Some(width);
+    // GPUI discards all height hints on width changes, including the first layout.
+    list.clone().with_uniform_item_height(gpui::px(super::lines::LINE_HEIGHT));
+    true
+}
+
+pub fn apply_row_changes(list: &gpui::ListState, changes: Vec<(Range<usize>, usize)>) {
+    for (range, count) in changes.into_iter().rev() {
+        if range.len() == count { list.remeasure_items(range); } else { list.splice(range, count); }
+    }
+}
+
+fn file_keys(files: &[FileDiff], review: bool) -> Vec<String> {
+    let mut occurrences = std::collections::HashMap::new();
+    files.iter().map(|file| {
+        if !review { return file.key(); }
+        let path_key = serde_json::json!([file.previous_path(), file.path()]).to_string();
+        let count = occurrences.entry(path_key.clone()).or_insert(0);
+        let key = format!("{path_key}:{count}");
+        *count += 1;
+        key
+    }).collect()
+}
+
+fn rows_for(files: &[FileDiff], keys: &[String], folded: &[bool], layout: Layout, previous: Option<&View>) -> Vec<Arc<Vec<DiffRow>>> {
+    let cached: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|view| view.keys.iter().enumerate().map(move |(i, key)| (key.as_str(), (view, i)))).collect();
+    files.iter().enumerate().map(|(i, file)| {
+        if let Some((view, old)) = cached.get(keys[i].as_str())
+            && view.layout == layout && view.folded[*old] == folded[i]
+            && same_rows(&view.parsed.files()[*old], file) {
+            return view.rows[*old].clone();
+        }
+        Arc::new(file_rows(0, file, folded[i], layout))
+    }).collect()
+}
+
+fn same_rows(before: &FileDiff, after: &FileDiff) -> bool {
+    before.binary == after.binary && before.hunks.shares_with(&after.hunks)
+}
+
+fn gutter_digits(file: &FileDiff) -> usize { file.hunks.gutter_digits() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use t3_core::diff::{ChangeKind, ReviewFile};
+
+    #[test]
+    fn lazy_file_keys_keep_folds_when_metadata_changes_type_and_inserts_a_path() {
+        let stat = ReviewFile { path: "new.rs".into(), previous_path: Some("old.rs".into()), additions: 1, deletions: 0 };
+        let placeholder = stat.placeholder();
+        let parsed = |files| Parsed::from_patch(ParsedPatch::Files(files), false, None, None, None);
+        let mut session = DiffSession::default();
+        let initial = View::new(parsed(vec![placeholder.clone()]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
+        let key = initial.key(0).unwrap().to_owned();
+        session.set_file_fold("scope".into(), key.clone(), false, || initial.folded_keys());
+        let loaded = FileDiff { change: ChangeKind::RenamePure, ..placeholder };
+        let inserted = ReviewFile { path: "a.rs".into(), previous_path: None, additions: 1, deletions: 0 }.placeholder();
+        let next = View::new(parsed(vec![inserted, loaded.clone()]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
+        assert_eq!(next.key(1), Some(key.as_str()));
+        assert!(!next.is_folded(1));
+        let pair = View::new(parsed(vec![loaded.clone(), loaded]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
+        assert_ne!(pair.key(0), pair.key(1), "same-path delete/add entries remain distinct");
+    }
+    #[test]
+    fn lazy_updates_reuse_status_data_and_unaffected_file_rows() {
+        let file = |index, text| {
+            let ParsedPatch::Files(mut files) = parse_patch(&format!("--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-before\n+{text}\n")) else { panic!("files") };
+            files.remove(0)
+        };
+        let files: Vec<_> = (0..12).map(|i| file(i, "after")).collect();
+        let parsed = |files| Parsed::from_patch(ParsedPatch::Files(files), false, None, None, None);
+        let session = DiffSession::default();
+        let mut view = View::new(parsed(files.clone()), "scope".into(), Layout::Stacked, &session, false, &HashSet::new(), true);
+        let pointers = |view: &View| view.rows.iter().map(|rows| rows.as_ptr()).collect::<Vec<_>>();
+        let original = pointers(&view);
+        view.update(view.parsed.clone(), &session, &HashSet::new(), true);
+        assert_eq!(pointers(&view), original, "status-only updates must reuse every file's rows");
+        let mut changed = files.clone();
+        changed[5] = file(5, "changed");
+        let changes = view.update(parsed(changed.clone()), &session, &HashSet::new(), true).expect("same file order");
+        assert_eq!(changes.len(), 1);
+        for (i, pointer) in pointers(&view).iter().enumerate() {
+            assert_eq!(*pointer == original[i], i != 5, "only the settled file regenerates rows");
+        }
+        let previous = pointers(&view);
+        changed.insert(0, file(99, "inserted"));
+        view.update(parsed(changed), &session, &HashSet::new(), true);
+        assert_eq!(&pointers(&view)[1..], previous.as_slice(), "metadata insertion reuses unchanged rows");
+        for i in 0..13 { assert_eq!(view.row(view.header_row(i).unwrap()).unwrap().file(), i); }
+        let list = gpui::ListState::new(200, gpui::ListAlignment::Top, gpui::px(0.));
+        list.reset_with_uniform_height(200, gpui::px(32.));
+        list.scroll_to(gpui::ListOffset { item_ix: 140, offset_in_item: gpui::px(0.) });
+        let offset = list.offset_for_item(140);
+        apply_row_changes(&list, vec![(0..1, 1), (1..2, 1)]);
+        assert_eq!(list.offset_for_item(140), offset, "settling headers above the viewport keeps their height estimates");
+        assert_eq!(list.logical_scroll_top().item_ix, 140);
+        let unmeasured = gpui::ListState::new(200, gpui::ListAlignment::Top, gpui::px(0.));
+        unmeasured.scroll_to(gpui::ListOffset { item_ix: 140, offset_in_item: gpui::px(0.) });
+        let mut width = None;
+        seed_height_estimates(&unmeasured, gpui::px(800.), &mut width);
+        assert_eq!(unmeasured.offset_for_item(140), gpui::px(2800.), "width invalidation must not leave later headers at zero distance");
+        assert_eq!(unmeasured.logical_scroll_top().item_ix, 140);
+        assert!(!seed_height_estimates(&unmeasured, gpui::px(800.), &mut width), "unchanged width does not remeasure the list again");
+
+    }
+
 }

@@ -5,21 +5,25 @@
 use std::sync::Arc;
 
 use t3_core::diff::{
-    PreviewSourceKind, ToolCallDiff, ToolCallTarget, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
-    diff_preview_request, hide_whitespace_changes, preview_is_repository, tool_call_diff,
+    PreviewSourceKind, ToolCallDiff, ToolCallTarget, checkpoint_diff_request, decode_turn_diff,
+    hide_whitespace_changes, tool_call_diff, ReviewModel,
 };
 use t3_core::timeline::{GET_TURN_ITEM, decode_detail};
 
 use super::view::Parsed;
+mod worker;
+pub use worker::{Command, run};
+#[cfg(feature = "snapshot")]
+pub(super) use worker::run_with;
 use crate::app_state::AppState;
 
 /// A patch's identity. The environment is part of it, so a cache never serves one server's
 /// patches after pairing with another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestKey {
-    /// `review.getDiffPreview` answers both git scopes. `revision` bumps on refresh and when
+    /// Only the selected Git scope is requested. `revision` bumps on refresh and when
     /// the agent may have changed the workspace.
-    Git { environment: String, cwd: String, base_ref: Option<String>, ignore_whitespace: bool, revision: u64 },
+    Git { kind: PreviewSourceKind, environment: String, cwd: String, base_ref: Option<String>, ignore_whitespace: bool, revision: u64 },
     Turn { environment: String, thread_id: String, turn_count: u64, ignore_whitespace: bool },
     /// `orchestration.getTurnItem`; whitespace is hidden client-side, so it is not part of the key.
     ToolCall { environment: String, target: ToolCallTarget },
@@ -30,9 +34,9 @@ impl RequestKey {
     pub fn same_source(&self, other: &RequestKey) -> bool {
         match (self, other) {
             (
-                RequestKey::Git { environment, cwd, base_ref, ignore_whitespace, .. },
-                RequestKey::Git { environment: e, cwd: c, base_ref: b, ignore_whitespace: w, .. },
-            ) => environment == e && cwd == c && base_ref == b && ignore_whitespace == w,
+                RequestKey::Git { kind, environment, cwd, base_ref, ignore_whitespace, .. },
+                RequestKey::Git { kind: k, environment: e, cwd: c, base_ref: b, ignore_whitespace: w, .. },
+            ) => kind == k && environment == e && cwd == c && base_ref == b && ignore_whitespace == w,
             (RequestKey::ToolCall { environment, target }, RequestKey::ToolCall { environment: e, target: t }) => {
                 environment == e && target.thread_id == t.thread_id && target.item_id == t.item_id
             }
@@ -51,7 +55,7 @@ pub fn needs_fetch(request: &RequestKey, loaded: Option<&RequestKey>) -> bool {
 #[derive(Clone)]
 pub enum Loaded {
     /// `repository` is false when the server found no VCS at the cwd (`sources: []`).
-    Git { branch: Option<Arc<Parsed>>, unstaged: Option<Arc<Parsed>>, repository: bool },
+    Git { parsed: Arc<Parsed>, review: Arc<ReviewModel>, repository: bool },
     Turn(Arc<Parsed>),
     ToolCall(Arc<ToolCall>),
 }
@@ -75,20 +79,7 @@ impl ToolCall {
 pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHandle<Result<Loaded, String>>> {
     if !state.can_read_threads() { return None; }
     match key {
-        RequestKey::Git { cwd, base_ref, ignore_whitespace, .. } => {
-            let (method, payload) = diff_preview_request(cwd, base_ref.as_deref(), *ignore_whitespace);
-            state.request(method, payload, |value| {
-                let source = |kind| {
-                    decode_diff_preview(&value, kind)
-                        .map(|source| Parsed::new(&source.diff, source.truncated, source.totals, source.base_ref, source.head_ref))
-                };
-                Ok(Loaded::Git {
-                    branch: source(PreviewSourceKind::BranchRange),
-                    unstaged: source(PreviewSourceKind::WorkingTree),
-                    repository: preview_is_repository(&value),
-                })
-            })
-        }
+        RequestKey::Git { .. } => None,
         RequestKey::Turn { thread_id, turn_count, ignore_whitespace, .. } => {
             let (method, payload) = checkpoint_diff_request(thread_id, *turn_count, *ignore_whitespace);
             state.request(method, payload, |value| {
@@ -135,7 +126,10 @@ mod tests {
         assert!(!live.same_source(&other_environment));
         assert!(needs_fetch(&live, Some(&other_environment)));
 
-        let git = |revision| RequestKey::Git { environment: "e".into(), cwd: "/r".into(), base_ref: None, ignore_whitespace: true, revision };
+        let git = |revision| RequestKey::Git { kind: PreviewSourceKind::BranchRange, environment: "e".into(), cwd: "/r".into(), base_ref: None, ignore_whitespace: true, revision };
         assert!(git(2).same_source(&git(1)) && needs_fetch(&git(2), Some(&git(1))));
+        let RequestKey::Git { environment, cwd, base_ref, ignore_whitespace, revision, .. } = git(1) else { unreachable!() };
+        let working = RequestKey::Git { kind: PreviewSourceKind::WorkingTree, environment, cwd, base_ref, ignore_whitespace, revision };
+        assert!(!working.same_source(&git(1)), "working-tree metadata cannot satisfy a branch preview");
     }
 }

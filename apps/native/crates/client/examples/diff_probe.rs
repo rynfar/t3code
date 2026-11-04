@@ -11,7 +11,7 @@ use t3_client::store;
 use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus, start};
 use t3_core::diff::{
     self, ParsedPatch, PreviewSourceKind, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
-    diff_preview_request, parse_patch, turn_diff_summaries,
+    ReviewModel, ReviewScope, parse_patch, turn_diff_summaries,
 };
 use t3_core::shell::ShellState;
 use t3_core::thread::ThreadState;
@@ -66,17 +66,40 @@ async fn main() -> anyhow::Result<()> {
     });
     if let Some(cwd) = cwd {
         println!("git scopes in {cwd}");
-        let (method, payload) = diff_preview_request(&cwd, None, true);
-        match client.request(method, payload).await {
-            Ok(value) => {
-                for (label, kind) in [("changes", PreviewSourceKind::BranchRange), ("uncommitted", PreviewSourceKind::WorkingTree)] {
-                    match decode_diff_preview(&value, kind) {
-                        Some(source) => print_patch(label, &source.diff),
-                        None => println!("{label}: no source"),
+        for kind in [PreviewSourceKind::BranchRange, PreviewSourceKind::WorkingTree] {
+            let scope = ReviewScope { environment: client.environment().into(), connection: 1, cwd: cwd.clone(), kind, base_ref: None, ignore_whitespace: true };
+            let mut review = ReviewModel::new(scope.clone());
+            let (method, payload) = scope.request(true);
+            println!("selected {} metadataOnly=true trackedOnly=true", kind.wire());
+            match client.request(method, payload).await {
+                Ok(value) => {
+                    review.accept_preview(&value);
+                    println!("  tracked: incomplete={} files={} deferred={}", review.incomplete, review.files().len(), review.lazy());
+                    if review.incomplete {
+                        let (method, payload) = scope.request(false);
+                        review.accept_preview(&client.request(method, payload).await?);
+                        println!("  complete: incomplete={} files={} deferred={}", review.incomplete, review.files().len(), review.lazy());
+                    }
+                    let reads = review.take_requests();
+                    println!("  initial file reads={} (limit 4)", reads.len());
+                    let mut tasks = tokio::task::JoinSet::new();
+                    for ticket in reads {
+                        let client = client.clone();
+                        tasks.spawn(async move {
+                            let (method, payload) = ticket.request();
+                            let value = client.request(method, payload).await.map_err(|e| e.to_string()).and_then(|v| decode_diff_preview(&v, ticket.scope.kind).ok_or_else(|| "missing source".into()));
+                            (ticket, value)
+                        });
+                    }
+                    while let Some(result) = tasks.join_next().await {
+                        let (ticket, result) = result?;
+                        review.accept_patch(&ticket, result);
+                        let state = review.state(&ticket.file).expect("requested file state");
+                        println!("    file {} loaded={} truncated={} error={:?}", ticket.file.path, state.files.is_some(), state.truncated, state.error);
                     }
                 }
+                Err(error) => println!("  metadata failed: {error}"),
             }
-            Err(error) => println!("diff preview failed: {error}"),
         }
     }
     Ok(())

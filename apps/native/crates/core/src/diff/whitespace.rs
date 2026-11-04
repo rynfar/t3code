@@ -18,7 +18,7 @@ pub fn hide_whitespace_changes(patch: &ParsedPatch) -> ParsedPatch {
 fn hide_in_file(file: &FileDiff) -> FileDiff {
     let hunks: Vec<Hunk> = file.hunks.iter().map(hide_in_hunk).collect();
     let count = |kind: LineKind| hunks.iter().flat_map(|hunk| &hunk.lines).filter(|line| line.kind == kind).count() as u32;
-    FileDiff { additions: count(LineKind::Addition), deletions: count(LineKind::Deletion), hunks, ..file.clone() }
+    FileDiff { additions: count(LineKind::Addition), deletions: count(LineKind::Deletion), hunks: hunks.into(), ..file.clone() }
 }
 
 fn hide_in_hunk(hunk: &Hunk) -> Hunk {

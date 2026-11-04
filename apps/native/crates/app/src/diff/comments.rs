@@ -224,7 +224,7 @@ impl DiffPanel {
         };
         let Some(diff) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)) else { return };
         let Some(comment) = review::build_diff_comment(uuid_v4(), section, title, diff, selection, "") else { return };
-        let file_key = diff.key();
+        let Some(file_key) = self.view.as_ref().and_then(|view| view.key(file)).map(str::to_owned) else { return };
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Add a comment…"));
         let subscription = cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -251,7 +251,7 @@ impl DiffPanel {
             _ => false,
         });
         if let Some(row) = row {
-            self.list.splice(row..row + 1, 1);
+            self.list.remeasure_items(row..row + 1);
         }
     }
 
