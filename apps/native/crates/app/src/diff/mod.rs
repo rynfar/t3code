@@ -111,7 +111,8 @@ impl DiffPanel {
         let mut panel = Self::construct(state, cx);
         let entity = cx.entity().downgrade();
         panel.list.set_scroll_handler(move |_, _, cx| {
-            if let Some(entity) = entity.upgrade() { entity.update(cx, |panel, cx| panel.load_nearby(cx)); }
+            let entity = entity.clone();
+            cx.defer(move |cx| { if let Some(entity) = entity.upgrade() { entity.update(cx, |panel, cx| panel.load_nearby(cx)); } });
         });
         #[cfg(feature = "snapshot")]
         if snapshot::install(&mut panel, cx) { return panel; }
@@ -506,8 +507,12 @@ impl DiffPanel {
         let Some(file) = review.files().iter().find(|f| review.state(f).is_none_or(|s| s.pending)) else { return };
         let Some(view) = &self.view else { return };
         let Some(index) = view.parsed.files().iter().position(|f| f.path() == file.path) else { return };
-        if let Some(row) = view.header_row(index).and_then(|row| self.list.bounds_for_item(row))
-            && row.top() <= self.list.viewport_bounds().bottom() + px(600.) {
+        let Some(header) = view.header_row(index) else { return };
+        let top = self.list.logical_scroll_top();
+        let viewport = self.list.viewport_bounds();
+        let measured = self.list.bounds_for_item(header).map(|row| f32::from(row.top() - viewport.top()));
+        let estimate = self.list.offset_for_item(header) - self.list.offset_for_item(top.item_ix) - top.offset_in_item;
+        if t3_core::diff::review_boundary_near(header, top.item_ix, measured, estimate.into(), viewport.size.height.into()) {
             self.patch_command(source::Command::Next);
         }
     }
@@ -585,10 +590,21 @@ impl DiffPanel {
                 let file = view.row(top.item_ix)?.file();
                 Some((view.key(file)?.to_owned(), top.item_ix - view.header_row(file)?, top.offset_in_item))
             });
-        let view = View::new(parsed, scope_key.clone(), layout, &self.session, files_collapsed_default, &self.tree_collapsed, self.review().is_some());
+        let review = self.review().is_some();
+        let compatible = self.view.as_ref().is_some_and(|view| view.scope_key == scope_key && view.layout == layout && view.files_collapsed_default == files_collapsed_default);
+        let changes = if compatible {
+            self.view.as_mut().expect("compatible view").update(parsed, &self.session, &self.tree_collapsed, review)
+        } else {
+            self.view = Some(View::new(parsed, scope_key.clone(), layout, &self.session, files_collapsed_default, &self.tree_collapsed, review));
+            None
+        };
+        let view = self.view.as_ref().expect("installed view");
         if self.comments.editor.as_ref().is_some_and(|editor| !(0..view.parsed.files().len()).any(|i| view.key(i) == Some(editor.file_key.as_str()))) { self.comments.editor = None; }
         let count = view.row_count();
-        self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT));
+        match changes {
+            Some(changes) => view::apply_row_changes(&self.list, changes),
+            None => self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT)),
+        }
         let keep = keep.and_then(|(key, within, offset_in_item)| {
             let file = (0..view.parsed.files().len()).find(|&i| view.key(i) == Some(&key))?;
             let start = view.header_row(file)?;
@@ -600,7 +616,6 @@ impl DiffPanel {
             None => self.h_offset = px(0.),
         }
         self.top_file = view.row(0).map(|row| row.file());
-        self.view = Some(view);
         self.reveal_requested(cx);
     }
 

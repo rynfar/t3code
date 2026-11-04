@@ -237,7 +237,7 @@ fn build_file(header: Header, hunks: Vec<Hunk>) -> FileDiff {
         new_path: if change == ChangeKind::Deleted { None } else { new_path },
         change,
         binary: header.binary,
-        hunks,
+        hunks: hunks.into(),
     }
 }
 

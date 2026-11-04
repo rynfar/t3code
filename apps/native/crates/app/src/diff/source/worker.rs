@@ -13,18 +13,20 @@ pub enum Command {
     Retry(String),
 }
 
-pub fn loaded(model: &ReviewModel) -> Loaded {
-    let source = model.source.as_ref();
-    Loaded::Git {
-        parsed: Parsed::from_patch(
-            model.patch(),
-            source.is_some_and(|s| s.truncated && !model.lazy()),
-            source.and_then(|s| s.totals),
-            source.and_then(|s| s.base_ref.clone()),
-            source.and_then(|s| s.head_ref.clone()),
-        ),
-        review: Arc::new(model.clone()),
-        repository: model.repository,
+#[derive(Default)]
+struct Projection {
+    version: Option<u64>,
+    parsed: Option<Arc<Parsed>>,
+}
+
+impl Projection {
+    fn loaded(&mut self, model: &ReviewModel) -> Loaded {
+        if self.version != Some(model.render_version()) {
+            let source = model.source.as_ref();
+            self.parsed = Some(Parsed::from_patch(model.patch(), source.is_some_and(|s| s.truncated && !model.lazy()), source.and_then(|s| s.totals), source.and_then(|s| s.base_ref.clone()), source.and_then(|s| s.head_ref.clone())));
+            self.version = Some(model.render_version());
+        }
+        Loaded::Git { parsed: self.parsed.as_ref().expect("parsed projection installed").clone(), review: Arc::new(model.clone()), repository: model.repository }
     }
 }
 
@@ -85,6 +87,7 @@ pub(crate) async fn run_with<F, Fut>(
         metadata.spawn(async move { request(method, payload).await });
     }
     let mut patches = JoinSet::new();
+    let mut projection = Projection::default();
     let mut publish = true;
     loop {
         if publish {
@@ -101,7 +104,7 @@ pub(crate) async fn run_with<F, Fut>(
                     (ticket, result)
                 });
             }
-            if updates.send(Ok(loaded(&model))).await.is_err() {
+            if updates.send(Ok(projection.loaded(&model))).await.is_err() {
                 return;
             }
         }
@@ -180,14 +183,15 @@ mod tests {
             updates,
         ));
         let first = receive.recv().await.unwrap().unwrap_or_else(|e| panic!("{e}"));
-        let Loaded::Git { review, .. } = first else { panic!("git preview") };
+        let Loaded::Git { review, parsed: original_parsed, .. } = first else { panic!("git preview") };
         assert!(review.incomplete);
         assert_eq!(review.files()[0].path, "a");
         release.send(()).unwrap();
         assert!(matches!(receive.recv().await.unwrap(), Err(error) if error == "full preview failed"));
-        let Loaded::Git { review: retained, .. } = receive.recv().await.unwrap().unwrap_or_else(|e| panic!("{e}")) else {
+        let Loaded::Git { review: retained, parsed: retained_parsed, .. } = receive.recv().await.unwrap().unwrap_or_else(|e| panic!("{e}")) else {
             panic!("retained preview")
         };
+        assert!(Arc::ptr_eq(&original_parsed, &retained_parsed), "status-only publication reuses the parsed representation");
         assert_eq!(retained.source, review.source);
         assert_eq!(retained.revision, review.revision);
         drop(send);

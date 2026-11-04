@@ -35,6 +35,15 @@ pub enum DiffRow {
 }
 
 impl DiffRow {
+    pub fn at_file(mut self, index: usize) -> Self {
+        match &mut self {
+            DiffRow::FileHeader { file } | DiffRow::Separator { file, .. } | DiffRow::Line { file, .. }
+            | DiffRow::Split { file, .. } | DiffRow::Notice { file } | DiffRow::NoNewline { file, .. }
+            | DiffRow::SplitNoNewline { file, .. } => *file = index,
+        }
+        self
+    }
+
     pub fn file(&self) -> usize {
         match *self {
             DiffRow::FileHeader { file }

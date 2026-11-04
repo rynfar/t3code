@@ -53,7 +53,7 @@ impl ReviewFile {
                 ChangeKind::Modified
             },
             binary: false,
-            hunks: Vec::new(),
+            hunks: Vec::new().into(),
             additions: self.additions as u32,
             deletions: self.deletions as u32,
         }
@@ -88,13 +88,14 @@ impl PatchTicket {
 #[derive(Debug, Clone)]
 pub struct ReviewModel {
     pub scope: ReviewScope,
-    pub source: Option<DiffPreviewSource>,
+    pub source: Option<Arc<DiffPreviewSource>>,
     pub incomplete: bool,
     pub repository: bool,
     pub revision: u64,
     pub states: HashMap<String, FilePatchState>,
-    requested: HashSet<String>,
-    legacy: ParsedPatch,
+    requested: Arc<HashSet<String>>,
+    rendered: Arc<ParsedPatch>,
+    render_version: u64,
 }
 
 impl ReviewModel {
@@ -106,8 +107,9 @@ impl ReviewModel {
             repository: true,
             revision: 0,
             states: HashMap::new(),
-            requested: HashSet::new(),
-            legacy: ParsedPatch::Empty,
+            requested: Arc::new(HashSet::new()),
+            rendered: Arc::new(ParsedPatch::Empty),
+            render_version: 0,
         }
     }
 
@@ -127,7 +129,7 @@ impl ReviewModel {
     }
 
     pub fn accept_preview(&mut self, value: &Value) {
-        let source = decode_diff_preview(value, self.scope.kind);
+        let source = decode_diff_preview(value, self.scope.kind).map(Arc::new);
         self.repository = super::preview_is_repository(value);
         self.incomplete = value["incomplete"].as_bool().unwrap_or(false);
         let same_refs = self
@@ -136,22 +138,26 @@ impl ReviewModel {
             .zip(source.as_ref())
             .is_some_and(|(a, b)| a.kind == b.kind && a.base_ref == b.base_ref && a.head_ref == b.head_ref);
         if !same_refs {
-            self.requested.clear();
+            Arc::make_mut(&mut self.requested).clear();
         }
-        if self.source != source {
+        let changed = self.source != source;
+        if changed {
             self.revision += 1;
             self.states.clear();
         }
         self.source = source;
         let identities: HashSet<_> = self.files().iter().map(ReviewFile::identity).collect();
-        self.requested.retain(|id| identities.contains(id));
-        self.requested
-            .extend(self.files().iter().take(4).map(ReviewFile::identity).collect::<Vec<_>>());
-        self.legacy = if self.lazy() {
-            ParsedPatch::Empty
-        } else {
-            self.source.as_ref().map_or(ParsedPatch::Empty, |s| parse_patch(&s.diff))
-        };
+        Arc::make_mut(&mut self.requested).retain(|id| identities.contains(id));
+        let automatic = self.files().iter().take(4).map(ReviewFile::identity).collect::<Vec<_>>();
+        Arc::make_mut(&mut self.requested).extend(automatic);
+        if changed {
+            self.rendered = Arc::new(if self.lazy() {
+                ParsedPatch::Files(self.files().iter().map(ReviewFile::placeholder).collect())
+            } else {
+                self.source.as_ref().map_or(ParsedPatch::Empty, |s| parse_patch(&s.diff))
+            });
+            self.render_version += 1;
+        }
     }
 
     pub fn request_file(&mut self, path: &str) -> bool {
@@ -159,7 +165,7 @@ impl ReviewModel {
             .iter()
             .find(|f| f.path == path)
             .map(ReviewFile::identity)
-            .is_some_and(|id| self.requested.insert(id))
+            .is_some_and(|id| Arc::make_mut(&mut self.requested).insert(id))
     }
 
     pub fn load_next(&mut self) -> bool {
@@ -168,18 +174,19 @@ impl ReviewModel {
         if self.requested.contains(&self.files()[start].identity()) {
             return false;
         }
-        self.requested
-            .extend(self.files()[start..].iter().take(4).map(ReviewFile::identity).collect::<Vec<_>>());
+        let next = self.files()[start..].iter().take(4).map(ReviewFile::identity).collect::<Vec<_>>();
+        Arc::make_mut(&mut self.requested).extend(next);
         true
     }
 
     pub fn retry(&mut self, path: &str) -> bool {
-        if let Some(file) = self.files().iter().find(|f| f.path == path) {
+        if let Some(file) = self.files().iter().find(|f| f.path == path).cloned() {
             let id = file.identity();
             if self.states.get(&id).is_some_and(|s| s.error.is_some() && !s.pending) {
-                self.states.remove(&id);
+                let had_patch = self.states.remove(&id).is_some_and(|s| s.files.is_some());
+                if had_patch { self.replace_file(&file, &[file.placeholder()]); }
             }
-            self.requested.insert(id);
+            Arc::make_mut(&mut self.requested).insert(id);
             return true;
         }
         false
@@ -259,29 +266,30 @@ impl ReviewModel {
         state.pending = false;
         match result {
             Ok((files, truncated)) => {
-                state.files = Some(files);
+                state.files = Some(files.clone());
                 state.truncated = truncated;
                 state.error = None;
+                self.replace_file(&ticket.file, &files);
             }
             Err(error) => state.error = Some(error),
         }
         true
     }
 
-    pub fn patch(&self) -> ParsedPatch {
-        if !self.lazy() {
-            return self.legacy.clone();
-        }
-        ParsedPatch::Files(
-            self.files()
-                .iter()
-                .flat_map(|f| {
-                    self.state(f)
-                        .and_then(|s| s.files.as_deref())
-                        .cloned()
-                        .unwrap_or_else(|| vec![f.placeholder()])
-                })
-                .collect(),
-        )
+    fn replace_file(&mut self, file: &ReviewFile, replacement: &[FileDiff]) {
+        let ParsedPatch::Files(files) = Arc::make_mut(&mut self.rendered) else { return };
+        let matches = |f: &&FileDiff| f.path() == file.path && f.previous_path() == file.previous_path.as_deref().unwrap_or(&file.path);
+        let Some(start) = files.iter().position(|f| matches(&f)) else { return };
+        let end = start + files[start..].iter().take_while(matches).count();
+        files.splice(start..end, replacement.iter().cloned());
+        self.render_version += 1;
     }
+
+    pub fn render_version(&self) -> u64 { self.render_version }
+
+    pub fn patch(&self) -> ParsedPatch { (*self.rendered).clone() }
+}
+
+pub fn review_boundary_near(header: usize, top: usize, measured_offset: Option<f32>, estimated_offset: f32, viewport_height: f32) -> bool {
+    viewport_height > 0. && (header <= top || measured_offset.unwrap_or(estimated_offset) <= viewport_height + 600.)
 }

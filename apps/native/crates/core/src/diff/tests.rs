@@ -802,13 +802,16 @@ fn lazy_review_tracks_paths_across_complete_metadata_and_bounds_revision_reads()
     use crate::composer::review::{build_diff_comment, Selection, Side};
     let selection = Selection { start: 1, end: 1, side: Side::Additions, end_side: Side::Additions };
     assert!(build_diff_comment("id".into(), "unstaged".into(), "Uncommitted".into(), &placeholders[0], selection, "comment").is_none(), "an unloaded placeholder has no selectable line");
+    let render_version = review.render_version();
     let initial = review.take_requests();
+    assert_eq!(review.render_version(), render_version, "request state does not replace parsed content");
     assert_eq!(initial.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["b","c","d","e"]);
     review.request_file("j");
     review.load_next();
     assert!(review.take_requests().is_empty(), "no fifth concurrent read");
     assert!(review.accept_patch(&initial[0], Err("offline".into())));
     assert_eq!(review.revision, 1, "patch failure cannot refresh the preview revision");
+    assert_eq!(review.render_version(), render_version, "failure status keeps the parsed representation");
     assert_eq!(review.take_requests().len(), 1, "on-demand file uses the released permit");
     review.accept_preview(&metadata(&["a","b","c","d","e","f","g","h","i","j"], "complete", false));
     assert!(review.has_complete_preview());
@@ -873,4 +876,23 @@ fn review_accepts_legacy_complete_patch_and_preserves_rename_and_replaced_file_i
     review.accept_patch(&ticket, Ok(decode_diff_preview(&replacement, PreviewSourceKind::WorkingTree).unwrap()));
     let ParsedPatch::Files(files) = review.patch() else { panic!("files") };
     assert_eq!(files.iter().map(|f| f.change).collect::<Vec<_>>(), [ChangeKind::Deleted, ChangeKind::New]);
+}
+
+#[test]
+fn lazy_batches_resume_after_jumping_past_pending_and_unmeasured_headers() {
+    let mut review = ReviewModel::new(review_scope());
+    review.accept_preview(&metadata(&["a","b","c","d","e","f","g","h","i","j","k","l"], "complete", false));
+    let initial = review.take_requests();
+    assert!(review_boundary_near(0, 20, None, -640., 600.), "scrollbar jump left the pending boundary above the viewport");
+    assert!(!review.load_next(), "the initial four are still pending");
+    for ticket in &initial { review.accept_patch(ticket, Err("failed".into())); }
+    assert!(review_boundary_near(4, 20, None, -512., 600.), "settling the batch must not strand the next boundary");
+    assert!(review.load_next());
+    let next = review.take_requests();
+    assert_eq!(next.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["e","f","g","h"]);
+    assert!(review.take_requests().is_empty(), "jumping preserves the four-read bound");
+    assert!(review_boundary_near(20, 20, None, 0., 600.));
+    assert!(review_boundary_near(25, 20, None, 160., 600.), "unmeasured visible header uses retained height estimates");
+    assert!(!review_boundary_near(100, 20, None, 2560., 600.));
+    assert!(!review_boundary_near(25, 20, Some(1500.), 160., 600.), "measured geometry wins over estimates");
 }
