@@ -67,6 +67,7 @@ impl Workspace {
         let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+        thread.update(cx, |view, cx| view.bind_composer(&composer, cx));
         let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer.clone(), window, cx));
         let prompt_links = cx.new(|cx| crate::prompt_links::PromptLinks::new(state.clone(), composer.clone(), window, cx));
         let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));

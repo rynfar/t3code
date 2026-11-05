@@ -34,16 +34,18 @@ pub(super) fn target(key: &str) -> Option<Target> {
 }
 
 impl Composer {
+    pub(super) fn restore_draft_choices(&mut self, target: &Target, draft: &Draft, cx: &mut Context<Self>) {
+        self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
+        if self.snapshot.target.as_ref() == Some(target) { self.sync_provider_target(cx); }
+    }
+
     /// Loads the saved drafts: choices, mentions and uploaded attachments go back to their
     /// targets; prompts load when a target opens.
     pub(super) fn load_drafts(&mut self, cx: &mut Context<Self>) {
         let store = DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref());
         for key in store.keys() {
             let (Some(target), Some(draft)) = (target(key), store.get(key)) else { continue };
-            self.choices.insert(
-                target.clone(),
-                Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode },
-            );
+            self.restore_draft_choices(&target, draft, cx);
             self.seed_records(&target, draft.context_records.clone());
             self.seed_mentions(&target, draft.thread_contexts());
             self.seed_terminals(&target, draft.terminals.clone());
@@ -93,6 +95,8 @@ impl Composer {
 
     /// Records the current target's draft and schedules a write.
     pub(super) fn draft_changed(&mut self, cx: &mut Context<Self>) {
+        let choice = self.choices().and_then(|choices| choices.model.as_ref()).map(|model| &model.instance_id);
+        if choice != self.provider_choice.as_ref() { self.sync_provider_target(cx); }
         if self.cancel_pending_send() { cx.notify(); }
         if let Some(target) = self.snapshot.target.clone() {
             self.record_draft(&target, cx);
@@ -119,6 +123,7 @@ impl Composer {
     /// Forgets a new-thread draft once it launched, as the web deletes the draft thread.
     pub(super) fn discard_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
         self.choices.remove(target);
+        self.sync_provider_target(cx);
         if self.drafts.store.remove(&key(target)) {
             self.schedule_draft_save(target, cx);
         }
@@ -193,7 +198,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
+        self.restore_draft_choices(&target, &draft, cx);
         self.seed_records(&target, draft.context_records.clone());
             self.seed_mentions(&target, draft.thread_contexts());
         self.seed_terminals(&target, draft.terminals.clone());

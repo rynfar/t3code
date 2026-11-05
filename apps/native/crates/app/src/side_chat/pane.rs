@@ -26,6 +26,7 @@ impl SideChatPane {
     pub fn new(state: Entity<AppState>, thread_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let transcript = cx.new(|cx| ThreadView::embedded(state.clone(), thread_id.clone(), window, cx));
         let composer = cx.new(|cx| Composer::embedded(state.clone(), thread_id.clone(), window, cx));
+        transcript.update(cx, |view, cx| view.bind_composer(&composer, cx));
         let subscription = cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
             if matches!(event, AppEvent::Shell | AppEvent::SideThread | AppEvent::Selection) {
                 cx.notify();
