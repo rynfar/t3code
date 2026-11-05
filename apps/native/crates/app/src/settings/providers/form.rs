@@ -59,6 +59,13 @@ pub(super) struct FormState {
     error: Option<String>,
 }
 impl FormState {
+    pub(super) fn reset(&mut self) {
+        *self = Self {
+            generation: self.generation + 1,
+            ..Default::default()
+        };
+    }
+
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
         self.fields
             .iter()
@@ -69,6 +76,36 @@ impl FormState {
     }
 }
 impl SettingsView {
+    fn form_event_current(&self, generation: usize, cx: &App) -> bool {
+        self.provider_form().generation == generation && self.current_form_instance(cx).is_some()
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn assert_form_queue_safety(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.provider_form().generation;
+        assert!(self.form_event_current(generation, cx));
+        self.providers.selected = Some("other".into());
+        assert!(
+            !self.form_event_current(generation, cx),
+            "queued runtime/argument/environment blur cannot address a new selection before render"
+        );
+        let selected = self.page_data(cx).unwrap().selected.unwrap();
+        self.sync_editor_inputs(Some(&selected), window, cx);
+        self.sync_provider_form(&selected, window, cx);
+        assert!(
+            !self.form_event_current(generation, cx),
+            "queued callbacks cannot read the replacement form's values"
+        );
+        self.providers.selected = Some("codex".into());
+        let selected = self.page_data(cx).unwrap().selected.unwrap();
+        self.sync_editor_inputs(Some(&selected), window, cx);
+        self.sync_provider_form(&selected, window, cx);
+        assert!(
+            !self.form_event_current(generation, cx),
+            "a selection round trip must not revive queued callbacks"
+        );
+    }
+
     fn provider_form(&self) -> &FormState {
         self.providers.dialog.as_ref().map_or(&self.providers.form, |d| &d.local_form)
     }
@@ -164,7 +201,9 @@ impl SettingsView {
             }
             let key = field.key.clone();
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(field.placeholder.clone()).masked(field.secret));
-            let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
+            let generation = self.provider_form().generation;
+            let subscription = cx.subscribe_in(&input, window, move |this, source, event: &InputEvent, window, cx| {
+                if !this.form_event_current(generation, cx) || !this.provider_form().fields.iter().any(|field| field.key == key && &field.input == source) { return; }
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     this.commit_config_field(&key, window, cx);
                 }
@@ -239,7 +278,9 @@ impl SettingsView {
             } else {
                 let id = row.id;
                 let input = cx.new(|cx| InputState::new(window, cx).default_value(row.value));
-                let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| {
+                let generation = self.provider_form().generation;
+                let subscription = cx.subscribe_in(&input, window, move |this, source, event: &InputEvent, _, cx| {
+                    if !this.form_event_current(generation, cx) || !this.provider_form().argument_inputs.iter().any(|field| field.id == id && &field.input == source) { return; }
                     if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) || (this.providers.dialog.is_some() && matches!(event, InputEvent::Change)) {
                         this.commit_argument(id, cx);
                     }
@@ -283,10 +324,12 @@ impl SettingsView {
                     raw["value"].as_str().unwrap_or("")
                 })
         });
+        let generation = self.provider_form().generation;
         let subscriptions = [(&name, false), (&value, true)]
             .into_iter()
             .map(|(input, is_value)| {
-                cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| {
+                cx.subscribe_in(input, window, move |this, source, event: &InputEvent, window, cx| {
+                    if !this.form_event_current(generation, cx) || !this.provider_form().variables.iter().any(|field| field.id == id && if is_value { &field.value == source } else { &field.name == source }) { return; }
                     if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) || (this.providers.dialog.is_some() && matches!(event, InputEvent::Change)) {
                         this.commit_variable(id, is_value, window, cx);
                     }
@@ -307,7 +350,7 @@ impl SettingsView {
 
     fn commit_config_field(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.providers.dialog.is_some() { return; }
-        let Some(id) = self.selected_instance_id(cx) else { return };
+        let Some(id) = self.editor_instance_id(cx) else { return };
         if id != self.provider_form().instance_id {
             return;
         }
@@ -332,6 +375,13 @@ impl SettingsView {
             return;
         }
         let value = json!(text);
+        if value.as_str().unwrap_or_default()
+            == form::field_value(&instance, key)
+                .as_str()
+                .unwrap_or_default()
+        {
+            return;
+        }
         if !form::validate_field(&instance.driver, key, &value) {
             self.provider_form_mut().error = Some("Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default.".into());
             cx.notify();
@@ -406,13 +456,20 @@ impl SettingsView {
         }
     }
 
-    fn current_form_instance(&self, cx: &App) -> Option<t3_core::server_config::ProviderInstanceConfig> {
+    pub(super) fn current_form_instance(
+        &self,
+        cx: &App,
+    ) -> Option<t3_core::server_config::ProviderInstanceConfig> {
         if let Some(dialog) = &self.providers.dialog {
             return Some(t3_core::settings::providers::wizard::instance(dialog.driver().kind, "", "", dialog.configs.get(dialog.driver().kind).and_then(|c| c.model.value.clone()), vec![]));
         }
+        let id = self.editor_instance_id(cx)?;
+        if id != self.provider_form().instance_id {
+            return None;
+        }
         let app = self.state.read(cx);
         let c = app.server_config.config.as_ref()?;
-        let id = &self.provider_form().instance_id;
+        let id = &id;
         Some(
             c.settings
                 .provider_instances
