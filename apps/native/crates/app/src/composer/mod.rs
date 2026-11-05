@@ -31,7 +31,7 @@ mod workspace;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, Entity, EntityInputHandler, FocusHandle, KeyBinding, Subscription, Task, Window, actions, prelude::*};
+use gpui::{App, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, KeyBinding, Subscription, Task, Window, actions, prelude::*};
 use gpui_component::input::{InputEvent, OutdentInline, TextareaState};
 use t3_core::composer::{self as rules, EnterKey};
 use t3_core::lists;
@@ -116,6 +116,23 @@ struct Snapshot {
     setup_queues: bool,
 }
 
+/// The corresponding transcript follows this composer's effective selection (`ChatView.tsx`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProviderTarget {
+    pub environment: String,
+    pub connection: Option<u64>,
+    pub thread: Option<String>,
+    pub instance: Option<String>,
+}
+
+impl ProviderTarget {
+    pub(crate) fn environment(state: &AppState) -> String {
+        state.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).filter(|id| !id.is_empty()).or_else(|| state.environment().map(str::to_owned)).unwrap_or_default()
+    }
+}
+
+impl EventEmitter<ProviderTarget> for Composer {}
+
 /// Everything the footer and send read, resolved against the server config.
 #[derive(Debug, Clone, Default)]
 struct Resolved {
@@ -152,6 +169,8 @@ pub struct Composer {
     /// The model and mode a new draft starts from: what the thread before it ran.
     carry: (Option<ModelSelection>, Option<InteractionMode>),
     snapshot: Snapshot,
+    pub(crate) provider_target: ProviderTarget,
+    provider_choice: Option<String>,
     responding: HashSet<String>,
     answers: HashMap<String, Answers>,
     /// The request whose active question the prompt edits, and the prompt it set aside.
@@ -239,7 +258,7 @@ impl Composer {
                         if this.cancel_pending_send() { cx.notify(); }
                     }
                 }
-                if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread) {
+                if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread | AppEvent::Phase) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
                 if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase) {
@@ -303,6 +322,8 @@ impl Composer {
             choices: HashMap::new(),
             carry: (None, None),
             snapshot: Snapshot::default(),
+            provider_target: ProviderTarget::default(),
+            provider_choice: None,
             responding: HashSet::new(),
             answers: HashMap::new(),
             answering: None,
@@ -346,7 +367,7 @@ impl Composer {
 
     fn read_snapshot(&self, cx: &App) -> Snapshot {
         let state = self.state.read(cx);
-        let environment = state.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).filter(|id| !id.is_empty()).or_else(|| state.environment().map(str::to_owned)).unwrap_or_default();
+        let environment = ProviderTarget::environment(state);
         let target = match (self.fixed.as_ref().or(state.selected_thread.as_ref()), &state.draft_project) {
             (Some(id), _) => Some(Target::Thread(id.clone())),
             (None, Some(project)) => Some(Target::Draft(project.clone())),
@@ -400,6 +421,7 @@ impl Composer {
             self.cancel_pending_send();
         }
         if next == self.snapshot && !config_changed {
+            if self.provider_target.connection != self.state.read(cx).connection_id() { self.sync_provider_target(cx); }
             if self.finish_prepared_reads(cx) || pruned { cx.notify(); }
             return;
         }
@@ -436,6 +458,7 @@ impl Composer {
             pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
         });
         self.snapshot = next;
+        self.sync_provider_target(cx);
         self.finish_prepared_reads(cx);
         #[cfg(feature = "snapshot")]
         self.attachment_fixture(cx);
@@ -451,6 +474,20 @@ impl Composer {
             self.picker.update(cx, |picker, cx| picker.update_input(input, config_changed, cx));
         }
         cx.notify();
+    }
+
+    fn sync_provider_target(&mut self, cx: &mut Context<Self>) {
+        self.provider_choice = self.choices().and_then(|choices| choices.model.as_ref()).map(|model| model.instance_id.clone());
+        let next = ProviderTarget {
+            environment: self.snapshot.environment.clone(),
+            connection: self.state.read(cx).connection_id(),
+            thread: self.thread_id(),
+            instance: self.resolve(cx).model.map(|model| model.instance_id),
+        };
+        if next != self.provider_target {
+            self.provider_target = next.clone();
+            cx.emit(next);
+        }
     }
 
     fn target_project(&self) -> Option<&str> {
@@ -731,5 +768,23 @@ const AUTO_ADVANCE: Duration = Duration::from_millis(200);
 impl Composer {
     pub(crate) fn snapshot_audit(&self, submissions: usize, cx: &App) -> serde_json::Value {
         serde_json::json!({"submissions": submissions, "prompt": self.prompt(cx), "workspace": self.selected_workspace(), "menuCwd": self.menu_cwd(cx), "questionProgress": self.progress(cx).map(|progress| serde_json::json!({"index":progress.question_index,"complete":progress.is_complete,"advance":progress.can_advance})), "regularAttachmentCount": self.snapshot.target.as_ref().map_or(0, |target| self.staged_for(target).len()), "activeAttachmentCount":self.staged().len(), "regularPrompt":self.draft_prompt(cx)})
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+impl Composer {
+    pub(crate) fn pick_banner_test_model(&mut self, instance: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_picker(&PickerEvent::Model { instance_id: instance.into(), model: "m".into() }, window, cx);
+    }
+
+    pub(crate) fn restore_banner_test_model(&mut self, instance: &str, cx: &mut Context<Self>) {
+        let target = self.snapshot.target.clone().unwrap();
+        let draft = t3_core::composer::drafts::Draft { model_selection: Some(ModelSelection { instance_id: instance.into(), model: "m".into(), options: None }), ..Default::default() };
+        self.restore_draft_choices(&target, &draft, cx);
+    }
+
+    pub(crate) fn type_banner_test_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_prompt("unsent text", window, cx);
+        self.on_prompt_change(cx);
     }
 }

@@ -81,6 +81,9 @@ pub struct Banners {
     refresh: t3_core::providers::StatusRefresh,
     can_refresh: bool,
     grants: Option<(u64, Task<()>)>,
+    target: Option<crate::composer::ProviderTarget>,
+    environment: String,
+    composer: Option<gpui::Subscription>,
 }
 
 impl ThreadView {
@@ -138,23 +141,33 @@ impl ThreadView {
 
     fn sync_banners(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
+        let was_pending = self.banners.refresh.pending();
+        let environment = crate::composer::ProviderTarget::environment(state);
+        if environment != self.banners.environment {
+            self.banners.environment = environment.clone();
+            self.banners.dismissed_provider = None;
+            self.banners.refresh.reset();
+        }
         let mut next = BannerLines::default();
         if let (Some(projection), Some(thread_id)) = (self.thread_state(state).projection.as_ref(), self.thread_id.as_deref()) {
-            let thread = &projection.thread;
             let local = self.local_error.clone().map(|message| ThreadError { message, class: None, code: None, reset_at: None, runtime_failed: false });
             next.error = local
                 .or_else(|| timeline_thread_error(thread_error(projection), state.thread_shell(thread_id)))
                 .filter(|error| !self.banners.dismissed_errors.contains(&error.banner_key(thread_id)));
-            let instance = if thread.provider_instance_id.is_empty() { &thread.model_selection.instance_id } else { &thread.provider_instance_id };
-            let provider = state.server_config.config.as_ref().and_then(|config| config.providers.iter().find(|provider| &provider.instance_id == instance));
-            next.provider = provider.and_then(provider_banner);
+        }
+        if let Some(target) = &self.banners.target
+            && target.thread.is_some()
+            && target.connection == state.connection_id()
+            && target.environment == environment
+            && target.thread == self.thread_id
+        {
+            next.provider = target.instance.as_ref().and_then(|id| state.server_config.config.as_ref()?.provider(id)).and_then(provider_banner);
         }
         match &next.provider {
             None => self.banners.dismissed_provider = None,
             Some(banner) if self.banners.dismissed_provider.as_deref() == Some(banner.key.as_str()) => next.provider = None,
             Some(_) => {}
         }
-        let was_pending = self.banners.refresh.pending();
         self.banners.refresh.set_target(state.connection_id(), self.thread_id.as_deref(), next.provider.as_ref().map(|banner| banner.instance_id.as_str()));
         if next == self.banners.lines {
             if was_pending != self.banners.refresh.pending() { cx.notify(); }
@@ -693,4 +706,132 @@ fn alert(warning: bool, icon: AlertIcon, title: Option<String>, body: Vec<AnyEle
                 ),
         )
         .into_any_element()
+}
+
+impl ThreadView {
+    pub(crate) fn bind_composer(&mut self, composer: &Entity<crate::composer::Composer>, cx: &mut Context<Self>) {
+        self.banners.target = Some(composer.read(cx).provider_target.clone());
+        self.banners.composer = Some(cx.subscribe(composer, |view, _, target: &crate::composer::ProviderTarget, cx| {
+            view.banners.target = Some(target.clone());
+            view.sync_banners(cx);
+        }));
+        self.sync(cx);
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod selected_provider_tests {
+    use super::*;
+    use crate::app_state::AppEvent;
+    use crate::composer::Composer;
+    use gpui::{AppContext, Render, size};
+    use serde_json::json;
+
+    struct Pair { transcript: Entity<ThreadView>, composer: Entity<Composer> }
+    impl Render for Pair {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement { div() }
+    }
+
+    #[gpui::test]
+    fn unsent_provider_choices_follow_the_matching_composer(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = cx.update(|cx| {
+            cx.set_global(serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                "provider": {"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap());
+            let state = crate::boot(runtime.handle().clone(), cx);
+            state.update(cx, |state, _| {
+                state.selected_thread = Some("main".into());
+                state.server_config.config = Some(serde_json::from_value(json!({
+                    "environment":{"environmentId":"one"},
+                    "providers":[
+                        {"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"warning","message":"A","models":[{"slug":"m","name":"A"}]},
+                        {"instanceId":"claudeAgent","driver":"claudeAgent","enabled":true,"installed":true,"status":"warning","message":"B","models":[{"slug":"m","name":"B"}]}
+                    ]
+                })).unwrap());
+                let thread = json!({"id":"main","projectId":"p","title":"Main","providerInstanceId":"codex",
+                    "modelSelection":{"instanceId":"codex","model":"m"},"runtimeMode":"full-access","interactionMode":"default",
+                    "lineage":{"rootThreadId":"main"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"});
+                state.thread.projection = Some(serde_json::from_value(json!({
+                    "thread":thread,"runs":[],"attempts":[],"nodes":[],"subagents":[],"providerSessions":[],"providerThreads":[],"providerTurns":[],
+                    "runtimeRequests":[],"messages":[],"plans":[],"turnItems":[],"checkpointScopes":[],"checkpoints":[],"contextHandoffs":[],"contextTransfers":[],"visibleTurnItems":[],"updatedAt":""
+                })).unwrap());
+                let shell = |id| { let mut value=thread.clone(); value["id"]=json!(id); value["tags"]=json!([]); value["status"]=json!("idle"); value["hasActionableProposedPlan"]=json!(false); value["itemCount"]=json!(0); value["visibleItemCount"]=json!(0); serde_json::from_value(value).unwrap() };
+                state.shell.snapshot = Some(t3_core::shell::ShellSnapshot { threads:vec![shell("main"),shell("side")], ..Default::default() });
+            });
+            state
+        });
+        let main = cx.open_window(size(px(800.),px(600.)), |window, cx| {
+            let transcript = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+            transcript.update(cx, |view, cx| { view.sync(cx); view.bind_composer(&composer, cx); });
+            Pair {transcript, composer}
+        });
+        let side = cx.open_window(size(px(800.),px(600.)), |window, cx| {
+            let transcript = cx.new(|cx| ThreadView::embedded(state.clone(), "side".into(), window, cx));
+            let composer = cx.new(|cx| Composer::embedded(state.clone(), "side".into(), window, cx));
+            transcript.update(cx, |view, cx| view.bind_composer(&composer, cx));
+            Pair {transcript, composer}
+        });
+        let (view, composer) = main.read_with(cx, |pair, _| (pair.transcript.clone(),pair.composer.clone())).unwrap();
+        let (side_view, side_composer) = side.read_with(cx, |pair, _| (pair.transcript.clone(),pair.composer.clone())).unwrap();
+        let shown = |view: &Entity<ThreadView>, cx: &mut gpui::TestAppContext| view.read_with(cx, |view, _| view.banners.lines.provider.as_ref().map(|banner| banner.instance_id.clone()));
+        assert_eq!(shown(&view,cx).as_deref(),Some("codex"));
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
+        assert_eq!(shown(&view,cx).as_deref(),Some("claudeAgent"),"unsent B must replace persisted A's banner");
+        assert_eq!(shown(&side_view,cx).as_deref(),Some("codex"),"main choices must not reach side chat");
+        cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
+        assert_eq!(shown(&view,cx).as_deref(),Some("codex"));
+        assert_eq!(shown(&side_view,cx).as_deref(),Some("claudeAgent"));
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].message=Some("B updated".into());cx.emit(AppEvent::ServerConfig);});
+        side_view.read_with(cx, |view,_| assert_eq!(view.banners.lines.provider.as_ref().unwrap().message,"B updated"));
+        side_view.update(cx, |view,cx| {
+            view.banners.dismissed_provider=Some(view.banners.lines.provider.as_ref().unwrap().key.clone());
+            view.sync_banners(cx);
+        });
+        assert_eq!(shown(&side_view,cx),None);
+        cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
+        assert_eq!(shown(&side_view,cx).as_deref(),Some("codex"));
+        cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
+        assert_eq!(shown(&side_view,cx),None,"returning to the same dismissed key stays dismissed");
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].message=Some("B new key".into());cx.emit(AppEvent::ServerConfig);});
+        assert_eq!(shown(&side_view,cx).as_deref(),Some("claudeAgent"));
+        let notifications=std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed=notifications.clone();
+        let _subscription=cx.update(|cx| cx.observe(&view,move|_,_| observed.set(observed.get()+1)));
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.type_banner_test_prompt(window,cx))).unwrap();
+        assert_eq!(notifications.get(),0,"typing does not redraw the transcript");
+        composer.update(cx, |composer,cx| composer.restore_banner_test_model("claudeAgent",cx));
+        assert_eq!(shown(&view,cx).as_deref(),Some("claudeAgent"),"draft choices are published on restore");
+        let old_refresh=view.update(cx, |view,_| {
+            view.banners.refresh.set_target(Some(1),Some("main"),Some("claudeAgent"));
+            let grants=serde_json::from_value(json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap();
+            view.banners.refresh.start(Some(&grants)).unwrap()
+        });
+        let before=notifications.get();
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().environment.environment_id="pending-transition".into();cx.emit(AppEvent::ServerConfig);});
+        assert!(notifications.get()>before,"retiring Refreshing must redraw even when the banner text is unchanged");
+        view.update(cx, |view,_| {assert!(!view.banners.refresh.pending());assert!(!view.banners.refresh.finish(&old_refresh));});
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].availability=Some("unavailable".into());cx.emit(AppEvent::ServerConfig);});
+        assert_eq!(shown(&view,cx).as_deref(),Some("codex"),"unusable local B follows the composer's effective fallback");
+        state.update(cx, |state,cx| {let config=state.server_config.config.as_mut().unwrap();config.providers[1].availability=None;config.environment.environment_id="two".into();cx.emit(AppEvent::ServerConfig);});
+        assert_eq!(shown(&view,cx).as_deref(),Some("claudeAgent"));
+        state.update(cx, |state,cx| {state.selected_thread=Some("side".into());state.thread=Default::default();cx.emit(AppEvent::Selection);});
+        assert_eq!(shown(&view,cx).as_deref(),Some("codex"),"the newly selected target must not inherit main's B choice");
+        state.update(cx, |state,cx| {state.selected_thread=Some("main".into());cx.emit(AppEvent::Selection);});
+        assert_eq!(shown(&view,cx).as_deref(),Some("claudeAgent"));
+        cx.update_window(main.into(), |_,window,cx| {
+            let seeded=cx.new(|cx| ThreadView::new(state.clone(),window,cx));
+            seeded.update(cx, |view,cx| view.bind_composer(&composer,cx));
+            assert_eq!(seeded.read(cx).banners.lines.provider.as_ref().unwrap().instance_id,"claudeAgent","binding seeds an already resolved composer");
+        }).unwrap();
+        state.update(cx, |state,cx| {state.selected_thread=None;cx.emit(AppEvent::Selection);});
+        assert_eq!(shown(&view,cx),None,"no transcript target must not show the default provider's banner");
+        assert_eq!(shown(&side_view,cx).as_deref(),Some("claudeAgent"),"side chat keeps its own target when the main selection closes");
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers.clear();cx.emit(AppEvent::ServerConfig);});
+        assert_eq!(shown(&view,cx),None);
+        assert_eq!(shown(&side_view,cx),None);
+    }
 }
