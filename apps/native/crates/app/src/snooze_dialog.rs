@@ -168,6 +168,55 @@ fn calendar_disabled(date: NaiveDate, now: i64, zone: &dyn Zone) -> bool {
         .is_none_or(|today| date < today)
 }
 
+fn refresh_calendar(
+    calendar: &mut CalendarState,
+    window: &mut Window,
+    cx: &mut Context<CalendarState>,
+) {
+    if calendar.today() == chrono::Local::now().date_naive() {
+        return;
+    }
+    // The pinned state has no today setter; retain the entity, focus and full navigation range.
+    let page = calendar.years_on_page().first().copied();
+    while calendar.prev_year_page() {}
+    let first = calendar
+        .years_on_page()
+        .first()
+        .copied()
+        .unwrap_or(calendar.current_year());
+    while calendar.next_year_page() {}
+    let last = calendar.years_on_page().last().copied().unwrap_or(first);
+    let mut fresh = CalendarState::new(window, cx).year_range((first, last + 1));
+    fresh.focus_handle = calendar.focus_handle.clone();
+    // A selected day can have become disabled since midnight, but must remain selected.
+    fresh.apply_date(calendar.date());
+    fresh.select_year(calendar.current_year());
+    fresh.select_month(calendar.current_month());
+    fresh.set_view(calendar.view());
+    if let Some(page) = page {
+        while fresh
+            .years_on_page()
+            .first()
+            .is_some_and(|first| *first > page)
+            && fresh.prev_year_page()
+        {}
+        while fresh
+            .years_on_page()
+            .first()
+            .is_some_and(|first| *first < page)
+            && fresh.next_year_page()
+        {}
+    }
+    fresh.set_number_of_months(calendar.number_of_months(), window, cx);
+    fresh.set_disabled_matcher(
+        |date: &NaiveDate| calendar_disabled(*date, now_ms(), &SystemZone),
+        window,
+        cx,
+    );
+    *calendar = fresh;
+    cx.notify();
+}
+
 fn reset_calendar(
     calendar: &mut CalendarState,
     date: NaiveDate,
@@ -428,6 +477,7 @@ impl SnoozeDialog {
         self.amount
             .update(cx, |input, cx| input.set_value("2", window, cx));
         self.calendar.update(cx, |calendar, cx| {
+            refresh_calendar(calendar, window, cx);
             reset_calendar(
                 calendar,
                 NaiveDate::parse_from_str(&date, "%Y-%m-%d").expect("local date"),
@@ -440,13 +490,20 @@ impl SnoozeDialog {
         self.unit = DurationUnit::Hours;
         self.error = None;
         self.date.update(cx, |input, cx| input.focus(window, cx));
-        self.clock = Some(cx.spawn(async move |this, cx| {
+        self.clock = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 let wait = (MINUTE_MS - now_ms().rem_euclid(MINUTE_MS)) as u64;
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(wait))
                     .await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.calendar
+                            .update(cx, |calendar, cx| refresh_calendar(calendar, window, cx));
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1039,6 +1096,14 @@ mod calendar_tests {
     fn calendar_keyboard_tracks_visible_views_and_resets_navigation(cx: &mut gpui::TestAppContext) {
         use gpui_base::CalendarView;
         use std::{cell::RefCell, rc::Rc};
+        // Optional process-local clock interposition exercises midnight without changing OS time.
+        let clock_file = std::env::var_os("N265_CLOCK_FILE");
+        let set_clock = |iso: &str| {
+            if let Some(path) = &clock_file {
+                std::fs::write(path, (parse_iso(iso).unwrap() / 1000).to_string()).unwrap();
+            }
+        };
+        set_clock("2026-11-05T06:59:59Z");
         let (calendar, cx) = cx.add_window_view(CalendarState::new);
         let events = Rc::new(RefCell::new(Vec::new()));
         let observed = events.clone();
@@ -1130,7 +1195,61 @@ mod calendar_tests {
                     "displayed leap month keeps valid day",
                     calendar.date().start() == NaiveDate::from_ymd_opt(2032, 2, 29),
                 ));
+                for (before, after) in [
+                    ("2026-11-05T06:59:59Z", "2026-11-05T07:00:00Z"),
+                    ("2027-01-01T06:59:59Z", "2027-01-01T07:00:00Z"),
+                    ("2032-03-01T06:59:59Z", "2032-03-01T07:00:00Z"),
+                    ("2026-03-08T08:59:59Z", "2026-03-08T09:00:00Z"),
+                    ("2026-11-01T07:59:59Z", "2026-11-01T08:00:00Z"),
+                ] {
+                    set_clock(before);
+                    refresh_calendar(calendar, window, cx);
+                    for view in [CalendarView::Day, CalendarView::Month, CalendarView::Year] {
+                        calendar.set_disabled_matcher_shared(None);
+                        calendar.set_date(date, window, cx);
+                        calendar.set_disabled_matcher(
+                            |date: &NaiveDate| calendar_disabled(*date, now_ms(), &SystemZone),
+                            window,
+                            cx,
+                        );
+                        calendar.next_month();
+                        calendar.next_year_page();
+                        calendar.set_view(view);
+                        let selected = calendar.date();
+                        let year_month = (calendar.current_year(), calendar.current_month());
+                        let page = calendar.years_on_page().to_vec();
+                        let focus = calendar.focus_handle.clone();
+                        window.focus(&focus, cx);
+                        set_clock(after);
+                        refresh_calendar(calendar, window, cx);
+                        outcomes.push((
+                            "minute refresh follows local day and retains calendar presentation",
+                            calendar.today() == chrono::Local::now().date_naive()
+                                && calendar.date() == selected
+                                && (calendar.current_year(), calendar.current_month())
+                                    == year_month
+                                && calendar.view() == view
+                                && calendar.years_on_page() == page
+                                && calendar.focus_handle == focus
+                                && focus.is_focused(window),
+                        ));
+                        let today = chrono::Local::now().date_naive();
+                        if clock_file.is_some() {
+                            assert_eq!(calendar.today(), today, "{before} -> {after}");
+                            assert!(
+                                calendar
+                                    .disabled_matcher_ref()
+                                    .unwrap()
+                                    .matched(&today.pred_opt().unwrap())
+                            );
+                            assert!(!calendar.disabled_matcher_ref().unwrap().matched(&today));
+                        }
+                        set_clock(before);
+                        refresh_calendar(calendar, window, cx);
+                    }
+                }
                 let lower = NaiveDate::from_ymd_opt(2030, 3, 1).unwrap();
+                calendar.set_disabled_matcher_shared(None);
                 calendar.set_date(lower, window, cx);
                 calendar.set_disabled_matcher(move |date: &NaiveDate| *date < lower, window, cx);
                 calendar.prev_month();
