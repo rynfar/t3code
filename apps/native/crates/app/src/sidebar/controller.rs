@@ -291,7 +291,6 @@ impl AppState {
                     selected_thread_id: self.selected_thread.as_deref(),
                     project_scope: self.sidebar.project_scope.as_ref(),
                     hidden_thread_ids: Some(&self.sidebar.hidden_thread_ids),
-                    connected: connected(&self.phase),
                     now,
                     dragging: self.sidebar.drag.as_ref().map(|(_, from)| *from),
                 },

@@ -700,4 +700,89 @@ mod capture {
             cx.capture_screenshot(window.into()).unwrap().save(std::path::Path::new(&out).join(format!("{step}-{status}.png"))).unwrap();
         }
     }
+
+    struct WorkingRows(Entity<SidebarPane>);
+
+    impl Render for WorkingRows {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let count = self.0.read(cx).state.read(cx).sidebar.model.rows.len();
+            let mut column = div().size_full().flex().flex_col().bg(hsla(palette(cx).sidebar));
+            for index in 0..count {
+                column = column.child(self.0.update(cx, |pane, cx| {
+                    pane.now = 1_780_272_045_000;
+                    let row = pane.render_row(index, window, cx);
+                    pane.clock = None;
+                    row
+                }));
+            }
+            column
+        }
+    }
+
+    #[test]
+    fn production_cached_working_rows() {
+        let Some(out) = std::env::var_os("T3_SIDEBAR_WORKING_CAPTURE") else { return };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets), gpui_platform::current_headless_renderer,
+        );
+        let state = cx.update(|cx| {
+            cx.set_global(serde_json::from_value::<crate::chatgpt_setup::Fixture>(serde_json::json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap());
+            crate::boot(runtime.handle().clone(), cx)
+        });
+        state.update(&mut cx, |state, _| {
+            state.stop_pump();
+            let threads: Vec<_> = [("pinned", "Pinned cached thread", None), ("active", "Inbox thread", None),
+                ("busy-older", "Working: earlier send", Some("2026-06-01T00:00:00Z")),
+                ("busy-newer", "Working: later send", Some("2026-06-01T00:00:30Z"))].into_iter().map(|(id, title, sent)| {
+                serde_json::json!({
+                    "id":id,"projectId":"fixture-project","title":title,"createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-01T00:00:00Z",
+                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                    "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+                    "status":if sent.is_some() {"running"} else {"idle"},"latestRunId":sent.map(|_| "fixture-run"),
+                    "activeRunId":sent.map(|_| "fixture-run"),"activityRunStartedAt":sent,
+                    "latestUserAuthoredMessageAt":sent,"pinnedAt":if id == "pinned" {Some("2026-06-01T00:00:00Z")} else {None},
+                    "hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+                })
+            }).collect();
+            state.shell.snapshot = Some(serde_json::from_value(serde_json::json!({
+                "snapshotSequence":1,"projects":[{"id":"fixture-project","title":"Fixture","workspaceRoot":"/fixture",
+                    "createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-01T00:00:00Z"}],"threads":threads
+            })).unwrap());
+            state.sidebar.shelves.working_expanded = true;
+        });
+        let window = cx.open_window(size(px(400.), px(500.)), |window, cx| {
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu, dialog, snooze, window, cx));
+            cx.new(|_| WorkingRows(pane))
+        }).unwrap();
+        let mut records = Vec::new();
+        for (step, (label, connected, enabled)) in [
+            ("connected", true, true), ("disconnected", false, true), ("reconnected", true, true),
+            ("disabled-disconnected", false, false), ("reenabled-disconnected", false, true),
+        ].into_iter().enumerate() {
+            state.update(&mut cx, |state, cx| {
+                state.phase = crate::app_state::Phase::Online(if connected {
+                    t3_client::supervisor::ConnectionStatus::Connected
+                } else {
+                    t3_client::supervisor::ConnectionStatus::Reconnecting { reason: "Synthetic disconnect".into(), attempt: 1 }
+                });
+                state.sidebar.settings.working_shelf_enabled = enabled;
+                state.rebuild_sidebar(cx);
+                assert!(state.selected_thread.is_none() && state.client_handle().is_none() && state.sidebar.drag.is_none());
+                records.push(serde_json::json!({"step":label,"connected":connected,"enabled":enabled,
+                    "rows":format!("{:?}",state.sidebar.model.rows),"partition":format!("{:?}",state.sidebar.model.partition)}));
+            });
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| { window.draw(cx).clear(); }).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(std::path::Path::new(&out).join(format!("{step}-{label}.png"))).unwrap();
+        }
+        std::fs::write(std::path::Path::new(&out).join("model.json"), serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+    }
 }
