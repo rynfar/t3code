@@ -277,7 +277,7 @@ impl SidebarPane {
             }
             Some(top) => {
                 let duration = match state.status {
-                    ThreadStatus::Working => status::working_started_at(thread),
+                    ThreadStatus::Preparing | ThreadStatus::Working => status::working_started_at(thread),
                     ThreadStatus::Waiting => thread.latest_run.as_ref().and_then(|run| run.completed_at),
                     _ => None,
                 }
@@ -341,7 +341,7 @@ impl SidebarPane {
             .py(px(2.))
             .pb(px(3.))
             .child(
-                self.row_surface(thread, project.clone(), section, active, state.recede && state.status == ThreadStatus::Working, cx).child(
+                self.row_surface(thread, project.clone(), section, active, state.recede && matches!(state.status, ThreadStatus::Preparing | ThreadStatus::Working), cx).child(
                     div()
                         .when(has_meta, |this| this.h(px(CARD_CONTENT_HEIGHT)))
                         .px(px(10.))
@@ -601,5 +601,103 @@ pub(super) trait AppearanceExt {
 impl AppearanceExt for App {
     fn window_appearance_is_dark(&self) -> bool {
         gpui_component::ActiveTheme::theme(self).is_dark()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod capture {
+    use super::*;
+    use gpui::{AppContext, Entity, HeadlessAppContext, Render, size};
+    use std::sync::Arc;
+    use t3_core::sidebar::thread::{SubagentRequest, present_thread};
+
+    struct Rows {
+        pane: Entity<SidebarPane>,
+        runtime: &'static str,
+    }
+
+    impl Render for Rows {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = palette(cx);
+            let mut columns = div().flex().size_full().bg(hsla(p.sidebar));
+            for active in [false, true] {
+                let mut column = div().w(px(400.)).flex_none().flex().flex_col().child(
+                    div().p(px(12.)).text_color(hsla(p.foreground)).child(if active { "Active row" } else { "Background row" }),
+                );
+                for (index, request) in [None, Some(SubagentRequest::Approval), Some(SubagentRequest::UserInput)].into_iter().enumerate() {
+                    let shell = serde_json::from_value(serde_json::json!({
+                        "id":format!("capture-{active}-{index}"),"projectId":"fixture-project","title":match request {
+                            None => "Goal active", Some(SubagentRequest::Approval) => "Subagent approval", Some(SubagentRequest::UserInput) => "Subagent input"
+                        },"createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-01T00:00:00Z",
+                        "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                        "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":"capture"},
+                        "status":self.runtime,"latestRunId":"capture-run","activeRunId":"capture-run",
+                        "activityRunStartedAt":"2026-06-01T00:00:00Z","goal":{"status":"active"},
+                        "hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+                    })).unwrap();
+                    let mut thread = present_thread(&shell, request);
+                    for variant in 0..if request.is_none() { 4 } else { 1 } {
+                        thread.id = format!("capture-{active}-{index}-{variant}");
+                        thread.has_pending_approvals = variant == 1;
+                        thread.has_pending_user_input = variant == 2;
+                        thread.pending_guest_message_count = u64::from(variant == 3);
+                        thread.title = match variant { 1 => "Approval", 2 => "User input", 3 => "Guest request", _ => shell.title.as_str() }.into();
+                        let card = self.pane.update(cx, |pane, cx| {
+                            pane.now = 1_780_272_045_000;
+                            let card = pane.render_card(&thread, Some("Fixture".into()), Section::Active, active, cx);
+                            pane.clock = None;
+                            card
+                        });
+                        column = column.child(card);
+                    }
+                    if request.is_none() {
+                        thread.has_pending_approvals = false;
+                        thread.has_pending_user_input = false;
+                        thread.pending_guest_message_count = 0;
+                        thread.title = "Slim settled row".into();
+                        let slim = self.pane.update(cx, |pane, cx| pane.render_slim(&thread, Some("Fixture".into()), Section::Settled, active, cx));
+                        column = column.child(slim);
+                    }
+                }
+                columns = columns.child(column);
+            }
+            columns
+        }
+    }
+
+    #[test]
+    fn production_status_rows() {
+        let Some(out) = std::env::var_os("T3_SIDEBAR_STATUS_CAPTURE") else { return };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets), gpui_platform::current_headless_renderer,
+        );
+        let state = cx.update(|cx| {
+            let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap();
+            cx.set_global(fixture);
+            crate::boot(runtime.handle().clone(), cx)
+        });
+        assert!(state.read_with(&cx, |state, _| state.selected_thread.is_none() && state.client_handle().is_none()));
+        let mut rows = None;
+        let window = cx.open_window(size(px(800.), px(650.)), |window, cx| {
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu, dialog, snooze, window, cx));
+            let view = cx.new(|_| Rows { pane, runtime: "preparing" });
+            rows = Some(view.clone());
+            view
+        }).unwrap();
+        let rows = rows.unwrap();
+        for (step, status) in ["preparing", "running", "idle", "completed", "preparing"].into_iter().enumerate() {
+            rows.update(&mut cx, |rows, cx| { rows.runtime = status; cx.notify(); });
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| { window.draw(cx).clear(); }).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(std::path::Path::new(&out).join(format!("{step}-{status}.png"))).unwrap();
+        }
     }
 }
