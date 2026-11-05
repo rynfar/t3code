@@ -1,6 +1,6 @@
 //! Window root: titlebar strip, sidebar, and the thread area, or the connect screen.
 
-use gpui::{ClipboardItem, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window, WindowControlArea, div, prelude::*, px};
+use gpui::{ Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
 
@@ -446,13 +446,52 @@ impl Workspace {
     }
 
     fn copy_selected_reference(&mut self, cx: &mut Context<Self>) {
-        let reference = {
-            let state = self.state.read(cx);
-            state.selected_thread.as_deref().and_then(|id| state.sidebar.model.thread(id)).map(|thread| (t3_core::thread_actions::thread_reference(&thread.title, &thread.id), thread.title.clone()))
-        };
-        if let Some((text, title)) = reference {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.state.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, "Thread copied").description(title), cx));
-        }
+        self.state.update(cx, |state, cx| {
+            #[cfg(feature = "snapshot")]
+            let fixture_model = if crate::webview::is_offscreen() && state.selected_thread.is_none()
+            {
+                std::env::args()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .find(|pair| pair[0] == "--copy-thread-fixture")
+                    .map(|pair| {
+                        let thread: t3_core::shell::ThreadShell = serde_json::from_slice(
+                            &std::fs::read(&pair[1]).expect("copy fixture file"),
+                        )
+                        .expect("copy fixture thread");
+                        assert!(
+                            thread.id.starts_with("snapshot-copy-"),
+                            "only synthetic copy targets"
+                        );
+                        state.stop_pump();
+                        let original = std::mem::take(&mut state.sidebar.model);
+                        let mut model = t3_core::sidebar::SidebarModel::default();
+                        model.index_by_id.insert(thread.id.clone(), 0);
+                        model
+                            .threads
+                            .push(t3_core::sidebar::thread::present_thread(&thread, None));
+                        state.sidebar.model = std::sync::Arc::new(model);
+                        // Assign directly: selecting a thread normally sends a visit to the server.
+                        state.selected_thread = Some(thread.id);
+                        original
+                    })
+            } else {
+                None
+            };
+            let Some(id) = state.selected_thread.clone() else {
+                return;
+            };
+            state.run_thread_action(
+                &id,
+                t3_core::thread_actions::ThreadAction::CopyThread,
+                &[],
+                cx,
+            );
+            #[cfg(feature = "snapshot")]
+            if let Some(model) = fixture_model {
+                state.selected_thread = None;
+                state.sidebar.model = model;
+            }
+        });
     }
 }

@@ -364,43 +364,8 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
         .collect()
 }
 
-fn fnv1a64(value: &str) -> String {
-    let units: Vec<u16> = value.encode_utf16().collect();
-    let (mut forward, mut reverse) = (0x811c_9dc5u32, 0x9dc5_811cu32);
-    for index in 0..units.len() {
-        forward = (forward ^ u32::from(units[index])).wrapping_mul(0x0100_0193);
-        reverse = (reverse ^ u32::from(units[units.len() - 1 - index])).wrapping_mul(0x0100_0193);
-    }
-    format!("{forward:08x}{reverse:08x}")
-}
-
-fn is_context_id(value: &str) -> bool {
-    (1..=128).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// `toComposerContextId` (`packages/shared/src/composerContextReferences.ts`).
-fn composer_context_id(producer_id: &str) -> String {
-    if is_context_id(producer_id) {
-        return producer_id.to_owned();
-    }
-    let mut slug = String::new();
-    for c in producer_id.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            slug.push(c);
-        } else if !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug: String = slug.trim_matches('-').chars().take(48).collect();
-    format!("{}-{}", if slug.is_empty() { "ctx" } else { &slug }, fnv1a64(producer_id))
-}
-
-/// `threadChipCopyTarget`'s plain text for Copy → Thread: a thread chip reference link.
-pub fn thread_reference(title: &str, thread_id: &str) -> String {
-    let cleaned: String = title.replace(['[', ']', '\\', '\r', '\n'], " ").split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
-    let label = if cleaned.is_empty() { "thread".to_owned() } else { cleaned };
-    format!("[{label}](t3-context://v1/thread/{})", composer_context_id(&format!("thread_{thread_id}")))
-}
+pub(crate) mod thread_reference;
+pub use thread_reference::thread_reference;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoStep {
@@ -629,6 +594,52 @@ mod tests {
             snooze_presets: presets,
             available: Available::ALL,
         }
+    }
+
+    #[test]
+    fn copied_thread_reference_uses_the_hosted_contract() {
+        assert_eq!(
+            thread_reference("Fix chips", Some("env-1"), "thread-1")
+                .unwrap()
+                .text,
+            "https://app.t3.codes/threads/env-1/thread-1"
+        );
+        for (environment, thread, expected) in [
+            (
+                "env.1",
+                "thread:delegated/mcp%3A1.",
+                "env%2E1/thread%3Adelegated%2Fmcp%253A1%2E",
+            ),
+            (
+                "测试",
+                "é?!~*'()#&=",
+                "%E6%B5%8B%E8%AF%95/%C3%A9%3F%21%7E%2A%27%28%29%23%26%3D",
+            ),
+        ] {
+            let target = thread_reference("Fix [chips]\nnow", Some(environment), thread).unwrap();
+            assert_eq!(
+                target.text,
+                format!("https://app.t3.codes/threads/{expected}")
+            );
+            let fragment = crate::composer::records::decode_fragment(&target.fragment).unwrap();
+            assert_eq!(fragment["source"]["environmentId"], environment);
+            assert_eq!(fragment["records"][0]["threadId"], thread);
+            assert_eq!(fragment["records"][0]["environmentId"], environment);
+            assert_eq!(fragment["records"][0]["title"], "Fix chips now");
+        }
+        let unicode = thread_reference(&"😀".repeat(150), Some("e"), "t").unwrap();
+        assert_eq!(unicode.description.encode_utf16().count(), 200);
+        assert!(crate::composer::records::decode_fragment(&unicode.fragment).is_some());
+        for environment in [None, Some(""), Some(" "), Some(" env")] {
+            assert!(thread_reference("x", environment, "t").is_none());
+        }
+        for id in ["", " ", " t"] {
+            assert!(thread_reference("x", Some("e"), id).is_none());
+        }
+        assert_ne!(
+            thread_reference("x", Some("a"), "same").unwrap().text,
+            thread_reference("x", Some("b"), "same").unwrap().text
+        );
     }
 
     #[test]

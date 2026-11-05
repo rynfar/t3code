@@ -894,6 +894,34 @@ impl AppState {
         self.server_config.config.as_ref().map_or_else(|| DEFAULT_SNOOZE_PRESETS.to_vec(), |config| menu_settings(&config.settings.threads.snooze_presets))
     }
 
+    pub(crate) fn thread_copy_scope(&self) -> Option<(String, Option<String>, u64)> {
+        if !connected(&self.phase) || !self.shell.synchronized {
+            return None;
+        }
+        let environment = &self
+            .server_config
+            .config
+            .as_ref()?
+            .environment
+            .environment_id;
+        if environment.is_empty() || environment.trim() != environment {
+            return None;
+        }
+        if self
+            .environments
+            .active()
+            .and_then(|saved| saved.environment_id.as_deref())
+            .is_some_and(|saved| saved != environment)
+        {
+            return None;
+        }
+        Some((
+            environment.clone(),
+            self.environments.active.clone(),
+            self.connection_id()?,
+        ))
+    }
+
     /// Runs one context-menu or palette action for a thread.
     pub fn run_thread_action(&mut self, thread_id: &str, action: ThreadAction, shown_presets: &[SnoozePreset], cx: &mut Context<Self>) {
         let Some(thread) = self.snapshot_thread(thread_id) else { return };
@@ -929,7 +957,21 @@ impl AppState {
                     self.copy(branch.clone(), "Branch copied", Some(branch), cx);
                 }
             }
-            ThreadAction::CopyThread => self.copy(actions::thread_reference(&thread.title, &thread.id), "Thread copied", Some(thread.title.clone()), cx),
+            ThreadAction::CopyThread => {
+                let Some((environment, _, _)) = self.thread_copy_scope() else {
+                    return;
+                };
+                let Some(reference) =
+                    actions::thread_reference(&thread.title, Some(&environment), &thread.id)
+                else {
+                    return;
+                };
+                crate::composer::clipboard::write(reference.text, reference.fragment, cx);
+                self.show_toast(
+                    Toast::new(ToastKind::Success, "Thread copied").description(reference.description),
+                    cx,
+                );
+            }
             ThreadAction::CopyThreadId => self.copy(thread.id.clone(), "Thread ID copied", Some(thread.id.clone()), cx),
             ThreadAction::Find => {
                 self.select_thread(thread_id, cx);
