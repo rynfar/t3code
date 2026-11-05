@@ -128,6 +128,26 @@ impl ProviderSettingsTarget {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct HealthIntervalOwner {
+    environment: String,
+    connection: Option<u64>,
+}
+
+impl HealthIntervalOwner {
+    fn capture(state: &AppState) -> Option<Self> {
+        state.server_config.config.as_ref()?;
+        Some(Self {
+            environment: crate::composer::ProviderTarget::environment(state),
+            connection: state.connection_id(),
+        })
+    }
+
+    fn current(&self, state: &AppState) -> bool {
+        Self::capture(state).as_ref() == Some(self)
+    }
+}
+
 pub(crate) struct ProvidersState {
     removal: removal::Removal,
     selected: Option<String>,
@@ -162,6 +182,7 @@ pub(crate) struct ProvidersState {
     method_id: SharedString,
     /// Inputs belong to the environment and connection they were filled from.
     editor_owner: Option<ProviderSettingsTarget>,
+    health_owner: Option<HealthIntervalOwner>,
     setup_target: Option<ProviderSettingsTarget>,
     setup_unavailable: bool,
     dialog: Option<dialog::AddDialog>,
@@ -264,6 +285,7 @@ impl ProvidersState {
             email_revealed: false,
             method_id: SharedString::default(),
             editor_owner: None,
+            health_owner: None,
             setup_target: None,
             setup_unavailable: false,
             dialog: None,
@@ -407,10 +429,7 @@ impl SettingsView {
         self.sync_editor_inputs(data.selected.as_ref(), window, cx);
         if let Some(selected)=&data.selected {self.sync_provider_form(selected,window,cx);}
         self.schedule_label_refresh(data.next_label_change, cx);
-        let interval = data.panel.health_interval_seconds().to_string();
-        if !self.providers.health_interval.focus_handle(cx).is_focused(window) && self.providers.health_interval.read(cx).value().as_ref() != interval {
-            self.providers.health_interval.update(cx, |input, cx| input.set_value(interval, window, cx));
-        }
+        self.sync_health_interval(&data.panel, window, cx);
 
         let providers = self.render_providers_section(&data, window, cx);
         let advanced = self.render_advanced(&data.panel, cx);
@@ -913,23 +932,6 @@ impl SettingsView {
         if switched {
             self.providers.editor_owner = owner;
             self.providers.form.reset();
-            let interval = self
-                .state
-                .read(cx)
-                .server_config
-                .config
-                .as_ref()
-                .map(|config| {
-                    config
-                        .settings
-                        .provider_panel
-                        .health_interval_seconds()
-                        .to_string()
-                })
-                .unwrap_or_default();
-            self.providers
-                .health_interval
-                .update(cx, |input, cx| input.set_value(interval, window, cx));
             self.providers.adding_custom_model = false;
             self.providers.custom_model_error = None;
             self.providers.advisory_open = None;
@@ -1081,6 +1083,14 @@ impl SettingsView {
         let state = self.state.read(cx);
         if self
             .providers
+            .health_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.current(state))
+        {
+            self.providers.health_owner = None;
+        }
+        if self
+            .providers
             .setup_target
             .as_ref()
             .is_some_and(|target| !target.setup_current(state))
@@ -1193,27 +1203,103 @@ impl SettingsView {
         }
     }
 
-    fn commit_health_interval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_instance_id(cx).is_none() { return; }
-        let typed = self.providers.health_interval.read(cx).value().trim().to_owned();
-        let panel = self.state.read(cx).server_config.config.as_ref().map(|config| config.settings.provider_panel.clone());
-        let Some(panel) = panel else { return };
-        match typed.parse::<f64>().ok().filter(|seconds| seconds.is_finite()) {
+    fn sync_health_interval(
+        &mut self,
+        panel: &ProviderPanelSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = HealthIntervalOwner::capture(self.state.read(cx));
+        let switched = self.providers.health_owner != owner;
+        self.providers.health_owner = owner;
+        let interval = panel.health_interval_seconds().to_string();
+        if (switched
+            || !self
+                .providers
+                .health_interval
+                .focus_handle(cx)
+                .is_focused(window))
+            && self.providers.health_interval.read(cx).value().as_ref() != interval
+        {
+            self.providers
+                .health_interval
+                .update(cx, |input, cx| input.set_value(interval, window, cx));
+        }
+    }
+
+    fn health_interval_change(&self, cx: &App) -> Option<Result<Value, String>> {
+        if !self
+            .providers
+            .health_owner
+            .as_ref()?
+            .current(self.state.read(cx))
+        {
+            return None;
+        }
+        let typed = self.providers.health_interval.read(cx).value();
+        let panel = &self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()?
+            .settings
+            .provider_panel;
+        match typed
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|seconds| seconds.is_finite())
+        {
             Some(seconds) => {
                 let seconds = seconds.max(0.).round() as u64;
-                if seconds != panel.health_interval_seconds() {
-                    store::update_server(&self.state, ServerSettingChange::Prepared(panel.health_interval_payload(Some(seconds))), cx);
-                }
+                (seconds != panel.health_interval_seconds())
+                    .then(|| Ok(panel.health_interval_payload(Some(seconds))))
             }
-            None => {
-                let saved = panel.health_interval_seconds().to_string();
-                self.providers.health_interval.update(cx, |input, cx| input.set_value(saved, window, cx));
-            }
+            None => Some(Err(panel.health_interval_seconds().to_string())),
         }
+    }
+
+    fn focused_health_interval_change(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Result<Value, String>> {
+        self.providers
+            .health_interval
+            .focus_handle(cx)
+            .is_focused(window)
+            .then(|| self.health_interval_change(cx))
+            .flatten()
+    }
+
+    fn apply_health_interval_change(
+        &mut self,
+        change: Option<Result<Value, String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match change {
+            Some(Ok(payload)) => {
+                store::update_server(&self.state, ServerSettingChange::Prepared(payload), cx)
+            }
+            Some(Err(saved)) => self
+                .providers
+                .health_interval
+                .update(cx, |input, cx| input.set_value(saved, window, cx)),
+            None => {}
+        }
+    }
+
+    fn commit_health_interval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let change = self.health_interval_change(cx);
+        self.apply_health_interval_change(change, window, cx);
     }
 
     /// Saves what a commit-on-blur provider field holds before the modal closes.
     pub(super) fn commit_focused_provider_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let interval = self.focused_health_interval_change(window, cx);
+        self.apply_health_interval_change(interval, window, cx);
         if self.editor_instance_id(cx).is_none() && self.providers.dialog.is_none() { return; }
         self.commit_focused_form_field(window,cx);
         if self.providers.display_name.focus_handle(cx).is_focused(window) {
@@ -1221,9 +1307,6 @@ impl SettingsView {
         }
         if self.providers.accent.focus_handle(cx).is_focused(window) {
             self.commit_accent(window, cx);
-        }
-        if self.providers.health_interval.focus_handle(cx).is_focused(window) {
-            self.commit_health_interval(window, cx);
         }
     }
 
@@ -1389,6 +1472,46 @@ mod setup_ownership_tests {
                     "a queued name blur after switching has no edit to publish"
                 );
                 assert_eq!(view.editor_instance_id(cx).as_deref(), Some("other"));
+                let panel = view.page_data(cx).unwrap().panel;
+                view.sync_health_interval(&panel, window, cx);
+                view.providers.setup_target = ProviderSettingsTarget::capture(state.read(cx), "other");
+                state.update(cx, |state, _| {
+                    let config = state.server_config.config.as_mut().unwrap();
+                    config.providers.retain(|provider| provider.instance_id != "other");
+                    config.settings.provider_instances = config.settings.provider_instances.iter().filter(|(id, _)| *id != "other").map(|(id, instance)| (id.to_owned(), instance.clone())).collect();
+                });
+                view.invalidate_provider_setup(cx);
+                assert!(view.providers.setup_unavailable && view.editor_instance_id(cx).is_none());
+                view.providers.health_interval.update(cx, |input, cx| {
+                    input.set_value("45", window, cx);
+                    input.focus(window, cx);
+                });
+                let seconds = |change: Option<Result<Value, String>>| change.map(|change| change.unwrap()["patch"]["backgroundActivity"]["overrides"]["providerHealthRefreshInterval"].clone());
+                assert_eq!(seconds(view.health_interval_change(cx)), Some(json!(45000)), "an unavailable provider must not block this environment's Advanced edit");
+                assert_eq!(seconds(view.focused_health_interval_change(window, cx)), Some(json!(45000)), "modal close must plan the focused interval independently of an instance editor");
+                state.update(cx, |state, _| state.server_config.config.as_mut().unwrap().environment.environment_id = "third".into());
+                assert!(view.health_interval_change(cx).is_none(), "queued blur cannot carry the old value to another environment");
+                assert!(view.focused_health_interval_change(window, cx).is_none(), "close must discard a stale environment's value");
+                view.invalidate_provider_setup(cx);
+                state.update(cx, |state, _| state.server_config.config.as_mut().unwrap().environment.environment_id = "two".into());
+                assert!(view.focused_health_interval_change(window, cx).is_none(), "returning to an environment does not revive a discarded edit");
+                view.sync_health_interval(&panel, window, cx);
+                assert_eq!(view.providers.health_interval.read(cx).value().as_ref(), "300", "refill a stale input even while it has focus");
+                assert!(view.health_interval_change(cx).is_none(), "a queued blur after refill has no edit");
+                view.providers.health_interval.update(cx, |input, cx| input.set_value("60", window, cx));
+                assert_eq!(seconds(view.focused_health_interval_change(window, cx)), Some(json!(60000)));
+                view.providers.health_owner.as_mut().unwrap().connection = Some(u64::MAX);
+                assert!(view.health_interval_change(cx).is_none(), "a replaced connection cannot inherit an old interval edit");
+                assert!(view.focused_health_interval_change(window, cx).is_none(), "close also rejects the stale connection");
+                view.invalidate_provider_setup(cx);
+                view.sync_health_interval(&panel, window, cx);
+                assert_eq!(view.providers.health_interval.read(cx).value().as_ref(), "300");
+                assert!(view.focused_health_interval_change(window, cx).is_none(), "queued blur after connection refill has no edit");
+                view.providers.health_interval.update(cx, |input, cx| input.set_value("90", window, cx));
+                assert_eq!(seconds(view.health_interval_change(cx)), Some(json!(90000)), "fresh edits remain available without an instance after connection refill");
+                assert_eq!(seconds(view.focused_health_interval_change(window, cx)), Some(json!(90000)));
+
+
             });
         })
         .unwrap();
