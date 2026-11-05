@@ -90,8 +90,25 @@ pub fn message_context(prompt: &str, records: &[Value]) -> Option<Value> {
     (!records.is_empty()).then(|| json!({"version":1,"records":records}))
 }
 
+fn hosted_record(
+    record: &Value,
+    link: &crate::thread_actions::thread_reference::HostedReference,
+) -> bool {
+    valid_record(record)
+        && field(record, "kind") == "thread"
+        && field(record, "environmentId") == link.environment
+        && field(record, "threadId") == link.thread
+}
+
 pub fn clipboard_records(markdown: &str, records: &[Value]) -> Vec<Value> {
     let mut selected = referenced(markdown, records);
+    for link in crate::thread_actions::thread_reference::hosted_references(markdown) {
+        if let Some(record) = records.iter().find(|r| hosted_record(r, &link))
+            && !selected.contains(record)
+        {
+            selected.push(record.clone());
+        }
+    }
     let screenshots: Vec<String> = selected
         .iter()
         .filter(|r| field(r, "kind") == "preview-annotation")
@@ -247,6 +264,20 @@ fn import_records_with(
     copy_attachments: bool,
     mut fresh: impl FnMut() -> String,
 ) -> Option<String> {
+    let mut hosted_text = markdown.to_owned();
+    for link in crate::thread_actions::thread_reference::hosted_references(markdown)
+        .into_iter()
+        .rev()
+    {
+        if let Some(record) = selected
+            .iter()
+            .find(|r| hosted_record(r, &link) && field(r, "environmentId") == environment)
+            && let Some(reference) = reference(record)
+        {
+            hosted_text.replace_range(link.start..link.end, &reference);
+        }
+    }
+    let markdown = hosted_text.as_str();
     selected.sort_by_key(|r| field(r, "kind") != "preview-annotation");
     let mut rewrites = std::collections::HashMap::new();
     let mut skipped = std::collections::HashSet::new();

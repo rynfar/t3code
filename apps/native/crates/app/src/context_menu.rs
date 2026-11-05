@@ -47,6 +47,7 @@ struct OpenMenu {
     /// The selected threads a bulk menu acts on.
     selection: Vec<String>,
     snooze_request: Option<SnoozeRequest>,
+    copy_scope: Option<(String, Option<String>, u64)>,
 }
 
 pub struct ContextMenu {
@@ -106,7 +107,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request) });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -123,7 +124,7 @@ impl ContextMenu {
             items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
         }
         items.push(discard);
-        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None});
+        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None});
         window.focus(&self.focus,cx);
         cx.notify();
     }
@@ -146,7 +147,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request) });
+        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -156,7 +157,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
-        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None });
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -183,7 +184,7 @@ impl ContextMenu {
         let mut custom = MenuItem::new(MenuAction::Thread(ThreadAction::SnoozeCustom), "Custom…", None);
         custom.separator_before = !presets.is_empty();
         items.push(custom);
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request) });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -237,6 +238,11 @@ impl ContextMenu {
             }
             MenuAction::Project(ProjectAction::Settings) => crate::settings::open_project(&open.target_id, cx),
             MenuAction::Bulk(action) => self.state.update(cx, |state, cx| state.run_bulk_action(&open.selection, action, &open.presets, cx)),
+            MenuAction::Thread(ThreadAction::CopyThread) => self.state.update(cx, |state, cx| {
+                if open.copy_scope.is_some() && open.copy_scope == state.thread_copy_scope() {
+                    state.run_thread_action(&open.target_id, ThreadAction::CopyThread, &[], cx);
+                }
+            }),
             MenuAction::Thread(action) => self.state.update(cx, |state, cx| state.run_thread_action(&open.target_id, action, &open.presets, cx)),
             MenuAction::Project(action) => self.state.update(cx, |state, cx| match action {
                 ProjectAction::NewThread => state.start_draft(&open.target_id, cx),

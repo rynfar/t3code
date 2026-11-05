@@ -267,3 +267,153 @@ fn media_only_message_copy_synthesizes_references_for_its_attachments() {
 fn ordinary_sent_text_bypasses_the_markdown_parser() {
     assert!(sent_references_with("Ordinary user text without references", |_| panic!("plain text must bypass GFM")).is_empty());
 }
+
+#[test]
+fn hosted_copy_imports_only_the_matching_thread_outside_code() {
+    let record =
+        super::super::menu::ThreadContext::new("env-1", "thread-1", "Fix chips").to_record();
+    let url = "https://app.t3.codes/threads/env-1/thread-1";
+    let raw = json!({"version":1,"source":{"environmentId":"env-1"},"records":[record.clone()]})
+        .to_string();
+    let mut held = Vec::new();
+    assert_eq!(
+        import_fragment(url, &raw, &mut held, "env-1", || panic!("no collision")).unwrap(),
+        reference(&record).unwrap()
+    );
+    assert_eq!(held, [record]);
+}
+
+#[test]
+fn hosted_fragment_import_preserves_identity_and_rejects_unmatched_records() {
+    let record =
+        super::super::menu::ThreadContext::new("env.1/测试", "a%3A1: /é", "Fix chips").to_record();
+    let target =
+        crate::thread_actions::thread_reference("Fix chips", Some("env.1/测试"), "a%3A1: /é")
+            .unwrap();
+    assert_eq!(
+        decode_fragment(&target.fragment).unwrap()["records"],
+        json!([record.clone()])
+    );
+    for text in [
+        target.text.clone(),
+        format!("[Old]({})", target.text),
+        format!("<{}>", target.text),
+    ] {
+        let mut held = Vec::new();
+        assert_eq!(
+            import_fragment(&text, &target.fragment, &mut held, "env.1/测试", || panic!(
+                "no collision"
+            ))
+            .unwrap(),
+            reference(&record).unwrap()
+        );
+        assert_eq!(held.as_slice(), std::slice::from_ref(&record));
+    }
+    let raw = |records: Vec<Value>| {
+        json!({"version":1,"source":{"environmentId":"env.1/测试"},"records":records}).to_string()
+    };
+    let mut forged = record.clone();
+    forged["environmentId"] = json!("elsewhere");
+    let mut other_thread = record.clone();
+    other_thread["threadId"] = json!("other");
+    let mut unknown = record.clone();
+    unknown["kind"] = json!("future");
+    let mut empty = record.clone();
+    empty["threadId"] = json!("");
+    for records in [
+        vec![],
+        vec![forged],
+        vec![other_thread],
+        vec![unknown],
+        vec![empty],
+    ] {
+        let mut held = Vec::new();
+        assert_eq!(
+            import_fragment(
+                &target.text,
+                &raw(records),
+                &mut held,
+                "env.1/测试",
+                || panic!("no imports")
+            )
+            .unwrap(),
+            target.text
+        );
+        assert!(held.is_empty());
+    }
+    let local = super::super::menu::ThreadContext::new("elsewhere", "a%3A1: /é", "Local same id")
+        .to_record();
+    let mut held = vec![local.clone()];
+    assert_eq!(
+        import_fragment(
+            &target.text,
+            &target.fragment,
+            &mut held,
+            "elsewhere",
+            || panic!("foreign")
+        )
+        .unwrap(),
+        target.text
+    );
+    assert_eq!(held, [local]);
+    let mut renamed = record.clone();
+    renamed["label"] = json!("Renamed");
+    renamed["title"] = json!("Renamed");
+    let mut held = vec![renamed];
+    import_fragment(
+        &target.text,
+        &raw(vec![
+            record.clone(),
+            environment_record("unreferenced", "Ignore"),
+        ]),
+        &mut held,
+        "env.1/测试",
+        || panic!("thread identity must reuse id"),
+    )
+    .unwrap();
+    assert_eq!(held, [record]);
+}
+
+#[test]
+fn hosted_import_leaves_code_invalid_urls_and_unreferenced_fragments_untouched() {
+    let target =
+        crate::thread_actions::thread_reference("Fix chips", Some("env-1"), "thread-1").unwrap();
+    let url = &target.text;
+    for text in [
+        format!("`{url}`"),
+        format!("``{url}``"),
+        format!("```md\n{url}\n```"),
+        format!("~~~md\n{url}\n~~~"),
+        format!("```\n{url}"),
+        format!("{url}?prompt=go"),
+        format!("{url}#fragment"),
+        format!("{url}/extra"),
+        "https://app.t3.codes/threads/env-1/%GG".into(),
+        "https://app.t3.codes/threads/env-1/%FF".into(),
+        "https://app.t3.codes/threads/env-1/".into(),
+        "https://evil.test/threads/env-1/thread-1".into(),
+        "ordinary text".into(),
+    ] {
+        let mut held = Vec::new();
+        assert_eq!(
+            import_fragment(&text, &target.fragment, &mut held, "env-1", || panic!(
+                "no imports"
+            ))
+            .unwrap(),
+            text
+        );
+        assert!(held.is_empty(), "{text}");
+    }
+    let text = format!("`{url}` and {url}.\n~~~\n{url}\n~~~\n<{url}>");
+    let mut held = Vec::new();
+    let pasted = import_fragment(&text, &target.fragment, &mut held, "env-1", || {
+        panic!("no collision")
+    })
+    .unwrap();
+    let chip = reference(&held[0]).unwrap();
+    assert_eq!(
+        pasted,
+        format!("`{url}` and {chip}.\n~~~\n{url}\n~~~\n{chip}")
+    );
+    assert_eq!(held.len(), 1);
+}
