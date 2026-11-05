@@ -6,6 +6,7 @@ use gpui::{
     AnyElement, App, BoxShadow, Context, MouseButton, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
     ParentElement, Pixels, Point, Render, SharedString, Styled, Window, anchored, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
+use t3_core::sidebar::grouping::{GroupingSettings, ProjectGroup, ProjectScope, build_project_groups};
 use t3_core::sidebar::selection::{BulkAction, build_bulk_menu};
 use t3_core::sidebar::settled::{self, SnoozePreset};
 use t3_core::thread_actions::{Available, MenuItem, ProjectAction, Supports, ThreadAction, ThreadActionMenuState, build_menu, build_project_menu};
@@ -35,6 +36,104 @@ pub enum ContextMenuEvent {
     BulkDelete(Vec<String>),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ProjectFilterMember {
+    id: String,
+    root: String,
+    created_at: String,
+    archived_at: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ThreadProjectFilter {
+    owner: Option<((String, Option<String>, u64), u64)>,
+    shell_generation: u64,
+    thread: String,
+    created_at: String,
+    project: String,
+    group: ProjectGroup,
+    grouping: GroupingSettings,
+    members: Vec<ProjectFilterMember>,
+}
+
+impl ThreadProjectFilter {
+    fn capture(state: &AppState, thread_id: &str) -> Option<Self> {
+        let thread = state.thread_shell(thread_id)?;
+        if thread.archived_at.is_some() || thread.deleted_at.is_some() {
+            return None;
+        }
+        let environment = &state
+            .server_config
+            .config
+            .as_ref()?
+            .environment
+            .environment_id;
+        let snapshot = state.shell.snapshot.as_ref()?;
+        let grouping = state.sidebar.settings.grouping.clone();
+        let group = build_project_groups(environment, &snapshot.projects, &grouping)
+            .into_iter()
+            .find(|group| {
+                !group.archived && group.member_project_ids.contains(&thread.project_id)
+            })?;
+        let members = group
+            .member_project_ids
+            .iter()
+            .map(|id| {
+                let project = state.shell.project(id)?;
+                Some(ProjectFilterMember {
+                    id: id.clone(),
+                    root: project.workspace_root.clone(),
+                    created_at: project.created_at.clone(),
+                    archived_at: project.archived_at.clone(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let owner = state.thread_copy_scope().and_then(|owner| {
+            Some((
+                owner,
+                *state.client_handle()?.connection_generation().borrow(),
+            ))
+        });
+        Some(Self {
+            owner,
+            shell_generation: state.shell.generation,
+            thread: thread_id.to_owned(),
+            created_at: thread.created_at.clone(),
+            project: thread.project_id.clone(),
+            group,
+            grouping,
+            members,
+        })
+    }
+
+    fn can_apply(&self, state: &AppState) -> bool {
+        self.owner.is_some()
+            && state.sidebar.capabilities.config_loaded
+            && state.sidebar.capabilities.can_operate
+            && state.client_handle().is_some_and(|client| {
+                client
+                    .session_state()
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| {
+                        session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                    })
+            })
+            && Self::capture(state, &self.thread).as_ref() == Some(self)
+    }
+
+    fn apply(self, state: &mut AppState, cx: &mut Context<AppState>) {
+        if !self.can_apply(state) {
+            return;
+        }
+        let mut scope = ProjectScope::default();
+        if !state.sidebar.project_filter_scope.is_selected(&self.group) {
+            scope.toggle(&self.group, std::slice::from_ref(&self.group), true);
+        }
+        state.set_project_scope(scope, cx);
+    }
+}
+
 struct OpenMenu {
     /// The thread or project the menu acts on.
     target_id: String,
@@ -48,6 +147,7 @@ struct OpenMenu {
     selection: Vec<String>,
     snooze_request: Option<SnoozeRequest>,
     copy_scope: Option<(String, Option<String>, u64)>,
+    project_filter: Option<ThreadProjectFilter>,
 }
 
 pub struct ContextMenu {
@@ -71,8 +171,17 @@ impl ContextMenu {
     }
 
     pub fn open_for_thread(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_thread(thread_id, position, true, window, cx);
+    }
+
+    pub fn open_for_header(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_thread(thread_id, position, false, window, cx);
+    }
+
+    fn open_thread(&mut self, thread_id: &str, position: Point<Pixels>, sidebar: bool, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(thread) = state.sidebar.model.thread(thread_id) else { return };
+        let project_filter = sidebar.then(|| ThreadProjectFilter::capture(state, thread_id)).flatten();
         let now = now_ms();
         let presets = state.snooze_presets();
         let caps = state.sidebar.capabilities;
@@ -82,7 +191,7 @@ impl ContextMenu {
             can_operate: caps.can_operate,
             can_find: false,
             branch: thread.branch.as_deref(),
-            project_filter: None,
+            project_filter: project_filter.as_ref().map(|filter| (filter.group.label.as_str(), state.sidebar.project_filter_scope.is_selected(&filter.group))),
             is_pinned: thread.pinned,
             is_settled: thread.is_settled(),
             auto_settle_enabled: !thread.auto_settle_disabled,
@@ -98,6 +207,9 @@ impl ContextMenu {
         let can_snooze = snooze_request.plan_for(state, now).is_some();
         let items = items.into_iter().map(|item| {
             let mut item = item.map(&MenuAction::Thread);
+            if item.action == MenuAction::Thread(ThreadAction::FilterByProject) {
+                item.disabled = project_filter.as_ref().is_none_or(|filter| !filter.can_apply(state));
+            }
             if item.action == MenuAction::Thread(ThreadAction::Unsnooze) && snooze_request.plan_for_action(state, now, false).is_none() {
                 item.disabled = true;
             }
@@ -107,7 +219,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope() });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -124,7 +236,7 @@ impl ContextMenu {
             items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
         }
         items.push(discard);
-        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None});
+        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None});
         window.focus(&self.focus,cx);
         cx.notify();
     }
@@ -147,7 +259,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None });
+        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -157,7 +269,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
-        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None });
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -184,7 +296,7 @@ impl ContextMenu {
         let mut custom = MenuItem::new(MenuAction::Thread(ThreadAction::SnoozeCustom), "Custom…", None);
         custom.separator_before = !presets.is_empty();
         items.push(custom);
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -227,6 +339,11 @@ impl ContextMenu {
                             }
                         }
                     });
+                }
+            }
+            MenuAction::Thread(ThreadAction::FilterByProject) => {
+                if let Some(filter) = open.project_filter {
+                    self.state.update(cx, |state, cx| filter.apply(state, cx));
                 }
             }
             MenuAction::Bulk(BulkAction::Delete) => cx.emit(ContextMenuEvent::BulkDelete(open.selection)),
@@ -440,5 +557,466 @@ impl Render for ContextMenu {
                 .with_priority(130),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod project_filter_tests {
+    use super::*;
+    use gpui::AppContext;
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+    use t3_core::auth::AuthSessionState;
+    use t3_core::shell::{ShellSnapshot, ShellState};
+    use t3_core::sidebar::grouping::{ProjectScope, build_project_groups};
+
+    fn session(operate: bool) -> AuthSessionState {
+        serde_json::from_value(serde_json::json!({
+            "authenticated":true,
+            "permissions": if operate { vec![t3_core::auth::ORCHESTRATION_OPERATE_SCOPE] } else { vec![] }
+        })).unwrap()
+    }
+
+    fn install(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<AppState>, ClientFixture, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap();
+            cx.set_global(fixture);
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        let (client, mut fixture) = ClientFixture::handle(session(true));
+        state.update(cx, |state, cx| {
+            state.environments = serde_json::from_value(serde_json::json!({"active":"saved-fixture", "environments":[{
+                "id":"saved-fixture","label":"Fixture","httpBase":"http://fixture.invalid","environmentId":"fixture-env"
+            }]})).unwrap();
+            let projects = [("checkout-a", "/fixture/a", "repo"), ("checkout-b", "/fixture/b", "repo"), ("other", "/fixture/other", "other")].into_iter().map(|(id, path, repo)| {
+                serde_json::from_value(serde_json::json!({
+                    "id":id,"title": if repo == "repo" { "Shared repo" } else { "Other" },"workspaceRoot":path,
+                    "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z",
+                    "projectIcon":{"kind":"monogram","text":"P","color":"blue"},
+                    "repositoryIdentity":{"canonicalKey":repo}
+                })).unwrap()
+            }).collect();
+            let threads = [("menu-thread", "checkout-b"), ("sibling", "checkout-a"), ("other-thread", "other")].into_iter().map(|(id, project)| {
+                serde_json::from_value(serde_json::json!({
+                    "id":id,"projectId":project,"title":id,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z",
+                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                    "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},"status":"idle",
+                    "hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+                })).unwrap()
+            }).collect();
+            let mut shell = ShellState::default();
+            shell.snapshot = Some(ShellSnapshot {projects, threads, ..Default::default()});
+            shell.synchronized = true;
+            state.install_active_environment(client, shell, state.server_config.clone(), ConnectionStatus::Connected, cx);
+        });
+        fixture.take_commands();
+        (state, fixture, runtime)
+    }
+
+    fn select_groups(state: &Entity<AppState>, keys: &[&str], cx: &mut gpui::TestAppContext) {
+        state.update(cx, |state, cx| {
+            let groups = build_project_groups(
+                "fixture-env",
+                &state.shell.snapshot.as_ref().unwrap().projects,
+                &state.sidebar.settings.grouping,
+            );
+            let mut scope = ProjectScope::default();
+            for group in groups
+                .iter()
+                .filter(|group| keys.contains(&group.key.as_str()))
+            {
+                scope.toggle(group, &groups, true);
+            }
+            state.set_project_scope(scope, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_menu_activation_replaces_and_clears_logical_scope(cx: &mut gpui::TestAppContext) {
+        let (state, mut fixture, _runtime) = install(cx);
+        let (menu, cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+        let draft = state.read_with(cx, |state, _| state.draft_project.clone());
+        for clear in [false, true] {
+            if clear {
+                select_groups(&state, &["repo", "other"], cx);
+            }
+            state.update(cx, |state, _| {
+                state.sidebar.selection.toggle("other-thread")
+            });
+            let shown = cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.open_for_thread("menu-thread", point(px(10.), px(10.)), window, cx);
+                    menu.open
+                        .as_ref()
+                        .unwrap()
+                        .items
+                        .iter()
+                        .find(|item| {
+                            item.action == MenuAction::Thread(ThreadAction::FilterByProject)
+                        })
+                        .cloned()
+                })
+            });
+            if !clear {
+                select_groups(&state, &["other"], cx);
+            }
+            cx.update(|_, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.activate(MenuAction::Thread(ThreadAction::FilterByProject), cx);
+                    assert!(!menu.is_open());
+                })
+            });
+            state.read_with(cx, |state, _| {
+                let expected = (!clear).then(|| {
+                    ["checkout-a".to_owned(), "checkout-b".to_owned()]
+                        .into_iter()
+                        .collect()
+                });
+                assert_eq!(
+                    state.sidebar.project_scope, expected,
+                    "real menu activation must replace/clear the sidebar scope"
+                );
+                assert_eq!(state.sidebar.project_filter_scope.is_empty(), clear);
+                assert!(state.sidebar.model.thread("sibling").is_some());
+                assert_eq!(state.sidebar.model.thread("other-thread").is_some(), clear);
+                assert!(state.sidebar.selection.selected().is_empty());
+                assert_eq!(state.selected_thread, None);
+                assert_eq!(state.draft_project, draft);
+            });
+            let shown = shown.expect("sidebar menu exposes its logical project filter");
+            assert_eq!(
+                shown.label,
+                if clear {
+                    "Show all projects"
+                } else {
+                    "Filter by Shared repo"
+                }
+            );
+            assert_eq!(shown.icon, Some("folder-tree"));
+            assert!(!shown.disabled);
+            assert!(
+                fixture.take_commands().is_empty(),
+                "scope changes must enqueue no RPCs or visits"
+            );
+            eprintln!(
+                "production menu activation: clear={clear}; logical members=checkout-a,checkout-b; selection cleared; route retained; zero client commands"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_menu_rechecks_current_grants_and_captured_target(cx: &mut gpui::TestAppContext) {
+        for mode in [
+            "revoked",
+            "unknown-grants",
+            "unauthenticated",
+            "capability",
+            "config-loading",
+            "config-missing",
+            "disconnected",
+            "unsynchronized",
+            "reconnected",
+            "shell-replaced",
+            "client-replaced",
+            "environment-replaced",
+            "saved-replaced",
+            "saved-mismatch",
+            "thread-missing",
+            "thread-archived",
+            "thread-replaced",
+            "thread-moved",
+            "project-missing",
+            "group-archived",
+            "member-missing",
+            "member-replaced",
+            "member-archived",
+            "regrouped",
+        ] {
+            let (state, mut fixture, _runtime) = install(cx);
+            let (menu, cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+            cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.open_for_thread("menu-thread", point(px(10.), px(10.)), window, cx);
+                    assert!(
+                        menu.open
+                            .as_ref()
+                            .unwrap()
+                            .items
+                            .iter()
+                            .any(|item| item.action
+                                == MenuAction::Thread(ThreadAction::FilterByProject)
+                                && !item.disabled)
+                    );
+                })
+            });
+            state.update(cx, |state, _| {
+                state.sidebar.selection.toggle("other-thread")
+            });
+            let mut replacement = None;
+            state.update(cx, |state, cx| match mode {
+                "revoked" => {
+                    fixture.grants.send(Some(session(false))).unwrap();
+                }
+                "unknown-grants" => {
+                    fixture.grants.send(None).unwrap();
+                }
+                "unauthenticated" => {
+                    let mut denied = session(true);
+                    denied.authenticated = false;
+                    fixture.grants.send(Some(denied)).unwrap();
+                }
+                "capability" => state.sidebar.capabilities.can_operate = false,
+                "config-loading" => state.sidebar.capabilities.config_loaded = false,
+                "config-missing" => state.server_config.config = None,
+                "disconnected" => {
+                    state.phase = crate::app_state::Phase::Online(ConnectionStatus::Connecting)
+                }
+                "unsynchronized" => state.shell.synchronized = false,
+                "reconnected" => {
+                    fixture.generation.send(2).unwrap();
+                }
+                "shell-replaced" => state.shell.generation += 1,
+                "client-replaced" => {
+                    let (client, observed) = ClientFixture::handle(session(true));
+                    state.install_active_environment(
+                        client,
+                        state.shell.clone(),
+                        state.server_config.clone(),
+                        ConnectionStatus::Connected,
+                        cx,
+                    );
+                    replacement = Some(observed);
+                }
+                "environment-replaced" => {
+                    state
+                        .server_config
+                        .config
+                        .as_mut()
+                        .unwrap()
+                        .environment
+                        .environment_id = "other-env".into()
+                }
+                "saved-replaced" => state.environments.active = Some("other-saved".into()),
+                "saved-mismatch" => {
+                    state.environments.environments[0].environment_id = Some("other-env".into())
+                }
+                "thread-missing" => state
+                    .shell
+                    .snapshot
+                    .as_mut()
+                    .unwrap()
+                    .threads
+                    .retain(|thread| thread.id != "menu-thread"),
+                "thread-archived" => {
+                    state.shell.snapshot.as_mut().unwrap().threads[0].archived_at =
+                        Some("2026-11-05T00:00:00Z".into())
+                }
+                "thread-replaced" => {
+                    state.shell.snapshot.as_mut().unwrap().threads[0].created_at =
+                        "2026-11-05T00:00:00Z".into()
+                }
+                "thread-moved" => {
+                    state.shell.snapshot.as_mut().unwrap().threads[0].project_id = "other".into();
+                }
+                "member-archived" => {
+                    state.shell.snapshot.as_mut().unwrap().projects[0].archived_at =
+                        Some("2026-11-05T00:00:00Z".into());
+                }
+                "project-missing" => state
+                    .shell
+                    .snapshot
+                    .as_mut()
+                    .unwrap()
+                    .projects
+                    .retain(|project| project.id != "checkout-b"),
+                "group-archived" => {
+                    for project in &mut state.shell.snapshot.as_mut().unwrap().projects {
+                        project.archived_at = Some("2026-11-05T00:00:00Z".into());
+                    }
+                }
+                "member-missing" => state
+                    .shell
+                    .snapshot
+                    .as_mut()
+                    .unwrap()
+                    .projects
+                    .retain(|project| project.id != "checkout-a"),
+                "member-replaced" => {
+                    state.shell.snapshot.as_mut().unwrap().projects[0].workspace_root =
+                        "/replaced/a".into()
+                }
+                "regrouped" => {}
+                _ => unreachable!(),
+            });
+            if mode == "regrouped" {
+                cx.update(|_, cx| {
+                    crate::settings::store::install_committed_client(
+                        &state,
+                        serde_json::from_value(
+                            serde_json::json!({"sidebarProjectGroupingMode":"separate"}),
+                        )
+                        .unwrap(),
+                        cx,
+                    )
+                });
+            }
+            if let Some(replacement) = &mut replacement {
+                replacement.take_commands();
+            }
+            cx.update(|_, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.activate(MenuAction::Thread(ThreadAction::FilterByProject), cx)
+                })
+            });
+            state.read_with(cx, |state, _| {
+                assert!(state.sidebar.project_filter_scope.is_empty(), "{mode}");
+                assert!(state.sidebar.project_scope.is_none(), "{mode}");
+                assert_eq!(
+                    state.sidebar.selection.selected(),
+                    ["other-thread"],
+                    "{mode}"
+                );
+                assert!(state.selected_thread.is_none(), "{mode}");
+            });
+            assert!(!menu.read_with(cx, |menu, _| menu.is_open()), "{mode}");
+            assert!(
+                fixture.take_commands().is_empty(),
+                "{mode}: original client commands"
+            );
+            assert!(
+                replacement
+                    .as_mut()
+                    .is_none_or(|fixture| fixture.take_commands().is_empty()),
+                "{mode}: replacement client commands"
+            );
+            eprintln!(
+                "production activation rejected: {mode}; unchanged scope/selection; zero commands"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_filter_omission_disabled_grants_header_and_keyboard(cx: &mut gpui::TestAppContext) {
+        for mode in ["header", "archived", "missing", "denied"] {
+            let (state, mut fixture, _runtime) = install(cx);
+            let (menu, cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+            state.update(cx, |state, _| {
+                if mode == "archived" {
+                    for project in &mut state.shell.snapshot.as_mut().unwrap().projects {
+                        project.archived_at = Some("2026-11-05T00:00:00Z".into());
+                    }
+                } else if mode == "missing" {
+                    state.shell.snapshot.as_mut().unwrap().projects.clear();
+                }
+            });
+            if mode == "denied" {
+                fixture.grants.send(Some(session(false))).unwrap();
+            }
+            cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    if mode == "header" {
+                        menu.open_for_header("menu-thread", point(px(10.), px(10.)), window, cx);
+                    } else {
+                        menu.open_for_thread("menu-thread", point(px(10.), px(10.)), window, cx);
+                    }
+                    let items = &menu.open.as_ref().unwrap().items;
+                    assert!(
+                        !items
+                            .iter()
+                            .any(|item| item.action == MenuAction::Thread(ThreadAction::Find))
+                    );
+                    let filter = items.iter().find(|item| {
+                        item.action == MenuAction::Thread(ThreadAction::FilterByProject)
+                    });
+                    if mode == "denied" {
+                        assert!(filter.unwrap().disabled);
+                    } else {
+                        assert!(filter.is_none(), "{mode}");
+                    }
+                    menu.activate(MenuAction::Thread(ThreadAction::FilterByProject), cx);
+                })
+            });
+            assert!(
+                state.read_with(cx, |state, _| state.sidebar.project_filter_scope.is_empty()),
+                "{mode}"
+            );
+            assert!(fixture.take_commands().is_empty());
+        }
+        let (state, mut fixture, _runtime) = install(cx);
+        let (menu, cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+        fixture.grants.send(Some(session(false))).unwrap();
+        fixture.grants.send(Some(session(true))).unwrap();
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.open_for_thread("menu-thread", point(px(10.), px(10.)), window, cx);
+                let items = &menu.open.as_ref().unwrap().items;
+                let index = items
+                    .iter()
+                    .position(|item| {
+                        item.action == MenuAction::Thread(ThreadAction::FilterByProject)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    items[index - 1].action,
+                    MenuAction::Thread(ThreadAction::MarkUnread)
+                );
+                for _ in 0..=index {
+                    menu.on_key(
+                        &KeyDownEvent {
+                            keystroke: gpui::Keystroke::parse("down").unwrap(),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        cx,
+                    );
+                }
+                menu.on_key(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    cx,
+                );
+                assert!(!menu.is_open());
+            })
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state
+                .sidebar
+                .project_scope
+                .as_ref()
+                .unwrap()
+                .len()),
+            2
+        );
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.open_for_thread("menu-thread", point(px(10.), px(10.)), window, cx);
+                menu.on_key(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    cx,
+                );
+                assert!(!menu.is_open());
+            })
+        });
+        assert!(fixture.take_commands().is_empty());
+        eprintln!(
+            "production menu: missing/archived/header omitted; live grant denial disabled; regrant/keyboard Enter scopes two checkouts; Escape dismisses; no Find; zero commands"
+        );
     }
 }

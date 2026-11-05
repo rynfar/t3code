@@ -97,6 +97,56 @@ pub struct ClientHandle {
     connection_generation: watch::Receiver<u64>,
 }
 
+/// In-memory channels for app integration tests; no supervisor consumes their commands.
+#[cfg(feature = "test-support")]
+pub struct ClientFixture {
+    pub grants: watch::Sender<Option<AuthSessionState>>,
+    pub generation: watch::Sender<u64>,
+    commands: mpsc::UnboundedReceiver<Command>,
+}
+
+#[cfg(feature = "test-support")]
+impl ClientFixture {
+    pub fn handle(session: AuthSessionState) -> (ClientHandle, Self) {
+        let (commands, received) = mpsc::unbounded_channel();
+        let (grants, session_state) = watch::channel(Some(session));
+        let (generation, connection_generation) = watch::channel(1);
+        let handle = ClientHandle {
+            refs: Default::default(),
+            commands,
+            credentials: Arc::new(Credentials {
+                http_base: "http://fixture.invalid".into(),
+                access_token: String::new(),
+            }),
+            session_state,
+            connection_generation,
+        };
+        (
+            handle,
+            Self {
+                grants,
+                generation,
+                commands: received,
+            },
+        )
+    }
+
+    pub fn take_commands(&mut self) -> Vec<&'static str> {
+        let mut commands = Vec::new();
+        while let Ok(command) = self.commands.try_recv() {
+            commands.push(match command {
+                Command::OpenThread(_) => "open-thread",
+                Command::CloseThread(_) => "close-thread",
+                Command::CloseAllThreads => "close-all-threads",
+                Command::RefreshSessionState => "refresh-session",
+                Command::RetryNow => "retry",
+                Command::Request { method, .. } | Command::Stream { method, .. } => method,
+            });
+        }
+        commands
+    }
+}
+
 impl ClientHandle {
     /// The server this handle talks to; caches keyed by it never mix environments.
     pub fn environment(&self) -> &str {

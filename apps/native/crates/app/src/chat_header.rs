@@ -74,7 +74,7 @@ impl ChatHeader {
 
     fn open_menu(&mut self, thread_id: String, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_menu = None;
-        self.menu.update(cx, |menu, cx| menu.open_for_thread(&thread_id, position, window, cx));
+        self.menu.update(cx, |menu, cx| menu.open_for_header(&thread_id, position, window, cx));
     }
 
     /// A single click opens the thread menu after the double-click window; a double click renames.
