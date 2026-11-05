@@ -1576,7 +1576,7 @@ fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
         "message":"Inventory diagnostic", "compatibilityAdvisory":{"status":"unsupported","message":"Use 2.0.0."}
     });
     let expected = |title: &str, message: &str, warning, key: [&str; 4]| Some(ProviderBanner {
-        instance_id: key[0].into(), refresh_tooltip: "Refresh Work Codex provider status".into(),
+        can_setup: false, instance_id: key[0].into(), refresh_tooltip: "Refresh Work Codex provider status".into(),
         key: key.join("\u{0}"), title: title.into(), message: message.into(), warning,
     });
     let unsupported = || expected("Work Codex 1.2.3 is unsupported", "Use 2.0.0.", true, ["work-codex", "unsupported", "1.2.3", "Use 2.0.0."]);
@@ -1617,7 +1617,7 @@ fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
             expected("Work Codex provider status", "Inventory diagnostic", false, ["work-codex", "error", "authenticated", "Inventory diagnostic"])),
         ("normal Antigravity unknown auth suppressed", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"},"compatibilityAdvisory":null}), None),
         ("Antigravity unsupported warning suppressed", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"}}), None),
-        ("Antigravity broken bypasses suppression", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"},"compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken()),
+        ("Antigravity broken bypasses suppression", json!({"driver":"antigravity","status":"warning","auth":{"status":"unknown"},"compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken().map(|mut banner| {banner.can_setup=true;banner})),
     ];
     for status in ["warning", "unknown", "error"] {
         cases.push((status, json!({"status":status,"auth":{"status":"unknown"},"compatibilityAdvisory":{"status":"broken","message":"Use 2.0.0."}}), broken()));
@@ -1630,6 +1630,54 @@ fn provider_status_stream_updates_the_banner_while_a_refresh_is_pending() {
             expected("Work Codex is unauthenticated", "Inventory diagnostic", false, ["work-codex", "error", "unauthenticated", "Inventory diagnostic"])));
         cases.push((advisory, json!({"status":"error","auth":{"status":"unauthenticated"},"message":null,"compatibilityAdvisory":{"status":advisory,"message":"Use 2.0.0."}}),
             expected("Work Codex is unauthenticated", "Sign in via the CLI to authenticate again.", false, ["work-codex", "error", "unauthenticated", ""])));
+    }
+    cases.push((
+        "setup preserves diagnostic precedence",
+        json!({"status":"error","setup":{"canAuthenticate":true}}),
+        expected(
+            "Work Codex provider status",
+            "Inventory diagnostic",
+            false,
+            [
+                "work-codex",
+                "error",
+                "authenticated",
+                "Inventory diagnostic",
+            ],
+        )
+        .map(|mut banner| {
+            banner.can_setup = true;
+            banner
+        }),
+    ));
+    cases.push((
+        "setup preserves compatibility precedence",
+        json!({"setup":{"canInstall":true}}),
+        unsupported().map(|mut banner| {
+            banner.can_setup = true;
+            banner
+        }),
+    ));
+    cases.push((
+        "explicit false capabilities",
+        json!({"status":"error","setup":{"canAuthenticate":false,"canInstall":false}}),
+        expected(
+            "Work Codex provider status",
+            "Inventory diagnostic",
+            false,
+            [
+                "work-codex",
+                "error",
+                "authenticated",
+                "Inventory diagnostic",
+            ],
+        ),
+    ));
+    for setup in [json!({"canAuthenticate":true}), json!({"canInstall":true})] {
+        cases.push(("capable sign-in", json!({"status":"error","auth":{"status":"unauthenticated"},"message":null,"compatibilityAdvisory":null,"setup":setup}),
+            expected("Work Codex is unauthenticated", "Open provider setup to sign in.", false, ["work-codex", "error", "unauthenticated", ""]).map(|mut banner| {banner.can_setup=true;banner})));
+        cases.push(("capable install", json!({"status":"error","installed":false,"message":null,"compatibilityAdvisory":null,"setup":setup}),
+            expected("Work Codex provider status", "Open provider setup to install Codex on this environment.", false, ["work-codex", "error", "authenticated", ""]).map(|mut banner| {banner.can_setup=true;banner})));
     }
     let mut failures = Vec::new();
     for (case, patch, expected) in cases {

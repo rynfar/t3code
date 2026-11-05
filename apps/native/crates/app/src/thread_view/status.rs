@@ -119,6 +119,24 @@ impl ThreadView {
         })));
     }
 
+    fn open_provider_setup(
+        &mut self,
+        target: &crate::composer::ProviderTarget,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_banners(cx);
+        if self.banners.target.as_ref() == Some(target)
+            && self
+                .banners
+                .lines
+                .provider
+                .as_ref()
+                .is_some_and(|banner| banner.can_setup)
+        {
+            crate::settings::open_provider_setup(target.clone(), cx);
+        }
+    }
+
     fn refresh_banner_provider(&mut self, cx: &mut Context<Self>) {
         self.sync_banners(cx);
         let state = self.state.read(cx);
@@ -610,7 +628,9 @@ impl ThreadView {
                 .tooltip(banner.refresh_tooltip.clone())
                 .disabled(!self.banners.can_refresh || refreshing)
                 .on_click(cx.listener(|view, _, _, cx| view.refresh_banner_provider(cx)));
-            let body = v_flex().gap(rem(8.)).child(body).child(h_flex().flex_wrap().justify_end().gap(rem(12.)).child(refresh)).into_any_element();
+            let target = self.banners.target.clone().filter(|_| banner.can_setup);
+            let setup = target.map(|target| inline_button("provider-setup", "Open provider setup", InlineTone::Default, false, cx.listener(move |view, _, _, cx| view.open_provider_setup(&target, cx)), cx));
+            let body = v_flex().gap(rem(8.)).child(body).child(h_flex().flex_wrap().justify_end().gap(rem(12.)).children(setup).child(refresh)).into_any_element();
             banners.push(alert(banner.warning, AlertIcon::Lucide(Icon::Info), Some(banner.title.clone()), vec![body], vec![dismiss], f32::INFINITY, cx));
         }
         if let (Some(error), Some(thread_id)) = (&lines.error, self.thread_id.as_deref()) {
@@ -746,8 +766,8 @@ mod selected_provider_tests {
                 state.server_config.config = Some(serde_json::from_value(json!({
                     "environment":{"environmentId":"one"},
                     "providers":[
-                        {"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"warning","message":"A","models":[{"slug":"m","name":"A"}]},
-                        {"instanceId":"claudeAgent","driver":"claudeAgent","enabled":true,"installed":true,"status":"warning","message":"B","models":[{"slug":"m","name":"B"}]}
+                        {"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"warning","message":"A","setup":{"canAuthenticate":true},"models":[{"slug":"m","name":"A"}]},
+                        {"instanceId":"claudeAgent","driver":"claudeAgent","enabled":true,"installed":true,"status":"warning","message":"B","setup":{"canInstall":true},"models":[{"slug":"m","name":"B"}]}
                     ]
                 })).unwrap());
                 let thread = json!({"id":"main","projectId":"p","title":"Main","providerInstanceId":"codex",
@@ -785,6 +805,89 @@ mod selected_provider_tests {
         cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
         assert_eq!(shown(&view,cx).as_deref(),Some("codex"));
         assert_eq!(shown(&side_view,cx).as_deref(),Some("claudeAgent"));
+        cx.update_window(side.into(), |_, window, cx| {
+            side_composer.update(cx, |composer, cx| {
+                composer.pick_banner_test_model("claudeAgent", window, cx)
+            })
+        })
+        .unwrap();
+        cx.update_window(main.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.pick_banner_test_model("codex", window, cx)
+            })
+        })
+        .unwrap();
+        assert_eq!(shown(&view, cx).as_deref(), Some("codex"));
+        assert_eq!(shown(&side_view, cx).as_deref(), Some("claudeAgent"));
+        cx.update_window(side.into(), |_, window, cx| {
+            side_view.update(cx, |view, cx| {
+                view.open_provider_setup(&side_composer.read(cx).provider_target.clone(), cx)
+            });
+            assert_eq!(
+                crate::settings::setup_selection_for_test(window, cx).as_deref(),
+                Some("claudeAgent"),
+                "setup must open the side composer's exact non-first instance"
+            );
+        })
+        .unwrap();
+        cx.update_window(main.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_provider_setup(&composer.read(cx).provider_target.clone(), cx)
+            });
+            assert_eq!(
+                crate::settings::setup_selection_for_test(window, cx).as_deref(),
+                Some("codex"),
+                "already-open Settings must follow the main composer"
+            );
+        })
+        .unwrap();
+        cx.update_window(main.into(), |_, window, cx| {
+            crate::settings::test_setup_target_lifetime(
+                composer.read(cx).provider_target.clone(),
+                window,
+                cx,
+            );
+            let mut stale = composer.read(cx).provider_target.clone();
+            stale.thread = Some("side".into());
+            view.update(cx, |view, cx| view.open_provider_setup(&stale, cx));
+            assert_eq!(
+                crate::settings::setup_selection_for_test(window, cx),
+                None,
+                "a side source cannot activate the main transcript's action"
+            );
+            stale = composer.read(cx).provider_target.clone();
+            stale.instance = Some("claudeAgent".into());
+            view.update(cx, |view, cx| view.open_provider_setup(&stale, cx));
+            assert_eq!(
+                crate::settings::setup_selection_for_test(window, cx),
+                None,
+                "a replaced composer choice cannot activate an old banner action"
+            );
+        })
+        .unwrap();
+        let queued = composer.read_with(cx, |composer, _| composer.provider_target.clone());
+        cx.update(|cx| crate::settings::open_provider_setup(queued.clone(), cx));
+        state.update(cx, |state, cx| {
+            state
+                .server_config
+                .config
+                .as_mut()
+                .unwrap()
+                .environment
+                .environment_id = "before-consumption".into();
+            cx.emit(AppEvent::ServerConfig);
+        });
+        state.update(cx, |state, cx| {
+            state
+                .server_config
+                .config
+                .as_mut()
+                .unwrap()
+                .environment
+                .environment_id = queued.environment;
+            cx.emit(AppEvent::ServerConfig);
+        });
+        cx.update_window(main.into(), |_,window,cx| assert_eq!(crate::settings::setup_selection_for_test(window,cx),None,"an unconsumed target is retired on the first invalidating event, even if the environment returns")).unwrap();
         state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].message=Some("B updated".into());cx.emit(AppEvent::ServerConfig);});
         side_view.read_with(cx, |view,_| assert_eq!(view.banners.lines.provider.as_ref().unwrap().message,"B updated"));
         side_view.update(cx, |view,cx| {

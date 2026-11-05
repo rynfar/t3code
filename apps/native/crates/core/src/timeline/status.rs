@@ -422,6 +422,7 @@ pub fn status_line(thread: &SidebarThread, now: i64) -> Option<StatusLine> {
 pub struct ProviderBanner {
     pub instance_id: String,
     pub refresh_tooltip: String,
+    pub can_setup: bool,
     pub key: String,
     pub title: String,
     pub message: String,
@@ -444,7 +445,7 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
         None => [provider.instance_id.as_str(), &provider.status, &provider.auth.status, provider.message.as_deref().unwrap_or_default()].join("\u{0}"),
     };
     let name = provider.display_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map_or_else(|| driver_label(&provider.driver), str::to_owned);
-    let setup = provider.driver == "antigravity";
+    let setup = provider.driver == "antigravity" || provider.setup.as_ref().is_some_and(|setup| setup.can_authenticate || setup.can_install);
     let message = if let Some(message) = incompatible.and_then(|advisory| advisory.message.as_ref()) {
         message.clone()
     } else if let Some(message) = provider.message.as_ref().filter(|message| !message.is_empty()) {
@@ -452,7 +453,13 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
     } else if !provider.installed && setup {
         format!("Open provider setup to install {} on this environment.", driver_label(&provider.driver))
     } else if provider.auth.status == "unauthenticated" {
-        if setup { "Open provider setup to sign in with Google.".into() } else { "Sign in via the CLI to authenticate again.".into() }
+        if provider.driver == "antigravity" {
+            "Open provider setup to sign in with Google.".into()
+        } else if setup {
+            "Open provider setup to sign in.".into()
+        } else {
+            "Sign in via the CLI to authenticate again.".into()
+        }
     } else if provider.status == "ready" {
         "No models are available for this provider.".into()
     } else if provider.status == "error" {
@@ -463,6 +470,7 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
     Some(ProviderBanner {
         instance_id: provider.instance_id.clone(),
         refresh_tooltip: format!("Refresh {name} provider status"),
+        can_setup: setup,
         key,
         title: if unauthenticated {
             format!("{name} is unauthenticated")

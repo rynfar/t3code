@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, icon, muted_text, r, section, section_title};
 use super::{Block, SettingsView, store};
-use crate::app_state::AppEvent;
+use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette};
@@ -91,6 +91,43 @@ struct InstallSession {
     _stream: Option<Stream>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProviderSettingsTarget {
+    environment: String,
+    pub(super) connection: Option<u64>,
+    instance: String,
+    driver: String,
+}
+
+impl ProviderSettingsTarget {
+    pub(super) fn capture(state: &AppState, instance: &str) -> Option<Self> {
+        let config = state.server_config.config.as_ref()?;
+        let row = model::instance_rows(&config.settings, &config.providers, Some(instance))
+            .into_iter()
+            .find(|row| row.instance_id == instance)?;
+        Some(Self {
+            environment: crate::composer::ProviderTarget::environment(state),
+            connection: state.connection_id(),
+            instance: instance.to_owned(),
+            driver: row.driver,
+        })
+    }
+
+    fn current(&self, state: &AppState) -> bool {
+        Self::capture(state, &self.instance).as_ref() == Some(self)
+    }
+
+    pub(super) fn setup_current(&self, state: &AppState) -> bool {
+        self.current(state)
+            && state
+                .server_config
+                .config
+                .as_ref()
+                .and_then(|config| config.provider(&self.instance))
+                .is_some_and(|provider| provider.driver == self.driver)
+    }
+}
+
 pub(crate) struct ProvidersState {
     removal: removal::Removal,
     selected: Option<String>,
@@ -123,8 +160,10 @@ pub(crate) struct ProvidersState {
     /// The account email shows only after a click (`RedactedSensitiveText`).
     email_revealed: bool,
     method_id: SharedString,
-    /// The instance the name and accent fields were last filled from.
-    synced_instance: Option<String>,
+    /// Inputs belong to the environment and connection they were filled from.
+    editor_owner: Option<ProviderSettingsTarget>,
+    setup_target: Option<ProviderSettingsTarget>,
+    setup_unavailable: bool,
     dialog: Option<dialog::AddDialog>,
     /// Redraws once when the "Checked …" label would next read differently.
     label_timer: Option<(i64, Task<()>)>,
@@ -132,6 +171,11 @@ pub(crate) struct ProvidersState {
 }
 
 impl ProvidersState {
+    pub(super) fn clear_setup_target(&mut self) {
+        self.setup_target = None;
+        self.setup_unavailable = false;
+    }
+
     pub(super) fn leave(&mut self) {
         self.removal.model.cancel();
         self.dialog=None;
@@ -219,7 +263,9 @@ impl ProvidersState {
             model_rows: editor::ModelRows::default(),
             email_revealed: false,
             method_id: SharedString::default(),
-            synced_instance: None,
+            editor_owner: None,
+            setup_target: None,
+            setup_unavailable: false,
             dialog: None,
             label_timer: None,
             _subscriptions: subscriptions,
@@ -308,7 +354,19 @@ impl SettingsView {
             .selected
             .as_deref()
             .and_then(|id| views.iter().find(|(row, ..)| row.instance_id == id))
-            .or_else(|| views.first())
+            .filter(|_| {
+                !self.providers.setup_unavailable
+                    && self
+                        .providers
+                        .setup_target
+                        .as_ref()
+                        .is_none_or(|target| target.setup_current(app))
+            })
+            .or_else(|| {
+                (self.providers.setup_target.is_none() && !self.providers.setup_unavailable)
+                    .then(|| views.first())
+                    .flatten()
+            })
             .map(|(row, view, accent)| {
                 let provider = live.iter().find(|provider| provider.instance_id == row.instance_id).cloned();
                 let instance = row.instance();
@@ -337,6 +395,7 @@ impl SettingsView {
     }
 
     pub(super) fn providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
+        self.invalidate_provider_setup(cx);
         if self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()) { self.providers.dialog=None; self.providers.auth=None; }
         self.sync_provider_removal(window, cx);
         let Some(data) = self.page_data(cx) else {
@@ -426,7 +485,16 @@ impl SettingsView {
 
         let editor = match &data.selected {
             Some(selected) => self.render_editor(selected, &data.environment_label, window, cx),
-            None => div().p(r(24.)).text_sm().text_color(hsla(p.muted_foreground)).child("No providers configured.").into_any_element(),
+            None => div()
+                .p(r(24.))
+                .text_sm()
+                .text_color(hsla(p.muted_foreground))
+                .child(if self.providers.setup_unavailable {
+                    "This provider is no longer available. Select a provider to continue."
+                } else {
+                    "No providers configured."
+                })
+                .into_any_element(),
         };
 
         let wide = side_by_side(window);
@@ -495,10 +563,7 @@ impl SettingsView {
                     .gap(r(12.))
                     .cursor_pointer()
                     .when(!enabled && !selected, |this| this.opacity(0.6))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.providers.selected = Some(instance_id.clone());
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| this.select_provider(&instance_id, window, cx)))
                     .child(ProviderIcon::new(ProviderMark::configured(&row.driver, &view.display_name, accent)).size(px(20.)).badge(
                         crate::provider_icon::BadgeSize::Compact,
                         hsla(p.card),
@@ -842,10 +907,29 @@ impl SettingsView {
 
     /// Fills the name and accent fields from the selected instance, unless the user is typing.
     fn sync_editor_inputs(&mut self, selected: Option<&Selected>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(selected) = selected else { return };
-        let switched = self.providers.synced_instance.as_deref() != Some(selected.row.instance_id.as_str());
+        let Some(selected) = selected else { self.providers.editor_owner = None; return };
+        let owner = ProviderSettingsTarget::capture(self.state.read(cx), &selected.row.instance_id);
+        let switched = self.providers.editor_owner != owner;
         if switched {
-            self.providers.synced_instance = Some(selected.row.instance_id.clone());
+            self.providers.editor_owner = owner;
+            self.providers.form.reset();
+            let interval = self
+                .state
+                .read(cx)
+                .server_config
+                .config
+                .as_ref()
+                .map(|config| {
+                    config
+                        .settings
+                        .provider_panel
+                        .health_interval_seconds()
+                        .to_string()
+                })
+                .unwrap_or_default();
+            self.providers
+                .health_interval
+                .update(cx, |input, cx| input.set_value(interval, window, cx));
             self.providers.adding_custom_model = false;
             self.providers.custom_model_error = None;
             self.providers.advisory_open = None;
@@ -968,23 +1052,132 @@ impl SettingsView {
         store::update_server(&self.state, ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
     }
 
-    fn selected_instance_id(&self, cx: &App) -> Option<String> {
+    pub(super) fn selected_instance_id(&self, cx: &App) -> Option<String> {
         let app = self.state.read(cx);
+        if self.providers.setup_unavailable
+            || self
+                .providers
+                .setup_target
+                .as_ref()
+                .is_some_and(|target| !target.setup_current(app))
+        {
+            return None;
+        }
         let config = app.server_config.config.as_ref()?;
         let rows = model::instance_rows(&config.settings, &config.providers, self.providers.selected.as_deref());
-        let selected = self.providers.selected.as_deref().and_then(|id| rows.iter().find(|row| row.instance_id == id)).or(rows.first());
-        selected.map(|row| row.instance_id.clone())
+        self.providers.selected.as_deref().and_then(|id| rows.iter().find(|row| row.instance_id == id))
+            .or_else(|| self.providers.setup_target.is_none().then(|| rows.first()).flatten())
+            .map(|row| row.instance_id.clone())
+    }
+
+    fn editor_instance_id(&self, cx: &App) -> Option<String> {
+        let owner = self.providers.editor_owner.as_ref()?;
+        (owner.current(self.state.read(cx))
+            && self.selected_instance_id(cx).as_deref() == Some(owner.instance.as_str()))
+        .then(|| owner.instance.clone())
+    }
+
+    pub(super) fn invalidate_provider_setup(&mut self, cx: &App) {
+        let state = self.state.read(cx);
+        if self
+            .providers
+            .setup_target
+            .as_ref()
+            .is_some_and(|target| !target.setup_current(state))
+        {
+            self.providers.setup_target = None;
+            self.providers.setup_unavailable = true;
+            self.providers.selected = None;
+            self.providers.editor_owner = None;
+            self.providers.form.reset();
+        }
+        if self
+            .providers
+            .editor_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.current(state))
+        {
+            self.providers.editor_owner = None;
+            self.providers.form.reset();
+        }
+    }
+
+    fn select_provider(&mut self, instance: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if ProviderSettingsTarget::capture(self.state.read(cx), instance).is_none() {
+            return;
+        }
+        self.commit_focused_provider_field(window, cx);
+        self.providers.clear_setup_target();
+        self.providers.selected = Some(instance.to_owned());
+        let selected = self.page_data(cx).and_then(|data| data.selected);
+        self.sync_editor_inputs(selected.as_ref(), window, cx);
+        if let Some(selected) = selected {
+            self.sync_provider_form(&selected, window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn select_provider_setup(
+        &mut self,
+        target: ProviderSettingsTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !target.setup_current(self.state.read(cx)) {
+            return;
+        }
+        self.select_provider(&target.instance, window, cx);
+        self.providers.setup_target = Some(target);
     }
 
     fn commit_display_name(&mut self, cx: &mut Context<Self>) {
-        let Some(instance_id) = self.selected_instance_id(cx) else { return };
+        if let Some((instance_id, edit)) = self.display_name_edit(cx) {
+            self.update_instance(&instance_id, edit, cx);
+        }
+    }
+
+    fn display_name_edit(&self, cx: &App) -> Option<(String, model::InstanceEdit)> {
+        let instance_id = self.editor_instance_id(cx)?;
         let value = self.providers.display_name.read(cx).value().to_string();
-        self.update_instance(&instance_id, model::InstanceEdit::DisplayName(value.to_string()), cx);
+        let saved = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()?
+            .settings
+            .provider_instances
+            .get(&instance_id)
+            .and_then(|instance| instance.display_name.as_deref())
+            .unwrap_or_default();
+        (value != saved).then_some((instance_id, model::InstanceEdit::DisplayName(value)))
+    }
+
+    fn accent_edit(&self, cx: &App) -> Option<(String, model::InstanceEdit)> {
+        let instance_id = self.editor_instance_id(cx)?;
+        let value = self.providers.accent.read(cx).value().trim().to_owned();
+        if !value.is_empty() && model::normalize_accent(&value).is_none() {
+            return None;
+        }
+        let saved = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()?
+            .settings
+            .provider_instances
+            .get(&instance_id)
+            .and_then(|instance| instance.accent_color.as_deref())
+            .unwrap_or_default();
+        (value != saved).then_some((instance_id, model::InstanceEdit::Accent(value)))
     }
 
     /// Saves a typed accent color, or puts the saved one back when it is not a `#rrggbb`.
     fn commit_accent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(instance_id) = self.selected_instance_id(cx) else { return };
+        let Some(instance_id) = self.editor_instance_id(cx) else {
+            return;
+        };
         let value = self.providers.accent.read(cx).value().trim().to_owned();
         if !value.is_empty() && model::normalize_accent(&value).is_none() {
             let saved = {
@@ -995,10 +1188,13 @@ impl SettingsView {
             self.providers.accent.update(cx, |input, cx| input.set_value(saved.unwrap_or_default(), window, cx));
             return;
         }
-        self.update_instance(&instance_id, model::InstanceEdit::Accent(value.to_string()), cx);
+        if let Some((instance_id, edit)) = self.accent_edit(cx) {
+            self.update_instance(&instance_id, edit, cx);
+        }
     }
 
     fn commit_health_interval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_instance_id(cx).is_none() { return; }
         let typed = self.providers.health_interval.read(cx).value().trim().to_owned();
         let panel = self.state.read(cx).server_config.config.as_ref().map(|config| config.settings.provider_panel.clone());
         let Some(panel) = panel else { return };
@@ -1018,6 +1214,7 @@ impl SettingsView {
 
     /// Saves what a commit-on-blur provider field holds before the modal closes.
     pub(super) fn commit_focused_provider_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_instance_id(cx).is_none() && self.providers.dialog.is_none() { return; }
         self.commit_focused_form_field(window,cx);
         if self.providers.display_name.focus_handle(cx).is_focused(window) {
             self.commit_display_name(cx);
@@ -1088,4 +1285,112 @@ fn flat_section(title: impl Into<SharedString>, rows: Vec<AnyElement>, cx: &App)
         .gap(r(4.))
         .child(section_title(title))
         .child(v_flex().children(rows.into_iter().enumerate().map(move |(index, row)| div().when(index > 0, |this| this.border_t_1().border_color(divider)).child(row))))
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod setup_ownership_tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use gpui::{Render, size};
+    use serde_json::json;
+
+    #[gpui::test]
+    fn provider_fields_keep_their_environment_and_instance_owner(cx: &mut gpui::TestAppContext) {
+        struct Root;
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state: Entity<AppState> = cx.update(|cx| {
+            cx.set_global(serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                "provider":{"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap());
+            let state = crate::boot(runtime.handle().clone(),cx);
+            state.update(cx, |state,_| {
+                state.server_config.config = Some(serde_json::from_value(json!({
+                    "environment":{"environmentId":"one"},
+                    "settings":{"providerInstances":{"codex":{"driver":"codex","displayName":"Old","config":{"binaryPath":"old-cli"}},"other":{"driver":"codex","displayName":"New"}}},
+                    "providers":[{"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"error"},{"instanceId":"other","driver":"codex","enabled":true,"installed":true,"status":"error"}]
+                })).unwrap());
+            });state
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root);
+        cx.update_window(window.into(), |_, window, cx| {
+            let view = cx.new(|cx| {
+                SettingsView::new(state.clone(), search::Section::Providers, None, window, cx)
+            });
+            view.update(cx, |view, cx| {
+                let data = view.page_data(cx).unwrap();
+                view.sync_editor_inputs(data.selected.as_ref(), window, cx);
+                view.sync_provider_form(data.selected.as_ref().unwrap(), window, cx);
+                view.providers.display_name.update(cx, |input, cx| {
+                    input.set_value("Typed for Old", window, cx);
+                    input.focus(window, cx);
+                });
+                view.providers
+                    .accent
+                    .update(cx, |input, cx| input.set_value("#123456", window, cx));
+                assert_eq!(view.accent_edit(cx).unwrap().0, "codex");
+                let (id, edit) = view.display_name_edit(cx).unwrap();
+                assert_eq!(id, "codex");
+                assert!(
+                    matches!(edit,model::InstanceEdit::DisplayName(value) if value=="Typed for Old")
+                );
+                view.providers.selected = Some("other".into());
+                assert!(
+                    view.display_name_edit(cx).is_none(),
+                    "an old focused value must never produce a new instance's command"
+                );
+                assert!(view.accent_edit(cx).is_none());
+                view.providers.selected = Some("codex".into());
+                state.update(cx, |state, _| {
+                    state
+                        .server_config
+                        .config
+                        .as_mut()
+                        .unwrap()
+                        .environment
+                        .environment_id = "two".into()
+                });
+                assert!(
+                    view.display_name_edit(cx).is_none(),
+                    "same id in another environment is a different field owner"
+                );
+                assert!(
+                    view.current_form_instance(cx).is_none(),
+                    "runtime and environment fields must also reject a stale owner"
+                );
+                assert!(view.accent_edit(cx).is_none());
+                let data = view.page_data(cx).unwrap();
+                view.sync_editor_inputs(data.selected.as_ref(), window, cx);
+                view.sync_provider_form(data.selected.as_ref().unwrap(), window, cx);
+                assert!(
+                    view.display_name_edit(cx).is_none(),
+                    "a new environment fills even a focused old input before blur"
+                );
+                view.providers.editor_owner.as_mut().unwrap().connection = Some(u64::MAX);
+                assert!(view.display_name_edit(cx).is_none());
+                assert!(
+                    view.current_form_instance(cx).is_none(),
+                    "a replaced connection cannot commit runtime or environment inputs"
+                );
+                view.providers.editor_owner.as_mut().unwrap().connection = None;
+                view.assert_form_queue_safety(window, cx);
+                view.providers
+                    .display_name
+                    .update(cx, |input, cx| input.set_value("Old", window, cx));
+                view.select_provider("other", window, cx);
+                assert_eq!(view.providers.display_name.read(cx).value().as_ref(), "New");
+                assert!(
+                    view.display_name_edit(cx).is_none(),
+                    "a queued name blur after switching has no edit to publish"
+                );
+                assert_eq!(view.editor_instance_id(cx).as_deref(), Some("other"));
+            });
+        })
+        .unwrap();
+    }
 }

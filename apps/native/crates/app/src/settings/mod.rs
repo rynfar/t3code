@@ -50,10 +50,12 @@ struct Host {
     pending: Option<(Section, Option<String>)>,
     /// The project a "Project settings" entry point opens the Projects page on.
     pending_project: Option<String>,
+    pending_provider: Option<providers::ProviderSettingsTarget>,
     /// What had focus when the modal opened, focused again when it closes.
     previous_focus: Option<FocusHandle>,
     /// Features the web build reads from its environment, read once at launch.
     features: Features,
+    _provider_navigation: Subscription,
 }
 
 impl Global for Host {}
@@ -64,7 +66,29 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     typography::init(cx);
     providers::init(cx);
     let features = Features::from_secrets_flag(std::env::var("T3CODE_FEATURE_SECRETS").ok().as_deref());
-    cx.set_global(Host { state, view: None, pending: None, pending_project: None, previous_focus: None, features });
+    let provider_navigation = cx.subscribe(&state, |state, event: &AppEvent, cx| {
+        if matches!(event, AppEvent::Phase | AppEvent::ServerConfig)
+            && cx
+                .global::<Host>()
+                .pending_provider
+                .as_ref()
+                .is_some_and(|target| !target.setup_current(state.read(cx)))
+        {
+            let host = cx.global_mut::<Host>();
+            host.pending_provider = None;
+            host.pending = None;
+        }
+    });
+    cx.set_global(Host {
+        _provider_navigation: provider_navigation,
+        state,
+        view: None,
+        pending: None,
+        pending_project: None,
+        pending_provider: None,
+        previous_focus: None,
+        features,
+    });
     cx.on_action(|_: &OpenSettings, cx| open(Section::General, cx));
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
@@ -80,6 +104,207 @@ pub fn open(section: Section, cx: &mut App) {
     open_at(section, None, cx);
 }
 
+pub(crate) fn open_provider_setup(target: crate::composer::ProviderTarget, cx: &mut App) {
+    let state = cx.global::<Host>().state.read(cx);
+    let Some(instance) = target.instance.as_deref() else {
+        return;
+    };
+    if target.environment != crate::composer::ProviderTarget::environment(state)
+        || target.connection != state.connection_id()
+    {
+        return;
+    }
+    let Some(target) = providers::ProviderSettingsTarget::capture(state, instance) else {
+        return;
+    };
+    if !target.setup_current(state) {
+        return;
+    }
+    open_at(Section::Providers, None, cx);
+    cx.global_mut::<Host>().pending_provider = Some(target);
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) fn setup_selection_for_test(window: &mut Window, cx: &mut App) -> Option<String> {
+    apply_pending(window, cx);
+    let view = cx.global::<Host>().view.clone()?;
+    view.update(cx, |view, cx| {
+        if view.section != Section::Providers {
+            return None;
+        }
+        view.invalidate_provider_setup(cx);
+        view.selected_instance_id(cx)
+    })
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) fn test_setup_target_lifetime(
+    target: crate::composer::ProviderTarget,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let state = cx.global::<Host>().state.clone();
+    finish_close(window, cx);
+    open_provider_setup(target.clone(), cx);
+    open(Section::General, cx);
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "generic opening cancels the pending target"
+    );
+    finish_close(window, cx);
+    open_provider_setup(target.clone(), cx);
+    finish_close(window, cx);
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "close cancels even an unconsumed target"
+    );
+    let mut stale = target.clone();
+    stale.connection = Some(u64::MAX);
+    open_provider_setup(stale, cx);
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "a stale connection cannot activate setup"
+    );
+    open_provider_setup(target.clone(), cx);
+    cx.global_mut::<Host>()
+        .pending_provider
+        .as_mut()
+        .unwrap()
+        .connection = Some(u64::MAX);
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "deferred consumption revalidates the connection"
+    );
+    open_provider_setup(target.clone(), cx);
+    let environment = target.environment.clone();
+    state.update(cx, |state, cx| {
+        state
+            .server_config
+            .config
+            .as_mut()
+            .unwrap()
+            .environment
+            .environment_id = "stale-environment".into();
+        cx.emit(AppEvent::ServerConfig);
+    });
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "deferred consumption rejects a different environment"
+    );
+    state.update(cx, |state, cx| {
+        state
+            .server_config
+            .config
+            .as_mut()
+            .unwrap()
+            .environment
+            .environment_id = environment;
+        cx.emit(AppEvent::ServerConfig);
+    });
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "discarded pending targets cannot reactivate"
+    );
+    open_provider_setup(target.clone(), cx);
+    assert_eq!(setup_selection_for_test(window, cx), target.instance);
+    let providers = state
+        .read(cx)
+        .server_config
+        .config
+        .as_ref()
+        .unwrap()
+        .providers
+        .clone();
+    let provider = providers
+        .iter()
+        .find(|provider| Some(&provider.instance_id) == target.instance.as_ref())
+        .unwrap()
+        .clone();
+    state.update(cx, |state, cx| {
+        state
+            .server_config
+            .config
+            .as_mut()
+            .unwrap()
+            .providers
+            .retain(|p| p.instance_id != provider.instance_id);
+        cx.emit(AppEvent::ServerConfig);
+    });
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "removed targets never fall back to the first row"
+    );
+    state.update(cx, |state, cx| {
+        state.server_config.config.as_mut().unwrap().providers = providers;
+        cx.emit(AppEvent::ServerConfig);
+    });
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "restoring the row must not reactivate the explicit target"
+    );
+    let view = cx.global::<Host>().view.clone().unwrap();
+    view.update(cx, |view, cx| view.navigate(Section::Providers, None, cx));
+    assert!(
+        setup_selection_for_test(window, cx).is_some(),
+        "generic navigation restores normal selection"
+    );
+    finish_close(window, cx);
+    let mut missing = target.clone();
+    missing.instance = Some("removed-provider".into());
+    open_provider_setup(missing, cx);
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "missing targets cannot open the first row"
+    );
+    open_provider_setup(target, cx);
+    let _ = setup_selection_for_test(window, cx);
+    let environment = state
+        .read(cx)
+        .server_config
+        .config
+        .as_ref()
+        .unwrap()
+        .environment
+        .environment_id
+        .clone();
+    state.update(cx, |state, cx| {
+        state
+            .server_config
+            .config
+            .as_mut()
+            .unwrap()
+            .environment
+            .environment_id = "other-environment".into();
+        cx.emit(AppEvent::ServerConfig);
+    });
+    assert_eq!(setup_selection_for_test(window, cx), None);
+    state.update(cx, |state, cx| {
+        state
+            .server_config
+            .config
+            .as_mut()
+            .unwrap()
+            .environment
+            .environment_id = environment;
+        cx.emit(AppEvent::ServerConfig);
+    });
+    assert_eq!(
+        setup_selection_for_test(window, cx),
+        None,
+        "consumed targets cannot reactivate across an environment round trip"
+    );
+    finish_close(window, cx);
+}
+
 fn features(cx: &App) -> Features {
     cx.global::<Host>().features
 }
@@ -92,6 +317,7 @@ pub fn open_setting(id: &str, cx: &mut App) {
 }
 
 fn open_at(section: Section, anchor: Option<String>, cx: &mut App) {
+    cx.global_mut::<Host>().pending_provider = None;
     cx.global_mut::<Host>().pending = Some((section, anchor));
     cx.refresh_windows();
 }
@@ -151,6 +377,9 @@ fn close(window: &mut Window, cx: &mut App) {
 fn finish_close(window: &mut Window, cx: &mut App) {
     let host = cx.global_mut::<Host>();
     host.view = None;
+    host.pending = None;
+    host.pending_project = None;
+    host.pending_provider = None;
     let previous = host.previous_focus.take();
     store::clear_error(cx);
     if let Some(previous) = previous {
@@ -159,12 +388,22 @@ fn finish_close(window: &mut Window, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// The modal layer, drawn by the workspace above everything else while settings are open.
-pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-    if let Some((section, anchor)) = cx.global_mut::<Host>().pending.take() {
+fn apply_pending(window: &mut Window, cx: &mut App) {
+    let pending = cx.global_mut::<Host>().pending.take();
+    let provider = cx.global_mut::<Host>().pending_provider.take();
+    if let Some((section, anchor)) = pending.filter(|_| {
+        provider
+            .as_ref()
+            .is_none_or(|target| target.setup_current(cx.global::<Host>().state.read(cx)))
+    }) {
         let view = match cx.global::<Host>().view.clone() {
             Some(view) => {
-                view.update(cx, |view, cx| view.navigate(section, anchor, cx));
+                view.update(cx, |view, cx| {
+                    if provider.is_none() {
+                        view.commit_focused_provider_field(window, cx);
+                    }
+                    view.navigate(section, anchor, cx);
+                });
                 view
             }
             None => {
@@ -178,10 +417,20 @@ pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
                 view
             }
         };
+        if let Some(provider) = provider {
+            view.update(cx, |view, cx| {
+                view.select_provider_setup(provider, window, cx)
+            });
+        }
         if let Some(project_id) = cx.global_mut::<Host>().pending_project.take() {
             view.update(cx, |view, cx| view.select_project_id(&project_id, cx));
         }
     }
+}
+
+/// The modal layer, drawn by the workspace above everything else while settings are open.
+pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    apply_pending(window, cx);
     let view = cx.global::<Host>().view.clone()?;
     let p = palette(cx);
     let dark = cx.theme().is_dark();
@@ -295,8 +544,9 @@ impl SettingsView {
                 }
                 _ => {}
             }),
-            cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
+            cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::ServerConfig | AppEvent::Phase | AppEvent::Shell) {
+                    this.invalidate_provider_setup(cx);
                     cx.notify();
                 }
             }),
@@ -341,6 +591,7 @@ impl SettingsView {
     }
 
     fn navigate(&mut self, section: Section, target: Option<String>, cx: &mut Context<Self>) {
+        self.providers.clear_setup_target();
         if section != Section::Providers { self.providers.leave(); }
         let changed = self.section != section;
         self.section = section;
