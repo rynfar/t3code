@@ -788,6 +788,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Option<Option<String>> {
         let current = self.delete_target();
+        let same_scope = reply.target.same_scope(&current);
         let owned = reply.owner.is_some_and(|token| {
             self.sidebar
                 .pending_deletion
@@ -797,17 +798,19 @@ impl AppState {
         if owned {
             self.sidebar.pending_deletion = None;
         }
+        if ok && same_scope {
+            self.sidebar.undo.expire_placement(&reply.id, true);
+            cx.emit(AppEvent::Notice);
+        }
         if !ok || !connected(&self.phase) {
             if owned && reply.target == current && self.thread.deleted {
                 self.close_selected_thread(cx);
             }
             return None;
         }
-        if !reply.target.same_scope(&current) {
+        if !same_scope {
             return None;
         }
-        self.sidebar.undo.expire_placement(&reply.id, true);
-        cx.emit(AppEvent::Notice);
         owned
             .then(|| {
                 self.deletion_route(&reply.target, &reply.id, &reply.project, reply.fallback, ok)
@@ -1492,12 +1495,16 @@ mod deletion_tests {
             "draft",
             "clear",
             "disconnect",
+            "background-disconnect",
             "reset",
             "unowned",
         ] {
-            let event_first = !matches!(mode, "reply-first" | "failed-before-event");
+            let event_first = !matches!(
+                mode,
+                "reply-first" | "failed-before-event" | "background-disconnect"
+            );
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
-            state.update(cx, |state, cx| {
+            let Some((reply, claims, discard, other_claim, later_event)) = state.update(cx, |state, cx| {
                 let make = |id, at| serde_json::from_value(serde_json::json!({
                     "id":id,"projectId":"p1","title":id,"createdAt":at,"updatedAt":at,
                     "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
@@ -1526,13 +1533,13 @@ mod deletion_tests {
                 let deletion = Deletion { target: state.delete_target(), doomed: Arc::new(["deleted".into()].into()) };
                 let background = state.prepare_deletion("survivor".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap();
                 assert!(background.fallback.is_none(), "background deletion must not compute a discarded fallback");
-                let reply = (mode != "unowned").then(|| state.prepare_deletion("deleted".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap());
+                let reply = if mode == "background-disconnect" { Some(background) } else { (mode != "unowned").then(|| state.prepare_deletion("deleted".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap()) };
                 if event_first { state.apply_batch(vec![event()], cx); }
                 if mode == "unowned" {
                     assert_eq!(state.selected_thread, None);
                     assert_eq!(state.draft_project.as_deref(), Some("p1"));
                     assert!(!state.hold_pending_thread_deletion());
-                    return;
+                    return None;
                 }
                 if event_first {
                     assert!(state.thread.deleted);
@@ -1542,26 +1549,90 @@ mod deletion_tests {
                 match mode {
                     "draft" => state.start_draft("p2", cx),
                     "clear" => state.clear_selection(cx),
-                    "disconnect" => state.apply_batch(vec![t3_client::supervisor::ClientEvent::Status(ConnectionStatus::Reconnecting { reason: "fixture disconnect".into(), attempt: 1 })], cx),
+                    "disconnect" | "background-disconnect" => state.apply_batch(vec![t3_client::supervisor::ClientEvent::Status(ConnectionStatus::Reconnecting { reason: "fixture disconnect".into(), attempt: 1 })], cx),
                     "reset" => state.clear_connection_state(cx),
                     _ => {}
                 }
-                let expected = matches!(mode, "reply-first" | "event-first").then_some(Some("survivor".into()));
-                assert_eq!(state.finish_deletion(reply.unwrap(), !matches!(mode, "failed-or-cancelled" | "failed-before-event"), cx), expected, "mode={mode}, selected={:?}, draft={:?}", state.selected_thread, state.draft_project);
+                let reply = reply.unwrap();
+                let claims = [UndoKind::Settle, UndoKind::Snooze, UndoKind::Pin, UndoKind::Archive].map(|kind| state.sidebar.undo.begin(kind, &reply.id));
+                state.sidebar.undo.show(UndoAction::Unpinned, claims[2].clone(), vec![UndoStep::Pin { order_key: None }], 0);
+                let discard = state.sidebar.undo.begin(UndoKind::Discard, &reply.id);
+                let other_claim = state.sidebar.undo.begin(UndoKind::Pin, "other");
+                state.sidebar.undo.show(UndoAction::Unpinned, other_claim.clone(), vec![UndoStep::Pin { order_key: None }], 0);
+                assert_eq!(state.sidebar.undo.notice().unwrap().count, 2);
+                Some((reply, claims, discard, other_claim, event()))
+            }) else { continue };
+            let notices = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = notices.clone();
+            let _notice_subscription = cx.update(|cx| {
+                cx.subscribe(&state, move |_, event: &AppEvent, _| {
+                    if matches!(event, AppEvent::Notice) {
+                        observed.set(observed.get() + 1);
+                    }
+                })
+            });
+            let cleanup = !matches!(
+                mode,
+                "failed-or-cancelled" | "failed-before-event" | "reset"
+            );
+            state.update(cx, |state, cx| {
+                let expected = matches!(mode, "reply-first" | "event-first")
+                    .then_some(Some("survivor".into()));
+                assert_eq!(
+                    state.finish_deletion(
+                        reply,
+                        !matches!(mode, "failed-or-cancelled" | "failed-before-event"),
+                        cx
+                    ),
+                    expected,
+                    "mode={mode}, selected={:?}, draft={:?}",
+                    state.selected_thread,
+                    state.draft_project
+                );
                 assert!(!state.hold_pending_thread_deletion());
                 assert!(state.sidebar.pending_deletion.is_none());
-                if !event_first {
+                for claim in &claims {
+                    assert_eq!(
+                        state.sidebar.undo.is_current(claim),
+                        !cleanup,
+                        "deleted placement/archive claim after {mode}"
+                    );
+                }
+                assert!(
+                    state.sidebar.undo.is_current(&discard),
+                    "deletion leaves draft Undo alone"
+                );
+                assert!(
+                    state.sidebar.undo.is_current(&other_claim),
+                    "other thread Undo must survive {mode}"
+                );
+                assert_eq!(
+                    state.sidebar.undo.notice().unwrap().count,
+                    if cleanup { 1 } else { 2 }
+                );
+                if mode == "background-disconnect" {
+                    assert_eq!(state.selected_thread.as_deref(), Some("deleted"));
+                } else if !event_first {
                     // No navigation is executed in this command-plan test; the now-unowned event closes normally.
-                    state.apply_batch(vec![event()], cx);
+                    state.apply_batch(vec![later_event], cx);
                     assert_eq!(state.selected_thread, None);
                     assert_eq!(state.draft_project.as_deref(), Some("p1"));
                 } else if !matches!(mode, "event-first") {
-                    assert_eq!(state.selected_thread, None, "held deletion must not survive {mode}");
+                    assert_eq!(
+                        state.selected_thread, None,
+                        "held deletion must not survive {mode}"
+                    );
                     assert!(!state.thread.deleted);
-                    if mode == "draft" { assert_eq!(state.draft_project.as_deref(), Some("p2")); }
+                    if mode == "draft" {
+                        assert_eq!(state.draft_project.as_deref(), Some("p2"));
+                    }
                 }
-
             });
+            assert_eq!(
+                notices.get(),
+                usize::from(cleanup),
+                "completion Notice for {mode}"
+            );
         }
     }
 }
