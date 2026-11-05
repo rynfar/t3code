@@ -124,6 +124,34 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     items
 }
 
+fn palette_threads(
+    model: &t3_core::sidebar::SidebarModel,
+    history: &t3_core::sidebar::visits::OpenHistory,
+    environment: Option<&t3_core::sidebar::visits::OpenEnvironment>,
+) -> Vec<PaletteThread> {
+    model
+        .threads
+        .iter()
+        .map(|thread| PaletteThread {
+            environment_id: ENVIRONMENT.to_owned(),
+            id: thread.id.clone(),
+            project_id: thread.project_id.clone(),
+            title: thread.title.clone(),
+            branch: thread.branch.clone(),
+            created_at: thread.created_at.map(format_iso).unwrap_or_default(),
+            updated_at: thread.updated_at.map(format_iso).unwrap_or_default(),
+            latest_user_message_at: thread.latest_user_message_at.map(format_iso),
+            latest_user_authored_message_at: thread
+                .latest_user_authored_message_at
+                .map(|at| at.map(format_iso)),
+            opens: thread.opens.clone(),
+            local_opened_at: environment
+                .and_then(|environment| history.local_opened_at(environment, &thread.id)),
+            ..Default::default()
+        })
+        .collect()
+}
+
 impl CommandPalette {
     pub fn new(state: Entity<AppState>, composer: Entity<crate::composer::Composer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands, projects, and threads..."));
@@ -291,26 +319,11 @@ impl CommandPalette {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let environment = self.state.update(cx, |state, _| state.visit_environment());
         let state = self.state.read(cx);
         let model = state.sidebar.model.clone();
         let titles: HashMap<String, String> = model.project_names.iter().map(|(id, name)| (format!("{ENVIRONMENT}:{id}"), name.clone())).collect();
-        let threads: Vec<PaletteThread> = model
-            .threads
-            .iter()
-            .map(|thread| PaletteThread {
-                environment_id: ENVIRONMENT.to_owned(),
-                id: thread.id.clone(),
-                project_id: thread.project_id.clone(),
-                title: thread.title.clone(),
-                branch: thread.branch.clone(),
-                created_at: thread.created_at.map(format_iso).unwrap_or_default(),
-                updated_at: thread.updated_at.map(format_iso).unwrap_or_default(),
-                latest_user_message_at: thread.latest_user_message_at.map(format_iso),
-                latest_user_authored_message_at: thread.latest_user_authored_message_at.map(|at| at.map(format_iso)),
-                opens: thread.opens.clone(),
-                ..Default::default()
-            })
-            .collect();
+        let threads = palette_threads(&model, &state.open_history, environment.as_ref());
         let active = state.selected_thread.as_deref().map(|id| (ENVIRONMENT, id));
         let items = build_thread_action_items(&threads, active, &titles, |_| None);
         let active_value = active.map(|(env, id)| format!("thread:{env}:{id}"));
@@ -696,5 +709,71 @@ impl Render for CommandPalette {
         )
         .with_priority(60)
         .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod visit_recency_tests {
+    use super::*;
+    use t3_core::sidebar::visits::OpenHistory;
+
+    #[test]
+    fn palette_ranking_observes_deduped_local_opens_and_identity_replacement() {
+        let mut model = t3_core::sidebar::SidebarModel::default();
+        for id in ["a", "b"] {
+            let shell: t3_core::shell::ThreadShell = serde_json::from_value(serde_json::json!({
+                "id":id,"projectId":"p","title":id,"providerInstanceId":"replay",
+                "modelSelection":{"instanceId":"replay","model":"replay"},"runtimeMode":"full-access","interactionMode":"default",
+                "lineage":{"rootThreadId":id},"status":"idle","hasActionableProposedPlan":false,
+                "itemCount":0,"visibleItemCount":0,"createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z"
+            })).unwrap();
+            model
+                .threads
+                .push(t3_core::sidebar::thread::present_thread(&shell, None));
+        }
+        let mut history = OpenHistory::default();
+        let environment = history.environment(Some("saved"), None).unwrap();
+        assert!(history.claim(&environment, "a", 1_000));
+        assert!(history.claim(&environment, "b", 2_000));
+        let rank = |history: &OpenHistory,
+                    environment: &t3_core::sidebar::visits::OpenEnvironment| {
+            let items = build_thread_action_items(
+                &palette_threads(&model, history, Some(environment)),
+                None,
+                &HashMap::new(),
+                |_| None,
+            );
+            recent_thread_items(&items, None)
+                .into_iter()
+                .map(|item| item.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rank(&history, &environment),
+            ["thread:local:b", "thread:local:a"]
+        );
+        assert!(!history.claim(&environment, "a", 3_000));
+        assert_eq!(
+            rank(&history, &environment),
+            ["thread:local:a", "thread:local:b"]
+        );
+        let bound = history
+            .environment(Some("saved"), Some("canonical"))
+            .unwrap();
+        assert_eq!(rank(&history, &bound), ["thread:local:a", "thread:local:b"]);
+        let other = history.environment(Some("other"), Some("other")).unwrap();
+        assert!(
+            palette_threads(&model, &history, Some(&other))
+                .iter()
+                .all(|thread| thread.local_opened_at.is_none())
+        );
+        let replacement = history
+            .environment(Some("saved"), Some("replacement"))
+            .unwrap();
+        assert!(
+            palette_threads(&model, &history, Some(&replacement))
+                .iter()
+                .all(|thread| thread.local_opened_at.is_none())
+        );
     }
 }

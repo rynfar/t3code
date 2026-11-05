@@ -77,6 +77,7 @@ pub struct AppState {
     pub cloud: crate::cloud::CloudState,
     pub shell: ShellState,
     pub sidebar: SidebarController,
+    pub(crate) open_history: t3_core::sidebar::visits::OpenHistory,
     pub prompt_link_urls: VecDeque<String>,
     pub toasts: crate::toast::Toasts,
     pub composer_mentions: Vec<crate::project_files::ComposerMention>,
@@ -157,6 +158,7 @@ impl AppState {
             cloud: Default::default(),
             shell: ShellState::default(),
             sidebar: SidebarController::default(),
+            open_history: Default::default(),
             prompt_link_urls: Default::default(),
             toasts: Default::default(),
             composer_mentions: Vec::new(),
@@ -376,6 +378,8 @@ impl AppState {
             self.sync_side_threads(cx);
             if sidebar_changed {
                 self.rebuild_sidebar(cx);
+            } else {
+                self.track_visit(cx);
             }
             cx.emit(AppEvent::Shell);
             self.restore_shell_selection(cx);
@@ -419,6 +423,7 @@ impl AppState {
         if let (Some(client), Some(thread_id)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&thread_id);
         }
+        self.track_visit(cx);
         self.release_families(None);
         self.thread = ThreadState::default();
         self.sync_side_threads(cx);
@@ -457,6 +462,7 @@ impl AppState {
             client.close_thread(previous);
         }
         self.selected_thread = Some(thread_id.to_owned());
+        self.track_visit(cx);
         self.thread = ThreadState::default();
         self.adopt_side_thread(thread_id);
         self.restore_thread = None;
