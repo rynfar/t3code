@@ -45,8 +45,16 @@ struct ProjectFilterMember {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+struct ProjectFilterOwner {
+    environment: String,
+    saved_environment: Option<String>,
+    connection: u64,
+    generation: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct ThreadProjectFilter {
-    owner: Option<((String, Option<String>, u64), u64)>,
+    owner: Option<ProjectFilterOwner>,
     shell_generation: u64,
     thread: String,
     created_at: String,
@@ -88,12 +96,17 @@ impl ThreadProjectFilter {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        let owner = state.thread_copy_scope().and_then(|owner| {
-            Some((
-                owner,
-                *state.client_handle()?.connection_generation().borrow(),
-            ))
-        });
+        let owner =
+            state
+                .thread_copy_scope()
+                .and_then(|(environment, saved_environment, connection)| {
+                    Some(ProjectFilterOwner {
+                        environment,
+                        saved_environment,
+                        connection,
+                        generation: *state.client_handle()?.connection_generation().borrow(),
+                    })
+                });
         Some(Self {
             owner,
             shell_generation: state.shell.generation,
