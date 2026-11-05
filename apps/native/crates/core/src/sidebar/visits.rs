@@ -46,7 +46,13 @@ impl VisitTracker {
             self.open_pending = false;
             return self.dispatched(visited_at, now, true);
         }
-        if shell.last_visited_at.is_some_and(|visited| visited >= visited_at) || self.last_dispatched.is_some_and(|sent| sent >= visited_at) {
+        if shell.last_visited_at.is_some_and(|visited| visited >= visited_at) {
+            if self.last_dispatched.is_none_or(|sent| sent < visited_at) {
+                self.last_dispatched = Some(visited_at);
+            }
+            return VisitDecision::Skip;
+        }
+        if self.last_dispatched.is_some_and(|sent| sent >= visited_at) {
             return VisitDecision::Skip;
         }
         let unseen_completion = shell.completed_at.is_some_and(|completed| shell.last_visited_at.is_none_or(|visited| completed > visited));
@@ -88,6 +94,24 @@ mod tests {
         assert_eq!(tracker.on_shell(shell(200, Some(100)), 1_200), VisitDecision::At { due: 11_000, visited_at: 200 });
         assert_eq!(tracker.fire(200, 11_000), VisitDecision::Now { visited_at: 200, opened: false });
         assert_eq!(tracker.on_shell(shell(300, Some(200)), 30_000), VisitDecision::Now { visited_at: 300, opened: false });
+
+        for seen in [shell(20, Some(20)), shell(20, Some(30)), VisitedShell { woke_at: Some(20), ..shell(16, Some(20)) }] {
+            let mut tracker = VisitTracker::new("t");
+            assert_eq!(tracker.on_shell(shell(10, Some(0)), 1_000), VisitDecision::Now { visited_at: 10, opened: true });
+            assert_eq!(tracker.on_shell(shell(15, Some(10)), 1_100), VisitDecision::At { due: 11_000, visited_at: 15 });
+            assert_eq!(tracker.on_shell(seen, 2_000), VisitDecision::Skip);
+            let unread = VisitedShell { completed_at: Some(seen.updated_at - 1), ..shell(seen.updated_at, Some(seen.updated_at - 2)) };
+            let mut older = tracker.clone();
+            let decisions = [tracker.on_shell(unread, 2_001), older.on_shell(shell(5, Some(5)), 2_002), older.on_shell(unread, 2_003)];
+            assert_eq!(decisions, [VisitDecision::Skip; 3], "mark unread stays sticky, including after an older snapshot: {seen:?}");
+            assert_eq!(tracker.on_shell(shell(21, Some(20)), 2_004), VisitDecision::At { due: 11_000, visited_at: 21 });
+            assert_eq!(tracker.fire(15, 11_000), VisitDecision::Skip);
+            assert_eq!(tracker.fire(20, 11_000), VisitDecision::Skip);
+            assert_eq!(tracker.on_shell(shell(21, Some(20)), 11_000), VisitDecision::Now { visited_at: 21, opened: false });
+            assert_eq!(tracker.fire(21, 11_000), VisitDecision::Skip);
+            assert_eq!(tracker.on_shell(shell(22, Some(21)), 11_001), VisitDecision::At { due: 21_000, visited_at: 22 });
+            assert_eq!(tracker.fire(22, 21_000), VisitDecision::Now { visited_at: 22, opened: false });
+        }
     }
 
     #[test]
