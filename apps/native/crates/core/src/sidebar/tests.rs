@@ -433,6 +433,56 @@ fn woke_unseen_dismisses_at_its_timestamp() {
 
 #[test]
 fn sidebar_status_follows_the_web_priority() {
+    let preparing = SidebarThread { runtime: Some(runtime("preparing")), goal_active: true, ..base("setup") };
+    assert_eq!(top_status(resolve_status(&preparing), preparing.goal_active, false, false).map(|status| status.label), Some("Setting up"));
+    assert_eq!(resolve_status(&preparing), ThreadStatus::Preparing);
+    for goal_active in [false, true] {
+        assert_eq!(top_status(resolve_status(&preparing), goal_active, true, true), Some(TopStatus { label: "Setting up", icon: StatusIcon::Working, tone: StatusTone::Info }));
+    }
+    assert!(should_recede(resolve_status(&preparing), true, true, false));
+    assert!(!should_recede(resolve_status(&preparing), false, false, true));
+    assert!(is_thread_working(&preparing));
+    for (approval, input, subagent, guest, expected) in [
+        (false, false, None, 1, ThreadStatus::Request),
+        (false, true, None, 1, ThreadStatus::Input),
+        (true, true, None, 1, ThreadStatus::Approval),
+        (false, false, Some(SubagentRequest::UserInput), 1, ThreadStatus::Input),
+        (true, false, Some(SubagentRequest::UserInput), 1, ThreadStatus::Approval),
+        (false, true, Some(SubagentRequest::Approval), 1, ThreadStatus::Approval),
+    ] {
+        let pending = SidebarThread { has_pending_approvals: approval, has_pending_user_input: input, pending_subagent_request: subagent, pending_guest_message_count: guest, ..preparing.clone() };
+        assert_eq!(resolve_status(&pending), expected);
+    }
+    let mut reverse = preparing.clone();
+    for (runtime_status, blocked, expected, label) in [
+        ("running", false, ThreadStatus::Working, Some("Goal")),
+        ("running", true, ThreadStatus::Waiting, Some("Waiting")),
+        ("idle", false, ThreadStatus::Waiting, Some("Waiting")),
+        ("completed", false, ThreadStatus::Ready, None),
+        ("preparing", true, ThreadStatus::Preparing, Some("Setting up")),
+    ] {
+        reverse.runtime = Some(runtime(runtime_status));
+        reverse.blocked_on_thread_wait = blocked;
+        assert_eq!(resolve_status(&reverse), expected);
+        assert_eq!(top_status(resolve_status(&reverse), reverse.goal_active, false, false).map(|status| status.label), label);
+    }
+    for runtime_status in ["queued", "starting", "running", "waiting"] {
+        assert_eq!(resolve_status(&SidebarThread { runtime: Some(runtime(runtime_status)), ..base("unchanged") }), ThreadStatus::Working);
+    }
+    let mut timed = SidebarThread {
+        runtime: Some(RuntimeSummary { active_run_id: Some("r1".into()), activity_started_at: Some(Some(100)), ..runtime("preparing") }),
+        latest_run: Some(RunSummary { started_at: Some(200), ..run("preparing", Some(NOW), None) }),
+        ..base("timer")
+    };
+    assert_eq!(working_started_at(&timed), Some(100));
+    timed.runtime.as_mut().unwrap().activity_started_at = Some(None);
+    assert_eq!(working_started_at(&timed), None);
+    timed.runtime.as_mut().unwrap().activity_started_at = None;
+    assert_eq!(working_started_at(&timed), Some(200));
+    timed.latest_run.as_mut().unwrap().started_at = None;
+    assert_eq!(working_started_at(&timed), Some(iso(NOW)));
+    timed.runtime.as_mut().unwrap().active_run_id = None;
+    assert_eq!(working_started_at(&timed), None);
     let mut thread = SidebarThread { runtime: Some(runtime("running")), ..base("s") };
     assert_eq!(resolve_status(&thread), ThreadStatus::Working);
     thread.blocked_on_thread_wait = true;
@@ -470,8 +520,10 @@ fn unseen_completion_needs_a_visit_older_than_the_completion() {
 fn status_pills_match_the_palette() {
     let pending = SidebarThread { has_pending_approvals: true, ..base("a") };
     assert_eq!(status_pill(&pending).map(|p| p.label), Some("Pending Approval"));
-    let connecting = SidebarThread { runtime: Some(runtime("starting")), ..base("c") };
-    assert_eq!(status_pill(&connecting).map(|p| (p.label, p.pulse)), Some(("Connecting", true)));
+    for runtime_status in ["preparing", "starting", "queued"] {
+        let connecting = SidebarThread { runtime: Some(runtime(runtime_status)), ..base("c") };
+        assert_eq!(status_pill(&connecting).map(|p| (p.label, p.tone, p.pulse)), Some(("Connecting", PillTone::Working, true)));
+    }
     let plan = SidebarThread {
         interaction_mode: "plan".into(),
         has_actionable_proposed_plan: true,

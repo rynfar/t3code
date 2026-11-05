@@ -10,6 +10,7 @@ pub enum ThreadStatus {
     Approval,
     Input,
     Request,
+    Preparing,
     Working,
     Waiting,
     Failed,
@@ -30,7 +31,8 @@ pub fn resolve_status(thread: &SidebarThread) -> ThreadStatus {
     let Some(runtime) = &thread.runtime else { return ThreadStatus::Ready };
     match runtime.status.as_str() {
         "running" if thread.blocked_on_thread_wait => ThreadStatus::Waiting,
-        "preparing" | "queued" | "starting" | "running" | "waiting" => ThreadStatus::Working,
+        "preparing" => ThreadStatus::Preparing,
+        "queued" | "starting" | "running" | "waiting" => ThreadStatus::Working,
         "idle" => ThreadStatus::Waiting,
         "failed" if runtime.last_error_class.as_deref() == Some("usage_limit") => ThreadStatus::Limited,
         "failed" => ThreadStatus::Failed,
@@ -59,7 +61,7 @@ pub fn should_recede(status: ThreadStatus, is_unread: bool, is_woke: bool, is_ac
         return false;
     }
     match status {
-        ThreadStatus::Working | ThreadStatus::Waiting => true,
+        ThreadStatus::Preparing | ThreadStatus::Working | ThreadStatus::Waiting => true,
         ThreadStatus::Ready | ThreadStatus::Approval => !is_unread && !is_woke,
         _ => false,
     }
@@ -100,6 +102,7 @@ pub struct TopStatus {
 pub fn top_status(status: ThreadStatus, goal_active: bool, is_woke: bool, is_unread: bool) -> Option<TopStatus> {
     let make = |label, icon, tone| Some(TopStatus { label, icon, tone });
     match status {
+        ThreadStatus::Preparing => make("Setting up", StatusIcon::Working, StatusTone::Info),
         ThreadStatus::Working => make(if goal_active { "Goal" } else { "Working" }, StatusIcon::Working, StatusTone::Info),
         ThreadStatus::Waiting => make("Waiting", StatusIcon::Waiting, StatusTone::Muted),
         ThreadStatus::Approval => make("Approval", StatusIcon::Approval, StatusTone::Warning),
