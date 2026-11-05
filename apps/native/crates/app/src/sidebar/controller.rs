@@ -17,7 +17,7 @@ use t3_core::families::MountedReads;
 use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::sidebar::history::NavEntry;
 use t3_core::sidebar::thread::same_apart_from_streaming;
-use t3_core::sidebar::visits::{VisitDecision, VisitTracker, VisitedShell};
+use t3_core::sidebar::visits::{OpenEnvironment, OpenHistory, VisitDecision, VisitTracker, VisitedShell};
 use t3_core::sidebar::{ModelInput, OlderSettledShelf, Shelf, ShelfState, SidebarModel, SidebarSettings};
 use t3_core::thread_actions::{
     self as actions, PlanFor, RenameOutcome, ThreadAction, ThreadUndoStore, UndoAction, UndoKind, UndoStep,
@@ -102,9 +102,92 @@ pub struct SidebarController {
     hiding_tags: bool,
     tracker: InboxReturnTracker,
     visit: Option<VisitTracker>,
+    visit_target: Option<VisitTarget>,
+    visit_revision: u64,
     wake_timer: Option<Task<()>>,
     visit_timer: Option<Task<()>>,
     undo_timer: Option<Task<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisitTarget {
+    environment: OpenEnvironment,
+    thread: String,
+    connection: Option<u64>,
+    mount: u64,
+}
+
+#[derive(Clone)]
+struct VisitTimer {
+    target: VisitTarget,
+    revision: u64,
+    visited_at: Ms,
+}
+
+impl SidebarController {
+    fn visit_decision(
+        &mut self,
+        history: &mut OpenHistory,
+        target: Option<(OpenEnvironment, Option<u64>, &str)>,
+        shell: Option<VisitedShell>,
+        now: Ms,
+    ) -> VisitDecision {
+        self.visit_timer = None;
+        self.visit_revision += 1;
+        let Some((environment, connection, id)) = target else {
+            self.visit = None;
+            self.visit_target = None;
+            return VisitDecision::Skip;
+        };
+        if self.visit_target.as_ref().is_none_or(|current| {
+            current.environment != environment
+                || current.thread != id
+                || current.connection != connection
+        }) {
+            let opened = history.claim(&environment, id, now);
+            self.visit = Some(VisitTracker::new(id, opened));
+            self.visit_target = Some(VisitTarget {
+                environment,
+                thread: id.to_owned(),
+                connection,
+                mount: history.next_mount(),
+            });
+        }
+        shell.map_or(VisitDecision::Skip, |shell| {
+            self.visit.as_mut().unwrap().on_shell(shell, now)
+        })
+    }
+
+    fn pending_visit(&self, visited_at: Ms) -> Option<VisitTimer> {
+        Some(VisitTimer {
+            target: self.visit_target.clone()?,
+            revision: self.visit_revision,
+            visited_at,
+        })
+    }
+
+    fn fire_visit(
+        &mut self,
+        timer: &VisitTimer,
+        environment: Option<&OpenEnvironment>,
+        connection: Option<u64>,
+        selected: Option<&str>,
+        now: Ms,
+    ) -> VisitDecision {
+        if self.visit_target.as_ref() != Some(&timer.target)
+            || self.visit_revision != timer.revision
+            || environment != Some(&timer.target.environment)
+            || connection != timer.target.connection
+            || selected != Some(timer.target.thread.as_str())
+        {
+            return VisitDecision::Skip;
+        }
+        self.visit_timer = None;
+        self.visit_revision += 1;
+        self.visit.as_mut().map_or(VisitDecision::Skip, |tracker| {
+            tracker.fire(timer.visited_at, now)
+        })
+    }
 }
 
 fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, hidden: &std::collections::HashSet<String>, hiding: bool, entry: &NavEntry) -> bool {
@@ -255,33 +338,77 @@ impl AppState {
         cx.emit(AppEvent::Selection);
     }
 
-    fn track_visit(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected_thread.clone() else {
-            self.sidebar.visit = None;
-            return;
-        };
-        let Some(thread) = self.thread_shell(&id) else { return };
-        let Some(updated_at) = t3_core::sidebar::time::parse_iso(&thread.updated_at) else { return };
+    pub(crate) fn visit_environment(&mut self) -> Option<OpenEnvironment> {
+        let saved = self.environments.active();
+        let canonical = self
+            .server_config
+            .config
+            .as_ref()
+            .map(|config| config.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| saved.and_then(|saved| saved.environment_id.as_deref()));
+        self.open_history
+            .environment(saved.map(|saved| saved.id.as_str()), canonical)
+    }
+
+    pub(crate) fn track_visit(&mut self, cx: &mut Context<Self>) {
+        let id = self.selected_thread.clone();
         let now = now_ms();
-        let shell = VisitedShell {
-            updated_at,
-            last_visited_at: thread.last_visited_at.as_deref().and_then(t3_core::sidebar::time::parse_iso),
-            completed_at: self.sidebar.model.thread(&id).and_then(|t| t.latest_run.as_ref()).and_then(|run| run.completed_at),
-            woke_at: self.sidebar.model.thread(&id).and_then(|t| settled::woke_at(t, now)),
-        };
-        if self.sidebar.visit.as_ref().is_none_or(|tracker| tracker.thread_id() != id) {
-            self.sidebar.visit = Some(VisitTracker::new(&id));
-        }
-        let Some(tracker) = self.sidebar.visit.as_mut() else { return };
-        match tracker.on_shell(shell, now) {
+        let environment = self.visit_environment();
+        let shell = id.as_deref().and_then(|id| {
+            let thread = self.thread_shell(id)?;
+            Some(VisitedShell {
+                updated_at: t3_core::sidebar::time::parse_iso(&thread.updated_at)?,
+                last_visited_at: thread
+                    .last_visited_at
+                    .as_deref()
+                    .and_then(t3_core::sidebar::time::parse_iso),
+                completed_at: self
+                    .sidebar
+                    .model
+                    .thread(id)
+                    .and_then(|t| t.latest_run.as_ref())
+                    .and_then(|run| run.completed_at),
+                woke_at: self
+                    .sidebar
+                    .model
+                    .thread(id)
+                    .and_then(|t| settled::woke_at(t, now)),
+            })
+        });
+        let connection = self.connection_id();
+        let decision = self.sidebar.visit_decision(
+            &mut self.open_history,
+            environment
+                .zip(id.as_deref())
+                .map(|(environment, id)| (environment, connection, id)),
+            shell,
+            now,
+        );
+        let Some(id) = id else { return };
+        match decision {
             VisitDecision::Skip => {}
-            VisitDecision::Now { visited_at, opened } => self.send_visit(&id, visited_at, opened, cx),
+            VisitDecision::Now { visited_at, opened } => {
+                self.send_visit(&id, visited_at, opened, cx)
+            }
             VisitDecision::At { due, visited_at } => {
+                let Some(timer) = self.sidebar.pending_visit(visited_at) else {
+                    return;
+                };
                 self.sidebar.visit_timer = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_millis((due - now).max(0) as u64)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis((due - now).max(0) as u64))
+                        .await;
                     let _ = this.update(cx, |state, cx| {
-                        let Some(tracker) = state.sidebar.visit.as_mut().filter(|tracker| tracker.thread_id() == id) else { return };
-                        if let VisitDecision::Now { visited_at, opened } = tracker.fire(visited_at, now_ms()) {
+                        let environment = state.visit_environment();
+                        let connection = state.connection_id();
+                        if let VisitDecision::Now { visited_at, opened } = state.sidebar.fire_visit(
+                            &timer,
+                            environment.as_ref(),
+                            connection,
+                            state.selected_thread.as_deref(),
+                            now_ms(),
+                        ) {
                             state.send_visit(&id, visited_at, opened, cx);
                         }
                     });
@@ -629,4 +756,363 @@ impl AppState {
 
 pub fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod visit_tests {
+    use super::*;
+
+    #[test]
+    fn selected_mount_claims_before_shell_and_dedupes_reopens() {
+        let mut sidebar = SidebarController::default();
+        let mut history = OpenHistory::default();
+        let env = history.environment(Some("saved-a"), None);
+        assert_eq!(
+            sidebar.visit_decision(
+                &mut history,
+                env.clone().map(|env| (env, Some(1), "a")),
+                None,
+                1_000
+            ),
+            VisitDecision::Skip
+        );
+        assert!(
+            sidebar.visit.is_some(),
+            "the mount must claim before shell arrival"
+        );
+        let shell = VisitedShell {
+            updated_at: 100,
+            last_visited_at: Some(100),
+            completed_at: None,
+            woke_at: None,
+        };
+        assert_eq!(
+            sidebar.visit_decision(
+                &mut history,
+                env.clone().map(|env| (env, Some(1), "a")),
+                Some(shell),
+                2_000
+            ),
+            VisitDecision::Now {
+                visited_at: 100,
+                opened: true
+            }
+        );
+        sidebar.visit_decision(&mut history, None, None, 2_001);
+        assert_eq!(
+            sidebar.visit_decision(
+                &mut history,
+                env.clone().map(|env| (env, Some(1), "a")),
+                Some(shell),
+                3_000
+            ),
+            VisitDecision::Skip,
+            "deduped reopen preserves a read watermark"
+        );
+    }
+
+    #[test]
+    fn read_thread_reopen_does_not_send_another_open() {
+        let mut sidebar = SidebarController::default();
+        let mut history = OpenHistory::default();
+        let env = history.environment(Some("saved-a"), None);
+        let shell = VisitedShell {
+            updated_at: 100,
+            last_visited_at: Some(100),
+            completed_at: None,
+            woke_at: None,
+        };
+        sidebar.visit_decision(
+            &mut history,
+            env.clone().map(|env| (env, Some(1), "a")),
+            Some(shell),
+            1_000,
+        );
+        sidebar.visit_decision(
+            &mut history,
+            env.clone().map(|env| (env, Some(1), "b")),
+            Some(shell),
+            2_000,
+        );
+        assert_eq!(
+            sidebar.visit_decision(
+                &mut history,
+                env.clone().map(|env| (env, Some(1), "a")),
+                Some(shell),
+                3_000
+            ),
+            VisitDecision::Skip
+        );
+        let unread = VisitedShell {
+            last_visited_at: Some(80),
+            completed_at: Some(90),
+            ..shell
+        };
+        for next in [
+            unread,
+            VisitedShell {
+                updated_at: 50,
+                last_visited_at: Some(50),
+                ..shell
+            },
+            unread,
+        ] {
+            assert_eq!(
+                sidebar.visit_decision(
+                    &mut history,
+                    env.clone().map(|env| (env, Some(1), "a")),
+                    Some(next),
+                    3_001
+                ),
+                VisitDecision::Skip
+            );
+        }
+    }
+    #[test]
+    fn environment_identity_reconnect_and_client_clock_boundary_share_history() {
+        let mut sidebar = SidebarController::default();
+        let mut history = OpenHistory::default();
+        let shell = VisitedShell {
+            updated_at: 100,
+            last_visited_at: Some(100),
+            completed_at: None,
+            woke_at: None,
+        };
+        let mut plan = |sidebar: &mut SidebarController, saved, canonical, connection, now| {
+            let env = history.environment(saved, canonical);
+            let decision = sidebar.visit_decision(
+                &mut history,
+                env.clone().map(|env| (env, Some(connection), "a")),
+                Some(shell),
+                now,
+            );
+            (
+                decision,
+                env.as_ref()
+                    .and_then(|env| history.local_opened_at(env, "a")),
+            )
+        };
+        assert_eq!(
+            plan(&mut sidebar, None, None, 1, 0),
+            (VisitDecision::Skip, None)
+        );
+        assert_eq!(
+            plan(&mut sidebar, Some("saved-a"), None, 1, 1_000).0,
+            VisitDecision::Now {
+                visited_at: 100,
+                opened: true
+            }
+        );
+        assert_eq!(
+            plan(&mut sidebar, Some("saved-a"), Some("canonical-a"), 1, 2_000).1,
+            Some(1_000),
+            "binding config is not a new mount"
+        );
+        assert_eq!(
+            plan(&mut sidebar, Some("saved-b"), None, 2, 3_000).0,
+            VisitDecision::Now {
+                visited_at: 100,
+                opened: true
+            }
+        );
+        sidebar = SidebarController::default();
+        assert_eq!(
+            plan(&mut sidebar, Some("saved-a"), Some("canonical-a"), 3, 4_000),
+            (VisitDecision::Skip, Some(4_000))
+        );
+        sidebar = SidebarController::default();
+        assert_eq!(
+            plan(
+                &mut sidebar,
+                Some("saved-a"),
+                Some("canonical-a"),
+                4,
+                600_999
+            )
+            .0,
+            VisitDecision::Skip
+        );
+        sidebar = SidebarController::default();
+        assert_eq!(
+            plan(
+                &mut sidebar,
+                Some("saved-a"),
+                Some("canonical-a"),
+                5,
+                601_000
+            )
+            .0,
+            VisitDecision::Now {
+                visited_at: 100,
+                opened: true
+            }
+        );
+        assert_eq!(
+            plan(
+                &mut sidebar,
+                Some("saved-a"),
+                Some("replacement"),
+                5,
+                601_001
+            )
+            .0,
+            VisitDecision::Now {
+                visited_at: 100,
+                opened: true
+            }
+        );
+        assert_eq!(
+            plan(&mut sidebar, None, Some("replacement"), 6, 601_002).0,
+            VisitDecision::Now {
+                visited_at: 100,
+                opened: true
+            },
+            "canonical-only keys have their own prefix"
+        );
+    }
+
+    #[test]
+    fn stale_timers_cannot_authorize_a_returned_target_or_clear_a_new_timer() {
+        let mut sidebar = SidebarController::default();
+        let mut history = OpenHistory::default();
+        let env = history.environment(Some("saved-a"), None).unwrap();
+        let shell = VisitedShell {
+            updated_at: 100,
+            last_visited_at: Some(0),
+            completed_at: None,
+            woke_at: None,
+        };
+        sidebar.visit_decision(
+            &mut history,
+            Some((env.clone(), Some(1), "a")),
+            Some(shell),
+            1_000,
+        );
+        let updated = VisitedShell {
+            updated_at: 200,
+            ..shell
+        };
+        assert!(matches!(
+            sidebar.visit_decision(
+                &mut history,
+                Some((env.clone(), Some(1), "a")),
+                Some(updated),
+                1_001
+            ),
+            VisitDecision::At { .. }
+        ));
+        let stale = sidebar.pending_visit(200).unwrap();
+        for next in [None, Some("b"), Some("a")] {
+            sidebar.visit_decision(
+                &mut history,
+                next.map(|id| (env.clone(), Some(1), id)),
+                Some(shell),
+                1_002,
+            );
+        }
+        sidebar.visit_decision(
+            &mut history,
+            Some((env.clone(), Some(1), "a")),
+            Some(updated),
+            1_003,
+        );
+        let current = sidebar.pending_visit(200).unwrap();
+        sidebar.visit_timer = Some(Task::ready(()));
+        assert_eq!(
+            sidebar.fire_visit(&stale, Some(&env), Some(1), Some("a"), 11_000),
+            VisitDecision::Skip
+        );
+        assert!(sidebar.visit_timer.is_some());
+        assert_eq!(
+            sidebar.fire_visit(&current, Some(&env), Some(2), Some("a"), 11_000),
+            VisitDecision::Skip
+        );
+        assert_eq!(
+            sidebar.fire_visit(&current, Some(&env), Some(1), Some("b"), 11_000),
+            VisitDecision::Skip
+        );
+        assert_eq!(
+            sidebar.fire_visit(&current, None, Some(1), Some("a"), 11_000),
+            VisitDecision::Skip
+        );
+        for shell in [
+            None,
+            Some(VisitedShell {
+                last_visited_at: Some(200),
+                ..updated
+            }),
+        ] {
+            sidebar.visit_decision(
+                &mut history,
+                Some((env.clone(), Some(1), "a")),
+                shell,
+                1_004,
+            );
+            assert!(sidebar.visit_timer.is_none());
+            assert_eq!(
+                sidebar.fire_visit(&current, Some(&env), Some(1), Some("a"), 11_000),
+                VisitDecision::Skip
+            );
+        }
+        sidebar.visit_decision(
+            &mut history,
+            Some((env.clone(), Some(1), "a")),
+            Some(VisitedShell {
+                updated_at: 300,
+                ..shell
+            }),
+            1_005,
+        );
+        let current = sidebar.pending_visit(300).unwrap();
+        assert_eq!(
+            sidebar.fire_visit(&current, Some(&env), Some(1), Some("a"), 11_000),
+            VisitDecision::Now {
+                visited_at: 300,
+                opened: false
+            }
+        );
+        assert_eq!(
+            sidebar.fire_visit(&current, Some(&env), Some(1), Some("a"), 11_001),
+            VisitDecision::Skip
+        );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn app_owned_history_survives_reset_and_prefers_installed_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
+                "provider": {"instanceId":"replay", "driver":"replay", "enabled":true, "installed":true, "status":"ready"},
+                "auth":{"phase":"idle"}, "install":{"phase":"idle"}
+            })).unwrap();
+            cx.set_global(fixture);
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        state.update(cx, |state, cx| {
+            state.environments = serde_json::from_value(serde_json::json!({"active":"saved", "environments":[{
+                "id":"saved", "label":"Test", "httpBase":"http://127.0.0.1:14658", "environmentId":"stale-metadata"
+            }]})).unwrap();
+            let environment = state.visit_environment().unwrap();
+            state.selected_thread = Some("a".into());
+            state.track_visit(cx);
+            assert!(state.open_history.local_opened_at(&environment, "a").is_some());
+            assert!(state.sidebar.visit.is_some(), "missing shell still mounts the tracker");
+            let config = state.server_config.clone();
+            state.clear_connection_state(cx);
+            state.server_config = config;
+            let restored = state.visit_environment().unwrap();
+            assert_eq!(environment, restored);
+            assert!(state.open_history.local_opened_at(&restored, "a").is_some());
+            let replaced = state.open_history.environment(Some("saved"), Some("replacement")).unwrap();
+            assert_eq!(state.open_history.local_opened_at(&replaced, "a"), None);
+            // Installed config beats stale saved metadata, including after a reset.
+            assert_ne!(state.visit_environment().unwrap(), replaced);
+        });
+    }
 }
