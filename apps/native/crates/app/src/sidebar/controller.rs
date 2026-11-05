@@ -107,6 +107,9 @@ pub struct SidebarController {
     wake_timer: Option<Task<()>>,
     visit_timer: Option<Task<()>>,
     undo_timer: Option<Task<()>>,
+    // The delete stream can precede its reply; only that request may hold the selected mount.
+    pending_deletion: Option<PendingDeletion>,
+    deletion_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +118,52 @@ struct VisitTarget {
     thread: String,
     connection: Option<u64>,
     mount: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DeleteTarget {
+    environment: Option<String>,
+    canonical: Option<String>,
+    connection: Option<u64>,
+    selected: Option<String>,
+    visit: Option<VisitTarget>,
+}
+
+#[derive(Clone)]
+pub(super) struct Deletion {
+    pub target: DeleteTarget,
+    pub doomed: Arc<std::collections::HashSet<String>>,
+}
+
+struct PendingDeletion {
+    token: u64,
+    target: DeleteTarget,
+}
+
+struct DeletionReply {
+    owner: Option<u64>,
+    target: DeleteTarget,
+    id: String,
+    project: String,
+    fallback: Option<String>,
+}
+
+impl DeleteTarget {
+    fn same_scope(&self, current: &Self) -> bool {
+        self.environment == current.environment
+            && self.canonical == current.canonical
+            && self.connection == current.connection
+    }
+
+    fn route(
+        &self,
+        current: &Self,
+        deleted: &str,
+        ok: bool,
+        fallback: Option<String>,
+    ) -> Option<Option<String>> {
+        (ok && self.selected.as_deref() == Some(deleted) && self == current).then_some(fallback)
+    }
 }
 
 #[derive(Clone)]
@@ -207,6 +256,7 @@ fn connected(phase: &Phase) -> bool {
 impl AppState {
     /// Re-derives the sidebar from the shell. Cheap enough per batch; rows notify only the sidebar.
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.release_stale_deletion(cx);
         let now = now_ms();
         let extras = self.omitted.mounts.extras(&self.shell);
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
@@ -574,41 +624,238 @@ impl AppState {
         });
     }
 
-    /// Deletes after the caller confirmed. Stops a live runtime first, as the web does.
-    pub fn delete_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let fallback = self.sidebar.model.adjacent_thread(Some(thread_id), true).or_else(|| self.sidebar.model.adjacent_thread(Some(thread_id), false)).map(str::to_owned);
-        self.delete_thread_then(thread_id, fallback, "Failed to delete thread", cx, |_, _, _| {});
+    pub(super) fn delete_target(&self) -> DeleteTarget {
+        DeleteTarget {
+            environment: self.environments.active.clone(),
+            canonical: self
+                .server_config
+                .config
+                .as_ref()
+                .map(|config| config.environment.environment_id.clone()),
+            connection: self.connection_id(),
+            selected: self.selected_thread.clone(),
+            visit: self.sidebar.visit_target.clone(),
+        }
     }
 
-    /// `delete_thread` with the thread to open if the deleted one was open, and a callback with
-    /// the outcome.
-    pub(crate) fn delete_thread_then(
+    fn deletion_fallback(
+        &self,
+        thread_id: &str,
+        doomed: &std::collections::HashSet<String>,
+        order: t3_core::sidebar::sort::ThreadSortOrder,
+        now: Ms,
+    ) -> Option<String> {
+        let snapshot = self.shell.snapshot.as_ref()?;
+        let extras = self.omitted.mounts.extras(&self.shell);
+        let requests = t3_core::sidebar::thread::pending_subagent_requests(&snapshot.threads);
+        let threads: Vec<_> = snapshot
+            .threads
+            .iter()
+            .chain(extras.iter().copied())
+            .filter(|thread| thread.archived_at.is_none() && thread.deleted_at.is_none())
+            .map(|thread| {
+                t3_core::sidebar::thread::present_thread(thread, requests.get(&thread.id).copied())
+            })
+            .collect();
+        t3_core::sidebar::fallback_after_delete(&threads, thread_id, doomed, order, now)
+            .map(str::to_owned)
+    }
+
+    fn deletion_route(
+        &self,
+        target: &DeleteTarget,
+        id: &str,
+        project: &str,
+        fallback: Option<String>,
+        ok: bool,
+    ) -> Option<Option<String>> {
+        let fallback = fallback.filter(|next| {
+            self.thread_shell(next).is_some_and(|thread| {
+                thread.project_id == project
+                    && thread.deleted_at.is_none()
+                    && thread.archived_at.is_none()
+            })
+        });
+        target.route(&self.delete_target(), id, ok, fallback)
+    }
+
+    /// Deletes after the caller confirmed. Stops a live runtime first, as the web does.
+    pub fn delete_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let target = self.delete_target();
+        self.delete_thread_then(
+            thread_id,
+            Deletion {
+                target,
+                doomed: Arc::default(),
+            },
+            "Failed to delete thread",
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    pub(super) fn delete_thread_then(
         &mut self,
         thread_id: &str,
-        fallback: Option<String>,
+        deletion: Deletion,
         failure_title: &'static str,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(thread) = self.snapshot_thread(thread_id) else { return then(self, false, cx) };
-        if thread.runtime.is_some() {
-            self.dispatch_then(t3_core::commands::stop_thread(&uuid(), thread_id), None, cx, |_, _, _| {});
+        if !deletion.target.same_scope(&self.delete_target()) {
+            return;
         }
+        let Some(thread) = self.thread_shell(thread_id) else {
+            return then(self, false, cx);
+        };
+        let thread = t3_core::sidebar::thread::present_thread(thread, None);
         let id = thread_id.to_owned();
-        self.dispatch_then(actions::delete(&uuid(), thread_id), Some(failure_title), cx, move |state, ok, cx| {
-            if !ok {
-                return then(state, false, cx);
-            }
-            state.sidebar.undo.expire_placement(&id, true);
-            cx.emit(AppEvent::Notice);
-            if state.selected_thread.as_deref() == Some(id.as_str()) {
-                match fallback {
-                    Some(next) => state.select_thread(&next, cx),
-                    None => state.clear_selection(cx),
-                }
-            }
-            then(state, true, cx);
+        if thread.runtime.is_some() {
+            self.dispatch_then(
+                t3_core::commands::stop_thread(&uuid(), thread_id),
+                None,
+                cx,
+                move |state, _, cx| {
+                    if deletion.target.same_scope(&state.delete_target()) {
+                        state.delete_stopped_thread(id, deletion, failure_title, cx, then);
+                    }
+                },
+            );
+        } else {
+            self.delete_stopped_thread(id, deletion, failure_title, cx, then);
+        }
+    }
+
+    pub(crate) fn hold_pending_thread_deletion(&self) -> bool {
+        connected(&self.phase)
+            && self
+                .sidebar
+                .pending_deletion
+                .as_ref()
+                .is_some_and(|pending| pending.target == self.delete_target())
+    }
+
+    fn release_stale_deletion(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar.pending_deletion.is_none() || self.hold_pending_thread_deletion() {
+            return;
+        }
+        let pending = self.sidebar.pending_deletion.take().unwrap();
+        if self.thread.deleted && pending.target == self.delete_target() {
+            self.close_selected_thread(cx);
+        }
+    }
+
+    fn prepare_deletion(
+        &mut self,
+        id: String,
+        deletion: &Deletion,
+        order: t3_core::sidebar::sort::ThreadSortOrder,
+        now: Ms,
+    ) -> Option<DeletionReply> {
+        let project = self.thread_shell(&id)?.project_id.clone();
+        let eligible = connected(&self.phase)
+            && deletion
+                .target
+                .route(&self.delete_target(), &id, true, None)
+                .is_some();
+        let fallback = if eligible {
+            self.deletion_fallback(&id, &deletion.doomed, order, now)
+        } else {
+            None
+        };
+        let owner = eligible.then(|| {
+            self.sidebar.deletion_revision += 1;
+            let token = self.sidebar.deletion_revision;
+            self.sidebar.pending_deletion = Some(PendingDeletion {
+                token,
+                target: deletion.target.clone(),
+            });
+            token
         });
+        Some(DeletionReply {
+            owner,
+            target: deletion.target.clone(),
+            id,
+            project,
+            fallback,
+        })
+    }
+
+    fn finish_deletion(
+        &mut self,
+        reply: DeletionReply,
+        ok: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Option<String>> {
+        let current = self.delete_target();
+        let same_scope = reply.target.same_scope(&current);
+        let owned = reply.owner.is_some_and(|token| {
+            self.sidebar
+                .pending_deletion
+                .as_ref()
+                .is_some_and(|pending| pending.token == token && pending.target == reply.target)
+        });
+        if owned {
+            self.sidebar.pending_deletion = None;
+        }
+        if ok && same_scope {
+            self.sidebar.undo.expire_placement(&reply.id, true);
+            cx.emit(AppEvent::Notice);
+        }
+        if !ok || !connected(&self.phase) {
+            if owned && reply.target == current && self.thread.deleted {
+                self.close_selected_thread(cx);
+            }
+            return None;
+        }
+        if !same_scope {
+            return None;
+        }
+        owned
+            .then(|| {
+                self.deletion_route(&reply.target, &reply.id, &reply.project, reply.fallback, ok)
+            })
+            .flatten()
+    }
+
+    fn delete_stopped_thread(
+        &mut self,
+        id: String,
+        deletion: Deletion,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
+    ) {
+        if self.client_handle().is_none() {
+            return then(self, false, cx);
+        }
+        let Some(reply) = self.prepare_deletion(
+            id.clone(),
+            &deletion,
+            crate::settings::store::client(cx).thread_sort_order(),
+            now_ms(),
+        ) else {
+            return then(self, false, cx);
+        };
+        self.dispatch_then(
+            actions::delete(&uuid(), &id),
+            Some(failure_title),
+            cx,
+            move |state, ok, cx| {
+                let same_scope = reply.target.same_scope(&state.delete_target());
+                let route = state.finish_deletion(reply, ok, cx);
+                if !same_scope {
+                    return;
+                }
+                if let Some(route) = route {
+                    match route {
+                        Some(next) => state.select_thread(&next, cx),
+                        None => state.clear_selection(cx),
+                    }
+                }
+                then(state, ok, cx);
+            },
+        );
     }
 
     fn select_adjacent_after_removal(&mut self, removed: &str, cx: &mut Context<Self>) {
@@ -1114,5 +1361,278 @@ mod visit_tests {
             // Installed config beats stale saved metadata, including after a reset.
             assert_ne!(state.visit_environment().unwrap(), replaced);
         });
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_reply_routes_only_the_original_open_mount_after_success() {
+        let target = DeleteTarget {
+            environment: Some("saved".into()),
+            canonical: Some("environment".into()),
+            connection: Some(1),
+            selected: Some("deleted".into()),
+            visit: None,
+        };
+        assert_eq!(
+            target.route(&target, "deleted", true, Some("survivor".into())),
+            Some(Some("survivor".into()))
+        );
+        assert_eq!(target.route(&target, "deleted", true, None), Some(None));
+        assert_eq!(
+            target.route(&target, "deleted", false, Some("survivor".into())),
+            None
+        );
+        assert_eq!(
+            target.route(&target, "background", true, Some("survivor".into())),
+            None
+        );
+        for current in [
+            DeleteTarget {
+                selected: None,
+                ..target.clone()
+            },
+            DeleteTarget {
+                selected: Some("new-selection".into()),
+                ..target.clone()
+            },
+            DeleteTarget {
+                environment: Some("different".into()),
+                ..target.clone()
+            },
+            DeleteTarget {
+                canonical: Some("different".into()),
+                ..target.clone()
+            },
+            DeleteTarget {
+                connection: Some(2),
+                ..target.clone()
+            },
+            DeleteTarget {
+                connection: None,
+                ..target.clone()
+            },
+        ] {
+            assert_eq!(
+                target.route(&current, "deleted", true, Some("survivor".into())),
+                None
+            );
+        }
+        let environment = OpenHistory::default()
+            .environment(Some("saved"), None)
+            .unwrap();
+        let mounted = DeleteTarget {
+            visit: Some(VisitTarget {
+                environment,
+                thread: "deleted".into(),
+                connection: Some(1),
+                mount: 1,
+            }),
+            ..target
+        };
+        let mut returned = mounted.clone();
+        returned.visit.as_mut().unwrap().mount = 2;
+        assert_eq!(
+            mounted.route(&returned, "deleted", true, Some("survivor".into())),
+            None
+        );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn deletion_reads_environment_shells_and_mounts_before_sidebar_filters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap();
+            cx.set_global(fixture);
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        state.update(cx, |state, _| {
+            let make = |id, project, at| serde_json::from_value(serde_json::json!({
+                "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+                "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+                "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+            })).unwrap();
+            state.shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                threads: vec![make("deleted", "p1", "2026-04-01T00:00:00Z"), make("filtered", "p1", "2026-04-02T00:00:00Z"), make("other-project", "p2", "2026-04-05T00:00:00Z")],
+                ..Default::default()
+            });
+            state.omitted.mounts.mount("family", state.shell.generation, vec![t3_core::families::FamilyRead {
+                snapshot_sequence: 1, threads: vec![make("omitted", "p1", "2026-04-03T00:00:00Z")],
+            }]);
+            state.selected_thread = Some("deleted".into());
+            assert!(state.sidebar.model.threads.is_empty());
+            let doomed = ["omitted".into()].into();
+            assert_eq!(state.deletion_fallback("deleted", &Default::default(), t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).as_deref(), Some("omitted"));
+            assert_eq!(state.deletion_fallback("deleted", &doomed, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).as_deref(), Some("filtered"));
+            let target = state.delete_target();
+            assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(Some("filtered".into())));
+            state.shell.snapshot.as_mut().unwrap().threads.retain(|thread| thread.id != "filtered");
+            assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(None));
+            state.shell.snapshot.as_mut().unwrap().threads.push(make("filtered", "p2", "2026-04-06T00:00:00Z"));
+            assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(None));
+
+        });
+        // Drive the real event boundary; finish_deletion is the production reply's pre-navigation plan.
+        for mode in [
+            "reply-first",
+            "event-first",
+            "failed-before-event",
+            "failed-or-cancelled",
+            "draft",
+            "clear",
+            "disconnect",
+            "background-disconnect",
+            "reset",
+            "unowned",
+        ] {
+            let event_first = !matches!(
+                mode,
+                "reply-first" | "failed-before-event" | "background-disconnect"
+            );
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let Some((reply, claims, discard, other_claim, later_event)) = state.update(cx, |state, cx| {
+                let make = |id, at| serde_json::from_value(serde_json::json!({
+                    "id":id,"projectId":"p1","title":id,"createdAt":at,"updatedAt":at,
+                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                    "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+                    "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+                })).unwrap();
+                state.shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                    projects: vec![serde_json::from_value(serde_json::json!({
+                        "id":"p1","title":"Project","workspaceRoot":"/fixture","createdAt":"2026-04-01T00:00:00Z","updatedAt":"2026-04-01T00:00:00Z"
+                    })).unwrap()],
+                    threads: vec![make("deleted", "2026-04-01T00:00:00Z"), make("survivor", "2026-04-02T00:00:00Z"), make("other", "2026-03-01T00:00:00Z")],
+                    ..Default::default()
+                });
+                state.start_draft("p1", cx);
+                state.draft_project = None;
+                state.selected_thread = Some("deleted".into());
+                state.track_visit(cx);
+                let mut payload = serde_json::to_value(state.thread_shell("deleted").unwrap()).unwrap();
+                payload["deletedAt"] = serde_json::json!("2026-04-03T00:00:00Z");
+                let event = || t3_client::supervisor::ClientEvent::Thread {
+                    thread_id: "deleted".into(),
+                    item: Box::new(serde_json::from_value(serde_json::json!({
+                        "kind":"event","sequence":2,"event":{"id":"delete-event","threadId":"deleted","occurredAt":"2026-04-03T00:00:00Z","type":"thread.deleted","payload":payload}
+                    })).unwrap()),
+                };
+                let deletion = Deletion { target: state.delete_target(), doomed: Arc::new(["deleted".into()].into()) };
+                let background = state.prepare_deletion("survivor".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap();
+                assert!(background.fallback.is_none(), "background deletion must not compute a discarded fallback");
+                let reply = if mode == "background-disconnect" { Some(background) } else { (mode != "unowned").then(|| state.prepare_deletion("deleted".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap()) };
+                if event_first { state.apply_batch(vec![event()], cx); }
+                if mode == "unowned" {
+                    assert_eq!(state.selected_thread, None);
+                    assert_eq!(state.draft_project.as_deref(), Some("p1"));
+                    assert!(!state.hold_pending_thread_deletion());
+                    return None;
+                }
+                if event_first {
+                    assert!(state.thread.deleted);
+                    assert_eq!(state.selected_thread.as_deref(), Some("deleted"));
+                    assert!(state.hold_pending_thread_deletion());
+                }
+                match mode {
+                    "draft" => state.start_draft("p2", cx),
+                    "clear" => state.clear_selection(cx),
+                    "disconnect" | "background-disconnect" => state.apply_batch(vec![t3_client::supervisor::ClientEvent::Status(ConnectionStatus::Reconnecting { reason: "fixture disconnect".into(), attempt: 1 })], cx),
+                    "reset" => state.clear_connection_state(cx),
+                    _ => {}
+                }
+                let reply = reply.unwrap();
+                let claims = [UndoKind::Settle, UndoKind::Snooze, UndoKind::Pin, UndoKind::Archive].map(|kind| state.sidebar.undo.begin(kind, &reply.id));
+                state.sidebar.undo.show(UndoAction::Unpinned, claims[2].clone(), vec![UndoStep::Pin { order_key: None }], 0);
+                let discard = state.sidebar.undo.begin(UndoKind::Discard, &reply.id);
+                let other_claim = state.sidebar.undo.begin(UndoKind::Pin, "other");
+                state.sidebar.undo.show(UndoAction::Unpinned, other_claim.clone(), vec![UndoStep::Pin { order_key: None }], 0);
+                assert_eq!(state.sidebar.undo.notice().unwrap().count, 2);
+                Some((reply, claims, discard, other_claim, event()))
+            }) else { continue };
+            let notices = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = notices.clone();
+            let _notice_subscription = cx.update(|cx| {
+                cx.subscribe(&state, move |_, event: &AppEvent, _| {
+                    if matches!(event, AppEvent::Notice) {
+                        observed.set(observed.get() + 1);
+                    }
+                })
+            });
+            let cleanup = !matches!(
+                mode,
+                "failed-or-cancelled" | "failed-before-event" | "reset"
+            );
+            state.update(cx, |state, cx| {
+                let expected = matches!(mode, "reply-first" | "event-first")
+                    .then_some(Some("survivor".into()));
+                assert_eq!(
+                    state.finish_deletion(
+                        reply,
+                        !matches!(mode, "failed-or-cancelled" | "failed-before-event"),
+                        cx
+                    ),
+                    expected,
+                    "mode={mode}, selected={:?}, draft={:?}",
+                    state.selected_thread,
+                    state.draft_project
+                );
+                assert!(!state.hold_pending_thread_deletion());
+                assert!(state.sidebar.pending_deletion.is_none());
+                for claim in &claims {
+                    assert_eq!(
+                        state.sidebar.undo.is_current(claim),
+                        !cleanup,
+                        "deleted placement/archive claim after {mode}"
+                    );
+                }
+                assert!(
+                    state.sidebar.undo.is_current(&discard),
+                    "deletion leaves draft Undo alone"
+                );
+                assert!(
+                    state.sidebar.undo.is_current(&other_claim),
+                    "other thread Undo must survive {mode}"
+                );
+                assert_eq!(
+                    state.sidebar.undo.notice().unwrap().count,
+                    if cleanup { 1 } else { 2 }
+                );
+                if mode == "background-disconnect" {
+                    assert_eq!(state.selected_thread.as_deref(), Some("deleted"));
+                } else if !event_first {
+                    // No navigation is executed in this command-plan test; the now-unowned event closes normally.
+                    state.apply_batch(vec![later_event], cx);
+                    assert_eq!(state.selected_thread, None);
+                    assert_eq!(state.draft_project.as_deref(), Some("p1"));
+                } else if !matches!(mode, "event-first") {
+                    assert_eq!(
+                        state.selected_thread, None,
+                        "held deletion must not survive {mode}"
+                    );
+                    assert!(!state.thread.deleted);
+                    if mode == "draft" {
+                        assert_eq!(state.draft_project.as_deref(), Some("p2"));
+                    }
+                }
+            });
+            assert_eq!(
+                notices.get(),
+                usize::from(cleanup),
+                "completion Notice for {mode}"
+            );
+        }
     }
 }

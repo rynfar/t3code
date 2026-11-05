@@ -795,3 +795,242 @@ fn tag_visibility_applies_before_sidebar_partition_and_search() {
     assert!(search_titles(&model,"private",iso(NOW)).is_empty());
     assert_eq!(model.jump_target(0),Some("plain"));
 }
+
+#[test]
+fn deletion_fallback_stays_in_project_and_skips_parked_threads() {
+    let now = iso(NOW);
+    let future = iso(FUTURE_WAKE);
+    let snoozed_at = iso(SNOOZED_AT);
+    let napping = SidebarThread {
+        snoozed_until: Some(future),
+        snoozed_at: Some(snoozed_at),
+        ..base("parked")
+    };
+    let failed = SidebarThread {
+        latest_run: Some(RunSummary {
+            completed_at: Some(snoozed_at + 1),
+            ..run("failed", None, None)
+        }),
+        runtime: Some(runtime("failed")),
+        ..napping.clone()
+    };
+    for (candidate, eligible) in [
+        (
+            SidebarThread {
+                project_id: "another-physical-project".into(),
+                ..base("parked")
+            },
+            false,
+        ),
+        (
+            SidebarThread {
+                settled_override: Some(SettledOverride::Settled),
+                pinned: true,
+                has_pending_approvals: true,
+                ..base("parked")
+            },
+            false,
+        ),
+        (napping.clone(), false),
+        (
+            SidebarThread {
+                snoozed_until: Some(now),
+                ..napping.clone()
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                snoozed_until: Some(now - 1),
+                ..napping.clone()
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                has_pending_approvals: true,
+                ..napping.clone()
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                has_pending_user_input: true,
+                ..napping.clone()
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                has_pending_runtime_request: true,
+                ..napping.clone()
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                pending_subagent_request: Some(SubagentRequest::Approval),
+                ..napping.clone()
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                pending_guest_message_count: 1,
+                ..napping.clone()
+            },
+            true,
+        ),
+        (failed.clone(), true),
+        (
+            SidebarThread {
+                latest_run: Some(run("failed", None, None)),
+                ..failed.clone()
+            },
+            false,
+        ),
+        (
+            SidebarThread {
+                latest_run: Some(RunSummary {
+                    completed_at: Some(snoozed_at),
+                    ..run("failed", None, None)
+                }),
+                ..failed
+            },
+            false,
+        ),
+        (
+            SidebarThread {
+                settled_override: Some(SettledOverride::Active),
+                ..base("parked")
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                pinned: true,
+                ..base("parked")
+            },
+            true,
+        ),
+        (
+            SidebarThread {
+                pinned: true,
+                settled_override: Some(SettledOverride::Active),
+                ..napping
+            },
+            false,
+        ),
+    ] {
+        let threads = vec![candidate, base("deleted")];
+        let select = |at| {
+            fallback_after_delete(
+                &threads,
+                "deleted",
+                &HashSet::new(),
+                ThreadSortOrder::UpdatedAt,
+                at,
+            )
+        };
+        assert_eq!(
+            select(now),
+            eligible.then_some("parked"),
+            "{:?}",
+            threads[0]
+        );
+        // The instant comes from deletion, not the last sidebar rebuild.
+        if threads[0].project_id == "p1" && !threads[0].is_settled() {
+            assert_eq!(select(future), Some("parked"));
+        }
+    }
+}
+
+#[test]
+fn deletion_fallback_uses_current_sort_and_excludes_the_entire_batch() {
+    use crate::client_settings::ClientSettingsDoc;
+    let threads = vec![
+        SidebarThread {
+            created_at: Some(10),
+            updated_at: Some(20),
+            latest_user_message_at: Some(50),
+            ..base("user-message")
+        },
+        SidebarThread {
+            created_at: Some(30),
+            updated_at: Some(40),
+            ..base("tie-a")
+        },
+        SidebarThread {
+            created_at: Some(30),
+            updated_at: Some(40),
+            ..base("tie-z")
+        },
+        base("deleted"),
+    ];
+    for (json, expected) in [
+        ("{}", "user-message"),
+        (r#"{"sidebarThreadSortOrder":"updated_at"}"#, "user-message"),
+        (r#"{"sidebarThreadSortOrder":"created_at"}"#, "tie-z"),
+        (r#"{"sidebarThreadSortOrder":"invalid"}"#, "user-message"),
+        (r#"{"sidebarThreadSortOrder":false}"#, "user-message"),
+    ] {
+        let settings = ClientSettingsDoc::from_json(json);
+        let before = settings.to_json();
+        assert_eq!(
+            fallback_after_delete(
+                &threads,
+                "deleted",
+                &HashSet::new(),
+                settings.thread_sort_order(),
+                100
+            ),
+            Some(expected)
+        );
+        assert_eq!(settings.to_json(), before);
+    }
+    let select = |id, doomed: &HashSet<String>| {
+        fallback_after_delete(&threads, id, doomed, ThreadSortOrder::CreatedAt, 100)
+    };
+    assert_eq!(select("missing", &HashSet::new()), None);
+    assert_eq!(
+        select("deleted", &["deleted".into(), "tie-z".into()].into()),
+        Some("tie-a")
+    );
+    assert_eq!(
+        select("deleted", &threads.iter().map(|t| t.id.clone()).collect()),
+        None
+    );
+    assert_eq!(
+        fallback_after_delete(
+            &[],
+            "deleted",
+            &HashSet::new(),
+            ThreadSortOrder::UpdatedAt,
+            100
+        ),
+        None
+    );
+    let undated = [
+        SidebarThread {
+            created_at: None,
+            updated_at: None,
+            ..base("z")
+        },
+        SidebarThread {
+            created_at: None,
+            updated_at: None,
+            ..base("a")
+        },
+        base("deleted"),
+    ];
+    assert_eq!(
+        fallback_after_delete(
+            &undated,
+            "deleted",
+            &HashSet::new(),
+            ThreadSortOrder::UpdatedAt,
+            100
+        ),
+        Some("z")
+    );
+}
