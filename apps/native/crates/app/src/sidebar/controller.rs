@@ -107,6 +107,9 @@ pub struct SidebarController {
     wake_timer: Option<Task<()>>,
     visit_timer: Option<Task<()>>,
     undo_timer: Option<Task<()>>,
+    // The delete stream can precede its reply; only that request may hold the selected mount.
+    pending_deletion: Option<PendingDeletion>,
+    deletion_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +133,19 @@ pub(super) struct DeleteTarget {
 pub(super) struct Deletion {
     pub target: DeleteTarget,
     pub doomed: Arc<std::collections::HashSet<String>>,
+}
+
+struct PendingDeletion {
+    token: u64,
+    target: DeleteTarget,
+}
+
+struct DeletionReply {
+    owner: Option<u64>,
+    target: DeleteTarget,
+    id: String,
+    project: String,
+    fallback: Option<String>,
 }
 
 impl DeleteTarget {
@@ -240,6 +256,7 @@ fn connected(phase: &Phase) -> bool {
 impl AppState {
     /// Re-derives the sidebar from the shell. Cheap enough per batch; rows notify only the sidebar.
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.release_stale_deletion(cx);
         let now = now_ms();
         let extras = self.omitted.mounts.extras(&self.shell);
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
@@ -709,6 +726,95 @@ impl AppState {
         }
     }
 
+    pub(crate) fn hold_pending_thread_deletion(&self) -> bool {
+        connected(&self.phase)
+            && self
+                .sidebar
+                .pending_deletion
+                .as_ref()
+                .is_some_and(|pending| pending.target == self.delete_target())
+    }
+
+    fn release_stale_deletion(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar.pending_deletion.is_none() || self.hold_pending_thread_deletion() {
+            return;
+        }
+        let pending = self.sidebar.pending_deletion.take().unwrap();
+        if self.thread.deleted && pending.target == self.delete_target() {
+            self.close_selected_thread(cx);
+        }
+    }
+
+    fn prepare_deletion(
+        &mut self,
+        id: String,
+        deletion: &Deletion,
+        order: t3_core::sidebar::sort::ThreadSortOrder,
+        now: Ms,
+    ) -> Option<DeletionReply> {
+        let project = self.thread_shell(&id)?.project_id.clone();
+        let eligible = connected(&self.phase)
+            && deletion
+                .target
+                .route(&self.delete_target(), &id, true, None)
+                .is_some();
+        let fallback = if eligible {
+            self.deletion_fallback(&id, &deletion.doomed, order, now)
+        } else {
+            None
+        };
+        let owner = eligible.then(|| {
+            self.sidebar.deletion_revision += 1;
+            let token = self.sidebar.deletion_revision;
+            self.sidebar.pending_deletion = Some(PendingDeletion {
+                token,
+                target: deletion.target.clone(),
+            });
+            token
+        });
+        Some(DeletionReply {
+            owner,
+            target: deletion.target.clone(),
+            id,
+            project,
+            fallback,
+        })
+    }
+
+    fn finish_deletion(
+        &mut self,
+        reply: DeletionReply,
+        ok: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Option<String>> {
+        let current = self.delete_target();
+        let owned = reply.owner.is_some_and(|token| {
+            self.sidebar
+                .pending_deletion
+                .as_ref()
+                .is_some_and(|pending| pending.token == token && pending.target == reply.target)
+        });
+        if owned {
+            self.sidebar.pending_deletion = None;
+        }
+        if !ok || !connected(&self.phase) {
+            if owned && reply.target == current && self.thread.deleted {
+                self.close_selected_thread(cx);
+            }
+            return None;
+        }
+        if !reply.target.same_scope(&current) {
+            return None;
+        }
+        self.sidebar.undo.expire_placement(&reply.id, true);
+        cx.emit(AppEvent::Notice);
+        owned
+            .then(|| {
+                self.deletion_route(&reply.target, &reply.id, &reply.project, reply.fallback, ok)
+            })
+            .flatten()
+    }
+
     fn delete_stopped_thread(
         &mut self,
         id: String,
@@ -717,41 +823,34 @@ impl AppState {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(project) = self
-            .thread_shell(&id)
-            .map(|thread| thread.project_id.clone())
-        else {
+        if self.client_handle().is_none() {
             return then(self, false, cx);
-        };
-        let fallback = self.deletion_fallback(
-            &id,
-            &deletion.doomed,
+        }
+        let Some(reply) = self.prepare_deletion(
+            id.clone(),
+            &deletion,
             crate::settings::store::client(cx).thread_sort_order(),
             now_ms(),
-        );
+        ) else {
+            return then(self, false, cx);
+        };
         self.dispatch_then(
             actions::delete(&uuid(), &id),
             Some(failure_title),
             cx,
             move |state, ok, cx| {
-                let current = state.delete_target();
-                if !deletion.target.same_scope(&current) {
+                let same_scope = reply.target.same_scope(&state.delete_target());
+                let route = state.finish_deletion(reply, ok, cx);
+                if !same_scope {
                     return;
                 }
-                if !ok {
-                    return then(state, false, cx);
-                }
-                state.sidebar.undo.expire_placement(&id, true);
-                cx.emit(AppEvent::Notice);
-                if let Some(route) =
-                    state.deletion_route(&deletion.target, &id, &project, fallback, ok)
-                {
+                if let Some(route) = route {
                     match route {
                         Some(next) => state.select_thread(&next, cx),
                         None => state.clear_selection(cx),
                     }
                 }
-                then(state, true, cx);
+                then(state, ok, cx);
             },
         );
     }
@@ -1349,6 +1448,7 @@ mod deletion_tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
+            crate::settings::store::init(cx);
             let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
                 "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
                 "auth":{"phase":"idle"},"install":{"phase":"idle"}
@@ -1383,5 +1483,85 @@ mod deletion_tests {
             assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(None));
 
         });
+        // Drive the real event boundary; finish_deletion is the production reply's pre-navigation plan.
+        for mode in [
+            "reply-first",
+            "event-first",
+            "failed-before-event",
+            "failed-or-cancelled",
+            "draft",
+            "clear",
+            "disconnect",
+            "reset",
+            "unowned",
+        ] {
+            let event_first = !matches!(mode, "reply-first" | "failed-before-event");
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, cx| {
+                let make = |id, at| serde_json::from_value(serde_json::json!({
+                    "id":id,"projectId":"p1","title":id,"createdAt":at,"updatedAt":at,
+                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                    "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+                    "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+                })).unwrap();
+                state.shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                    projects: vec![serde_json::from_value(serde_json::json!({
+                        "id":"p1","title":"Project","workspaceRoot":"/fixture","createdAt":"2026-04-01T00:00:00Z","updatedAt":"2026-04-01T00:00:00Z"
+                    })).unwrap()],
+                    threads: vec![make("deleted", "2026-04-01T00:00:00Z"), make("survivor", "2026-04-02T00:00:00Z"), make("other", "2026-03-01T00:00:00Z")],
+                    ..Default::default()
+                });
+                state.start_draft("p1", cx);
+                state.draft_project = None;
+                state.selected_thread = Some("deleted".into());
+                state.track_visit(cx);
+                let mut payload = serde_json::to_value(state.thread_shell("deleted").unwrap()).unwrap();
+                payload["deletedAt"] = serde_json::json!("2026-04-03T00:00:00Z");
+                let event = || t3_client::supervisor::ClientEvent::Thread {
+                    thread_id: "deleted".into(),
+                    item: Box::new(serde_json::from_value(serde_json::json!({
+                        "kind":"event","sequence":2,"event":{"id":"delete-event","threadId":"deleted","occurredAt":"2026-04-03T00:00:00Z","type":"thread.deleted","payload":payload}
+                    })).unwrap()),
+                };
+                let deletion = Deletion { target: state.delete_target(), doomed: Arc::new(["deleted".into()].into()) };
+                let background = state.prepare_deletion("survivor".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap();
+                assert!(background.fallback.is_none(), "background deletion must not compute a discarded fallback");
+                let reply = (mode != "unowned").then(|| state.prepare_deletion("deleted".into(), &deletion, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).unwrap());
+                if event_first { state.apply_batch(vec![event()], cx); }
+                if mode == "unowned" {
+                    assert_eq!(state.selected_thread, None);
+                    assert_eq!(state.draft_project.as_deref(), Some("p1"));
+                    assert!(!state.hold_pending_thread_deletion());
+                    return;
+                }
+                if event_first {
+                    assert!(state.thread.deleted);
+                    assert_eq!(state.selected_thread.as_deref(), Some("deleted"));
+                    assert!(state.hold_pending_thread_deletion());
+                }
+                match mode {
+                    "draft" => state.start_draft("p2", cx),
+                    "clear" => state.clear_selection(cx),
+                    "disconnect" => state.apply_batch(vec![t3_client::supervisor::ClientEvent::Status(ConnectionStatus::Reconnecting { reason: "fixture disconnect".into(), attempt: 1 })], cx),
+                    "reset" => state.clear_connection_state(cx),
+                    _ => {}
+                }
+                let expected = matches!(mode, "reply-first" | "event-first").then_some(Some("survivor".into()));
+                assert_eq!(state.finish_deletion(reply.unwrap(), !matches!(mode, "failed-or-cancelled" | "failed-before-event"), cx), expected, "mode={mode}, selected={:?}, draft={:?}", state.selected_thread, state.draft_project);
+                assert!(!state.hold_pending_thread_deletion());
+                assert!(state.sidebar.pending_deletion.is_none());
+                if !event_first {
+                    // No navigation is executed in this command-plan test; the now-unowned event closes normally.
+                    state.apply_batch(vec![event()], cx);
+                    assert_eq!(state.selected_thread, None);
+                    assert_eq!(state.draft_project.as_deref(), Some("p1"));
+                } else if !matches!(mode, "event-first") {
+                    assert_eq!(state.selected_thread, None, "held deletion must not survive {mode}");
+                    assert!(!state.thread.deleted);
+                    if mode == "draft" { assert_eq!(state.draft_project.as_deref(), Some("p2")); }
+                }
+
+            });
+        }
     }
 }

@@ -317,7 +317,7 @@ impl AppState {
         self.land_home(cx);
     }
 
-    fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
         let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut config_changed) = (false, false, false, false);
         // A resubscribed shell is live again at its completion marker, even with nothing new.
         let mut resynchronized = false;
@@ -354,7 +354,9 @@ impl AppState {
         self.sync_shell_views(shell_changed, sidebar_changed, resynchronized, cx);
         if thread_changed && self.thread.deleted {
             // The web treats a deleted open thread as missing and goes home.
-            self.close_selected_thread(cx);
+            if !self.hold_pending_thread_deletion() {
+                self.close_selected_thread(cx);
+            }
         } else if thread_changed {
             cx.emit(AppEvent::Thread);
         }
@@ -419,7 +421,7 @@ impl AppState {
         }
     }
 
-    fn close_selected_thread(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_selected_thread(&mut self, cx: &mut Context<Self>) {
         if let (Some(client), Some(thread_id)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&thread_id);
         }
