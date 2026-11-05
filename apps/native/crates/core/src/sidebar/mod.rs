@@ -424,6 +424,32 @@ impl SidebarModel {
     }
 }
 
+/// `getFallbackThreadIdAfterDelete`: candidates come from the environment, before sidebar filtering.
+pub fn fallback_after_delete<'a>(
+    threads: &'a [SidebarThread],
+    deleted: &str,
+    doomed: &HashSet<String>,
+    order: sort::ThreadSortOrder,
+    now: Ms,
+) -> Option<&'a str> {
+    let project = &threads
+        .iter()
+        .find(|thread| thread.id == deleted)?
+        .project_id;
+    let mut survivors: Vec<_> = threads
+        .iter()
+        .filter(|thread| {
+            thread.project_id == *project
+                && thread.id != deleted
+                && !doomed.contains(&thread.id)
+                && !thread.is_settled()
+                && !effective_snoozed(thread, now)
+        })
+        .collect();
+    sort::sort_threads(&mut survivors, order);
+    survivors.first().map(|thread| thread.id.as_str())
+}
+
 /// The smallest splice that turns `old` into `new`: `(old range, new count)`, or `None` when equal.
 pub fn splice_range<T: PartialEq>(old: &[T], new: &[T]) -> Option<(Range<usize>, usize)> {
     let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();

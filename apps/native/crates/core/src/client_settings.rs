@@ -510,6 +510,13 @@ impl ClientSettingsDoc {
         self.literal("sidebarProjectSortOrder", ProjectSortOrder::parse)
     }
 
+    pub fn thread_sort_order(&self) -> crate::sidebar::sort::ThreadSortOrder {
+        match self.text("sidebarThreadSortOrder") {
+            Some("created_at") => crate::sidebar::sort::ThreadSortOrder::CreatedAt,
+            _ => crate::sidebar::sort::ThreadSortOrder::UpdatedAt,
+        }
+    }
+
     pub fn working_shelf(&self) -> bool {
         self.flag("sidebarWorkingShelfEnabled", true)
     }

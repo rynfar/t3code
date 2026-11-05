@@ -117,6 +117,39 @@ struct VisitTarget {
     mount: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DeleteTarget {
+    environment: Option<String>,
+    canonical: Option<String>,
+    connection: Option<u64>,
+    selected: Option<String>,
+    visit: Option<VisitTarget>,
+}
+
+#[derive(Clone)]
+pub(super) struct Deletion {
+    pub target: DeleteTarget,
+    pub doomed: Arc<std::collections::HashSet<String>>,
+}
+
+impl DeleteTarget {
+    fn same_scope(&self, current: &Self) -> bool {
+        self.environment == current.environment
+            && self.canonical == current.canonical
+            && self.connection == current.connection
+    }
+
+    fn route(
+        &self,
+        current: &Self,
+        deleted: &str,
+        ok: bool,
+        fallback: Option<String>,
+    ) -> Option<Option<String>> {
+        (ok && self.selected.as_deref() == Some(deleted) && self == current).then_some(fallback)
+    }
+}
+
 #[derive(Clone)]
 struct VisitTimer {
     target: VisitTarget,
@@ -574,41 +607,153 @@ impl AppState {
         });
     }
 
-    /// Deletes after the caller confirmed. Stops a live runtime first, as the web does.
-    pub fn delete_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let fallback = self.sidebar.model.adjacent_thread(Some(thread_id), true).or_else(|| self.sidebar.model.adjacent_thread(Some(thread_id), false)).map(str::to_owned);
-        self.delete_thread_then(thread_id, fallback, "Failed to delete thread", cx, |_, _, _| {});
+    pub(super) fn delete_target(&self) -> DeleteTarget {
+        DeleteTarget {
+            environment: self.environments.active.clone(),
+            canonical: self
+                .server_config
+                .config
+                .as_ref()
+                .map(|config| config.environment.environment_id.clone()),
+            connection: self.connection_id(),
+            selected: self.selected_thread.clone(),
+            visit: self.sidebar.visit_target.clone(),
+        }
     }
 
-    /// `delete_thread` with the thread to open if the deleted one was open, and a callback with
-    /// the outcome.
-    pub(crate) fn delete_thread_then(
+    fn deletion_fallback(
+        &self,
+        thread_id: &str,
+        doomed: &std::collections::HashSet<String>,
+        order: t3_core::sidebar::sort::ThreadSortOrder,
+        now: Ms,
+    ) -> Option<String> {
+        let snapshot = self.shell.snapshot.as_ref()?;
+        let extras = self.omitted.mounts.extras(&self.shell);
+        let requests = t3_core::sidebar::thread::pending_subagent_requests(&snapshot.threads);
+        let threads: Vec<_> = snapshot
+            .threads
+            .iter()
+            .chain(extras.iter().copied())
+            .filter(|thread| thread.archived_at.is_none() && thread.deleted_at.is_none())
+            .map(|thread| {
+                t3_core::sidebar::thread::present_thread(thread, requests.get(&thread.id).copied())
+            })
+            .collect();
+        t3_core::sidebar::fallback_after_delete(&threads, thread_id, doomed, order, now)
+            .map(str::to_owned)
+    }
+
+    fn deletion_route(
+        &self,
+        target: &DeleteTarget,
+        id: &str,
+        project: &str,
+        fallback: Option<String>,
+        ok: bool,
+    ) -> Option<Option<String>> {
+        let fallback = fallback.filter(|next| {
+            self.thread_shell(next).is_some_and(|thread| {
+                thread.project_id == project
+                    && thread.deleted_at.is_none()
+                    && thread.archived_at.is_none()
+            })
+        });
+        target.route(&self.delete_target(), id, ok, fallback)
+    }
+
+    /// Deletes after the caller confirmed. Stops a live runtime first, as the web does.
+    pub fn delete_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let target = self.delete_target();
+        self.delete_thread_then(
+            thread_id,
+            Deletion {
+                target,
+                doomed: Arc::default(),
+            },
+            "Failed to delete thread",
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    pub(super) fn delete_thread_then(
         &mut self,
         thread_id: &str,
-        fallback: Option<String>,
+        deletion: Deletion,
         failure_title: &'static str,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(thread) = self.snapshot_thread(thread_id) else { return then(self, false, cx) };
-        if thread.runtime.is_some() {
-            self.dispatch_then(t3_core::commands::stop_thread(&uuid(), thread_id), None, cx, |_, _, _| {});
+        if !deletion.target.same_scope(&self.delete_target()) {
+            return;
         }
+        let Some(thread) = self.thread_shell(thread_id) else {
+            return then(self, false, cx);
+        };
+        let thread = t3_core::sidebar::thread::present_thread(thread, None);
         let id = thread_id.to_owned();
-        self.dispatch_then(actions::delete(&uuid(), thread_id), Some(failure_title), cx, move |state, ok, cx| {
-            if !ok {
-                return then(state, false, cx);
-            }
-            state.sidebar.undo.expire_placement(&id, true);
-            cx.emit(AppEvent::Notice);
-            if state.selected_thread.as_deref() == Some(id.as_str()) {
-                match fallback {
-                    Some(next) => state.select_thread(&next, cx),
-                    None => state.clear_selection(cx),
+        if thread.runtime.is_some() {
+            self.dispatch_then(
+                t3_core::commands::stop_thread(&uuid(), thread_id),
+                None,
+                cx,
+                move |state, _, cx| {
+                    if deletion.target.same_scope(&state.delete_target()) {
+                        state.delete_stopped_thread(id, deletion, failure_title, cx, then);
+                    }
+                },
+            );
+        } else {
+            self.delete_stopped_thread(id, deletion, failure_title, cx, then);
+        }
+    }
+
+    fn delete_stopped_thread(
+        &mut self,
+        id: String,
+        deletion: Deletion,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
+    ) {
+        let Some(project) = self
+            .thread_shell(&id)
+            .map(|thread| thread.project_id.clone())
+        else {
+            return then(self, false, cx);
+        };
+        let fallback = self.deletion_fallback(
+            &id,
+            &deletion.doomed,
+            crate::settings::store::client(cx).thread_sort_order(),
+            now_ms(),
+        );
+        self.dispatch_then(
+            actions::delete(&uuid(), &id),
+            Some(failure_title),
+            cx,
+            move |state, ok, cx| {
+                let current = state.delete_target();
+                if !deletion.target.same_scope(&current) {
+                    return;
                 }
-            }
-            then(state, true, cx);
-        });
+                if !ok {
+                    return then(state, false, cx);
+                }
+                state.sidebar.undo.expire_placement(&id, true);
+                cx.emit(AppEvent::Notice);
+                if let Some(route) =
+                    state.deletion_route(&deletion.target, &id, &project, fallback, ok)
+                {
+                    match route {
+                        Some(next) => state.select_thread(&next, cx),
+                        None => state.clear_selection(cx),
+                    }
+                }
+                then(state, true, cx);
+            },
+        );
     }
 
     fn select_adjacent_after_removal(&mut self, removed: &str, cx: &mut Context<Self>) {
@@ -1113,6 +1258,130 @@ mod visit_tests {
             assert_eq!(state.open_history.local_opened_at(&replaced, "a"), None);
             // Installed config beats stale saved metadata, including after a reset.
             assert_ne!(state.visit_environment().unwrap(), replaced);
+        });
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_reply_routes_only_the_original_open_mount_after_success() {
+        let target = DeleteTarget {
+            environment: Some("saved".into()),
+            canonical: Some("environment".into()),
+            connection: Some(1),
+            selected: Some("deleted".into()),
+            visit: None,
+        };
+        assert_eq!(
+            target.route(&target, "deleted", true, Some("survivor".into())),
+            Some(Some("survivor".into()))
+        );
+        assert_eq!(target.route(&target, "deleted", true, None), Some(None));
+        assert_eq!(
+            target.route(&target, "deleted", false, Some("survivor".into())),
+            None
+        );
+        assert_eq!(
+            target.route(&target, "background", true, Some("survivor".into())),
+            None
+        );
+        for current in [
+            DeleteTarget {
+                selected: None,
+                ..target.clone()
+            },
+            DeleteTarget {
+                selected: Some("new-selection".into()),
+                ..target.clone()
+            },
+            DeleteTarget {
+                environment: Some("different".into()),
+                ..target.clone()
+            },
+            DeleteTarget {
+                canonical: Some("different".into()),
+                ..target.clone()
+            },
+            DeleteTarget {
+                connection: Some(2),
+                ..target.clone()
+            },
+            DeleteTarget {
+                connection: None,
+                ..target.clone()
+            },
+        ] {
+            assert_eq!(
+                target.route(&current, "deleted", true, Some("survivor".into())),
+                None
+            );
+        }
+        let environment = OpenHistory::default()
+            .environment(Some("saved"), None)
+            .unwrap();
+        let mounted = DeleteTarget {
+            visit: Some(VisitTarget {
+                environment,
+                thread: "deleted".into(),
+                connection: Some(1),
+                mount: 1,
+            }),
+            ..target
+        };
+        let mut returned = mounted.clone();
+        returned.visit.as_mut().unwrap().mount = 2;
+        assert_eq!(
+            mounted.route(&returned, "deleted", true, Some("survivor".into())),
+            None
+        );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn deletion_reads_environment_shells_and_mounts_before_sidebar_filters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            })).unwrap();
+            cx.set_global(fixture);
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        state.update(cx, |state, _| {
+            let make = |id, project, at| serde_json::from_value(serde_json::json!({
+                "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+                "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+                "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+            })).unwrap();
+            state.shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                threads: vec![make("deleted", "p1", "2026-04-01T00:00:00Z"), make("filtered", "p1", "2026-04-02T00:00:00Z"), make("other-project", "p2", "2026-04-05T00:00:00Z")],
+                ..Default::default()
+            });
+            state.omitted.mounts.mount("family", state.shell.generation, vec![t3_core::families::FamilyRead {
+                snapshot_sequence: 1, threads: vec![make("omitted", "p1", "2026-04-03T00:00:00Z")],
+            }]);
+            state.selected_thread = Some("deleted".into());
+            assert!(state.sidebar.model.threads.is_empty());
+            let doomed = ["omitted".into()].into();
+            assert_eq!(state.deletion_fallback("deleted", &Default::default(), t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).as_deref(), Some("omitted"));
+            assert_eq!(state.deletion_fallback("deleted", &doomed, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt, 0).as_deref(), Some("filtered"));
+            let target = state.delete_target();
+            assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(Some("filtered".into())));
+            state.shell.snapshot.as_mut().unwrap().threads.retain(|thread| thread.id != "filtered");
+            assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(None));
+            state.shell.snapshot.as_mut().unwrap().threads.push(make("filtered", "p2", "2026-04-06T00:00:00Z"));
+            assert_eq!(state.deletion_route(&target, "deleted", "p1", Some("filtered".into()), true), Some(None));
+
         });
     }
 }

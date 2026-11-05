@@ -11,7 +11,7 @@ use t3_core::sidebar::selection::{BulkAction, BulkSelection};
 use t3_core::sidebar::settled::{self, SnoozePreset};
 use t3_core::thread_actions::{self as actions, UndoKind};
 
-use super::controller::{SystemZone, now_ms, time_label, uuid};
+use super::controller::{Deletion, SystemZone, now_ms, time_label, uuid};
 use crate::app_state::{AppEvent, AppState};
 
 impl AppState {
@@ -118,37 +118,41 @@ impl AppState {
         });
     }
 
-    /// `deleteSelectedThreadEntries`: deletes in order, keeps a failed thread selected, and opens
-    /// the nearest surviving thread when the open one goes.
+    /// `deleteSelectedThreadEntries`: failures stay selected; no co-deleted thread is a fallback.
     pub fn delete_threads(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
-        let doomed: HashSet<&str> = ids.iter().map(String::as_str).collect();
-        let model = self.sidebar.model.clone();
-        let ordered: Vec<&str> = model.ordered.iter().map(|index| model.threads[*index].id.as_str()).collect();
-        let fallback = self.selected_thread.as_deref().and_then(|open| {
-            let at = ordered.iter().position(|id| *id == open)?;
-            ordered[at..].iter().chain(ordered[..at].iter().rev()).find(|id| !doomed.contains(**id)).map(|id| (*id).to_owned())
-        });
-        self.delete_next(ids, fallback, cx);
+        let doomed = std::sync::Arc::new(ids.iter().cloned().collect());
+        let target = self.delete_target();
+        self.delete_next(ids, Deletion { doomed, target }, cx);
     }
 
-    fn delete_next(&mut self, mut ids: Vec<String>, fallback: Option<String>, cx: &mut Context<Self>) {
+    fn delete_next(&mut self, mut ids: Vec<String>, deletion: Deletion, cx: &mut Context<Self>) {
         if ids.is_empty() {
             let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-            let missing: Vec<String> = self.sidebar.selection.selected().iter().filter(|id| mounts.thread(shell, id).is_none()).cloned().collect();
+            let requested: Vec<_> = deletion.doomed.iter().cloned().collect();
+            let missing = t3_core::sidebar::selection::keys_to_deselect_after_delete(
+                &requested,
+                &HashSet::new(),
+                |id| mounts.thread(shell, id).is_some(),
+            );
             if self.sidebar.selection.remove(&missing) {
                 self.selection_changed(cx);
             }
             return;
         }
         let id = ids.remove(0);
-        let next_fallback = fallback.clone();
         let key = id.clone();
-        self.delete_thread_then(&key, fallback, "Failed to delete threads", cx, move |state, ok, cx| {
-            if ok && state.sidebar.selection.remove(std::slice::from_ref(&id)) {
-                state.selection_changed(cx);
-            }
-            state.delete_next(ids, next_fallback, cx);
-        });
+        self.delete_thread_then(
+            &key,
+            deletion.clone(),
+            "Failed to delete threads",
+            cx,
+            move |state, ok, cx| {
+                if ok && state.sidebar.selection.remove(std::slice::from_ref(&id)) {
+                    state.selection_changed(cx);
+                }
+                state.delete_next(ids, deletion, cx);
+            },
+        );
     }
 
     /// A row started dragging: the list shows its drop markers until the drag ends.
