@@ -3,12 +3,13 @@
 
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use gpui::{
     App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
     MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, deferred,
     div, hsla as gpui_hsla, point, prelude::*, px,
 };
+use gpui_base::CalendarView;
 use gpui_component::calendar::{Calendar, CalendarEvent, CalendarState, Date};
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{Sizable, Size};
@@ -167,6 +168,136 @@ fn calendar_disabled(date: NaiveDate, now: i64, zone: &dyn Zone) -> bool {
         .is_none_or(|today| date < today)
 }
 
+fn reset_calendar(
+    calendar: &mut CalendarState,
+    date: NaiveDate,
+    window: &mut Window,
+    cx: &mut Context<CalendarState>,
+) {
+    calendar.set_view(CalendarView::Day);
+    calendar.set_date(date, window, cx);
+    let year = calendar.current_year();
+    while calendar
+        .years_on_page()
+        .last()
+        .is_some_and(|last| *last < year)
+        && calendar.next_year_page()
+    {}
+    while calendar
+        .years_on_page()
+        .first()
+        .is_some_and(|first| *first > year)
+        && calendar.prev_year_page()
+    {}
+}
+
+fn calendar_day(calendar: &CalendarState) -> Option<NaiveDate> {
+    // Header navigation changes the displayed month without changing the selected date.
+    let day = calendar.date().start().map_or(1, |date| date.day());
+    (1..=day).rev().find_map(|day| {
+        NaiveDate::from_ymd_opt(
+            calendar.current_year(),
+            u32::from(calendar.current_month()),
+            day,
+        )
+    })
+}
+
+fn calendar_key(
+    calendar: &mut CalendarState,
+    key: &str,
+    window: &mut Window,
+    cx: &mut Context<CalendarState>,
+) -> bool {
+    let view = calendar.view();
+    // The pinned Small facade uses 232px width, p-3, and 30%/16% items with m-1.
+    let content = (230. - f32::from(window.rem_size()) * 1.5).max(1.);
+    let fraction = if view == CalendarView::Month {
+        0.3
+    } else {
+        0.16
+    };
+    let columns = (content / (content * fraction + f32::from(window.rem_size()) * 0.5))
+        .floor()
+        .max(1.) as i64;
+    let row = if view == CalendarView::Day {
+        7
+    } else {
+        columns
+    };
+    let offset = match key {
+        "left" => -1,
+        "right" => 1,
+        "up" => -row,
+        "down" => row,
+        _ => 0,
+    };
+    if offset != 0 {
+        match view {
+            CalendarView::Day => {
+                if let Some(date) = calendar_day(calendar)
+                    .and_then(|date| date.checked_add_signed(chrono::Duration::days(offset)))
+                {
+                    calendar.set_date(date, window, cx);
+                }
+            }
+            CalendarView::Month => {
+                let month = i64::from(calendar.current_month()) + offset;
+                if (1..=12).contains(&month) {
+                    calendar.select_month(month as u8);
+                    calendar.set_view(CalendarView::Month);
+                }
+            }
+            CalendarView::Year => {
+                let years = calendar.years_on_page();
+                let mut index = years
+                    .iter()
+                    .position(|year| *year == calendar.current_year())
+                    .unwrap_or(0) as i64
+                    + offset;
+                let count = years.len() as i64;
+                if index < 0 && calendar.prev_year_page() {
+                    index += calendar.years_on_page().len() as i64;
+                } else if index >= count && calendar.next_year_page() {
+                    index -= count;
+                }
+                if let Some(year) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| calendar.years_on_page().get(index))
+                    .copied()
+                {
+                    calendar.select_year(year);
+                    calendar.set_view(CalendarView::Year);
+                }
+            }
+        }
+    } else if matches!(key, "enter" | "space") {
+        match view {
+            CalendarView::Day => {
+                if let Some(date) = calendar_day(calendar) {
+                    calendar.activate_date(date, cx);
+                }
+            }
+            CalendarView::Month => calendar.select_month(calendar.current_month()),
+            CalendarView::Year => {
+                let years = calendar.years_on_page();
+                if let Some(year) = years
+                    .iter()
+                    .find(|year| **year == calendar.current_year())
+                    .or_else(|| years.first())
+                    .copied()
+                {
+                    calendar.select_year(year);
+                }
+            }
+        }
+    } else {
+        return false;
+    }
+    cx.notify();
+    true
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Date,
@@ -297,7 +428,8 @@ impl SnoozeDialog {
         self.amount
             .update(cx, |input, cx| input.set_value("2", window, cx));
         self.calendar.update(cx, |calendar, cx| {
-            calendar.set_date(
+            reset_calendar(
+                calendar,
                 NaiveDate::parse_from_str(&date, "%Y-%m-%d").expect("local date"),
                 window,
                 cx,
@@ -340,8 +472,9 @@ impl SnoozeDialog {
         self.calendar_open = !self.calendar_open;
         if self.calendar_open {
             if let Ok(date) = NaiveDate::parse_from_str(&self.date.read(cx).value(), "%Y-%m-%d") {
-                self.calendar
-                    .update(cx, |calendar, cx| calendar.set_date(date, window, cx));
+                self.calendar.update(cx, |calendar, cx| {
+                    reset_calendar(calendar, date, window, cx)
+                });
             }
             let focus = self.calendar.read(cx).focus_handle.clone();
             window.focus(&focus, cx);
@@ -383,27 +516,11 @@ impl SnoozeDialog {
             };
             window.focus(&stops[next], cx);
         } else if self.calendar_open && self.calendar.read(cx).focus_handle.is_focused(window) {
-            let current = self.calendar.read(cx).date().start();
-            let offset = match key {
-                "left" => -1,
-                "right" => 1,
-                "up" => -7,
-                "down" => 7,
-                _ => 0,
-            };
-            if let Some(date) =
-                current.and_then(|date| date.checked_add_signed(chrono::Duration::days(offset)))
+            if !self
+                .calendar
+                .update(cx, |calendar, cx| calendar_key(calendar, key, window, cx))
             {
-                if offset != 0 {
-                    self.calendar
-                        .update(cx, |calendar, cx| calendar.set_date(date, window, cx));
-                } else if matches!(key, "enter" | "space") {
-                    self.calendar.update(cx, |calendar, cx| {
-                        calendar.activate_date(date, cx);
-                    });
-                } else {
-                    return;
-                }
+                return;
             }
         } else if matches!(key, "enter" | "space") {
             if self.calendar_trigger.is_focused(window) {
@@ -505,6 +622,7 @@ impl SnoozeDialog {
         options: &[(T, &'static str)],
         value: T,
         pick: fn(&mut Self, T),
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = palette(cx);
@@ -519,13 +637,15 @@ impl SnoozeDialog {
             .children(options.iter().enumerate().map(|(index, (option, label))| {
                 let option = *option;
                 let pressed = option == value;
+                let focus = if id == "snooze-mode" {
+                    &self.mode_focus[index]
+                } else {
+                    &self.unit_focus[index]
+                };
+                let keyboard_focus = focus.is_focused(window) && window.last_input_was_keyboard();
                 div()
                     .id(SharedString::from(format!("{id}-{index}")))
-                    .track_focus(if id == "snooze-mode" {
-                        &self.mode_focus[index]
-                    } else {
-                        &self.unit_focus[index]
-                    })
+                    .track_focus(focus)
                     .flex_1()
                     .h(px(24.))
                     .px(px(10.))
@@ -547,6 +667,24 @@ impl SnoozeDialog {
                         } else {
                             hsla(p.background)
                         })
+                    })
+                    .when(keyboard_focus, |this| {
+                        this.shadow(vec![
+                            BoxShadow {
+                                color: hsla(p.ring),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(0.),
+                                spread_radius: px(3.),
+                                inset: true,
+                            },
+                            BoxShadow {
+                                color: hsla(p.background),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(0.),
+                                spread_radius: px(1.),
+                                inset: true,
+                            },
+                        ])
                     })
                     .child(*label)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -578,7 +716,7 @@ impl SnoozeDialog {
 }
 
 impl Render for SnoozeDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending.is_none() {
             return div().into_any_element();
         }
@@ -654,6 +792,7 @@ impl Render for SnoozeDialog {
                     ],
                     self.unit,
                     |this, unit| this.unit = unit,
+                    window,
                     cx,
                 )))
                 .into_any_element(),
@@ -738,6 +877,7 @@ impl Render for SnoozeDialog {
                                     &[(Mode::Date, "Date and time"), (Mode::Duration, "Duration")],
                                     self.mode,
                                     |this, mode| this.mode = mode,
+                                    window,
                                     cx,
                                 ))
                                 .child(body)
@@ -894,6 +1034,123 @@ mod tests {
 mod calendar_tests {
     use super::*;
     use t3_core::sidebar::time::{FixedZone, parse_iso};
+
+    #[gpui::test]
+    fn calendar_keyboard_tracks_visible_views_and_resets_navigation(cx: &mut gpui::TestAppContext) {
+        use gpui_base::CalendarView;
+        use std::{cell::RefCell, rc::Rc};
+        let (calendar, cx) = cx.add_window_view(CalendarState::new);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&calendar, move |_, event: &CalendarEvent, _| {
+                let CalendarEvent::Selected(date) = event;
+                observed.borrow_mut().push(*date);
+            })
+        });
+        let date = NaiveDate::from_ymd_opt(2030, 1, 31).unwrap();
+        let outcomes = cx.update(|window, cx| {
+            calendar.update(cx, |calendar, cx| {
+                window.set_rem_size(px(16.));
+                calendar.set_year_range((2000, 2100), cx);
+                let mut outcomes = Vec::new();
+                for view in [CalendarView::Month, CalendarView::Year] {
+                    calendar.set_date(date, window, cx);
+                    calendar.set_view(view);
+                    calendar_key(calendar, "enter", window, cx);
+                    outcomes.push((
+                        "caption Enter opens days",
+                        calendar.view() == CalendarView::Day
+                            && calendar.date().start() == Some(date),
+                    ));
+                    calendar.set_view(view);
+                    calendar.next_year_page();
+                    reset_calendar(calendar, date, window, cx);
+                    outcomes.push((
+                        "fresh request resets view and year page",
+                        calendar.view() == CalendarView::Day
+                            && calendar.years_on_page().contains(&2030),
+                    ));
+                }
+                calendar.set_view(CalendarView::Day);
+                calendar.set_date(date, window, cx);
+                calendar.next_month();
+                calendar_key(calendar, "right", window, cx);
+                outcomes.push((
+                    "arrow follows displayed month and clamps day",
+                    calendar.date().start() == NaiveDate::from_ymd_opt(2030, 3, 1),
+                ));
+                calendar.set_date(date, window, cx);
+                calendar.next_month();
+                calendar_key(calendar, "enter", window, cx);
+                outcomes.push((
+                    "day Enter activates displayed month",
+                    calendar.date().start() == NaiveDate::from_ymd_opt(2030, 2, 28),
+                ));
+                calendar.set_date(date, window, cx);
+                calendar.select_month(5);
+                calendar.set_view(CalendarView::Month);
+                calendar_key(calendar, "down", window, cx);
+                outcomes.push((
+                    "month arrow follows two-column grid",
+                    calendar.view() == CalendarView::Month
+                        && calendar.current_month() == 7
+                        && calendar.date().start() == Some(date),
+                ));
+                calendar_key(calendar, "space", window, cx);
+                outcomes.push((
+                    "month Space opens its day grid",
+                    calendar.view() == CalendarView::Day
+                        && calendar.current_month() == 7
+                        && calendar.date().start() == Some(date),
+                ));
+                calendar.set_date(date, window, cx);
+                calendar.set_year_range((2000, 2100), cx);
+                calendar.next_year_page();
+                let first = calendar.years_on_page()[0];
+                calendar.set_view(CalendarView::Year);
+                calendar_key(calendar, "down", window, cx);
+                outcomes.push((
+                    "year arrow follows visible page",
+                    calendar.view() == CalendarView::Year
+                        && calendar.current_year() == first + 5
+                        && calendar.date().start() == Some(date),
+                ));
+                calendar_key(calendar, "enter", window, cx);
+                outcomes.push((
+                    "year Enter opens its day grid",
+                    calendar.view() == CalendarView::Day
+                        && calendar.current_year() == first + 5
+                        && calendar.date().start() == Some(date),
+                ));
+                calendar.set_date(NaiveDate::from_ymd_opt(2032, 1, 31).unwrap(), window, cx);
+                calendar.next_month();
+                calendar_key(calendar, "enter", window, cx);
+                outcomes.push((
+                    "displayed leap month keeps valid day",
+                    calendar.date().start() == NaiveDate::from_ymd_opt(2032, 2, 29),
+                ));
+                let lower = NaiveDate::from_ymd_opt(2030, 3, 1).unwrap();
+                calendar.set_date(lower, window, cx);
+                calendar.set_disabled_matcher(move |date: &NaiveDate| *date < lower, window, cx);
+                calendar.prev_month();
+                calendar_key(calendar, "enter", window, cx);
+                outcomes.push((
+                    "pinned disabled matcher blocks activation",
+                    calendar.date().start() == Some(lower),
+                ));
+                outcomes
+            })
+        });
+        assert!(outcomes.iter().all(|(_, passed)| *passed), "{outcomes:?}");
+        assert_eq!(
+            *events.borrow(),
+            [
+                Date::Single(NaiveDate::from_ymd_opt(2030, 2, 28)),
+                Date::Single(NaiveDate::from_ymd_opt(2032, 2, 29))
+            ]
+        );
+    }
 
     #[test]
     fn calendar_lower_bound_follows_local_midnight() {
