@@ -152,6 +152,41 @@ fn scoped_project_items(entries: &[crate::new_thread::ProjectPickerEntry]) -> (
     (items, actions)
 }
 
+fn scoped_project_thread_items(
+    items: &[CommandPaletteItem],
+    actions: &HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>,
+    preferred: Option<&t3_core::sidebar::grouping::ProjectRef>,
+    primary: Option<&str>,
+) -> Vec<CommandPaletteItem> {
+    let drafts = items.iter().filter_map(|item| {
+        let (group, reference, draft) = actions.get(&item.value)?;
+        let target = group.registrations.iter().find(|project| project.reference() == *reference)?;
+        (*draft).then_some((item, group, target))
+    }).collect::<Vec<_>>();
+    let scratch = drafts.iter().filter(|(_, _, target)| target.is_scratch)
+        .find(|(_, _, target)| primary == Some(target.owner.saved_id.as_str()))
+        .or_else(|| drafts.iter().filter(|(_, _, target)| target.is_scratch)
+            .find(|(_, _, target)| preferred.is_some_and(|reference| reference.environment_id == target.owner.saved_id)))
+        .or_else(|| {
+            let mut offering = drafts.iter().filter(|(_, _, target)| target.is_scratch);
+            let first = offering.next()?;
+            offering.next().is_none().then_some(first)
+        });
+    let mut projects = drafts.iter().filter(|(_, _, target)| !target.is_scratch)
+        .map(|(item, group, _)| CommandPaletteItem { title:group.label.clone(), ..(*item).clone() }).collect::<Vec<_>>();
+    if let Some((item, _, _)) = scratch {
+        let first = drafts.iter().find(|(_, _, target)| target.is_scratch).unwrap();
+        let preferred_scratch = preferred.is_some_and(|reference| first.1.member_refs.contains(reference));
+        let index = if first.1.pinned || preferred_scratch {
+            drafts.iter().take_while(|(candidate, _, _)| candidate.value != first.0.value).filter(|(_, _, target)| !target.is_scratch).count()
+        } else {
+            (drafts.iter().filter(|(_, group, target)| !target.is_scratch && group.pinned).count() + 1).min(projects.len())
+        };
+        projects.insert(index, CommandPaletteItem { title:"No project".into(), search_terms:vec!["no project".into(),"without project".into(),"none".into()], ..(*item).clone() });
+    }
+    projects
+}
+
 fn palette_threads(
     model: &t3_core::sidebar::SidebarModel,
     history: &t3_core::sidebar::visits::OpenHistory,
@@ -385,20 +420,22 @@ impl CommandPalette {
         self.projects = build_project_action_items(&projects, "project", |_| Vec::new(), None);
         self.scoped_project_actions.clear();
         self.scoped_thread_actions.clear();
+        let preferred = crate::new_thread::default_project(state).and_then(|project_id| Some(t3_core::sidebar::grouping::ProjectRef { environment_id:state.environments.active.clone()?,project_id }));
         if !state.fleet.environments.is_empty() {
             let groups = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Palette, cx);
-            let preferred = crate::new_thread::default_project(state).and_then(|project_id| Some(t3_core::sidebar::grouping::ProjectRef { environment_id:state.environments.active.clone()?,project_id }));
             self.projects.clear();
             let entries = crate::new_thread::picker_entries(groups, preferred.as_ref());
             (self.projects, self.scoped_project_actions) = scoped_project_items(&entries);
         }
+        let primary = state.local_saved_environment().map(|environment| environment.id.as_str()).or_else(|| {
+            let mut local = state.environments.environments.iter().filter(|environment| environment.local);
+            let first = local.next()?;
+            local.next().is_none().then_some(first.id.as_str())
+        });
         let project_thread_items = if state.fleet.environments.is_empty() {
             build_project_action_items(&projects, "new-thread-in", |_| Vec::new(), None)
         } else {
-            self.projects.iter().filter_map(|item| {
-                let (group, _, draft) = self.scoped_project_actions.get(&item.value)?;
-                (*draft).then(|| CommandPaletteItem { title: if group.is_scratch { "No project".into() } else { group.label.clone() }, ..item.clone() })
-            }).collect()
+            scoped_project_thread_items(&self.projects, &self.scoped_project_actions, preferred.as_ref(), primary)
         };
         let mut actions = action_items(state);
         if !project_thread_items.is_empty() {
@@ -826,6 +863,18 @@ mod scoped_project_tests {
         build_scoped_project_groups(&GroupInput { projects: &projects, threads: &[], settings: &GroupingSettings::default(), preferences: &ProjectPreferences::default(), preferred_environment: Some("a"), consumer: GroupConsumer::Palette, sort: ProjectSortOrder::Manual })
     }
 
+    fn scratch_groups() -> Vec<ScopedProjectGroup> {
+        let mut projects = groups().into_iter().flat_map(|group| group.registrations).collect::<Vec<_>>();
+        for saved in ["scratch-a", "scratch-b"] {
+            let mut scratch = projects.iter().find(|project| project.owner.saved_id == "a").unwrap().clone();
+            scratch.owner.saved_id = saved.into(); scratch.owner.canonical_id = Some(saved.into());
+            scratch.project.title = saved.into(); scratch.project.workspace_root = format!("/{saved}");
+            scratch.project.repository_identity = None; scratch.is_scratch = true;
+            projects.push(scratch);
+        }
+        build_scoped_project_groups(&GroupInput { projects:&projects,threads:&[],settings:&GroupingSettings::default(),preferences:&ProjectPreferences::default(),preferred_environment:Some("scratch-b"),consumer:GroupConsumer::Palette,sort:ProjectSortOrder::Manual })
+    }
+
     #[test]
     fn scoped_project_picker_promotes_only_exact_unpinned_context() {
         let groups = groups();
@@ -856,9 +905,49 @@ mod scoped_project_tests {
         }
     }
 
+    #[test]
+    fn scoped_project_draft_picker_excludes_actual_scratch_targets() {
+        let preferred = ProjectRef { environment_id:"scratch-b".into(),project_id:"same".into() };
+        let entries = crate::new_thread::picker_entries(scratch_groups(), Some(&preferred));
+        let drafts = crate::new_thread::draft_picker_entries(entries).collect::<Vec<_>>();
+        assert!(drafts.iter().all(|entry| !entry.target.project.is_scratch));
+        assert_eq!(drafts.len(), 3);
+    }
+
+    #[test]
+    fn scoped_project_palette_offers_one_existing_scratch_target_in_context_order() {
+        for (saved, primary, expected, index) in [
+            ("scratch-b", Some("scratch-a"), Some("scratch-a"), 1),
+            ("scratch-b", None, Some("scratch-b"), 1),
+            ("b", None, None, 2),
+            ("b", Some("scratch-a"), Some("scratch-a"), 2),
+            ("scratch-b", Some("missing"), Some("scratch-b"), 1),
+        ] {
+            let preferred = ProjectRef { environment_id:saved.into(),project_id:"same".into() };
+            let entries = crate::new_thread::picker_entries(scratch_groups(), Some(&preferred));
+            let (items, actions) = scoped_project_items(&entries);
+            let root_scratch = items.iter().filter(|item| !actions[&item.value].2 && actions[&item.value].0.registrations.iter().any(|project| project.is_scratch)).count();
+            assert_eq!(root_scratch, 2, "root project search retains physical scratch entries");
+            let submenu = scoped_project_thread_items(&items, &actions, Some(&preferred), primary);
+            let scratch = submenu.iter().filter(|item| actions[&item.value].0.registrations.iter().all(|project| project.is_scratch)).collect::<Vec<_>>();
+            assert_eq!(scratch.len(), usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert_eq!(scratch[0].title, "No project");
+                assert_eq!(actions[&scratch[0].value].1.environment_id, expected);
+                let position = submenu.iter().position(|item| item.value == scratch[0].value).unwrap();
+                assert_eq!(position, index, "placement follows first ordered scratch, not selected destination");
+            }
+        }
+        let entries = crate::new_thread::picker_entries(scratch_groups().into_iter().filter(|group| !group.registrations.iter().any(|project| project.owner.saved_id == "scratch-b")).collect(), None);
+        let (items, actions) = scoped_project_items(&entries);
+        let submenu = scoped_project_thread_items(&items, &actions, None, None);
+        let scratch = submenu.iter().find(|item| item.title == "No project").unwrap();
+        assert_eq!(actions[&scratch.value].1.environment_id, "scratch-a", "sole existing offering does not need a primary or context");
+    }
+
     #[gpui::test]
     fn scoped_project_palette_empty_query_exposes_new_thread_group_browse(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (state, fixture) = cx.update(|cx| {
             let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
             crate::composer::init(cx);

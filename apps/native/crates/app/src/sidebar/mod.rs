@@ -99,6 +99,7 @@ impl SidebarPane {
         cx: &mut Context<Self>,
     ) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        state.update(cx, |state, _| state.sidebar.search_input = Some(search_input.downgrade()));
         let subscriptions = vec![
             cx.subscribe(&composer, |this, _, event: &crate::composer::drafts::DraftsChanged, cx| {
                 let state = this.state.read(cx);

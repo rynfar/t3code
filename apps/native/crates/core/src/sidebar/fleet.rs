@@ -123,6 +123,7 @@ pub struct ScopedSidebarModel {
     pub threads: Vec<ScopedSidebarThread>,
     pub index_by_key: HashMap<ThreadKey, usize>,
     pub project_names: HashMap<ProjectRef, String>,
+    pub folder_groups: HashMap<String, ScopedProjectGroup>,
     pub partition: Partition,
     pub rows: Vec<ScopedSidebarRow>,
     pub ordered: Vec<usize>,
@@ -236,6 +237,7 @@ impl ScopedSidebarModel {
             let by_pointer = indexes.iter().map(|index| (&threads[*index].thread as *const SidebarThread, *index)).collect::<HashMap<_, _>>();
             match section {
                 Section::Pinned => sort::sort_pinned(&mut rows),
+                Section::Active if input.folder_mode => sort::sort_working_by_send(&mut rows),
                 Section::Active if working_shelf_enabled => sort::sort_inbox_by_return(&mut rows, |thread| returned[&threads[by_pointer[&(thread as *const SidebarThread)]].key]),
                 Section::Active => sort::sort_active_by_order_key(&mut rows),
                 Section::Working => sort::sort_working_by_send(&mut rows),
@@ -267,12 +269,13 @@ impl ScopedSidebarModel {
             let scoped = !resolved.is_empty();
             for archived in [false, true] {
                 if archived && scoped { continue; }
-                for group in input.groups.iter().filter(|group| group.archived == archived) {
+                for group in input.groups.iter().filter(|group| group.archived == archived && (!scoped || resolved.contains(&group.key))) {
                     let rows = active.iter().copied().filter(|index| group.member_refs.contains(&model.threads[*index].project)).collect::<Vec<_>>();
-                    if rows.is_empty() && !(group.pinned || resolved.contains(&group.key) || archived) { continue; }
+                    if rows.is_empty() && !(scoped || (group.pinned && !archived)) { continue; }
                     let expanded = input.preferences.expanded(group);
                     let hidden = rows.iter().copied().filter(|index| !expanded && Some(*index) != selected).collect::<Vec<_>>();
                     let dot = folder_dot(&hidden.iter().map(|index| &model.threads[*index].thread).collect::<Vec<_>>());
+                    model.folder_groups.insert(group.key.clone(), group.clone());
                     model.rows.push(ScopedSidebarRow::Folder { key: group.key.clone(), expanded, hidden_count: hidden.len(), dot, archived });
                     let visible = rows.into_iter().filter(|index| expanded || Some(*index) == selected).collect::<Vec<_>>();
                     push(&mut model, &visible, Section::Active);

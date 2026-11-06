@@ -115,7 +115,7 @@ impl SidebarPane {
         drag.at = Some((row, after));
         let state = self.state.read(cx);
         let from = state.sidebar.fleet_drag.as_ref().map(|(_, from)| *from).or_else(|| state.sidebar.drag.as_ref().map(|(_, from)| *from));
-        let target = if state.sidebar.fleet_drag.is_some() { state.scoped_thread_drop_target(row + usize::from(after)).map(|(target, _)| target.section) }
+        let target = if state.sidebar.fleet_drag.is_some() { state.scoped_thread_drop_target(row + usize::from(after), cx).map(|(target, _)| target.section) }
             else { state.sidebar.model.drop_slot(row, after).and_then(|slot| state.thread_drop_target(slot)).map(|(target, _)| target.section) };
         drag.target = target;
         let verb = from.and_then(|from| resolve_drop_verb(from, target));

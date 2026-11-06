@@ -277,6 +277,9 @@ impl AppState {
         self.sidebar.fleet_state = previous.fleet_state;
         self.sidebar.fleet_selection = previous.fleet_selection;
         self.sidebar.fleet_anchor = previous.fleet_anchor;
+        self.sidebar.route_observed = previous.route_observed;
+        self.sidebar.route_pending = previous.route_pending;
+        self.sidebar.search_input = previous.search_input;
         self.sidebar.owner_omitted = previous.owner_omitted;
         self.sidebar.owner_favicons = previous.owner_favicons;
         self.sidebar.owner_extra_threads = previous.owner_extra_threads;
@@ -424,6 +427,7 @@ impl AppState {
         if let ScopedRouteAction::Thread(id)=&action && self.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(&owner.saved_id,id)).is_some_and(|_| self.scoped_environment(&owner.saved_id).is_some_and(|entry| !entry.summary.threads.iter().any(|row| row.thread.id==*id))) {
             self.read_scoped_family(&owner,id,cx);
         }
+        if let ScopedRouteAction::Thread(id) = &action { self.observe_scoped_route(t3_core::sidebar::tag_filter::ThreadKey::new(&owner.saved_id, id)); }
         self.pending_scoped_route = Some(ScopedRoute { owner: owner.clone(), action });
         if self.environments.active.as_deref() == Some(&owner.saved_id) {
             self.finish_scoped_route(cx);

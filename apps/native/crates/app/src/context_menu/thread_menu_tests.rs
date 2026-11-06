@@ -802,6 +802,13 @@ fn scoped_menu_keeps_background_owner_and_rejects_same_id_replacement(cx: &mut g
         assert!(state.project_preferences.resolved_scope(&groups, true).is_empty(), "the checked scratch alias must clear through the actual menu action");
         assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route);
     });
+    state.update(cx, |state, cx| {
+        let delegated = ThreadKey::new("background", "menu-thread");
+        state.notifications.visibility.delegated_under_parent.insert(delegated.clone());
+        state.rebuild_sidebar(cx);
+        assert!(state.sidebar.fleet.thread(&delegated).is_none(), "delegated rows are hidden under their parent across the fleet");
+        assert!(state.sidebar.fleet.thread(&ThreadKey::new("saved-fixture", "menu-thread")).is_some(), "same raw id in another owner must stay visible");
+    });
     assert!(client.take_commands().is_empty());
 }
 
@@ -837,6 +844,23 @@ fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut 
         assert_eq!(state.sidebar.undo.notice().unwrap().count,2);
         assert!(state.selected_thread.is_none());
     });
+    for folders in [false, true] {
+        cx.update(|cx| crate::settings::store::install_committed_client(&state, serde_json::from_value(serde_json::json!({"boringSidebarEnabled":folders})).unwrap(), cx));
+        state.update(cx, |state, cx| {
+            state.sidebar.settings.working_shelf_enabled=false;
+            state.rebuild_sidebar(cx);
+            let active=state.sidebar.fleet.partition.active.iter().map(|index| state.sidebar.fleet.threads[*index].key.clone()).collect::<Vec<_>>();
+            assert!(active.len()>1);
+            let dragged=active.last().unwrap().clone();
+            let target=active[0].clone();
+            state.start_scoped_thread_drag(&dragged, cx);
+            let slot=state.sidebar.fleet.rows.iter().position(|row| matches!(row, t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, section:t3_core::sidebar::Section::Active } if state.sidebar.fleet.threads[*index].key==target)).unwrap();
+            let plan=state.scoped_thread_drop_target(slot, cx);
+            if folders { assert!(plan.is_none(), "folder Active rows are time-ordered, not manually reorderable"); }
+            else { assert!(matches!(plan, Some((_, t3_core::sidebar::drag::DropPlan::MoveActive { assignments, .. })) if !assignments.is_empty()), "normal Active mode permits a real reorder"); }
+            state.end_thread_drag(cx);
+        });
+    }
     assert!(fixture.take_commands().is_empty());
 }
 
@@ -888,12 +912,13 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let (client,mut background)=t3_client::supervisor::ClientFixture::handle(project_filter_tests::session(true));
     let (shell,mut config)=state.read_with(cx,|state,_| (state.shell.clone(),state.server_config.clone()));
     config.config.as_mut().unwrap().environment.environment_id="background-env".into();
+    config.config.as_mut().unwrap().environment.capabilities.project_organization=Some(true);
     let (ready,loaded)=tokio::sync::oneshot::channel(); let mut ready=Some(ready);
     let _loaded=state.update(cx,|_,cx| cx.subscribe(&state,move |state,_,event,_| {
         if *event==crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some() { if let Some(ready)=ready.take() { let _=ready.send(()); } }
     }));
     let install=state.update(cx,|state,_| state.connections.install_fixture("background",client,shell,config,t3_client::supervisor::ConnectionStatus::Connected));
-    let _events=runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+    let events=runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
     let (shown,notice)=tokio::sync::oneshot::channel(); let mut shown=Some(shown);
     let _notice=state.update(cx,|_,cx| cx.subscribe(&state,move |state,_,event,_| {
         if *event==crate::app_state::AppEvent::Notice && state.sidebar.undo.notice().is_some() { if let Some(shown)=shown.take() { let _=shown.send(()); } }
@@ -909,6 +934,54 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
     state.read_with(cx,|state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
     assert!(active_fixture.take_commands().is_empty());
+    let captured = state.read_with(cx, |state, cx| state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.member_refs.contains(&t3_core::sidebar::grouping::ProjectRef { environment_id:"background".into(), project_id:"checkout-b".into() })).unwrap());
+    let original_owner = captured.registrations.iter().find(|project| project.owner.saved_id=="background" && project.project.id=="checkout-b").unwrap().owner.clone();
+    let (menu, cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+    cx.update(|window, cx| menu.update(cx, |menu, cx| {
+        menu.open_scoped_project(captured, point(px(10.), px(10.)), window, cx);
+        assert!(menu.open.as_ref().unwrap().items.iter().any(|item| item.action == MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin) && !item.disabled));
+    }));
+    let mut replacement = state.read_with(cx, |state, _| state.scoped_project(&t3_core::sidebar::grouping::ProjectRef { environment_id:"background".into(), project_id:"checkout-b".into() }).unwrap().project.clone());
+    replacement.created_at="replacement".into();
+    let (send, replaced)=tokio::sync::oneshot::channel(); let mut send=Some(send);
+    let _replaced=state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event==crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.projects.iter().any(|project| project.project.id=="checkout-b" && project.project.created_at=="replacement")) {
+            if let Some(send)=send.take() { let _=send.send(()); }
+        }
+    }));
+    runtime.spawn(async move { events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence:2, project:Box::new(replacement) })).await.unwrap(); }).await.unwrap();
+    replaced.await.unwrap();
+    state.read_with(cx, |state, _| assert_eq!(state.scoped_environment("background").unwrap().summary.owner, original_owner));
+    background.take_commands();
+    cx.update(|_, cx| menu.update(cx, |menu, cx| menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin), cx)));
+    let barrier=state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+    runtime.spawn(barrier).await.unwrap().unwrap();
+    cx.run_until_parked();
+    assert!(!background.take_commands().contains(&t3_core::projects::PROJECTS_MUTATE), "a captured folder menu must not pin a same-id replacement project");
+    state.read_with(cx, |state, _| assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before));
+    state.update(cx, |state, cx| {
+        let steps=["menu-thread", "sibling"].into_iter().map(|id| {
+            let owner=ThreadMenuOwner::capture_scoped(state, &t3_core::sidebar::tag_filter::ThreadKey::new("background", id)).unwrap();
+            (owner, t3_core::thread_actions::mark_unread(&crate::sidebar::controller::uuid(), id))
+        }).collect();
+        state.run_scoped_drop_steps(steps, cx);
+    });
+    let (method, payload, reply)=background.next_request().await;
+    assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+    assert_eq!(payload["threadId"], "menu-thread");
+    cx.update(|_, _| {
+        reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
+        background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":[]})).unwrap()));
+    });
+    let barrier=state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+    let _=runtime.spawn(barrier).await.unwrap();
+    cx.run_until_parked();
+    assert!(!background.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND), "grant drift after one saved action must stop before the second send");
+    state.read_with(cx, |state, _| {
+        let toast=state.toasts.latest().expect("partial completion must report why the action stopped");
+        assert_eq!(toast.kind, crate::toast::ToastKind::Error);
+        assert!(toast.description.as_ref().is_some_and(|description| description.starts_with("1 change(s) saved")));
+    });
 }
 
 #[gpui::test]
@@ -919,7 +992,7 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (state, mut active) = cx.update(|cx| project_filter_tests::install_state(cx, runtime.handle().clone()));
     let route = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
-    let (client, mut arriving) = ClientFixture::handle(project_filter_tests::session(true));
+    let (client, mut arriving) = ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
     let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
     for project in &mut shell.snapshot.as_mut().unwrap().projects { project.repository_identity = None; }
     config.config.as_mut().unwrap().environment.environment_id.clear();
@@ -961,5 +1034,51 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
     });
     assert!(active.take_commands().is_empty());
     assert!(arriving.take_commands().is_empty());
+    let incompatible = state.update(cx, |state, cx| {
+        let key=state.scoped_project(&ProjectRef { environment_id:"arriving".into(), project_id:"checkout-a".into() }).unwrap().physical_key();
+        state.set_scoped_project_scope(vec![key.clone()], cx);
+        state.sidebar.fleet_selection.insert(t3_core::sidebar::tag_filter::ThreadKey::new("arriving", "sibling"));
+        key
+    });
+    let (menu, cx)=cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+    cx.update(|window, cx| menu.update(cx, |menu, cx| {
+        menu.open_for_scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("arriving", "menu-thread"), point(px(10.), px(10.)), window, cx);
+        menu.close(cx);
+    }));
+    state.read_with(cx, |state, _| {
+        assert_eq!(state.project_preferences.scope_keys, vec![incompatible.clone()], "merely opening a menu must not widen the scope");
+        assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()), route);
+    });
+    let (send, selected)=tokio::sync::oneshot::channel(); let mut send=Some(send);
+    let _selected=state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event==crate::app_state::AppEvent::Selection && state.environments.active.as_deref()==Some("arriving") && state.selected_thread.as_deref()==Some("menu-thread") {
+            if let Some(send)=send.take() { let _=send.send(()); }
+        }
+    }));
+    state.update(cx, |state, cx| {
+        let owner=state.scoped_environment("arriving").unwrap().summary.owner.clone();
+        state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread("menu-thread".into()), cx);
+    });
+    selected.await.unwrap();
+    let (method, payload, reply)=arriving.next_request().await;
+    assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+    assert_eq!(payload["type"], "thread.visit");
+    assert_eq!(payload["threadId"], "menu-thread");
+    reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+    state.read_with(cx, |state, _| {
+        assert!(state.project_preferences.scope_keys.is_empty(), "an actual new route must reveal the out-of-scope destination");
+        assert!(state.sidebar.fleet_selection.is_empty());
+        assert!(state.sidebar.fleet.thread(&t3_core::sidebar::tag_filter::ThreadKey::new("arriving", "menu-thread")).is_some());
+    });
+    runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())).await.unwrap().unwrap();
+    assert!(t3_client::store::load_project_preferences().scope_keys.is_empty(), "the widened scope must be persisted");
+    state.update(cx, |state, cx| {
+        state.set_scoped_project_scope(vec![incompatible.clone()], cx);
+        state.rebuild_sidebar(cx);
+        state.select_thread("menu-thread", cx);
+        state.rebuild_sidebar(cx);
+        assert_eq!(state.project_preferences.scope_keys, vec![incompatible], "a deliberate scope on the same route must survive rebuilds and reselect");
+    });
+    assert!(!arriving.take_commands().iter().any(|method| matches!(*method, t3_core::commands::method::DISPATCH_COMMAND | t3_core::projects::PROJECTS_MUTATE)));
     state.update(cx, |state, _| state.stop_pump());
 }

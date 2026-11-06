@@ -293,7 +293,7 @@ impl AppState {
 
     fn scoped_drag_id(key: &t3_core::sidebar::tag_filter::ThreadKey) -> String { serde_json::to_string(&(&key.environment_id, &key.thread_id)).unwrap() }
 
-    pub fn scoped_thread_drop_target(&self, slot: usize) -> Option<(DropTarget, DropPlan)> {
+    pub fn scoped_thread_drop_target(&self, slot: usize, cx: &gpui::App) -> Option<(DropTarget, DropPlan)> {
         use t3_core::sidebar::fleet::ScopedSidebarRow;
         use t3_core::sidebar::drag::{DropItem, Marker};
         let (key, from) = self.sidebar.fleet_drag.as_ref()?;
@@ -317,12 +317,12 @@ impl AppState {
         let active_keys = model.threads.iter().map(|row| (Self::scoped_drag_id(&row.key), row.thread.active_order_key.clone())).collect();
         let writable = model.threads.iter().filter(|row| self.scoped_ready(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).map(|row| Self::scoped_drag_id(&row.key)).collect();
         let plan = plan_thread_drop(&DropPlanInput { active_key: &id, active_section: *from, active_pinned: row.thread.pinned, active_settled: row.thread.is_settled(), supports_settlement: true,
-            target: &target, pinned_order: &pinned, pinned_keys_by_id: &pinned_keys, reorderable_keys: Some(&writable), active_order: &active, active_keys_by_id: &active_keys, active_reorderable_keys: Some(&writable), active_time_ordered: self.sidebar.settings.working_shelf_enabled });
+            target: &target, pinned_order: &pinned, pinned_keys_by_id: &pinned_keys, reorderable_keys: Some(&writable), active_order: &active, active_keys_by_id: &active_keys, active_reorderable_keys: Some(&writable), active_time_ordered: self.sidebar.settings.working_shelf_enabled || crate::settings::store::client(cx).boring_sidebar_enabled() });
         (plan != DropPlan::None).then_some((target, plan))
     }
 
     pub fn drop_scoped_thread(&mut self, slot: usize, cx: &mut Context<Self>) {
-        let planned = self.sidebar.fleet_drag.as_ref().map(|(key, _)| key.clone()).zip(self.scoped_thread_drop_target(slot));
+        let planned = self.sidebar.fleet_drag.as_ref().map(|(key, _)| key.clone()).zip(self.scoped_thread_drop_target(slot, cx));
         self.end_thread_drag(cx);
         let Some((key, (_, plan))) = planned else { return };
         let id = Self::scoped_drag_id(&key);
@@ -365,11 +365,23 @@ impl AppState {
                 && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))).unwrap_or(false) { return; }
             for (completed, ((((owner, command), target), undo), stop_first)) in steps.into_iter().zip(targets).zip(undo).zip(stop).enumerate() {
                 if !this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.response_after_placement(state) && owner.can_operate_owner(state)
-                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) { return; }
+                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) {
+                    let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped")
+                        .description(format!("{completed} change(s) saved before destination or permission changed")), cx));
+                    return;
+                }
                 if stop_first {
-                    if target.client.dispatch(t3_core::commands::stop_thread(&uuid(), &owner.thread)).await.is_err() { return; }
+                    if let Err(error) = target.client.dispatch(t3_core::commands::stop_thread(&uuid(), &owner.thread)).await {
+                        let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped")
+                            .description(format!("{completed} change(s) saved before {}: {error}", owner.thread)), cx));
+                        return;
+                    }
                     if !this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.current(state) && owner.can_operate_owner(state)
-                        && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) { return; }
+                        && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) {
+                        let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped")
+                            .description(format!("{completed} change(s) saved before destination or permission changed")), cx));
+                        return;
+                    }
                 }
                 if let Err(error) = target.client.dispatch(command).await {
                     let _ = this.update(cx, |state, cx| {

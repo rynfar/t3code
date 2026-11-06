@@ -1269,6 +1269,10 @@ fn scoped_preferences_keep_missing_intent_scratch_migration_and_consumer_order()
     let settings_groups = build_scoped_project_groups(&GroupInput { consumer: GroupConsumer::Settings, ..input });
     assert_eq!(settings_groups.len(), 3);
     assert_eq!(settings_groups.iter().map(|group| group.label.as_str()).collect::<Vec<_>>(), ["a", "AAA", "b"]);
+    let mut pinned_projects = projects.clone();
+    pinned_projects[1].project.pinned_at = Some("2026-01-01T00:00:00Z".into());
+    let pinned_groups = build_scoped_project_groups(&GroupInput { projects:&pinned_projects, ..input });
+    assert!(pinned_groups[0].pinned, "Sidebar stably puts pinned logical groups before the physical manual order");
     preferences.project_expanded.insert(legacy_project_cwd_key("/scratch"), false);
     assert!(!preferences.expanded(scratch));
     preferences.set_expanded(scratch, true);
@@ -1342,6 +1346,47 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let older_aliases = [ScopedOlderSettled { owner: &ea.owner, older: &older, frontier: None }, ScopedOlderSettled { owner: &alias.owner, older: &older, frontier: None }];
     let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &aliases, older: &older_aliases, folder_mode: false, selected: None, ..input }, &mut state);
     assert_eq!(model.settled_count, 2);
+
+    let mut scope_groups = groups.clone();
+    scope_groups[0].key = "chosen".into();
+    let mut pinned_empty = scope_groups[0].clone();
+    pinned_empty.key = "pinned-empty".into(); pinned_empty.member_refs.clear(); pinned_empty.pinned = true;
+    let mut archived_empty = pinned_empty.clone();
+    archived_empty.key = "archived-empty".into(); archived_empty.archived = true;
+    let mut archived_active = scope_groups[0].clone();
+    archived_active.key = "archived-active".into(); archived_active.archived = true;
+    scope_groups.extend([pinned_empty, archived_empty]);
+    let mut older_send = threads[0].clone();
+    older_send.thread.id = "older-send".into(); older_send.thread.active_order_key = Some("a".into());
+    older_send.thread.created_at = Some(1); older_send.thread.latest_user_authored_message_at = Some(Some(10));
+    let mut newer_send = older_send.clone();
+    newer_send.thread.id = "newer-send".into(); newer_send.thread.active_order_key = Some("z".into());
+    newer_send.thread.latest_user_authored_message_at = Some(Some(20));
+    let mut environment = ea.clone(); environment.threads = vec![older_send, newer_send];
+    let environments = [&environment];
+    let prefs = ProjectPreferences::default();
+    let sidebar = SidebarSettings { working_shelf_enabled:false, ..Default::default() };
+    let folder_input = ScopedSidebarInput { environments: &environments, groups: &scope_groups, preferences: &prefs, settings:&sidebar, selected: None, older: &[], folder_mode: true, ..input };
+    let reports = [
+        ("folder-send", true, Vec::new()),
+        ("normal-manual", false, Vec::new()),
+        ("scoped-only", true, vec!["chosen".into()]),
+    ].map(|(name, folder_mode, scope_keys)| {
+        let preferences = ProjectPreferences { scope_keys, ..Default::default() };
+        let model = ScopedSidebarModel::build(&ScopedSidebarInput { preferences: &preferences, folder_mode, ..folder_input }, &mut ScopedSidebarState::default());
+        let folders = model.rows.iter().filter_map(|row| match row { ScopedSidebarRow::Folder { key, .. } => Some(key.clone()), _ => None }).collect::<Vec<_>>();
+        let order = model.ordered.iter().map(|index| model.threads[*index].thread.id.clone()).collect::<Vec<_>>();
+        (name, folders, order)
+    });
+    assert_eq!(reports, [
+        ("folder-send", vec!["chosen".into(), "pinned-empty".into()], vec!["newer-send".into(), "older-send".into()]),
+        ("normal-manual", vec![], vec!["older-send".into(), "newer-send".into()]),
+        ("scoped-only", vec!["chosen".into()], vec!["newer-send".into(), "older-send".into()]),
+    ]);
+    let archived = [archived_active];
+    let model = ScopedSidebarModel::build(&ScopedSidebarInput { groups: &archived, ..folder_input }, &mut ScopedSidebarState::default());
+    assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Folder { archived:true, .. })));
+    assert_eq!(model.ordered.len(), 2, "archived projects keep folders only for their Active rows");
 }
 
 

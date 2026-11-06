@@ -507,6 +507,8 @@ pub fn build_scoped_project_groups(input: &GroupInput<'_>) -> Vec<ScopedProjectG
     }
     if input.consumer == GroupConsumer::DraftPicker {
         groups.retain(|group| !group.archived);
+    }
+    if matches!(input.consumer, GroupConsumer::Sidebar | GroupConsumer::DraftPicker) {
         groups.sort_by_key(|group| !group.pinned);
     }
     groups

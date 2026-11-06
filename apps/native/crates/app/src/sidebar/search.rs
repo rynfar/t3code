@@ -46,6 +46,9 @@ impl SearchState {
             return;
         }
         self.query = query;
+        if self.query.trim().is_empty() {
+            state.update(cx, |state, cx| { state.rebuild_sidebar(cx); cx.emit(crate::app_state::AppEvent::Shell); });
+        }
         self.highlighted = 0;
         self.content_matches.clear();
         self.requests.clear();

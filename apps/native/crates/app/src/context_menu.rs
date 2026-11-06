@@ -861,6 +861,7 @@ pub(crate) mod project_filter_tests {
                 "auth":{"phase":"idle"},"install":{"phase":"idle"}
             })).unwrap();
             cx.set_global(fixture);
+        t3_client::store::save_last_thread("");
         let state = cx.new(|cx| AppState::new(runtime, cx));
         let (client, mut fixture) = ClientFixture::handle(session(true));
         state.update(cx, |state, cx| {

@@ -47,6 +47,10 @@ pub(crate) fn picker_entries(
     entries
 }
 
+pub(crate) fn draft_picker_entries(entries: Vec<ProjectPickerEntry>) -> impl Iterator<Item = ProjectPickerEntry> {
+    entries.into_iter().filter(|entry| !entry.target.project.is_scratch)
+}
+
 pub fn init(state: Entity<AppState>, cx: &mut App) {
     let scratch = state.clone();
     cx.on_action(move |_: &NewThread, cx| state.update(cx, start_new_thread));
@@ -168,8 +172,7 @@ impl DraftHero {
             .unwrap_or_default();
         if !app.fleet.environments.is_empty() {
             let preferred = current.as_ref().and_then(|id| Some(t3_core::sidebar::grouping::ProjectRef { environment_id: app.environments.active.clone()?, project_id:id.clone() }));
-            projects = picker_entries(app.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::DraftPicker, cx), preferred.as_ref()).into_iter()
-                .filter(|entry| !entry.group.is_scratch)
+            projects = draft_picker_entries(picker_entries(app.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::DraftPicker, cx), preferred.as_ref()))
                 .map(|entry| (entry.group.key, entry.target.project.project.id, entry.group.label, Some(entry.target.project.owner))).collect();
         }
         div()

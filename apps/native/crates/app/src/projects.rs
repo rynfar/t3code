@@ -30,9 +30,10 @@ impl AppState {
 
     pub(crate) fn pin_scoped_project_group(&mut self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, pinned: bool, cx: &mut Context<Self>) {
         let refs = group.mutation_refs();
-        let members: Option<Vec<_>> = refs.iter().map(|key| self.scoped_project(key).cloned()).collect();
+        let members: Option<Vec<_>> = refs.iter().map(|key| group.registrations.iter().find(|project| project.reference() == *key).cloned()).collect();
         let Some(members) = members else { return; };
-        if members.iter().any(|project| !self.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)) { return; }
+        if members.iter().any(|project| !self.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+            || !self.scoped_project(&project.reference()).is_some_and(|current| current.owner == project.owner && current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)) { return; }
         let lookups: Vec<_> = members.iter().map(|project| self.connections.destination(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect();
         cx.spawn(async move |this, cx| {
             let mut destinations = Vec::new();

@@ -135,6 +135,9 @@ pub struct SidebarController {
     pub owner_omitted: std::collections::HashMap<t3_core::sidebar::grouping::EnvironmentOwner, crate::omitted_rows::OmittedRows>,
     pub fleet_selection: std::collections::HashSet<t3_core::sidebar::tag_filter::ThreadKey>,
     pub fleet_anchor: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) route_observed: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) route_pending: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) search_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
     pub grouping_projects: Vec<t3_core::sidebar::grouping::ScopedProject>,
     pub grouping_threads: Vec<t3_core::sidebar::fleet::ScopedThread>,
     pub fleet_drag: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::sidebar::Section)>,
@@ -383,10 +386,11 @@ impl AppState {
 
     fn rebuild_fleet_sidebar(&mut self, cx: &mut Context<Self>) {
         if self.fleet.environments.is_empty() { return; }
+        self.reveal_scoped_route(cx);
         let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
         let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
         let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id));
-        let hidden = self.notifications.visibility.hidden.clone();
+        let hidden = self.notifications.visibility.hidden.union(&self.notifications.visibility.delegated_under_parent).cloned().collect();
         let owners: std::collections::HashSet<_> = environments.iter().map(|entry| entry.owner.clone()).collect();
         self.sidebar.owner_omitted.retain(|owner, _| owners.contains(owner));
         let older_values: Vec<_> = self.sidebar.owner_omitted.iter().filter_map(|(owner, omitted)| omitted.older().map(|older| (owner, older))).collect();
@@ -498,6 +502,33 @@ impl AppState {
             _ => return,
         };
         self.run_scoped_command(owner, command, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE, "Thread action failed", cx);
+    }
+
+    pub(crate) fn observe_scoped_route(&mut self, key: t3_core::sidebar::tag_filter::ThreadKey) {
+        if self.sidebar.route_observed.as_ref() != Some(&key) {
+            self.sidebar.route_observed = Some(key.clone());
+            self.sidebar.route_pending = Some(key);
+        }
+    }
+
+    fn reveal_scoped_route(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id)) { self.observe_scoped_route(key); }
+        let Some(key) = self.sidebar.route_pending.clone() else { return; };
+        if self.sidebar.search_input.as_ref().and_then(gpui::WeakEntity::upgrade).is_some_and(|input| !input.read(cx).value().trim().is_empty())
+            || !self.fleet.environments.iter().all(|entry| entry.summary.synchronized && entry.config.config.is_some()) { return; }
+        let Some(thread) = self.scoped_thread(&key) else { return; };
+        if self.notifications.visibility.hidden.contains(&key) || self.notifications.visibility.delegated_under_parent.contains(&key)
+            || (self.environments.active.as_deref() == Some(&key.environment_id) && self.sidebar.hidden_thread_ids.contains(&key.thread_id)) { return; }
+        let reference = thread.project_ref();
+        let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let Some(group) = groups.iter().find(|group| !group.archived && group.member_refs.contains(&reference)) else { return; };
+        let scope = self.scoped_project_scope(&groups);
+        self.sidebar.route_pending = None;
+        if !scope.is_empty() && !scope.contains(&group.key) {
+            self.project_preferences.scope_keys.clear();
+            self.sidebar.fleet_selection.clear();
+            self.save_project_preferences(cx);
+        }
     }
 
     pub(crate) fn scoped_project_scope(&self, groups: &[t3_core::sidebar::grouping::ScopedProjectGroup]) -> Vec<String> {
