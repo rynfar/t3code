@@ -87,7 +87,7 @@ fn hover_action(id: SharedString, p: Palette) -> gpui::Stateful<gpui::Div> {
 }
 
 impl SidebarPane {
-    pub(super) fn render_row(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if index < self.drafts.rows.len() { return self.render_draft_row(index, cx); }
         let index = if self.drafts.rows.is_empty() { index } else {
             if index == self.drafts.rows.len() {
@@ -110,7 +110,7 @@ impl SidebarPane {
                 t3_core::sidebar::fleet::ScopedSidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, cx),
                 t3_core::sidebar::fleet::ScopedSidebarRow::ShowMore { count } => self.render_show_more(*count, cx),
                 t3_core::sidebar::fleet::ScopedSidebarRow::Marker(marker) => self.render_marker(*marker, cx),
-                t3_core::sidebar::fleet::ScopedSidebarRow::Folder { key, expanded, hidden_count, dot, .. } => self.render_project_folder(key, *expanded, *hidden_count, *dot, cx),
+                t3_core::sidebar::fleet::ScopedSidebarRow::Folder { key, expanded, hidden_count, dot, .. } => self.render_project_folder(key, *expanded, *hidden_count, *dot, window, cx),
             };
             return div().id(("scoped-sidebar-row", index)).relative()
                 .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedThread>, _, cx| this.drag_moved(index, event, cx)))

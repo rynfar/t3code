@@ -908,7 +908,7 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let runtime=tokio::runtime::Runtime::new().unwrap();
     let (state,mut active_fixture)=cx.update(|cx| project_filter_tests::install_state(cx,runtime.handle().clone()));
     let before=state.read_with(cx,|state,_| (state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()));
-    let (client,mut background)=t3_client::supervisor::ClientFixture::handle(project_filter_tests::session(true));
+    let (client,mut background)=t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
     let (shell,mut config)=state.read_with(cx,|state,_| (state.shell.clone(),state.server_config.clone()));
     config.config.as_mut().unwrap().environment.environment_id="background-env".into();
     config.config.as_mut().unwrap().environment.capabilities.project_organization=Some(true);
@@ -940,6 +940,60 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         menu.open_scoped_project(captured, point(px(10.), px(10.)), window, cx);
         assert!(menu.open.as_ref().unwrap().items.iter().any(|item| item.action == MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin) && !item.disabled));
     }));
+    let group = menu.read_with(cx, |menu, _| menu.open.as_ref().unwrap().scoped_group.clone().unwrap());
+    cx.update(|window, cx| menu.update(cx, |menu, cx| {
+        menu.open_scoped_project(group.clone(), point(px(10.), px(10.)), window, cx);
+        menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin), cx);
+    }));
+    let mut changed = std::collections::HashSet::new();
+    for _ in 0..group.mutation_refs().len() {
+        let (method, payload, reply) = background.next_request().await;
+        assert_eq!(method, t3_core::projects::PROJECTS_MUTATE);
+        assert_eq!(payload["type"], "project.update");
+        assert_eq!(payload["pinned"], true);
+        changed.insert(payload["projectId"].as_str().unwrap().to_owned());
+        reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+    }
+    assert_eq!(changed, std::collections::HashSet::from(["checkout-a".to_owned(), "checkout-b".to_owned()]));
+    cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(group.clone(), point(px(10.), px(10.)), window, cx)));
+    let owner_before = state.read_with(cx, |state, _| state.scoped_environment("background").unwrap().summary.owner.clone());
+    for supported in [false, true] {
+        let mut changed_config = state.read_with(cx, |state, _| state.scoped_environment("background").unwrap().config.config.clone().unwrap());
+        changed_config.environment.capabilities.project_organization = Some(supported);
+        let (ready, applied) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").and_then(|entry| entry.config.config.as_ref()).is_some_and(|config| config.environment.capabilities.project_organization == Some(supported)) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let changed_events = events.clone();
+        runtime.spawn(async move { changed_events.send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(changed_config) }))).await.unwrap(); }).await.unwrap();
+        applied.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.scoped_environment("background").unwrap().summary.owner, owner_before);
+            assert!(state.scoped_ready(&owner_before, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+            for captured in &group.registrations {
+                let current = state.scoped_project(&captured.reference()).unwrap();
+                assert_eq!(current.project.created_at, captured.project.created_at);
+                assert_eq!(current.project.workspace_root, captured.project.workspace_root);
+            }
+        });
+        if !supported {
+            cx.update(|_, cx| menu.update(cx, |menu, cx| menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin), cx)));
+            let barrier = state.read_with(cx, |state, _| state.connections.destination(&owner_before, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+            runtime.spawn(barrier).await.unwrap().unwrap();
+            cx.run_until_parked();
+            assert!(!background.take_commands().contains(&t3_core::projects::PROJECTS_MUTATE), "a captured project menu must refuse pin after projectOrganization is removed");
+            state.read_with(cx, |state, _| {
+                let toast = state.toasts.latest().expect("a project capability refusal must be visible");
+                assert_eq!(toast.kind, crate::toast::ToastKind::Error);
+                assert!(toast.description.as_ref().is_some_and(|description| !description.is_empty()));
+                assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before);
+            });
+        }
+    }
+    cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(group.clone(), point(px(10.), px(10.)), window, cx)));
     let mut replacement = state.read_with(cx, |state, _| state.scoped_project(&t3_core::sidebar::grouping::ProjectRef { environment_id:"background".into(), project_id:"checkout-b".into() }).unwrap().project.clone());
     replacement.created_at="replacement".into();
     let (send, replaced)=tokio::sync::oneshot::channel(); let mut send=Some(send);
@@ -948,7 +1002,8 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
             if let Some(send)=send.take() { let _=send.send(()); }
         }
     }));
-    runtime.spawn(async move { events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence:2, project:Box::new(replacement) })).await.unwrap(); }).await.unwrap();
+    let replacement_events = events.clone();
+    runtime.spawn(async move { replacement_events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence:2, project:Box::new(replacement) })).await.unwrap(); }).await.unwrap();
     replaced.await.unwrap();
     state.read_with(cx, |state, _| assert_eq!(state.scoped_environment("background").unwrap().summary.owner, original_owner));
     background.take_commands();
@@ -981,6 +1036,218 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         assert_eq!(toast.kind, crate::toast::ToastKind::Error);
         assert!(toast.description.as_ref().is_some_and(|description| description.starts_with("1 change(s) saved")));
     });
+    background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
+    let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+    runtime.spawn(barrier).await.unwrap().unwrap();
+    cx.run_until_parked();
+    let stable = state.read_with(cx, |state, cx| state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.member_refs.contains(&t3_core::sidebar::grouping::ProjectRef { environment_id:"background".into(), project_id:"checkout-a".into() })).unwrap());
+    let representative = stable.representative.clone();
+    state.read_with(cx, |state, cx| assert_eq!(state.scoped_project_action_target(&stable, cx).unwrap().project.reference(), representative));
+    let mut title_only = state.read_with(cx, |state, _| state.scoped_project(&representative).unwrap().project.clone());
+    title_only.title = "Harmless title change".into();
+    let (ready, renamed) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+    let renamed_ref = representative.clone();
+    let _renamed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&renamed_ref).is_some_and(|project| project.project.title == "Harmless title change") {
+            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        }
+    }));
+    let title_events = events.clone();
+    runtime.spawn(async move { title_events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence:3, project:Box::new(title_only) })).await.unwrap(); }).await.unwrap();
+    renamed.await.unwrap();
+    state.read_with(cx, |state, cx| assert_eq!(state.scoped_project_action_target(&stable, cx).unwrap().project.reference(), representative));
+    cx.update(|window, cx| menu.update(cx, |menu, cx| {
+        menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx);
+        menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin), cx);
+    }));
+    let mut changed = std::collections::HashSet::new();
+    for _ in 0..stable.mutation_refs().len() {
+        let (method, payload, reply) = background.next_request().await;
+        assert_eq!(method, t3_core::projects::PROJECTS_MUTATE);
+        assert_eq!(payload["pinned"], true);
+        changed.insert(payload["projectId"].as_str().unwrap().to_owned());
+        reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+    }
+    assert_eq!(changed, std::collections::HashSet::from(["checkout-a".to_owned(), "checkout-b".to_owned()]), "harmless title changes must not invalidate a captured group");
+    let mut next_sequence = 4;
+    for reference in &stable.member_refs {
+        let mut pinned = state.read_with(cx, |state, _| state.scoped_project(reference).unwrap().project.clone());
+        pinned.pinned_at = Some("2026-11-06T00:00:00Z".into());
+        let reference = reference.clone();
+        let (ready, applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&reference).is_some_and(|project| project.project.pinned_at.is_some()) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let pin_events = events.clone();
+        let sequence = next_sequence;
+        next_sequence += 1;
+        runtime.spawn(async move { pin_events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence, project:Box::new(pinned) })).await.unwrap(); }).await.unwrap();
+        applied.await.unwrap();
+    }
+    let pinned_group = state.read_with(cx, |state, cx| state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.key == stable.key).unwrap());
+    cx.update(|window, cx| menu.update(cx, |menu, cx| {
+        menu.open_scoped_project(pinned_group, point(px(10.), px(10.)), window, cx);
+        assert!(menu.open.as_ref().unwrap().items.iter().any(|item| item.action == MenuAction::Project(t3_core::thread_actions::ProjectAction::Unpin) && item.label == "Unpin project" && !item.disabled));
+        menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::Unpin), cx);
+    }));
+    let mut unpinned = std::collections::HashSet::new();
+    for _ in 0..stable.mutation_refs().len() {
+        let (method, payload, reply) = background.next_request().await;
+        assert_eq!(method, t3_core::projects::PROJECTS_MUTATE);
+        assert_eq!(payload["type"], "project.update");
+        assert_eq!(payload["pinned"], false);
+        unpinned.insert(payload["projectId"].as_str().unwrap().to_owned());
+        reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+    }
+    assert_eq!(unpinned, changed, "Unpin reaches each original physical checkout exactly once");
+    for completed in [0, 1] {
+        let (ready, stopped) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _stopped = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Project pin stopped" && toast.description.as_ref().is_some_and(|description| description.starts_with(&format!("{completed} checkout(s) changed;")))) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        state.update(cx, |state, cx| state.pin_scoped_project_group(&stable, true, cx));
+        for _ in 0..completed {
+            let (method, payload, reply) = background.next_request().await;
+            assert_eq!(method, t3_core::projects::PROJECTS_MUTATE);
+            assert_eq!(payload["pinned"], true);
+            reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+        }
+        let (method, payload, reply) = background.next_request().await;
+        assert_eq!(method, t3_core::projects::PROJECTS_MUTATE);
+        assert_eq!(payload["pinned"], true);
+        background.take_commands();
+        reply.send(Err(t3_client::session::RpcError::Closed)).unwrap();
+        stopped.await.unwrap();
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        runtime.spawn(barrier).await.unwrap().unwrap();
+        cx.run_until_parked();
+        assert!(!background.take_commands().contains(&t3_core::projects::PROJECTS_MUTATE), "a failed project write must not continue to later targets");
+        state.read_with(cx, |state, _| assert_eq!(state.toasts.latest().unwrap().kind, crate::toast::ToastKind::Error));
+    }
+    state.update(cx, |state, cx| state.pin_scoped_project_group(&stable, true, cx));
+    let (method, payload, first_reply) = background.next_request().await;
+    assert_eq!(method, t3_core::projects::PROJECTS_MUTATE);
+    assert_eq!(payload["pinned"], true);
+    background.take_commands();
+    let mut first_reply = Some(first_reply);
+    for supported in [false, true] {
+        let mut changed_config = state.read_with(cx, |state, _| state.scoped_environment("background").unwrap().config.config.clone().unwrap());
+        changed_config.environment.capabilities.project_organization = Some(supported);
+        let (ready, applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").and_then(|entry| entry.config.config.as_ref()).is_some_and(|config| config.environment.capabilities.project_organization == Some(supported)) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let config_events = events.clone();
+        runtime.spawn(async move { config_events.send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config:Box::new(changed_config) }))).await.unwrap(); }).await.unwrap();
+        applied.await.unwrap();
+        if !supported {
+            let (ready, stopped) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+            let _stopped = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == crate::app_state::AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.description.as_ref().is_some_and(|description| description.starts_with("1 checkout(s) changed before"))) {
+                    if let Some(ready) = ready.take() { let _ = ready.send(()); }
+                }
+            }));
+            first_reply.take().unwrap().send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+            stopped.await.unwrap();
+            let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+            runtime.spawn(barrier).await.unwrap().unwrap();
+            cx.run_until_parked();
+            assert!(!background.take_commands().contains(&t3_core::projects::PROJECTS_MUTATE), "capability loss while first write waits must stop before second write");
+            state.read_with(cx, |state, _| assert_eq!(state.toasts.latest().unwrap().kind, crate::toast::ToastKind::Error));
+        }
+    }
+    for action in [t3_core::thread_actions::ProjectAction::NewThread, t3_core::thread_actions::ProjectAction::Settings] {
+        cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
+        background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:operate"]})).unwrap()));
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        assert!(matches!(runtime.spawn(barrier).await.unwrap(), Err(t3_client::environments::DestinationError::Denied)));
+        cx.run_until_parked();
+        state.read_with(cx, |state, cx| {
+            assert!(!state.scoped_ready(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
+            assert!(state.scoped_ready(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+            assert!(state.scoped_project_action_target(&stable, cx).is_ok(), "read refusal must be independent of captured group identity");
+            for captured in &stable.registrations {
+                let current = state.scoped_project(&captured.reference()).unwrap();
+                assert_eq!(current.owner, captured.owner);
+                assert_eq!(current.project.created_at, captured.project.created_at);
+                assert_eq!(current.project.workspace_root, captured.project.workspace_root);
+            }
+        });
+        background.take_commands();
+        cx.update(|_, cx| menu.update(cx, |menu, cx| menu.activate(MenuAction::Project(action), cx)));
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        runtime.spawn(barrier).await.unwrap().unwrap();
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before);
+            let toast = state.toasts.latest().expect("read grant refusal must be visible");
+            assert_eq!(toast.kind, crate::toast::ToastKind::Error);
+            assert_eq!(toast.title, "Project action stopped", "captured project navigation must visibly refuse current read-grant loss");
+            assert!(toast.description.as_ref().is_some_and(|description| !description.is_empty()));
+        });
+        assert!(background.take_commands().is_empty(), "read-refused project navigation must not send RPCs");
+        background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        runtime.spawn(barrier).await.unwrap().unwrap();
+        cx.run_until_parked();
+    }
+    cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
+    let split_ref = stable.member_refs.iter().find(|reference| **reference != representative).unwrap().clone();
+    let mut split = state.read_with(cx, |state, _| state.scoped_project(&split_ref).unwrap().project.clone());
+    split.repository_identity = Some(serde_json::json!({"canonicalKey":"different-repository"}));
+    let (ready, split_applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+    let split_key = split_ref.clone();
+    let _split = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&split_key).is_some_and(|project| project.project.repository_identity.as_ref().is_some_and(|identity| identity["canonicalKey"] == "different-repository")) {
+            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        }
+    }));
+    let split_events = events.clone();
+    let sequence = next_sequence;
+    next_sequence += 1;
+    runtime.spawn(async move { split_events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence, project:Box::new(split) })).await.unwrap(); }).await.unwrap();
+    split_applied.await.unwrap();
+    state.read_with(cx, |state, cx| {
+        let current = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        assert!(current.iter().find(|group| group.key == stable.key).is_some_and(|group| group.member_refs.len() < stable.member_refs.len()));
+        for captured in &stable.registrations {
+            let current = state.scoped_project(&captured.reference()).unwrap();
+            assert_eq!(current.owner, captured.owner);
+            assert_eq!(current.project.created_at, captured.project.created_at);
+            assert_eq!(current.project.workspace_root, captured.project.workspace_root);
+        }
+    });
+    cx.update(|_, cx| menu.update(cx, |menu, cx| menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::Pin), cx)));
+    let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+    runtime.spawn(barrier).await.unwrap().unwrap();
+    cx.run_until_parked();
+    let membership_refused = !background.take_commands().contains(&t3_core::projects::PROJECTS_MUTATE);
+    state.read_with(cx, |state, cx| assert!(state.scoped_project_action_target(&stable, cx).is_err(), "Copy-path planning must refuse changed membership without touching the clipboard"));
+    cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
+    let mut replaced_representative = state.read_with(cx, |state, _| state.scoped_project(&representative).unwrap().project.clone());
+    replaced_representative.created_at = "replaced-representative".into();
+    let (ready, representative_applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+    let replaced_ref = representative.clone();
+    let _representative = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&replaced_ref).is_some_and(|project| project.project.created_at == "replaced-representative") {
+            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        }
+    }));
+    runtime.spawn(async move { events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence:next_sequence, project:Box::new(replaced_representative) })).await.unwrap(); }).await.unwrap();
+    representative_applied.await.unwrap();
+    state.read_with(cx, |state, cx| assert!(state.scoped_project_action_target(&stable, cx).is_err(), "Copy-path planning must refuse a replaced representative without touching the clipboard"));
+    cx.update(|_, cx| menu.update(cx, |menu, cx| menu.activate(MenuAction::Project(t3_core::thread_actions::ProjectAction::NewThread), cx)));
+    let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
+    runtime.spawn(barrier).await.unwrap().unwrap();
+    cx.run_until_parked();
+    let route_retained = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()) == before);
+    assert!(membership_refused && route_retained, "captured project menu must refuse changed logical membership and replaced representative navigation: membership_refused={membership_refused}, route_retained={route_retained}");
 }
 
 #[gpui::test]

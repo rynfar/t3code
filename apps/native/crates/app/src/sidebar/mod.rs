@@ -1095,10 +1095,10 @@ mod grouping_frames {
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
             let command_palette = cx.new(|cx| crate::palette::CommandPalette::new(state.clone(), composer, window, cx));
-            handles = Some((pane.clone(), command_palette.clone()));
+            handles = Some((pane.clone(), command_palette.clone(), menu.clone()));
             cx.new(|_| GroupingFrame { pane, menu, dialog, snooze, palette:command_palette })
         }).unwrap();
-        let (pane, command_palette) = handles.unwrap();
+        let (pane, command_palette, menu) = handles.unwrap();
         let outside = outside.unwrap();
         let click = |cx:&mut HeadlessAppContext, x:f32, y:f32| {
             cx.update_window(window.into(), |_, window, cx| {
@@ -1106,6 +1106,13 @@ mod grouping_frames {
                 window.simulate_mouse_move(position, cx);
                 window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button:gpui::MouseButton::Left, position, modifiers:Default::default(), click_count:1, first_mouse:false }), cx);
                 window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button:gpui::MouseButton::Left, position, modifiers:Default::default(), click_count:1 }), cx);
+            }).unwrap();
+        };
+        let press_key = |cx:&mut HeadlessAppContext, key:&str| {
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent { keystroke:keystroke.clone(), is_held:false, prefer_character_input:false }), cx);
+                window.dispatch_event(gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
             }).unwrap();
         };
         let capture = |cx:&mut HeadlessAppContext, name:&str| {
@@ -1134,6 +1141,65 @@ mod grouping_frames {
                 crate::theme::set_preferences(preferences,cx);
             });
             capture(&mut cx,&format!("{theme}-folders"));
+            let folder_position = pane.read_with(&cx, |pane, cx| {
+                let state = pane.state.read(cx);
+                let index = state.sidebar.fleet.rows.iter().position(|row| matches!(row, ScopedSidebarRow::Folder { .. })).unwrap();
+                let offset = if pane.drafts.rows.is_empty() { 0 } else { pane.drafts.rows.len() + 1 };
+                pane.list.bounds_for_item(index + offset).expect("rendered production folder must have measured list bounds").center()
+            });
+            std::fs::write(out.join(format!("{theme}-folder-hit.json")), serde_json::to_vec_pretty(&json!({"x":f32::from(folder_position.x),"y":f32::from(folder_position.y),"source":"production ListState::bounds_for_item center"})).unwrap()).unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.focus(&outside, cx)).unwrap();
+            click(&mut cx, f32::from(folder_position.x), f32::from(folder_position.y));
+            cx.run_until_parked();
+            let expanded_before_menu = state.read_with(&cx, |state, cx| state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar, cx)[0]));
+            let folder_focus = cx.update_window(window.into(), |_, window, cx| window.focused(cx)).unwrap();
+            for key in ["shift-f10", "menu"] {
+                press_key(&mut cx, key);
+                cx.run_until_parked();
+                assert!(menu.read_with(&cx, |menu, _| menu.is_open()), "focused production folder must open its context menu from {key}");
+                assert!(folder_focus.is_some());
+                state.read_with(&cx, |state, cx| {
+                    assert_eq!(state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar, cx)[0]), expanded_before_menu, "context-menu key must not toggle the folder");
+                    assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+                });
+                capture(&mut cx,&format!("{theme}-folder-context-{key}"));
+                press_key(&mut cx, "escape");
+                cx.run_until_parked();
+                assert!(!menu.read_with(&cx, |menu, _| menu.is_open()));
+                cx.update_window(window.into(), |_, window, cx| assert_eq!(window.focused(cx), folder_focus, "Escape restores the folder's real focus")).unwrap();
+            }
+            cx.update_window(window.into(), |_, window, cx| {
+                window.simulate_mouse_move(folder_position, cx);
+                window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button:gpui::MouseButton::Right, position:folder_position, modifiers:Default::default(), click_count:1, first_mouse:false }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button:gpui::MouseButton::Right, position:folder_position, modifiers:Default::default(), click_count:1 }), cx);
+            }).unwrap();
+            cx.run_until_parked();
+            assert!(menu.read_with(&cx, |menu, _| menu.is_open()), "right-click on the measured production folder opens the same menu");
+            capture(&mut cx,&format!("{theme}-folder-context-right-click"));
+            let backdrop = cx.update_window(window.into(), |_, window, cx| {
+                let sidebar = pane.read(cx).list.viewport_bounds();
+                let viewport = window.viewport_size();
+                gpui::point((sidebar.right() + viewport.width) / 2., viewport.height / 2.)
+            }).unwrap();
+            click(&mut cx, f32::from(backdrop.x), f32::from(backdrop.y));
+            cx.run_until_parked();
+            assert!(!menu.read_with(&cx, |menu, _| menu.is_open()), "actual content backdrop click cancels the project menu");
+            state.read_with(&cx, |state, cx| {
+                assert_eq!(state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar, cx)[0]), expanded_before_menu);
+                assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+            });
+            cx.update_window(window.into(), |_, window, cx| assert_eq!(window.focused(cx), folder_focus, "backdrop cancellation restores folder focus")).unwrap();
+            for key in ["enter", "space"] {
+                press_key(&mut cx, key);
+                cx.run_until_parked();
+                state.read_with(&cx, |state, cx| assert_eq!(state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar, cx)[0]), !expanded_before_menu, "{key} toggles the focused folder exactly once"));
+                press_key(&mut cx, key);
+                cx.run_until_parked();
+                state.read_with(&cx, |state, cx| assert_eq!(state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar, cx)[0]), expanded_before_menu, "{key} reopens the same folder exactly once"));
+            }
+            click(&mut cx, f32::from(folder_position.x), f32::from(folder_position.y));
+            cx.run_until_parked();
+            capture(&mut cx,&format!("{theme}-folders-keyboard-restored"));
             click(&mut cx, 150., 125.);
             state.read_with(&cx, |state, cx| {
                 let group = &state.project_groups_for(GroupConsumer::Sidebar, cx)[0];
@@ -1162,6 +1228,51 @@ mod grouping_frames {
             cx.run_until_parked();
         }
         state.read_with(&cx, |state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
+        let restore = state.read_with(&cx, |state, _| (state.client_handle().unwrap(),state.shell.clone(),state.server_config.clone()));
+        let target = state.read_with(&cx, |state, cx| state.scoped_project_action_target(&state.project_groups_for(GroupConsumer::Sidebar,cx)[0],cx).unwrap());
+        let expanded_before_draft = state.read_with(&cx, |state,cx| state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar,cx)[0]));
+        let header_position = pane.read_with(&cx, |pane,cx| {
+            let index=pane.state.read(cx).sidebar.fleet.rows.iter().position(|row| matches!(row,ScopedSidebarRow::Folder { .. })).unwrap();
+            let offset=if pane.drafts.rows.is_empty() { 0 } else { pane.drafts.rows.len()+1 };
+            pane.list.bounds_for_item(index+offset).unwrap().center()
+        });
+        click(&mut cx,f32::from(header_position.x),f32::from(header_position.y));
+        cx.run_until_parked();
+        capture(&mut cx,"folder-child-before-tab");
+        let header_focus=cx.update_window(window.into(),|_,window,cx| window.focused(cx)).unwrap().unwrap();
+        cx.update_window(window.into(),|_,window,cx| window.focus_next(cx)).unwrap();
+        cx.run_until_parked();
+        capture(&mut cx,"folder-child-tab-focused");
+        let child_focus=cx.update_window(window.into(),|_,window,cx| window.focused(cx)).unwrap().unwrap();
+        assert_ne!(child_focus,header_focus,"Tab moves from the real header to its New thread affordance");
+        cx.update_window(window.into(),|_,window,cx| window.focus_prev(cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(),|_,window,cx| assert_eq!(window.focused(cx),Some(header_focus))).unwrap();
+        cx.update_window(window.into(),|_,window,cx| window.focus_next(cx)).unwrap();
+        cx.run_until_parked();
+        capture(&mut cx,"folder-child-activation-ready");
+        cx.update_window(window.into(),|_,window,cx| assert_eq!(window.focused(cx),Some(child_focus))).unwrap();
+        press_key(&mut cx,"enter");
+        cx.run_until_parked();
+        let barrier=state.read_with(&cx,|state,_| state.connections.destination(&target.project.owner,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        executor.block_test(runtime.spawn(barrier)).unwrap().unwrap();
+        cx.run_until_parked();
+        state.read_with(&cx,|state,cx| {
+            assert_eq!(state.environments.active.as_deref(),Some(target.project.owner.saved_id.as_str()));
+            assert_eq!(state.draft_project.as_deref(),Some(target.project.project.id.as_str()));
+            assert_eq!(state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar,cx)[0]),!expanded_before_draft,"New thread activation must not also toggle the header");
+        });
+        state.update(&mut cx,|state,cx| {
+            state.environments.active=before.0.clone();
+            state.install_active_environment(restore.0,restore.1,restore.2,ConnectionStatus::Connected,cx);
+            state.selected_thread=before.1.clone(); state.draft_project=before.2.clone();
+            let group=state.project_groups_for(GroupConsumer::Sidebar,cx)[0].clone();
+            state.project_preferences.set_expanded(&group,expanded_before_draft);
+            state.rebuild_sidebar(cx);
+            cx.emit(crate::app_state::AppEvent::Selection);
+        });
+        cx.run_until_parked();
+        state.read_with(&cx,|state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
         let forbidden = |method:&str| matches!(method,
             t3_core::commands::method::DISPATCH_COMMAND | t3_core::commands::method::LAUNCH_THREAD | t3_core::projects::PROJECTS_MUTATE
             | t3_core::commands::method::SERVER_UPDATE_SETTINGS | t3_core::settings::keybindings::SERVER_UPSERT_KEYBINDING
