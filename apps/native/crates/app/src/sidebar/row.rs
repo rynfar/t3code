@@ -806,14 +806,18 @@ mod capture {
             ("connected", true, true), ("disconnected", false, true), ("reconnected", true, true),
             ("disabled-disconnected", false, false), ("reenabled-disconnected", false, true),
         ].into_iter().enumerate() {
+            cx.update(|cx| crate::settings::store::install_committed_client(&state, serde_json::from_value(serde_json::json!({"sidebarWorkingShelfEnabled":enabled})).unwrap(), cx));
             state.update(&mut cx, |state, cx| {
                 state.phase = crate::app_state::Phase::Online(if connected {
                     t3_client::supervisor::ConnectionStatus::Connected
                 } else {
                     t3_client::supervisor::ConnectionStatus::Reconnecting { reason: "Synthetic disconnect".into(), attempt: 1 }
                 });
-                state.sidebar.settings.working_shelf_enabled = enabled;
                 state.rebuild_sidebar(cx);
+                assert_eq!(crate::settings::store::client(cx).working_shelf(), enabled);
+                assert_eq!(state.sidebar.settings.working_shelf_enabled, enabled);
+                let working = state.sidebar.model.partition.working.iter().map(|index| state.sidebar.model.threads[*index].id.as_str()).collect::<Vec<_>>();
+                assert_eq!(working, if enabled { vec!["busy-newer", "busy-older"] } else { vec![] });
                 assert!(state.selected_thread.is_none() && state.client_handle().is_none() && state.sidebar.drag.is_none());
                 records.push(serde_json::json!({"step":label,"connected":connected,"enabled":enabled,
                     "rows":format!("{:?}",state.sidebar.model.rows),"partition":format!("{:?}",state.sidebar.model.partition)}));

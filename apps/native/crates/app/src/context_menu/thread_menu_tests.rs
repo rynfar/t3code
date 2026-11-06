@@ -845,9 +845,8 @@ fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut 
         assert!(state.selected_thread.is_none());
     });
     for folders in [false, true] {
-        cx.update(|cx| crate::settings::store::install_committed_client(&state, serde_json::from_value(serde_json::json!({"boringSidebarEnabled":folders})).unwrap(), cx));
+        cx.update(|cx| crate::settings::store::install_committed_client(&state, serde_json::from_value(serde_json::json!({"boringSidebarEnabled":folders,"sidebarWorkingShelfEnabled":false})).unwrap(), cx));
         state.update(cx, |state, cx| {
-            state.sidebar.settings.working_shelf_enabled=false;
             state.rebuild_sidebar(cx);
             let active=state.sidebar.fleet.partition.active.iter().map(|index| state.sidebar.fleet.threads[*index].key.clone()).collect::<Vec<_>>();
             assert!(active.len()>1);
