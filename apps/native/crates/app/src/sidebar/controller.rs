@@ -452,7 +452,7 @@ impl AppState {
             ThreadAction::Unpin => actions::unpin(&uuid(), id),
             ThreadAction::Unsnooze => actions::unsnooze(&uuid(), id),
             ThreadAction::Archive => actions::archive(&uuid(), id),
-            ThreadAction::Delete => actions::delete(&uuid(), id),
+            ThreadAction::Delete => { self.delete_scoped_threads(vec![owner], cx); return; }
             ThreadAction::MarkUnread => actions::mark_unread(&uuid(), id),
             ThreadAction::RegenerateTitle => actions::regenerate_title(&uuid(), id),
             ThreadAction::AutoSettle | ThreadAction::AutoSettleEnabled => actions::set_auto_settle(&uuid(), id, true),
@@ -575,6 +575,112 @@ impl AppState {
             "thread.archive" => (UndoKind::Archive, UndoAction::Archived, vec![UndoStep::Unarchive]), _ => return None,
         };
         Some((store.begin_owned(kind, owner.clone()), action, plan))
+    }
+
+    fn scoped_deletion_missing(&self, owner: &crate::context_menu::ThreadMenuOwner) -> bool {
+        owner.response_after_deletion(self)
+            && owner.key().is_some_and(|key| self.scoped_thread(&key).is_none_or(|row| row.thread.deleted))
+    }
+
+    fn deletion_interrupted(error: &RpcError) -> bool {
+        match error {
+            RpcError::Closed => true,
+            RpcError::Failure(failure) => failure.tag.is_none() && failure.message == "Interrupted" && failure.error.is_null(),
+        }
+    }
+
+    pub(crate) fn delete_scoped_threads(&mut self, owners: Vec<crate::context_menu::ThreadMenuOwner>, cx: &mut Context<Self>) {
+        if owners.is_empty() { return; }
+        if owners.iter().any(|owner| !(owner.current(self) || self.scoped_deletion_missing(owner)) || !owner.can_operate_owner(self)) {
+            self.show_toast(Toast::new(ToastKind::Error, "Thread deletion incomplete").description("0 thread(s) deleted; stopped: destination or permission changed"), cx);
+            return;
+        }
+        let target = self.delete_target();
+        let resolves = owners.iter().map(|owner| self.connections.destination(owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect::<Vec<_>>();
+        cx.spawn(async move |this, cx| {
+            let mut destinations = Vec::new();
+            for resolve in resolves {
+                let Ok(destination) = resolve.await else {
+                    let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Thread deletion incomplete").description("0 thread(s) deleted; stopped: destination or permission changed"), cx));
+                    return;
+                };
+                destinations.push(destination);
+            }
+            if !this.read_with(cx, |state, _| owners.iter().zip(&destinations).all(|(owner, destination)| {
+                destination.is_current(&state.fleet) && (owner.current(state) || state.scoped_deletion_missing(owner)) && owner.can_operate_owner(state)
+                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+            })).unwrap_or(false) {
+                let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Thread deletion incomplete").description("0 thread(s) deleted; stopped: destination or permission changed"), cx));
+                return;
+            }
+            let mut completed = 0;
+            let mut failures = 0;
+            let mut interruption = None;
+            for (owner, destination) in owners.iter().zip(&destinations) {
+                let current = |state: &AppState| destination.is_current(&state.fleet) && owner.current(state) && owner.can_operate_owner(state)
+                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+                let missing = this.read_with(cx, |state, _| destination.is_current(&state.fleet) && state.scoped_deletion_missing(owner) && owner.can_operate_owner(state)
+                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false);
+                if missing { continue; }
+                if !this.read_with(cx, |state, _| current(state)).unwrap_or(false) {
+                    interruption = Some("destination or permission changed".to_owned()); break;
+                }
+                let stop = this.read_with(cx, |state, _| owner.key().and_then(|key| state.scoped_thread(&key)).is_some_and(|row| row.thread.runtime.is_some())).unwrap_or(false);
+                if stop {
+                    if let Err(error) = destination.client.dispatch(t3_core::commands::stop_thread(&uuid(), &owner.thread)).await {
+                        if Self::deletion_interrupted(&error) { interruption = Some(error.to_string()); break; }
+                        failures += 1;
+                        continue;
+                    }
+                    if !this.read_with(cx, |state, _| current(state)).unwrap_or(false) {
+                        interruption = Some("destination or permission changed".to_owned()); break;
+                    }
+                }
+                let reply = this.update(cx, |state, cx| {
+                    if !current(state) { return None; }
+                    let reply = if target.environment.as_deref() == owner.destination.as_ref().map(|destination| destination.saved_id.as_str()) {
+                        let doomed = owners.iter().filter(|candidate| candidate.destination == owner.destination).map(|candidate| candidate.thread.clone()).collect();
+                        state.prepare_deletion(owner.thread.clone(), &Deletion { target: target.clone(), doomed: Arc::new(doomed) }, crate::settings::store::client(cx).thread_sort_order(), now_ms())
+                    } else { None };
+                    Some(reply)
+                }).ok().flatten();
+                let Some(reply) = reply else { interruption = Some("destination or permission changed".to_owned()); break; };
+                let result = destination.client.dispatch(actions::delete(&uuid(), &owner.thread)).await;
+                let interrupted = result.as_ref().err().is_some_and(Self::deletion_interrupted);
+                let ok = result.is_ok();
+                let valid = this.update(cx, |state, cx| {
+                    let valid = destination.is_current(&state.fleet) && owner.response_after_deletion(state) && owner.can_operate_owner(state)
+                        && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+                    if let Some(reply) = reply
+                        && let Some(route) = state.finish_deletion(reply, ok && valid, cx) {
+                        match route { Some(next) => state.select_thread(&next, cx), None => state.clear_selection(cx) }
+                    }
+                    if ok && valid {
+                        state.sidebar.undo.expire_owned(owner, true);
+                        if let Some(key) = owner.key() { state.sidebar.fleet_selection.remove(&key); }
+                        cx.emit(AppEvent::Notice);
+                        cx.emit(AppEvent::SidebarSelection);
+                    }
+                    valid
+                }).unwrap_or(false);
+                if ok { completed += 1; } else { failures += 1; }
+                if interrupted || !valid {
+                    interruption = Some(if interrupted { "connection closed or interrupted" } else { "destination or permission changed" }.to_owned()); break;
+                }
+            }
+            let _ = this.update(cx, |state, cx| {
+                for owner in &owners {
+                    if state.scoped_deletion_missing(owner) && owner.can_operate_owner(state)
+                        && let Some(key) = owner.key() {
+                        state.sidebar.fleet_selection.remove(&key);
+                    }
+                }
+                if failures > 0 || interruption.is_some() {
+                    state.show_toast(Toast::new(ToastKind::Error, "Thread deletion incomplete").description(format!("{completed} thread(s) deleted, {failures} failed{}", interruption.map(|reason| format!("; stopped: {reason}")).unwrap_or_default())), cx);
+                }
+                cx.emit(AppEvent::SidebarSelection);
+            });
+        }).detach();
     }
 
     pub(crate) fn run_scoped_command(&mut self, owner: crate::context_menu::ThreadMenuOwner, command: Value, scope: &'static str, failure: &'static str, cx: &mut Context<Self>) {
@@ -1773,6 +1879,652 @@ mod deletion_tests {
             mounted.route(&returned, "deleted", true, Some("survivor".into())),
             None
         );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_selected_delete_holds_event_until_reply_and_uses_physical_fallback(cx: &mut gpui::TestAppContext) {
+        use t3_client::supervisor::{ClientEvent, ClientFixture};
+        use t3_core::sidebar::tag_filter::ThreadKey;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, mut fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({
+            "authenticated":true,"permissions":["orchestration:read","orchestration:operate"]
+        })).unwrap());
+        let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
+        let make = |id, project, at| serde_json::from_value(serde_json::json!({
+            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+            "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+            "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+            "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+        })).unwrap();
+        shell.snapshot.as_mut().unwrap().threads = vec![
+            make("deleted","checkout-a","2026-04-01T00:00:00Z"),
+            make("survivor","checkout-a","2026-04-02T00:00:00Z"),
+            make("logical-sibling","checkout-b","2026-04-03T00:00:00Z"),
+        ];
+        let deleted = serde_json::to_value(&shell.snapshot.as_ref().unwrap().threads[0]).unwrap();
+        let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        let (ready, activated) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("deleted").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
+        activated.await.unwrap();
+        state.update(cx, |state, cx| state.select_thread("deleted", cx));
+        let (method, command, visit) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.visit");
+        visit.send(Ok(serde_json::json!({"sequence":1}))).unwrap();
+        let key = ThreadKey::new("saved-fixture","deleted");
+        state.update(cx, |state, cx| state.run_scoped_thread_action(&key,ThreadAction::Delete,&[],cx));
+        let (method, command, reply) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.delete");
+        assert_eq!(command["threadId"],"deleted");
+        let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let mut payload = deleted;
+        payload["deletedAt"] = serde_json::json!("2026-04-04T00:00:00Z");
+        events.send(ClientEvent::Thread { thread_id:"deleted".into(), item:Box::new(serde_json::from_value(serde_json::json!({
+            "kind":"event","sequence":2,"event":{"id":"deleted-event","threadId":"deleted","occurredAt":"2026-04-04T00:00:00Z","type":"thread.deleted","payload":payload}
+        })).unwrap()) }).await.unwrap();
+        events.send(ClientEvent::Shell(ShellStreamItem::ThreadRemoved { sequence:2, thread_id:"deleted".into() })).await.unwrap();
+        applied.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_thread.as_deref(),Some("deleted"),"scoped selected deletion holds its original mount until the successful reply");
+            assert!(state.hold_pending_thread_deletion());
+        });
+        let (sent, routed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _routed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Selection && state.selected_thread.as_deref() == Some("survivor") {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+        routed.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+            assert_eq!(state.selected_thread.as_deref(),Some("survivor"),"fallback stays in the physical checkout, not its newer logical sibling");
+            assert!(!state.hold_pending_thread_deletion());
+        });
+        assert!(!old_fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_selected_delete_failure_and_remounted_reply_preserve_navigation_ownership(cx: &mut gpui::TestAppContext) {
+        use t3_client::supervisor::{ClientEvent, ClientFixture};
+        use t3_core::sidebar::tag_filter::ThreadKey;
+
+        cx.executor().allow_parking();
+        for mode in ["failure", "remount", "reply-first"] {
+        let failed_reply = mode == "failure";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, mut fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({
+            "authenticated":true,"permissions":["orchestration:read","orchestration:operate"]
+        })).unwrap());
+        let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
+        let make = |id, project, at| serde_json::from_value(serde_json::json!({
+            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+            "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+            "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+            "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+        })).unwrap();
+        shell.snapshot.as_mut().unwrap().threads = vec![
+            make("deleted","checkout-a","2026-04-01T00:00:00Z"),
+            make("survivor","checkout-a","2026-04-02T00:00:00Z"),
+            make("logical-sibling","checkout-b","2026-04-03T00:00:00Z"),
+        ];
+        let deleted = serde_json::to_value(&shell.snapshot.as_ref().unwrap().threads[0]).unwrap();
+        let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        let (ready, activated) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("deleted").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
+        activated.await.unwrap();
+        state.update(cx, |state, cx| state.select_thread("deleted", cx));
+        let (method, command, visit) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.visit");
+        visit.send(Ok(serde_json::json!({"sequence":1}))).unwrap();
+        let key = ThreadKey::new("saved-fixture","deleted");
+        state.update(cx, |state, cx| state.run_scoped_thread_action(&key,ThreadAction::Delete,&[],cx));
+        let (method, command, reply) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.delete");
+        assert_eq!(command["threadId"],"deleted");
+        if failed_reply {
+            let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            let mut payload = deleted.clone();
+            payload["deletedAt"] = serde_json::json!("2026-04-04T00:00:00Z");
+            events.send(ClientEvent::Thread { thread_id:"deleted".into(), item:Box::new(serde_json::from_value(serde_json::json!({
+                "kind":"event","sequence":2,"event":{"id":"deleted-event","threadId":"deleted","occurredAt":"2026-04-04T00:00:00Z","type":"thread.deleted","payload":payload}
+            })).unwrap()) }).await.unwrap();
+            events.send(ClientEvent::Shell(ShellStreamItem::ThreadRemoved { sequence:2, thread_id:"deleted".into() })).await.unwrap();
+            applied.await.unwrap();
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.selected_thread.as_deref(),Some("deleted"));
+                assert!(state.hold_pending_thread_deletion());
+            });
+        } else if mode == "remount" {
+            let mount = state.read_with(cx, |state, _| state.sidebar.visit_target.clone());
+            state.update(cx, |state, cx| {
+                state.select_thread("survivor",cx);
+                state.select_thread("deleted",cx);
+            });
+            state.read_with(cx, |state, _| {
+                assert_ne!(state.sidebar.visit_target,mount,"away and back creates a new selected mount");
+                assert_eq!(state.selected_thread.as_deref(),Some("deleted"));
+            });
+            fixture.take_commands();
+        }
+        let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            let finished = if failed_reply {
+                *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete")
+            } else { *event == AppEvent::SidebarSelection && !state.hold_pending_thread_deletion() };
+            if finished { if let Some(sent) = sent.take() { let _ = sent.send(()); } }
+        }));
+        reply.send(if failed_reply {
+            Err(RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()),message:"cannot delete".into(),error:serde_json::json!({"_tag":"OperationError"}) }))
+        } else { Ok(serde_json::json!({"sequence":2})) }).unwrap();
+        finished.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+            assert_eq!(state.selected_thread.as_deref(),if failed_reply { None } else if mode == "remount" { Some("deleted") } else { Some("survivor") },"a failed reply never selects fallback; an old successful reply never navigates the new mount");
+            assert!(!state.hold_pending_thread_deletion());
+        });
+        if mode == "reply-first" {
+            let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            let mut payload = deleted.clone();
+            payload["deletedAt"] = serde_json::json!("2026-04-04T00:00:00Z");
+            events.send(ClientEvent::Thread { thread_id:"deleted".into(), item:Box::new(serde_json::from_value(serde_json::json!({
+                "kind":"event","sequence":2,"event":{"id":"late-deleted-event","threadId":"deleted","occurredAt":"2026-04-04T00:00:00Z","type":"thread.deleted","payload":payload}
+            })).unwrap()) }).await.unwrap();
+            events.send(ClientEvent::Shell(ShellStreamItem::ThreadRemoved { sequence:2, thread_id:"deleted".into() })).await.unwrap();
+            applied.await.unwrap();
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.selected_thread.as_deref(),Some("survivor"),"late deleted stream cannot clear the fallback selected after an owned success");
+                assert!(!state.hold_pending_thread_deletion());
+            });
+        }
+        assert!(!old_fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_selected_bulk_delete_excludes_full_doomed_set_and_retains_later_failure(cx: &mut gpui::TestAppContext) {
+        use t3_client::supervisor::{ClientEvent, ClientFixture};
+        use t3_core::sidebar::tag_filter::ThreadKey;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, mut fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({
+            "authenticated":true,"permissions":["orchestration:read","orchestration:operate"]
+        })).unwrap());
+        let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
+        let make = |id, project, at| serde_json::from_value(serde_json::json!({
+            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+            "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+            "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+            "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+        })).unwrap();
+        shell.snapshot.as_mut().unwrap().threads = vec![
+            make("deleted","checkout-a","2026-04-01T00:00:00Z"),
+            make("also-doomed","checkout-a","2026-04-02T00:00:00Z"),
+            make("survivor","checkout-a","2026-03-31T00:00:00Z"),
+            make("logical-sibling","checkout-b","2026-04-03T00:00:00Z"),
+        ];
+        let deleted = serde_json::to_value(&shell.snapshot.as_ref().unwrap().threads[0]).unwrap();
+        let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        let (ready, activated) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("deleted").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
+        activated.await.unwrap();
+        state.update(cx, |state, cx| state.select_thread("deleted", cx));
+        let (method, command, visit) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.visit");
+        visit.send(Ok(serde_json::json!({"sequence":1}))).unwrap();
+        let key = ThreadKey::new("saved-fixture","deleted");
+        let later = ThreadKey::new("saved-fixture","also-doomed");
+        let owners = state.read_with(cx, |state, _| [&key, &later].into_iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect());
+        state.update(cx, |state, cx| {
+            state.sidebar.fleet_selection.extend([key.clone(), later.clone()]);
+            state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx);
+        });
+        let (method, command, reply) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.delete");
+        assert_eq!(command["threadId"],"deleted");
+        let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let mut payload = deleted;
+        payload["deletedAt"] = serde_json::json!("2026-04-04T00:00:00Z");
+        events.send(ClientEvent::Thread { thread_id:"deleted".into(), item:Box::new(serde_json::from_value(serde_json::json!({
+            "kind":"event","sequence":2,"event":{"id":"deleted-event","threadId":"deleted","occurredAt":"2026-04-04T00:00:00Z","type":"thread.deleted","payload":payload}
+        })).unwrap()) }).await.unwrap();
+        events.send(ClientEvent::Shell(ShellStreamItem::ThreadRemoved { sequence:2, thread_id:"deleted".into() })).await.unwrap();
+        applied.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_thread.as_deref(),Some("deleted"),"scoped selected deletion holds its original mount until the successful reply");
+            assert!(state.hold_pending_thread_deletion());
+        });
+        let (sent, routed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _routed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Selection && state.selected_thread.as_deref() == Some("survivor") {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+        routed.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+            assert_eq!(state.selected_thread.as_deref(),Some("survivor"),"fallback stays in the physical checkout, not its newer logical sibling");
+            assert!(!state.hold_pending_thread_deletion());
+        });
+        let (method, command, visit) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.visit");
+        visit.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+        let (method, command, reply) = fixture.next_request().await;
+        assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"],"thread.delete");
+        assert_eq!(command["threadId"],"also-doomed");
+        let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Err(RpcError::Failure(t3_core::rpc::RpcFailure {
+            tag:Some("OperationError".into()), message:"cannot delete".into(), error:serde_json::json!({"_tag":"OperationError","message":"cannot delete"})
+        }))).unwrap();
+        finished.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_thread.as_deref(),Some("survivor"));
+            assert!(!state.sidebar.fleet_selection.contains(&key));
+            assert!(state.sidebar.fleet_selection.contains(&later));
+            assert!(state.toasts.latest().unwrap().description.as_ref().unwrap().contains("1 thread(s) deleted, 1 failed"));
+            assert!(!state.hold_pending_thread_deletion());
+        });
+        assert!(!old_fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+    }
+
+    #[cfg(feature = "snapshot")]
+    async fn scoped_delete_fixture(cx: &mut gpui::TestAppContext, runtime: &tokio::runtime::Runtime) -> (gpui::Entity<AppState>, t3_client::supervisor::ClientFixture, tokio::sync::mpsc::Sender<t3_client::supervisor::ClientEvent>) {
+        let (state, _) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, fixture) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({
+            "authenticated":true,"permissions":["orchestration:read","orchestration:operate"]
+        })).unwrap());
+        let (shell, config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+        let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("bulk-fixture").is_some() {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("bulk-fixture", client, shell, config, ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        (state, fixture, events)
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_bulk_delete_continues_failures_but_stops_effect_interrupt(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        for outcome in ["failure", "interrupt", "closed"] {
+            let interrupted = outcome != "failure";
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (state, mut fixture, events) = scoped_delete_fixture(cx, &runtime).await;
+            let keys = ["menu-thread", "sibling"].map(|id| t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", id));
+            let owners = state.read_with(cx, |state, _| keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect());
+            state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
+            let (sent, mut finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            state.update(cx, |state, cx| state.run_scoped_bulk_action(owners, t3_core::sidebar::selection::BulkAction::Delete, cx));
+            let (_, command, reply) = fixture.next_request().await;
+            assert_eq!(command["threadId"], "menu-thread");
+            let encoded = if interrupted {
+                serde_json::json!({"_tag":"Failure","cause":[{"_tag":"Interrupt"}]})
+            } else {
+                serde_json::json!({"_tag":"Failure","cause":[{"_tag":"Fail","error":{"_tag":"OperationError","message":"cannot delete"}}]})
+            };
+            let failure = serde_json::from_value::<t3_core::rpc::ExitEncoded>(encoded).unwrap().into_result().unwrap_err();
+            reply.send(Err(if outcome == "closed" { RpcError::Closed } else { RpcError::Failure(failure) })).unwrap();
+            let next = tokio::select! {
+                request = fixture.next_request() => Some(request),
+                _ = &mut finished => None,
+            };
+            assert_eq!(next.is_none(), interrupted, "an Effect interrupt must stop before a later write, unlike an ordinary operation failure");
+            if let Some((_, command, reply)) = next {
+                assert_eq!(command["threadId"], "sibling");
+                let fresh = t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", "other-thread");
+                state.update(cx, |state, _| { state.sidebar.fleet_selection.insert(fresh.clone()); });
+                reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+                finished.await.unwrap();
+                state.read_with(cx, |state, _| {
+                    assert!(state.sidebar.fleet_selection.contains(&keys[0]));
+                    assert!(!state.sidebar.fleet_selection.contains(&keys[1]));
+                    assert!(state.sidebar.fleet_selection.contains(&fresh));
+                    assert!(state.toasts.latest().unwrap().description.as_ref().unwrap().contains("1 thread(s) deleted, 1 failed"));
+                });
+            } else {
+                state.read_with(cx, |state, _| assert!(keys.iter().all(|key| state.sidebar.fleet_selection.contains(key))));
+            }
+            state.update(cx, |state, _| state.stop_pump());
+            drop(events);
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_bulk_delete_rejects_held_reply_after_grant_target_or_owner_drift(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        for drift in ["grant", "target", "owner"] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (state, mut fixture, events) = scoped_delete_fixture(cx, &runtime).await;
+            let keys = ["menu-thread", "sibling"].map(|id| t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", id));
+            let owners: Vec<_> = state.read_with(cx, |state, _| keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect());
+            let original = owners[0].destination.clone().unwrap();
+            let route = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
+            state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
+            let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            state.update(cx, |state, cx| state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx));
+            let (_, command, reply) = fixture.next_request().await;
+            assert_eq!(command["type"], "thread.delete");
+            assert_eq!(command["threadId"], "menu-thread");
+            let (sent, changed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let observed = original.clone();
+            let _changed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                let changed = match drift {
+                    "grant" => !state.scoped_ready(&observed,t3_core::auth::ORCHESTRATION_OPERATE_SCOPE),
+                    "target" => state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture","menu-thread")).is_some_and(|row| row.created_at == "2026-06-01T00:00:00Z"),
+                    _ => state.scoped_environment("bulk-fixture").is_some_and(|entry| entry.summary.owner != observed),
+                };
+                if *event == AppEvent::Shell && changed {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            let mut replacement_fixture = None;
+            let mut replacement_events = None;
+            match drift {
+                "grant" => { fixture.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap())); }
+                "target" => {
+                    let mut thread = state.read_with(cx, |state, _| state.shell.thread("menu-thread").unwrap().clone());
+                    thread.created_at = "2026-06-01T00:00:00Z".into();
+                    events.send(t3_client::supervisor::ClientEvent::Shell(ShellStreamItem::ThreadUpdated { sequence:2, location:"active".into(), thread:Box::new(thread) })).await.unwrap();
+                }
+                _ => {
+                    let (client, fixture) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
+                    let (shell, config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+                    let install = state.update(cx, |state, _| state.connections.install_fixture("bulk-fixture",client,shell,config,ConnectionStatus::Connected));
+                    replacement_events = Some(runtime.spawn(install).await.unwrap());
+                    replacement_fixture = Some(fixture);
+                }
+            }
+            changed.await.unwrap();
+            reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
+            finished.await.unwrap();
+            state.read_with(cx, |state, _| {
+                assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()),route);
+                assert!(keys.iter().all(|key| state.sidebar.fleet_selection.contains(key)),"stale success cannot deselect a replacement or unattempted original");
+                assert!(state.toasts.latest().unwrap().description.as_ref().unwrap().contains("1 thread(s) deleted"));
+            });
+            assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+            if let Some(fixture) = replacement_fixture.as_mut() { assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND)); }
+            state.update(cx, |state, _| state.stop_pump());
+            drop(replacement_events);
+            drop(events);
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_bulk_delete_keeps_same_raw_id_results_local_to_each_owner(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut first, events) = scoped_delete_fixture(cx, &runtime).await;
+        let (client, mut second) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
+        let (shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(),state.server_config.clone()));
+        config.config.as_mut().unwrap().environment.environment_id = "second-env".into();
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("second-fixture").is_some() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("second-fixture",client,shell,config,ConnectionStatus::Connected));
+        let second_events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        let keys = ["bulk-fixture","second-fixture"].map(|environment| t3_core::sidebar::tag_filter::ThreadKey::new(environment,"menu-thread"));
+        let owners = state.read_with(cx, |state, _| keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state,key).unwrap()).collect());
+        let route = state.read_with(cx, |state, _| (state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()));
+        state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
+        let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        state.update(cx, |state, cx| state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx));
+        let (_, command, reply) = first.next_request().await;
+        assert_eq!(command["threadId"],"menu-thread");
+        reply.send(Err(RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()),message:"cannot delete".into(),error:serde_json::json!({"_tag":"OperationError"}) }))).unwrap();
+        let (_, command, reply) = second.next_request().await;
+        assert_eq!(command["type"],"thread.delete");
+        assert_eq!(command["threadId"],"menu-thread");
+        reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
+        finished.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert!(state.sidebar.fleet_selection.contains(&keys[0]));
+            assert!(!state.sidebar.fleet_selection.contains(&keys[1]));
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),route);
+            assert!(state.toasts.latest().unwrap().description.as_ref().unwrap().contains("1 thread(s) deleted, 1 failed"));
+        });
+        assert!(!first.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        assert!(!second.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(second_events);
+        drop(events);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_bulk_delete_checks_runtime_stop_failure_and_post_stop_grants(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        for revoke in [false,true] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (state, mut fixture, events) = scoped_delete_fixture(cx,&runtime).await;
+            let keys = ["menu-thread","sibling"].map(|id| t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture",id));
+            let mut thread = state.read_with(cx, |state, _| state.shell.thread("menu-thread").unwrap().clone());
+            thread.active_provider_thread_id = Some("running-provider".into());
+            let (sent, running) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _running = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture","menu-thread")).is_some_and(|row| row.thread.runtime.is_some()) {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            events.send(t3_client::supervisor::ClientEvent::Shell(ShellStreamItem::ThreadUpdated { sequence:2,location:"active".into(),thread:Box::new(thread) })).await.unwrap(); running.await.unwrap();
+            let owners: Vec<_> = state.read_with(cx, |state, _| keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state,key).unwrap()).collect());
+            let destination = owners[0].destination.clone().unwrap();
+            state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
+            let (sent, mut finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            state.update(cx, |state, cx| state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx));
+            let (_,command,stop) = fixture.next_request().await;
+            assert_eq!(command["type"],t3_core::commands::stop_thread("id","menu-thread")["type"]);
+            assert_eq!(command["threadId"],"menu-thread");
+            if revoke {
+                let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+                let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                    if *event == AppEvent::Shell && !state.scoped_ready(&destination,t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) {
+                        if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                    }
+                }));
+                fixture.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap())); denied.await.unwrap();
+                stop.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
+            } else {
+                stop.send(Err(RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()),message:"cannot stop".into(),error:serde_json::json!({"_tag":"OperationError"}) }))).unwrap();
+            }
+            let next = tokio::select! { request = fixture.next_request() => Some(request), _ = &mut finished => None };
+            assert_eq!(next.is_none(),revoke,"a grant change during stop must prevent delete and later writes; ordinary stop failure continues");
+            if let Some((_,command,reply)) = next {
+                assert_eq!(command["type"],"thread.delete");
+                assert_eq!(command["threadId"],"sibling");
+                reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap(); finished.await.unwrap();
+            }
+            state.read_with(cx, |state, _| {
+                assert!(state.sidebar.fleet_selection.contains(&keys[0]));
+                assert_eq!(state.sidebar.fleet_selection.contains(&keys[1]),revoke);
+                assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+            });
+            assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+            state.update(cx, |state, _| state.stop_pump());
+            drop(events);
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_bulk_delete_skips_missing_original_before_valid_later_target(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture, events) = scoped_delete_fixture(cx, &runtime).await;
+        let keys = ["menu-thread", "sibling"].map(|id| t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", id));
+        let owners: Vec<_> = state.read_with(cx, |state, _| keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect());
+        let destination = owners[0].destination.clone().unwrap();
+        state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
+        let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _removed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", "menu-thread")).is_none() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        events.send(t3_client::supervisor::ClientEvent::Shell(ShellStreamItem::ThreadRemoved { sequence:2, thread_id:"menu-thread".into() })).await.unwrap();
+        removed.await.unwrap();
+        state.update(cx, |state, cx| state.run_scoped_bulk_action(owners, t3_core::sidebar::selection::BulkAction::Delete, cx));
+        cx.run_until_parked();
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        runtime.spawn(barrier).await.unwrap().unwrap();
+        cx.run_until_parked();
+        use futures::FutureExt;
+        let request = fixture.next_request().now_or_never();
+        assert!(request.is_some(), "a missing original target must not abort deletion of a valid later target");
+        let (_, command, reply) = request.unwrap();
+        assert_eq!(command["threadId"], "sibling");
+        let (sent, completed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _completed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::SidebarSelection && state.sidebar.fleet_selection.is_empty() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap(); completed.await.unwrap();
+        state.read_with(cx, |state, _| assert_eq!(state.environments.active.as_deref(), Some("saved-fixture")));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scoped_bulk_delete_entry_denial_reports_zero_saved(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture, events) = scoped_delete_fixture(cx, &runtime).await;
+        let key = t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", "menu-thread");
+        let owner = state.read_with(cx, |state, _| crate::context_menu::ThreadMenuOwner::capture_scoped(state, &key).unwrap());
+        state.update(cx, |state, _| { state.sidebar.fleet_selection.insert(key.clone()); });
+        fixture.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()));
+        let destination = owner.destination.clone().unwrap();
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        let _ = runtime.spawn(barrier).await.unwrap();
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.run_scoped_bulk_action(vec![owner], t3_core::sidebar::selection::BulkAction::Delete, cx));
+        cx.run_until_parked();
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        let _ = runtime.spawn(barrier).await.unwrap();
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let toast = state.toasts.latest().expect("entry permission refusal must visibly report that no deletion was saved");
+            assert_eq!(toast.kind, ToastKind::Error);
+            assert!(toast.description.as_ref().unwrap().contains("0 thread(s) deleted"));
+            assert!(state.sidebar.fleet_selection.contains(&key));
+        });
+        assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
     }
 
     #[cfg(feature = "snapshot")]
