@@ -271,14 +271,16 @@ fn publish(entries: &HashMap<String, Entry>, changed: &str, material: bool, outp
     let previous = output.borrow().clone();
     let mut environments = previous.environments.iter().filter(|environment| entries.contains_key(&environment.summary.owner.saved_id)).cloned().collect::<Vec<_>>();
     let mut dirty = environments.len() != previous.environments.len();
+    let mut relink = material || dirty;
     if let Some(entry) = entries.get(changed) {
         let owner = entry.owner(changed);
         let grants = entry.client.session_state().borrow().clone();
         let index = environments.iter().position(|environment| environment.summary.owner.saved_id == changed);
         let prior = index.map(|index| &environments[index]);
-        let summary = match prior.filter(|prior| !material && prior.summary.owner == owner && prior.config.config == entry.config.config) {
+        let summary_config = |state: &ServerConfigState| state.config.as_ref().map(|config| (config.environment.label.clone(), config.scratch_workspace_root.clone()));
+        let summary = match prior.filter(|prior| !material && prior.summary.owner == owner && summary_config(&prior.config) == summary_config(&entry.config)) {
             Some(prior) => prior.summary.clone(),
-            None => Arc::new(EnvironmentSummary::from_shell(owner, &entry.shell, &entry.config)),
+            None => { relink = true; Arc::new(EnvironmentSummary::from_shell(owner, &entry.shell, &entry.config)) },
         };
         let same = prior.is_some_and(|prior| prior.summary == summary && prior.status == entry.status && prior.config.config == entry.config.config && prior.grants == grants && prior.settings_revision == entry.config.settings_revision() && prior.keybindings_revision == entry.config.keybindings_revision());
         if !same {
@@ -287,7 +289,7 @@ fn publish(entries: &HashMap<String, Entry>, changed: &str, material: bool, outp
             dirty = true;
         }
     }
-    if material {
+    if relink {
         let linked_environments = entries.iter().filter(|(_, entry)| entry.status == ConnectionStatus::Connected && entry.shell.synchronized)
             .filter_map(|(id, entry)| Some(LinkedEnvironment { saved_id: id, canonical_id: entry.config.config.as_ref().map(|config| config.environment.environment_id.as_str()).filter(|id| !id.is_empty()).unwrap_or(id), threads: &entry.shell.snapshot.as_ref()?.threads })).collect::<Vec<_>>();
         let linked = LinkedRequests::build(&linked_environments);
@@ -444,7 +446,7 @@ async fn run(
                         if entry.owner(&owner.saved_id) != owner { return Err(DestinationError::Stale); }
                         Ok(entry.config.apply_settings_reply(settings, revision))
                     });
-                    if result == Ok(true) { publish(&entries, &owner.saved_id, true, &view); }
+                    if result == Ok(true) { publish(&entries, &owner.saved_id, false, &view); }
                     let _ = reply.send(result);
                 }
                 Some(Command::ApplyKeybindings { owner, value, revision, reply }) => {
@@ -452,7 +454,7 @@ async fn run(
                         if entry.owner(&owner.saved_id) != owner { return Err(DestinationError::Stale); }
                         Ok(entry.config.apply_keybindings_reply(&value, revision))
                     });
-                    if result == Ok(true) { publish(&entries, &owner.saved_id, true, &view); }
+                    if result == Ok(true) { publish(&entries, &owner.saved_id, false, &view); }
                     let _ = reply.send(result);
                 }
                 Some(Command::Destination { owner, scope, reply }) => { let _ = reply.send(entries.get(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| entry.destination(&owner, &scope))); }
@@ -501,6 +503,7 @@ async fn run(
                 let entry = entries.get_mut(&id).unwrap();
                 let mut changed = false;
                 let mut config_changed = false;
+                let revisions = (entry.config.settings_revision(), entry.config.keybindings_revision());
                 let mut lifecycle_changed = false;
                 for event in &batch {
                     match event {
@@ -521,9 +524,9 @@ async fn run(
                 if config_changed && let Some(config) = &entry.config.config {
                     let _ = output.send(EnvironmentEvent::Identity { id: id.clone(), generation: epoch, descriptor: Box::new(config.environment.clone()) }).await;
                 }
-                if changed || config_changed || lifecycle_changed {
-                    publish(&entries, &id, true, &view);
-                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
+                if changed || config_changed || lifecycle_changed || revisions != (entry.config.settings_revision(), entry.config.keybindings_revision()) {
+                    publish(&entries, &id, changed || lifecycle_changed, &view);
+                    if changed || config_changed || lifecycle_changed { reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await; }
                 }
                 if active.as_ref() == Some(&id) {
                     let events = batch.into_iter().filter(|e| !matches!(e, ClientEvent::Status(_) | ClientEvent::Moved { .. })).collect::<Vec<_>>();

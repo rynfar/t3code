@@ -398,6 +398,29 @@ mod quiet_fleet {
         assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Missing)));
     }
 
+    #[tokio::test]
+    async fn quiet_fleet_config_updates_publish_revisions_and_reuse_quiet_summary() {
+        let (entry, _fixture) = entry("config");
+        let (mut owner, mut output) = Environments::start(&tokio::runtime::Handle::current(), false);
+        let mut view = owner.view();
+        let events = owner.install_fixture("config", entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await;
+        view.changed().await.unwrap();
+        let initial = view.borrow_and_update().clone();
+        let revision = initial.environment("config").unwrap().settings_revision;
+        let summary = initial.environment("config").unwrap().summary.clone();
+        owner.activate(Some("config"));
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Activated { .. })) { break; } }
+        let equal = entry.config.config.clone().unwrap();
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(equal) }))).await.unwrap();
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
+        assert_eq!(view.borrow().environment("config").unwrap().settings_revision, revision + 1);
+        assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));
+        let mut changed = entry.config.config.clone().unwrap(); changed.settings.guest_sharing_enabled = Some(false);
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(changed) }))).await.unwrap();
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
+        assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));
+    }
+
     fn b_owner(view: &watch::Receiver<Arc<FleetView>>) -> EnvironmentOwner {
         view.borrow().environment("b").unwrap().summary.owner.clone()
     }

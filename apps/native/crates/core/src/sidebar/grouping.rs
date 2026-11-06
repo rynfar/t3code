@@ -382,7 +382,9 @@ pub struct ScopedProjectGroup {
 impl ScopedProjectGroup {
     pub fn mutation_refs(&self) -> Vec<ProjectRef> {
         let mut seen = HashSet::new();
-        self.registrations.iter().filter(|project| seen.insert((project.owner.identity(), project.project.id.clone())))
+        self.registrations.iter().filter(|project| project.owner.saved_id == self.representative.environment_id)
+            .chain(self.registrations.iter().filter(|project| project.owner.saved_id != self.representative.environment_id))
+            .filter(|project| seen.insert((project.owner.identity(), project.project.id.clone())))
             .map(ScopedProject::reference).collect()
     }
 }
@@ -474,12 +476,15 @@ pub fn build_scoped_project_groups(input: &GroupInput<'_>) -> Vec<ScopedProjectG
         }
     }
     for group in &mut groups {
-        let representative = input.preferred_environment.and_then(|id| group.members.iter().find(|member| member.project.owner.saved_id == id))
-            .unwrap_or(&group.members[0]);
-        group.representative = representative.project.reference();
+        let preferred = input.preferred_environment.and_then(|id| group.registrations.iter().find(|project| project.owner.saved_id == id))
+            .map(|project| group.registrations.iter().filter(|candidate| candidate.owner.saved_id == project.owner.saved_id && candidate.physical_key() == project.physical_key())
+                .reduce(|a, b| if replaces_winner(&a.project, &b.project) { b } else { a }).unwrap());
+        let representative = preferred.unwrap_or(&group.members[0].project);
+        group.representative = representative.reference();
+        let display = group.members.iter().find(|member| member.physical_key == representative.physical_key()).unwrap();
         group.label = if group.is_scratch { "No project".into() } else if group.members.len() > 1 {
-            group_label(&representative.project.project, &group.members.iter().map(|member| &member.project.project).collect::<Vec<_>>())
-        } else { representative.project.project.title.clone() };
+            group_label(&display.project.project, &group.members.iter().map(|member| &member.project.project).collect::<Vec<_>>())
+        } else { display.project.project.title.clone() };
     }
     if input.consumer == GroupConsumer::Settings {
         groups.sort_by(|a, b| crate::thread::locale_compare(&a.label, &b.label));
@@ -493,7 +498,7 @@ pub fn build_scoped_project_groups(input: &GroupInput<'_>) -> Vec<ScopedProjectG
             }
         }
         let mut keyed = groups.into_iter().enumerate().map(|(index, group)| {
-            let project = &group.members.iter().find(|member| member.project.reference() == group.representative).unwrap().project.project;
+            let project = &group.registrations.iter().find(|project| project.reference() == group.representative).unwrap().project;
             let fallback = if input.sort == ProjectSortOrder::CreatedAt { parse_iso(&project.created_at) } else { parse_iso(&project.updated_at) };
             (latest[index].unwrap_or(fallback), project.title.clone(), group)
         }).collect::<Vec<_>>();
@@ -507,12 +512,15 @@ pub fn build_scoped_project_groups(input: &GroupInput<'_>) -> Vec<ScopedProjectG
     groups
 }
 
-pub fn pick_project_target<'a>(group: &'a ScopedProjectGroup, preferred: Option<&ProjectRef>) -> Option<&'a ScopedProjectMember> {
-    let exact = preferred.and_then(|reference| group.registrations.iter().find(|project| project.reference() == *reference));
-    exact.and_then(|project| group.members.iter().find(|member| member.physical_key == project.physical_key()))
-        .or_else(|| preferred.and_then(|reference| group.members.iter().find(|member| member.project.owner.saved_id == reference.environment_id)))
-        .or_else(|| group.members.iter().find(|member| member.project.reference() == group.representative))
-        .or_else(|| group.members.first())
+pub fn pick_project_target(group: &ScopedProjectGroup, preferred: Option<&ProjectRef>) -> Option<ScopedProjectMember> {
+    let context = preferred.and_then(|reference| group.registrations.iter().find(|project| project.reference() == *reference))
+        .or_else(|| preferred.and_then(|reference| group.registrations.iter().find(|project| project.owner.saved_id == reference.environment_id)))
+        .or_else(|| group.registrations.iter().find(|project| project.reference() == group.representative));
+    let Some(context) = context else { return group.members.first().cloned() };
+    let physical_key = context.physical_key();
+    let project = group.registrations.iter().filter(|project| project.owner.saved_id == context.owner.saved_id && project.physical_key() == physical_key)
+        .reduce(|a, b| if replaces_winner(&a.project, &b.project) { b } else { a }).unwrap_or(context);
+    Some(ScopedProjectMember { physical_key, project: project.clone() })
 }
 
 pub fn latest_group_thread(group: &ScopedProjectGroup, threads: &[super::fleet::ScopedThread], order: ThreadSortOrder) -> Option<super::tag_filter::ThreadKey> {

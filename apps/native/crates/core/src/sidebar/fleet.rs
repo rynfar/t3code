@@ -152,25 +152,61 @@ impl ScopedSidebarModel {
         let mut returned = HashMap::new();
         let mut unloaded = 0;
         let mut frontier = HashMap::new();
+        let eligible = |thread: &&ScopedThread| !thread.thread.archived && !thread.thread.deleted && thread.thread.listed
+            && !input.hidden.contains(&thread.key()) && scope.as_ref().is_none_or(|scope| scope.contains(&thread.project_ref()));
+        let candidates = input.environments.iter().map(|environment| {
+            let mut seen = HashSet::new();
+            let extra = input.extra_threads.iter().filter(|extra| *extra.owner == environment.owner).flat_map(|extra| extra.threads);
+            environment.threads.iter().chain(extra).filter(|thread| thread.owner == environment.owner)
+                .filter(|thread| seen.insert(thread.thread.id.clone())).filter(eligible).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
         let mut aliases = HashMap::new();
-        for environment in input.environments {
-            for thread in &environment.threads {
+        for (environment, threads) in input.environments.iter().zip(&candidates) {
+            for thread in threads {
                 let identity = (environment.owner.identity(), thread.thread.id.clone());
                 let rank = (input.selected == Some(&thread.key()), environment.synchronized, thread.thread.updated_at);
                 let replace = aliases.get(&identity).is_none_or(|(prior_rank, prior_key): &((bool, bool, Option<Ms>), ThreadKey)| rank > *prior_rank || (rank == *prior_rank && environment.owner.saved_id < prior_key.environment_id));
                 if replace { aliases.insert(identity, (rank, thread.key())); }
             }
         }
-        for environment in input.environments {
-            let mut seen = HashSet::new();
-            let extra = input.extra_threads.iter().filter(|extra| *extra.owner == environment.owner).flat_map(|extra| extra.threads);
-            let scoped = environment.threads.iter().chain(extra).filter(|thread| thread.owner == environment.owner)
-                .filter(|thread| seen.insert(thread.thread.id.clone()))
-                .filter(|thread| aliases.get(&(environment.owner.identity(), thread.thread.id.clone())).is_none_or(|(_, key)| *key == thread.key()))
-                .filter(|thread| !thread.thread.archived && !thread.thread.deleted && thread.thread.listed)
-                .filter(|thread| !input.hidden.contains(&thread.key()))
-                .filter(|thread| scope.as_ref().is_none_or(|scope| scope.contains(&thread.project_ref())))
-                .collect::<Vec<_>>();
+        let mut loaded_projects = HashSet::new();
+        for thread in candidates.iter().flatten() {
+            if aliases.get(&(thread.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key()) {
+                loaded_projects.insert((thread.owner.identity(), thread.thread.project_id.clone(), thread.owner.saved_id.clone()));
+            }
+        }
+        let mut count_owners = HashMap::new();
+        for older in input.older.iter().filter(|older| input.environments.iter().any(|environment| environment.owner == *older.owner)) {
+            for project in older.older.counts.keys() {
+                let reference = ProjectRef { environment_id: older.owner.saved_id.clone(), project_id: project.clone() };
+                if scope.as_ref().is_some_and(|scope| !scope.contains(&reference)) { continue; }
+                let loaded = loaded_projects.contains(&(older.owner.identity(), project.clone(), older.owner.saved_id.clone()));
+                let synchronized = input.environments.iter().any(|environment| environment.owner == *older.owner && environment.synchronized);
+                let rank = (loaded, synchronized);
+                let key = (older.owner.identity(), project.clone());
+                let replace = count_owners.get(&key).is_none_or(|(prior_rank, saved): &((bool, bool), String)| rank > *prior_rank || (rank == *prior_rank && older.owner.saved_id < *saved));
+                if replace { count_owners.insert(key, (rank, older.owner.saved_id.clone())); }
+            }
+        }
+        let mut cuts = HashMap::new();
+        for older in input.older {
+            for project in older.older.counts.keys() {
+                let identity = (older.owner.identity(), project.clone());
+                if count_owners.get(&identity).is_some_and(|(_, saved)| *saved == older.owner.saved_id) {
+                    cuts.insert(identity, (&older.owner.saved_id, older.older.before_ms));
+                }
+            }
+        }
+        let mut held_counts = HashMap::<String, usize>::new();
+        for thread in candidates.iter().flatten() {
+            if !aliases.get(&(thread.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key()) { continue; }
+            if let Some((saved, before)) = cuts.get(&(thread.owner.identity(), thread.thread.project_id.clone()))
+                && thread.thread.is_settled() && thread.thread.settled_at.is_some_and(|at| at < *before) {
+                *held_counts.entry((*saved).clone()).or_default() += 1;
+            }
+        }
+        for (environment, candidates) in input.environments.iter().zip(candidates) {
+            let scoped = candidates.into_iter().filter(|thread| aliases.get(&(environment.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key())).collect::<Vec<_>>();
             let local = scoped.iter().map(|thread| thread.thread.clone()).collect::<Vec<_>>();
             let tracker = state.trackers.entry(environment.owner.clone()).or_default();
             let observation = if working_shelf_enabled { tracker.observe(&local, input.now) } else { tracker.clear(); Default::default() };
@@ -188,8 +224,8 @@ impl ScopedSidebarModel {
             model.partition.settled.extend(partition.settled.iter().map(|index| offset + index));
             model.next_change_at = model.next_change_at.into_iter().chain(tracker.next_deadline()).min();
             if let Some(older) = input.older.iter().find(|older| *older.owner == environment.owner) {
-                let counted = older.older.counts.iter().filter(|(project, _)| scope.as_ref().is_none_or(|scope| scope.contains(&ProjectRef { environment_id: environment.owner.saved_id.clone(), project_id: (*project).clone() }))).map(|(_, count)| *count).sum::<u64>();
-                let held = local.iter().filter(|thread| thread.is_settled() && thread.settled_at.is_some_and(|at| at < older.older.before_ms)).count();
+                let counted = older.older.counts.iter().filter(|(project, _)| count_owners.get(&(environment.owner.identity(), (*project).clone())).is_some_and(|(_, saved)| *saved == environment.owner.saved_id)).map(|(_, count)| *count).sum::<u64>();
+                let held = held_counts.get(&environment.owner.saved_id).copied().unwrap_or(0);
                 unloaded += (counted as usize).saturating_sub(held);
                 frontier.insert(environment.owner.saved_id.clone(), older.frontier);
             }

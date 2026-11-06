@@ -1233,8 +1233,13 @@ fn scoped_groups_keep_colliding_refs_physical_winners_and_saved_aliases() {
     assert_eq!(groups[0].members.len(), 2);
     assert_eq!(groups[0].member_refs.len(), 4);
     assert_eq!(groups[0].mutation_refs().len(), 3);
+    let aliased = build_scoped_project_groups(&GroupInput { projects: &[projects[0].clone(), projects[2].clone()], preferred_environment: Some("alias"), ..input });
+    assert_eq!(aliased[0].representative.environment_id, "alias");
+    assert_eq!(aliased[0].mutation_refs(), [projects[2].reference()]);
+    assert_eq!(pick_project_target(&aliased[0], Some(&projects[2].reference())).unwrap().project.owner.saved_id, "alias");
     assert_eq!(groups[0].representative.environment_id, "b");
-    assert_eq!(pick_project_target(&groups[0], Some(&projects[2].reference())).unwrap().project.project.id, "p-new");
+    assert_eq!(pick_project_target(&groups[0], Some(&projects[2].reference())).unwrap().project.project.id, projects[2].project.id);
+    assert_eq!(pick_project_target(&groups[0], Some(&projects[0].reference())).unwrap().project.project.id, "p-new");
     assert_eq!(latest_group_thread(&groups[0], &threads, ThreadSortOrder::UpdatedAt), Some(tag_filter::ThreadKey::new("b", "same")));
     assert_eq!(latest_group_thread(&groups[0], &threads, ThreadSortOrder::CreatedAt), Some(tag_filter::ThreadKey::new("a", "same")));
     let unknown = [scoped_fixture("a", None, "/repo", false).0, scoped_fixture("b", None, "/repo", false).0];
@@ -1311,6 +1316,17 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let deduped = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &aliases, folder_mode: false, ..input }, &mut state);
     assert_eq!(deduped.threads.len(), 2);
     assert!(deduped.thread(&ThreadKey::new("a", "same")).is_some());
+    let hidden_alias = [ThreadKey::new("a", "same")].into();
+    let eligible = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &aliases, hidden: &hidden_alias, folder_mode: false, ..input }, &mut state);
+    assert_eq!(eligible.threads.len(), 2);
+    assert!(eligible.thread(&ThreadKey::new("alias", "same")).is_some());
+    let mut empty_a = ea.clone(); empty_a.threads.clear();
+    let mut empty_alias = alias.clone(); empty_alias.threads.clear();
+    let extra_a = [ea.threads[0].clone()]; let extra_alias = [alias.threads[0].clone()];
+    let extra = [ScopedExtraThreads { owner: &ea.owner, threads: &extra_a }, ScopedExtraThreads { owner: &alias.owner, threads: &extra_alias }];
+    let empty_owners = [&empty_a, &empty_alias];
+    let omitted_aliases = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &empty_owners, extra_threads: &extra, folder_mode: false, selected: None, ..input }, &mut state);
+    assert_eq!(omitted_aliases.threads.len(), 1);
     let mut ea = ea.clone(); let mut eb = eb.clone();
     for environment in [&mut ea, &mut eb] { environment.threads[0].thread.settled_override = Some(SettledOverride::Settled); environment.threads[0].thread.settled_at = Some(10); }
     let older = OlderSettled { before: format_iso(20), before_ms: 20, counts: [("p1".into(), 2)].into() };
@@ -1320,6 +1336,12 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &environments, older: &owners, folder_mode: false, selected: None, ..input }, &mut state);
     assert_eq!(model.settled_count, 4);
     assert_eq!(model.listed_settled_count, 1);
+    let mut alias = ea.clone(); alias.owner.saved_id = "alias".into();
+    for thread in &mut alias.threads { thread.owner = alias.owner.clone(); }
+    let aliases = [&ea, &alias];
+    let older_aliases = [ScopedOlderSettled { owner: &ea.owner, older: &older, frontier: None }, ScopedOlderSettled { owner: &alias.owner, older: &older, frontier: None }];
+    let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &aliases, older: &older_aliases, folder_mode: false, selected: None, ..input }, &mut state);
+    assert_eq!(model.settled_count, 2);
 }
 
 
