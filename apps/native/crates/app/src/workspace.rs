@@ -407,6 +407,11 @@ impl Workspace {
     }
 
     fn traverse(&mut self, next: bool, cx: &mut Context<Self>) {
+        if !self.state.read(cx).fleet.environments.is_empty() {
+            let target = { let state = self.state.read(cx); let selected = state.selected_thread.as_deref().and_then(|id| state.active_thread_key(id)); state.sidebar.fleet.adjacent_thread(selected.as_ref(), next).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key.thread_id))) };
+            if let Some((owner, id)) = target { self.state.update(cx, |state, cx| state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id), cx)); }
+            return;
+        }
         let target = {
             let state = self.state.read(cx);
             state.sidebar.model.adjacent_thread(state.selected_thread.as_deref(), next).map(str::to_owned)
@@ -417,6 +422,11 @@ impl Workspace {
     }
 
     fn jump(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.state.read(cx).fleet.environments.is_empty() {
+            let target = { let state = self.state.read(cx); state.sidebar.fleet.jump_target(index).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key.thread_id))) };
+            if let Some((owner, id)) = target { self.state.update(cx, |state, cx| state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id), cx)); }
+            return;
+        }
         if let Some(id) = self.state.read(cx).sidebar.model.jump_target(index).map(str::to_owned) {
             self.state.update(cx, |state, cx| state.select_thread(&id, cx));
         }
@@ -429,6 +439,13 @@ impl Workspace {
             let Some(thread) = state.sidebar.model.thread(&id) else { return };
             if thread.is_settled() {
                 return state.unsettle_thread(&id, cx);
+            }
+            if !state.fleet.environments.is_empty() {
+                let Some(key) = state.active_thread_key(&id) else { return };
+                let next = state.sidebar.fleet.adjacent_thread(Some(&key), true).or_else(|| state.sidebar.fleet.adjacent_thread(Some(&key), false)).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key.thread_id)));
+                state.run_scoped_thread_action(&key, t3_core::thread_actions::ThreadAction::Settle, &[], cx);
+                if let Some((owner, id)) = next { state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id), cx); }
+                return;
             }
             let next = state.sidebar.model.adjacent_thread(Some(&id), true).or_else(|| state.sidebar.model.adjacent_thread(Some(&id), false)).map(str::to_owned);
             state.settle_thread(&id, cx);

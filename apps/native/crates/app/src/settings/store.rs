@@ -21,9 +21,14 @@ type OnFailed = Box<dyn FnOnce(&mut App)>;
 /// Told when a save settles: `None` once saved, else why it was not.
 type OnDone = Box<dyn FnOnce(Option<String>, &mut App)>;
 
+enum SaveTarget {
+    Active(ServerSettingChange),
+    Projects { members: Vec<t3_core::sidebar::grouping::ScopedProject>, edit: t3_core::settings::projects::OverrideEdit },
+}
+
 struct PendingSave {
     state: Entity<AppState>,
-    change: ServerSettingChange,
+    target: SaveTarget,
     on_done: Option<OnDone>,
 }
 
@@ -163,7 +168,7 @@ fn apply_client(
     state.update(cx, |state, cx| {
         state.client_settings = composer;
         let grouping = client(cx).project_grouping_settings();
-        if grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides {
+        if grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides || matches!(change, ClientSettingChange::ProjectSortOrder(_) | ClientSettingChange::BoringSidebarEnabled(_)) {
             state.rebuild_sidebar(cx);
             cx.emit(AppEvent::Shell);
         }
@@ -213,7 +218,7 @@ pub fn update_server_then(state: &Entity<AppState>, change: ServerSettingChange,
 fn enqueue(state: &Entity<AppState>, change: ServerSettingChange, on_done: Option<OnDone>, cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
     prefs.error = None;
-    prefs.queue.push_back(PendingSave { state: state.clone(), change, on_done });
+    prefs.queue.push_back(PendingSave { state: state.clone(), target: SaveTarget::Active(change), on_done });
     if !prefs.saving {
         send_next(cx);
     }
@@ -221,11 +226,15 @@ fn enqueue(state: &Entity<AppState>, change: ServerSettingChange, on_done: Optio
 
 fn send_next(cx: &mut App) {
     let prefs = cx.global_mut::<ClientPrefs>();
-    let Some(PendingSave { state, change, on_done }) = prefs.queue.pop_front() else {
+    let Some(PendingSave { state, target, on_done }) = prefs.queue.pop_front() else {
         prefs.saving = false;
         return;
     };
     prefs.saving = true;
+    let change = match target {
+        SaveTarget::Active(change) => change,
+        SaveTarget::Projects { members, edit } => return send_projects(state, members, edit, on_done, cx),
+    };
     let Some(payload) = change.payload_for(state.read(cx).server_config.config.as_ref().map(|config| &config.settings)) else {
         if let Some(on_done) = on_done {
             on_done(Some("Reconnect to save this setting.".to_owned()), cx);
@@ -271,4 +280,298 @@ fn send_next(cx: &mut App) {
         });
     })
     .detach();
+}
+
+pub(super) fn project_current(state: &AppState, project: &t3_core::sidebar::grouping::ScopedProject, scope: &str) -> bool {
+    state.scoped_ready(&project.owner, scope)
+        && state.scoped_project(&project.reference()).is_some_and(|current| current.owner == project.owner
+            && current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)
+}
+
+pub(super) fn update_projects(
+    state: &Entity<AppState>, members: Vec<t3_core::sidebar::grouping::ScopedProject>,
+    edit: t3_core::settings::projects::OverrideEdit, on_done: impl FnOnce(Option<String>, &mut App) + 'static, cx: &mut App,
+) {
+    let prefs = cx.global_mut::<ClientPrefs>();
+    prefs.error = None;
+    prefs.queue.push_back(PendingSave { state: state.clone(), target: SaveTarget::Projects { members, edit }, on_done: Some(Box::new(on_done)) });
+    if !prefs.saving { send_next(cx); }
+}
+
+fn prepare_project_writes(
+    app: &AppState, destination: &t3_client::environments::Destination,
+    members: &[t3_core::sidebar::grouping::ScopedProject], edit: &t3_core::settings::projects::OverrideEdit,
+) -> Option<(Vec<t3_core::settings::project_actions::ActionWrite>, u64, u64, String)> {
+    use t3_core::settings::project_actions::{ActionWrite, Member, plan_writes};
+    let view = app.connections.view();
+    let view = view.borrow();
+    if !destination.is_current(&view) { return None; }
+    let entry = view.environment(&destination.owner.saved_id)?;
+    let config = entry.config.config.as_ref()?;
+    let selected = members.iter().filter(|project| project.owner == destination.owner).collect::<Vec<_>>();
+    if selected.is_empty() { return None; }
+    let as_member = |project: &t3_core::sidebar::grouping::ScopedProject| Member {
+        id: project.project.id.clone(), scripts: project.project.scripts.iter().filter_map(|script| serde_json::from_value(script.clone()).ok()).collect(),
+    };
+    let targets = selected.iter().map(|project| {
+        if !project_current(app, project, "settings:write") { return None; }
+        let current = entry.summary.projects.iter().find(|current| current.project.id == project.project.id)?;
+        (current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)
+            .then(|| as_member(current))
+    }).collect::<Option<Vec<_>>>()?;
+    let writes = match edit {
+        t3_core::settings::projects::OverrideEdit::Scripts(edit) => plan_writes(&config.settings, &t3_core::keybindings::decode_resolved_keybindings(&config.keybindings),
+            &entry.summary.projects.iter().map(as_member).collect::<Vec<_>>(), &targets, edit),
+        _ => vec![ActionWrite::Settings(t3_core::settings::projects::override_patch(&config.settings, &targets, edit))],
+    };
+    Some((writes, entry.settings_revision, entry.keybindings_revision, config.environment.label.clone()))
+}
+
+fn send_projects(
+    state: Entity<AppState>, members: Vec<t3_core::sidebar::grouping::ScopedProject>,
+    edit: t3_core::settings::projects::OverrideEdit, on_done: Option<OnDone>, cx: &mut App,
+) {
+    const SCOPE: &str = "settings:write";
+    let mut owners = Vec::new();
+    for project in &members {
+        if !owners.contains(&project.owner) { owners.push(project.owner.clone()); }
+    }
+    let valid = !members.is_empty() && members.iter().all(|project| project_current(state.read(cx), project, SCOPE));
+    if !valid {
+        let message = "A project destination changed or cannot change settings.".to_owned();
+        show_error(message.clone(), cx);
+        if let Some(done) = on_done { done(Some(message), cx); }
+        return send_next(cx);
+    }
+    let lookups = owners.iter().map(|owner| state.read(cx).connections.destination(owner, SCOPE)).collect::<Vec<_>>();
+    cx.spawn(async move |cx| {
+        let mut failure = None;
+        let mut destinations = Vec::new();
+        for lookup in lookups {
+            match lookup.await {
+                Ok(destination) => destinations.push(destination),
+                Err(error) => { failure = Some(format!("Project settings preflight failed: {error:?}")); break; }
+            }
+        }
+        if failure.is_none() && !cx.update(|cx| members.iter().all(|project| project_current(state.read(cx), project, SCOPE))
+            && destinations.iter().all(|destination| destination.is_current(&state.read(cx).fleet)
+                && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(SCOPE)))) {
+            failure = Some("Project settings preflight failed: a checkout or permission changed; nothing was sent.".to_owned());
+        }
+        let prepared = cx.update(|cx| destinations.iter().all(|destination| prepare_project_writes(state.read(cx), destination, &members, &edit).is_some()));
+        if !prepared && failure.is_none() { failure = Some("Project settings preflight failed: a checkout or its settings are unavailable; nothing was sent.".to_owned()); }
+        let mut changed = 0;
+        if failure.is_none() {
+            for destination in destinations {
+                let plan = cx.update(|cx| prepare_project_writes(state.read(cx), &destination, &members, &edit));
+                let Some((writes, settings_revision, keybindings_revision, label)) = plan else {
+                    failure = Some(format!("Project settings stopped after {changed} saved write(s): a checkout or its settings changed."));
+                    break;
+                };
+                for write in writes {
+                    let valid = cx.update(|cx| {
+                        let app = state.read(cx);
+                        let view = app.connections.view();
+                        let view = view.borrow();
+                        destination.is_current(&view)
+                            && members.iter().filter(|project| project.owner == destination.owner).all(|project| {
+                                project_current(app, project, SCOPE) && view.environment(&destination.owner.saved_id).is_some_and(|entry|
+                                    entry.summary.projects.iter().any(|current| current.project.id == project.project.id
+                                        && current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root))
+                            })
+                    }) && destination.client.session_state().borrow().as_ref().is_some_and(|grants| grants.grants(SCOPE));
+                    if !valid { failure = Some(format!("Project settings stopped on {label} after {changed} saved write(s): permission or checkout changed.")); break; }
+                    let client = destination.client.clone();
+                    let method = write.method();
+                    if method != method::SERVER_UPDATE_SETTINGS && !cx.update(|cx| {
+                        let view = state.read(cx).connections.view();
+                        let view = view.borrow();
+                        destination.is_current(&view) && view.environment(&destination.owner.saved_id)
+                            .is_some_and(|entry| entry.keybindings_revision == keybindings_revision)
+                    }) {
+                        failure = Some(format!("Project settings stopped on {label} after {changed} saved write(s): shortcuts changed."));
+                        break;
+                    }
+                    let payload = write.payload().clone();
+                    let runtime = cx.update(|cx| state.read(cx).runtime().clone());
+                    let response = runtime.spawn(async move { client.request(method, payload).await }).await;
+                    let reply = match response {
+                        Ok(Ok(reply)) => reply,
+                        Ok(Err(error)) => { failure = Some(format!("Project settings stopped on {label} after {changed} saved write(s): {error}")); break; }
+                        Err(error) => { failure = Some(format!("Project settings stopped on {label} after {changed} saved write(s): {error}")); break; }
+                    };
+                    changed += 1;
+                    let applied = if method == method::SERVER_UPDATE_SETTINGS {
+                        let Some(settings) = decode_update_reply(reply.clone()) else { failure = Some(format!("Project settings stopped on {label}: invalid reply after {changed} saved write(s).")); break; };
+                        let apply = cx.update(|cx| state.read(cx).connections.apply_settings_reply(&destination.owner, settings, settings_revision));
+                        apply.await
+                    } else {
+                        let apply = cx.update(|cx| state.read(cx).connections.apply_keybindings_reply(&destination.owner, reply.clone(), keybindings_revision));
+                        apply.await
+                    };
+                    if let Err(error) = applied { failure = Some(format!("Project settings stopped on {label} after {changed} saved write(s): reply owner changed ({error:?}).")); break; }
+                    cx.update(|cx| state.update(cx, |app, cx| {
+                        if !destination.is_current(&app.connections.view().borrow()) || app.environments.active.as_deref() != Some(&destination.owner.saved_id) { return; }
+                        if method == method::SERVER_UPDATE_SETTINGS {
+                            if let Some(settings) = decode_update_reply(reply) { app.server_config.apply_settings_reply(settings, settings_revision); }
+                        } else { app.server_config.apply_keybindings_reply(&reply, keybindings_revision); }
+                        cx.emit(AppEvent::ServerConfig);
+                    }));
+                }
+                if failure.is_some() { break; }
+            }
+        }
+        cx.update(|cx| {
+            if let Some(message) = &failure { show_error(message.clone(), cx); }
+            if let Some(done) = on_done { done(failure, cx); }
+            send_next(cx);
+        });
+    }).detach();
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use t3_client::{supervisor::{ClientFixture, ConnectionStatus}, session::RpcError};
+    use t3_core::{server_config::ServerConfigState, shell::ShellState, settings::projects::OverrideEdit};
+
+    #[gpui::test]
+    async fn grouped_settings_queue_keeps_destinations_and_reports_partial_writes(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        for scenario in ["saved", "denied", "missing-config", "partial", "action-partial", "later-owner-stream", "shortcut-stream"] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (state, _active_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+            let before = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
+            let (ready, loaded) = tokio::sync::oneshot::channel();
+            let mut ready = Some(ready);
+            let _subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell && state.fleet.environments.len() == 2 {
+                    if let Some(ready) = ready.take() { let _ = ready.send(()); }
+                }
+            }));
+            let mut fixtures = Vec::new();
+            let mut events = Vec::new();
+            for saved in ["a", "b"] {
+                let session = serde_json::from_value(json!({"authenticated":true,"permissions":if scenario == "denied" && saved == "b" { Vec::<&str>::new() } else { vec!["settings:write"] }})).unwrap();
+                let (client, fixture) = ClientFixture::handle(session);
+                let mut shell = ShellState::default();
+                shell.apply(serde_json::from_value(json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[{
+                    "id":"same", "title":saved, "workspaceRoot":format!("/fixture/{saved}"), "createdAt":"created", "updatedAt":"updated",
+                    "projectIcon":{"kind":"monogram","text":"P","color":"blue"}
+                }],"threads":[]}})).unwrap());
+                shell.synchronized = true;
+                let mut config = ServerConfigState::default();
+                if scenario != "missing-config" || saved != "b" {
+                    config.apply(serde_json::from_value(json!({"type":"snapshot","config":{
+                        "environment":{"environmentId":saved,"label":saved},
+                        "settings":{"projectSettingsOverrides":{"same":{"defaultThreadEnvMode":"local","retained":saved}}}
+                    }})).unwrap());
+                }
+                let install = state.update(cx, |state, _| state.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
+                events.push(runtime.spawn(install).await.unwrap());
+                fixtures.push(fixture);
+            }
+            loaded.await.unwrap();
+            let members = state.read_with(cx, |state, _| state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect::<Vec<_>>());
+            let (finished, done) = tokio::sync::oneshot::channel();
+            let edit = if matches!(scenario, "action-partial" | "shortcut-stream") {
+                OverrideEdit::Scripts(t3_core::settings::project_actions::ScriptsEdit::Save {
+                    id:"test".into(), is_new:true, input:t3_core::settings::project_actions::ScriptInput {
+                        name:"Test".into(), command:"node --test".into(), keybinding:Some(Some("cmd-t".into())), ..Default::default()
+                    },
+                })
+            } else { OverrideEdit::Set { key:"defaultThreadEnvMode".into(), value:json!("worktree") } };
+            cx.update(|cx| update_projects(&state, members.clone(), edit, move |failure, _| { let _ = finished.send(failure); }, cx));
+            if matches!(scenario, "denied" | "missing-config") {
+                assert!(done.await.unwrap().is_some());
+                assert!(fixtures.iter_mut().all(|fixture| fixture.take_commands().is_empty()), "all-member preflight sends nothing");
+                continue;
+            }
+            if scenario == "shortcut-stream" {
+                let (rpc, payload, reply) = fixtures[0].next_request().await;
+                assert_eq!(rpc, method::SERVER_UPDATE_SETTINGS);
+                let expected_revision = state.read_with(cx, |state, _| state.connections.view().borrow().environment("a").unwrap().keybindings_revision + 1);
+                let (streamed, applied) = tokio::sync::oneshot::channel();
+                let mut streamed = Some(streamed);
+                let _streamed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                    if *event == AppEvent::ServerConfig && state.scoped_environment("a").is_some_and(|entry| entry.keybindings_revision == expected_revision) {
+                        if let Some(streamed) = streamed.take() { let _ = streamed.send(()); }
+                    }
+                }));
+                events[0].send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({
+                    "type":"keybindingsUpdated", "payload":{"keybindings":[]}
+                })).unwrap()))).await.unwrap();
+                applied.await.unwrap();
+                reply.send(Ok(payload["patch"].clone())).unwrap();
+                let failure = {
+                    let next = fixtures[0].next_request();
+                    futures::pin_mut!(next);
+                    match futures::future::select(done, next).await {
+                        futures::future::Either::Left((result, _)) => result.unwrap().expect("shortcut stream drift stops instead of sending a stale plan"),
+                        futures::future::Either::Right(((method, _, _), _)) => panic!("stale shortcut write escaped revision preflight: {method}"),
+                    }
+                };
+                assert!(failure.contains("after 1 saved write(s)"));
+                assert!(failure.contains("shortcuts changed"));
+                assert!(fixtures[1].take_commands().is_empty(), "later owner untouched on shortcut drift");
+                continue;
+            }
+            if scenario == "action-partial" {
+                let (rpc, payload, reply) = fixtures[0].next_request().await;
+                assert_eq!(rpc, method::SERVER_UPDATE_SETTINGS);
+                assert_eq!(payload["patch"]["projectSettingsOverrides"]["same"]["defaultProjectScripts"][0]["id"], "test");
+                reply.send(Ok(payload["patch"].clone())).unwrap();
+                let (rpc, _, reply) = fixtures[0].next_request().await;
+                assert_eq!(rpc, t3_core::settings::keybindings::SERVER_UPSERT_KEYBINDING);
+                reply.send(Err(RpcError::Closed)).unwrap();
+                let failure = done.await.unwrap().unwrap();
+                assert!(failure.contains("after 1 saved write(s)"));
+                assert!(fixtures[1].take_commands().is_empty(), "a later owner is untouched after partial shortcut failure");
+                continue;
+            }
+            for (index, fixture) in fixtures.iter_mut().enumerate() {
+                let (rpc, payload, reply) = fixture.next_request().await;
+                assert_eq!(rpc, method::SERVER_UPDATE_SETTINGS);
+                let overrides = &payload["patch"]["projectSettingsOverrides"];
+                assert_eq!(overrides["same"]["defaultThreadEnvMode"], "worktree");
+                assert_eq!(overrides["same"]["retained"], ["a", "b"][index]);
+                if scenario == "later-owner-stream" && index == 0 {
+                    let (streamed, applied) = tokio::sync::oneshot::channel();
+                    let mut streamed = Some(streamed);
+                    let _streamed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                        if *event == AppEvent::ServerConfig && state.scoped_environment("b").and_then(|entry| entry.config.config.as_ref())
+                            .is_some_and(|config| config.settings.project_settings_overrides["same"].raw.contains_key("concurrent")) {
+                            if let Some(streamed) = streamed.take() { let _ = streamed.send(()); }
+                        }
+                    }));
+                    events[1].send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({
+                        "type":"settingsUpdated", "payload":{"settings":{"projectSettingsOverrides":{"same":{
+                            "defaultThreadEnvMode":"local", "retained":"b", "concurrent":"preserve"
+                        }}}}
+                    })).unwrap()))).await.unwrap();
+                    applied.await.unwrap();
+                }
+                if scenario == "later-owner-stream" && index == 1 { assert_eq!(overrides["same"]["concurrent"], "preserve", "later destination patch keeps a newer streamed field"); }
+                if scenario == "partial" && index == 1 {
+                    reply.send(Err(RpcError::Closed)).unwrap();
+                } else { reply.send(Ok(payload["patch"].clone())).unwrap(); }
+            }
+            let failure = done.await.unwrap();
+            assert_eq!(failure.is_some(), scenario == "partial");
+            if let Some(failure) = failure { assert!(failure.contains("after 1 saved write(s)")); }
+            let first_config = state.read_with(cx, |state, _| state.connections.view().borrow().environment("a").unwrap().config.config.clone().unwrap());
+            assert_eq!(first_config.settings.project_settings_overrides["same"].raw["defaultThreadEnvMode"], "worktree");
+            state.read_with(cx, |state, _| assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before));
+            assert!(fixtures.iter_mut().all(|fixture| fixture.take_commands().is_empty()));
+            let (finished, done) = tokio::sync::oneshot::channel();
+            cx.update(|cx| update_projects(&state, vec![members[0].clone()], OverrideEdit::Set { key:"sidebarAutoSettleAfterDays".into(), value:json!(7) }, move |failure, _| { let _ = finished.send(failure); }, cx));
+            let (rpc, payload, reply) = fixtures[0].next_request().await;
+            assert_eq!(rpc, method::SERVER_UPDATE_SETTINGS);
+            assert_eq!(payload["patch"]["projectSettingsOverrides"]["same"]["defaultThreadEnvMode"], "worktree", "next save keeps the acknowledged first override");
+            reply.send(Ok(payload["patch"].clone())).unwrap();
+            assert!(done.await.unwrap().is_none());
+            drop(events);
+        }
+    }
 }

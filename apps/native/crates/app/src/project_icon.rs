@@ -26,6 +26,13 @@ impl ProjectVisual {
         state.sidebar.favicons.visual(id)
     }
 
+    pub fn for_scoped_project(state: &AppState, key: &t3_core::sidebar::grouping::ProjectRef) -> Self {
+        let Some(project) = state.scoped_project(key) else { return Self::default() };
+        state.sidebar.owner_favicons.get(&project.owner).map(|store| store.visual(&key.project_id)).unwrap_or_else(|| Self {
+            presentation: Some(Arc::new(Presentation::new(project.project.project_icon.as_ref(), &project.project.title))), image: None,
+        })
+    }
+
     pub fn render(&self, size: Pixels, muted: Hsla, cx: &App) -> AnyElement {
         self.render_with_grayscale(size, muted, false, cx)
     }

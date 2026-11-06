@@ -573,6 +573,8 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
             t3_core::composer::drafts::STORE_NAME,
             &json!({"version":1,"drafts":{"draft:checkout-b":{"prompt":"Keep restored draft", "workspace":workspace, "updatedAt":1}}}),
         );
+        runtime.block_on(runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())))
+            .expect("fixture writer barrier task").expect("fixture drafts committed before Composer reads them");
         state.update(&mut cx, |state, cx| {
             let config = state.server_config.config.as_mut().unwrap();
             config.providers = vec![serde_json::from_value(json!({"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready","models":[{"slug":"replay","name":"Replay","isDefault":true}]})).unwrap()];
@@ -744,4 +746,220 @@ async fn archive_completion_preserves_undo_after_the_shell_removes_its_row(
             .send(Err(t3_client::session::RpcError::Closed))
             .is_ok()
     );
+}
+
+#[gpui::test]
+fn scoped_menu_keeps_background_owner_and_rejects_same_id_replacement(cx: &mut gpui::TestAppContext) {
+    use std::sync::Arc;
+    use t3_core::sidebar::fleet::EnvironmentSummary;
+    use t3_core::sidebar::grouping::{EnvironmentOwner, GroupConsumer};
+    use t3_core::sidebar::tag_filter::ThreadKey;
+    use t3_client::environments::{EnvironmentView, FleetView};
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (state, mut client) = cx.update(|cx| project_filter_tests::install_state(cx, runtime.handle().clone()));
+    state.update(cx, |state, cx| {
+        let mut environments = Vec::new();
+        for (saved, canonical) in [("saved-fixture", "fixture-env"), ("background", "other-env")] {
+            let owner = EnvironmentOwner { saved_id:saved.into(), canonical_id:Some(canonical.into()), generation:1, connection_generation:1, shell_generation:state.shell.generation };
+            let mut config = state.server_config.clone();
+            config.config.as_mut().unwrap().scratch_workspace_root = Some("/fixture/b".into());
+            environments.push(Arc::new(EnvironmentView { summary:Arc::new(EnvironmentSummary::from_shell(owner, &state.shell, &config)), status:t3_client::supervisor::ConnectionStatus::Connected, config, grants:Some(project_filter_tests::session(true)), settings_revision:0, keybindings_revision:0 }));
+        }
+        state.fleet = Arc::new(FleetView { revision:1, environments });
+        state.sidebar.grouping_projects = state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+        state.sidebar.grouping_threads = state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+        state.rebuild_sidebar(cx);
+        assert_eq!(state.project_groups_for(GroupConsumer::Sidebar,cx).iter().flat_map(|group| &group.registrations).count(), 6);
+        let key = ThreadKey::new("background", "menu-thread");
+        let owner = ThreadMenuOwner::capture_scoped(state,&key).unwrap();
+        assert!(owner.current(state));
+        assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+        let mut replaced = (*state.fleet).clone();
+        let entry = Arc::make_mut(&mut replaced.environments[1]);
+        Arc::make_mut(&mut entry.summary).threads.iter_mut().find(|row| row.thread.id=="menu-thread").unwrap().created_at="replacement".into();
+        state.fleet=Arc::new(replaced);
+        assert!(!owner.current(state));
+        assert_eq!(state.selected_thread,None);
+        assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+    });
+    let (menu, cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+    let route = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
+    state.update(cx, |state, cx| {
+        let groups = state.project_groups_for(GroupConsumer::Sidebar, cx);
+        let scratch = groups.iter().find(|group| group.is_scratch).unwrap();
+        state.project_preferences.scope_keys = vec![scratch.members[0].physical_key.clone()];
+        assert_eq!(state.project_preferences.resolved_scope(&groups, true), vec![scratch.key.clone()]);
+        state.rebuild_sidebar(cx);
+    });
+    cx.update(|window, cx| menu.update(cx, |menu, cx| {
+        menu.open_for_scoped_thread(&ThreadKey::new("background", "menu-thread"), point(px(10.), px(10.)), window, cx);
+        assert!(menu.is_open());
+        menu.activate(MenuAction::Thread(ThreadAction::FilterByProject), cx);
+        assert!(!menu.is_open());
+    }));
+    state.read_with(cx, |state, cx| {
+        let groups = state.project_groups_for(GroupConsumer::Sidebar, cx);
+        assert!(state.project_preferences.resolved_scope(&groups, true).is_empty(), "the checked scratch alias must clear through the actual menu action");
+        assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route);
+    });
+    assert!(client.take_commands().is_empty());
+}
+
+#[gpui::test]
+fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut gpui::TestAppContext) {
+    use std::sync::Arc;
+    use t3_core::sidebar::fleet::EnvironmentSummary;
+    use t3_core::sidebar::grouping::EnvironmentOwner;
+    use t3_core::sidebar::tag_filter::ThreadKey;
+    use t3_client::environments::{EnvironmentView,FleetView};
+    let runtime=tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (state,mut fixture)=cx.update(|cx| project_filter_tests::install_state(cx,runtime.handle().clone()));
+    state.update(cx,|state,cx| {
+        let environments=["first","second"].into_iter().map(|saved| {
+            let owner=EnvironmentOwner { saved_id:saved.into(),canonical_id:Some(saved.into()),generation:1,connection_generation:1,shell_generation:state.shell.generation };
+            Arc::new(EnvironmentView { summary:Arc::new(EnvironmentSummary::from_shell(owner,&state.shell,&state.server_config)),status:t3_client::supervisor::ConnectionStatus::Connected,config:state.server_config.clone(),grants:Some(project_filter_tests::session(true)),settings_revision:0,keybindings_revision:0 })
+        }).collect();
+        state.fleet=Arc::new(FleetView { revision:1,environments });
+        state.sidebar.grouping_projects=state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+        state.sidebar.grouping_threads=state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+        state.rebuild_sidebar(cx);
+        let model=&state.sidebar.fleet;
+        let keys=model.ordered.iter().map(|index| model.threads[*index].key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys.len(),6);
+        assert_ne!(keys[0],keys[1]);
+        assert_eq!(model.adjacent_thread(None,true),keys.first().cloned());
+        assert_eq!(model.jump_target(1),Some(keys[1].clone()));
+        for saved in ["first","second"] {
+            let owner=ThreadMenuOwner::capture_scoped(state,&ThreadKey::new(saved,"menu-thread")).unwrap();
+            let (claim,action,plan)=state.scoped_undo_claim(&owner,"thread.settle").unwrap();
+            state.sidebar.undo.show(action,claim,plan,crate::sidebar::controller::now_ms());
+        }
+        assert_eq!(state.sidebar.undo.notice().unwrap().count,2);
+        assert!(state.selected_thread.is_none());
+    });
+    assert!(fixture.take_commands().is_empty());
+}
+
+    #[gpui::test]
+    fn undo_contexts_preserve_interleaved_order_and_share_header_invalidation(cx:&mut gpui::TestAppContext) {
+    use std::sync::Arc;
+    use t3_core::sidebar::fleet::EnvironmentSummary;
+    use t3_core::sidebar::grouping::EnvironmentOwner;
+    use t3_core::sidebar::tag_filter::ThreadKey;
+    use t3_client::environments::{EnvironmentView,FleetView};
+    use t3_client::supervisor::ConnectionStatus;
+        let runtime=tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (state,mut fixture)=cx.update(|cx| project_filter_tests::install_state(cx,runtime.handle().clone()));
+        state.update(cx,|state,cx| {
+            let entries=["saved-fixture","other"].into_iter().map(|saved| {
+                let owner=EnvironmentOwner { saved_id:saved.into(),canonical_id:Some(saved.into()),generation:1,connection_generation:1,shell_generation:state.shell.generation };
+                Arc::new(EnvironmentView { summary:Arc::new(EnvironmentSummary::from_shell(owner,&state.shell,&state.server_config)),status:ConnectionStatus::Connected,config:state.server_config.clone(),grants:Some(crate::context_menu::project_filter_tests::session(true)),settings_revision:0,keybindings_revision:0 })
+            }).collect();
+            state.fleet=Arc::new(FleetView { revision:1,environments:entries });
+            state.rebuild_sidebar(cx);
+            let first=crate::context_menu::ThreadMenuOwner::capture_scoped(state,&ThreadKey::new("saved-fixture","menu-thread")).unwrap();
+            let other=crate::context_menu::ThreadMenuOwner::capture_scoped(state,&ThreadKey::new("other","menu-thread")).unwrap();
+            for (owner,command) in [(first.clone(),"thread.settle"),(other.clone(),"thread.unpin"),(first.clone(),"thread.snooze")] {
+                let (claim,action,plan)=state.scoped_undo_claim(&owner,command).unwrap(); state.sidebar.undo.show(action,claim,plan,0);
+            }
+            for expected in [t3_core::thread_actions::UndoAction::Snoozed,t3_core::thread_actions::UndoAction::Unpinned,t3_core::thread_actions::UndoAction::Settled] {
+                assert_eq!(state.sidebar.undo.notice().unwrap().action,expected);
+                assert_eq!(state.sidebar.undo.take_latest_group().len(),1);
+            }
+            let (first_claim,_,_)=state.scoped_undo_claim(&first,"thread.snooze").unwrap();
+            let (other_claim,action,plan)=state.scoped_undo_claim(&other,"thread.snooze").unwrap();
+            state.rebuild_sidebar(cx);
+            state.sidebar.undo.invalidate(t3_core::thread_actions::UndoKind::Snooze,"menu-thread");
+            assert!(!state.sidebar.undo.is_current(&first_claim));
+            assert!(state.sidebar.undo.is_current(&other_claim));
+            state.sidebar.undo.show(action,other_claim,plan,0);
+            assert!(state.sidebar.undo.expire(t3_core::thread_actions::UNDO_NOTICE_MS));
+            assert!(state.sidebar.undo.notice().is_none());
+        });
+        assert!(fixture.take_commands().is_empty());
+    }
+
+#[gpui::test]
+async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime=tokio::runtime::Runtime::new().unwrap();
+    let (state,mut active_fixture)=cx.update(|cx| project_filter_tests::install_state(cx,runtime.handle().clone()));
+    let before=state.read_with(cx,|state,_| (state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()));
+    let (client,mut background)=t3_client::supervisor::ClientFixture::handle(project_filter_tests::session(true));
+    let (shell,mut config)=state.read_with(cx,|state,_| (state.shell.clone(),state.server_config.clone()));
+    config.config.as_mut().unwrap().environment.environment_id="background-env".into();
+    let (ready,loaded)=tokio::sync::oneshot::channel(); let mut ready=Some(ready);
+    let _loaded=state.update(cx,|_,cx| cx.subscribe(&state,move |state,_,event,_| {
+        if *event==crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some() { if let Some(ready)=ready.take() { let _=ready.send(()); } }
+    }));
+    let install=state.update(cx,|state,_| state.connections.install_fixture("background",client,shell,config,t3_client::supervisor::ConnectionStatus::Connected));
+    let _events=runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+    let (shown,notice)=tokio::sync::oneshot::channel(); let mut shown=Some(shown);
+    let _notice=state.update(cx,|_,cx| cx.subscribe(&state,move |state,_,event,_| {
+        if *event==crate::app_state::AppEvent::Notice && state.sidebar.undo.notice().is_some() { if let Some(shown)=shown.take() { let _=shown.send(()); } }
+    }));
+    let key=t3_core::sidebar::tag_filter::ThreadKey::new("background","menu-thread");
+    state.update(cx,|state,cx| state.run_scoped_thread_action(&key,ThreadAction::Settle,&[],cx));
+    let (method,payload,reply)=background.next_request().await;
+    assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND); assert_eq!(payload["type"],"thread.settle"); assert_eq!(payload["threadId"],"menu-thread");
+    reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap(); notice.await.unwrap();
+    assert!(state.update(cx,|state,cx| state.undo_latest(cx)));
+    let (method,payload,reply)=background.next_request().await;
+    assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND); assert_eq!(payload["type"],"thread.unsettle"); assert_eq!(payload["threadId"],"menu-thread");
+    reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
+    state.read_with(cx,|state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
+    assert!(active_fixture.take_commands().is_empty());
+}
+
+#[gpui::test]
+async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppContext) {
+    use t3_core::sidebar::grouping::{GroupConsumer, ProjectPreferences, ProjectRef};
+    use t3_client::supervisor::{ClientEvent, ClientFixture, ConnectionStatus};
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, mut active) = cx.update(|cx| project_filter_tests::install_state(cx, runtime.handle().clone()));
+    let route = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
+    let (client, mut arriving) = ClientFixture::handle(project_filter_tests::session(true));
+    let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+    for project in &mut shell.snapshot.as_mut().unwrap().projects { project.repository_identity = None; }
+    config.config.as_mut().unwrap().environment.environment_id.clear();
+    let (ready, loaded) = tokio::sync::oneshot::channel();
+    let mut ready = Some(ready);
+    let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("arriving").is_some_and(|entry| entry.summary.owner.canonical_id.is_none()) {
+            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        }
+    }));
+    let install = state.update(cx, |state, _| state.connections.install_fixture("arriving", client, shell, config.clone(), ConnectionStatus::Connected));
+    let events = runtime.spawn(install).await.unwrap();
+    loaded.await.unwrap();
+    let reference = ProjectRef { environment_id:"arriving".into(), project_id:"checkout-b".into() };
+    state.update(cx, |state, cx| {
+        let key = state.scoped_project(&reference).unwrap().physical_key();
+        state.project_preferences = ProjectPreferences { scope_keys:vec![key.clone(), "missing-intent".into()], project_order:vec![key.clone()], project_expanded:std::collections::HashMap::from([(key, false)]) };
+        state.rebuild_sidebar(cx);
+    });
+    let (ready, changed) = tokio::sync::oneshot::channel();
+    let mut ready = Some(ready);
+    let _changed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("arriving").is_some_and(|entry| entry.summary.owner.canonical_id.as_deref() == Some("arrived-env")) {
+            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        }
+    }));
+    config.config.as_mut().unwrap().environment.environment_id = "arrived-env".into();
+    runtime.spawn(async move { events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config:Box::new(config.config.unwrap()) }))).await.unwrap(); }).await.unwrap();
+    changed.await.unwrap();
+    state.read_with(cx, |state, cx| {
+        let key = state.scoped_project(&reference).unwrap().physical_key();
+        assert!(state.project_preferences.scope_keys.contains(&key), "canonical arrival must migrate the selected physical project");
+        assert_eq!(state.project_preferences.project_order, vec![key.clone()]);
+        assert_eq!(state.project_preferences.project_expanded.get(&key), Some(&false));
+        assert!(state.project_preferences.scope_keys.contains(&"missing-intent".to_owned()));
+        let groups = state.project_groups_for(GroupConsumer::Sidebar, cx);
+        assert_eq!(state.project_preferences.resolved_scope(&groups, true), vec![key]);
+        assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route);
+    });
+    assert!(active.take_commands().is_empty());
+    assert!(arriving.take_commands().is_empty());
+    state.update(cx, |state, _| state.stop_pump());
 }

@@ -34,12 +34,15 @@ pub enum ContextMenuEvent {
     Delete(ThreadMenuOwner, Option<FocusHandle>),
     CustomSnooze(SnoozeRequest),
     BulkDelete(Vec<String>),
+    ScopedBulk(Vec<ThreadMenuOwner>, BulkAction),
+    ScopedConfirm(ThreadMenuOwner, ThreadAction),
 }
 
 /// The exact destination captured by a thread menu or one of its delayed callbacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadMenuOwner {
     pub thread: String,
+    pub(crate) destination: Option<t3_core::sidebar::grouping::EnvironmentOwner>,
     scope: (String, Option<String>, u64),
     generation: u64,
     shell_generation: u64,
@@ -58,12 +61,49 @@ impl ThreadMenuOwner {
         if thread.archived_at.is_some() || thread.deleted_at.is_some() { return None; }
         let project = state.shell.project(&thread.project_id)?;
         if project.archived_at.is_some() { return None; }
-        Some(Self { thread:id.into(), scope:state.thread_copy_scope()?,
+        Some(Self { thread:id.into(), destination: None, scope:state.thread_copy_scope()?,
             generation:*state.client_handle()?.connection_generation().borrow(), shell_generation:state.shell.generation,
             created_at:thread.created_at.clone(), project:thread.project_id.clone(), project_created:project.created_at.clone(),
             root:project.workspace_root.clone(), branch:thread.branch.clone(), worktree:thread.worktree_path.clone() })
     }
+    pub(crate) fn capture_undo(state: &AppState, id: &str) -> Option<Self> {
+        let local = Self::capture(state, id)?;
+        if let Some(key) = state.active_thread_key(id) && let Some(scoped) = Self::capture_scoped(state, &key)
+            && scoped.created_at == local.created_at && scoped.project_created == local.project_created && scoped.root == local.root { return Some(scoped); }
+        Some(local)
+    }
+
+    pub(crate) fn capture_scoped(state: &AppState, key: &t3_core::sidebar::tag_filter::ThreadKey) -> Option<Self> {
+        let row = state.scoped_thread(key)?;
+        if row.thread.archived || row.thread.deleted { return None; }
+        let project = state.scoped_project(&t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: row.thread.project_id.clone() })?;
+        if project.project.archived_at.is_some() { return None; }
+        Some(Self {
+            thread: key.thread_id.clone(), destination: Some(row.owner.clone()),
+            scope: (row.owner.canonical_id.clone().unwrap_or_default(), Some(row.owner.saved_id.clone()), row.owner.generation),
+            generation: row.owner.connection_generation, shell_generation: row.owner.shell_generation,
+            created_at: row.created_at.clone(), project: row.thread.project_id.clone(), project_created: project.project.created_at.clone(),
+            root: project.project.workspace_root.clone(), branch: row.thread.branch.clone(), worktree: row.thread.worktree_path.clone(),
+        })
+    }
+
+    pub(crate) fn key(&self) -> Option<t3_core::sidebar::tag_filter::ThreadKey> {
+        Some(t3_core::sidebar::tag_filter::ThreadKey::new(&self.destination.as_ref()?.saved_id, &self.thread))
+    }
+
+    pub(crate) fn project_ref(&self) -> Option<t3_core::sidebar::grouping::ProjectRef> {
+        Some(t3_core::sidebar::grouping::ProjectRef { environment_id: self.destination.as_ref()?.saved_id.clone(), project_id: self.project.clone() })
+    }
+
+    pub(crate) fn can_operate_owner(&self, state: &AppState) -> bool {
+        self.destination.as_ref().map_or_else(|| Self::can_operate(state), |owner| state.scoped_ready(owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+    }
+
     fn response_scope_current(&self, state: &AppState) -> bool {
+        if let Some(owner) = &self.destination {
+            return state.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == *owner && entry.summary.synchronized && entry.status == t3_client::supervisor::ConnectionStatus::Connected)
+                && self.project_ref().and_then(|key| state.scoped_project(&key)).is_some_and(|project| project.project.created_at == self.project_created && project.project.workspace_root == self.root && project.project.archived_at.is_none());
+        }
         state.thread_copy_scope().as_ref() == Some(&self.scope)
             && state.phase == crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
             && state.shell.synchronized && state.shell.generation == self.shell_generation
@@ -71,21 +111,40 @@ impl ThreadMenuOwner {
             && state.shell.project(&self.project).is_some_and(|project| project.created_at == self.project_created && project.workspace_root == self.root && project.archived_at.is_none())
     }
     pub(crate) fn response_current(&self, state: &AppState) -> bool {
+        if let Some(key) = self.key() { return self.response_scope_current(state) && state.scoped_thread(&key).is_some_and(|row| row.created_at == self.created_at && !row.thread.deleted); }
         self.response_scope_current(state) && state.thread_shell(&self.thread).is_some_and(|thread| thread.created_at == self.created_at && thread.deleted_at.is_none())
     }
     pub(crate) fn response_after_placement(&self, state: &AppState) -> bool {
         // Placement commits can remove a row from the bounded shell before their reply.
+        if let Some(key) = self.key() { return self.response_scope_current(state) && state.scoped_thread(&key).is_none_or(|row| row.created_at == self.created_at && !row.thread.deleted); }
         self.response_scope_current(state)
             && !(state.selected_thread.as_deref() == Some(self.thread.as_str()) && (state.thread.deleted || state.thread.projection.as_ref().is_some_and(|projection| projection.thread.created_at != self.created_at || projection.thread.deleted_at.is_some())))
             && state.thread_shell(&self.thread).is_none_or(|thread| thread.created_at == self.created_at && thread.deleted_at.is_none())
     }
-    pub(crate) fn current(&self, state: &AppState) -> bool { Self::capture(state, &self.thread).as_ref() == Some(self) }
+    pub(crate) fn current(&self, state: &AppState) -> bool {
+        self.key().map_or_else(|| Self::capture(state, &self.thread), |key| Self::capture_scoped(state, &key)).as_ref() == Some(self)
+    }
     pub(crate) fn can_operate(state: &AppState) -> bool {
         state.sidebar.capabilities.config_loaded && state.sidebar.capabilities.can_operate
             && state.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
     }
     pub(crate) fn allows(&self, state: &AppState, action: &ThreadAction) -> bool {
-        if !self.current(state) || (action.requires_operate() && !Self::can_operate(state)) { return false; }
+        if !self.current(state) || (action.requires_operate() && !self.can_operate_owner(state)) { return false; }
+        if let Some(key) = self.key() {
+            let Some(row) = state.scoped_thread(&key) else { return false; };
+            let Some(environment) = state.scoped_environment(&key.environment_id) else { return false; };
+            let config = environment.config.config.as_ref();
+            return match action {
+                ThreadAction::ShareGuest => state.can_share_scoped(self),
+                ThreadAction::TurnIntoProject => state.can_promote_scoped(self),
+                ThreadAction::Archive => row.thread.can_archive(),
+                ThreadAction::RegenerateTitle => config.is_some() && !row.thread.regenerating_title,
+                ThreadAction::AutoSettle | ThreadAction::AutoSettleEnabled | ThreadAction::AutoSettleDisabled => config.is_some_and(|config| config.environment.capabilities.thread_auto_settle_opt_out == Some(true)),
+                ThreadAction::Pin | ThreadAction::Unpin | ThreadAction::Settle | ThreadAction::Unsettle => config.is_some(),
+                ThreadAction::NewThreadOnBranch | ThreadAction::CopyBranch => self.branch.as_ref().is_some_and(|branch| !branch.is_empty()),
+                _ => true,
+            };
+        }
         match action {
             ThreadAction::ShareGuest => state.can_share_with_guest(),
             ThreadAction::TurnIntoProject => state.can_turn_into_project(&self.thread),
@@ -228,6 +287,8 @@ struct OpenMenu {
     previous_focus: Option<FocusHandle>,
     window: gpui::AnyWindowHandle,
     header: bool,
+    scoped_group: Option<t3_core::sidebar::grouping::ScopedProjectGroup>,
+    scoped_selection: Vec<ThreadMenuOwner>,
 }
 
 pub struct ContextMenu {
@@ -301,7 +362,49 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter, owner: ThreadMenuOwner::capture(state, thread_id), previous_focus: window.focused(cx), window: window.window_handle(), header: !sidebar });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter, owner: ThreadMenuOwner::capture(state, thread_id), previous_focus: window.focused(cx), window: window.window_handle(), header: !sidebar, scoped_group: None, scoped_selection: Vec::new() });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_for_scoped_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(owner) = ThreadMenuOwner::capture_scoped(state, key) else { return; };
+        let Some(row) = state.scoped_thread(key) else { return; };
+        let Some(environment) = state.scoped_environment(&key.environment_id) else { return; };
+        let config = environment.config.config.as_ref();
+        let settings = config.map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).unwrap_or_default();
+        let presets = settled::resolve_snooze_presets(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &crate::sidebar::controller::time_label);
+        let loaded = config.is_some();
+        let project_ref = row.project_ref();
+        let project_group = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.member_refs.contains(&project_ref));
+        let project_filter = project_group.as_ref().map(|group| (group.label.as_str(), state.scoped_project_scope(std::slice::from_ref(group)).contains(&group.key)));
+        let items = build_menu(&ThreadActionMenuState {
+            can_operate: owner.can_operate_owner(state), can_find: false,
+            can_share_with_guest: state.can_share_scoped(&owner), can_turn_into_project: state.can_promote_scoped(&owner),
+            branch: row.thread.branch.as_deref(), project_filter, is_pinned: row.thread.pinned, is_settled: row.thread.is_settled(),
+            auto_settle_enabled: !row.thread.auto_settle_disabled, is_snoozed: settled::effective_snoozed(&row.thread, now_ms()),
+            can_snooze_now: settled::can_snooze(&row.thread, now_ms()), is_regenerating_title: row.thread.regenerating_title,
+            is_running: !row.thread.can_archive(),
+            supports: Supports { settlement: loaded, auto_settle_opt_out: config.is_some_and(|config| config.environment.capabilities.thread_auto_settle_opt_out == Some(true)), snooze: loaded, pinning: loaded, title_regeneration: loaded },
+            snooze_presets: &presets, available: Available { new_thread_on_branch: true, custom_snooze: true, project_settings: true },
+        }).into_iter().map(|item| item.map(&MenuAction::Thread)).collect();
+        let request = SnoozeRequest::capture_scoped(state, vec![key.clone()], false, window.focused(cx));
+        self.open = Some(OpenMenu { target_id:key.thread_id.clone(),items,position,highlighted:None,submenu:None,sub_highlighted:None,presets,selection:Vec::new(),snooze_request:Some(request),copy_scope:None,project_filter:None,owner:Some(owner),previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:None,scoped_selection:Vec::new() });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_scoped_snooze(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_for_scoped_thread(key, position, window, cx);
+        if let Some(open) = self.open.as_mut() { open.items.retain(|item| matches!(item.action, MenuAction::Thread(ThreadAction::Snooze | ThreadAction::Unsnooze))); }
+    }
+
+    pub(crate) fn open_scoped_project(&mut self, group: t3_core::sidebar::grouping::ScopedProjectGroup, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let can_pin = group.registrations.iter().all(|project| state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) && state.scoped_environment(&project.owner.saved_id).and_then(|entry| entry.config.config.as_ref()).is_some_and(|config| config.environment.capabilities.project_organization == Some(true)));
+        let items = build_project_menu(group.pinned, can_pin).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
+        self.open = Some(OpenMenu { target_id:group.representative.project_id.clone(),items,position,highlighted:None,submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:Some(group),scoped_selection:Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -318,13 +421,27 @@ impl ContextMenu {
             items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
         }
         items.push(discard);
-        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false});
+        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:None,scoped_selection:Vec::new()});
         window.focus(&self.focus,cx);
         cx.notify();
     }
 
+    fn open_for_scoped_selection(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let owners = state.sidebar.fleet.ordered.iter().map(|index| &state.sidebar.fleet.threads[*index]).filter(|row| state.sidebar.fleet_selection.contains(&row.key)).filter_map(|row| ThreadMenuOwner::capture_scoped(state, &row.key)).collect::<Vec<_>>();
+        if owners.is_empty() { return; }
+        let threads = owners.iter().filter_map(|owner| owner.key().and_then(|key| state.scoped_thread(&key))).collect::<Vec<_>>();
+        let summary = t3_core::sidebar::selection::BulkSelection { count: threads.len(), pinned: threads.iter().filter(|row| row.thread.pinned).count(), settling: threads.iter().filter(|row| !row.thread.is_settled()).count(), can_snooze: threads.iter().all(|row| settled::can_snooze(&row.thread, now_ms())), regeneratable: threads.iter().filter(|row| !row.thread.regenerating_title).count(), config_loaded: owners.iter().all(|owner| owner.destination.as_ref().and_then(|owner| state.scoped_environment(&owner.saved_id)).is_some_and(|entry| entry.config.config.is_some())), can_operate: owners.iter().all(|owner| owner.can_operate_owner(state)) };
+        let presets = owners.first().and_then(|owner| owner.destination.as_ref()).and_then(|owner| state.scoped_environment(&owner.saved_id)).and_then(|entry| entry.config.config.as_ref()).map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).map(|settings| settled::resolve_snooze_presets(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &crate::sidebar::controller::time_label)).unwrap_or_default();
+        let request = SnoozeRequest::capture_scoped(state, owners.iter().filter_map(ThreadMenuOwner::key).collect(), true, window.focused(cx));
+        let items = build_bulk_menu(&summary, &presets).into_iter().map(|item| item.map(&MenuAction::Bulk)).collect();
+        self.open = Some(OpenMenu { target_id:String::new(),items,position,highlighted:None,submenu:None,sub_highlighted:None,presets,selection:Vec::new(),snooze_request:Some(request),copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:None,scoped_selection:owners });
+        window.focus(&self.focus, cx); cx.notify();
+    }
+
     /// The multi-select menu (`handleMultiSelectContextMenu`).
     pub fn open_for_selection(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.read(cx).sidebar.fleet_selection.is_empty() { self.open_for_scoped_selection(position, window, cx); return; }
         let state = self.state.read(cx);
         let (selection, summary) = state.bulk_selection();
         if selection.is_empty() {
@@ -341,7 +458,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false });
+        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -351,7 +468,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
-        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false });
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -378,7 +495,7 @@ impl ContextMenu {
         let mut custom = MenuItem::new(MenuAction::Thread(ThreadAction::SnoozeCustom), "Custom…", None);
         custom.separator_before = !presets.is_empty();
         items.push(custom);
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -409,6 +526,10 @@ impl ContextMenu {
         });
     }
 
+    pub(crate) fn confirm_scoped(&mut self, owner: ThreadMenuOwner, action: ThreadAction, cx: &mut Context<Self>) {
+        cx.emit(ContextMenuEvent::ScopedConfirm(owner,action));
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if let Some(open) = self.open.take() {
             self.restore_focus(open.previous_focus, open.window, cx);
@@ -429,6 +550,37 @@ impl ContextMenu {
                 if !owner.allows(self.state.read(cx), thread_action)
                     || (open.header && self.state.read(cx).selected_thread.as_deref() != Some(open.target_id.as_str())) { return; }
             } else if !matches!(thread_action, ThreadAction::SnoozeCustom | ThreadAction::SnoozePreset(_) | ThreadAction::Unsnooze) { return; }
+        }
+        if !open.scoped_selection.is_empty() {
+            if let MenuAction::Bulk(action) = action {
+                match action {
+                    BulkAction::SnoozeCustom => { if let Some(request) = open.snooze_request { cx.emit(ContextMenuEvent::CustomSnooze(request)); } },
+                    BulkAction::SnoozePreset(id) => { if let Some(request) = open.snooze_request { self.state.update(cx, |state, cx| request.pick_preset(&id, &open.presets, state, cx)); } },
+                    BulkAction::Delete | BulkAction::Unpin => cx.emit(ContextMenuEvent::ScopedBulk(open.scoped_selection, action)),
+                    _ => self.state.update(cx, |state, cx| state.run_scoped_bulk_action(open.scoped_selection, action, cx)),
+                }
+            }
+            return;
+        }
+        if let Some(group) = &open.scoped_group {
+            if let MenuAction::Project(action) = action {
+                self.state.update(cx, |state, cx| state.run_scoped_project_action(group, action, cx));
+            }
+            return;
+        }
+        if let (Some(owner), MenuAction::Thread(thread_action)) = (&open.owner, &action) {
+            if let Some(key) = owner.key() {
+                match thread_action {
+                    ThreadAction::ShareGuest => crate::guest_share::open(owner.clone(), open.window, cx),
+                    ThreadAction::Archive | ThreadAction::Unpin => cx.emit(ContextMenuEvent::ScopedConfirm(owner.clone(), thread_action.clone())),
+                    ThreadAction::Rename => cx.emit(ContextMenuEvent::Rename(owner.clone(), open.previous_focus)),
+                    ThreadAction::Delete => cx.emit(ContextMenuEvent::Delete(owner.clone(), open.previous_focus)),
+                    ThreadAction::SnoozeCustom => { if let Some(request) = open.snooze_request { cx.emit(ContextMenuEvent::CustomSnooze(request)); } },
+                    ThreadAction::SnoozePreset(id) => { if let Some(request) = open.snooze_request { self.state.update(cx, |state, cx| request.pick_preset(id, &open.presets, state, cx)); } },
+                    _ => self.state.update(cx, |state, cx| state.run_scoped_thread_action(&key, thread_action.clone(), &open.presets, cx)),
+                }
+                return;
+            }
         }
         match action {
             MenuAction::DiscardDraft => cx.emit(ContextMenuEvent::DiscardDraft(open.target_id)),

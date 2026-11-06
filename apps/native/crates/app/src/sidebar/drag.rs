@@ -18,6 +18,7 @@ const PLACEHOLDER_HEIGHT: f32 = 36.;
 /// The drag payload of a sidebar thread row.
 pub struct DraggedThread {
     pub id: String,
+    pub key: Option<t3_core::sidebar::tag_filter::ThreadKey>,
 }
 
 /// The pointer's gap while dragging: the row it is over, below its midpoint when `after`.
@@ -99,9 +100,9 @@ impl Render for ThreadDragPreview {
 
 impl SidebarPane {
     /// The drag constructor ran: the list shows its drop markers.
-    pub(super) fn begin_drag(&mut self, thread_id: &str, preview: Entity<ThreadDragPreview>, cx: &mut Context<Self>) {
+    pub(super) fn begin_drag(&mut self, thread_id: &str, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, preview: Entity<ThreadDragPreview>, cx: &mut Context<Self>) {
         self.drag = Some(PaneDrag { preview: Some(preview), ..Default::default() });
-        self.state.update(cx, |state, cx| state.start_thread_drag(thread_id, cx));
+        self.state.update(cx, |state, cx| match key { Some(key) => state.start_scoped_thread_drag(key, cx), None => state.start_thread_drag(thread_id, cx) });
     }
 
     /// Tracks the gap under the pointer; listeners on every rendered row see each move.
@@ -113,8 +114,9 @@ impl SidebarPane {
         let Some(drag) = self.drag.as_mut().filter(|drag| drag.at != Some((row, after))) else { return };
         drag.at = Some((row, after));
         let state = self.state.read(cx);
-        let from = state.sidebar.drag.as_ref().map(|(_, from)| *from);
-        let target = state.sidebar.model.drop_slot(row, after).and_then(|slot| state.thread_drop_target(slot)).map(|(target, _)| target.section);
+        let from = state.sidebar.fleet_drag.as_ref().map(|(_, from)| *from).or_else(|| state.sidebar.drag.as_ref().map(|(_, from)| *from));
+        let target = if state.sidebar.fleet_drag.is_some() { state.scoped_thread_drop_target(row + usize::from(after)).map(|(target, _)| target.section) }
+            else { state.sidebar.model.drop_slot(row, after).and_then(|slot| state.thread_drop_target(slot)).map(|(target, _)| target.section) };
         drag.target = target;
         let verb = from.and_then(|from| resolve_drop_verb(from, target));
         if let Some(preview) = drag.preview.clone() {
@@ -130,8 +132,10 @@ impl SidebarPane {
 
     pub(super) fn finish_drag(&mut self, drop: bool, cx: &mut Context<Self>) {
         let Some(drag) = self.drag.take() else { return };
-        let slot = drag.target.and(drag.at).and_then(|(row, after)| self.state.read(cx).sidebar.model.drop_slot(row, after));
+        let scoped = self.state.read(cx).sidebar.fleet_drag.is_some();
+        let slot = drag.target.and(drag.at).and_then(|(row, after)| if scoped { Some(row + usize::from(after)) } else { self.state.read(cx).sidebar.model.drop_slot(row, after) });
         self.state.update(cx, |state, cx| match slot {
+            Some(slot) if drop && scoped => state.drop_scoped_thread(slot, cx),
             Some(slot) if drop => state.drop_thread(slot, cx),
             _ => state.end_thread_drag(cx),
         });

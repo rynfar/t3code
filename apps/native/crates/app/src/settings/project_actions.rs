@@ -5,7 +5,7 @@
 //! the first failure. The rules live in `t3_core::settings::project_actions`.
 
 use gpui::{
-    AnyElement, App, AppContext, BoxShadow, Context, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, Keystroke,
+    AnyElement, AppContext, BoxShadow, Context, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, Keystroke,
     MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, anchored, deferred, div, point,
     prelude::FluentBuilder, px,
 };
@@ -14,13 +14,11 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::keybindings::{ResolvedKeybindingRule, ShortcutMatchContext, decode_resolved_keybindings, shortcut_label_for_command};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script};
 use t3_core::settings::keybindings::keybinding_from_keystroke;
-use t3_core::settings::ServerSettingChange;
 use t3_core::settings::project_actions::{
-    ACTIONS_DESCRIPTION, ActionWrite, EditorRequest, FileScript, FormValues, Member, NO_ACTIONS, ProjectFile, SCRIPT_ICONS, ScriptInput, ScriptsEdit,
-    importable, keybinding_writes, scripts_mixed, scripts_overridden, shown_scripts, submit_id, validate_form,
+    ACTIONS_DESCRIPTION, EditorRequest, FileScript, FormValues, NO_ACTIONS, ProjectFile, SCRIPT_ICONS, ScriptInput, ScriptsEdit,
+    importable, scripts_overridden, shown_scripts, validate_form,
 };
 use t3_core::settings::projects::OverrideEdit;
-use t3_core::shell::ProjectShell;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Switch, focus_ring, group, icon, r, section_title};
 use super::projects::{SETTINGS_WRITE_SCOPE, Shown};
@@ -56,6 +54,7 @@ pub(super) struct Editor {
     saving: bool,
     /// Which open this is, so a save that settles late never closes or fails a newer one.
     generation: u64,
+    targets: Vec<t3_core::sidebar::grouping::ScopedProject>,
 }
 
 /// What a finished save does besides reporting a failure.
@@ -134,19 +133,9 @@ impl ActionsState {
     }
 }
 
-pub(super) fn members_of(projects: &[ProjectShell]) -> Vec<Member> {
-    projects
-        .iter()
-        .map(|project| Member { id: project.id.clone(), scripts: project.scripts.iter().filter_map(|script| serde_json::from_value(script.clone()).ok()).collect() })
-        .collect()
-}
-
 impl SettingsView {
-    fn actions_keybindings(&self, cx: &App) -> Vec<ResolvedKeybindingRule> {
-        self.thread_settings(cx).map(|config| decode_resolved_keybindings(&config.keybindings)).unwrap_or_default()
-    }
-
     fn open_action_editor(&mut self, request: EditorRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.project_targets(cx);
         let actions = &mut self.projects.actions;
         actions.import_open = false;
         actions.generation += 1;
@@ -166,6 +155,7 @@ impl SettingsView {
             error: request.error.clone(),
             saving: false,
             generation: actions.generation,
+            targets,
             request,
         });
         actions.name.update(cx, |input, cx| input.focus(window, cx));
@@ -184,7 +174,7 @@ impl SettingsView {
         if self.projects.actions.editor.is_none() || !self.projects.actions.keybinding_focus.is_focused(window) {
             return;
         }
-        if !self.may(SETTINGS_WRITE_SCOPE, cx) || matches!(keystroke.key.as_str(), "tab" | "escape") {
+        if !self.projects_permitted(SETTINGS_WRITE_SCOPE, cx) || matches!(keystroke.key.as_str(), "tab" | "escape") {
             return;
         }
         cx.stop_propagation();
@@ -202,10 +192,11 @@ impl SettingsView {
     }
 
     fn save_action_editor(&mut self, cx: &mut Context<Self>) {
-        let can_write = self.may(SETTINGS_WRITE_SCOPE, cx);
-        let shown = self.shown_members(cx);
-        let Some(first) = shown.first().map(|member| member.id.clone()) else { return };
-        let scripts = self.thread_settings(cx).map(|config| shown_scripts(&config.settings, &first).to_vec()).unwrap_or_default();
+        let can_write = self.projects_permitted(SETTINGS_WRITE_SCOPE, cx);
+        let targets = self.projects.actions.editor.as_ref().map(|editor| editor.targets.clone()).unwrap_or_default();
+        let Some(first) = targets.first() else { return };
+        let scripts = self.project_config(first, cx).map(|config| shown_scripts(&config.settings, &first.project.id).to_vec()).unwrap_or_default();
+        if !self.icon_target(cx).allows(&super::projects::IconTarget { members: targets }, can_write, false) { return; }
         let actions = &self.projects.actions;
         let Some(editor) = actions.editor.as_ref().filter(|editor| !editor.saving) else { return };
         let form = FormValues {
@@ -236,69 +227,45 @@ impl SettingsView {
 
     /// `submit`: a new action takes an id no project uses; the others give up the roles it claims.
     fn submit_action(&mut self, script_id: Option<String>, input: ScriptInput, after: AfterSave, cx: &mut Context<Self>) {
-        let members = members_of(&self.shown_members(cx));
-        let projects = members_of(&self.state.read(cx).shell.snapshot.as_ref().map(|snapshot| snapshot.projects.clone()).unwrap_or_default());
-        let Some(config) = self.thread_settings(cx) else { return };
-        let id = submit_id(&config.settings, &projects, &members, script_id.as_deref(), &input.name, now_ms().max(0) as u64);
+        let targets = self.project_targets(cx);
+        if targets.is_empty() { return; }
+        let mut id = script_id.clone().unwrap_or_default();
+        if script_id.is_none() {
+            let state = self.state.read(cx);
+            let mut existing = state.fleet.environments.iter().flat_map(|environment| environment.summary.projects.iter())
+                .flat_map(|project| project.project.scripts.iter()).filter_map(|script| script.get("id").and_then(serde_json::Value::as_str)).collect::<Vec<_>>();
+            for project in &targets {
+                if let Some(config) = self.project_config(project, cx) {
+                    existing.extend(config.settings.default_project_scripts.iter().map(|script| script.id.as_str()));
+                    existing.extend(config.settings.project_settings_overrides.values().flat_map(|entry| entry.default_project_scripts.iter().flatten()).map(|script| script.id.as_str()));
+                }
+            }
+            id = t3_core::settings::project_actions::next_project_script_id(&input.name, existing, now_ms().max(0) as u64);
+        }
         self.persist_actions(ScriptsEdit::Save { id, input, is_new: script_id.is_none() }, after, cx);
     }
 
-    /// `persist`: refuses while another save runs or without settings access. The list joins the
-    /// settings queue and is built when it sends, so it keeps a model or workspace change queued
-    /// ahead of it; the shortcuts follow once it saved.
     fn persist_actions(&mut self, edit: ScriptsEdit, after: AfterSave, cx: &mut Context<Self>) {
-        let shown = self.shown_members(cx);
-        if self.projects.actions.saving || shown.is_empty() {
+        let targets = self.project_targets(cx);
+        if self.projects.actions.saving || targets.is_empty() {
             let message = "No available machine, or another action change is saving.";
             store::show_error(format!("Actions not saved: {message}"), cx);
             return self.finish_actions_save(after, Some(message.to_owned()), cx);
         }
-        if !self.may(SETTINGS_WRITE_SCOPE, cx) {
-            let message = "This connection cannot change environment settings.";
+        if !targets.iter().all(|project| store::project_current(self.state.read(cx), project, SETTINGS_WRITE_SCOPE)) {
+            let message = "A checkout changed or cannot change environment settings.";
             store::show_error(format!("Failed to save project actions: {message}"), cx);
             return self.finish_actions_save(after, Some(message.to_owned()), cx);
         }
-        let members = members_of(&shown);
-        let projects = members_of(&self.state.read(cx).shell.snapshot.as_ref().map(|snapshot| snapshot.projects.clone()).unwrap_or_default());
-        let keybindings = self.actions_keybindings(cx);
-        let Some(config) = self.thread_settings(cx) else { return };
-        let shortcuts = keybinding_writes(&config.settings, &keybindings, &projects, &members, &edit);
         self.projects.actions.saving = true;
         cx.notify();
-        let (view, state) = (cx.entity().downgrade(), self.state.clone());
-        let change = ServerSettingChange::ProjectOverride { members, edit: OverrideEdit::Scripts(edit) };
-        store::update_server_then(
-            &self.state,
-            change,
-            move |error, cx| {
-                if let Some(message) = error {
-                    let _ = view.update(cx, |this, cx| {
-                        this.projects.actions.saving = false;
-                        this.finish_actions_save(after, Some(message), cx);
-                    });
-                    return;
-                }
-                let requests: Vec<_> = shortcuts.iter().map(|write: &ActionWrite| state.read(cx).rpc(write.method(), write.payload().clone())).collect();
-                cx.spawn(async move |cx| {
-                    let mut failure = None;
-                    for request in requests {
-                        if let Err(error) = request.await {
-                            failure = Some(error.to_string());
-                            break;
-                        }
-                    }
-                    let _ = view.update(cx, |this, cx| {
-                        this.projects.actions.saving = false;
-                        if let Some(message) = &failure {
-                            store::show_error(format!("Failed to save project actions: {message}"), cx);
-                        }
-                        this.finish_actions_save(after, failure, cx);
-                    });
-                })
-                .detach();
-            },
-            cx,
-        );
+        let view = cx.entity().downgrade();
+        store::update_projects(&self.state, targets, OverrideEdit::Scripts(edit), move |failure, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.projects.actions.saving = false;
+                this.finish_actions_save(after, failure, cx);
+            });
+        }, cx);
     }
 
     fn finish_actions_save(&mut self, after: AfterSave, failure: Option<String>, cx: &mut Context<Self>) {
@@ -357,11 +324,14 @@ impl SettingsView {
     fn request_delete_action(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.projects.actions.editor.as_ref() else { return };
         let Some(script_id) = editor.request.script_id.clone() else { return };
+        let targets = editor.targets.clone();
+        let generation = editor.generation;
         let name = self.projects.actions.name.read(cx).value().to_string();
         let view = cx.entity().downgrade();
         crate::dialog::ask(format!("Delete action \"{name}\"?"), "This action cannot be undone.", "Delete action", move |_, cx| {
             let _ = view.update(cx, |this, cx| {
-                if !this.may(SETTINGS_WRITE_SCOPE, cx) {
+                if this.projects.actions.editor.as_ref().is_none_or(|editor| editor.generation != generation)
+                    || !(super::projects::IconTarget { members: targets }).allows(&this.icon_target(cx), this.projects_permitted(SETTINGS_WRITE_SCOPE, cx), false) {
                     if let Some(editor) = this.projects.actions.editor.as_mut() {
                         editor.error = Some("This connection cannot change project actions.".to_owned());
                     }
@@ -379,11 +349,11 @@ impl SettingsView {
         let p = palette(cx);
         let ids = shown.member_ids();
         let settings = &config.settings;
-        let can_write = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let can_write = self.projects_permitted(SETTINGS_WRITE_SCOPE, cx);
         let actions = &self.projects.actions;
         let disabled = actions.saving || !can_write;
         let scripts = shown_scripts(settings, ids[0]).to_vec();
-        let mixed = scripts_mixed(settings, &ids);
+        let mixed = shown.targets.iter().any(|project| self.project_config(project, cx).is_none_or(|config| shown_scripts(&config.settings, &project.project.id) != scripts));
         let keybindings = decode_resolved_keybindings(&config.keybindings);
         let file_scripts: Vec<FileScript> = self.project_file().map(ProjectFile::scripts).unwrap_or_default().to_vec();
         let importable: Vec<FileScript> = importable(&file_scripts, &scripts).into_iter().cloned().collect();
@@ -405,7 +375,7 @@ impl SettingsView {
         let header = Row::new("project-actions-row", "Actions")
             .description(ACTIONS_DESCRIPTION)
             .reset_tooltip("Reset to inherited value")
-            .reset(can_write && scripts_overridden(settings, &ids), cx.listener(|this, _, _, cx| this.reset_actions(cx)))
+            .reset(can_write && shown.targets.iter().any(|project| self.project_config(project, cx).is_some_and(|config| scripts_overridden(&config.settings, &[&project.project.id]))), cx.listener(|this, _, _, cx| this.reset_actions(cx)))
             .control(h_flex().flex_wrap().gap(r(6.)).children(import).child(add));
 
         let mut rows = vec![header.into_any_element()];
@@ -559,7 +529,7 @@ impl SettingsView {
         let editor = self.projects.actions.editor.as_ref()?;
         let p = palette(cx);
         let dark = cx.theme().is_dark();
-        let can_write = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let can_write = self.projects_permitted(SETTINGS_WRITE_SCOPE, cx);
         let locked = editor.saving || !can_write;
         let editing = editor.request.script_id.is_some();
         let viewport = window.viewport_size();

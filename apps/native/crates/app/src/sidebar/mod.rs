@@ -10,6 +10,7 @@ pub mod controller;
 mod drag;
 mod favicons;
 mod project_filter;
+mod project_folders;
 mod row;
 mod search;
 
@@ -52,7 +53,7 @@ enum ClockRate {
 }
 
 #[derive(PartialEq, Eq)]
-enum PaneRowKey { Draft(String), Divider, Thread(RowKey) }
+enum PaneRowKey { Draft(String), Divider, Thread(RowKey), Scoped(t3_core::sidebar::fleet::ScopedRowKey) }
 
 pub struct SidebarPane {
     updates: Entity<crate::updates::UpdateControl>,
@@ -74,6 +75,8 @@ pub struct SidebarPane {
     jump_hint_timer: Option<Task<()>>,
     now: Ms,
     model_seen: Arc<t3_core::sidebar::SidebarModel>,
+    fleet_seen: Arc<t3_core::sidebar::fleet::ScopedSidebarModel>,
+    rename_key: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     /// Whether the last frame drew a ticking working duration; only then does the clock run per second.
     live_rendered: bool,
     clock: Option<(ClockRate, Task<()>)>,
@@ -118,12 +121,13 @@ impl SidebarPane {
             }),
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
                 AppEvent::Shell | AppEvent::Selection => {
-                    let model = this.state.read(cx).sidebar.model.clone();
-                    // Streaming ticks reach the shell but leave the model alone; nothing to redraw.
-                    if matches!(event, AppEvent::Shell) && Arc::ptr_eq(&model, &this.model_seen) {
-                        return;
-                    }
+                    let state = this.state.read(cx);
+                    let model = state.sidebar.model.clone();
+                    let fleet = state.sidebar.fleet.clone();
+                    // Streaming ticks reach the shell but leave both derived models alone.
+                    if matches!(event, AppEvent::Shell) && Arc::ptr_eq(&model, &this.model_seen) && Arc::ptr_eq(&fleet, &this.fleet_seen) { return; }
                     this.model_seen = model;
+                    this.fleet_seen = fleet;
                     this.sync_rows(cx);
                     this.search.refresh(&this.state, cx);
                     cx.notify();
@@ -164,8 +168,35 @@ impl SidebarPane {
             }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
                 ContextMenuEvent::DiscardDraft(project) => this.discard_draft(project, window, cx),
-                ContextMenuEvent::Rename(owner, focus) => { if owner.allows(this.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { this.start_rename_from_menu(&owner.thread, focus.clone(), window, cx); } },
+                ContextMenuEvent::Rename(owner, focus) => { if owner.allows(this.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) {
+                    if let Some(key) = owner.key() { this.start_scoped_rename(&key, window, cx); }
+                    else { this.start_rename_from_menu(&owner.thread, focus.clone(), window, cx); }
+                } },
                 ContextMenuEvent::CustomSnooze(thread_ids) => snooze.update(cx, |snooze, cx| snooze.open(thread_ids.clone(), window, cx)),
+                ContextMenuEvent::ScopedConfirm(owner, action) => {
+                    let owner = owner.clone(); let action = action.clone();
+                    if !owner.allows(this.state.read(cx),&action) { return; }
+                    let Some(key) = owner.key() else { return };
+                    let title = this.state.read(cx).scoped_thread(&key).map(|row| row.thread.title.clone()).unwrap_or_default();
+                    let (confirm,heading,description,label) = if matches!(action,t3_core::thread_actions::ThreadAction::Unpin) {
+                        let (heading,description) = t3_core::thread_actions::unpin_confirmation(&title);
+                        (crate::settings::client_settings(cx).confirm_thread_unpin(),heading,description,"Unpin")
+                    } else {
+                        let heading = t3_core::thread_actions::archive_confirmation(&title);
+                        (crate::settings::client_settings(cx).confirm_thread_archive(),heading,"You can reopen this thread later.","Archive")
+                    };
+                    if confirm { dialog.update(cx,|dialog,cx| dialog.confirm(heading,description,label,move |state,cx| {
+                        if owner.allows(state,&action) { state.run_scoped_thread_action(&key,action,&[],cx); }
+                    },window,cx)); }
+                    else { this.state.update(cx,|state,cx| state.run_scoped_thread_action(&key,action,&[],cx)); }
+                }
+                ContextMenuEvent::ScopedBulk(owners, action) => {
+                    let owners = owners.clone(); let action = action.clone();
+                    let needs_confirm = match action { t3_core::sidebar::selection::BulkAction::Delete => crate::settings::client_settings(cx).confirm_thread_delete(), t3_core::sidebar::selection::BulkAction::Unpin => crate::settings::client_settings(cx).confirm_thread_unpin(), _ => false };
+                    if !needs_confirm { return this.state.update(cx, |state, cx| state.run_scoped_bulk_action(owners, action, cx)); }
+                    let (heading, description) = if matches!(action, t3_core::sidebar::selection::BulkAction::Unpin) { (format!("Unpin {} threads?", owners.len()), "This will move the threads out of your pinned section.") } else { t3_core::sidebar::selection::bulk_delete_confirmation(owners.len()) };
+                    dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Confirm", move |state, cx| state.run_scoped_bulk_action(owners, action, cx), window, cx));
+                }
                 ContextMenuEvent::BulkDelete(thread_ids) => {
                     if !crate::settings::client_settings(cx).confirm_thread_delete() {
                         return this.state.update(cx, |state, cx| state.delete_threads(thread_ids.clone(), cx));
@@ -177,6 +208,17 @@ impl SidebarPane {
                 ContextMenuEvent::Delete(owner, focus) => {
                     if !owner.allows(this.state.read(cx), &t3_core::thread_actions::ThreadAction::Delete) { return; }
                     let thread_id = &owner.thread;
+                    if let Some(key) = owner.key() {
+                        let title = this.state.read(cx).scoped_thread(&key).map(|row| row.thread.title.clone()).unwrap_or_default();
+                        let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
+                        let owner = owner.clone();
+                        if crate::settings::client_settings(cx).confirm_thread_delete() {
+                            dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| {
+                                if owner.allows(state, &t3_core::thread_actions::ThreadAction::Delete) { state.run_scoped_thread_action(&key, t3_core::thread_actions::ThreadAction::Delete, &[], cx); }
+                            }, window, cx));
+                        } else { this.state.update(cx, |state, cx| state.run_scoped_thread_action(&key, t3_core::thread_actions::ThreadAction::Delete, &[], cx)); }
+                        return;
+                    }
                     if !crate::settings::client_settings(cx).confirm_thread_delete() {
                         return this.state.update(cx, |state, cx| state.delete_thread(thread_id, cx));
                     }
@@ -209,6 +251,8 @@ impl SidebarPane {
             jump_hint_timer: None,
             now: now_ms(),
             model_seen: Default::default(),
+            fleet_seen: Default::default(),
+            rename_key: None,
             live_rendered: false,
             clock: None,
             drag: None,
@@ -260,7 +304,8 @@ impl SidebarPane {
         let state = self.state.read(cx);
         let mut keys: Vec<_> = self.drafts.rows.iter().map(|row| PaneRowKey::Draft(row.project_id.clone())).collect();
         if !keys.is_empty() { keys.push(PaneRowKey::Divider); }
-        keys.extend(state.sidebar.model.row_keys().into_iter().map(PaneRowKey::Thread));
+        if state.fleet.environments.is_empty() { keys.extend(state.sidebar.model.row_keys().into_iter().map(PaneRowKey::Thread)); }
+        else { keys.extend(state.sidebar.fleet.row_keys().into_iter().map(PaneRowKey::Scoped)); }
         if let Some((range, count)) = t3_core::sidebar::splice_range(&self.row_keys, &keys) {
             self.list.splice(range, count);
         }
@@ -331,6 +376,34 @@ impl SidebarPane {
         }));
     }
 
+    fn start_scoped_rename(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(self.state.read(cx), key) else { return; };
+        if !owner.allows(self.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { return; }
+        let Some(title) = self.state.read(cx).scoped_thread(key).map(|row| row.thread.title.clone()) else { return; };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let input_key = key.clone();
+        let previous = window.focused(cx);
+        let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) && this.rename_key.as_ref() == Some(&input_key) {
+                let title = input.read(cx).value().to_string();
+                this.rename = None;
+                this.rename_key = None;
+                this.state.update(cx, |state, cx| {
+                    if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) {
+                        state.run_scoped_command(owner.clone(), t3_core::thread_actions::rename(&controller::uuid(), &owner.thread, title.trim()), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE, "Failed to rename thread", cx);
+                    }
+                });
+                if input.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = &previous { window.focus(focus, cx); }
+                cx.notify();
+            }
+        });
+        self.rename_key = Some(key.clone());
+        self.rename = Some((key.thread_id.clone(), input.clone()));
+        self._subscriptions.push(subscription);
+        input.update(cx, |input, cx| { input.focus(window, cx); input.select_all(window, cx); });
+        cx.notify();
+    }
+
     fn start_rename(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.start_rename_from_menu(thread_id, None, window, cx);
     }
@@ -396,9 +469,12 @@ impl SidebarPane {
     }
 
     fn open_search_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.search.highlighted_id().map(str::to_owned) else { return };
+        let Some(key) = self.search.highlighted_key().cloned() else { return };
         self.clear_search(window, cx);
-        self.state.update(cx, |state, cx| state.select_thread(&thread_id, cx));
+        self.state.update(cx, |state, cx| {
+            if key.environment_id.is_empty() { state.select_thread(&key.thread_id, cx); }
+            else if let Some(owner) = state.scoped_environment(&key.environment_id).map(|entry| entry.summary.owner.clone()) { state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx); }
+        });
     }
 
     /// `SidebarChromeHeader`: the brand (a link home) and the history buttons, in the 52px drag
@@ -652,7 +728,8 @@ impl SidebarPane {
 
     /// `SidebarThreadUndoNotice`: "<summary>, ⌘Z to undo" in the footer row's free space.
     fn render_undo_notice(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let notice = self.state.read(cx).sidebar.undo.notice()?;
+        let state = self.state.read(cx);
+        let notice = state.sidebar.undo.notice()?;
         let p = palette(cx);
         let label = crate::keymap::label("thread.undo", cx).map_or_else(|| "Undo".to_owned(), |shortcut| format!("{shortcut} to undo"));
         Some(
@@ -897,5 +974,208 @@ mod snooze_grant_tests {
         cx.cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
         drop(fixture); drop(replacement); drop(runtime); cx.run_until_parked();
         println!("production cached-pane notification contract: revoke/regrant/initial grant, stale-owner release, reconnect and config; stationary pointer, unchanged clock; retained ebd row hit proof is separate");
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod grouping_frames {
+    use super::*;
+    use gpui::{AppContext, HeadlessAppContext, Render, size};
+    use serde_json::json;
+    use std::sync::Arc;
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+    use t3_core::sidebar::fleet::ScopedSidebarRow;
+    use t3_core::sidebar::grouping::GroupConsumer;
+
+    struct GroupingFrame {
+        pane: Entity<SidebarPane>,
+        menu: Entity<crate::context_menu::ContextMenu>,
+        dialog: Entity<crate::dialog::ConfirmDialog>,
+        snooze: Entity<crate::snooze_dialog::SnoozeDialog>,
+        palette: Entity<crate::palette::CommandPalette>,
+    }
+    impl Render for GroupingFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().flex().bg(hsla(palette(cx).background))
+                .child(div().w(px(320.)).h_full().child(self.pane.clone()))
+                .child(div().flex_1().h_full().border_l_1().border_color(hsla(palette(cx).border)))
+                .child(self.menu.clone()).child(self.dialog.clone()).child(self.snooze.clone())
+                .child(self.palette.clone()).children(crate::settings::overlay(window, cx))
+        }
+    }
+
+    #[test]
+    fn production_grouping_frames() {
+        let Some(out) = std::env::var_os("T3_GROUPING_CAPTURE") else { return };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.allow_parking();
+        let (state, mut active_fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        t3_client::store::save_ui_state(t3_core::composer::drafts::STORE_NAME, &json!({"version":1,"drafts":{}}));
+        runtime.block_on(runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())))
+            .expect("fixture writer barrier task").expect("empty fixture drafts committed");
+        let before = state.read_with(&cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
+        let (ready, loaded) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready);
+        let _loaded = state.update(&mut cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.fleet.environments.len() == 2 {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let mut fixtures = Vec::new();
+        let mut fixture_events = Vec::new();
+        for saved in ["grouping-a", "grouping-b"] {
+            let (client, fixture) = ClientFixture::handle(serde_json::from_value(json!({
+                "authenticated":true,"permissions":["orchestration:read","orchestration:operate","settings:write"]
+            })).unwrap());
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.apply(serde_json::from_value(json!({"kind":"snapshot","snapshot":{
+                "snapshotSequence":1,"projects":[{
+                    "id":"same-project","title":"Shared repository","workspaceRoot":format!("/fixture/{saved}"),
+                    "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z",
+                    "projectIcon":{"kind":"monogram","text":"SR","color":"blue"},
+                    "repositoryIdentity":{"canonicalKey":"shared-repository"}
+                }],"threads":[{
+                    "id":"same-thread","projectId":"same-project","title":format!("{saved} thread"),
+                    "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z",
+                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                    "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":"same-thread"},
+                    "status":if saved=="grouping-a" { "running" } else { "idle" },
+                    "latestRunId":if saved=="grouping-a" { Some("fixture-run") } else { None },
+                    "activeRunId":if saved=="grouping-a" { Some("fixture-run") } else { None },
+                    "activityRunStartedAt":if saved=="grouping-a" { Some("2026-11-01T00:00:00Z") } else { None },
+                    "hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+                }]
+            }})).unwrap());
+            shell.synchronized = true;
+            let mut config = t3_core::server_config::ServerConfigState::default();
+            config.apply(serde_json::from_value(json!({"type":"snapshot","config":{
+                "environment":{"environmentId":saved,"label":saved,"capabilities":{"projectOrganization":true}},
+                "cwd":format!("/fixture/{saved}"),"settings":{}
+            }})).unwrap());
+            let install = state.update(&mut cx, |state, _| state.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
+            fixture_events.push(runtime.block_on(install));
+            fixtures.push(fixture);
+        }
+        let executor = cx.update(|cx| cx.foreground_executor().clone());
+        executor.block_test(loaded).unwrap();
+        state.update(&mut cx, |state, cx| {
+            assert_eq!(state.fleet.environments.len(), 2);
+            state.project_preferences = Default::default();
+            state.sidebar.settings.working_shelf_enabled = true;
+            state.sidebar.shelves.working_expanded = true;
+            state.rebuild_sidebar(cx);
+            let groups = state.project_groups_for(GroupConsumer::Sidebar, cx);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].registrations.len(), 2);
+            assert_eq!(state.sidebar.fleet.threads.len(), 2);
+            assert_ne!(state.sidebar.fleet.threads[0].key, state.sidebar.fleet.threads[1].key);
+            assert!(state.sidebar.fleet.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Shelf { shelf:t3_core::sidebar::Shelf::Working, .. })));
+        });
+        let mut handles = None;
+        let mut outside = None;
+        let window = cx.open_window(size(px(1280.), px(900.)), |window, cx| {
+            outside = Some(cx.focus_handle());
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
+            let command_palette = cx.new(|cx| crate::palette::CommandPalette::new(state.clone(), composer, window, cx));
+            handles = Some((pane.clone(), command_palette.clone()));
+            cx.new(|_| GroupingFrame { pane, menu, dialog, snooze, palette:command_palette })
+        }).unwrap();
+        let (pane, command_palette) = handles.unwrap();
+        let outside = outside.unwrap();
+        let click = |cx:&mut HeadlessAppContext, x:f32, y:f32| {
+            cx.update_window(window.into(), |_, window, cx| {
+                let position = gpui::point(px(x), px(y));
+                window.simulate_mouse_move(position, cx);
+                window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button:gpui::MouseButton::Left, position, modifiers:Default::default(), click_count:1, first_mouse:false }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button:gpui::MouseButton::Left, position, modifiers:Default::default(), click_count:1 }), cx);
+            }).unwrap();
+        };
+        let capture = |cx:&mut HeadlessAppContext, name:&str| {
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(); }).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(out.join(format!("{name}.png"))).unwrap();
+        };
+        cx.update(|cx| crate::settings::store::install_committed_client(&state, serde_json::from_value(json!({"boringSidebarEnabled":true})).unwrap(), cx));
+        state.update(&mut cx, |state, cx| {
+            state.sidebar.settings.working_shelf_enabled = true;
+            state.rebuild_sidebar(cx);
+            assert!(state.sidebar.fleet.rows.iter().any(|row| matches!(row,ScopedSidebarRow::Folder { .. })));
+            assert!(!state.sidebar.fleet.rows.iter().any(|row| matches!(row,ScopedSidebarRow::Shelf { shelf:t3_core::sidebar::Shelf::Working, .. })));
+            let groups=state.project_groups_for(GroupConsumer::Sidebar,cx);
+            state.project_preferences.scope_keys=vec![groups[0].key.clone()];
+            state.rebuild_sidebar(cx);
+            assert_eq!(state.project_preferences.resolved_scope(&groups,true),vec![groups[0].key.clone()]);
+            assert_eq!(state.sidebar.fleet.threads.len(),2);
+        });
+        for dark in [false,true] {
+            let theme=if dark { "dark" } else { "light" };
+            cx.update(|cx| {
+                let mut preferences=crate::theme::preferences(cx).clone();
+                let mode=if dark { t3_core::client_settings::AppearanceMode::Dark } else { t3_core::client_settings::AppearanceMode::Light };
+                preferences.theme=t3_core::client_settings::ThemePreference::Default(mode); preferences.mode=mode;
+                crate::theme::set_preferences(preferences,cx);
+            });
+            capture(&mut cx,&format!("{theme}-folders"));
+            click(&mut cx, 150., 125.);
+            state.read_with(&cx, |state, cx| {
+                let group = &state.project_groups_for(GroupConsumer::Sidebar, cx)[0];
+                assert!(!state.project_preferences.expanded(group), "observed folder row click collapses the logical group");
+                assert!(!state.sidebar.fleet.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Thread { .. })));
+            });
+            capture(&mut cx,&format!("{theme}-folders-collapsed"));
+            click(&mut cx, 150., 125.);
+            state.read_with(&cx, |state, cx| assert!(state.project_preferences.expanded(&state.project_groups_for(GroupConsumer::Sidebar, cx)[0])));
+            pane.update(&mut cx,|pane,cx| { pane.project_filter=Some(gpui::point(px(260.),px(60.))); cx.notify(); });
+            capture(&mut cx,&format!("{theme}-project-filter"));
+            pane.update(&mut cx,|pane,cx| { pane.project_filter=None; cx.notify(); });
+            cx.update_window(window.into(),|_,window,cx| {
+                command_palette.update(cx,|palette,cx| palette.toggle(window,cx));
+                assert!(command_palette.read(cx).focus_handle(cx).is_focused(window));
+                // Focused Input requires a real macOS NSView; this captures the production palette unfocused.
+                window.focus(&outside, cx);
+            }).unwrap();
+            capture(&mut cx,&format!("{theme}-command-palette"));
+            cx.update_window(window.into(),|_,window,cx| command_palette.update(cx,|palette,cx| palette.toggle(window,cx))).unwrap();
+            cx.update(|cx| crate::settings::open(t3_core::settings::search::Section::Projects,cx));
+            capture(&mut cx,&format!("{theme}-project-settings-list"));
+            click(&mut cx, 500., 230.);
+            capture(&mut cx,&format!("{theme}-project-settings-detail"));
+            cx.update_window(window.into(),|_,window,cx| window.dispatch_action(Box::new(crate::settings::CloseSettings),cx)).unwrap();
+            cx.run_until_parked();
+        }
+        state.read_with(&cx, |state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
+        let forbidden = |method:&str| matches!(method,
+            t3_core::commands::method::DISPATCH_COMMAND | t3_core::commands::method::LAUNCH_THREAD | t3_core::projects::PROJECTS_MUTATE
+            | t3_core::commands::method::SERVER_UPDATE_SETTINGS | t3_core::settings::keybindings::SERVER_UPSERT_KEYBINDING
+            | t3_core::settings::keybindings::SERVER_REMOVE_KEYBINDING | "guestShare.create"
+            | "projects.createFromThread" | "projects.createNew"
+        );
+        let mut commands=active_fixture.take_commands();
+        for fixture in &mut fixtures { commands.extend(fixture.take_commands()); }
+        assert!(!commands.iter().any(|method| forbidden(method)),"frames must not send writes or launch providers");
+        std::fs::write(out.join("grouping-frames.json"),serde_json::to_vec_pretty(&json!({
+            "themes":["light","dark"],"owners":["grouping-a","grouping-b"],"rawProjectId":"same-project","rawThreadId":"same-thread",
+            "logicalGroups":1,"registrations":2,"folderWorkingShelf":false,"routeUnchanged":true,"rpcWrites":0,
+            "settingsFrame":"projects-list-and-observed-row-click-detail","folderCollapseClick":true,"paletteFrame":"unfocused; native NSView input not verified","commandsObserved":commands
+        })).unwrap()).unwrap();
+        state.update(&mut cx,|state,_| state.stop_pump());
+        drop(fixture_events);
     }
 }
