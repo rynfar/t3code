@@ -147,7 +147,7 @@ impl ConfirmDialog {
 
     fn resolve(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.take() else { return };
-        if self.focus.is_focused(window) { if let Some(focus) = self.previous_focus.take() { window.focus(&focus, cx); } }
+        if self.focus.is_focused(window) && let Some(focus) = self.previous_focus.take() { window.focus(&focus, cx); }
         if confirmed {
             self.state.update(cx, |state, cx| (pending.on_confirm)(state, cx));
         }

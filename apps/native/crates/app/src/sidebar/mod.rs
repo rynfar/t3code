@@ -348,7 +348,7 @@ impl SidebarPane {
                 if this.rename.as_ref().is_some_and(|(renaming, _)| *renaming == id) {
                     this.rename = None;
                     this.state.update(cx, |state, cx| { if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) { state.rename_thread(&id, &title, cx); } });
-                    if input.read(cx).focus_handle(cx).is_focused(window) { if let Some(focus) = &previous_focus { window.focus(focus, cx); } }
+                    if input.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = &previous_focus { window.focus(focus, cx); }
                     cx.notify();
                 }
             }
@@ -369,7 +369,7 @@ impl SidebarPane {
             let previous = self.rename_previous_focus.take();
             cx.defer(move |cx| {
                 if let Some(window) = cx.active_window() { let _ = window.update(cx, |_, window, cx| {
-                    if input_focus.is_focused(window) { if let Some(previous) = previous { window.focus(&previous, cx); } }
+                    if input_focus.is_focused(window) && let Some(previous) = previous { window.focus(&previous, cx); }
                 }); }
             });
             cx.notify();

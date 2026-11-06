@@ -76,7 +76,7 @@ impl ChatHeader {
     fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.renaming.take() else { return };
         let title = self.rename.read(cx).value().to_string();
-        if self.rename.read(cx).focus_handle(cx).is_focused(window) { if let Some(focus) = self.rename_previous_focus.take() { window.focus(&focus, cx); } }
+        if self.rename.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = self.rename_previous_focus.take() { window.focus(&focus, cx); }
         let owner = self.rename_owner.take();
         self.state.update(cx, |state, cx| { if owner.is_some_and(|owner| owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename)) { state.rename_thread(&thread_id, &title, cx); } });
         cx.notify();

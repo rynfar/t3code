@@ -301,7 +301,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter, owner: ThreadMenuOwner::capture(state, thread_id), previous_focus: window.focused(cx), window: window.window_handle().into(), header: !sidebar });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter, owner: ThreadMenuOwner::capture(state, thread_id), previous_focus: window.focused(cx), window: window.window_handle(), header: !sidebar });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -318,7 +318,7 @@ impl ContextMenu {
             items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
         }
         items.push(discard);
-        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle().into(),header:false});
+        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false});
         window.focus(&self.focus,cx);
         cx.notify();
     }
@@ -341,7 +341,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle().into(), header: false });
+        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -351,7 +351,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
-        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle().into(), header: false });
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -378,7 +378,7 @@ impl ContextMenu {
         let mut custom = MenuItem::new(MenuAction::Thread(ThreadAction::SnoozeCustom), "Custom…", None);
         custom.separator_before = !presets.is_empty();
         items.push(custom);
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle().into(), header: false });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -404,7 +404,7 @@ impl ContextMenu {
         cx.defer(move |cx| {
             if menu.upgrade().is_none_or(|menu| menu.read(cx).open.is_some()) { return; }
             let _ = cx.update_window(window, |_, window, cx| {
-                if focus.is_focused(window) { if let Some(previous) = previous { window.focus(&previous, cx); } }
+                if focus.is_focused(window) && let Some(previous) = previous { window.focus(&previous, cx); }
             });
         });
     }

@@ -108,17 +108,15 @@ fn interrupted(error: &t3_client::session::RpcError) -> bool {
 }
 
 fn create_error(error: t3_client::session::RpcError) -> String {
-    if let t3_client::session::RpcError::Failure(failure) = &error {
-        if failure.tag.as_deref() == Some("GuestShareCreateError") {
-            if let Some(message) = failure
-                .error
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .and_then(rules::failure_message)
-            {
-                return message.into();
-            }
-        }
+    if let t3_client::session::RpcError::Failure(failure) = &error
+        && failure.tag.as_deref() == Some("GuestShareCreateError")
+        && let Some(message) = failure
+            .error
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .and_then(rules::failure_message)
+    {
+        return message.into();
     }
     error.to_string()
 }
@@ -252,10 +250,10 @@ impl GuestShareDialog {
         self.share_watch = None;
         self.copied_reset = None;
         self.active_share = None;
-        if self.focus.contains_focused(window, cx) {
-            if let Some(focus) = self.previous_focus.take() {
-                window.focus(&focus, cx);
-            }
+        if self.focus.contains_focused(window, cx)
+            && let Some(focus) = self.previous_focus.take()
+        {
+            window.focus(&focus, cx);
         }
         cx.notify();
     }
@@ -407,13 +405,11 @@ impl GuestShareDialog {
                         .pending
                         .as_mut()
                         .filter(|pending| pending.owner == owner)
+                        && let CreateState::Created(current, copied) = &mut pending.state
+                        && *current == url
                     {
-                        if let CreateState::Created(current, copied) = &mut pending.state {
-                            if *current == url {
-                                *copied = false;
-                                cx.notify();
-                            }
-                        }
+                        *copied = false;
+                        cx.notify();
                     }
                 });
             }));
@@ -538,10 +534,9 @@ impl GuestIndicator {
                     | AppEvent::Shell
                     | AppEvent::Phase
                     | AppEvent::ServerConfig
-            ) {
-                if this.sync(cx) {
-                    cx.notify();
-                }
+            ) && this.sync(cx)
+            {
+                cx.notify();
             }
         });
         let mut view = Self {
@@ -631,18 +626,16 @@ impl GuestIndicator {
                         .read(cx)
                         .guest_share(&owner.thread)
                         .is_some_and(|current| current.id == share)
+                    && let Err(error) = result
+                    && !interrupted(&error)
                 {
-                    if let Err(error) = result {
-                        if !interrupted(&error) {
-                            this.state.update(cx, |state, cx| {
-                                state.show_toast(
-                                    Toast::new(ToastKind::Error, "Failed to stop guest share")
-                                        .description(error.to_string()),
-                                    cx,
-                                )
-                            });
-                        }
-                    }
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            Toast::new(ToastKind::Error, "Failed to stop guest share")
+                                .description(error.to_string()),
+                            cx,
+                        )
+                    });
                 }
                 cx.notify();
             });
