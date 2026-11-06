@@ -731,6 +731,9 @@ impl AppState {
 
     pub fn toggle_shelf(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
         self.sidebar.shelves.toggle(shelf);
+        if shelf == Shelf::Settled && !self.sidebar.shelves.settled_expanded {
+            self.suspend_settled_pages();
+        }
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Shell);
     }

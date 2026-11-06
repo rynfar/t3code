@@ -29,12 +29,23 @@ pub struct OmittedRows {
     /// The count key last read (or being read), so a key is read once.
     count_key: Option<String>,
     count_task: Option<Task<()>>,
+    page_task: Option<Task<()>>,
     /// The shell generation each family was last asked for, so a generation reads it once.
     family_requested: HashMap<String, u64>,
     scoped_projects: Option<Vec<String>>,
 }
 
 impl OmittedRows {
+    fn suspend_pages(&mut self, generation: u64) {
+        self.page_task = None;
+        self.mounts.unmount(PAGES_KEY);
+        let requested = self.pages.requested;
+        self.pages = SettledPages::default();
+        self.pages.requested = requested;
+        let older = self.older();
+        self.pages.sync_generation(generation, older.as_ref());
+    }
+
     /// The cut and newest counts, while the shell omits older settled threads.
     pub fn older(&self) -> Option<OlderSettled> {
         self.counts.current()
@@ -42,6 +53,13 @@ impl OmittedRows {
 }
 
 impl AppState {
+    pub(crate) fn suspend_settled_pages(&mut self) {
+        self.omitted.suspend_pages(self.shell.generation);
+        for (owner, omitted) in &mut self.sidebar.owner_omitted {
+            omitted.suspend_pages(owner.shell_generation);
+        }
+    }
+
     /// A thread from the shell, else from a read the shell left rows to.
     pub fn thread_shell(&self, id: &str) -> Option<&ThreadShell> {
         self.omitted.mounts.thread(&self.shell, id)
@@ -126,13 +144,13 @@ impl AppState {
     }
 
     fn request_settled_page(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar.shelves.settled_expanded { return; }
         let Some((generation, before)) = self.omitted.pages.next_request() else { return };
         let rpc = self.rpc(GET_OLDER_SETTLED_THREADS, page_request(&before, None));
-        cx.spawn(async move |this, cx| {
+        self.omitted.page_task = Some(cx.spawn(async move |this, cx| {
             let page = rpc.await.map_err(|error| error.to_string()).and_then(decode_read);
             let _ = this.update(cx, |state, cx| state.apply_settled_page(generation, &before, page, cx));
-        })
-        .detach();
+        }));
         // Only the shelf's button changes; the rows wait for the page.
         cx.emit(AppEvent::Notice);
     }
@@ -343,6 +361,7 @@ impl AppState {
     }
 
     fn request_scoped_settled_page(&mut self, owner: t3_core::sidebar::grouping::EnvironmentOwner, cx: &mut Context<Self>) {
+        if !self.sidebar.shelves.settled_expanded { return; }
         if !self.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) { return; }
         let project_ids = self.scoped_older_projects(&owner,cx);
         if project_ids.as_ref().is_some_and(Vec::is_empty) { return; }
@@ -351,7 +370,8 @@ impl AppState {
         let Some((generation, before)) = omitted.pages.next_request() else { return };
         let resolve = self.connections.destination(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
         let runtime = self.runtime().clone();
-        cx.spawn(async move |this, cx| {
+        let page_owner = owner.clone();
+        let task = cx.spawn(async move |this, cx| {
             let Ok(target) = resolve.await else { return };
             let cursor = before.clone(); let requested_projects=project_ids.clone();
             if !this.read_with(cx,|state,_| target.is_current(&state.fleet) && state.scoped_ready(&owner,t3_core::auth::ORCHESTRATION_READ_SCOPE) && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))).unwrap_or(false) { return; }
@@ -364,7 +384,8 @@ impl AppState {
                 omitted.mounts.mount(PAGES_KEY, generation, omitted.pages.reads.clone());
                 state.rebuild_sidebar(cx); state.request_scoped_settled_page(owner, cx); cx.emit(AppEvent::Shell);
             });
-        }).detach();
+        });
+        self.sidebar.owner_omitted.get_mut(&page_owner).unwrap().page_task = Some(task);
         cx.emit(AppEvent::Notice);
     }
 
@@ -450,5 +471,114 @@ mod tests {
         assert!(!active.take_commands().contains(&GET_OLDER_SETTLED_THREADS));
         state.update(cx, |state, _| state.stop_pump());
         drop(event_senders);
+    }
+
+    #[gpui::test]
+    async fn collapsed_scoped_shelf_releases_its_loaded_page_mount(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx,runtime.handle().clone()));
+        let (client, mut fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap());
+        let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+        let sample = shell.snapshot.as_ref().unwrap().threads[0].clone();
+        let snapshot = shell.snapshot.as_mut().unwrap();
+        snapshot.snapshot_sequence = 1;
+        snapshot.threads.clear();
+        snapshot.older_settled = Some(serde_json::from_value(serde_json::json!({
+            "before":t3_core::sidebar::time::format_iso(100_000),"asOfSequence":1,"counts":[{"projectId":"checkout-b","count":50}]
+        })).unwrap());
+        config.config.as_mut().unwrap().environment.environment_id = "collapse-server".into();
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("collapse-fixture").is_some() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let mut next_snapshot = shell.snapshot.as_ref().unwrap().clone();
+        next_snapshot.snapshot_sequence = 2;
+        let install = state.update(cx, |state, _| state.connections.install_fixture("collapse-fixture",client,shell,config,ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(payload["limit"],25);
+        let page = (0..25).map(|index| {
+            let mut thread = sample.clone();
+            thread.id = format!("page-{index:02}"); thread.lineage.root_thread_id = thread.id.clone();
+            thread.settled_override = Some("settled".into());
+            thread.settled_at = Some(t3_core::sidebar::time::format_iso(90_000-index*1000));
+            thread
+        }).collect::<Vec<_>>();
+        let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.sidebar.owner_omitted.iter().any(|(owner,omitted)| owner.saved_id == "collapse-fixture" && omitted.pages.reads.len() == 1) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":page}))).unwrap(); applied.await.unwrap();
+        let owner = state.read_with(cx, |state, _| state.scoped_environment("collapse-fixture").unwrap().summary.owner.clone());
+        state.read_with(cx, |state, _| {
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_eq!(omitted.pages.reads.len(),1);
+            assert_eq!(omitted.mounts.generation_of(PAGES_KEY),Some(owner.shell_generation));
+        });
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        state.read_with(cx, |state, _| {
+            assert!(!state.sidebar.shelves.settled_expanded);
+            assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().mounts.generation_of(PAGES_KEY),None,"collapsing the scoped Settled shelf releases its page consumer");
+        });
+        let family = family_key("independent-family");
+        state.update(cx, |state, _| {
+            state.sidebar.owner_omitted.get_mut(&owner).unwrap().mounts.mount(&family,owner.shell_generation,vec![FamilyRead { snapshot_sequence:1,threads:vec![sample.clone()] }]);
+        });
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        let (_,old_payload,old_reply) = fixture.next_request().await;
+        assert_eq!(old_payload["limit"],25);
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        state.read_with(cx, |state, _| assert!(state.sidebar.owner_omitted.get(&owner).unwrap().mounts.keys().any(|key| key == family)));
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        let (_,new_payload,new_reply) = fixture.next_request().await;
+        assert_eq!(new_payload,old_payload,"reopening restarts at the same cut without accepting the old consumer's reply");
+        let mut stale = sample.clone(); stale.id = "stale-page".into(); stale.lineage.root_thread_id = stale.id.clone();
+        stale.settled_override = Some("settled".into()); stale.settled_at = Some(t3_core::sidebar::time::format_iso(90_000));
+        let mut fresh = stale.clone(); fresh.id = "fresh-page".into(); fresh.lineage.root_thread_id = fresh.id.clone();
+        let _ = old_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[stale]})));
+        let (sent, fresh_applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _fresh_applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.sidebar.owner_omitted.values().any(|omitted| omitted.pages.reads.iter().any(|read| read.threads.iter().any(|thread| thread.id == "fresh-page"))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        new_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[fresh]}))).unwrap(); fresh_applied.await.unwrap();
+        state.read_with(cx, |state, _| {
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert!(omitted.pages.reads.iter().flat_map(|read| &read.threads).all(|thread| thread.id != "stale-page"));
+            assert!(omitted.mounts.keys().any(|key| key == family));
+        });
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        let (sent, snapshotted) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _snapshotted = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("collapse-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(2)) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::Snapshot { snapshot:Box::new(next_snapshot),resolved_repository_identity_roots:None })).await.unwrap(); snapshotted.await.unwrap();
+        let current = state.read_with(cx, |state, _| state.scoped_environment("collapse-fixture").unwrap().summary.owner.clone());
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&current,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        runtime.spawn(barrier).await.unwrap().unwrap(); cx.run_until_parked();
+        use futures::FutureExt;
+        assert!(fixture.next_request().now_or_never().is_none(),"a collapsed snapshot must not replay page reads");
+        state.read_with(cx, |state, _| {
+            let omitted = state.sidebar.owner_omitted.get(&current).unwrap();
+            assert_eq!(omitted.mounts.generation_of(PAGES_KEY),None);
+            assert!(omitted.mounts.keys().any(|key| key == family));
+        });
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        let (_,payload,reply) = fixture.next_request().await;
+        assert_eq!(payload["limit"],25);
+        assert_eq!(payload["before"]["settledAt"],t3_core::sidebar::time::format_iso(100_000));
+        reply.send(Err(t3_client::session::RpcError::Closed)).unwrap();
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
     }
 }
