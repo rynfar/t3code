@@ -157,18 +157,19 @@ fn scoped_project_thread_items(
     actions: &HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>,
     preferred: Option<&t3_core::sidebar::grouping::ProjectRef>,
     primary: Option<&str>,
+    actual_context: Option<&str>,
+    eligible: &std::collections::HashSet<String>,
 ) -> Vec<CommandPaletteItem> {
     let drafts = items.iter().filter_map(|item| {
         let (group, reference, draft) = actions.get(&item.value)?;
         let target = group.registrations.iter().find(|project| project.reference() == *reference)?;
         (*draft).then_some((item, group, target))
     }).collect::<Vec<_>>();
-    let scratch = drafts.iter().filter(|(_, _, target)| target.is_scratch)
-        .find(|(_, _, target)| primary == Some(target.owner.saved_id.as_str()))
-        .or_else(|| drafts.iter().filter(|(_, _, target)| target.is_scratch)
-            .find(|(_, _, target)| preferred.is_some_and(|reference| reference.environment_id == target.owner.saved_id)))
+    let available = || drafts.iter().filter(|(_, _, target)| target.is_scratch && eligible.contains(&target.owner.saved_id));
+    let scratch = available().find(|(_, _, target)| primary == Some(target.owner.saved_id.as_str()))
+        .or_else(|| available().find(|(_, _, target)| actual_context == Some(target.owner.saved_id.as_str())))
         .or_else(|| {
-            let mut offering = drafts.iter().filter(|(_, _, target)| target.is_scratch);
+            let mut offering = available();
             let first = offering.next()?;
             offering.next().is_none().then_some(first)
         });
@@ -432,10 +433,15 @@ impl CommandPalette {
             let first = local.next()?;
             local.next().is_none().then_some(first.id.as_str())
         });
+        let actual_context = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)).map(|_| ())
+            .or_else(|| state.draft_project.as_deref().and_then(|id| state.shell.project(id)).map(|_| ()))
+            .and(state.environments.active.as_deref());
+        let eligible = state.fleet.environments.iter().filter(|entry| state.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE))
+            .map(|entry| entry.summary.owner.saved_id.clone()).collect();
         let project_thread_items = if state.fleet.environments.is_empty() {
             build_project_action_items(&projects, "new-thread-in", |_| Vec::new(), None)
         } else {
-            scoped_project_thread_items(&self.projects, &self.scoped_project_actions, preferred.as_ref(), primary)
+            scoped_project_thread_items(&self.projects, &self.scoped_project_actions, preferred.as_ref(), primary, actual_context, &eligible)
         };
         let mut actions = action_items(state);
         if !project_thread_items.is_empty() {
@@ -916,19 +922,22 @@ mod scoped_project_tests {
 
     #[test]
     fn scoped_project_palette_offers_one_existing_scratch_target_in_context_order() {
-        for (saved, primary, expected, index) in [
-            ("scratch-b", Some("scratch-a"), Some("scratch-a"), 1),
-            ("scratch-b", None, Some("scratch-b"), 1),
-            ("b", None, None, 2),
-            ("b", Some("scratch-a"), Some("scratch-a"), 2),
-            ("scratch-b", Some("missing"), Some("scratch-b"), 1),
+        for (saved, primary, context, ready, expected, index) in [
+            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-b"], Some("scratch-b"), 1),
+            ("scratch-b", None, None, vec!["scratch-a", "scratch-b"], None, 1),
+            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 1),
+            ("scratch-b", None, Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 1),
+            ("b", None, Some("b"), vec!["scratch-a", "scratch-b"], None, 2),
+            ("b", Some("scratch-a"), Some("b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 2),
+            ("scratch-b", Some("missing"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 1),
         ] {
             let preferred = ProjectRef { environment_id:saved.into(),project_id:"same".into() };
             let entries = crate::new_thread::picker_entries(scratch_groups(), Some(&preferred));
             let (items, actions) = scoped_project_items(&entries);
             let root_scratch = items.iter().filter(|item| !actions[&item.value].2 && actions[&item.value].0.registrations.iter().any(|project| project.is_scratch)).count();
             assert_eq!(root_scratch, 2, "root project search retains physical scratch entries");
-            let submenu = scoped_project_thread_items(&items, &actions, Some(&preferred), primary);
+            let eligible = ready.into_iter().map(str::to_owned).collect();
+            let submenu = scoped_project_thread_items(&items, &actions, Some(&preferred), primary, context, &eligible);
             let scratch = submenu.iter().filter(|item| actions[&item.value].0.registrations.iter().all(|project| project.is_scratch)).collect::<Vec<_>>();
             assert_eq!(scratch.len(), usize::from(expected.is_some()));
             if let Some(expected) = expected {
@@ -940,7 +949,7 @@ mod scoped_project_tests {
         }
         let entries = crate::new_thread::picker_entries(scratch_groups().into_iter().filter(|group| !group.registrations.iter().any(|project| project.owner.saved_id == "scratch-b")).collect(), None);
         let (items, actions) = scoped_project_items(&entries);
-        let submenu = scoped_project_thread_items(&items, &actions, None, None);
+        let submenu = scoped_project_thread_items(&items, &actions, None, None, None, &["scratch-a".to_owned()].into());
         let scratch = submenu.iter().find(|item| item.title == "No project").unwrap();
         assert_eq!(actions[&scratch.value].1.environment_id, "scratch-a", "sole existing offering does not need a primary or context");
     }

@@ -1080,5 +1080,38 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
         assert_eq!(state.project_preferences.scope_keys, vec![incompatible], "a deliberate scope on the same route must survive rebuilds and reselect");
     });
     assert!(!arriving.take_commands().iter().any(|method| matches!(*method, t3_core::commands::method::DISPATCH_COMMAND | t3_core::projects::PROJECTS_MUTATE)));
+    let search=cx.update(|window, cx| {
+        let input=cx.new(|cx| gpui_component::input::InputState::new(window, cx));
+        input.update(cx, |input, cx| input.set_value("pending search", window, cx));
+        state.update(cx, |state, _| state.sidebar.search_input=Some(input.downgrade()));
+        input
+    });
+    let chosen=state.read_with(cx, |state, _| state.project_preferences.scope_keys.clone());
+    let pending=t3_core::sidebar::tag_filter::ThreadKey::new("arriving", "other-thread");
+    state.update(cx, |state, cx| {
+        let owner=state.scoped_environment("arriving").unwrap().summary.owner.clone();
+        state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread("other-thread".into()), cx);
+        assert_eq!(state.selected_thread.as_deref(), Some("other-thread"));
+        assert_eq!(state.sidebar.route_pending.as_ref(), Some(&pending));
+        assert_eq!(state.project_preferences.scope_keys, chosen);
+    });
+    let (method, payload, reply)=arriving.next_request().await;
+    assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+    assert_eq!(payload["type"], "thread.visit");
+    assert_eq!(payload["threadId"], "other-thread");
+    reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
+    state.update(cx, |state, cx| {
+        state.start_draft("checkout-a", cx);
+        assert!(state.selected_thread.is_none());
+        assert_eq!(state.sidebar.route_pending.as_ref(), Some(&pending));
+        assert_eq!(state.project_preferences.scope_keys, chosen);
+    });
+    cx.update(|window, cx| search.update(cx, |input, cx| input.set_value("", window, cx)));
+    state.update(cx, |state, cx| {
+        state.rebuild_sidebar(cx);
+        assert!(state.selected_thread.is_none());
+        assert_eq!(state.draft_project.as_deref(), Some("checkout-a"));
+        assert_eq!(state.project_preferences.scope_keys, chosen, "clearing search on a draft must not reveal a stale thread route");
+    });
     state.update(cx, |state, _| state.stop_pump());
 }

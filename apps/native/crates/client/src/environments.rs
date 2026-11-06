@@ -101,7 +101,7 @@ pub enum EnvironmentEvent {
 enum Command {
     #[cfg(feature = "test-support")]
     Fixture { id: String, generation: u64, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, reply: tokio::sync::oneshot::Sender<mpsc::Sender<ClientEvent>> },
-    ApplySettings { owner: EnvironmentOwner, settings: t3_core::server_config::ServerSettings, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
+    ApplySettings { owner: EnvironmentOwner, settings: Box<t3_core::server_config::ServerSettings>, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     ApplyKeybindings { owner: EnvironmentOwner, value: serde_json::Value, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     Destination { owner: EnvironmentOwner, scope: String, reply: tokio::sync::oneshot::Sender<Result<Destination, DestinationError>> },
     Client { id: String, reply: tokio::sync::oneshot::Sender<Option<ClientHandle>> },
@@ -200,7 +200,7 @@ impl Environments {
 
     pub fn apply_settings_reply(&self, owner: &EnvironmentOwner, settings: t3_core::server_config::ServerSettings, sent_revision: u64) -> impl std::future::Future<Output = Result<bool, DestinationError>> + Send + 'static + use<> {
         let (reply, response) = tokio::sync::oneshot::channel();
-        let _ = self.commands.send(Command::ApplySettings { owner: owner.clone(), settings, revision: sent_revision, reply });
+        let _ = self.commands.send(Command::ApplySettings { owner: owner.clone(), settings: Box::new(settings), revision: sent_revision, reply });
         async move { response.await.unwrap_or(Err(DestinationError::Missing)) }
     }
 
@@ -444,7 +444,7 @@ async fn run(
                 Some(Command::ApplySettings { owner, settings, revision, reply }) => {
                     let result = entries.get_mut(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| {
                         if entry.owner(&owner.saved_id) != owner { return Err(DestinationError::Stale); }
-                        Ok(entry.config.apply_settings_reply(settings, revision))
+                        Ok(entry.config.apply_settings_reply(*settings, revision))
                     });
                     if result == Ok(true) { publish(&entries, &owner.saved_id, false, &view); }
                     let _ = reply.send(result);

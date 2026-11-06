@@ -512,8 +512,9 @@ impl AppState {
     }
 
     fn reveal_scoped_route(&mut self, cx: &mut Context<Self>) {
-        if let Some(key) = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id)) { self.observe_scoped_route(key); }
-        let Some(key) = self.sidebar.route_pending.clone() else { return; };
+        let Some(current) = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id)) else { return; };
+        self.observe_scoped_route(current.clone());
+        let Some(key) = self.sidebar.route_pending.clone().filter(|key| *key == current) else { return; };
         if self.sidebar.search_input.as_ref().and_then(gpui::WeakEntity::upgrade).is_some_and(|input| !input.read(cx).value().trim().is_empty())
             || !self.fleet.environments.iter().all(|entry| entry.summary.synchronized && entry.config.config.is_some()) { return; }
         let Some(thread) = self.scoped_thread(&key) else { return; };
