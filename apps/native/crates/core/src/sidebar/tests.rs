@@ -619,7 +619,6 @@ fn older_settled_listing_and_counts() {
             shelves: &ShelfState::default(),
             selected_thread_id: None,
             project_scope: None, hidden_thread_ids: None,
-            connected: true,
             now: iso(NOW),
             dragging: None,
         },
@@ -661,7 +660,7 @@ fn snapshot(threads: Vec<Value>) -> ShellSnapshot {
 
 fn build(snapshot: &ShellSnapshot, shelves: &ShelfState, selected: Option<&str>) -> SidebarModel {
     SidebarModel::build(
-        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, hidden_thread_ids: None, connected: true, now: iso(NOW), dragging: None },
+        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: None },
         &mut InboxReturnTracker::default(),
     )
 }
@@ -704,6 +703,74 @@ fn model_lists_sections_with_collapsed_shelves_and_the_open_thread() {
     assert_eq!(model.adjacent_thread(None, false), Some("done-2"));
     assert_eq!(model.jump_target(0), Some("pinned"));
     assert_eq!(model.section_of("napping"), Some(Section::Snoozed));
+
+    let mut snapshot = snapshot;
+    snapshot.threads.push(serde_json::from_value(wire_thread("busy-newer", json!({
+        "latestRunId": "r2", "activeRunId": "r2", "status": "running",
+        "latestUserAuthoredMessageAt": "2026-04-10T11:00:00.000Z", "activeOrderKey": "b"
+    }))).unwrap());
+    snapshot.threads[2].latest_user_authored_message_at = Some(Some("2026-04-10T10:00:00.000Z".into()));
+    snapshot.threads[2].active_order_key = Some("c".into());
+    for index in [0, 3, 4] {
+        snapshot.threads[index].latest_run_id = Some("r".into());
+        snapshot.threads[index].status = "running".into();
+    }
+    for enabled in [true, false] {
+        let settings = SidebarSettings { working_shelf_enabled: enabled, ..Default::default() };
+        let mut tracker = InboxReturnTracker::default();
+        let model = SidebarModel::build(&ModelInput {
+            snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &settings, shelves: &open,
+            selected_thread_id: None, project_scope: None, hidden_thread_ids: None,
+            now: iso(NOW), dragging: None,
+        }, &mut tracker);
+        let working: Vec<_> = model.partition.working.iter().map(|i| model.threads[*i].id.as_str()).collect();
+        let active: Vec<_> = model.partition.active.iter().map(|i| model.threads[*i].id.as_str()).collect();
+        assert_eq!(working, if enabled { vec!["busy-newer", "busy"] } else { vec![] }, "enabled={enabled}");
+        assert_eq!(active, if enabled { vec!["active"] } else { vec!["active", "busy-newer", "busy"] });
+        for (id, section) in [("pinned", Section::Pinned), ("napping", Section::Snoozed), ("done-1", Section::Settled)] {
+            assert_eq!(model.section_of(id), Some(section));
+        }
+    }
+
+    let mut completed = snapshot.clone();
+    let newer = completed.threads.last_mut().unwrap();
+    newer.status = "completed".into();
+    newer.active_run_id = None;
+    newer.latest_run_completed_at = Some(Some(NOW.into()));
+    for kind in ["approval", "user_input"] {
+        let mut tracker = InboxReturnTracker::default();
+        let mut input = ModelInput {
+            snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &open,
+            selected_thread_id: None, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: None,
+        };
+        assert_eq!(SidebarModel::build(&input, &mut tracker).section_of("busy-newer"), Some(Section::Working));
+        input.snapshot = &completed;
+        for (elapsed, section) in [(1, Section::Working), (2_000, Section::Working), (2_001, Section::Active)] {
+            input.now = iso(NOW) + elapsed;
+            let model = SidebarModel::build(&input, &mut tracker);
+            assert_eq!(model.section_of("busy-newer"), Some(section));
+            if section == Section::Active {
+                let active: Vec<_> = model.partition.active.iter().map(|i| model.threads[*i].id.as_str()).collect();
+                assert_eq!(active, ["busy-newer", "active"]);
+            }
+        }
+        input.snapshot = &snapshot;
+        input.now += 1;
+        assert_eq!(SidebarModel::build(&input, &mut tracker).section_of("busy-newer"), Some(Section::Working));
+        input.snapshot = &completed;
+        input.now += 1;
+        assert_eq!(SidebarModel::build(&input, &mut tracker).section_of("busy-newer"), Some(Section::Working));
+        let mut requested = completed.clone();
+        requested.threads.last_mut().unwrap().pending_runtime_request = Some(crate::shell::PendingRuntimeRequestSummary {
+            id: "request".into(), kind: kind.into(), blocking: Some(true),
+        });
+        input.snapshot = &requested;
+        input.now += 1;
+        assert_eq!(SidebarModel::build(&input, &mut tracker).section_of("busy-newer"), Some(Section::Active));
+        assert_eq!(tracker.next_deadline(), None);
+        input.snapshot = &snapshot;
+        assert_eq!(SidebarModel::build(&input, &mut tracker).section_of("busy-newer"), Some(Section::Working));
+    }
 }
 
 #[test]
@@ -714,7 +781,7 @@ fn dragging_adds_drop_markers_and_slots_resolve_through_them() {
         wire_thread("done-1", json!({"settledOverride": "settled", "settledAt": "2026-04-03T00:00:00.000Z"})),
     ]);
     let model = SidebarModel::build(
-        &ModelInput { snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, hidden_thread_ids: None, connected: true, now: iso(NOW), dragging: Some(Section::Active) },
+        &ModelInput { snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: Some(Section::Active) },
         &mut InboxReturnTracker::default(),
     );
     assert_eq!(labels(&model), ["<PinnedHeader>", "Pinned:pinned", "<PinnedDivider>", "Active:active", "[Settled 1]", "<SettledPlaceholder>"]);
@@ -842,7 +909,7 @@ fn tag_visibility_applies_before_sidebar_partition_and_search() {
     let tags = vec!["private".into()];
     let hidden = tag_filter::hidden_thread_keys(&[tag_filter::Environment{environment_id:"env",threads:&refs,hidden_tags:Some(&tags)}],&HashSet::new(),&HashSet::new(),true)
         .into_iter().map(|key|key.thread_id).collect();
-    let model = SidebarModel::build(&ModelInput {snapshot:&snapshot,extra_threads:&[],older_settled:None,settings:&Default::default(),shelves:&Default::default(),selected_thread_id:Some("private"),project_scope:None,hidden_thread_ids:Some(&hidden),connected:true,now:iso(NOW),dragging:None},&mut Default::default());
+    let model = SidebarModel::build(&ModelInput {snapshot:&snapshot,extra_threads:&[],older_settled:None,settings:&Default::default(),shelves:&Default::default(),selected_thread_id:Some("private"),project_scope:None,hidden_thread_ids:Some(&hidden),now:iso(NOW),dragging:None},&mut Default::default());
     assert_eq!(model.threads.iter().map(|thread|thread.id.as_str()).collect::<Vec<_>>(),["plain"]);
     assert!(search_titles(&model,"private",iso(NOW)).is_empty());
     assert_eq!(model.jump_target(0),Some("plain"));

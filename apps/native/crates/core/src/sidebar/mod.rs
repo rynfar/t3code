@@ -159,7 +159,6 @@ pub struct PartitionInput<'a> {
     pub working_shelf_enabled: bool,
     /// Older servers can't settle or snooze; the web gates both on a loaded server config.
     pub config_loaded: bool,
-    pub disconnected: bool,
     pub now: Ms,
     pub inbox: &'a InboxObservation,
 }
@@ -174,7 +173,7 @@ pub fn partition(input: &PartitionInput) -> Partition {
             thread.pinned,
         );
         let section = match section {
-            Section::Active if input.working_shelf_enabled && !input.disconnected && input.inbox.is_working(thread) => Section::Working,
+            Section::Active if input.working_shelf_enabled && input.inbox.is_working(thread) => Section::Working,
             other => other,
         };
         buckets[section as usize].push(thread);
@@ -213,7 +212,6 @@ pub struct ModelInput<'a> {
     /// Scoped project ids, or `None` for every project.
     pub project_scope: Option<&'a HashSet<String>>,
     pub hidden_thread_ids: Option<&'a HashSet<String>>,
-    pub connected: bool,
     pub now: Ms,
     /// The section a thread is being dragged out of, which shows the drop markers.
     pub dragging: Option<Section>,
@@ -264,7 +262,6 @@ impl SidebarModel {
             threads: &threads,
             working_shelf_enabled: input.settings.working_shelf_enabled,
             config_loaded: true,
-            disconnected: !input.connected,
             now: input.now,
             inbox: &observation,
         });

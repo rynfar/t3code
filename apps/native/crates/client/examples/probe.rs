@@ -483,7 +483,6 @@ async fn main() -> anyhow::Result<()> {
                 shelves: &shelves,
                 selected_thread_id: None,
                 project_scope: None, hidden_thread_ids: None,
-                connected: true,
                 dragging: None,
                 now,
             },
