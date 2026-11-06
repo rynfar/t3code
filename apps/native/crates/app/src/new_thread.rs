@@ -257,3 +257,23 @@ impl Render for DraftHero {
             .child(self.composer.clone())
     }
 }
+
+impl AppState {
+    pub(crate) fn start_branch_draft(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self, thread_id) else { return };
+        let Some(thread) = self.thread_shell(thread_id) else { return };
+        let project_id = thread.project_id.clone();
+        let Some(project) = self.shell.project(&project_id) else { return };
+        let choice = t3_core::workspace::DraftWorkspace {
+            destination: Some((self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).unwrap_or_default(), project.created_at.clone())),
+            branch: thread.branch.clone(),
+            environment_id: self.environments.active.clone().unwrap_or_default(),
+            project_root: project.workspace_root.clone(),
+            mode: if thread.worktree_path.is_some() { t3_core::server_config::ThreadEnvMode::Worktree } else { t3_core::server_config::ThreadEnvMode::Local },
+            previous: thread.worktree_path.as_ref().map(|path| t3_core::workspace::PreviousWorktreeSeed { worktree_path:path.clone(), branch:thread.branch.clone() }),
+        };
+        self.start_draft(&project_id, cx);
+        self.branch_draft = Some((owner, choice));
+        cx.emit(AppEvent::BranchDraft);
+    }
+}

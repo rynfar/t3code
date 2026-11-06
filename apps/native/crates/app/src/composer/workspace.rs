@@ -20,6 +20,7 @@ struct Scope {
     root: String,
     connection: u64,
     generation: u64,
+    destination: (String, String),
 }
 
 #[derive(Default)]
@@ -38,7 +39,7 @@ pub(super) struct Workspace {
 impl Composer {
     fn workspace_choice(&self) -> Option<&DraftWorkspace> {
         let scope = self.workspace.scope.as_ref()?;
-        self.drafts.store.get(&drafts::key(&Target::Draft(scope.project.clone())))?.workspace.as_ref().filter(|choice| choice.in_scope(&scope.environment, &scope.root))
+        self.drafts.store.get(&drafts::key(&Target::Draft(scope.project.clone())))?.workspace.as_ref().filter(|choice| choice.in_scope(&scope.environment, &scope.root) && choice.destination.as_ref().is_none_or(|destination| destination == &scope.destination))
     }
 
     pub(super) fn selected_workspace(&self) -> Option<DraftWorkspace> {
@@ -60,6 +61,7 @@ impl Composer {
                 root: state.shell.project(project)?.workspace_root.clone(),
                 connection: state.connection_id()?,
                 generation: *state.client_handle()?.connection_generation().borrow(),
+                destination: (state.server_config.config.as_ref()?.environment.environment_id.clone(), state.shell.project(project)?.created_at.clone()),
             })
         })();
         let changed = scope != self.workspace.scope;
@@ -182,7 +184,10 @@ impl Composer {
     }
 
     fn workspace_visible(&self) -> bool {
-        self.workspace.scope.is_some() && (self.workspace.is_repo || self.workspace.error.is_some())
+        self.workspace.scope.as_ref().is_some_and(|scope| {
+            self.workspace.is_repo || self.workspace.error.is_some()
+                || (self.workspace_choice().is_none() && self.drafts.store.get(&drafts::key(&Target::Draft(scope.project.clone()))).is_some_and(|draft| draft.workspace.is_some()))
+        })
     }
 
     pub(super) fn workspace_enabled(&self) -> bool {
@@ -200,7 +205,7 @@ impl Composer {
         self.record_draft(&target, cx);
         let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
         draft.updated_at = crate::sidebar::controller::now_ms();
-        draft.workspace = Some(DraftWorkspace { environment_id: scope.environment, project_root: scope.root, mode, previous });
+        draft.workspace = Some(DraftWorkspace { destination: Some(scope.destination), branch: None, environment_id: scope.environment, project_root: scope.root, mode, previous });
         self.drafts.store.set(&drafts::key(&target), draft);
         self.schedule_draft_save(&target, cx);
         self.workspace.open = false;
@@ -352,5 +357,26 @@ impl Composer {
         self.workspace.task = None;
         eprintln!("workspace availability: hidden non-repo shortcut/keys refused; empty Enter reached submit spy; error/retry and repository menus remained accessible; loss of availability released keys; no launch RPC");
         Ok(())
+    }
+}
+
+impl Composer {
+    pub(super) fn apply_branch_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.state.update(cx, |state, _| state.branch_draft.take());
+        let Some((owner, choice)) = pending else { return };
+        let state = self.state.read(cx);
+        if !owner.current(state) || state.selected_thread.is_some() { return; }
+        let Some(project) = state.draft_project.clone() else { return };
+        let target = Target::Draft(project);
+        if self.snapshot.target.as_ref() != Some(&target) { return; }
+        self.record_draft(&target, cx);
+        let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
+        draft.workspace = Some(choice);
+        self.drafts.store.set(&drafts::key(&target), draft);
+        self.schedule_draft_save(&target, cx);
+        self.sync_workspace(false, cx);
+        self.sync_menu(true, cx);
+        self.focus(window, cx);
+        cx.notify();
     }
 }

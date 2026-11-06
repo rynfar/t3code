@@ -510,6 +510,8 @@ pub struct EnvironmentCapabilities {
     pub side_chats: Option<bool>,
     #[serde(default)]
     pub thread_auto_settle_opt_out: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub thread_project_from_scratch: Option<bool>,
     #[serde(default)]
     pub project_organization: Option<bool>,
     #[serde(default)]
@@ -638,6 +640,8 @@ pub struct ProjectSettingsOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub guest_sharing_enabled: Option<bool>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub environment_icon: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]

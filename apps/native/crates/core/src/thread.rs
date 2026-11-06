@@ -49,6 +49,8 @@ impl<'de> Deserialize<'de> for Entity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppThread {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_share: Option<crate::thread_actions::guest_share::GuestShare>,
     pub id: String,
     pub project_id: String,
     pub title: String,

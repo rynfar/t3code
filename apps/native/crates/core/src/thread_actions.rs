@@ -143,6 +143,8 @@ pub enum ThreadAction {
     Rename,
     RegenerateTitle,
     MarkUnread,
+    ShareGuest,
+    TurnIntoProject,
     Copy,
     CopyPath,
     CopyBranch,
@@ -161,6 +163,7 @@ impl ThreadAction {
                 | ThreadAction::NewThreadOnBranch
                 | ThreadAction::ProjectSettings
                 | ThreadAction::MarkUnread
+                | ThreadAction::ShareGuest
                 | ThreadAction::Copy
                 | ThreadAction::CopyPath
                 | ThreadAction::CopyBranch
@@ -226,6 +229,8 @@ pub struct Supports {
 pub struct ThreadActionMenuState<'a> {
     pub can_operate: bool,
     pub can_find: bool,
+    pub can_share_with_guest: bool,
+    pub can_turn_into_project: bool,
     pub branch: Option<&'a str>,
     pub project_filter: Option<(&'a str, bool)>,
     pub is_pinned: bool,
@@ -275,7 +280,7 @@ pub fn build_project_menu(pinned: bool, can_pin: bool) -> Vec<MenuItem<ProjectAc
     items
 }
 
-/// `buildThreadActionMenuItems`, without guest sharing and project promotion.
+/// `buildThreadActionMenuItems`.
 pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
     use ThreadAction as A;
     let mut items = Vec::new();
@@ -322,9 +327,15 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
         items.push(MenuItem::new(A::RegenerateTitle, label, Some("refresh-cw")).disabled(state.is_regenerating_title));
     }
     items.push(MenuItem::new(A::MarkUnread, "Mark unread", Some("mail-open")));
+    if state.can_share_with_guest {
+        items.push(MenuItem::new(A::ShareGuest, "Share with guest", Some("user-plus")));
+    }
     if let Some((label, active)) = state.project_filter {
         let label = if active { "Show all projects".to_owned() } else { format!("Filter by {label}") };
         items.push(MenuItem::new(A::FilterByProject, label, Some("folder-tree")));
+    }
+    if state.can_turn_into_project {
+        items.push(MenuItem::new(A::TurnIntoProject, "Turn into project", Some("folder-plus")).disabled(state.is_running));
     }
     if state.supports.auto_settle_opt_out {
         let mut auto = MenuItem::new(A::AutoSettle, "Auto-settle behavior", Some("timer"));
@@ -364,6 +375,7 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
         .collect()
 }
 
+pub mod guest_share;
 pub(crate) mod thread_reference;
 pub use thread_reference::thread_reference;
 
@@ -581,6 +593,8 @@ mod tests {
         ThreadActionMenuState {
             can_operate: true,
             can_find: false,
+            can_share_with_guest: false,
+            can_turn_into_project: false,
             branch: Some("feature/x"),
             project_filter: None,
             is_pinned: false,
@@ -686,6 +700,17 @@ mod tests {
         assert!(read_only.iter().find(|item| item.action == ThreadAction::Pin).unwrap().disabled);
         assert!(!read_only.iter().find(|item| item.action == ThreadAction::MarkUnread).unwrap().disabled);
         assert!(!read_only.iter().find(|item| item.action == ThreadAction::Copy).unwrap().children[0].disabled);
+    }
+
+    #[test]
+    fn optional_actions_keep_web_order_and_independent_grants() {
+        let items = build_menu(&ThreadActionMenuState { can_find:true, can_share_with_guest:true, can_turn_into_project:true, project_filter:Some(("Repo", false)), supports:Supports { auto_settle_opt_out:true, ..supports() }, ..state(&[]) });
+        let actions: Vec<_> = items.iter().map(|item| item.action.clone()).collect();
+        assert_eq!(actions, [ThreadAction::Find, ThreadAction::NewThreadOnBranch, ThreadAction::Pin, ThreadAction::Settle, ThreadAction::Snooze, ThreadAction::Rename, ThreadAction::RegenerateTitle, ThreadAction::MarkUnread, ThreadAction::ShareGuest, ThreadAction::FilterByProject, ThreadAction::TurnIntoProject, ThreadAction::AutoSettle, ThreadAction::Copy, ThreadAction::ProjectSettings, ThreadAction::Archive, ThreadAction::Delete]);
+        let read_only = build_menu(&ThreadActionMenuState { can_operate:false, can_share_with_guest:true, can_turn_into_project:true, supports:Supports {auto_settle_opt_out:true, ..supports()}, ..state(&[]) });
+        assert!(!read_only.iter().find(|item| item.action == ThreadAction::ShareGuest).unwrap().disabled);
+        assert!(read_only.iter().find(|item| item.action == ThreadAction::TurnIntoProject).unwrap().disabled);
+        assert!(read_only.iter().find(|item| item.action == ThreadAction::AutoSettle).unwrap().children.iter().all(|child| child.disabled));
     }
 
     #[test]

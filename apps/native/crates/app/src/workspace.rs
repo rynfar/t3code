@@ -46,6 +46,7 @@ pub struct Workspace {
     welcome: Entity<crate::onboarding::WelcomeWizard>,
     menu: Entity<ContextMenu>,
     dialog: Entity<ConfirmDialog>,
+    guest_share: Entity<crate::guest_share::GuestShareDialog>,
     palette: Entity<CommandPalette>,
     snooze: Entity<SnoozeDialog>,
     right_panel: Entity<RightPanelView>,
@@ -63,6 +64,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+        let guest_share = cx.new(|cx| crate::guest_share::GuestShareDialog::new(state.clone(), window, cx));
         let dialog = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
         let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
@@ -129,6 +131,7 @@ impl Workspace {
             welcome,
             menu,
             dialog,
+            guest_share,
             palette,
             snooze,
             right_panel,
@@ -363,6 +366,7 @@ impl Render for Workspace {
             .child(self.prompt_links.clone())
             .child(self.menu.clone())
             .child(self.dialog.clone())
+            .child(self.guest_share.clone())
             .child(self.git_dialogs.clone())
             .child(self.snooze.clone())
             .child(self.palette.clone())

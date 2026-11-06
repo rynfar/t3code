@@ -4,6 +4,7 @@
 
 use serde::Deserialize;
 
+pub const ACCESS_WRITE_SCOPE: &str = "access:write";
 pub const TERMINAL_READ_SCOPE: &str = "terminal:read";
 pub const TERMINAL_OPERATE_SCOPE: &str = "terminal:operate";
 pub const SOURCE_CONTROL_WRITE_SCOPE: &str = "source-control:write";

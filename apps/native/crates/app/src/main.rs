@@ -8,6 +8,7 @@ mod context_menu;
 mod context_chip;
 mod device;
 mod dialog;
+mod guest_share;
 mod diff;
 mod environments;
 mod cloud;

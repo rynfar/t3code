@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, SharedString, Styled,
+    AnyElement, App, ClickEvent, Context, Entity, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, SharedString, Styled,
     Subscription, Task, Window, div, point, prelude::*, px,
 };
 use gpui_component::h_flex;
@@ -29,6 +29,9 @@ pub struct ChatHeader {
     menu: Entity<ContextMenu>,
     rename: Entity<InputState>,
     renaming: Option<String>,
+    rename_owner: Option<crate::context_menu::ThreadMenuOwner>,
+    rename_previous_focus: Option<gpui::FocusHandle>,
+    guest: Entity<crate::guest_share::GuestIndicator>,
     pending_menu: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -46,15 +49,20 @@ impl ChatHeader {
                 AppEvent::Shell => cx.notify(),
                 _ => {}
             }),
-            cx.subscribe_in(&rename, window, |this, _, event: &InputEvent, _, cx| match event {
-                InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(cx),
+            cx.subscribe_in(&rename, window, |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(window, cx),
                 _ => {}
             }),
         ];
-        ChatHeader { state, menu, rename, renaming: None, pending_menu: None, _subscriptions: subscriptions }
+        let guest = cx.new(|cx| crate::guest_share::GuestIndicator::new(state.clone(), cx));
+        ChatHeader { state, menu, rename, renaming: None, rename_owner: None, rename_previous_focus: None, guest, pending_menu: None, _subscriptions: subscriptions }
     }
 
     fn start_rename(&mut self, thread_id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), &thread_id) else { return };
+        if !owner.allows(self.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { return; }
+        self.rename_owner = Some(owner);
+        self.rename_previous_focus = window.focused(cx);
         self.pending_menu = None;
         self.rename.update(cx, |input, cx| {
             input.set_value(title, window, cx);
@@ -65,10 +73,12 @@ impl ChatHeader {
         cx.notify();
     }
 
-    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.renaming.take() else { return };
         let title = self.rename.read(cx).value().to_string();
-        self.state.update(cx, |state, cx| state.rename_thread(&thread_id, &title, cx));
+        if self.rename.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = self.rename_previous_focus.take() { window.focus(&focus, cx); }
+        let owner = self.rename_owner.take();
+        self.state.update(cx, |state, cx| { if owner.is_some_and(|owner| owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename)) { state.rename_thread(&thread_id, &title, cx); } });
         cx.notify();
     }
 
@@ -83,11 +93,12 @@ impl ChatHeader {
         if event.click_count() >= 2 {
             return self.start_rename(thread_id, title, window, cx);
         }
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), &thread_id) else { return };
         let window_handle = window.window_handle();
         self.pending_menu = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(TITLE_MENU_DELAY).await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
-                let _ = this.update(cx, |this, cx| this.open_menu(thread_id, position, window, cx));
+                let _ = this.update(cx, |this, cx| { if owner.current(this.state.read(cx)) && this.state.read(cx).selected_thread.as_deref() == Some(thread_id.as_str()) { this.open_menu(thread_id, position, window, cx); } });
             });
         }));
     }
@@ -133,8 +144,9 @@ impl Render for ChatHeader {
                 .flex_1()
                 .min_w_0()
                 .h(px(24.))
-                .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                     this.renaming = None;
+                    if let Some(focus) = this.rename_previous_focus.take() { window.focus(&focus, cx); }
                     cx.notify();
                     cx.stop_propagation();
                 }))
@@ -199,6 +211,7 @@ impl Render for ChatHeader {
                     .child(separator())
             }))
             .child(title_element)
+            .child(self.guest.clone())
             .into_any_element()
     }
 }

@@ -266,6 +266,9 @@ impl Composer {
                     this.sync_menu(false, cx);
                 }
                 if matches!(event, AppEvent::SidebarSelection | AppEvent::Shell | AppEvent::Phase) && !this.context.linked.is_empty() { cx.notify(); }
+                if *event == AppEvent::BranchDraft && this.fixed.is_none() {
+                    this.apply_branch_draft(window, cx);
+                }
                 if *event == AppEvent::ComposerMention {
                     let mentions = this.state.update(cx, |state, _| std::mem::take(&mut state.composer_mentions));
                     for mention in mentions {

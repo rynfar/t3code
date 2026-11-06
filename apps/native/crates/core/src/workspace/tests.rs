@@ -153,6 +153,8 @@ fn previous_worktree_uses_the_latest_eligible_project_thread_and_keeps_first_tie
 #[test]
 fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
     let choice = DraftWorkspace {
+        destination: None,
+        branch: None,
         environment_id: "env-a".into(),
         project_root: "/repo".into(),
         mode: ThreadEnvMode::Worktree,
@@ -171,6 +173,8 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
     let current = DraftWorkspace { mode: ThreadEnvMode::Local, ..choice.clone() };
     assert_eq!(current.strategy(), choice.strategy());
     let detached = DraftWorkspace {
+        destination: None,
+        branch: None,
         previous: Some(PreviousWorktreeSeed {
             branch: None,
             worktree_path: "/wt/detached".into(),
@@ -182,6 +186,8 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
         json!({"type":"existing_worktree", "worktreePath":"/wt/detached"})
     );
     let local = DraftWorkspace {
+        destination: None,
+        branch: None,
         mode: ThreadEnvMode::Local,
         previous: None,
         ..choice.clone()
@@ -195,6 +201,8 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
     assert_eq!(draft_cwd(Some(&local), "env-a", "/repo"), "/repo");
 
     let new = DraftWorkspace {
+        destination: None,
+        branch: None,
         previous: None,
         ..choice
     };
@@ -207,4 +215,13 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
     ] {
         assert!(!can_use_previous_worktree(server, locked, force));
     }
+}
+
+#[test]
+fn menu_branch_seed_survives_restore_without_selecting_a_default_branch() {
+    let choice: DraftWorkspace = serde_json::from_value(json!({
+        "environmentId":"env-a", "projectRoot":"/repo", "mode":"local", "previous":null,
+        "branch":"feature/captured"
+    })).unwrap();
+    assert_eq!(choice.strategy().unwrap().to_json(), json!({"type":"root","branch":"feature/captured"}));
 }
