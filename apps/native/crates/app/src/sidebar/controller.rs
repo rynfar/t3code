@@ -83,7 +83,7 @@ pub fn time_label(time: LocalTime) -> String {
 
 #[derive(Clone, PartialEq)]
 pub(crate) enum UndoContext {
-    Thread(crate::context_menu::ThreadMenuOwner),
+    Thread(Box<crate::context_menu::ThreadMenuOwner>),
     Draft { environment: Option<String>, canonical: Option<String>, connection: Option<u64>, generation: u64, project: Box<t3_core::shell::ProjectShell> },
     Unavailable { id: String, draft: bool },
 }
@@ -108,11 +108,11 @@ impl UndoContexts {
         self.token(context)
     }
     pub fn begin(&mut self, kind: UndoKind, id: &str) -> actions::Claim { let token = self.active_token(kind,id); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
-    fn begin_owned(&mut self, kind: UndoKind, owner: crate::context_menu::ThreadMenuOwner) -> actions::Claim { let token = self.token(UndoContext::Thread(owner)); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
+    fn begin_owned(&mut self, kind: UndoKind, owner: crate::context_menu::ThreadMenuOwner) -> actions::Claim { let token = self.token(UndoContext::Thread(Box::new(owner))); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
     pub fn invalidate(&mut self, kind: UndoKind, id: &str) { let token = self.active_token(kind,id); self.store.invalidate(kind,&token); }
-    fn invalidate_owned(&mut self, kind: UndoKind, owner: &crate::context_menu::ThreadMenuOwner) { let token = self.token(UndoContext::Thread(owner.clone())); self.store.invalidate(kind,&token); }
+    fn invalidate_owned(&mut self, kind: UndoKind, owner: &crate::context_menu::ThreadMenuOwner) { let token = self.token(UndoContext::Thread(Box::new(owner.clone()))); self.store.invalidate(kind,&token); }
     pub fn expire_placement(&mut self, id: &str, archive: bool) { let token = self.active_token(UndoKind::Pin,id); self.store.expire_placement(&token,archive); }
-    fn expire_owned(&mut self, owner: &crate::context_menu::ThreadMenuOwner, archive: bool) { let token = self.token(UndoContext::Thread(owner.clone())); self.store.expire_placement(&token,archive); }
+    fn expire_owned(&mut self, owner: &crate::context_menu::ThreadMenuOwner, archive: bool) { let token = self.token(UndoContext::Thread(Box::new(owner.clone()))); self.store.expire_placement(&token,archive); }
     pub fn is_current(&self, claim: &actions::Claim) -> bool { self.store.is_current(claim) }
     pub fn finish(&mut self, claim: &actions::Claim) { self.pending.retain(|pending| pending != claim); self.store.finish(claim); self.prune(); }
     pub fn show(&mut self, action: UndoAction, claim: actions::Claim, plan: Vec<UndoStep>, now: Ms) { self.pending.retain(|pending| *pending != claim); self.store.show(action,claim,plan,now); }
@@ -555,7 +555,7 @@ impl AppState {
 
     fn sync_undo_contexts(&mut self) {
         let ids = self.shell.snapshot.as_ref().map(|snapshot| snapshot.threads.iter().chain(&snapshot.archived_threads).chain(self.omitted.mounts.extras(&self.shell)).map(|thread| thread.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
-        let threads = ids.into_iter().filter_map(|id| crate::context_menu::ThreadMenuOwner::capture_undo(self,&id).map(|owner| (id,UndoContext::Thread(owner)))).collect();
+        let threads = ids.into_iter().filter_map(|id| crate::context_menu::ThreadMenuOwner::capture_undo(self,&id).map(|owner| (id,UndoContext::Thread(Box::new(owner))))).collect();
         let drafts = self.shell.snapshot.as_ref().map(|snapshot| snapshot.projects.iter().map(|project| (project.id.clone(),UndoContext::Draft { environment:self.environments.active.clone(),canonical:self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()),connection:self.connection_id(),generation:self.shell.generation,project:Box::new(project.clone()) })).collect()).unwrap_or_default();
         self.sidebar.undo.active_threads = threads;
         self.sidebar.undo.active_drafts = drafts;
@@ -1284,7 +1284,7 @@ impl AppState {
         let mut threads = Vec::new();
         for (context, plan) in group {
             match context {
-                UndoContext::Thread(owner) => threads.push((owner,plan)),
+                UndoContext::Thread(owner) => threads.push((*owner,plan)),
                 UndoContext::Draft { environment,canonical,connection,generation,project } => {
                     if self.environments.active == environment && self.connection_id() == connection && self.shell.generation == generation
                         && self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()) == canonical
