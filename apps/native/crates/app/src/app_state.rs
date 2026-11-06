@@ -139,6 +139,7 @@ pub(crate) enum ScopedRouteAction {
     Draft(String),
     Branch(String),
     ProjectSettings(String),
+    Project { group: Box<t3_core::sidebar::grouping::ScopedProjectGroup>, action: t3_core::thread_actions::ProjectAction },
 }
 
 #[derive(Clone)]
@@ -442,8 +443,12 @@ impl AppState {
 
     fn finish_scoped_route(&mut self, cx: &mut Context<Self>) {
         let Some(route) = self.pending_scoped_route.clone() else { return; };
+        if matches!(&route.action, ScopedRouteAction::Project { .. }) && self.client_handle().is_none() { return; }
         if !self.scoped_ready(&route.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
             self.pending_scoped_route = None;
+            if let ScopedRouteAction::Project { group, action } = route.action {
+                self.finish_scoped_project_action(&group, action, cx);
+            }
             return;
         }
         if self.environments.active.as_deref() != Some(&route.owner.saved_id)
@@ -459,6 +464,7 @@ impl AppState {
             ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
             ScopedRouteAction::Branch(id) => self.start_branch_draft(&id, cx),
             ScopedRouteAction::ProjectSettings(id) => crate::settings::open_project(&id, cx),
+            ScopedRouteAction::Project { group, action } => self.finish_scoped_project_action(&group, action, cx),
         }
     }
 
@@ -883,3 +889,7 @@ impl AppState {
 pub fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+#[cfg(all(test, feature = "snapshot"))]
+#[path = "scoped_route_tests.rs"]
+mod scoped_route_tests;

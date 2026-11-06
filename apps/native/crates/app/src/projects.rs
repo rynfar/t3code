@@ -12,14 +12,62 @@ use crate::sidebar::controller::uuid;
 use crate::toast::{Toast, ToastKind};
 
 impl AppState {
+    fn validate_scoped_project_group(&self, captured: &t3_core::sidebar::grouping::ScopedProjectGroup, cx: &gpui::App) -> Result<(), &'static str> {
+        let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let current = groups.iter().find(|group| group.key == captured.key).ok_or("The selected project group is no longer available.")?;
+        if current.representative != captured.representative || current.member_refs.len() != captured.member_refs.len()
+            || !captured.member_refs.iter().all(|reference| current.member_refs.contains(reference))
+            || current.registrations.len() != captured.registrations.len()
+            || !captured.registrations.iter().all(|project| current.registrations.iter().any(|candidate| candidate.reference() == project.reference()
+                && candidate.owner == project.owner && candidate.project.created_at == project.project.created_at
+                && candidate.project.workspace_root == project.project.workspace_root)) {
+            return Err("The selected project group changed. Open its menu again.");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scoped_project_action_target(&self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, cx: &gpui::App) -> Result<t3_core::sidebar::grouping::ScopedProjectMember, &'static str> {
+        self.validate_scoped_project_group(group, cx)?;
+        t3_core::sidebar::grouping::pick_project_target(group, None).ok_or("The selected project is no longer available.")
+    }
+
+    fn scoped_project_navigation_target(&self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, cx: &gpui::App) -> Result<t3_core::sidebar::grouping::ScopedProjectMember, &'static str> {
+        let target = self.scoped_project_action_target(group, cx)?;
+        if !self.scoped_ready(&target.project.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+            return Err("The project destination is not connected or read access changed.");
+        }
+        Ok(target)
+    }
+
     pub(crate) fn run_scoped_project_action(&mut self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, action: t3_core::thread_actions::ProjectAction, cx: &mut Context<Self>) {
-        let Some(target) = t3_core::sidebar::grouping::pick_project_target(group, None) else { return; };
+        let navigation = matches!(action, t3_core::thread_actions::ProjectAction::NewThread | t3_core::thread_actions::ProjectAction::Settings);
+        let target = match if navigation { self.scoped_project_navigation_target(group, cx) } else { self.scoped_project_action_target(group, cx) } {
+            Ok(target) => target,
+            Err(error) => {
+                self.show_toast(Toast::new(ToastKind::Error, "Project action stopped").description(error), cx);
+                return;
+            }
+        };
         match action {
-            t3_core::thread_actions::ProjectAction::NewThread => self.navigate_scoped(target.project.owner.clone(), crate::app_state::ScopedRouteAction::Draft(target.project.project.id.clone()), cx),
-            t3_core::thread_actions::ProjectAction::Settings => self.navigate_scoped(target.project.owner.clone(), crate::app_state::ScopedRouteAction::ProjectSettings(target.project.project.id.clone()), cx),
+            t3_core::thread_actions::ProjectAction::NewThread | t3_core::thread_actions::ProjectAction::Settings => self.navigate_scoped(target.project.owner.clone(), crate::app_state::ScopedRouteAction::Project { group:Box::new(group.clone()), action }, cx),
             t3_core::thread_actions::ProjectAction::CopyPath => self.copy_project_scoped(&target.project.project.workspace_root, cx),
             t3_core::thread_actions::ProjectAction::Pin => self.pin_scoped_project_group(group, true, cx),
             t3_core::thread_actions::ProjectAction::Unpin => self.pin_scoped_project_group(group, false, cx),
+        }
+    }
+
+    pub(crate) fn finish_scoped_project_action(&mut self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, action: t3_core::thread_actions::ProjectAction, cx: &mut Context<Self>) {
+        let target = match self.scoped_project_navigation_target(group, cx) {
+            Ok(target) => target,
+            Err(error) => {
+                self.show_toast(Toast::new(ToastKind::Error, "Project action stopped").description(error), cx);
+                return;
+            }
+        };
+        match action {
+            t3_core::thread_actions::ProjectAction::NewThread => self.start_draft(&target.project.project.id, cx),
+            t3_core::thread_actions::ProjectAction::Settings => crate::settings::open_project(&target.project.project.id, cx),
+            _ => {},
         }
     }
 
@@ -28,30 +76,48 @@ impl AppState {
         self.show_toast(Toast::new(ToastKind::Success, "Path copied").description(path.to_owned()), cx);
     }
 
+    fn scoped_project_pinnable(&self, project: &t3_core::sidebar::grouping::ScopedProject) -> bool {
+        self.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+            && self.scoped_environment(&project.owner.saved_id).and_then(|entry| entry.config.config.as_ref())
+                .is_some_and(|config| config.environment.capabilities.project_organization == Some(true))
+            && self.scoped_project(&project.reference()).is_some_and(|current| current.owner == project.owner
+                && current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)
+    }
+
+    fn project_pin_refused(&mut self, completed: usize, cx: &mut Context<Self>) {
+        self.show_toast(Toast::new(ToastKind::Error, "Project pin stopped")
+            .description(format!("{completed} checkout(s) changed before the project, destination, permission or project organization support changed.")), cx);
+    }
+
     pub(crate) fn pin_scoped_project_group(&mut self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, pinned: bool, cx: &mut Context<Self>) {
+        if self.validate_scoped_project_group(group, cx).is_err() { self.project_pin_refused(0, cx); return; }
+        let group = group.clone();
         let refs = group.mutation_refs();
         let members: Option<Vec<_>> = refs.iter().map(|key| group.registrations.iter().find(|project| project.reference() == *key).cloned()).collect();
-        let Some(members) = members else { return; };
-        if members.iter().any(|project| !self.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
-            || !self.scoped_project(&project.reference()).is_some_and(|current| current.owner == project.owner && current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)) { return; }
+        let Some(members) = members else { self.project_pin_refused(0, cx); return; };
+        if members.iter().any(|project| !self.scoped_project_pinnable(project)) { self.project_pin_refused(0, cx); return; }
         let lookups: Vec<_> = members.iter().map(|project| self.connections.destination(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect();
         cx.spawn(async move |this, cx| {
             let mut destinations = Vec::new();
             for lookup in lookups {
-                let Ok(destination) = lookup.await else { return; };
+                let Ok(destination) = lookup.await else {
+                    let _ = this.update(cx, |state, cx| state.project_pin_refused(0, cx));
+                    return;
+                };
                 destinations.push(destination);
             }
-            let preflight = this.read_with(cx, |state, _| members.iter().zip(&destinations).all(|(project, destination)| destination.is_current(&state.fleet)
-                && state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
-                && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
-                && state.scoped_project(&project.reference()).is_some_and(|current| current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root))).unwrap_or(false);
-            if !preflight { return; }
+            let preflight = this.read_with(cx, |state, cx| state.validate_scoped_project_group(&group, cx).is_ok() && members.iter().zip(&destinations).all(|(project, destination)| destination.is_current(&state.fleet)
+                && state.scoped_project_pinnable(project)
+                && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))).unwrap_or(false);
+            if !preflight {
+                let _ = this.update(cx, |state, cx| state.project_pin_refused(0, cx));
+                return;
+            }
             for (index, (project, destination)) in members.iter().zip(destinations).enumerate() {
-                let valid = this.read_with(cx, |state, _| destination.is_current(&state.fleet) && state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
-                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
-                    && state.scoped_project(&project.reference()).is_some_and(|current| current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)).unwrap_or(false);
+                let valid = this.read_with(cx, |state, cx| state.validate_scoped_project_group(&group, cx).is_ok() && destination.is_current(&state.fleet) && state.scoped_project_pinnable(project)
+                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false);
                 if !valid {
-                    let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Project pin stopped").description(format!("{index} checkout(s) changed before this destination became unavailable.")), cx));
+                    let _ = this.update(cx, |state, cx| state.project_pin_refused(index, cx));
                     return;
                 }
                 if let Err(error) = destination.client.request(PROJECTS_MUTATE, set_project_pinned(&uuid(), &project.project.id, pinned)).await {
