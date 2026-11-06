@@ -37,6 +37,7 @@ fn base(id: &str) -> SidebarThread {
         latest_user_authored_message_at: None,
         has_pending_approvals: false,
         has_pending_user_input: false,
+        pending_user_input_at: None,
         has_pending_runtime_request: false,
         pending_subagent_request: None,
         pending_guest_message_count: 0,
@@ -286,6 +287,41 @@ fn effective_snooze_never_hides_on_malformed_data_and_wakes_for_requests() {
     assert!(!effective_snoozed(&SidebarThread { has_pending_approvals: true, ..snoozed(FUTURE_WAKE) }, now));
     assert!(!effective_snoozed(&SidebarThread { has_pending_user_input: true, ..snoozed(FUTURE_WAKE) }, now));
     assert!(!effective_snoozed(&snoozed(PAST_WAKE), now));
+    for kind in ["approval", "auth_refresh", "future_request"] {
+        let blocked = present_thread(&serde_json::from_value(wire_thread("request", json!({
+            "snoozedUntil": FUTURE_WAKE, "snoozedAt": SNOOZED_AT,
+            "pendingRuntimeRequest":{"id":"request", "kind":kind}
+        }))).unwrap(), None);
+        assert!(!can_snooze(&blocked, now));
+        assert!(!effective_snoozed(&blocked, now));
+    }
+    for block in [
+        SidebarThread { has_pending_approvals: true, ..base("approval") },
+        SidebarThread { pending_guest_message_count: 1, ..base("guest") },
+        SidebarThread { pending_subagent_request: Some(SubagentRequest::UserInput), ..base("child") },
+    ] {
+        assert!(!can_snooze(&block, now));
+    }
+
+    let legacy = present_thread(&serde_json::from_value(wire_thread("legacy", json!({
+        "snoozedUntil":FUTURE_WAKE, "snoozedAt":SNOOZED_AT,
+        "pendingRuntimeRequest":{"id":"legacy", "kind":"user_input"}
+    }))).unwrap(), None);
+    assert!(can_snooze(&legacy, now));
+    assert!(!effective_snoozed(&legacy, now));
+    for (created_at, hidden) in [(json!(SNOOZED_AT), true), (json!("2026-04-10T08:00:00Z"), true), (json!("2026-04-10T09:30:00Z"), false), (Value::Null, false), (json!("invalid"), false)] {
+        let question = present_thread(&serde_json::from_value(wire_thread("question", json!({
+            "snoozedUntil": FUTURE_WAKE, "snoozedAt": SNOOZED_AT,
+            "pendingRuntimeRequest": {"id":"question", "kind":"user_input", "createdAt":created_at, "blocking":false}
+        }))).unwrap(), None);
+        assert!(can_snooze(&question, now), "existing question: {created_at}");
+        assert_eq!(effective_snoozed(&question, now), hidden, "question time: {created_at}");
+        assert!(!effective_snoozed(&SidebarThread { snoozed_at: None, ..question.clone() }, now));
+        assert_eq!(woke_at(&SidebarThread { snoozed_until: Some(iso(PAST_WAKE)), ..question.clone() }, now), if hidden { Some(iso(PAST_WAKE)) } else if created_at == json!("2026-04-10T09:30:00Z") { Some(iso("2026-04-10T09:30:00Z")) } else { Some(iso(SNOOZED_AT)) });
+        if !hidden && created_at == json!("2026-04-10T09:30:00Z") {
+            assert_eq!(woke_at(&question, now), Some(iso("2026-04-10T09:30:00Z")));
+        }
+    }
 }
 
 #[test]
@@ -342,6 +378,19 @@ fn fresh_failures_wake_but_stale_ones_do_not() {
                 assert_eq!(woke_at(&legacy, now), wake);
             }
         }
+    }
+    for (question_at, failure_at, expected) in [
+        ("2026-04-10T09:45:00Z", "2026-04-10T09:30:00Z", "2026-04-10T09:45:00Z"),
+        ("2026-04-10T09:30:00Z", "2026-04-10T09:45:00Z", "2026-04-10T09:45:00Z"),
+        ("2026-04-10T09:30:00Z", "2026-04-10T09:30:00Z", "2026-04-10T09:30:00Z"),
+    ] {
+        let question = present_thread(&serde_json::from_value(wire_thread("question", json!({
+            "snoozedUntil": FUTURE_WAKE, "snoozedAt": SNOOZED_AT,
+            "status":"failed", "latestRunId":"failed-run", "latestRunCompletedAt":failure_at,
+            "pendingRuntimeRequest":{"id":"question", "kind":"user_input", "createdAt":question_at}
+        }))).unwrap(), None);
+        assert_eq!(woke_at(&question, now), Some(iso(expected)));
+        assert_eq!(woke_at(&SidebarThread { snoozed_until: Some(iso(PAST_WAKE)), ..question }, now), Some(iso(expected)));
     }
     assert_eq!(woke_at(&snoozed(PAST_WAKE), now), Some(iso(PAST_WAKE)));
 }
@@ -762,7 +811,7 @@ fn model_lists_sections_with_collapsed_shelves_and_the_open_thread() {
         assert_eq!(SidebarModel::build(&input, &mut tracker).section_of("busy-newer"), Some(Section::Working));
         let mut requested = completed.clone();
         requested.threads.last_mut().unwrap().pending_runtime_request = Some(crate::shell::PendingRuntimeRequestSummary {
-            id: "request".into(), kind: kind.into(), blocking: Some(true),
+            id: "request".into(), kind: kind.into(), created_at: None, blocking: Some(true),
         });
         input.snapshot = &requested;
         input.now += 1;
@@ -858,9 +907,10 @@ fn custom_snooze_rejects_invalid_or_past_calendar_input() {
 #[test]
 fn custom_snooze_resolves_durations_from_the_confirmation_time() {
     let confirmed = local(2026, 9, 14, 14, 35);
-    for (unit, amount, elapsed) in [(DurationUnit::Minutes, "45", 45 * MINUTE_MS), (DurationUnit::Hours, "1.5", 90 * MINUTE_MS), (DurationUnit::Days, "2", 48 * HOUR_MS)] {
+    for (unit, amount, elapsed) in [(DurationUnit::Minutes, "0.5", 30_000), (DurationUnit::Minutes, "45", 45 * MINUTE_MS), (DurationUnit::Hours, "1.5", 90 * MINUTE_MS), (DurationUnit::Days, "2", 48 * HOUR_MS)] {
         assert_eq!(resolve_custom_snooze(&CustomSnoozeInput::Duration { amount, unit }, confirmed, &FixedZone(0)), Some(confirmed + elapsed));
     }
+    assert_eq!(["0.00001", "0.000026666666666666667"].map(|amount| resolve_custom_snooze(&CustomSnoozeInput::Duration { amount, unit: DurationUnit::Minutes }, confirmed, &FixedZone(0))), [None, Some(confirmed + 1)]);
     for amount in ["0", "NaN", "1e300", "-1", ""] {
         assert_eq!(resolve_custom_snooze(&CustomSnoozeInput::Duration { amount, unit: DurationUnit::Hours }, confirmed, &FixedZone(0)), None, "{amount}");
     }

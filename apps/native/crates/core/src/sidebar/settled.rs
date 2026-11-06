@@ -43,7 +43,10 @@ fn failure_edge_at(thread: &SidebarThread) -> Option<Option<Ms>> {
 
 /// Only a request for the user or a fresh failure ends a snooze early.
 pub fn raised_hand_while_snoozed(thread: &SidebarThread) -> bool {
-    if thread.has_pending_approvals || thread.has_pending_user_input || thread.has_pending_runtime_request {
+    if thread.has_pending_approvals || (thread.has_pending_runtime_request && !thread.has_pending_user_input) {
+        return true;
+    }
+    if thread.has_pending_user_input && !thread.pending_user_input_at.zip(thread.snoozed_at).is_some_and(|(question, snoozed)| question <= snoozed) {
         return true;
     }
     if thread.pending_subagent_request.is_some() || thread.pending_guest_message_count > 0 {
@@ -60,8 +63,7 @@ pub fn raised_hand_while_snoozed(thread: &SidebarThread) -> bool {
 
 pub fn can_snooze(thread: &SidebarThread, now: Ms) -> bool {
     !(thread.has_pending_approvals
-        || thread.has_pending_user_input
-        || thread.has_pending_runtime_request
+        || (thread.has_pending_runtime_request && !thread.has_pending_user_input)
         || thread.pending_subagent_request.is_some()
         || thread.pending_guest_message_count > 0
         || has_queued_turn_start(thread, now))
@@ -77,10 +79,15 @@ pub fn effective_snoozed(thread: &SidebarThread, now: Ms) -> bool {
 pub fn woke_at(thread: &SidebarThread, now: Ms) -> Option<Ms> {
     let wake_at = thread.snoozed_until?;
     if raised_hand_while_snoozed(thread) {
-        if let Some(Some(failed_at)) = failure_edge_at(thread)
-            && thread.snoozed_at.is_none_or(|snoozed_at| failed_at > snoozed_at)
+        let fresh_failure = failure_edge_at(thread).flatten().filter(|failed_at| thread.snoozed_at.is_none_or(|snoozed| *failed_at > snoozed));
+        let fresh_question = thread.pending_user_input_at.filter(|question| thread.snoozed_at.is_some_and(|snoozed| *question > snoozed));
+        if let Some(failed_at) = fresh_failure
+            && fresh_question.is_none_or(|question| failed_at >= question)
         {
             return Some(failed_at);
+        }
+        if let Some(question) = fresh_question {
+            return Some(question);
         }
         return thread.runtime.as_ref().and_then(|runtime| runtime.updated_at).or(thread.snoozed_at);
     }
@@ -287,7 +294,7 @@ pub fn resolve_custom_snooze(input: &CustomSnoozeInput, now: Ms, zone: &dyn Zone
             } as f64;
             let wake = now as f64 + amount * unit_ms;
             // JS Dates end at ±8.64e15 ms; beyond that the input is invalid.
-            (wake.abs() <= 8.64e15).then_some(wake.round() as Ms)?
+            (wake.abs() <= 8.64e15).then_some(wake.trunc() as Ms)?
         }
         CustomSnoozeInput::Date { date, time } => {
             let [year, month, day] = fixed_digits(date, &[4, 2, 2])?[..] else { return None };
