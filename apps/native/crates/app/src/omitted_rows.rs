@@ -380,7 +380,17 @@ impl AppState {
             let page = runtime.spawn(async move { target.client.request(GET_OLDER_SETTLED_THREADS, page_request(&cursor, requested_projects.as_deref())).await }).await
                 .map_err(|error| error.to_string()).and_then(|reply| reply.map_err(|error| error.to_string())).and_then(decode_read);
             let _ = this.update(cx, |state, cx| {
-                if !state.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) { return; }
+                if !state.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+                    if state.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)))
+                        && let Some(omitted) = state.sidebar.owner_omitted.get_mut(&owner)
+                        && omitted.scoped_projects == project_ids
+                        && omitted.pages.apply_page(generation, &before, Err("Read permission was revoked".into()))
+                    {
+                        state.rebuild_sidebar(cx);
+                        cx.emit(AppEvent::Shell);
+                    }
+                    return;
+                }
                 let omitted = state.sidebar.owner_omitted.entry(owner.clone()).or_default();
                 if omitted.scoped_projects != project_ids || !omitted.pages.apply_page(generation, &before, page) { return; }
                 omitted.mounts.mount(PAGES_KEY, generation, omitted.pages.reads.clone());
@@ -584,6 +594,98 @@ mod tests {
         assert_eq!(payload["limit"],25);
         assert_eq!(payload["before"]["settledAt"],t3_core::sidebar::time::format_iso(100_000));
         reply.send(Err(t3_client::session::RpcError::Closed)).unwrap();
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+    }
+
+    #[gpui::test]
+    async fn scoped_page_grant_refusal_retires_pending_and_explicitly_resumes(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx,runtime.handle().clone()));
+        let session = |read| serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":if read { vec!["orchestration:read"] } else { Vec::new() }})).unwrap();
+        let (client, mut fixture) = ClientFixture::handle(session(true));
+        let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+        let sample = shell.snapshot.as_ref().unwrap().threads[0].clone();
+        let snapshot = shell.snapshot.as_mut().unwrap();
+        snapshot.snapshot_sequence = 1;
+        snapshot.threads.clear();
+        snapshot.older_settled = Some(serde_json::from_value(serde_json::json!({
+            "before":t3_core::sidebar::time::format_iso(100_000),"asOfSequence":1,"counts":[{"projectId":"checkout-b","count":50}]
+        })).unwrap());
+        config.config.as_mut().unwrap().environment.environment_id = "pending-server".into();
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("pending-fixture",client,shell,config,ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(payload["limit"],25);
+        let owner = state.read_with(cx, |state, _| state.scoped_environment("pending-fixture").unwrap().summary.owner.clone());
+        let (frontier, projects) = state.read_with(cx, |state, _| {
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_eq!(omitted.pages.status,PageStatus::Pending);
+            (omitted.pages.frontier.clone(),omitted.scoped_projects.clone())
+        });
+        let denied_owner = owner.clone();
+        let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some_and(|entry| entry.summary.owner == denied_owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        fixture.grants.send_replace(Some(session(false))); denied.await.unwrap();
+        let consumer = state.update(cx, |state, _| state.sidebar.owner_omitted.get_mut(&owner).unwrap().page_task.take().unwrap());
+        let mut refused = sample.clone();
+        refused.id = "refused-page".into(); refused.lineage.root_thread_id = refused.id.clone();
+        refused.settled_override = Some("settled".into()); refused.settled_at = Some(t3_core::sidebar::time::format_iso(90_000));
+        reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[refused]}))).unwrap();
+        consumer.await;
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.scoped_environment("pending-fixture").unwrap().summary.owner,owner);
+            assert!(state.sidebar.shelves.settled_expanded);
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_ne!(omitted.pages.status,PageStatus::Pending,"a completed page consumer refused by its current read grant must retire its Pending attempt");
+            assert_eq!(omitted.pages.frontier,frontier);
+            assert_eq!(omitted.scoped_projects,projects);
+            assert!(omitted.pages.reads.is_empty());
+            assert_eq!(omitted.mounts.generation_of(PAGES_KEY),None);
+        });
+        let restored_owner = owner.clone();
+        let (sent, restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some_and(|entry| entry.summary.owner == restored_owner && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(state.sidebar.owner_omitted.get(&restored_owner).unwrap().pages.status); }
+            }
+        }));
+        fixture.grants.send_replace(Some(session(true)));
+        assert_eq!(restored.await.unwrap(),PageStatus::Failed,"grant restoration must leave retry explicit, not silently re-admit the page");
+        state.update(cx, |state, cx| state.show_more_settled(cx));
+        let (method, resumed_payload, resumed_reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(resumed_payload,payload);
+        let mut fresh = sample; fresh.id = "resumed-page".into(); fresh.lineage.root_thread_id = fresh.id.clone();
+        fresh.settled_override = Some("settled".into()); fresh.settled_at = Some(t3_core::sidebar::time::format_iso(90_000));
+        let applied_owner = owner.clone();
+        let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.sidebar.owner_omitted.get(&applied_owner).is_some_and(|omitted| omitted.pages.reads.iter().any(|read| read.threads.iter().any(|thread| thread.id == "resumed-page"))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        resumed_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[fresh]}))).unwrap(); applied.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.scoped_environment("pending-fixture").unwrap().summary.owner,owner);
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_eq!(omitted.pages.status,PageStatus::Ready);
+            assert_eq!(omitted.pages.reads.len(),1);
+            assert!(omitted.pages.reads.iter().flat_map(|read| &read.threads).all(|thread| thread.id != "refused-page"));
+        });
         state.update(cx, |state, _| state.stop_pump());
         drop(events);
     }
