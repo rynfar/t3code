@@ -343,6 +343,7 @@ impl AppState {
             Some(snapshot) => SidebarModel::build(
                 &ModelInput {
                     snapshot,
+                    config_loaded: self.server_config.config.is_some(),
                     extra_threads: &extras,
                     older_settled,
                     settings: &self.sidebar.settings,

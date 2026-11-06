@@ -204,6 +204,7 @@ pub struct OlderSettledShelf<'a> {
 
 pub struct ModelInput<'a> {
     pub snapshot: &'a ShellSnapshot,
+    pub config_loaded: bool,
     /// Rows on-demand reads hold that the shell omits (shelf pages, families); shell rows win.
     pub extra_threads: &'a [&'a ThreadShell],
     pub older_settled: Option<OlderSettledShelf<'a>>,
@@ -262,7 +263,7 @@ impl SidebarModel {
         let partition = partition(&PartitionInput {
             threads: &threads,
             working_shelf_enabled: input.settings.working_shelf_enabled,
-            config_loaded: true,
+            config_loaded: input.config_loaded,
             now: input.now,
             inbox: &observation,
         });
