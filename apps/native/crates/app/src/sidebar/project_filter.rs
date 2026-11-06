@@ -225,7 +225,7 @@ impl SidebarPane {
         deferred(div().id("scoped-project-filter-backdrop").absolute().inset_0().occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.project_filter = None; cx.notify(); }))
             .child(anchored().position(position + gpui::point(px(-8.), px(16.))).snap_to_window_with_margin(px(8.)).child(
-                div().id("scoped-project-filter-popup").occlude().w(px(280.)).max_h(px(360.)).overflow_y_scroll().p(px(5.)).rounded(px(8.))
+                div().id("scoped-project-filter-popup").occlude().w(px(280.)).max_h(px(360.)).overflow_y_scroll().p(px(5.)).rounded(px(8.)).text_sm().text_color(hsla(p.popover_foreground))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx)).children(rows))))
             .with_priority(130).into_any_element()
