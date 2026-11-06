@@ -39,7 +39,11 @@ pub(crate) fn ask(
     // The caller may be inside a window update; focus once it returns.
     cx.defer(move |cx| {
         if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
+            let _ = window.update(cx, |_, window, cx| {
+                let previous = window.focused(cx);
+                dialog.update(cx, |dialog, _| dialog.previous_focus = previous);
+                window.focus(&focus, cx);
+            });
         }
     });
 }
@@ -55,8 +59,8 @@ impl AppState {
             return self.unpin_thread(thread_id, cx);
         }
         let (title, description) = unpin_confirmation(&self.thread_title(thread_id));
-        let id = thread_id.to_owned();
-        ask(title, description, "Unpin", move |state, cx| state.unpin_thread(&id, cx), cx);
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self, thread_id) else { return };
+        ask(title, description, "Unpin", move |state, cx| { if owner.allows(state, &t3_core::thread_actions::ThreadAction::Unpin) { state.unpin_thread(&owner.thread, cx); } }, cx);
     }
 
     /// Unpins a multi-selection, asking once first while "Confirm thread unpin" is on.
@@ -86,8 +90,8 @@ impl AppState {
         if !archivable || !crate::settings::client_settings(cx).confirm_thread_archive() {
             return self.archive_thread(thread_id, cx);
         }
-        let id = thread_id.to_owned();
-        ask(archive_confirmation(&self.thread_title(thread_id)), "", "Archive", move |state, cx| state.archive_thread(&id, cx), cx);
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self, thread_id) else { return };
+        ask(archive_confirmation(&self.thread_title(thread_id)), "", "Archive", move |state, cx| { if owner.allows(state, &t3_core::thread_actions::ThreadAction::Archive) { state.archive_thread(&owner.thread, cx); } }, cx);
     }
 }
 
@@ -104,6 +108,7 @@ pub struct ConfirmDialog {
     state: Entity<AppState>,
     pending: Option<Pending>,
     focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
 }
 
 impl Focusable for ConfirmDialog {
@@ -115,7 +120,7 @@ impl Focusable for ConfirmDialog {
 impl ConfirmDialog {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.set_global(Host(cx.weak_entity()));
-        ConfirmDialog { state, pending: None, focus: cx.focus_handle() }
+        ConfirmDialog { state, pending: None, focus: cx.focus_handle(), previous_focus: None }
     }
 
     pub fn confirm(
@@ -133,12 +138,16 @@ impl ConfirmDialog {
             confirm_label: confirm_label.into(),
             on_confirm: Box::new(on_confirm),
         });
+        self.previous_focus = window.focused(cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
-    fn resolve(&mut self, confirmed: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_previous_focus(&mut self, focus: Option<FocusHandle>) { self.previous_focus = focus; }
+
+    fn resolve(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.take() else { return };
+        if self.focus.is_focused(window) { if let Some(focus) = self.previous_focus.take() { window.focus(&focus, cx); } }
         if confirmed {
             self.state.update(cx, |state, cx| (pending.on_confirm)(state, cx));
         }
@@ -180,17 +189,17 @@ impl Render for ConfirmDialog {
                 .justify_center()
                 .p(px(16.))
                 .bg(hsla(p.dialog_backdrop))
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.resolve(false, cx)))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.resolve(false, window, cx)))
                 .child(
                     div()
                         .id("confirm-dialog")
                         .track_focus(&self.focus)
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| match event.keystroke.key.as_str() {
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| match event.keystroke.key.as_str() {
                             "escape" => {
                                 cx.stop_propagation();
-                                this.resolve(false, cx);
+                                this.resolve(false, window, cx);
                             }
-                            "enter" => this.resolve(true, cx),
+                            "enter" => this.resolve(true, window, cx),
                             _ => {}
                         }))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -228,8 +237,8 @@ impl Render for ConfirmDialog {
                                 .border_color(hsla(p.border))
                                 .rounded_b(px(15.))
                                 .bg(hsla(p.muted))
-                                .child(button("confirm-dialog-cancel", "Cancel".into(), false).on_click(cx.listener(|this, _, _, cx| this.resolve(false, cx))))
-                                .child(button("confirm-dialog-confirm", pending.confirm_label.clone(), true).on_click(cx.listener(|this, _, _, cx| this.resolve(true, cx)))),
+                                .child(button("confirm-dialog-cancel", "Cancel".into(), false).on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx))))
+                                .child(button("confirm-dialog-confirm", pending.confirm_label.clone(), true).on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)))),
                         ),
                 ),
         )

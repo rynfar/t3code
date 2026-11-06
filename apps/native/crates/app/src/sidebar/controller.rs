@@ -482,11 +482,15 @@ impl AppState {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
     ) {
+        let removes_row = matches!(command.get("type").and_then(Value::as_str), Some("thread.archive" | "thread.settle" | "thread.unpin"));
+        let guarded = matches!(command.get("type").and_then(Value::as_str), Some("thread.settle" | "thread.unsettle" | "thread.pin" | "thread.unpin" | "thread.archive" | "thread.metadata.update" | "thread.auto-settle.set"));
+        let owner = guarded.then(|| command.get("threadId").and_then(Value::as_str).and_then(|id| crate::context_menu::ThreadMenuOwner::capture(self, id))).flatten();
         let Some(client) = self.client_handle() else { return };
         let task = self.runtime().spawn(client.dispatch(command));
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or(Err(RpcError::Closed));
             let _ = this.update(cx, |state, cx| {
+                if owner.as_ref().is_some_and(|owner| !(if removes_row { owner.response_after_placement(state) } else { owner.response_current(state) }) || !crate::context_menu::ThreadMenuOwner::can_operate(state)) { return; }
                 if let (Err(error), Some(title)) = (&result, failure_title) {
                     state.show_toast(Toast::new(ToastKind::Error, title).description(error.to_string()), cx);
                 }
@@ -533,7 +537,7 @@ impl AppState {
                 state.sidebar.undo.finish(&claim);
                 return;
             }
-            if let Some(woke) = woke {
+            if let Some(woke) = woke.filter(|_| state.thread_shell(&id).is_some()) {
                 state.send_visit(&id, woke, false, cx);
             }
             state.sidebar.undo.show(UndoAction::Settled, claim, plan, now_ms());
@@ -925,6 +929,8 @@ impl AppState {
     pub fn run_thread_action(&mut self, thread_id: &str, action: ThreadAction, shown_presets: &[SnoozePreset], cx: &mut Context<Self>) {
         let Some(thread) = self.snapshot_thread(thread_id) else { return };
         match action {
+            ThreadAction::NewThreadOnBranch => self.start_branch_draft(thread_id, cx),
+            ThreadAction::TurnIntoProject => { if let Some(task) = self.turn_into_project(thread_id, cx) { task.detach(); } },
             ThreadAction::Settle => self.settle_thread(thread_id, cx),
             ThreadAction::Unsettle => self.unsettle_thread(thread_id, cx),
             ThreadAction::Pin => self.pin_thread(thread_id, None, cx),

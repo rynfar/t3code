@@ -203,6 +203,7 @@ icons! {
     Undo2 => "icons/lucide/undo-2.svg",
     Unlink2 => "icons/lucide/unlink-2.svg",
     UserCheck => "icons/lucide/user-check.svg",
+    UserPlus => "icons/lucide/user-plus.svg",
     UserRound => "icons/lucide/user-round.svg",
     UserRoundX => "icons/lucide/user-round-x.svg",
     Users => "icons/lucide/users.svg",

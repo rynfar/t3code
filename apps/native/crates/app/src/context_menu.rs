@@ -30,10 +30,73 @@ pub enum MenuAction {
 
 pub enum ContextMenuEvent {
     DiscardDraft(String),
-    Rename(String),
-    Delete(String),
+    Rename(ThreadMenuOwner, Option<FocusHandle>),
+    Delete(ThreadMenuOwner, Option<FocusHandle>),
     CustomSnooze(SnoozeRequest),
     BulkDelete(Vec<String>),
+}
+
+/// The exact destination captured by a thread menu or one of its delayed callbacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadMenuOwner {
+    pub thread: String,
+    scope: (String, Option<String>, u64),
+    generation: u64,
+    shell_generation: u64,
+    created_at: String,
+    project: String,
+    project_created: String,
+    root: String,
+    branch: Option<String>,
+    worktree: Option<String>,
+}
+impl ThreadMenuOwner {
+    pub(crate) fn capture(state: &AppState, id: &str) -> Option<Self> {
+        if state.phase != crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
+            || !state.shell.synchronized { return None; }
+        let thread = state.thread_shell(id)?;
+        if thread.archived_at.is_some() || thread.deleted_at.is_some() { return None; }
+        let project = state.shell.project(&thread.project_id)?;
+        if project.archived_at.is_some() { return None; }
+        Some(Self { thread:id.into(), scope:state.thread_copy_scope()?,
+            generation:*state.client_handle()?.connection_generation().borrow(), shell_generation:state.shell.generation,
+            created_at:thread.created_at.clone(), project:thread.project_id.clone(), project_created:project.created_at.clone(),
+            root:project.workspace_root.clone(), branch:thread.branch.clone(), worktree:thread.worktree_path.clone() })
+    }
+    fn response_scope_current(&self, state: &AppState) -> bool {
+        state.thread_copy_scope().as_ref() == Some(&self.scope)
+            && state.phase == crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
+            && state.shell.synchronized && state.shell.generation == self.shell_generation
+            && state.client_handle().is_some_and(|client| *client.connection_generation().borrow() == self.generation)
+            && state.shell.project(&self.project).is_some_and(|project| project.created_at == self.project_created && project.workspace_root == self.root && project.archived_at.is_none())
+    }
+    pub(crate) fn response_current(&self, state: &AppState) -> bool {
+        self.response_scope_current(state) && state.thread_shell(&self.thread).is_some_and(|thread| thread.created_at == self.created_at && thread.deleted_at.is_none())
+    }
+    pub(crate) fn response_after_placement(&self, state: &AppState) -> bool {
+        // Placement commits can remove a row from the bounded shell before their reply.
+        self.response_scope_current(state)
+            && !(state.selected_thread.as_deref() == Some(self.thread.as_str()) && (state.thread.deleted || state.thread.projection.as_ref().is_some_and(|projection| projection.thread.created_at != self.created_at || projection.thread.deleted_at.is_some())))
+            && state.thread_shell(&self.thread).is_none_or(|thread| thread.created_at == self.created_at && thread.deleted_at.is_none())
+    }
+    pub(crate) fn current(&self, state: &AppState) -> bool { Self::capture(state, &self.thread).as_ref() == Some(self) }
+    pub(crate) fn can_operate(state: &AppState) -> bool {
+        state.sidebar.capabilities.config_loaded && state.sidebar.capabilities.can_operate
+            && state.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
+    }
+    pub(crate) fn allows(&self, state: &AppState, action: &ThreadAction) -> bool {
+        if !self.current(state) || (action.requires_operate() && !Self::can_operate(state)) { return false; }
+        match action {
+            ThreadAction::ShareGuest => state.can_share_with_guest(),
+            ThreadAction::TurnIntoProject => state.can_turn_into_project(&self.thread),
+            ThreadAction::Archive => state.sidebar.model.thread(&self.thread).is_some_and(|thread| thread.can_archive()),
+            ThreadAction::RegenerateTitle => state.sidebar.capabilities.config_loaded && state.sidebar.model.thread(&self.thread).is_some_and(|thread| !thread.regenerating_title),
+            ThreadAction::AutoSettle | ThreadAction::AutoSettleEnabled | ThreadAction::AutoSettleDisabled => state.sidebar.capabilities.auto_settle_opt_out,
+            ThreadAction::Pin | ThreadAction::Unpin | ThreadAction::Settle | ThreadAction::Unsettle => state.sidebar.capabilities.config_loaded,
+            ThreadAction::NewThreadOnBranch | ThreadAction::CopyBranch => self.branch.as_ref().is_some_and(|branch| !branch.is_empty()),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -161,6 +224,10 @@ struct OpenMenu {
     snooze_request: Option<SnoozeRequest>,
     copy_scope: Option<(String, Option<String>, u64)>,
     project_filter: Option<ThreadProjectFilter>,
+    owner: Option<ThreadMenuOwner>,
+    previous_focus: Option<FocusHandle>,
+    window: gpui::AnyWindowHandle,
+    header: bool,
 }
 
 pub struct ContextMenu {
@@ -201,8 +268,10 @@ impl ContextMenu {
         let loaded = caps.config_loaded;
         let supports = Supports { settlement: loaded, auto_settle_opt_out: caps.auto_settle_opt_out, snooze: loaded, pinning: loaded, title_regeneration: loaded };
         let items = build_menu(&ThreadActionMenuState {
-            can_operate: caps.can_operate,
-            can_find: false,
+            can_operate: ThreadMenuOwner::can_operate(state),
+            can_find: !sidebar && state.selected_thread.as_deref() == Some(thread_id),
+            can_share_with_guest: state.can_share_with_guest(),
+            can_turn_into_project: state.can_turn_into_project(thread_id),
             branch: thread.branch.as_deref(),
             project_filter: project_filter.as_ref().map(|filter| (filter.group.label.as_str(), state.sidebar.project_filter_scope.is_selected(&filter.group))),
             is_pinned: thread.pinned,
@@ -214,7 +283,7 @@ impl ContextMenu {
             is_running: !thread.can_archive(),
             supports,
             snooze_presets: &presets,
-            available: Available { new_thread_on_branch: false, custom_snooze: true, project_settings: true },
+            available: Available { new_thread_on_branch: true, custom_snooze: true, project_settings: true },
         });
         let snooze_request = SnoozeRequest::capture(state, vec![thread_id.to_owned()], false, window.focused(cx));
         let can_snooze = snooze_request.plan_for(state, now).is_some();
@@ -232,7 +301,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter, owner: ThreadMenuOwner::capture(state, thread_id), previous_focus: window.focused(cx), window: window.window_handle().into(), header: !sidebar });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -249,7 +318,7 @@ impl ContextMenu {
             items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
         }
         items.push(discard);
-        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None});
+        self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle().into(),header:false});
         window.focus(&self.focus,cx);
         cx.notify();
     }
@@ -272,7 +341,7 @@ impl ContextMenu {
             }
             item
         }).collect();
-        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None });
+        self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle().into(), header: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -282,7 +351,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
-        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None });
+        self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle().into(), header: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -309,7 +378,7 @@ impl ContextMenu {
         let mut custom = MenuItem::new(MenuAction::Thread(ThreadAction::SnoozeCustom), "Custom…", None);
         custom.separator_before = !presets.is_empty();
         items.push(custom);
-        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None });
+        self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle().into(), header: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -329,8 +398,20 @@ impl ContextMenu {
         self.open.is_some()
     }
 
+    fn restore_focus(&self, previous: Option<FocusHandle>, window: gpui::AnyWindowHandle, cx: &mut Context<Self>) {
+        let focus = self.focus.clone();
+        let menu = cx.weak_entity();
+        cx.defer(move |cx| {
+            if menu.upgrade().is_none_or(|menu| menu.read(cx).open.is_some()) { return; }
+            let _ = cx.update_window(window, |_, window, cx| {
+                if focus.is_focused(window) { if let Some(previous) = previous { window.focus(&previous, cx); } }
+            });
+        });
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.open.take().is_some() {
+        if let Some(open) = self.open.take() {
+            self.restore_focus(open.previous_focus, open.window, cx);
             cx.emit(DismissEvent);
             cx.notify();
         }
@@ -338,12 +419,21 @@ impl ContextMenu {
 
     fn activate(&mut self, action: MenuAction, cx: &mut Context<Self>) {
         let Some(open) = self.open.take() else { return };
+        self.restore_focus(open.previous_focus.clone(), open.window, cx);
         cx.emit(DismissEvent);
         cx.notify();
+        let enabled = open.items.iter().any(|item| !item.disabled && (item.action == action && item.children.is_empty() || item.children.iter().any(|child| !child.disabled && child.action == action)));
+        if !enabled { return; }
+        if let MenuAction::Thread(ref thread_action) = action {
+            if let Some(owner) = &open.owner {
+                if !owner.allows(self.state.read(cx), thread_action)
+                    || (open.header && self.state.read(cx).selected_thread.as_deref() != Some(open.target_id.as_str())) { return; }
+            } else if !matches!(thread_action, ThreadAction::SnoozeCustom | ThreadAction::SnoozePreset(_) | ThreadAction::Unsnooze) { return; }
+        }
         match action {
             MenuAction::DiscardDraft => cx.emit(ContextMenuEvent::DiscardDraft(open.target_id)),
-            MenuAction::Thread(ThreadAction::Rename) => cx.emit(ContextMenuEvent::Rename(open.target_id)),
-            MenuAction::Thread(ThreadAction::Delete) => cx.emit(ContextMenuEvent::Delete(open.target_id)),
+            MenuAction::Thread(ThreadAction::Rename) => cx.emit(ContextMenuEvent::Rename(open.owner.unwrap(), open.previous_focus)),
+            MenuAction::Thread(ThreadAction::Delete) => cx.emit(ContextMenuEvent::Delete(open.owner.unwrap(), open.previous_focus)),
             MenuAction::Thread(ThreadAction::SnoozeCustom) | MenuAction::Bulk(BulkAction::SnoozeCustom) => {
                 if let Some(request) = open.snooze_request.filter(|request| request.plan_for(self.state.read(cx), now_ms()).is_some()) {
                     cx.emit(ContextMenuEvent::CustomSnooze(request));
@@ -371,6 +461,9 @@ impl ContextMenu {
                 }
             }
             MenuAction::Bulk(BulkAction::Delete) => cx.emit(ContextMenuEvent::BulkDelete(open.selection)),
+            MenuAction::Thread(ThreadAction::ShareGuest) => {
+                if let Some(owner) = open.owner { crate::guest_share::open(owner, open.window, cx); }
+            }
             MenuAction::Thread(ThreadAction::ProjectSettings) => {
                 let project_id = self.state.read(cx).sidebar.model.thread(&open.target_id).map(|thread| thread.project_id.clone());
                 if let Some(project_id) = project_id {
@@ -400,6 +493,7 @@ impl ContextMenu {
     }
 
     fn step(current: Option<usize>, enabled: &[usize], down: bool) -> Option<usize> {
+        if enabled.is_empty() { return None; }
         let position = current.and_then(|current| enabled.iter().position(|index| *index == current));
         let next = match (position, down) {
             (None, true) => 0,
@@ -1043,3 +1137,6 @@ pub(crate) mod project_filter_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "snapshot"))]
+mod thread_menu_tests;

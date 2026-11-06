@@ -131,6 +131,16 @@ impl ClientFixture {
         )
     }
 
+    pub async fn next_request(&mut self) -> (&'static str, Value, oneshot::Sender<Result<Value, RpcError>>) {
+        loop {
+            match self.commands.recv().await.expect("fixture request channel closed") {
+                Command::Request { method, payload, reply, .. } => return (method, payload, reply),
+                Command::OpenThread(_) | Command::CloseThread(_) | Command::CloseAllThreads | Command::Stream { .. } => {},
+                _ => panic!("unexpected fixture command before request"),
+            }
+        }
+    }
+
     pub fn take_commands(&mut self) -> Vec<&'static str> {
         let mut commands = Vec::new();
         while let Ok(command) = self.commands.try_recv() {

@@ -131,6 +131,7 @@ pub fn base_branch(refs: &VcsRefs) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strategy {
     Root,
+    RootBranch { branch: String },
     ExistingWorktree { worktree_path: String, branch: Option<String> },
     Worktree { base_ref: String, start_from_origin: bool },
 }
@@ -140,6 +141,7 @@ impl Strategy {
     pub fn to_json(&self) -> Value {
         match self {
             Strategy::Root => json!({ "type": "root" }),
+            Strategy::RootBranch { branch } => json!({"type":"root", "branch":branch}),
             Strategy::ExistingWorktree { worktree_path, branch } => {
                 let mut strategy = json!({"type": "existing_worktree", "worktreePath": worktree_path});
                 if let Some(branch) = branch { strategy["branch"] = json!(branch); }
@@ -240,6 +242,10 @@ pub fn can_use_previous_worktree(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftWorkspace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub environment_id: String,
     pub project_root: String,
     pub mode: ThreadEnvMode,
@@ -258,7 +264,7 @@ impl DraftWorkspace {
                 branch: seed.branch.clone(),
             });
         }
-        (self.mode == ThreadEnvMode::Local).then_some(Strategy::Root)
+        (self.mode == ThreadEnvMode::Local).then(|| self.branch.as_ref().map_or(Strategy::Root, |branch| Strategy::RootBranch { branch: branch.clone() }))
     }
 }
 

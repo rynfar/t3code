@@ -233,6 +233,22 @@ impl Composer {
         let root = state.shell.project(&project_id).map(|project| project.workspace_root.clone());
         let configured = config.and_then(|config| workspace::configured_env_mode(&config.settings, &project_id));
         let workspace_choice = self.selected_workspace();
+        let target = Target::Draft(project_id.clone());
+        let stored_workspace = self.drafts.store.get(&super::drafts::key(&target)).and_then(|draft| draft.workspace.clone());
+        let destination = (
+            state.environments.active.clone(),
+            config.map(|config| config.environment.environment_id.clone()),
+            state.shell.project(&project_id).map(|project| project.created_at.clone()),
+        );
+        if stored_workspace.as_ref().is_some_and(|choice| {
+            workspace_choice.as_ref() != Some(choice)
+                || !choice.in_scope(destination.0.as_deref().unwrap_or_default(), root.as_deref().unwrap_or_default())
+                || choice.destination.as_ref().is_some_and(|(environment, created)| destination.1.as_ref() != Some(environment) || destination.2.as_ref() != Some(created))
+        }) {
+            self.error = Some("The destination changed before launch. Select the workspace again.".into());
+            cx.notify();
+            return;
+        }
         let origin = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
         let new_projects_root = config.and_then(|config| config.new_projects_root.clone());
         // Settled threads the shell left out still count, as `readUnloadedThreadCount` does.
@@ -244,7 +260,6 @@ impl Composer {
         let cwd = root.clone().unwrap_or_default();
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
         let refs = workspace_choice.as_ref().and_then(workspace::DraftWorkspace::strategy).is_none().then(|| state.request(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd), |value| serde_json::from_value::<VcsRefs>(value).map_err(|error| error.to_string()))).flatten();
-        let target = Target::Draft(project_id.clone());
         self.record_draft(&target, cx);
         let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -265,7 +280,13 @@ impl Composer {
             let launch = this.update_in(cx, |this, _, cx| {
                 let state = this.state.read(cx);
                 let current = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
-                if current != origin || state.selected_thread.is_some() || state.draft_project.as_deref() != Some(project_id.as_str()) || this.snapshot.target.as_ref() != Some(&target) || state.shell.project(&project_id).map(|project| &project.workspace_root) != root.as_ref() {
+                let current_destination = (
+                    state.environments.active.clone(),
+                    state.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()),
+                    state.shell.project(&project_id).map(|project| project.created_at.clone()),
+                );
+                let current_workspace = this.drafts.store.get(&super::drafts::key(&target)).and_then(|draft| draft.workspace.as_ref());
+                if current_destination != destination || current_workspace != stored_workspace.as_ref() || current != origin || state.selected_thread.is_some() || state.draft_project.as_deref() != Some(project_id.as_str()) || this.snapshot.target.as_ref() != Some(&target) || state.shell.project(&project_id).map(|project| &project.workspace_root) != root.as_ref() {
                     return Err("The destination changed before launch. Select the workspace again.".to_owned());
                 }
                 let strategy = strategy.map_err(str::to_owned)?;
@@ -500,4 +521,14 @@ impl Composer {
         eprintln!("failed launch recovery: destination change, RPC failure, concurrent edits and persisted original attachments/context passed; no launch RPC");
         Ok(())
     }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+impl Composer {
+    pub(crate) fn exercise_menu_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Target::Draft(project)) = self.snapshot.target.clone() else { panic!("fixture needs a draft") };
+        let outgoing = self.outgoing(self.prompt(cx), &[]);
+        self.launch(project, outgoing, SubmitIntent::Foreground, window, cx);
+    }
+    pub(crate) fn menu_launch_outcome(&self) -> (bool, Option<String>) { (self.sending, self.error.clone()) }
 }

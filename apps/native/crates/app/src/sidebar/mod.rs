@@ -13,6 +13,7 @@ mod project_filter;
 mod row;
 mod search;
 
+use gpui::Focusable;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +67,7 @@ pub struct SidebarPane {
     search_input: Entity<InputState>,
     search: SearchState,
     rename: Option<(String, Entity<InputState>)>,
+    rename_previous_focus: Option<gpui::FocusHandle>,
     /// Where the project filter popover opens, while it is open.
     project_filter: Option<gpui::Point<gpui::Pixels>>,
     jump_hints: bool,
@@ -162,7 +164,7 @@ impl SidebarPane {
             }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
                 ContextMenuEvent::DiscardDraft(project) => this.discard_draft(project, window, cx),
-                ContextMenuEvent::Rename(thread_id) => this.start_rename(thread_id, window, cx),
+                ContextMenuEvent::Rename(owner, focus) => { if owner.allows(this.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { this.start_rename_from_menu(&owner.thread, focus.clone(), window, cx); } },
                 ContextMenuEvent::CustomSnooze(thread_ids) => snooze.update(cx, |snooze, cx| snooze.open(thread_ids.clone(), window, cx)),
                 ContextMenuEvent::BulkDelete(thread_ids) => {
                     if !crate::settings::client_settings(cx).confirm_thread_delete() {
@@ -172,14 +174,18 @@ impl SidebarPane {
                     let ids = thread_ids.clone();
                     dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| state.delete_threads(ids, cx), window, cx));
                 }
-                ContextMenuEvent::Delete(thread_id) => {
+                ContextMenuEvent::Delete(owner, focus) => {
+                    if !owner.allows(this.state.read(cx), &t3_core::thread_actions::ThreadAction::Delete) { return; }
+                    let thread_id = &owner.thread;
                     if !crate::settings::client_settings(cx).confirm_thread_delete() {
                         return this.state.update(cx, |state, cx| state.delete_thread(thread_id, cx));
                     }
                     let Some(title) = this.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
                     let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
-                    let id = thread_id.clone();
-                    dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| state.delete_thread(&id, cx), window, cx));
+                    let owner = owner.clone();
+                    let previous_focus = focus.clone();
+                    dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Delete", move |state, cx| { if owner.allows(state, &t3_core::thread_actions::ThreadAction::Delete) { state.delete_thread(&owner.thread, cx); } }, window, cx));
+                    dialog.update(cx, |dialog, _| dialog.set_previous_focus(previous_focus));
                 }
             }),
         ];
@@ -197,6 +203,7 @@ impl SidebarPane {
             search_input,
             search: SearchState::default(),
             rename: None,
+            rename_previous_focus: None,
             project_filter: None,
             jump_hints: false,
             jump_hint_timer: None,
@@ -325,15 +332,23 @@ impl SidebarPane {
     }
 
     fn start_rename(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_rename_from_menu(thread_id, None, window, cx);
+    }
+
+    fn start_rename_from_menu(&mut self, thread_id: &str, previous_focus: Option<gpui::FocusHandle>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(title) = self.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), thread_id) else { return };
+        let previous_focus = previous_focus.or_else(|| window.focused(cx));
+        self.rename_previous_focus = previous_focus.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
         let id = thread_id.to_owned();
-        let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, _, cx| match event {
+        let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } | InputEvent::Blur => {
                 let title = input.read(cx).value().to_string();
                 if this.rename.as_ref().is_some_and(|(renaming, _)| *renaming == id) {
                     this.rename = None;
-                    this.state.update(cx, |state, cx| state.rename_thread(&id, &title, cx));
+                    this.state.update(cx, |state, cx| { if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) { state.rename_thread(&id, &title, cx); } });
+                    if input.read(cx).focus_handle(cx).is_focused(window) { if let Some(focus) = &previous_focus { window.focus(focus, cx); } }
                     cx.notify();
                 }
             }
@@ -349,7 +364,14 @@ impl SidebarPane {
     }
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        if self.rename.take().is_some() {
+        if let Some((_, input)) = self.rename.take() {
+            let input_focus = input.read(cx).focus_handle(cx);
+            let previous = self.rename_previous_focus.take();
+            cx.defer(move |cx| {
+                if let Some(window) = cx.active_window() { let _ = window.update(cx, |_, window, cx| {
+                    if input_focus.is_focused(window) { if let Some(previous) = previous { window.focus(&previous, cx); } }
+                }); }
+            });
             cx.notify();
         }
     }

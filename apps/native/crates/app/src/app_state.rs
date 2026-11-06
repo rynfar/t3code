@@ -32,6 +32,7 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
     RestoreDraft,
+    BranchDraft,
     PromptLink,
     /// The connection, the saved environments, or the connect screen changed. Also sent for
     /// every new connection, so whatever follows one can check `connection_id`.
@@ -88,6 +89,7 @@ pub struct AppState {
     pub client_settings: ClientSettings,
     /// The project of the new-thread draft, while the user composes a thread that does not exist.
     pub draft_project: Option<String>,
+    pub(crate) branch_draft: Option<(crate::context_menu::ThreadMenuOwner, t3_core::workspace::DraftWorkspace)>,
     pub panels: crate::right_panel::PanelState,
     /// The pull requests page replaces the thread area while open (`/pull-requests`).
     pub pull_requests_open: bool,
@@ -168,6 +170,7 @@ impl AppState {
             server_config: ServerConfigState::default(),
             client_settings: settings,
             draft_project: None,
+            branch_draft: None,
             panels: Default::default(),
             pull_requests_open: false,
             restore_thread: store::load_last_thread(),
@@ -250,6 +253,7 @@ impl AppState {
         self.server_config = ServerConfigState::default();
         crate::theme::set_environment_themes(&[], cx);
         self.draft_project = None;
+        self.branch_draft = None;
         self.pull_requests_open = false;
         self.composer_mentions.clear();
         self.composer_terminal_context = None;
@@ -460,6 +464,7 @@ impl AppState {
         }
         self.pull_requests_open = false;
         self.draft_project = None;
+        self.branch_draft = None;
         if let (Some(client), Some(previous)) = (&self.client, &self.selected_thread) {
             client.close_thread(previous);
         }

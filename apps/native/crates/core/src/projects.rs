@@ -7,6 +7,14 @@ use serde_json::{Value, json};
 
 use crate::sidebar::grouping::normalize_project_path;
 
+pub const PROJECTS_CREATE_FROM_THREAD: &str = "projects.createFromThread";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFromThreadResult { pub project_id: String }
+
+pub fn create_from_thread(thread_id: &str) -> Value { json!({"threadId":thread_id}) }
+
 pub const PROJECTS_MUTATE: &str = "projects.mutate";
 pub const PROJECTS_CREATE_NEW: &str = "projects.createNew";
 pub const FILESYSTEM_BROWSE: &str = "filesystem.browse";
