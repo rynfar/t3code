@@ -400,22 +400,37 @@ mod quiet_fleet {
 
     #[tokio::test]
     async fn quiet_fleet_config_updates_publish_revisions_and_reuse_quiet_summary() {
-        let (entry, _fixture) = entry("config");
+        let (mut entry, _fixture) = entry("config");
+        let loaded_config = entry.config.config.clone().unwrap();
+        entry.config = ServerConfigState::default();
         let (mut owner, mut output) = Environments::start(&tokio::runtime::Handle::current(), false);
         let mut view = owner.view();
         let events = owner.install_fixture("config", entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await;
         view.changed().await.unwrap();
         let initial = view.borrow_and_update().clone();
-        let revision = initial.environment("config").unwrap().settings_revision;
-        let summary = initial.environment("config").unwrap().summary.clone();
+        let absent = initial.environment("config").unwrap().summary.clone();
+        assert!(initial.environment("config").unwrap().config.config.is_none());
+        assert!(!absent.config_loaded);
         owner.activate(Some("config"));
         loop { if matches!(output.recv().await, Some(EnvironmentEvent::Activated { .. })) { break; } }
-        let equal = entry.config.config.clone().unwrap();
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(loaded_config.clone()) }))).await.unwrap();
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
+        let loaded = view.borrow_and_update().clone();
+        let current = loaded.environment("config").unwrap();
+        assert!(current.config.config.is_some());
+        let revision = current.settings_revision;
+        let summary = current.summary.clone();
+        assert!(summary.config_loaded);
+        assert!(!Arc::ptr_eq(&absent,&summary), "first config publishes a new summary without a shell event");
+        assert_eq!(absent.snapshot_sequence,summary.snapshot_sequence);
+        assert_eq!(absent.owner.shell_generation,summary.owner.shell_generation);
+        assert_eq!(absent.threads.iter().map(|row| &row.thread).collect::<Vec<_>>(),summary.threads.iter().map(|row| &row.thread).collect::<Vec<_>>());
+        let equal = loaded_config.clone();
         events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(equal) }))).await.unwrap();
         loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
         assert_eq!(view.borrow().environment("config").unwrap().settings_revision, revision + 1);
         assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));
-        let mut changed = entry.config.config.clone().unwrap(); changed.settings.guest_sharing_enabled = Some(false);
+        let mut changed = loaded_config; changed.settings.guest_sharing_enabled = Some(false);
         events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(changed) }))).await.unwrap();
         loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
         assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));

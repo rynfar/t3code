@@ -38,6 +38,7 @@ pub struct EnvironmentSummary {
     pub projects: Vec<ScopedProject>,
     pub threads: Vec<ScopedThread>,
     pub synchronized: bool,
+    pub config_loaded: bool,
     pub snapshot_sequence: Option<u64>,
     pub older_settled: Option<crate::shell::OlderSettledCut>,
     pub removed_at: HashMap<String, u64>,
@@ -57,7 +58,7 @@ impl EnvironmentSummary {
         }).unwrap_or_default();
         let older_settled = shell.snapshot.as_ref().and_then(|snapshot| snapshot.older_settled.clone());
         let older_count_key = shell.snapshot.as_ref().zip(older_settled.as_ref().and_then(OlderSettled::from_cut)).map(|(snapshot, older)| older_settled::count_key(&snapshot.threads, older.before_ms, &shell.removed_at));
-        Self { owner, projects, threads, synchronized: shell.synchronized, snapshot_sequence: shell.sequence(), older_settled, removed_at: shell.removed_at.clone(), older_count_key }
+        Self { owner, projects, threads, synchronized: shell.synchronized, config_loaded: config.is_some(), snapshot_sequence: shell.sequence(), older_settled, removed_at: shell.removed_at.clone(), older_count_key }
     }
 }
 
@@ -211,7 +212,7 @@ impl ScopedSidebarModel {
             let local = scoped.iter().map(|thread| thread.thread.clone()).collect::<Vec<_>>();
             let tracker = state.trackers.entry(environment.owner.clone()).or_default();
             let observation = if working_shelf_enabled { tracker.observe(&local, input.now) } else { tracker.clear(); Default::default() };
-            let partition = super::partition(&PartitionInput { threads: &local, working_shelf_enabled, config_loaded: true, now: input.now, inbox: &observation });
+            let partition = super::partition(&PartitionInput { threads: &local, working_shelf_enabled, config_loaded: environment.config_loaded, now: input.now, inbox: &observation });
             let offset = model.threads.len();
             for thread in scoped {
                 let key = thread.key();

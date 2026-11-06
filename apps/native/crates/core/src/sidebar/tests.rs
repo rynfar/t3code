@@ -661,6 +661,7 @@ fn older_settled_listing_and_counts() {
     let empty = snapshot(vec![]);
     let model = SidebarModel::build(
         &ModelInput {
+            config_loaded: true,
             snapshot: &empty,
             extra_threads: &[],
             older_settled: Some(OlderSettledShelf { older: &older, frontier: None }),
@@ -709,7 +710,7 @@ fn snapshot(threads: Vec<Value>) -> ShellSnapshot {
 
 fn build(snapshot: &ShellSnapshot, shelves: &ShelfState, selected: Option<&str>) -> SidebarModel {
     SidebarModel::build(
-        &ModelInput { snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: None },
+        &ModelInput { config_loaded: true, snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves, selected_thread_id: selected, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: None },
         &mut InboxReturnTracker::default(),
     )
 }
@@ -768,6 +769,7 @@ fn model_lists_sections_with_collapsed_shelves_and_the_open_thread() {
         let settings = SidebarSettings { working_shelf_enabled: enabled, ..Default::default() };
         let mut tracker = InboxReturnTracker::default();
         let model = SidebarModel::build(&ModelInput {
+            config_loaded: true,
             snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &settings, shelves: &open,
             selected_thread_id: None, project_scope: None, hidden_thread_ids: None,
             now: iso(NOW), dragging: None,
@@ -789,6 +791,7 @@ fn model_lists_sections_with_collapsed_shelves_and_the_open_thread() {
     for kind in ["approval", "user_input"] {
         let mut tracker = InboxReturnTracker::default();
         let mut input = ModelInput {
+            config_loaded: true,
             snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &open,
             selected_thread_id: None, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: None,
         };
@@ -830,7 +833,7 @@ fn dragging_adds_drop_markers_and_slots_resolve_through_them() {
         wire_thread("done-1", json!({"settledOverride": "settled", "settledAt": "2026-04-03T00:00:00.000Z"})),
     ]);
     let model = SidebarModel::build(
-        &ModelInput { snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: Some(Section::Active) },
+        &ModelInput { config_loaded: true, snapshot: &snapshot, extra_threads: &[], older_settled: None, settings: &SidebarSettings::default(), shelves: &ShelfState::default(), selected_thread_id: None, project_scope: None, hidden_thread_ids: None, now: iso(NOW), dragging: Some(Section::Active) },
         &mut InboxReturnTracker::default(),
     );
     assert_eq!(labels(&model), ["<PinnedHeader>", "Pinned:pinned", "<PinnedDivider>", "Active:active", "[Settled 1]", "<SettledPlaceholder>"]);
@@ -959,7 +962,7 @@ fn tag_visibility_applies_before_sidebar_partition_and_search() {
     let tags = vec!["private".into()];
     let hidden = tag_filter::hidden_thread_keys(&[tag_filter::Environment{environment_id:"env",threads:&refs,hidden_tags:Some(&tags)}],&HashSet::new(),&HashSet::new(),true)
         .into_iter().map(|key|key.thread_id).collect();
-    let model = SidebarModel::build(&ModelInput {snapshot:&snapshot,extra_threads:&[],older_settled:None,settings:&Default::default(),shelves:&Default::default(),selected_thread_id:Some("private"),project_scope:None,hidden_thread_ids:Some(&hidden),now:iso(NOW),dragging:None},&mut Default::default());
+    let model = SidebarModel::build(&ModelInput {config_loaded:true,snapshot:&snapshot,extra_threads:&[],older_settled:None,settings:&Default::default(),shelves:&Default::default(),selected_thread_id:Some("private"),project_scope:None,hidden_thread_ids:Some(&hidden),now:iso(NOW),dragging:None},&mut Default::default());
     assert_eq!(model.threads.iter().map(|thread|thread.id.as_str()).collect::<Vec<_>>(),["plain"]);
     assert!(search_titles(&model,"private",iso(NOW)).is_empty());
     assert_eq!(model.jump_target(0),Some("plain"));
@@ -1299,8 +1302,8 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let mut preferences = ProjectPreferences::default();
     let groups = build_scoped_project_groups(&GroupInput { projects: &projects, threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::UpdatedAt });
     preferences.set_expanded(&groups[0], false);
-    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], synchronized: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
-    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], synchronized: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
+    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
+    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
     let selected = ThreadKey::new("b", "same");
     let sidebar = SidebarSettings::default(); let shelves = ShelfState::default(); let hidden = HashSet::new();
     let mut state = ScopedSidebarState::default();
@@ -1389,6 +1392,68 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     assert_eq!(model.ordered.len(), 2, "archived projects keep folders only for their Active rows");
 }
 
+
+#[test]
+fn scoped_sections_follow_loaded_config_per_owner_and_keep_cached_disconnects() {
+    use super::fleet::*;
+    use crate::{server_config::ServerConfigState, shell::ShellState};
+
+    let mut shell = ShellState::default();
+    shell.snapshot = Some(snapshot(vec![
+        wire_thread("snoozed", json!({"pinnedAt":SNOOZED_AT,"settledOverride":"settled","settledAt":SNOOZED_AT,"snoozedAt":SNOOZED_AT,"snoozedUntil":FUTURE_WAKE})),
+        wire_thread("settled", json!({"pinnedAt":SNOOZED_AT,"settledOverride":"settled","settledAt":SNOOZED_AT})),
+        wire_thread("working", json!({"status":"running","latestRunId":"run","activeRunId":"run"})),
+    ]));
+    shell.synchronized = true;
+    let absent = ServerConfigState::default();
+    let mut loaded = ServerConfigState::default();
+    loaded.apply(serde_json::from_value(json!({"type":"snapshot","config":{}})).unwrap());
+    let owner = |saved: &str| EnvironmentOwner {
+        saved_id:saved.into(), canonical_id:Some(format!("canonical-{saved}")),
+        generation:1, connection_generation:1, shell_generation:shell.generation,
+    };
+    let pending = EnvironmentSummary::from_shell(owner("pending"), &shell, &absent);
+    let ready = EnvironmentSummary::from_shell(owner("ready"), &shell, &loaded);
+    let settings = SidebarSettings::default();
+    let preferences = ProjectPreferences::default();
+    let shelves = ShelfState::default();
+    let hidden = HashSet::new();
+    for config in [&absent,&loaded] {
+        let model = SidebarModel::build(&ModelInput {
+            snapshot:shell.snapshot.as_ref().unwrap(), config_loaded:config.config.is_some(), extra_threads:&[], older_settled:None,
+            settings:&settings, shelves:&shelves, selected_thread_id:None, project_scope:None, hidden_thread_ids:None, now:iso(NOW), dragging:None,
+        }, &mut InboxReturnTracker::default());
+        assert_eq!(model.section_of("snoozed"),Some(if config.config.is_some() { Section::Snoozed } else { Section::Pinned }));
+        assert_eq!(model.section_of("settled"),Some(if config.config.is_some() { Section::Settled } else { Section::Pinned }));
+        assert_eq!(model.section_of("working"),Some(Section::Working));
+    }
+    for folder_mode in [false, true] {
+        let assert_sections = |environments: &[&EnvironmentSummary], pending_loaded: bool| {
+            let model = ScopedSidebarModel::build(&ScopedSidebarInput {
+                environments, groups:&[], preferences:&preferences, settings:&settings, shelves:&shelves,
+                selected:None, hidden:&hidden, older:&[], extra_threads:&[], now:iso(NOW), folder_mode, dragging:None,
+            }, &mut ScopedSidebarState::default());
+            assert_eq!(model.threads.len(), 6, "same raw ids in distinct owners remain distinct");
+            for (saved, config_loaded) in [("pending",pending_loaded),("ready",true)] {
+                for (id, expected) in [
+                    ("snoozed", if config_loaded { Section::Snoozed } else { Section::Pinned }),
+                    ("settled", if config_loaded { Section::Settled } else { Section::Pinned }),
+                    ("working", if folder_mode { Section::Active } else { Section::Working }),
+                ] {
+                    assert_eq!(model.section_of(&ThreadKey::new(saved,id)),Some(expected),"owner={saved} config_loaded={config_loaded} folder_mode={folder_mode} thread={id}");
+                }
+            }
+        };
+        assert_sections(&[&pending,&ready],false);
+        let pending_loaded = EnvironmentSummary::from_shell(owner("pending"), &shell, &loaded);
+        assert_sections(&[&pending_loaded,&ready],true);
+        let mut disconnected = shell.clone();
+        disconnected.synchronized = false;
+        let cached_pending = EnvironmentSummary::from_shell(owner("pending"), &disconnected, &loaded);
+        let cached_ready = EnvironmentSummary::from_shell(owner("ready"), &disconnected, &loaded);
+        assert_sections(&[&cached_pending,&cached_ready],true);
+    }
+}
 
 #[test]
 fn scoped_quiet_metadata_keeps_existing_omitted_row_rules() {

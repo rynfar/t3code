@@ -477,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
         let model = t3_core::sidebar::SidebarModel::build(
             &t3_core::sidebar::ModelInput {
                 snapshot,
+                config_loaded: config.config.is_some(),
                 extra_threads: &extras,
                 older_settled: older.as_ref().map(|older| t3_core::sidebar::OlderSettledShelf { older, frontier: pages.listing_frontier(Some(older)) }),
                 settings: &Default::default(),
