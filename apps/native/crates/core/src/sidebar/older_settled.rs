@@ -162,19 +162,20 @@ impl OlderSettledCounts {
     /// Follows the shell. Returns the key to read counts for, when the snapshot's no longer hold
     /// and no read for this key has landed.
     pub fn sync(&mut self, shell: &ShellState) -> Option<String> {
-        let Some(snapshot) = &shell.snapshot else {
-            *self = OlderSettledCounts::default();
-            return None;
-        };
-        let Some(older) = snapshot.older_settled.as_ref().and_then(OlderSettled::from_cut) else {
-            *self = OlderSettledCounts::default();
-            return None;
-        };
-        let cut = snapshot.older_settled.as_ref().map_or(0, |cut| cut.as_of_sequence);
-        self.key = count_key(&snapshot.threads, older.before_ms, &shell.removed_at);
-        if self.generation != shell.generation || self.from_snapshot.as_ref().map(|o| &o.before) != Some(&older.before) {
-            self.generation = shell.generation;
-            self.snapshot_key = (snapshot.snapshot_sequence == cut).then(|| self.key.clone());
+        let snapshot = shell.snapshot.as_ref();
+        let cut = snapshot.and_then(|snapshot| snapshot.older_settled.as_ref());
+        let key = snapshot.zip(cut.and_then(OlderSettled::from_cut)).map(|(snapshot, older)| count_key(&snapshot.threads, older.before_ms, &shell.removed_at));
+        self.sync_snapshot(shell.generation, shell.sequence(), cut, key.as_deref())
+    }
+
+    pub fn sync_snapshot(&mut self, generation: u64, snapshot_sequence: Option<u64>, cut: Option<&crate::shell::OlderSettledCut>, key: Option<&str>) -> Option<String> {
+        let Some((snapshot_sequence, cut)) = snapshot_sequence.zip(cut) else { *self = Self::default(); return None };
+        let Some(older) = OlderSettled::from_cut(cut) else { *self = Self::default(); return None };
+        let Some(key) = key else { *self = Self::default(); return None };
+        self.key = key.into();
+        if self.generation != generation || self.from_snapshot.as_ref().map(|older| &older.before) != Some(&older.before) {
+            self.generation = generation;
+            self.snapshot_key = (snapshot_sequence == cut.as_of_sequence).then(|| self.key.clone());
             self.read = None;
         }
         self.from_snapshot = Some(older);
@@ -229,11 +230,15 @@ pub struct SettledPages {
 impl SettledPages {
     /// Follows the shell: a new generation or cut starts the reads over from the cut.
     pub fn sync(&mut self, shell: &ShellState, older: Option<&OlderSettled>) {
+        self.sync_generation(shell.generation, older);
+    }
+
+    pub fn sync_generation(&mut self, generation: u64, older: Option<&OlderSettled>) {
         let before = older.map(|older| older.before.clone());
-        if self.generation == shell.generation && self.before == before {
+        if self.generation == generation && self.before == before {
             return;
         }
-        self.generation = shell.generation;
+        self.generation = generation;
         self.before = before;
         self.reads.clear();
         self.status = PageStatus::Ready;

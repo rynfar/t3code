@@ -1203,3 +1203,154 @@ fn deletion_fallback_uses_current_sort_and_excludes_the_entire_batch() {
         Some("z")
     );
 }
+
+
+fn scoped_fixture(saved: &str, canonical: Option<&str>, path: &str, scratch: bool) -> (ScopedProject, super::fleet::ScopedThread) {
+    let owner = EnvironmentOwner { saved_id: saved.into(), canonical_id: canonical.map(str::to_owned), generation: 1, connection_generation: 1, shell_generation: 1 };
+    let project = ScopedProject { owner: owner.clone(), project: project("p1", saved, path, Some(json!({"canonicalKey":"repo"}))), is_scratch: scratch, environment_label: saved.into() };
+    let thread = super::fleet::ScopedThread { owner, thread: base("same"), created_at: "2026-06-01T00:00:00.000Z".into(), lineage: crate::shell::Lineage { parent_thread_id: None, relationship_to_parent: None, root_thread_id: "same".into(), side_chat: None }, delegated_from: None, tags: Vec::new() };
+    (project, thread)
+}
+
+#[test]
+fn scoped_groups_keep_colliding_refs_physical_winners_and_saved_aliases() {
+    let (a, ta) = scoped_fixture("a", Some("server-a"), "/repo", false);
+    let (b, mut tb) = scoped_fixture("b", Some("server-b"), "/repo", false);
+    tb.thread.latest_user_message_at = Some(iso("2026-07-01T00:00:00Z"));
+    let mut alias = a.clone();
+    alias.owner.saved_id = "alias".into();
+    let mut newer = a.clone();
+    newer.project.id = "p-new".into();
+    newer.project.updated_at = "2026-02-01T00:00:00Z".into();
+    newer.project.repository_identity = None;
+    let projects = [a, b, alias, newer];
+    let threads = [ta, tb];
+    let settings = GroupingSettings::default();
+    let preferences = ProjectPreferences::default();
+    let input = GroupInput { projects: &projects, threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: Some("b"), consumer: GroupConsumer::Palette, sort: ProjectSortOrder::UpdatedAt };
+    let groups = build_scoped_project_groups(&input);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].members.len(), 2);
+    assert_eq!(groups[0].member_refs.len(), 4);
+    assert_eq!(groups[0].mutation_refs().len(), 3);
+    assert_eq!(groups[0].representative.environment_id, "b");
+    assert_eq!(pick_project_target(&groups[0], Some(&projects[2].reference())).unwrap().project.project.id, "p-new");
+    assert_eq!(latest_group_thread(&groups[0], &threads, ThreadSortOrder::UpdatedAt), Some(tag_filter::ThreadKey::new("b", "same")));
+    assert_eq!(latest_group_thread(&groups[0], &threads, ThreadSortOrder::CreatedAt), Some(tag_filter::ThreadKey::new("a", "same")));
+    let unknown = [scoped_fixture("a", None, "/repo", false).0, scoped_fixture("b", None, "/repo", false).0];
+    let settings = GroupingSettings { mode: GroupingMode::Separate, ..Default::default() };
+    let separated = build_scoped_project_groups(&GroupInput { projects: &unknown, settings: &settings, ..input });
+    assert_eq!(separated.len(), 2);
+    assert_ne!(separated[0].key, separated[1].key);
+}
+
+#[test]
+fn scoped_preferences_keep_missing_intent_scratch_migration_and_consumer_order() {
+    let (a, _) = scoped_fixture("a", Some("server-a"), "/scratch", true);
+    let (b, _) = scoped_fixture("b", Some("server-b"), "/scratch", true);
+    let mut ordinary = a.clone(); ordinary.project.id = "ordinary".into(); ordinary.project.workspace_root = "/ordinary".into(); ordinary.project.title = "AAA".into(); ordinary.is_scratch = false; ordinary.project.repository_identity = None;
+    let projects = [a, b, ordinary];
+    let settings = GroupingSettings { mode: GroupingMode::Separate, ..Default::default() };
+    let mut preferences = ProjectPreferences { scope_keys: vec![projects[0].physical_key()], project_order: vec![legacy_project_cwd_key("/ordinary")], ..Default::default() };
+    let input = GroupInput { projects: &projects, threads: &[], settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::Manual };
+    let groups = build_scoped_project_groups(&input);
+    assert_eq!(groups[0].representative.project_id, "ordinary");
+    let scratch = groups.iter().find(|group| group.is_scratch).unwrap();
+    assert_eq!(scratch.key, SCRATCH_SCOPE_KEY);
+    assert_eq!(preferences.resolved_scope(&groups, true), [SCRATCH_SCOPE_KEY]);
+    assert_eq!(preferences.scoped_members(&groups, true).unwrap().len(), 2);
+    assert_eq!(preferences.scoped_members(&[], true), None);
+    assert_eq!(preferences.scope_keys, [projects[0].physical_key()]);
+    let settings_groups = build_scoped_project_groups(&GroupInput { consumer: GroupConsumer::Settings, ..input });
+    assert_eq!(settings_groups.len(), 3);
+    assert_eq!(settings_groups.iter().map(|group| group.label.as_str()).collect::<Vec<_>>(), ["a", "AAA", "b"]);
+    preferences.project_expanded.insert(legacy_project_cwd_key("/scratch"), false);
+    assert!(!preferences.expanded(scratch));
+    preferences.set_expanded(scratch, true);
+    assert!(preferences.expanded(scratch));
+    let unknown = scoped_fixture("a", None, "/scratch", true).0;
+    let old_key = unknown.physical_key();
+    let old = build_scoped_project_groups(&GroupInput { projects: &[unknown], settings: &settings, preferences: &ProjectPreferences::default(), threads: &[], preferred_environment: None, consumer: GroupConsumer::Settings, sort: ProjectSortOrder::Manual });
+    preferences.scope_keys = vec![old_key.clone()]; preferences.project_order = vec![old_key];
+    preferences.reconcile(&old, &settings_groups);
+    assert_eq!(preferences.scope_keys, [projects[0].physical_key()]);
+    assert_eq!(preferences.project_order, [projects[0].physical_key()]);
+    preferences.reorder(&["a".into(),"b".into(),"c".into()], &["a".into()], &["b".into()]);
+    assert_eq!(preferences.project_order, ["b","a","c"]);
+}
+
+#[test]
+fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
+    use super::fleet::*;
+    let (a, ta) = scoped_fixture("a", Some("server-a"), "/a", false);
+    let (b, tb) = scoped_fixture("b", Some("server-b"), "/b", false);
+    let projects = [a.clone(), b.clone()];
+    let threads = [ta.clone(), tb.clone()];
+    let settings = GroupingSettings::default();
+    let mut preferences = ProjectPreferences::default();
+    let groups = build_scoped_project_groups(&GroupInput { projects: &projects, threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::UpdatedAt });
+    preferences.set_expanded(&groups[0], false);
+    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], synchronized: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
+    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], synchronized: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
+    let selected = ThreadKey::new("b", "same");
+    let sidebar = SidebarSettings::default(); let shelves = ShelfState::default(); let hidden = HashSet::new();
+    let mut state = ScopedSidebarState::default();
+    let environments = [&ea, &eb];
+    let input = ScopedSidebarInput { environments: &environments, groups: &groups, preferences: &preferences, settings: &sidebar, shelves: &shelves, selected: Some(&selected), hidden: &hidden, older: &[], extra_threads: &[], now: 0, folder_mode: true, dragging: None };
+    let model = ScopedSidebarModel::build(&input, &mut state);
+    assert_eq!(model.index_by_key.len(), 2);
+    assert_eq!(model.ordered.len(), 1);
+    assert_eq!(model.jump_target(0), Some(selected.clone()));
+    assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Folder { hidden_count: 1, expanded: false, .. })));
+    let normal = ScopedSidebarModel::build(&ScopedSidebarInput { folder_mode: false, ..input }, &mut state);
+    assert_eq!(normal.ordered.len(), 2);
+    assert_ne!(normal.row_keys()[0], normal.row_keys()[1]);
+    let mut alias = ea.clone(); alias.owner.saved_id = "alias".into();
+    for thread in &mut alias.threads { thread.owner = alias.owner.clone(); }
+    let aliases = [&ea, &eb, &alias];
+    let deduped = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &aliases, folder_mode: false, ..input }, &mut state);
+    assert_eq!(deduped.threads.len(), 2);
+    assert!(deduped.thread(&ThreadKey::new("a", "same")).is_some());
+    let mut ea = ea.clone(); let mut eb = eb.clone();
+    for environment in [&mut ea, &mut eb] { environment.threads[0].thread.settled_override = Some(SettledOverride::Settled); environment.threads[0].thread.settled_at = Some(10); }
+    let older = OlderSettled { before: format_iso(20), before_ms: 20, counts: [("p1".into(), 2)].into() };
+    let frontier = Cursor { settled_at: 15, thread_id: None };
+    let owners = [ScopedOlderSettled { owner: &ea.owner, older: &older, frontier: Some(&frontier) }, ScopedOlderSettled { owner: &eb.owner, older: &older, frontier: None }];
+    let environments = [&ea, &eb];
+    let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &environments, older: &owners, folder_mode: false, selected: None, ..input }, &mut state);
+    assert_eq!(model.settled_count, 4);
+    assert_eq!(model.listed_settled_count, 1);
+}
+
+
+#[test]
+fn scoped_quiet_metadata_keeps_existing_omitted_row_rules() {
+    use crate::families::{MountedReads, FamilyRead};
+    let row = serde_json::from_value::<ThreadShell>(json!({
+        "id":"extra", "projectId":"p1", "title":"extra", "providerInstanceId":"replay", "modelSelection":{"instanceId":"replay","model":"replay"},
+        "runtimeMode":"auto", "interactionMode":"default", "lineage":{"rootThreadId":"extra"}, "status":"idle", "hasActionableProposedPlan":false,
+        "itemCount":0, "visibleItemCount":0, "createdAt":"2026-01-01T00:00:00Z", "updatedAt":"2026-01-01T00:00:00Z"
+    })).unwrap();
+    let mut mounts = MountedReads::default();
+    mounts.mount("pages", 4, vec![FamilyRead { snapshot_sequence: 8, threads: vec![row.clone()] }]);
+    assert_eq!(mounts.extras_for(4, 8, &HashSet::new(), &HashMap::new()).len(), 1);
+    assert!(mounts.extras_for(5, 8, &HashSet::new(), &HashMap::new()).is_empty());
+    assert!(mounts.extras_for(4, 9, &HashSet::new(), &HashMap::new()).is_empty());
+    assert!(mounts.extras_for(4, 8, &["extra".into()].into(), &HashMap::new()).is_empty());
+    assert!(mounts.extras_for(4, 8, &HashSet::new(), &[("extra".into(), 9)].into()).is_empty());
+    let cut = crate::shell::OlderSettledCut { before: "2026-06-01T00:00:00Z".into(), as_of_sequence:8, counts:vec![crate::shell::OlderSettledCount { project_id:"p1".into(), count:2 }] };
+    let mut counts = OlderSettledCounts::default();
+    assert_eq!(counts.sync_snapshot(4, Some(8), Some(&cut), Some("snapshot")), None);
+    assert_eq!(counts.current().unwrap().counts["p1"], 2);
+    assert_eq!(counts.sync_snapshot(4, Some(9), Some(&cut), Some("changed")), Some("changed".into()));
+    counts.apply_read("old", [("p1".into(), 7)].into());
+    assert_eq!(counts.current().unwrap().counts["p1"], 2);
+    counts.apply_read("changed", [("p1".into(), 1)].into());
+    assert_eq!(counts.current().unwrap().counts["p1"], 1);
+    let mut pages = SettledPages::default();
+    pages.sync_generation(4, counts.current().as_ref());
+    pages.grow(counts.current().as_ref(), 0, 1);
+    let (generation, before) = pages.next_request().unwrap();
+    pages.sync_generation(5, counts.current().as_ref());
+    assert!(!pages.apply_page(generation, &before, Ok(FamilyRead { snapshot_sequence:9, threads:vec![row] })));
+}

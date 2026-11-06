@@ -3,6 +3,11 @@
 //! notification gates stay on Tokio; background frames never enter the UI queue.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use t3_core::auth::AuthSessionState;
+use t3_core::sidebar::fleet::EnvironmentSummary;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 
 use t3_core::notifications::{
     EnvironmentNotifications, LinkedEnvironment, LinkedRequests, NotificationVisibility, ThreadNotification,
@@ -10,10 +15,51 @@ use t3_core::notifications::{
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
 use t3_core::sidebar::tag_filter::{self, ThreadKey};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::auth::Credentials;
 use crate::supervisor::{self, ClientEvent, ClientHandle, ConnectionStatus, Prepare};
+
+
+#[derive(Debug, Clone)]
+pub struct EnvironmentView {
+    pub summary: Arc<EnvironmentSummary>,
+    pub status: ConnectionStatus,
+    pub config: ServerConfigState,
+    pub grants: Option<AuthSessionState>,
+    pub settings_revision: u64,
+    pub keybindings_revision: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FleetView {
+    pub revision: u64,
+    pub environments: Vec<Arc<EnvironmentView>>,
+}
+
+impl FleetView {
+    pub fn environment(&self, id: &str) -> Option<&EnvironmentView> {
+        self.environments.iter().find(|environment| environment.summary.owner.saved_id == id).map(Arc::as_ref)
+    }
+}
+
+pub struct Destination {
+    pub owner: EnvironmentOwner,
+    pub client: ClientHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationError { Missing, Stale, Disconnected, Unsynchronized, Denied }
+
+impl Destination {
+    pub fn is_current(&self, view: &FleetView) -> bool {
+        view.environment(&self.owner.saved_id).is_some_and(|environment| environment.summary.owner == self.owner
+            && environment.status == ConnectionStatus::Connected && environment.summary.synchronized)
+            && *self.client.connection_generation().borrow() == self.owner.connection_generation
+    }
+}
+
+enum RelayFrame { Events(Vec<ClientEvent>), Permission }
 
 pub enum EnvironmentEvent {
     Activated {
@@ -53,6 +99,9 @@ pub enum EnvironmentEvent {
 }
 
 enum Command {
+    ApplySettings { owner: EnvironmentOwner, settings: t3_core::server_config::ServerSettings, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
+    ApplyKeybindings { owner: EnvironmentOwner, value: serde_json::Value, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
+    Destination { owner: EnvironmentOwner, scope: String, reply: tokio::sync::oneshot::Sender<Result<Destination, DestinationError>> },
     Client { id: String, reply: tokio::sync::oneshot::Sender<Option<ClientHandle>> },
     Watch {
         id: String,
@@ -70,6 +119,7 @@ pub struct Environments {
     task: tokio::task::JoinHandle<()>,
     leases: HashMap<String, (Credentials, u64)>,
     generation: u64,
+    view: watch::Receiver<Arc<FleetView>>,
 }
 
 impl Drop for Environments {
@@ -85,13 +135,15 @@ impl Environments {
     ) -> (Self, mpsc::Receiver<EnvironmentEvent>) {
         let (commands, rx) = mpsc::unbounded_channel();
         let (events, output) = mpsc::channel(128);
-        let task = runtime.spawn(run(rx, events, enabled));
+        let (view_tx, view) = watch::channel(Arc::new(FleetView::default()));
+        let task = runtime.spawn(run(rx, events, enabled, view_tx));
         (
             Self {
                 commands,
                 task,
                 leases: HashMap::new(),
                 generation: 0,
+                view,
             },
             output,
         )
@@ -135,6 +187,26 @@ impl Environments {
         async move { response.await.ok().flatten() }
     }
 
+    pub fn apply_settings_reply(&self, owner: &EnvironmentOwner, settings: t3_core::server_config::ServerSettings, sent_revision: u64) -> impl std::future::Future<Output = Result<bool, DestinationError>> + Send + 'static + use<> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(Command::ApplySettings { owner: owner.clone(), settings, revision: sent_revision, reply });
+        async move { response.await.unwrap_or(Err(DestinationError::Missing)) }
+    }
+
+    pub fn apply_keybindings_reply(&self, owner: &EnvironmentOwner, value: serde_json::Value, sent_revision: u64) -> impl std::future::Future<Output = Result<bool, DestinationError>> + Send + 'static + use<> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(Command::ApplyKeybindings { owner: owner.clone(), value, revision: sent_revision, reply });
+        async move { response.await.unwrap_or(Err(DestinationError::Missing)) }
+    }
+
+    pub fn view(&self) -> watch::Receiver<Arc<FleetView>> { self.view.clone() }
+
+    pub fn destination(&self, owner: &EnvironmentOwner, scope: &str) -> impl std::future::Future<Output = Result<Destination, DestinationError>> + Send + 'static + use<> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(Command::Destination { owner: owner.clone(), scope: scope.into(), reply });
+        async move { response.await.unwrap_or(Err(DestinationError::Missing)) }
+    }
+
     pub fn activate(&self, id: Option<&str>) {
         let _ = self.commands.send(Command::Activate(id.map(str::to_owned)));
     }
@@ -160,6 +232,93 @@ struct Entry {
 impl Drop for Entry {
     fn drop(&mut self) {
         self.relay.abort();
+    }
+}
+
+
+impl Entry {
+    fn owner(&self, id: &str) -> EnvironmentOwner {
+        EnvironmentOwner { saved_id: id.into(), canonical_id: self.config.config.as_ref().map(|config| config.environment.environment_id.clone()).filter(|id| !id.is_empty()), generation: self.generation, connection_generation: *self.client.connection_generation().borrow(), shell_generation: self.shell.generation }
+    }
+
+    fn destination(&self, owner: &EnvironmentOwner, scope: &str) -> Result<Destination, DestinationError> {
+        if self.owner(&owner.saved_id) != *owner { return Err(DestinationError::Stale); }
+        if self.status != ConnectionStatus::Connected { return Err(DestinationError::Disconnected); }
+        if !self.shell.synchronized { return Err(DestinationError::Unsynchronized); }
+        if !self.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(scope)) { return Err(DestinationError::Denied); }
+        Ok(Destination { owner: owner.clone(), client: self.client.clone() })
+    }
+}
+
+fn apply_shell(entry: &mut Entry, item: &t3_core::shell::ShellStreamItem) -> bool {
+    let quiet = matches!(item, t3_core::shell::ShellStreamItem::ThreadUpdated { location, thread, .. }
+        if location == "active" && entry.shell.thread(&thread.id).is_some_and(|prior| t3_core::sidebar::thread::same_apart_from_streaming(prior, thread)));
+    entry.shell.apply(item.clone()) && !quiet
+}
+
+fn publish(entries: &HashMap<String, Entry>, changed: &str, material: bool, output: &watch::Sender<Arc<FleetView>>) {
+    let previous = output.borrow().clone();
+    let mut environments = previous.environments.iter().filter(|environment| entries.contains_key(&environment.summary.owner.saved_id)).cloned().collect::<Vec<_>>();
+    let mut dirty = environments.len() != previous.environments.len();
+    if let Some(entry) = entries.get(changed) {
+        let owner = entry.owner(changed);
+        let grants = entry.client.session_state().borrow().clone();
+        let index = environments.iter().position(|environment| environment.summary.owner.saved_id == changed);
+        let prior = index.map(|index| &environments[index]);
+        let summary = match prior.filter(|prior| !material && prior.summary.owner == owner && prior.config.config == entry.config.config) {
+            Some(prior) => prior.summary.clone(),
+            None => Arc::new(EnvironmentSummary::from_shell(owner, &entry.shell, &entry.config)),
+        };
+        let same = prior.is_some_and(|prior| prior.summary == summary && prior.status == entry.status && prior.config.config == entry.config.config && prior.grants == grants && prior.settings_revision == entry.config.settings_revision() && prior.keybindings_revision == entry.config.keybindings_revision());
+        if !same {
+            let view = Arc::new(EnvironmentView { summary, status: entry.status.clone(), config: entry.config.clone(), grants, settings_revision: entry.config.settings_revision(), keybindings_revision: entry.config.keybindings_revision() });
+            match index { Some(index) => environments[index] = view, None => environments.push(view) }
+            dirty = true;
+        }
+    }
+    if material {
+        let linked_environments = entries.iter().filter(|(_, entry)| entry.status == ConnectionStatus::Connected && entry.shell.synchronized)
+            .filter_map(|(id, entry)| Some(LinkedEnvironment { saved_id: id, canonical_id: entry.config.config.as_ref().map(|config| config.environment.environment_id.as_str()).filter(|id| !id.is_empty()).unwrap_or(id), threads: &entry.shell.snapshot.as_ref()?.threads })).collect::<Vec<_>>();
+        let linked = LinkedRequests::build(&linked_environments);
+        for environment in &mut environments {
+            let requests = linked.requests.get(&environment.summary.owner.saved_id);
+            let changed = environment.summary.threads.iter().any(|thread| thread.thread.pending_subagent_request != requests.and_then(|requests| requests.get(&thread.thread.id)).copied());
+            if changed {
+                let mut summary = (*environment.summary).clone();
+                for thread in &mut summary.threads { thread.thread.pending_subagent_request = requests.and_then(|requests| requests.get(&thread.thread.id)).copied(); }
+                let mut view = (**environment).clone(); view.summary = Arc::new(summary); *environment = Arc::new(view);
+                dirty = true;
+            }
+        }
+    }
+    if dirty {
+        environments.sort_by(|a, b| a.summary.owner.saved_id.cmp(&b.summary.owner.saved_id));
+        output.send_replace(Arc::new(FleetView { revision: previous.revision + 1, environments }));
+    }
+}
+
+async fn relay_events(
+    mut events: mpsc::Receiver<ClientEvent>,
+    mut grants: watch::Receiver<Option<AuthSessionState>>,
+    mut connections: watch::Receiver<u64>,
+    tx: mpsc::Sender<(String, u64, RelayFrame)>,
+    key: String,
+    epoch: u64,
+) {
+    loop {
+        let frame = tokio::select! {
+            event = events.recv() => {
+                let Some(first) = event else { break };
+                let mut batch = vec![first];
+                while batch.len() < 512 {
+                    match events.try_recv() { Ok(event) => batch.push(event), Err(_) => break }
+                }
+                RelayFrame::Events(batch)
+            }
+            result = grants.changed() => { if result.is_err() { break; } RelayFrame::Permission }
+            result = connections.changed() => { if result.is_err() { break; } RelayFrame::Permission }
+        };
+        if tx.send((key.clone(), epoch, frame)).await.is_err() { break; }
     }
 }
 
@@ -247,8 +406,9 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     output: mpsc::Sender<EnvironmentEvent>,
     mut enabled: bool,
+    view: watch::Sender<Arc<FleetView>>,
 ) {
-    let (frames, mut input) = mpsc::channel::<(String, u64, Vec<ClientEvent>)>(128);
+    let (frames, mut input) = mpsc::channel::<(String, u64, RelayFrame)>(128);
     let mut entries: HashMap<String, Entry> = HashMap::new();
     let mut active = None;
     let mut watchers = EnvironmentNotifications::default();
@@ -258,25 +418,35 @@ async fn run(
             _ = output.closed() => return,
             command = commands.recv() => match command {
                 None => return,
+                Some(Command::ApplySettings { owner, settings, revision, reply }) => {
+                    let result = entries.get_mut(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| {
+                        if entry.owner(&owner.saved_id) != owner { return Err(DestinationError::Stale); }
+                        Ok(entry.config.apply_settings_reply(settings, revision))
+                    });
+                    if result == Ok(true) { publish(&entries, &owner.saved_id, true, &view); }
+                    let _ = reply.send(result);
+                }
+                Some(Command::ApplyKeybindings { owner, value, revision, reply }) => {
+                    let result = entries.get_mut(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| {
+                        if entry.owner(&owner.saved_id) != owner { return Err(DestinationError::Stale); }
+                        Ok(entry.config.apply_keybindings_reply(&value, revision))
+                    });
+                    if result == Ok(true) { publish(&entries, &owner.saved_id, true, &view); }
+                    let _ = reply.send(result);
+                }
+                Some(Command::Destination { owner, scope, reply }) => { let _ = reply.send(entries.get(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| entry.destination(&owner, &scope))); }
                 Some(Command::Client { id, reply }) => { let _ = reply.send(entries.get(&id).map(|entry| entry.client.clone())); }
                 Some(Command::Watch { id, generation, credentials, prepare }) => {
                     if entries.get(&id).is_some_and(|e| e.credentials == credentials) { continue; }
                     let prior = entries.remove(&id);
-                    let (client, mut events) = supervisor::start_prepared(&tokio::runtime::Handle::current(), credentials.clone(), prepare);
+                    let (client, events) = supervisor::start_prepared(&tokio::runtime::Handle::current(), credentials.clone(), prepare);
                     let (tx, key, epoch) = (frames.clone(), id.clone(), generation);
-                    let relay = tokio::spawn(async move {
-                        while let Some(first) = events.recv().await {
-                            let mut batch = vec![first];
-                            while batch.len() < 512 {
-                                match events.try_recv() { Ok(event) => batch.push(event), Err(_) => break }
-                            }
-                            if tx.send((key.clone(), epoch, batch)).await.is_err() { break; }
-                        }
-                    });
+                    let relay = tokio::spawn(relay_events(events, client.session_state(), client.connection_generation(), tx, key, epoch));
                     let mut shell = prior.as_ref().map(|e| e.shell.clone()).unwrap_or_default();
                     shell.synchronized = false;
                     let config = prior.as_ref().map(|e| e.config.clone()).unwrap_or_default();
                     entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status: ConnectionStatus::Connecting });
+                    publish(&entries, &id, true, &view);
                     tracing::info!(environment = %id, watched = entries.len(), "watching environment with one supervisor");
                     reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
@@ -290,6 +460,7 @@ async fn run(
                 Some(Command::Remove(id)) => {
                     entries.remove(&id);
                     watchers.remove(&id);
+                    publish(&entries, &id, true, &view);
                     if active.as_ref() == Some(&id) { active = None; }
                     reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
@@ -300,18 +471,20 @@ async fn run(
                 }
             },
             frame = input.recv() => {
-                let Some((id, epoch, batch)) = frame else { return };
-                let Some(entry) = entries.get_mut(&id).filter(|e| e.generation == epoch) else { continue };
+                let Some((id, epoch, frame)) = frame else { return };
+                if !entries.get(&id).is_some_and(|entry| entry.generation == epoch) { continue; }
+                let batch = match frame {
+                    RelayFrame::Events(batch) => batch,
+                    RelayFrame::Permission => { publish(&entries, &id, false, &view); continue; }
+                };
+                let entry = entries.get_mut(&id).unwrap();
                 let mut changed = false;
                 let mut config_changed = false;
                 let mut lifecycle_changed = false;
                 for event in &batch {
                     match event {
                         ClientEvent::Shell(item) => {
-                            let quiet = matches!(item, t3_core::shell::ShellStreamItem::ThreadUpdated { location, thread, .. }
-                                if location == "active" && entry.shell.thread(&thread.id).is_some_and(|prior| t3_core::sidebar::thread::same_apart_from_streaming(prior, thread)));
-                            let applied = entry.shell.apply(item.clone());
-                            changed |= applied && !quiet;
+                            changed |= apply_shell(entry, item);
                         }
                         ClientEvent::ServerConfig(event) => { config_changed |= entry.config.apply(*event.clone()); }
                         ClientEvent::Status(status) => {
@@ -328,6 +501,7 @@ async fn run(
                     let _ = output.send(EnvironmentEvent::Identity { id: id.clone(), generation: epoch, descriptor: Box::new(config.environment.clone()) }).await;
                 }
                 if changed || config_changed || lifecycle_changed {
+                    publish(&entries, &id, true, &view);
                     reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
                 }
                 if active.as_ref() == Some(&id) {

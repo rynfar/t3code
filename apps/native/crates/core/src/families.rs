@@ -34,17 +34,17 @@ pub fn rows_missing_from_shell<'a>(
     reads: impl IntoIterator<Item = &'a FamilyRead>,
     removed_at: &HashMap<String, u64>,
 ) -> Vec<&'a ThreadShell> {
-    let mut present: HashSet<&str> = shell_threads.iter().map(|thread| thread.id.as_str()).collect();
+    let present = shell_threads.iter().map(|thread| thread.id.as_str()).collect();
+    missing_rows(&present, reads, removed_at)
+}
+
+fn missing_rows<'a>(present: &HashSet<&str>, reads: impl IntoIterator<Item = &'a FamilyRead>, removed_at: &HashMap<String, u64>) -> Vec<&'a ThreadShell> {
     let mut missing = Vec::new();
+    let mut emitted = HashSet::new();
     for read in reads {
         for thread in &read.threads {
-            if present.contains(thread.id.as_str()) {
-                continue;
-            }
-            if removed_at.get(&thread.id).is_some_and(|&sequence| sequence > read.snapshot_sequence) {
-                continue;
-            }
-            present.insert(thread.id.as_str());
+            if present.contains(thread.id.as_str()) || !emitted.insert(thread.id.as_str()) { continue; }
+            if removed_at.get(&thread.id).is_some_and(|&sequence| sequence > read.snapshot_sequence) { emitted.remove(thread.id.as_str()); continue; }
             missing.push(thread);
         }
     }
@@ -99,6 +99,12 @@ impl MountedReads {
     pub fn extras<'a>(&'a self, shell: &'a ShellState) -> Vec<&'a ThreadShell> {
         let Some(snapshot) = &shell.snapshot else { return Vec::new() };
         rows_missing_from_shell(&snapshot.threads, self.current_reads(shell), &shell.removed_at)
+    }
+
+    pub fn extras_for<'a>(&'a self, generation: u64, cut: u64, thread_ids: &HashSet<String>, removed_at: &HashMap<String, u64>) -> Vec<&'a ThreadShell> {
+        let present = thread_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let reads = self.mounts.iter().filter(|(_, current, _)| *current == generation).flat_map(|(_, _, reads)| reads).filter(|read| read.snapshot_sequence >= cut);
+        missing_rows(&present, reads, removed_at)
     }
 
     /// A thread from the shell, else from a mounted read: the row `extras` would merge for it.

@@ -10,6 +10,7 @@ fn missing_or_corrupt_files_read_as_contract_defaults() {
         assert_eq!(doc.project_grouping(), ProjectGroupingMode::Repository);
         assert_eq!(doc.project_sort_order(), ProjectSortOrder::UpdatedAt);
         assert!(doc.working_shelf());
+        assert!(!doc.boring_sidebar_enabled());
         assert!(!doc.confirm_thread_unpin());
         assert!(!doc.confirm_thread_archive());
         assert!(doc.confirm_thread_delete());

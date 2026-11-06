@@ -97,6 +97,16 @@ export const ItemDetail = await importSource<typeof ItemDetailModule>(
   "packages/client-runtime/src/work-log/itemDetail.ts",
 );
 
+export const ProjectGrouping = await importSource<typeof import("../../../packages/client-runtime/src/state/projectGrouping.ts")>(
+  "packages/client-runtime/src/state/projectGrouping.ts",
+);
+export const SidebarProjectGrouping = await importSource<typeof import("../../../apps/web/src/sidebarProjectGrouping.ts")>(
+  "apps/web/src/sidebarProjectGrouping.ts",
+);
+export const UiProjectState = await importSource<typeof import("../../../apps/web/src/uiStateStore.ts")>(
+  "apps/web/src/uiStateStore.ts",
+);
+
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Item = OrchestrationV2TurnItem;
 export type Row = OrchestrationV2ProjectedTurnItem;

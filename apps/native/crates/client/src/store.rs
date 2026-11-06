@@ -383,6 +383,22 @@ pub fn patch_client_settings(patch: serde_json::Map<String, serde_json::Value>) 
 /// UI state the web keeps in `localStorage` (panel tabs and widths, diff selections), one JSON
 /// file per store. A missing file or one that is not JSON reads as `None`; callers decode the
 /// value leniently so one bad key never costs the others.
+pub fn load_project_preferences() -> t3_core::sidebar::grouping::ProjectPreferences {
+    load_ui_state("sidebar-projects").and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default()
+}
+
+pub fn save_project_preferences(preferences: &t3_core::sidebar::grouping::ProjectPreferences) -> impl std::future::Future<Output = Result<(), String>> + Send + 'static + use<> {
+    let text = serde_json::to_string(preferences).map_err(|error| error.to_string());
+    let (reply, response) = tokio::sync::oneshot::channel();
+    let queued = text.and_then(|text| writer().ok_or_else(|| "UI writer unavailable".to_owned())?.send(|_| {
+        WriteRequest::Update(Box::new(move |base| {
+            let result = base.ok_or_else(|| "Native home unavailable".to_owned()).and_then(|base| write_atomically_result(&base, "sidebar-projects", &text).map_err(|error| error.to_string()));
+            let _ = reply.send(result);
+        }))
+    }).map(|_| ()));
+    async move { queued?; response.await.map_err(|error| error.to_string())? }
+}
+
 pub fn load_ui_state(name: &str) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(base()?.join(format!("{name}.json"))).ok()?;
     serde_json::from_str(&text).ok()
