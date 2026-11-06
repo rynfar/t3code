@@ -1100,6 +1100,20 @@ mod grouping_frames {
         }).unwrap();
         let (pane, command_palette, menu) = handles.unwrap();
         let outside = outside.unwrap();
+        let draft_root = state.read_with(&cx, |state, _| {
+            let project = state.draft_project.as_ref().expect("view initialization retains the existing home draft");
+            state.shell.project(project).unwrap().workspace_root.clone()
+        });
+        let (method, payload, reply) = runtime.block_on(active_fixture.next_request());
+        assert_eq!(method, t3_core::commands::method::PROJECTS_READ_FILE, "the composer draft initialization read precedes any hover input");
+        assert_eq!(payload, t3_core::workspace::project_file_request(&draft_root));
+        reply.send(Ok(json!({"exists":false}))).unwrap();
+        let (refs_method, payload, reply) = runtime.block_on(active_fixture.next_request());
+        assert_eq!(refs_method, t3_core::commands::method::VCS_LIST_REFS, "draft workspace initialization follows its project-file reply");
+        assert_eq!(payload, t3_core::workspace::list_refs_request(&draft_root));
+        reply.send(Ok(json!({"isRepo":false,"refs":[]}))).unwrap();
+        let setup_commands = vec![method, refs_method];
+        cx.run_until_parked();
         let click = |cx:&mut HeadlessAppContext, x:f32, y:f32| {
             cx.update_window(window.into(), |_, window, cx| {
                 let position = gpui::point(px(x), px(y));
@@ -1156,8 +1170,12 @@ mod grouping_frames {
             cx.advance_clock(std::time::Duration::from_millis(500));
             capture(&mut cx,&format!("{theme}-background-model-hover"));
             state.read_with(&cx, |state, _| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
-            assert!(active_fixture.take_commands().is_empty(), "hover must not send active-client commands");
-            for fixture in &mut fixtures { assert!(fixture.take_commands().is_empty(), "hover must not send destination-client commands"); }
+            let active_commands = active_fixture.take_commands();
+            assert!(active_commands.is_empty(), "hover must not send active-client commands: {active_commands:?}");
+            for (index, fixture) in fixtures.iter_mut().enumerate() {
+                let commands = fixture.take_commands();
+                assert!(commands.is_empty(), "hover must not send destination-client commands owner={index}: {commands:?}");
+            }
             cx.update_window(window.into(), |_, window, cx| window.simulate_mouse_move(gpui::point(px(1200.), px(850.)), cx)).unwrap();
             cx.run_until_parked();
             let folder_position = pane.read_with(&cx, |pane, cx| {
@@ -1298,7 +1316,8 @@ mod grouping_frames {
             | t3_core::settings::keybindings::SERVER_REMOVE_KEYBINDING | "guestShare.create"
             | "projects.createFromThread" | "projects.createNew"
         );
-        let mut commands=active_fixture.take_commands();
+        let mut commands=setup_commands;
+        commands.extend(active_fixture.take_commands());
         for fixture in &mut fixtures { commands.extend(fixture.take_commands()); }
         assert!(!commands.iter().any(|method| forbidden(method)),"frames must not send writes or launch providers");
         std::fs::write(out.join("grouping-frames.json"),serde_json::to_vec_pretty(&json!({
