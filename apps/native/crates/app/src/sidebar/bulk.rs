@@ -406,6 +406,7 @@ impl AppState {
 
 impl AppState {
     pub(crate) fn run_scoped_bulk_action(&mut self, owners: Vec<crate::context_menu::ThreadMenuOwner>, action: BulkAction, cx: &mut Context<Self>) {
+        if action == BulkAction::Delete { self.delete_scoped_threads(owners, cx); return; }
         if owners.iter().any(|owner| !owner.current(self) || !owner.can_operate_owner(self)) { return; }
         let mut steps = Vec::new();
         for owner in owners {
@@ -416,7 +417,6 @@ impl AppState {
                 BulkAction::Settle if !row.thread.is_settled() => actions::settle(&uuid(), &key.thread_id),
                 BulkAction::RegenerateTitles if !row.thread.regenerating_title => actions::regenerate_title(&uuid(), &key.thread_id),
                 BulkAction::MarkUnread => actions::mark_unread(&uuid(), &key.thread_id),
-                BulkAction::Delete => actions::delete(&uuid(), &key.thread_id),
                 _ => continue,
             };
             steps.push((owner, command));

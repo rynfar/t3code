@@ -110,6 +110,14 @@ impl ThreadMenuOwner {
             && state.client_handle().is_some_and(|client| *client.connection_generation().borrow() == self.generation)
             && state.shell.project(&self.project).is_some_and(|project| project.created_at == self.project_created && project.workspace_root == self.root && project.archived_at.is_none())
     }
+    pub(crate) fn response_after_deletion(&self, state: &AppState) -> bool {
+        let Some(key) = self.key() else { return false; };
+        self.response_scope_current(state)
+            && state.scoped_thread(&key).is_none_or(|row| row.created_at == self.created_at && row.thread.project_id == self.project)
+            && !(state.environments.active.as_deref() == Some(key.environment_id.as_str())
+                && state.selected_thread.as_deref() == Some(self.thread.as_str())
+                && state.thread.projection.as_ref().is_some_and(|projection| projection.thread.created_at != self.created_at || projection.thread.project_id != self.project))
+    }
     pub(crate) fn response_current(&self, state: &AppState) -> bool {
         if let Some(key) = self.key() { return self.response_scope_current(state) && state.scoped_thread(&key).is_some_and(|row| row.created_at == self.created_at && !row.thread.deleted); }
         self.response_scope_current(state) && state.thread_shell(&self.thread).is_some_and(|thread| thread.created_at == self.created_at && thread.deleted_at.is_none())
