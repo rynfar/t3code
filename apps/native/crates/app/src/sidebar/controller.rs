@@ -84,7 +84,7 @@ pub fn time_label(time: LocalTime) -> String {
 #[derive(Clone, PartialEq)]
 pub(crate) enum UndoContext {
     Thread(crate::context_menu::ThreadMenuOwner),
-    Draft { environment: Option<String>, canonical: Option<String>, connection: Option<u64>, generation: u64, project: t3_core::shell::ProjectShell },
+    Draft { environment: Option<String>, canonical: Option<String>, connection: Option<u64>, generation: u64, project: Box<t3_core::shell::ProjectShell> },
     Unavailable { id: String, draft: bool },
 }
 
@@ -490,12 +490,11 @@ impl AppState {
                 return;
             }
             ThreadAction::CopyThread => {
-                if let Some(environment) = self.scoped_environment(&key.environment_id) {
-                    if let Some(row) = self.scoped_thread(key)
-                        && let Some(reference) = actions::thread_reference(&row.thread.title, environment.summary.owner.canonical_id.as_deref(), id) {
-                        crate::composer::clipboard::write(reference.text, reference.fragment, cx);
-                        self.show_toast(Toast::new(ToastKind::Success, "Thread copied").description(reference.description), cx);
-                    }
+                if let Some(environment) = self.scoped_environment(&key.environment_id)
+                    && let Some(row) = self.scoped_thread(key)
+                    && let Some(reference) = actions::thread_reference(&row.thread.title, environment.summary.owner.canonical_id.as_deref(), id) {
+                    crate::composer::clipboard::write(reference.text, reference.fragment, cx);
+                    self.show_toast(Toast::new(ToastKind::Success, "Thread copied").description(reference.description), cx);
                 }
                 return;
             }
@@ -557,7 +556,7 @@ impl AppState {
     fn sync_undo_contexts(&mut self) {
         let ids = self.shell.snapshot.as_ref().map(|snapshot| snapshot.threads.iter().chain(&snapshot.archived_threads).chain(self.omitted.mounts.extras(&self.shell)).map(|thread| thread.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
         let threads = ids.into_iter().filter_map(|id| crate::context_menu::ThreadMenuOwner::capture_undo(self,&id).map(|owner| (id,UndoContext::Thread(owner)))).collect();
-        let drafts = self.shell.snapshot.as_ref().map(|snapshot| snapshot.projects.iter().map(|project| (project.id.clone(),UndoContext::Draft { environment:self.environments.active.clone(),canonical:self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()),connection:self.connection_id(),generation:self.shell.generation,project:project.clone() })).collect()).unwrap_or_default();
+        let drafts = self.shell.snapshot.as_ref().map(|snapshot| snapshot.projects.iter().map(|project| (project.id.clone(),UndoContext::Draft { environment:self.environments.active.clone(),canonical:self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()),connection:self.connection_id(),generation:self.shell.generation,project:Box::new(project.clone()) })).collect()).unwrap_or_default();
         self.sidebar.undo.active_threads = threads;
         self.sidebar.undo.active_drafts = drafts;
     }

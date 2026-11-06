@@ -568,8 +568,8 @@ impl ContextMenu {
             }
             return;
         }
-        if let (Some(owner), MenuAction::Thread(thread_action)) = (&open.owner, &action) {
-            if let Some(key) = owner.key() {
+        if let (Some(owner), MenuAction::Thread(thread_action)) = (&open.owner, &action)
+            && let Some(key) = owner.key() {
                 match thread_action {
                     ThreadAction::ShareGuest => crate::guest_share::open(owner.clone(), open.window, cx),
                     ThreadAction::Archive | ThreadAction::Unpin => cx.emit(ContextMenuEvent::ScopedConfirm(owner.clone(), thread_action.clone())),
@@ -580,7 +580,6 @@ impl ContextMenu {
                     _ => self.state.update(cx, |state, cx| state.run_scoped_thread_action(&key, thread_action.clone(), &open.presets, cx)),
                 }
                 return;
-            }
         }
         match action {
             MenuAction::DiscardDraft => cx.emit(ContextMenuEvent::DiscardDraft(open.target_id)),

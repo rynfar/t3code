@@ -57,6 +57,8 @@ impl Mode {
     }
 }
 
+type ScopedProjectActions = HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>;
+
 pub struct CommandPalette {
     state: Entity<AppState>,
     composer: Entity<crate::composer::Composer>,
@@ -70,7 +72,7 @@ pub struct CommandPalette {
     root: Vec<CommandPaletteGroup>,
     threads: Vec<CommandPaletteItem>,
     projects: Vec<CommandPaletteItem>,
-    scoped_project_actions: HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>,
+    scoped_project_actions: ScopedProjectActions,
     scoped_thread_actions: HashMap<String, t3_core::sidebar::tag_filter::ThreadKey>,
     settings: Vec<CommandPaletteItem>,
     groups: Vec<CommandPaletteGroup>,
@@ -129,7 +131,7 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
 
 fn scoped_project_items(entries: &[crate::new_thread::ProjectPickerEntry]) -> (
     Vec<CommandPaletteItem>,
-    HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>,
+    ScopedProjectActions,
 ) {
     let mut items = Vec::new();
     let mut actions = HashMap::new();
@@ -154,7 +156,7 @@ fn scoped_project_items(entries: &[crate::new_thread::ProjectPickerEntry]) -> (
 
 fn scoped_project_thread_items(
     items: &[CommandPaletteItem],
-    actions: &HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>,
+    actions: &ScopedProjectActions,
     preferred: Option<&t3_core::sidebar::grouping::ProjectRef>,
     primary: Option<&str>,
     actual_context: Option<&str>,

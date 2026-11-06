@@ -45,6 +45,7 @@ fn tone_color(tone: StatusTone, p: Palette) -> u32 {
 }
 
 struct RowState {
+    active: bool,
     status: ThreadStatus,
     top: Option<TopStatus>,
     recede: bool,
@@ -59,6 +60,7 @@ fn row_state(thread: &SidebarThread, active: bool, now: i64) -> RowState {
     let woke_at = settled::woke_at(thread, now);
     let is_woke = woke_at.is_some_and(|woke| thread.last_visited_at.is_none_or(|visited| visited < woke)) && !thread.is_settled();
     RowState {
+        active,
         status,
         top: status::top_status(status, thread.goal_active, is_woke, unread),
         recede: status::should_recede(status, unread, is_woke, active),
@@ -140,7 +142,9 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    fn row_surface(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, recede_working: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn row_surface(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, row: &RowState, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let active = row.active;
+        let recede_working = section.is_card() && row.recede && matches!(row.status, ThreadStatus::Preparing | ThreadStatus::Working);
         let p = palette(cx);
         let light = !cx.window_appearance_is_dark();
         let id = thread.id.clone();
@@ -381,7 +385,7 @@ impl SidebarPane {
             .py(px(2.))
             .pb(px(3.))
             .child(
-                self.row_surface(key, thread, project.clone(), section, active, state.recede && matches!(state.status, ThreadStatus::Preparing | ThreadStatus::Working), cx).child(
+                self.row_surface(key, thread, project.clone(), section, &state, cx).child(
                     div()
                         .when(has_meta, |this| this.h(px(CARD_CONTENT_HEIGHT)))
                         .px(px(10.))
@@ -490,7 +494,7 @@ impl SidebarPane {
             .px(px(8.))
             .pb(px(1.))
             .child(
-                self.row_surface(key, thread, project, section, active, false, cx).h(px(SLIM_HEIGHT)).child(
+                self.row_surface(key, thread, project, section, &state, cx).h(px(SLIM_HEIGHT)).child(
                     div()
                         .h_full()
                         .flex()
