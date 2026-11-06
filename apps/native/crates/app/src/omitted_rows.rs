@@ -689,4 +689,77 @@ mod tests {
         state.update(cx, |state, _| state.stop_pump());
         drop(events);
     }
+
+    #[gpui::test]
+    async fn effective_project_scope_resets_settled_tail_open_and_collapsed(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx,runtime.handle().clone()));
+        let (client, _fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap());
+        let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+        let snapshot = shell.snapshot.as_mut().unwrap();
+        let sample = snapshot.threads[0].clone();
+        snapshot.snapshot_sequence = 1;
+        snapshot.older_settled = None;
+        snapshot.threads = ["checkout-b","other"].into_iter().flat_map(|project| {
+            (0..35).map(|index| {
+                let mut thread = sample.clone();
+                thread.id = format!("{project}-{index:02}"); thread.lineage.root_thread_id = thread.id.clone();
+                thread.project_id = project.into();
+                thread.settled_override = Some("settled".into());
+                thread.settled_at = Some(t3_core::sidebar::time::format_iso(90_000-index*1000));
+                thread
+            }).collect::<Vec<_>>()
+        }).collect();
+        config.config.as_mut().unwrap().environment.environment_id = "tail-server".into();
+        state.update(cx, |state, _| state.selected_thread = None);
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("tail-fixture").is_some_and(|entry| entry.summary.threads.len() == 70) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("tail-fixture",client,shell,config,ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        let (scope_a,scope_b) = state.read_with(cx, |state, cx| {
+            let groups = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar,cx);
+            let key = |project| groups.iter().find(|group| group.member_refs.iter().any(|reference| reference.environment_id == "tail-fixture" && reference.project_id == project)).unwrap().key.clone();
+            (key("checkout-b"),key("other"))
+        });
+        assert_ne!(scope_a,scope_b);
+        state.update(cx, |state, cx| {
+            state.set_scoped_project_scope(vec![scope_a.clone()],cx);
+            state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx);
+            state.show_more_settled(cx);
+        });
+        state.read_with(cx, |state, _| {
+            assert!(state.selected_thread.is_none());
+            assert!(state.sidebar.shelves.settled_expanded);
+            assert_eq!(state.sidebar.shelves.settled_visible,35);
+            assert_eq!(state.sidebar.fleet.listed_settled_count,35);
+        });
+        state.update(cx, |state, cx| state.set_scoped_project_scope(vec![scope_b],cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.shelves.settled_visible,t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT,"changing the effective chosen project scope resets the open Settled tail");
+            assert!(state.sidebar.shelves.settled_expanded);
+            assert_eq!(state.sidebar.fleet.listed_settled_count,35);
+            assert!(state.selected_thread.is_none());
+        });
+        state.update(cx, |state, cx| {
+            state.show_more_settled(cx);
+            state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx);
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.shelves.settled_visible,35);
+            assert!(!state.sidebar.shelves.settled_expanded);
+        });
+        state.update(cx, |state, cx| state.set_scoped_project_scope(vec![scope_a],cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.shelves.settled_visible,t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT,"changing the effective chosen project scope resets the collapsed Settled tail too");
+            assert!(!state.sidebar.shelves.settled_expanded);
+            assert!(state.selected_thread.is_none());
+        });
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+    }
 }

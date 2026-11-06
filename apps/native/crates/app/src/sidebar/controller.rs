@@ -142,6 +142,7 @@ pub struct SidebarController {
     pub grouping_threads: Vec<t3_core::sidebar::fleet::ScopedThread>,
     pub fleet_drag: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::sidebar::Section)>,
     pub shelves: ShelfState,
+    settled_scope_keys: Vec<String>,
     pub settings: SidebarSettings,
     pub undo: UndoContexts,
     pub capabilities: ThreadCapabilities,
@@ -390,6 +391,11 @@ impl AppState {
         if self.fleet.environments.is_empty() { return; }
         self.reveal_scoped_route(cx);
         let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let scope_keys = self.scoped_project_scope(&groups);
+        if self.sidebar.settled_scope_keys != scope_keys {
+            self.sidebar.settled_scope_keys = scope_keys;
+            self.sidebar.shelves.settled_visible = t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT;
+        }
         let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
         let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id));
         let hidden = self.notifications.visibility.hidden.union(&self.notifications.visibility.delegated_under_parent).cloned().collect();
