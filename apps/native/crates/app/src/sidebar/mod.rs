@@ -1051,7 +1051,7 @@ mod grouping_frames {
                 }],"threads":[{
                     "id":"same-thread","projectId":"same-project","title":format!("{saved} thread"),
                     "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z",
-                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                    "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":if saved=="grouping-b" { "background-model-315" } else { "replay" }},
                     "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":"same-thread"},
                     "status":if saved=="grouping-a" { "running" } else { "idle" },
                     "latestRunId":if saved=="grouping-a" { Some("fixture-run") } else { None },
@@ -1141,6 +1141,25 @@ mod grouping_frames {
                 crate::theme::set_preferences(preferences,cx);
             });
             capture(&mut cx,&format!("{theme}-folders"));
+            let hover_position = pane.read_with(&cx, |pane, cx| {
+                let state = pane.state.read(cx);
+                let index = state.sidebar.fleet.rows.iter().position(|row| match row {
+                    ScopedSidebarRow::Thread { index, .. } => state.sidebar.fleet.threads[*index].key == t3_core::sidebar::tag_filter::ThreadKey::new("grouping-b", "same-thread"),
+                    _ => false,
+                }).expect("background collision must have a rendered production row");
+                let offset = if pane.drafts.rows.is_empty() { 0 } else { pane.drafts.rows.len() + 1 };
+                pane.list.bounds_for_item(index + offset).expect("background production row must have measured list bounds").center()
+            });
+            cx.update_window(window.into(), |_, window, cx| window.simulate_mouse_move(hover_position, cx)).unwrap();
+            cx.run_until_parked();
+            // The locked GPUI default tooltip delay is 500ms; advance only its deterministic clock.
+            cx.advance_clock(std::time::Duration::from_millis(500));
+            capture(&mut cx,&format!("{theme}-background-model-hover"));
+            state.read_with(&cx, |state, _| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
+            assert!(active_fixture.take_commands().is_empty(), "hover must not send active-client commands");
+            for fixture in &mut fixtures { assert!(fixture.take_commands().is_empty(), "hover must not send destination-client commands"); }
+            cx.update_window(window.into(), |_, window, cx| window.simulate_mouse_move(gpui::point(px(1200.), px(850.)), cx)).unwrap();
+            cx.run_until_parked();
             let folder_position = pane.read_with(&cx, |pane, cx| {
                 let state = pane.state.read(cx);
                 let index = state.sidebar.fleet.rows.iter().position(|row| matches!(row, ScopedSidebarRow::Folder { .. })).unwrap();
