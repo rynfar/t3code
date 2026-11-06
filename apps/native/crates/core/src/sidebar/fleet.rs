@@ -153,7 +153,10 @@ impl ScopedSidebarModel {
         let mut model = Self::default();
         let mut returned = HashMap::new();
         let mut unloaded = 0;
-        let mut frontier = HashMap::new();
+        let frontier = older_settled::highest_frontier(input.older.iter().filter(|older| {
+            input.environments.iter().any(|environment| environment.owner == *older.owner)
+                && scope.as_ref().is_none_or(|scope| scope.iter().any(|project| project.environment_id == older.owner.saved_id))
+        }).filter_map(|older| older.frontier));
         let eligible = |thread: &&ScopedThread| !thread.thread.archived && !thread.thread.deleted && thread.thread.listed
             && !input.hidden.contains(&thread.key()) && scope.as_ref().is_none_or(|scope| scope.contains(&thread.project_ref()));
         let candidates = input.environments.iter().map(|environment| {
@@ -229,7 +232,6 @@ impl ScopedSidebarModel {
                 let counted = older.older.counts.iter().filter(|(project, _)| count_owners.get(&(environment.owner.identity(), (*project).clone())).is_some_and(|(_, saved)| *saved == environment.owner.saved_id)).map(|(_, count)| *count).sum::<u64>();
                 let held = held_counts.get(&environment.owner.saved_id).copied().unwrap_or(0);
                 unloaded += (counted as usize).saturating_sub(held);
-                frontier.insert(environment.owner.saved_id.clone(), older.frontier);
             }
         }
         let threads = &model.threads;
@@ -300,7 +302,7 @@ impl ScopedSidebarModel {
             model.rows.push(ScopedSidebarRow::Shelf { shelf: Shelf::Settled, count: model.settled_count, expanded });
             let listed = model.partition.settled.iter().copied().filter(|index| {
                 let thread = &model.threads[*index];
-                older_settled::is_listed_settled(&thread.thread.id, thread.thread.settled_at, frontier.get(&thread.owner.saved_id).copied().flatten())
+                older_settled::is_listed_settled(&thread.thread.id, thread.thread.settled_at, frontier)
             }).collect::<Vec<_>>();
             model.listed_settled_count = listed.len();
             let mut visible = listed.into_iter().take(input.shelves.settled_visible).collect::<Vec<_>>();

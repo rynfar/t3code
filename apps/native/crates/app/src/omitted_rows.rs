@@ -321,14 +321,23 @@ impl AppState {
     pub(crate) fn grow_scoped_settled_shelf(&mut self, listed: usize, cx: &mut Context<Self>) {
         let visible = if self.sidebar.shelves.settled_expanded { self.sidebar.shelves.settled_visible } else { 0 };
         if listed >= visible { return; }
-        let scopes = self.sidebar.owner_omitted.keys().map(|owner| (owner.clone(),self.scoped_older_projects(owner,cx))).collect::<Vec<_>>();
+        let scopes = self.sidebar.owner_omitted.keys().filter(|owner| self.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == **owner))
+            .map(|owner| (owner.clone(),self.scoped_older_projects(owner,cx))).filter(|(_, scope)| !scope.as_ref().is_some_and(Vec::is_empty)).collect::<Vec<_>>();
+        for (owner,scope) in &scopes {
+            let omitted = self.sidebar.owner_omitted.get_mut(owner).unwrap();
+            if omitted.scoped_projects != *scope { omitted.pages = SettledPages::default(); omitted.scoped_projects = scope.clone(); let older=omitted.older(); omitted.pages.sync_generation(owner.shell_generation,older.as_ref()); omitted.mounts.unmount(PAGES_KEY); }
+        }
+        let frontier = t3_core::sidebar::older_settled::highest_frontier(scopes.iter().filter_map(|(owner, _)| {
+            let omitted = self.sidebar.owner_omitted.get(owner)?;
+            omitted.pages.listing_frontier(omitted.older().as_ref())
+        })).cloned();
+        let Some(frontier) = frontier else { return; };
         let mut owners = Vec::new();
-        for (owner,scope) in scopes {
-            if scope.as_ref().is_some_and(Vec::is_empty) { continue; }
+        for (owner, _) in scopes {
             let omitted = self.sidebar.owner_omitted.get_mut(&owner).unwrap();
-            if omitted.scoped_projects != scope { omitted.pages = SettledPages::default(); omitted.scoped_projects = scope; let older=omitted.older(); omitted.pages.sync_generation(owner.shell_generation,older.as_ref()); omitted.mounts.unmount(PAGES_KEY); }
             let older = omitted.older();
-            if omitted.pages.grow(older.as_ref(),listed,visible) { owners.push(owner); }
+            if omitted.pages.listing_frontier(older.as_ref()) == Some(&frontier)
+                && omitted.pages.grow(older.as_ref(),listed,visible) { owners.push(owner); }
         }
         for owner in owners { self.request_scoped_settled_page(owner, cx); }
     }
@@ -364,5 +373,82 @@ impl AppState {
         let omitted = self.sidebar.owner_omitted.entry(owner.clone()).or_default();
         match read.filter(|read| !read.threads.is_empty()) { Some(read) => omitted.mounts.mount(SEARCH_KEY, owner.shell_generation, vec![read]), None => omitted.mounts.unmount(SEARCH_KEY) }
         self.rebuild_sidebar(cx); cx.emit(AppEvent::Shell);
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+
+    #[gpui::test]
+    async fn scoped_shelf_reads_only_the_highest_frontier_then_hands_off(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut active) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx,runtime.handle().clone()));
+        let (shell, config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+        let sample = shell.snapshot.as_ref().unwrap().threads[0].clone();
+        let settled = |id: &str, at| {
+            let mut thread = sample.clone();
+            thread.id = id.into(); thread.lineage.root_thread_id = id.into();
+            thread.settled_override = Some("settled".into());
+            thread.settled_at = Some(t3_core::sidebar::time::format_iso(at));
+            thread
+        };
+        let mut fixtures = Vec::new();
+        let mut event_senders = Vec::new();
+        for (id, cut) in [("a",100_000),("b",80_000)] {
+            let (client, fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap());
+            let mut shell = shell.clone();
+            let snapshot = shell.snapshot.as_mut().unwrap();
+            snapshot.snapshot_sequence = 1;
+            snapshot.threads = if id == "b" { (0..10).map(|index| settled(&format!("old-{index}"),50_000-index)).collect() } else { Vec::new() };
+            snapshot.older_settled = Some(serde_json::from_value(serde_json::json!({"before":t3_core::sidebar::time::format_iso(cut),"asOfSequence":1,"counts":[{"projectId":"checkout-b","count":50}]})).unwrap());
+            let mut config = config.clone();
+            config.config.as_mut().unwrap().environment.environment_id = format!("server-{id}");
+            let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell && state.scoped_environment(id).is_some() {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            let install = state.update(cx, |state, _| state.connections.install_fixture(id,client,shell,config,ConnectionStatus::Connected));
+            event_senders.push(runtime.spawn(install).await.unwrap()); loaded.await.unwrap();
+            fixtures.push(fixture);
+        }
+        let mut a = fixtures.remove(0); let mut b = fixtures.remove(0);
+        state.update(cx, |state, cx| {
+            state.sidebar.shelves.settled_visible = 35;
+            state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx);
+        });
+        let (method, payload, reply) = a.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(payload["limit"],25);
+        assert_eq!(payload["before"]["settledAt"],t3_core::sidebar::time::format_iso(100_000));
+        let owner_b = state.read_with(cx, |state, _| state.scoped_environment("b").unwrap().summary.owner.clone());
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(&owner_b,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        runtime.spawn(barrier).await.unwrap().unwrap(); cx.run_until_parked();
+        use futures::FutureExt;
+        assert!(b.next_request().now_or_never().is_none(),"lower frontier must not read while the highest page is pending");
+        let page = (0..25).map(|index| settled(&format!("a-{index:02}"),90_000-index*1000)).collect::<Vec<_>>();
+        let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.sidebar.owner_omitted.iter().any(|(owner,omitted)| owner.saved_id == "a" && omitted.pages.reads.len() == 1) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":page}))).unwrap(); applied.await.unwrap();
+        let (method,payload,reply) = b.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(payload["limit"],25);
+        assert_eq!(payload["before"]["settledAt"],t3_core::sidebar::time::format_iso(80_000));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.fleet.listed_settled_count,11);
+            assert_eq!(state.environments.active.as_deref(),Some("saved-fixture"));
+        });
+        reply.send(Err(t3_client::session::RpcError::Closed)).unwrap();
+        assert!(!active.take_commands().contains(&GET_OLDER_SETTLED_THREADS));
+        state.update(cx, |state, _| state.stop_pump());
+        drop(event_senders);
     }
 }

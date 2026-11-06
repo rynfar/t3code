@@ -1342,7 +1342,25 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let environments = [&ea, &eb];
     let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &environments, older: &owners, folder_mode: false, selected: None, ..input }, &mut state);
     assert_eq!(model.settled_count, 4);
-    assert_eq!(model.listed_settled_count, 1);
+    assert_eq!(model.listed_settled_count, 0);
+    let at_time = Cursor { settled_at: 10, thread_id: None };
+    let low_id = Cursor { settled_at: 10, thread_id: Some("a".into()) };
+    let high_id = Cursor { settled_at: 10, thread_id: Some("z".into()) };
+    for (left, right, listed) in [(&at_time, &high_id, 2), (&high_id, &low_id, 0)] {
+        let owners = [ScopedOlderSettled { owner: &ea.owner, older: &older, frontier: Some(left) }, ScopedOlderSettled { owner: &eb.owner, older: &older, frontier: Some(right) }];
+        let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &environments, older: &owners, folder_mode: false, selected: None, ..input }, &mut state);
+        assert_eq!(model.listed_settled_count, listed);
+    }
+    let mut failed = super::older_settled::SettledPages::default();
+    failed.sync_generation(ea.owner.shell_generation, Some(&older));
+    failed.status = super::older_settled::PageStatus::Failed;
+    let owners = [ScopedOlderSettled { owner: &ea.owner, older: &older, frontier: failed.listing_frontier(Some(&older)) }, ScopedOlderSettled { owner: &eb.owner, older: &older, frontier: None }];
+    let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &environments, older: &owners, folder_mode: false, selected: None, ..input }, &mut state);
+    assert_eq!(model.listed_settled_count, 2, "failed and exhausted owners do not hold back the shelf");
+    let owners = [ScopedOlderSettled { owner: &ea.owner, older: &older, frontier: Some(&frontier) }, ScopedOlderSettled { owner: &eb.owner, older: &older, frontier: None }];
+    let model = ScopedSidebarModel::build(&ScopedSidebarInput { environments: &environments, older: &owners, folder_mode: false, selected: Some(&selected), ..input }, &mut state);
+    assert_eq!(model.listed_settled_count, 0);
+    assert_eq!(model.jump_target(0), Some(selected.clone()), "the selected row stays visible below the shared frontier");
     let mut alias = ea.clone(); alias.owner.saved_id = "alias".into();
     for thread in &mut alias.threads { thread.owner = alias.owner.clone(); }
     let aliases = [&ea, &alias];

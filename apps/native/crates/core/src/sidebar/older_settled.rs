@@ -47,6 +47,17 @@ impl Cursor {
     }
 }
 
+pub fn highest_frontier<'a>(frontiers: impl IntoIterator<Item = &'a Cursor>) -> Option<&'a Cursor> {
+    frontiers.into_iter().max_by(|a, b| {
+        a.settled_at.cmp(&b.settled_at).then_with(|| match (&a.thread_id, &b.thread_id) {
+            (Some(a), Some(b)) => b.cmp(a),
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+    })
+}
+
 /// `isOlderSettledThreadShell`.
 pub fn is_older_settled(thread: &ThreadShell, before_ms: Ms) -> bool {
     thread.lineage.is_listed()
