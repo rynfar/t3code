@@ -313,6 +313,7 @@ fn connected(phase: &Phase) -> bool {
 impl AppState {
     /// Re-derives the sidebar from the shell. Cheap enough per batch; rows notify only the sidebar.
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar.settings.working_shelf_enabled = crate::settings::store::client(cx).working_shelf();
         self.sync_undo_contexts();
         self.release_stale_deletion(cx);
         let now = now_ms();

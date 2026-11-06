@@ -168,7 +168,7 @@ fn apply_client(
     state.update(cx, |state, cx| {
         state.client_settings = composer;
         let grouping = client(cx).project_grouping_settings();
-        if grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides || matches!(change, ClientSettingChange::ProjectSortOrder(_) | ClientSettingChange::BoringSidebarEnabled(_)) {
+        if client(cx).working_shelf() != state.sidebar.settings.working_shelf_enabled || grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides || matches!(change, ClientSettingChange::ProjectSortOrder(_) | ClientSettingChange::BoringSidebarEnabled(_)) {
             state.rebuild_sidebar(cx);
             cx.emit(AppEvent::Shell);
         }
@@ -435,6 +435,270 @@ mod tests {
     use serde_json::json;
     use t3_client::{supervisor::{ClientFixture, ConnectionStatus}, session::RpcError};
     use t3_core::{server_config::ServerConfigState, shell::ShellState, settings::projects::OverrideEdit};
+
+    #[gpui::test]
+    fn working_shelf_preference_drives_cached_sidebar_on_load_and_edits(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        use t3_core::sidebar::{Section, fleet::EnvironmentSummary, grouping::EnvironmentOwner};
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| cx.global_mut::<ClientPrefs>().doc = ClientSettingsDoc::from_json(r#"{
+            "sidebarWorkingShelfEnabled":false,"boringSidebarEnabled":false
+        }"#));
+        state.update(cx, |state, cx| {
+            let snapshot = state.shell.snapshot.as_mut().unwrap();
+            snapshot.threads.truncate(2);
+            for (index, thread) in snapshot.threads.iter_mut().enumerate() {
+                thread.project_id = "checkout-a".into();
+                thread.status = "running".into();
+                thread.latest_run_id = Some(format!("run-{index}"));
+                thread.active_run_id = thread.latest_run_id.clone();
+                thread.active_order_key = Some(if index == 0 { "a" } else { "z" }.into());
+                thread.latest_user_authored_message_at = Some(Some(format!("2026-01-01T0{}:00:00Z", index + 1)));
+            }
+            let owner = EnvironmentOwner {
+                saved_id:"saved-fixture".into(), canonical_id:Some("fixture-env".into()),
+                generation:1, connection_generation:1, shell_generation:state.shell.generation,
+            };
+            let summary = Arc::new(EnvironmentSummary::from_shell(owner, &state.shell, &state.server_config));
+            state.sidebar.grouping_projects = summary.projects.clone();
+            state.sidebar.grouping_threads = summary.threads.clone();
+            state.fleet = Arc::new(t3_client::environments::FleetView { revision:1, environments:vec![Arc::new(t3_client::environments::EnvironmentView {
+                summary, status:ConnectionStatus::Connected, config:state.server_config.clone(),
+                grants:Some(crate::context_menu::project_filter_tests::session(true)), settings_revision:0, keybindings_revision:0,
+            })] });
+            state.project_preferences = Default::default();
+            state.rebuild_sidebar(cx);
+        });
+        let unchanged_shell = state.read_with(cx, |state, _| state.shell.snapshot.clone());
+        let unchanged_summary = state.read_with(cx, |state, _| state.fleet.environments[0].summary.clone());
+        let shell_events = Rc::new(Cell::new(0));
+        let observed = shell_events.clone();
+        let _subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |_, _, event, _| {
+            if *event == AppEvent::Shell { observed.set(observed.get() + 1); }
+        }));
+        let assert_sidebar = |cx: &gpui::TestAppContext, enabled: bool, folders: bool, step: &str| {
+            state.read_with(cx, |state, cx| {
+                let section = if enabled && !folders { Section::Working } else { Section::Active };
+                assert_eq!(state.sidebar.fleet.section_of(&t3_core::sidebar::tag_filter::ThreadKey::new("saved-fixture", "menu-thread")), Some(section), "{step}: committed preference drives actual scoped partition");
+                assert_eq!(state.sidebar.model.section_of("menu-thread"), Some(if enabled { Section::Working } else { Section::Active }), "{step}: local partition consumes the same preference");
+                assert_eq!(state.sidebar.settings.working_shelf_enabled, enabled, "{step}");
+                assert_eq!(client(cx).working_shelf(), enabled, "{step}");
+                let indexes = if enabled && !folders { &state.sidebar.fleet.partition.working } else { &state.sidebar.fleet.partition.active };
+                let ids = indexes.iter().map(|index| state.sidebar.fleet.threads[*index].thread.id.as_str()).collect::<Vec<_>>();
+                assert_eq!(ids, if enabled || folders { vec!["sibling", "menu-thread"] } else { vec!["menu-thread", "sibling"] }, "{step}: send versus saved Active order");
+                assert_eq!(state.shell.snapshot, unchanged_shell, "{step}: no shell change needed");
+                assert!(Arc::ptr_eq(&state.fleet.environments[0].summary, &unchanged_summary));
+            });
+        };
+        assert_sidebar(cx, false, false, "loaded false");
+        for (step, enabled, folders, receipt) in [
+            ("toggle on", true, false, false),
+            ("toggle off", false, false, false),
+            ("reset default", true, false, false),
+            ("committed false", false, false, true),
+            ("committed true", true, false, true),
+            ("folder off", false, true, false),
+            ("folder on", true, true, false),
+            ("folder committed false", false, true, true),
+            ("normal stored false", false, false, true),
+        ] {
+            cx.update(|cx| {
+                if client(cx).boring_sidebar_enabled() != folders {
+                    update_client(&state, ClientSettingChange::BoringSidebarEnabled(folders), cx);
+                }
+            });
+            let before = shell_events.get();
+            let changed = cx.update(|cx| client(cx).working_shelf() != enabled);
+            cx.update(|cx| {
+                if receipt {
+                    install_client_commit(&state, store::ClientCommit {
+                        sequence:u64::MAX,
+                        patch:serde_json::from_value(json!({"sidebarWorkingShelfEnabled":enabled})).unwrap(),
+                    }, cx);
+                } else { update_client(&state, ClientSettingChange::WorkingShelf(enabled), cx); }
+            });
+            assert_sidebar(cx, enabled, folders, step);
+            if changed { assert!(shell_events.get() > before, "{step}: settings edit invalidates cached sidebar without a shell update"); }
+        }
+        assert!(!fixture.take_commands().iter().any(|method| *method == t3_core::commands::method::DISPATCH_COMMAND), "preference changes never dispatch thread mutations");
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(fixture); drop(runtime); cx.run_until_parked();
+    }
+
+    #[test]
+    fn production_working_shelf_control() {
+        use gpui::{AppContext, HeadlessAppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
+        use std::sync::Arc;
+        use t3_core::sidebar::{Section, Shelf, fleet::ScopedSidebarRow, tag_filter::ThreadKey};
+
+        let Some(out) = std::env::var_os("T3_WORKING_CAPTURE") else { return };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let click_at = std::env::var("T3_WORKING_CLICK").ok().map(|value| {
+            let (x, y) = value.split_once(',').expect("T3_WORKING_CLICK=x,y logical pixels");
+            (x.parse::<f32>().unwrap(), y.parse::<f32>().unwrap())
+        });
+        struct WorkingFrame {
+            pane: Entity<crate::sidebar::SidebarPane>,
+            menu: Entity<crate::context_menu::ContextMenu>,
+            dialog: Entity<crate::dialog::ConfirmDialog>,
+            snooze: Entity<crate::snooze_dialog::SnoozeDialog>,
+        }
+        impl Render for WorkingFrame {
+            fn render(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().relative().size_full().flex().bg(crate::theme::hsla(crate::theme::palette(cx).background))
+                    .child(div().w(px(320.)).h_full().child(self.pane.clone()))
+                    .child(div().flex_1().h_full())
+                    .child(self.menu.clone()).child(self.dialog.clone()).child(self.snooze.clone())
+                    .children(crate::settings::overlay(window, cx))
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.allow_parking();
+        let (state, mut active_fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            install_committed_client(&installed.0, serde_json::from_value(json!({
+                "sidebarWorkingShelfEnabled":true,"boringSidebarEnabled":false
+            })).unwrap(), cx);
+            installed
+        });
+        store::save_ui_state(t3_core::composer::drafts::STORE_NAME, &json!({"version":1,"drafts":{}}));
+        runtime.block_on(runtime.spawn_blocking(|| store::commit_client_settings(serde_json::Map::new())))
+            .expect("fixture writer barrier task").expect("fixture drafts committed");
+        let (ready, loaded) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready);
+        let _loaded = state.update(&mut cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.fleet.environments.len() == 1 {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
+        let (actor, mut fixture) = ClientFixture::handle(serde_json::from_value(json!({
+            "authenticated":true,"permissions":["orchestration:read","orchestration:operate"]
+        })).unwrap());
+        let mut shell = ShellState::default();
+        shell.apply(serde_json::from_value(json!({"kind":"snapshot","snapshot":{
+            "snapshotSequence":1,"projects":[{
+                "id":"working-project","title":"Working preference","workspaceRoot":"/fixture/working",
+                "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z",
+                "projectIcon":{"kind":"monogram","text":"W","color":"blue"}
+            }],"threads":(["running","idle"].map(|id| json!({
+                "id":id,"projectId":"working-project","title":format!("{id} thread"),
+                "createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z",
+                "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+                "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
+                "status":if id=="running" { "running" } else { "idle" },
+                "latestRunId":if id=="running" { Some("fixture-run") } else { None },
+                "activeRunId":if id=="running" { Some("fixture-run") } else { None },
+                "activityRunStartedAt":if id=="running" { Some("2026-11-01T00:00:00Z") } else { None },
+                "hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
+            })))
+        }})).unwrap());
+        shell.synchronized = true;
+        let mut config = ServerConfigState::default();
+        config.apply(serde_json::from_value(json!({"type":"snapshot","config":{
+            "environment":{"environmentId":"working-owner","label":"Working fixture"},
+            "cwd":"/fixture/working","settings":{}
+        }})).unwrap());
+        let install = state.update(&mut cx, |state, _| state.connections.install_fixture("working-owner", actor, shell, config, ConnectionStatus::Connected));
+        let events = runtime.block_on(install);
+        let executor = cx.update(|cx| cx.foreground_executor().clone());
+        executor.block_test(loaded).unwrap();
+        state.update(&mut cx, |state, cx| {
+            state.project_preferences = Default::default();
+            state.sidebar.shelves.working_expanded = true;
+            state.rebuild_sidebar(cx);
+        });
+        let route = state.read_with(&cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
+        let assert_sidebar = |cx: &HeadlessAppContext, enabled: bool| {
+            state.read_with(cx, |state, cx| {
+                assert_eq!(client(cx).working_shelf(), enabled);
+                assert!(error(cx).is_none());
+                let model = &state.sidebar.fleet;
+                let mut keys = model.threads.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
+                keys.sort_by(|a,b| (&a.environment_id,&a.thread_id).cmp(&(&b.environment_id,&b.thread_id)));
+                assert_eq!(keys, [ThreadKey::new("working-owner","idle"),ThreadKey::new("working-owner","running")]);
+                assert_eq!(model.section_of(&keys[0]), Some(Section::Active));
+                assert_eq!(model.section_of(&keys[1]), Some(if enabled { Section::Working } else { Section::Active }));
+                assert_eq!(model.rows.iter().filter(|row| matches!(row,ScopedSidebarRow::Shelf { shelf:Shelf::Working, .. })).count(), usize::from(enabled));
+                assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route);
+            });
+        };
+        assert_sidebar(&cx, true);
+        let window = cx.open_window(size(px(1280.), px(900.)), |window, cx| {
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| crate::sidebar::SidebarPane::new(state.clone(), composer, menu.clone(), dialog.clone(), snooze.clone(), window, cx));
+            cx.new(|_| WorkingFrame { pane, menu, dialog, snooze })
+        }).unwrap();
+        let capture = |cx:&mut HeadlessAppContext, name:&str| {
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(); }).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(out.join(format!("{name}.png"))).unwrap();
+        };
+        capture(&mut cx,"normal-enabled");
+        cx.update(|cx| crate::settings::open_setting("working-shelf",cx));
+        capture(&mut cx,"settings-enabled");
+        if let Some((x,y)) = click_at {
+            for (enabled, settings_image, normal_image) in [
+                (false,"settings-disabled","normal-disabled"),
+                (true,"settings-restored","normal-restored"),
+            ] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    let position = gpui::point(px(x),px(y));
+                    window.simulate_mouse_move(position,cx);
+                    window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button:gpui::MouseButton::Left,position,modifiers:Default::default(),click_count:1,first_mouse:false }),cx);
+                    window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button:gpui::MouseButton::Left,position,modifiers:Default::default(),click_count:1 }),cx);
+                }).unwrap();
+                cx.run_until_parked();
+                assert_sidebar(&cx,enabled);
+                capture(&mut cx,settings_image);
+                cx.update_window(window.into(), |_,window,cx| window.dispatch_action(Box::new(crate::settings::CloseSettings),cx)).unwrap();
+                capture(&mut cx,normal_image);
+                if !enabled {
+                    cx.update(|cx| crate::settings::open_setting("working-shelf",cx));
+                    capture(&mut cx,"settings-reopened");
+                }
+            }
+            runtime.block_on(runtime.spawn_blocking(|| store::commit_client_settings(serde_json::Map::new())))
+                .expect("preference writer barrier task").expect("preference restored on disk");
+            assert!(ClientSettingsDoc::from_json(&store::load_client_settings().unwrap()).working_shelf());
+        } else {
+            cx.update_window(window.into(), |_,window,cx| window.dispatch_action(Box::new(crate::settings::CloseSettings),cx)).unwrap();
+        }
+        let mut commands = active_fixture.take_commands();
+        commands.extend(fixture.take_commands());
+        assert!(!commands.iter().any(|method| matches!(*method,
+            t3_core::commands::method::DISPATCH_COMMAND | t3_core::commands::method::LAUNCH_THREAD | t3_core::projects::PROJECTS_MUTATE
+            | t3_core::commands::method::SERVER_UPDATE_SETTINGS | t3_core::settings::keybindings::SERVER_UPSERT_KEYBINDING
+            | t3_core::settings::keybindings::SERVER_REMOVE_KEYBINDING | "guestShare.create" | "projects.createFromThread" | "projects.createNew"
+        )),"actual Settings clicks must not send RPC writes");
+        std::fs::write(out.join("working-control.json"),serde_json::to_vec_pretty(&json!({
+            "setting":"working-shelf","switch":"working-shelf-switch","window":[1280,900],
+            "stage":if click_at.is_some() { "actual-click-off-on" } else { "calibration-only" },"observedClick":click_at,
+            "normalEnabled":{"running":"Working","idle":"Active"},
+            "disabled":click_at.map(|_| json!({"running":"Active","idle":"Active"})),
+            "restored":click_at.map(|_| json!({"running":"Working","idle":"Active"})),
+            "keys":[["working-owner","idle"],["working-owner","running"]],"routeUnchanged":true,"forbiddenRpcWrites":0,
+            "input":"native Input/NSView not exercised","commandsObserved":commands
+        })).unwrap()).unwrap();
+        state.update(&mut cx,|state,_| state.stop_pump());
+        drop(events);
+        cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(fixture); drop(active_fixture); drop(runtime); cx.run_until_parked();
+    }
 
     #[gpui::test]
     async fn grouped_settings_queue_keeps_destinations_and_reports_partial_writes(cx: &mut gpui::TestAppContext) {
