@@ -15,7 +15,8 @@ use gpui::{
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
 use t3_core::palette::{
-    CommandPaletteGroup, CommandPaletteItem, CommandPaletteProject, CommandPaletteRow, CommandPaletteSearch, PaletteThread, build_command_palette_rows,
+    CommandPaletteGroup, CommandPaletteItem, CommandPaletteItemKind, CommandPaletteProject, CommandPaletteRow, CommandPaletteSearch, CommandPaletteSearchState, CommandPaletteSearchAction, CommandPaletteView, PaletteThread, build_command_palette_rows,
+    create_command_palette_search_state, reduce_command_palette_search_state,
     build_project_action_items, build_root_groups, build_thread_action_items, filter_command_palette_groups, recent_thread_items,
 };
 use t3_core::sidebar::time::{compact_relative_label, format_iso, parse_iso};
@@ -56,6 +57,8 @@ impl Mode {
     }
 }
 
+type ScopedProjectActions = HashMap<String, (t3_core::sidebar::grouping::ScopedProjectGroup, t3_core::sidebar::grouping::ProjectRef, bool)>;
+
 pub struct CommandPalette {
     state: Entity<AppState>,
     composer: Entity<crate::composer::Composer>,
@@ -65,10 +68,12 @@ pub struct CommandPalette {
     files: files::FileSearch,
     content: content::ContentSearch,
     browse: projects::ProjectBrowse,
-    query: String,
+    search: CommandPaletteSearchState,
     root: Vec<CommandPaletteGroup>,
     threads: Vec<CommandPaletteItem>,
     projects: Vec<CommandPaletteItem>,
+    scoped_project_actions: ScopedProjectActions,
+    scoped_thread_actions: HashMap<String, t3_core::sidebar::tag_filter::ThreadKey>,
     settings: Vec<CommandPaletteItem>,
     groups: Vec<CommandPaletteGroup>,
     highlighted: Option<String>,
@@ -124,6 +129,67 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     items
 }
 
+fn scoped_project_items(entries: &[crate::new_thread::ProjectPickerEntry]) -> (
+    Vec<CommandPaletteItem>,
+    ScopedProjectActions,
+) {
+    let mut items = Vec::new();
+    let mut actions = HashMap::new();
+    for entry in entries {
+        let group = &entry.group;
+        let target = &entry.target;
+        let target_ref = target.project.reference();
+        let description = format!("{} · {}", target.project.environment_label, target.project.project.workspace_root);
+        for (prefix, title, draft) in [("scoped-project", group.label.clone(), false), ("scoped-new-thread", format!("New thread in {}", group.label), true)] {
+            let value = format!("{prefix}:{}", group.key);
+            let mut search_terms = vec![group.label.clone(), target.project.project.workspace_root.clone(), target.project.environment_label.clone()];
+            for member in &group.members {
+                search_terms.extend([member.project.project.title.clone(), member.project.project.workspace_root.clone()]);
+                if !draft { search_terms.push(member.project.environment_label.clone()); }
+            }
+            items.push(CommandPaletteItem { value:value.clone(),title,description:Some(description.clone()),search_terms,..Default::default() });
+            actions.insert(value, (group.clone(),target_ref.clone(),draft));
+        }
+    }
+    (items, actions)
+}
+
+fn scoped_project_thread_items(
+    items: &[CommandPaletteItem],
+    actions: &ScopedProjectActions,
+    preferred: Option<&t3_core::sidebar::grouping::ProjectRef>,
+    primary: Option<&str>,
+    actual_context: Option<&str>,
+    eligible: &std::collections::HashSet<String>,
+) -> Vec<CommandPaletteItem> {
+    let drafts = items.iter().filter_map(|item| {
+        let (group, reference, draft) = actions.get(&item.value)?;
+        let target = group.registrations.iter().find(|project| project.reference() == *reference)?;
+        (*draft).then_some((item, group, target))
+    }).collect::<Vec<_>>();
+    let available = || drafts.iter().filter(|(_, _, target)| target.is_scratch && eligible.contains(&target.owner.saved_id));
+    let scratch = available().find(|(_, _, target)| primary == Some(target.owner.saved_id.as_str()))
+        .or_else(|| available().find(|(_, _, target)| actual_context == Some(target.owner.saved_id.as_str())))
+        .or_else(|| {
+            let mut offering = available();
+            let first = offering.next()?;
+            offering.next().is_none().then_some(first)
+        });
+    let mut projects = drafts.iter().filter(|(_, _, target)| !target.is_scratch)
+        .map(|(item, group, _)| CommandPaletteItem { title:group.label.clone(), ..(*item).clone() }).collect::<Vec<_>>();
+    if let Some((item, _, _)) = scratch {
+        let first = drafts.iter().find(|(_, _, target)| target.is_scratch).unwrap();
+        let preferred_scratch = preferred.is_some_and(|reference| first.1.member_refs.contains(reference));
+        let index = if first.1.pinned || preferred_scratch {
+            drafts.iter().take_while(|(candidate, _, _)| candidate.value != first.0.value).filter(|(_, _, target)| !target.is_scratch).count()
+        } else {
+            (drafts.iter().filter(|(_, group, target)| !target.is_scratch && group.pinned).count() + 1).min(projects.len())
+        };
+        projects.insert(index, CommandPaletteItem { title:"No project".into(), search_terms:vec!["no project".into(),"without project".into(),"none".into()], ..(*item).clone() });
+    }
+    projects
+}
+
 fn palette_threads(
     model: &t3_core::sidebar::SidebarModel,
     history: &t3_core::sidebar::visits::OpenHistory,
@@ -160,13 +226,13 @@ impl CommandPalette {
                 let query = input.read(cx).value().to_string();
                 match this.mode {
                     Mode::Command => {
-                        this.query = query;
+                        this.search = reduce_command_palette_search_state(std::mem::take(&mut this.search), CommandPaletteSearchAction::Query(query));
                         this.refilter(cx);
                     }
                     Mode::Files => this.files.search(query, &this.state.clone(), cx),
                     Mode::Content => this.content.search(query, &this.state.clone(), cx),
                     Mode::Browse => this.browse.set_query(query, &this.state.clone(), cx),
-                    Mode::NewProject => this.query = query,
+                    Mode::NewProject => this.search = reduce_command_palette_search_state(std::mem::take(&mut this.search), CommandPaletteSearchAction::Query(query)),
                 }
                 cx.notify();
             }
@@ -176,7 +242,7 @@ impl CommandPalette {
                 Mode::Content => this.open_match(*secondary, window, cx),
                 Mode::Browse => this.browse_pick(*secondary, window, cx),
                 Mode::NewProject => {
-                    let name = this.query.clone();
+                    let name = this.search.query.clone();
                     this.close(window, cx);
                     this.state.update(cx, |state, cx| state.create_new_project(&name, cx));
                 }
@@ -192,10 +258,12 @@ impl CommandPalette {
             files: Default::default(),
             content: Default::default(),
             browse: Default::default(),
-            query: String::new(),
+            search: create_command_palette_search_state(""),
             root: Vec::new(),
             threads: Vec::new(),
             projects: Vec::new(),
+            scoped_project_actions: HashMap::new(),
+            scoped_thread_actions: HashMap::new(),
             settings: crate::settings::palette_items(cx),
             groups: Vec::new(),
             highlighted: None,
@@ -233,7 +301,7 @@ impl CommandPalette {
         match mode {
             Mode::Command => {
                 self.rebuild(cx);
-                self.query.clear();
+                self.search = create_command_palette_search_state("");
                 self.refilter(cx);
             }
             Mode::Files => self.files.start(target, &self.state.clone(), cx),
@@ -243,7 +311,7 @@ impl CommandPalette {
                 self.input.update(cx, |input, cx| input.set_value("~/", window, cx));
                 self.browse.set_query("~/".to_owned(), &self.state.clone(), cx);
             }
-            Mode::NewProject => self.query.clear(),
+            Mode::NewProject => self.search = create_command_palette_search_state(""),
         }
         cx.notify();
     }
@@ -268,6 +336,11 @@ impl CommandPalette {
     /// Escape: a file or content search goes back to the command list; the list closes.
     fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
+            Mode::Command if !self.search.views.is_empty() => {
+                self.search = reduce_command_palette_search_state(std::mem::take(&mut self.search), CommandPaletteSearchAction::Back);
+                self.input.update(cx, |input, cx| input.set_value(self.search.query.clone(), window, cx));
+                self.refilter(cx);
+            }
             Mode::Command => self.close(window, cx),
             _ => self.enter_mode(Mode::Command, window, cx),
         }
@@ -348,7 +421,37 @@ impl CommandPalette {
             })
             .unwrap_or_default();
         self.projects = build_project_action_items(&projects, "project", |_| Vec::new(), None);
+        self.scoped_project_actions.clear();
+        self.scoped_thread_actions.clear();
+        let preferred = crate::new_thread::default_project(state).and_then(|project_id| Some(t3_core::sidebar::grouping::ProjectRef { environment_id:state.environments.active.clone()?,project_id }));
+        if !state.fleet.environments.is_empty() {
+            let groups = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Palette, cx);
+            self.projects.clear();
+            let entries = crate::new_thread::picker_entries(groups, preferred.as_ref());
+            (self.projects, self.scoped_project_actions) = scoped_project_items(&entries);
+        }
+        let primary = state.local_saved_environment().map(|environment| environment.id.as_str()).or_else(|| {
+            let mut local = state.environments.environments.iter().filter(|environment| environment.local);
+            let first = local.next()?;
+            local.next().is_none().then_some(first.id.as_str())
+        });
+        let actual_context = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)).map(|_| ())
+            .or_else(|| state.draft_project.as_deref().and_then(|id| state.shell.project(id)).map(|_| ()))
+            .and(state.environments.active.as_deref());
+        let eligible = state.fleet.environments.iter().filter(|entry| state.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE))
+            .map(|entry| entry.summary.owner.saved_id.clone()).collect();
+        let project_thread_items = if state.fleet.environments.is_empty() {
+            build_project_action_items(&projects, "new-thread-in", |_| Vec::new(), None)
+        } else {
+            scoped_project_thread_items(&self.projects, &self.scoped_project_actions, preferred.as_ref(), primary, actual_context, &eligible)
+        };
         let mut actions = action_items(state);
+        if !project_thread_items.is_empty() {
+            actions.push(CommandPaletteItem {
+                kind: CommandPaletteItemKind::Submenu(CommandPaletteView { groups: vec![CommandPaletteGroup { value:"projects".into(), label:"Projects".into(), items:project_thread_items }], initial_query:None }),
+                value:"action:new-thread-in".into(), title:"New thread in...".into(), search_terms:vec!["new thread project pick choose select".into()], ..Default::default()
+            });
+        }
         for (context, value, title) in [(false,"action:copy-prompt-link","Copy prompt link"),(true,"action:copy-prompt-link-context","Copy prompt link with repo and model")] {
             if self.composer.read(cx).prompt_link(context,cx).is_some() {
                 actions.push(CommandPaletteItem { value: value.into(), title: title.into(), search_terms: vec!["copy prompt link share repo model".into()], ..Default::default() });
@@ -356,13 +459,24 @@ impl CommandPalette {
         }
         self.root = build_root_groups(actions, recent);
         self.threads = items;
+        if !state.fleet.environments.is_empty() {
+            self.threads.clear();
+            for row in &state.sidebar.fleet.threads {
+                let value = format!("scoped-thread:{}", self.scoped_thread_actions.len());
+                self.scoped_thread_actions.insert(value.clone(), row.key.clone());
+                self.threads.push(CommandPaletteItem { value, title:row.thread.title.clone(),
+                    description:state.sidebar.fleet.project_names.get(&row.project).cloned(),
+                    search_terms:vec![row.thread.title.clone(),row.thread.branch.clone().unwrap_or_default(),state.scoped_environment(&row.owner.saved_id).and_then(|entry| entry.config.config.as_ref()).map(|config| config.environment.label.clone()).unwrap_or_default()],
+                    ..Default::default() });
+            }
+        }
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
         self.groups = filter_command_palette_groups(&CommandPaletteSearch {
-            active_groups: &self.root,
-            query: &self.query,
-            is_in_submenu: false,
+            active_groups: self.search.views.last().map_or(&self.root, |view| &view.view.groups),
+            query: &self.search.query,
+            is_in_submenu: !self.search.views.is_empty(),
             all_options: None,
             project_search_items: &self.projects,
             settings_search_items: &self.settings,
@@ -417,12 +531,40 @@ impl CommandPalette {
     }
 
     fn activate(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.groups.iter().flat_map(|group| &group.items).find_map(|item| {
+            if item.value != value { return None; }
+            match &item.kind { CommandPaletteItemKind::Submenu(view) => Some(view.clone()), CommandPaletteItemKind::Action => None }
+        }) {
+            self.search = reduce_command_palette_search_state(std::mem::take(&mut self.search), CommandPaletteSearchAction::Push(view));
+            self.input.update(cx, |input, cx| input.set_value(self.search.query.clone(), window, cx));
+            self.refilter(cx);
+            return;
+        }
         match value {
             "action:add-project" => return self.enter_mode(Mode::Browse, window, cx),
             "action:new-project" => return self.enter_mode(Mode::NewProject, window, cx),
             _ => {}
         }
+        let project_action = self.scoped_project_actions.get(value).cloned();
+        let thread_action = self.scoped_thread_actions.get(value).cloned();
         self.close(window, cx);
+        if let Some((group, target, draft)) = project_action {
+            self.state.update(cx, |state, cx| {
+                if !draft {
+                    let threads: Vec<_> = state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+                    if let Some(key) = t3_core::sidebar::grouping::latest_group_thread(&group, &threads, crate::settings::store::client(cx).thread_sort_order()) {
+                        if let Some(row) = state.scoped_thread(&key) { state.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx); }
+                        return;
+                    }
+                }
+                if let Some(project) = state.scoped_project(&target) { state.navigate_scoped(project.owner.clone(), crate::app_state::ScopedRouteAction::Draft(target.project_id), cx); }
+            });
+            return;
+        }
+        if let Some(key) = thread_action {
+            self.state.update(cx, |state, cx| { if let Some(row) = state.scoped_thread(&key) { state.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx); } });
+            return;
+        }
         if let Some(command) = value.strip_prefix("action:") {
             let action: Box<dyn gpui::Action> = match command {
                 "copy-prompt-link" => Box::new(crate::composer::prompt_links::CopyPromptLink),
@@ -457,6 +599,9 @@ impl CommandPalette {
         } else if let Some(rest) = value.strip_prefix("thread:") {
             let thread_id = rest.split_once(':').map_or(rest, |(_, id)| id).to_owned();
             self.state.update(cx, |state, cx| state.select_thread(&thread_id, cx));
+        } else if let Some(rest) = value.strip_prefix("new-thread-in:") {
+            let project_id = rest.split_once(':').map_or(rest, |(_, id)| id).to_owned();
+            self.state.update(cx, |state, cx| state.start_draft(&project_id, cx));
         } else if let Some(rest) = value.strip_prefix("project:") {
             let project_id = rest.split_once(':').map_or(rest, |(_, id)| id).to_owned();
             // No new-thread flow yet: a project opens its latest thread.
@@ -580,7 +725,7 @@ impl CommandPalette {
             .when(matches!(self.mode, Mode::Files | Mode::Content), |this| this.child(hint("⌘↵", "Mention in composer".to_owned())))
             .when(self.mode == Mode::Browse, |this| this.child(hint("⌘↵", "Add folder".to_owned())).child(hint("Tab", "Complete".to_owned())))
             .child(div().flex_1())
-            .child(hint("Esc", if self.mode == Mode::Command { "Close".to_owned() } else { "Back".to_owned() }))
+            .child(hint("Esc", if self.mode == Mode::Command && self.search.views.is_empty() { "Close".to_owned() } else { "Back".to_owned() }))
     }
 }
 
@@ -709,6 +854,147 @@ impl Render for CommandPalette {
         )
         .with_priority(60)
         .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod scoped_project_tests {
+    use super::*;
+    use t3_core::sidebar::grouping::{EnvironmentOwner, GroupConsumer, GroupInput, GroupingSettings, ProjectPreferences, ProjectRef, ProjectSortOrder, ScopedProject, ScopedProjectGroup, build_scoped_project_groups};
+
+    fn groups() -> Vec<ScopedProjectGroup> {
+        let projects = [("p", "Pinned", "/p", "p"), ("a", "Alpha", "/alpha", "repo"), ("b", "Beta", "/b", "b"), ("remote", "Secondary", "/uniquebeta", "repo")].map(|(saved, title, root, repo)| ScopedProject {
+            owner: EnvironmentOwner { saved_id: saved.into(), canonical_id: Some(saved.into()), generation: 1, connection_generation: 1, shell_generation: 1 },
+            project: serde_json::from_value(serde_json::json!({"id":"same","title":title,"workspaceRoot":root,"repositoryIdentity":{"canonicalKey":repo},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","pinnedAt":if saved == "p" { Some("2026-01-01T00:00:00Z") } else { None }})).unwrap(),
+            is_scratch: false, environment_label: if saved == "remote" { "UniqueRemoteHost".into() } else { saved.into() },
+        });
+        build_scoped_project_groups(&GroupInput { projects: &projects, threads: &[], settings: &GroupingSettings::default(), preferences: &ProjectPreferences::default(), preferred_environment: Some("a"), consumer: GroupConsumer::Palette, sort: ProjectSortOrder::Manual })
+    }
+
+    fn scratch_groups() -> Vec<ScopedProjectGroup> {
+        let mut projects = groups().into_iter().flat_map(|group| group.registrations).collect::<Vec<_>>();
+        for saved in ["scratch-a", "scratch-b"] {
+            let mut scratch = projects.iter().find(|project| project.owner.saved_id == "a").unwrap().clone();
+            scratch.owner.saved_id = saved.into(); scratch.owner.canonical_id = Some(saved.into());
+            scratch.project.title = saved.into(); scratch.project.workspace_root = format!("/{saved}");
+            scratch.project.repository_identity = None; scratch.is_scratch = true;
+            projects.push(scratch);
+        }
+        build_scoped_project_groups(&GroupInput { projects:&projects,threads:&[],settings:&GroupingSettings::default(),preferences:&ProjectPreferences::default(),preferred_environment:Some("scratch-b"),consumer:GroupConsumer::Palette,sort:ProjectSortOrder::Manual })
+    }
+
+    #[test]
+    fn scoped_project_picker_promotes_only_exact_unpinned_context() {
+        let groups = groups();
+        let original = groups.iter().map(|group| group.key.clone()).collect::<Vec<_>>();
+        let pinned = groups.iter().find(|group| group.pinned).unwrap().key.clone();
+        let alpha = groups.iter().find(|group| group.member_refs.contains(&ProjectRef { environment_id:"a".into(), project_id:"same".into() })).unwrap().key.clone();
+        let beta = groups.iter().find(|group| group.member_refs.contains(&ProjectRef { environment_id:"b".into(), project_id:"same".into() })).unwrap().key.clone();
+        for (saved, order) in [("b", vec![pinned.clone(), beta, alpha]), ("p", original.clone()), ("missing", original.clone())] {
+            let preferred = ProjectRef { environment_id: saved.into(), project_id:"same".into() };
+            let entries = crate::new_thread::picker_entries(groups.clone(), Some(&preferred));
+            assert_eq!(entries.iter().map(|entry| entry.group.key.clone()).collect::<Vec<_>>(), order, "context {saved}");
+            if let Some(entry) = entries.iter().find(|entry| entry.is_preferred) { assert_eq!(entry.target.project.reference(), preferred); }
+        }
+        assert_eq!(groups.iter().map(|group| group.key.clone()).collect::<Vec<_>>(), original);
+    }
+
+    #[test]
+    fn scoped_project_palette_search_finds_nonrepresentative_checkout() {
+        let preferred = ProjectRef { environment_id:"a".into(), project_id:"same".into() };
+        let entries = crate::new_thread::picker_entries(groups(), Some(&preferred));
+        let (items, actions) = scoped_project_items(&entries);
+        for (query, draft) in [("/uniquebeta", false), ("UniqueRemoteHost", false), ("Secondary", false), ("/uniquebeta", true)] {
+            let category = items.iter().filter(|item| actions[&item.value].2 == draft).cloned().collect::<Vec<_>>();
+            let matches = filter_command_palette_groups(&CommandPaletteSearch { active_groups:&[],query,is_in_submenu:false,all_options:None,project_search_items:&category,settings_search_items:&[],thread_search_items:&[],now:0 });
+            let matched = matches.iter().flat_map(|group| &group.items).collect::<Vec<_>>();
+            assert_eq!(matched.len(), 1, "query {query}, draft {draft}");
+            assert_eq!(actions[&matched[0].value].1, preferred);
+        }
+    }
+
+    #[test]
+    fn scoped_project_draft_picker_excludes_actual_scratch_targets() {
+        let preferred = ProjectRef { environment_id:"scratch-b".into(),project_id:"same".into() };
+        let entries = crate::new_thread::picker_entries(scratch_groups(), Some(&preferred));
+        let drafts = crate::new_thread::draft_picker_entries(entries).collect::<Vec<_>>();
+        assert!(drafts.iter().all(|entry| !entry.target.project.is_scratch));
+        assert_eq!(drafts.len(), 3);
+    }
+
+    #[test]
+    fn scoped_project_palette_offers_one_existing_scratch_target_in_context_order() {
+        for (saved, primary, context, ready, expected, index) in [
+            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-b"], Some("scratch-b"), 1),
+            ("scratch-b", None, None, vec!["scratch-a", "scratch-b"], None, 1),
+            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 1),
+            ("scratch-b", None, Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 1),
+            ("b", None, Some("b"), vec!["scratch-a", "scratch-b"], None, 2),
+            ("b", Some("scratch-a"), Some("b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 2),
+            ("scratch-b", Some("missing"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 1),
+        ] {
+            let preferred = ProjectRef { environment_id:saved.into(),project_id:"same".into() };
+            let entries = crate::new_thread::picker_entries(scratch_groups(), Some(&preferred));
+            let (items, actions) = scoped_project_items(&entries);
+            let root_scratch = items.iter().filter(|item| !actions[&item.value].2 && actions[&item.value].0.registrations.iter().any(|project| project.is_scratch)).count();
+            assert_eq!(root_scratch, 2, "root project search retains physical scratch entries");
+            let eligible = ready.into_iter().map(str::to_owned).collect();
+            let submenu = scoped_project_thread_items(&items, &actions, Some(&preferred), primary, context, &eligible);
+            let scratch = submenu.iter().filter(|item| actions[&item.value].0.registrations.iter().all(|project| project.is_scratch)).collect::<Vec<_>>();
+            assert_eq!(scratch.len(), usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert_eq!(scratch[0].title, "No project");
+                assert_eq!(actions[&scratch[0].value].1.environment_id, expected);
+                let position = submenu.iter().position(|item| item.value == scratch[0].value).unwrap();
+                assert_eq!(position, index, "placement follows first ordered scratch, not selected destination");
+            }
+        }
+        let entries = crate::new_thread::picker_entries(scratch_groups().into_iter().filter(|group| !group.registrations.iter().any(|project| project.owner.saved_id == "scratch-b")).collect(), None);
+        let (items, actions) = scoped_project_items(&entries);
+        let submenu = scoped_project_thread_items(&items, &actions, None, None, None, &["scratch-a".to_owned()].into());
+        let scratch = submenu.iter().find(|item| item.title == "No project").unwrap();
+        assert_eq!(actions[&scratch.value].1.environment_id, "scratch-a", "sole existing offering does not need a primary or context");
+    }
+
+    #[gpui::test]
+    fn scoped_project_palette_empty_query_exposes_new_thread_group_browse(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (palette, cx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            CommandPalette::new(state.clone(), composer, window, cx)
+        });
+        cx.update(|window, cx| palette.update(cx, |palette, cx| {
+            palette.toggle_mode(Mode::Command, window, cx);
+            let value = palette.root.iter().flat_map(|group| &group.items).find(|item| item.value == "action:new-thread-in").map(|item| item.value.clone()).expect("new-thread project browse is reachable without a search query");
+            palette.activate(&value, window, cx);
+            assert!(palette.open, "entering the group list keeps the palette open");
+            assert!(!build_command_palette_rows(&palette.groups).item_values.is_empty());
+            palette.escape(window, cx);
+            assert!(palette.open, "Escape from the group list returns to the root");
+            assert!(palette.search.views.is_empty());
+            palette.search = reduce_command_palette_search_state(std::mem::take(&mut palette.search), CommandPaletteSearchAction::Query("new thread in".into()));
+            palette.input.update(cx, |input, cx| input.set_value("new thread in", window, cx));
+            palette.refilter(cx);
+            palette.activate(&value, window, cx);
+            assert_eq!(palette.search.query, "");
+            assert_eq!(palette.search.views.len(), 1);
+            palette.escape(window, cx);
+            assert_eq!(palette.search.query, "new thread in");
+            assert!(palette.search.views.is_empty());
+            assert!(palette.open);
+            assert!(palette.input.read(cx).focus_handle(cx).is_focused(window));
+            window.blur();
+        }));
+        state.update(cx, |state, _| state.stop_pump());
+        cx.cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(fixture); drop(runtime); cx.run_until_parked();
     }
 }
 

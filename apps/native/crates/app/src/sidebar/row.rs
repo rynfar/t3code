@@ -45,6 +45,7 @@ fn tone_color(tone: StatusTone, p: Palette) -> u32 {
 }
 
 struct RowState {
+    active: bool,
     status: ThreadStatus,
     top: Option<TopStatus>,
     recede: bool,
@@ -59,6 +60,7 @@ fn row_state(thread: &SidebarThread, active: bool, now: i64) -> RowState {
     let woke_at = settled::woke_at(thread, now);
     let is_woke = woke_at.is_some_and(|woke| thread.last_visited_at.is_none_or(|visited| visited < woke)) && !thread.is_settled();
     RowState {
+        active,
         status,
         top: status::top_status(status, thread.goal_active, is_woke, unread),
         recede: status::should_recede(status, unread, is_woke, active),
@@ -93,7 +95,28 @@ impl SidebarPane {
             }
             index - self.drafts.rows.len() - 1
         };
-        let model = self.state.read(cx).sidebar.model.clone();
+        let app = self.state.read(cx);
+        if !app.fleet.environments.is_empty() {
+            let model = app.sidebar.fleet.clone();
+            let Some(row) = model.rows.get(index) else { return div().into_any_element() };
+            let element = match row {
+                t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, section } => {
+                    let row = &model.threads[*index];
+                    let project = model.project_names.get(&row.project).cloned();
+                    let active = app.active_thread_key(&row.key.thread_id).as_ref() == Some(&row.key) && app.selected_thread.as_deref() == Some(row.key.thread_id.as_str());
+                    if section.is_card() { self.render_card(Some(&row.key), &row.thread, project, *section, active, cx) }
+                    else { self.render_slim(Some(&row.key), &row.thread, project, *section, active, cx) }
+                }
+                t3_core::sidebar::fleet::ScopedSidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, cx),
+                t3_core::sidebar::fleet::ScopedSidebarRow::ShowMore { count } => self.render_show_more(*count, cx),
+                t3_core::sidebar::fleet::ScopedSidebarRow::Marker(marker) => self.render_marker(*marker, cx),
+                t3_core::sidebar::fleet::ScopedSidebarRow::Folder { key, expanded, hidden_count, dot, .. } => self.render_project_folder(key, *expanded, *hidden_count, *dot, cx),
+            };
+            return div().id(("scoped-sidebar-row", index)).relative()
+                .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedThread>, _, cx| this.drag_moved(index, event, cx)))
+                .child(element).children(self.drop_line(index, cx)).into_any_element();
+        }
+        let model = app.sidebar.model.clone();
         let Some(row) = model.rows.get(index) else { return div().into_any_element() };
         let element = match row {
             SidebarRow::Thread { index: thread_index, section } => {
@@ -101,9 +124,9 @@ impl SidebarPane {
                 let project = model.project_names.get(&thread.project_id).cloned();
                 let active = self.state.read(cx).selected_thread.as_deref() == Some(thread.id.as_str());
                 if section.is_card() {
-                    self.render_card(thread, project, *section, active, cx)
+                    self.render_card(None, thread, project, *section, active, cx)
                 } else {
-                    self.render_slim(thread, project, *section, active, cx)
+                    self.render_slim(None, thread, project, *section, active, cx)
                 }
             }
             SidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, cx),
@@ -119,22 +142,27 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    fn row_surface(&self, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, recede_working: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn row_surface(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, row: &RowState, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let active = row.active;
+        let recede_working = section.is_card() && row.recede && matches!(row.status, ThreadStatus::Preparing | ThreadStatus::Working);
         let p = palette(cx);
         let light = !cx.window_appearance_is_dark();
         let id = thread.id.clone();
         let menu_id = thread.id.clone();
+        let clicked_key = key.cloned();
+        let menu_key = key.cloned();
         let state = self.state.read(cx);
-        let selected = !active && state.sidebar.selection.contains(&thread.id);
+        let selected = !active && key.map_or_else(|| state.sidebar.selection.contains(&thread.id), |key| state.sidebar.fleet_selection.contains(key));
         let hover_bg = !active && !selected;
-        let dragging = state.sidebar.drag.as_ref().is_some_and(|(dragged, _)| *dragged == thread.id);
-        let draggable = section != Section::Working && state.sidebar.capabilities.can_operate && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != thread.id);
+        let dragging = key.map_or_else(|| state.sidebar.drag.as_ref().is_some_and(|(dragged, _)| *dragged == thread.id), |key| state.sidebar.fleet_drag.as_ref().is_some_and(|(dragged, _)| dragged == key));
+        let draggable = section != Section::Working && key.map_or(state.sidebar.capabilities.can_operate, |key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key).is_some_and(|owner| owner.can_operate_owner(state))) && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != thread.id);
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
-        let card = (self.state.clone(), thread.id.clone(), project.clone());
-        let preview = (thread.title.clone(), project, crate::project_icon::ProjectVisual::for_project(state, &thread.project_id));
+        let visual = key.map_or_else(|| crate::project_icon::ProjectVisual::for_project(state, &thread.project_id), |key| crate::project_icon::ProjectVisual::for_scoped_project(state, &t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: thread.project_id.clone() }));
+        let card = ThreadHoverCard { title: thread.title.clone().into(), project: project.clone().map(Into::into), favicon: visual.clone(), branch: thread.branch.clone().map(Into::into), model: key.is_none().then(|| state.thread_shell(&thread.id).map(|shell| shell.model_selection.model.clone()).filter(|model| !model.is_empty())).flatten().map(Into::into), error: thread.runtime.as_ref().filter(|runtime| runtime.last_error.is_some()).map(|runtime| runtime.last_error_class.as_deref() == Some("usage_limit")) };
+        let preview = (thread.title.clone(), project, visual);
         let pane = cx.entity().downgrade();
         div()
-            .id(SharedString::from(format!("thread-row-{}", thread.id)))
+            .id(SharedString::from(format!("thread-row-{:?}-{}", key, thread.id)))
             .group("sidebar-row")
             .relative()
             .w_full()
@@ -152,14 +180,13 @@ impl SidebarPane {
             })
             .when(dragging, |this| this.opacity(0.5))
             .when(self.drag.is_none() && !self.menu_open, |this| this.tooltip(move |_, cx| {
-                let hover = hover_card(card.0.read(cx), &card.1, card.2.clone());
-                cx.new(|_| hover).into()
+                cx.new(|_| ThreadHoverCard { title: card.title.clone(), project: card.project.clone(), favicon: card.favicon.clone(), branch: card.branch.clone(), model: card.model.clone(), error: card.error }).into()
             }))
             .when(draggable, |this| {
-                this.on_drag(DraggedThread { id: thread.id.clone() }, move |dragged, _, _, cx| {
+                this.on_drag(DraggedThread { id: thread.id.clone(), key: key.cloned() }, move |dragged, _, _, cx| {
                     let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone(), preview.2.clone()));
                     if let Some(pane) = pane.upgrade() {
-                        pane.update(cx, |pane, cx| pane.begin_drag(&dragged.id, preview.clone(), cx));
+                        pane.update(cx, |pane, cx| pane.begin_drag(&dragged.id, dragged.key.as_ref(), preview.clone(), cx));
                     }
                     preview
                 })
@@ -167,19 +194,27 @@ impl SidebarPane {
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                 let modifiers = event.modifiers();
                 if event.click_count() > 1 && !modifiers.shift && !modifiers.platform && !modifiers.control {
-                    this.start_rename(&id, window, cx);
+                    if let Some(key) = &clicked_key { this.start_scoped_rename(key, window, cx); }
+                    else { this.start_rename(&id, window, cx); }
                     return;
                 }
-                this.state.update(cx, |state, cx| state.click_sidebar_thread(&id, modifiers, cx));
+                this.state.update(cx, |state, cx| match &clicked_key {
+                    Some(key) => state.click_scoped_sidebar_thread(key, modifiers, cx),
+                    None => state.click_sidebar_thread(&id, modifiers, cx),
+                });
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                this.open_menu(&menu_id, event.position, window, cx);
+                if let Some(key) = &menu_key {
+                    let selected = this.state.read(cx).sidebar.fleet_selection.contains(key);
+                    this.menu.update(cx, |menu, cx| if selected { menu.open_for_selection(event.position, window, cx); } else { menu.open_for_scoped_thread(key, event.position, window, cx); });
+                }
+                else { this.open_menu(&menu_id, event.position, window, cx); }
                 cx.stop_propagation();
             }))
     }
 
-    fn render_title(&self, thread: &SidebarThread, color: Hsla, recede: bool, cx: &mut Context<Self>) -> AnyElement {
-        if let Some((_, input)) = self.rename.as_ref().filter(|(id, _)| *id == thread.id) {
+    fn render_title(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, color: Hsla, recede: bool, cx: &mut Context<Self>) -> AnyElement {
+        if let Some((_, input)) = self.rename.as_ref().filter(|(id, _)| *id == thread.id && self.rename_key.as_ref() == key) {
             let p = palette(cx);
             return div()
                 .id("thread-rename")
@@ -219,12 +254,13 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    fn pin_indicator(&self, thread: &SidebarThread, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn pin_indicator(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !thread.pinned {
             return None;
         }
         let p = palette(cx);
         let id = thread.id.clone();
+        let key = key.cloned();
         Some(
             div()
                 .id(SharedString::from(format!("unpin-{}", thread.id)))
@@ -236,13 +272,15 @@ impl SidebarPane {
                 .relative()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.state.update(cx, |state, cx| state.request_unpin_thread(&id, cx));
+                    if let Some(key) = &key {
+                        if let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(this.state.read(cx),key) { this.menu.update(cx,|menu,cx| menu.confirm_scoped(owner,t3_core::thread_actions::ThreadAction::Unpin,cx)); }
+                    } else { this.state.update(cx,|state,cx| state.request_unpin_thread(&id,cx)); }
                 }))
                 .into_any_element(),
         )
     }
 
-    fn render_card(&mut self, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_card(&mut self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let now = self.now;
         let state = row_state(thread, active, now);
@@ -303,6 +341,8 @@ impl SidebarPane {
         };
         let settle_id = thread.id.clone();
         let snooze_id = thread.id.clone();
+        let settle_key = key.cloned();
+        let snooze_key = key.cloned();
         let actions = div()
             .when(!state.is_woke, |this| this.absolute().right_0().top_0().bottom_0())
             .flex()
@@ -313,14 +353,18 @@ impl SidebarPane {
                 this.child(hover_action(SharedString::from(format!("snooze-{}", thread.id)), p).child(Icon::Clock.sized(px(12.))).on_click(cx.listener(
                     move |this, event: &gpui::ClickEvent, window, cx| {
                         cx.stop_propagation();
-                        this.open_snooze_menu(&snooze_id, event.position(), window, cx);
+                        if let Some(key) = &snooze_key { this.menu.update(cx, |menu, cx| menu.open_scoped_snooze(key, event.position(), window, cx)); }
+                        else { this.open_snooze_menu(&snooze_id, event.position(), window, cx); }
                     },
                 )))
             })
             .child(hover_action(SharedString::from(format!("settle-{}", thread.id)), p).mr(px(-4.)).child(Icon::Check.sized(px(14.))).child("Settle").on_click(cx.listener(
                 move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.state.update(cx, |state, cx| state.settle_thread(&settle_id, cx));
+                    this.state.update(cx, |state, cx| match &settle_key {
+                        Some(key) => state.run_scoped_thread_action(key, t3_core::thread_actions::ThreadAction::Settle, &[], cx),
+                        None => state.settle_thread(&settle_id, cx),
+                    });
                 },
             )));
         let meta = thread.branch.clone().map(|branch| {
@@ -341,7 +385,7 @@ impl SidebarPane {
             .py(px(2.))
             .pb(px(3.))
             .child(
-                self.row_surface(thread, project.clone(), section, active, state.recede && matches!(state.status, ThreadStatus::Preparing | ThreadStatus::Working), cx).child(
+                self.row_surface(key, thread, project.clone(), section, &state, cx).child(
                     div()
                         .when(has_meta, |this| this.h(px(CARD_CONTENT_HEIGHT)))
                         .px(px(10.))
@@ -354,7 +398,7 @@ impl SidebarPane {
                                 .gap(px(6.))
                                 .min_w_0()
                                 .child(self.favicon(&thread.project_id, false, cx))
-                                .children(self.pin_indicator(thread, cx))
+                                .children(self.pin_indicator(key, thread, cx))
                                 .child(
                                     div()
                                         .flex_1()
@@ -373,21 +417,21 @@ impl SidebarPane {
                                         .items_center()
                                         .justify_end()
                                         .text_xs()
-                                        .when_some(self.jump_hint(thread, cx), |this, hint| this.child(hint))
+                                        .when_some(self.jump_hint(key, thread, cx), |this, hint| this.child(hint))
                                         .when(!self.jump_hints_visible(), |this| {
                                             this.child(div().when(!state.is_woke, |this| this.group_hover("sidebar-row", |this| this.invisible())).child(status_slot))
                                                 .child(actions)
                                         }),
                                 ),
                         )
-                        .child(div().mt(px(4.)).flex().items_center().gap(px(6.)).min_w_0().child(self.render_title(thread, title_color, state.recede, cx)))
+                        .child(div().mt(px(4.)).flex().items_center().gap(px(6.)).min_w_0().child(self.render_title(key, thread, title_color, state.recede, cx)))
                         .children(meta),
                 ),
             )
             .into_any_element()
     }
 
-    fn render_slim(&mut self, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_slim(&mut self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let now = self.now;
         let state = row_state(thread, active, now);
@@ -431,34 +475,35 @@ impl SidebarPane {
             _ => thread.latest_user_message_at.or(thread.updated_at).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
         };
         let id = thread.id.clone();
+        let action_key = key.cloned();
         let action = match section {
             Section::Snoozed => hover_action(SharedString::from(format!("wake-{}", thread.id)), p).child(Icon::AlarmClockOff.sized(px(12.))).on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.state.update(cx, |state, cx| state.unsnooze_thread(&id, cx));
+                this.state.update(cx, |state, cx| match &action_key { Some(key) => state.run_scoped_thread_action(key, t3_core::thread_actions::ThreadAction::Unsnooze, &[], cx), None => state.unsnooze_thread(&id, cx) });
             })),
             Section::Settled => hover_action(SharedString::from(format!("unsettle-{}", thread.id)), p).child(Icon::Undo2.sized(px(14.))).on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.state.update(cx, |state, cx| state.unsettle_thread(&id, cx));
+                this.state.update(cx, |state, cx| match &action_key { Some(key) => state.run_scoped_thread_action(key, t3_core::thread_actions::ThreadAction::Unsettle, &[], cx), None => state.unsettle_thread(&id, cx) });
             })),
             _ => hover_action(SharedString::from(format!("settle-{}", thread.id)), p).child(Icon::Check.sized(px(12.))).on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.state.update(cx, |state, cx| state.settle_thread(&id, cx));
+                this.state.update(cx, |state, cx| match &action_key { Some(key) => state.run_scoped_thread_action(key, t3_core::thread_actions::ThreadAction::Settle, &[], cx), None => state.settle_thread(&id, cx) });
             })),
         };
         div()
             .px(px(8.))
             .pb(px(1.))
             .child(
-                self.row_surface(thread, project, section, active, false, cx).h(px(SLIM_HEIGHT)).child(
+                self.row_surface(key, thread, project, section, &state, cx).h(px(SLIM_HEIGHT)).child(
                     div()
                         .h_full()
                         .flex()
                         .items_center()
                         .gap(px(10.))
                         .px(px(10.))
-                        .child(self.favicon(&thread.project_id, !active && section != Section::Settled, cx))
-                        .child(self.render_title(thread, title_color, state.recede, cx))
-                        .children(self.pin_indicator(thread, cx))
+                        .child(self.scoped_favicon(key, &thread.project_id, !active && section != Section::Settled, cx))
+                        .child(self.render_title(key, thread, title_color, state.recede, cx))
+                        .children(self.pin_indicator(key, thread, cx))
                         .child(
                             div()
                                 .relative()
@@ -467,7 +512,7 @@ impl SidebarPane {
                                 .flex()
                                 .items_center()
                                 .justify_end()
-                                .when_some(self.jump_hint(thread, cx), |this, hint| this.child(hint))
+                                .when_some(self.jump_hint(key, thread, cx), |this, hint| this.child(hint))
                                 .when(!self.jump_hints_visible(), |this| {
                                     this.child(div().when(!state.is_woke, |this| this.group_hover("sidebar-row", |this| this.invisible())).children(time))
                                         .child(div().absolute().right(px(-4.)).top_0().bottom_0().flex().invisible().group_hover("sidebar-row", |this| this.visible()).child(action))
@@ -476,6 +521,13 @@ impl SidebarPane {
                 ),
             )
             .into_any_element()
+    }
+
+    fn scoped_favicon(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, project_id: &str, muted: bool, cx: &mut Context<Self>) -> AnyElement {
+        let Some(key) = key else { return self.favicon(project_id, muted, cx) };
+        let visual = crate::project_icon::ProjectVisual::for_scoped_project(self.state.read(cx), &t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: project_id.into() });
+        let size = crate::project_icon::size(16., cx); let ink = hsla(palette(cx).sidebar_icon);
+        if muted { visual.render_receding(size, ink, cx) } else { visual.render(size, ink, cx) }
     }
 
     /// Slim rows mute the same project visual until hovered.
@@ -491,12 +543,13 @@ impl SidebarPane {
     }
 
     /// The `mod+N` badge on the first nine rows while the jump modifier is held (`JumpHintBadge`).
-    fn jump_hint(&self, thread: &SidebarThread, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn jump_hint(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.jump_hints {
             return None;
         }
-        let model = self.state.read(cx).sidebar.model.clone();
-        let position = model.ordered.iter().take(9).position(|index| model.threads[*index].id == thread.id)?;
+        let state = self.state.read(cx);
+        let position = if let Some(key) = key { state.sidebar.fleet.ordered.iter().take(9).position(|index| state.sidebar.fleet.threads[*index].key == *key)? }
+            else { let model = &state.sidebar.model; model.ordered.iter().take(9).position(|index| model.threads[*index].id == thread.id)? };
         let label = crate::keymap::label(t3_core::keybindings::thread_jump_command_for_index(position)?, cx)?;
         let p = palette(cx);
         Some(
@@ -580,20 +633,6 @@ impl SidebarPane {
 }
 
 /// Built when the tooltip opens, so rows pay nothing for it while drawing.
-fn hover_card(state: &crate::app_state::AppState, thread_id: &str, project: Option<String>) -> ThreadHoverCard {
-    let thread = state.sidebar.model.thread(thread_id);
-    let model = state.thread_shell(thread_id).map(|shell| shell.model_selection.model.clone()).filter(|model| !model.is_empty());
-    let error = thread.and_then(|thread| thread.runtime.as_ref()).filter(|runtime| runtime.last_error.is_some()).map(|runtime| runtime.last_error_class.as_deref() == Some("usage_limit"));
-    ThreadHoverCard {
-        title: thread.map(|thread| thread.title.clone()).unwrap_or_default().into(),
-        project: project.map(Into::into),
-        favicon: thread.map(|thread| crate::project_icon::ProjectVisual::for_project(state, &thread.project_id)).unwrap_or_default(),
-        branch: thread.and_then(|thread| thread.branch.clone()).map(Into::into),
-        model: model.map(Into::into),
-        error,
-    }
-}
-
 pub(super) trait AppearanceExt {
     fn window_appearance_is_dark(&self) -> bool;
 }
@@ -644,7 +683,7 @@ mod capture {
                         thread.title = match variant { 1 => "Approval", 2 => "User input", 3 => "Guest request", _ => shell.title.as_str() }.into();
                         let card = self.pane.update(cx, |pane, cx| {
                             pane.now = 1_780_272_045_000;
-                            let card = pane.render_card(&thread, Some("Fixture".into()), Section::Active, active, cx);
+                            let card = pane.render_card(None, &thread, Some("Fixture".into()), Section::Active, active, cx);
                             pane.clock = None;
                             card
                         });
@@ -655,7 +694,7 @@ mod capture {
                         thread.has_pending_user_input = false;
                         thread.pending_guest_message_count = 0;
                         thread.title = "Slim settled row".into();
-                        let slim = self.pane.update(cx, |pane, cx| pane.render_slim(&thread, Some("Fixture".into()), Section::Settled, active, cx));
+                        let slim = self.pane.update(cx, |pane, cx| pane.render_slim(None, &thread, Some("Fixture".into()), Section::Settled, active, cx));
                         column = column.child(slim);
                     }
                 }

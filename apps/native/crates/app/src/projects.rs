@@ -12,6 +12,56 @@ use crate::sidebar::controller::uuid;
 use crate::toast::{Toast, ToastKind};
 
 impl AppState {
+    pub(crate) fn run_scoped_project_action(&mut self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, action: t3_core::thread_actions::ProjectAction, cx: &mut Context<Self>) {
+        let Some(target) = t3_core::sidebar::grouping::pick_project_target(group, None) else { return; };
+        match action {
+            t3_core::thread_actions::ProjectAction::NewThread => self.navigate_scoped(target.project.owner.clone(), crate::app_state::ScopedRouteAction::Draft(target.project.project.id.clone()), cx),
+            t3_core::thread_actions::ProjectAction::Settings => self.navigate_scoped(target.project.owner.clone(), crate::app_state::ScopedRouteAction::ProjectSettings(target.project.project.id.clone()), cx),
+            t3_core::thread_actions::ProjectAction::CopyPath => self.copy_project_scoped(&target.project.project.workspace_root, cx),
+            t3_core::thread_actions::ProjectAction::Pin => self.pin_scoped_project_group(group, true, cx),
+            t3_core::thread_actions::ProjectAction::Unpin => self.pin_scoped_project_group(group, false, cx),
+        }
+    }
+
+    fn copy_project_scoped(&mut self, path: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(path.to_owned()));
+        self.show_toast(Toast::new(ToastKind::Success, "Path copied").description(path.to_owned()), cx);
+    }
+
+    pub(crate) fn pin_scoped_project_group(&mut self, group: &t3_core::sidebar::grouping::ScopedProjectGroup, pinned: bool, cx: &mut Context<Self>) {
+        let refs = group.mutation_refs();
+        let members: Option<Vec<_>> = refs.iter().map(|key| group.registrations.iter().find(|project| project.reference() == *key).cloned()).collect();
+        let Some(members) = members else { return; };
+        if members.iter().any(|project| !self.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+            || !self.scoped_project(&project.reference()).is_some_and(|current| current.owner == project.owner && current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)) { return; }
+        let lookups: Vec<_> = members.iter().map(|project| self.connections.destination(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect();
+        cx.spawn(async move |this, cx| {
+            let mut destinations = Vec::new();
+            for lookup in lookups {
+                let Ok(destination) = lookup.await else { return; };
+                destinations.push(destination);
+            }
+            let preflight = this.read_with(cx, |state, _| members.iter().zip(&destinations).all(|(project, destination)| destination.is_current(&state.fleet)
+                && state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+                && state.scoped_project(&project.reference()).is_some_and(|current| current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root))).unwrap_or(false);
+            if !preflight { return; }
+            for (index, (project, destination)) in members.iter().zip(destinations).enumerate() {
+                let valid = this.read_with(cx, |state, _| destination.is_current(&state.fleet) && state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+                    && state.scoped_project(&project.reference()).is_some_and(|current| current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root)).unwrap_or(false);
+                if !valid {
+                    let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Project pin stopped").description(format!("{index} checkout(s) changed before this destination became unavailable.")), cx));
+                    return;
+                }
+                if let Err(error) = destination.client.request(PROJECTS_MUTATE, set_project_pinned(&uuid(), &project.project.id, pinned)).await {
+                    let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Project pin stopped").description(format!("{index} checkout(s) changed; {}: {error}", project.environment_label)), cx));
+                    return;
+                }
+            }
+        }).detach();
+    }
+
     /// `useProjectGroupUpdate`'s gate: servers without `projectOrganization` drop pin and archive.
     pub fn can_pin_projects(&self) -> bool {
         self.server_config.config.as_ref().is_some_and(|config| config.environment.capabilities.project_organization == Some(true))
@@ -85,31 +135,32 @@ impl AppState {
     /// `removeMembers` once confirmed: a forced `project.delete` per member, in order, stopping at
     /// the first failure. A draft in a removed project closes. Removing the whole project returns
     /// Settings to the project list.
-    pub fn remove_projects(&mut self, project_ids: Vec<String>, back_to_list: bool, cx: &mut Context<Self>) {
-        let requests: Vec<(String, String, _)> = project_ids
-            .iter()
-            .map(|id| {
-                let title = self.shell.project(id).map_or_else(|| id.clone(), |project| project.title.clone());
-                (id.clone(), title, self.rpc(PROJECTS_MUTATE, delete_project(&uuid(), id)))
-            })
-            .collect();
+    pub(crate) fn remove_scoped_projects(&mut self, members: Vec<t3_core::sidebar::grouping::ScopedProject>, back_to_list: bool, cx: &mut Context<Self>) {
+        let lookups = members.iter().map(|project| self.connections.destination(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect::<Vec<_>>();
         cx.spawn(async move |this, cx| {
-            for (id, title, request) in requests {
-                if let Err(error) = request.await {
-                    cx.update(|cx| crate::settings::store::show_error(format!("Failed to remove \"{title}\": {error}"), cx));
-                    return;
+            let mut destinations = Vec::new();
+            for lookup in lookups { let Ok(destination) = lookup.await else { return }; destinations.push(destination); }
+            let valid = |state: &AppState, project: &t3_core::sidebar::grouping::ScopedProject, destination: &t3_client::environments::Destination| destination.is_current(&state.fleet)
+                && state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+                && state.scoped_project(&project.reference()).is_some_and(|current| current.project.created_at == project.project.created_at && current.project.workspace_root == project.project.workspace_root);
+            if !this.read_with(cx, |state, _| members.iter().zip(&destinations).all(|(project, destination)| valid(state, project, destination))).unwrap_or(false) { return; }
+            for (index, (project, destination)) in members.into_iter().zip(destinations).enumerate() {
+                if !this.read_with(cx, |state, _| valid(state, &project, &destination)).unwrap_or(false) {
+                    cx.update(|cx| crate::settings::store::show_error(format!("Removed {index} checkout(s); destination changed before removing {}.", project.project.title), cx)); return;
+                }
+                if let Err(error) = destination.client.request(PROJECTS_MUTATE, delete_project(&uuid(), &project.project.id)).await {
+                    cx.update(|cx| crate::settings::store::show_error(format!("Removed {index} checkout(s); failed to remove {}: {error}", project.project.title), cx)); return;
                 }
                 let _ = this.update(cx, |state, cx| {
-                    if state.draft_project.as_deref() == Some(id.as_str()) {
-                        state.draft_project = None;
-                        state.clear_selection(cx);
+                    if state.environments.active.as_deref() == Some(&project.owner.saved_id) && state.draft_project.as_deref() == Some(&project.project.id) {
+                        state.draft_project = None; state.clear_selection(cx);
                     }
                 });
             }
-            if back_to_list {
-                cx.update(crate::settings::show_project_list);
-            }
-        })
-        .detach();
+            if back_to_list { cx.update(crate::settings::show_project_list); }
+        }).detach();
     }
+
+
 }

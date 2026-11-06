@@ -15,6 +15,25 @@ use super::controller::{Deletion, SystemZone, now_ms, time_label, uuid};
 use crate::app_state::{AppEvent, AppState};
 
 impl AppState {
+    pub(crate) fn click_scoped_sidebar_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, modifiers: Modifiers, cx: &mut Context<Self>) {
+        let toggle = if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control };
+        if toggle {
+            if !self.sidebar.fleet_selection.remove(key) { self.sidebar.fleet_selection.insert(key.clone()); }
+        } else if modifiers.shift {
+            let ordered: Vec<_> = self.sidebar.fleet.ordered.iter().map(|index| self.sidebar.fleet.threads[*index].key.clone()).collect();
+            if let (Some(start), Some(end)) = (self.sidebar.fleet_anchor.as_ref().and_then(|anchor| ordered.iter().position(|key| key == anchor)), ordered.iter().position(|candidate| candidate == key)) {
+                self.sidebar.fleet_selection.extend(ordered[start.min(end)..=start.max(end)].iter().cloned());
+            }
+        } else {
+            self.sidebar.fleet_selection.clear();
+            self.sidebar.fleet_anchor = Some(key.clone());
+            if let Some(row) = self.scoped_thread(key) {
+                self.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id.clone()), cx);
+            }
+        }
+        self.selection_changed(cx);
+    }
+
     fn selection_changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(AppEvent::SidebarSelection);
     }
@@ -42,8 +61,9 @@ impl AppState {
 
     /// Escape and the bulk actions clear the selection. Returns whether there was one.
     pub fn clear_thread_selection(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = !self.sidebar.selection.is_empty();
-        if self.sidebar.selection.clear() {
+        let had = !self.sidebar.selection.is_empty() || !self.sidebar.fleet_selection.is_empty();
+        let scoped = !self.sidebar.fleet_selection.is_empty(); self.sidebar.fleet_selection.clear();
+        if self.sidebar.selection.clear() || scoped {
             self.selection_changed(cx);
         }
         had
@@ -164,7 +184,8 @@ impl AppState {
     }
 
     pub fn end_thread_drag(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar.drag.take().is_some() {
+        let scoped = self.sidebar.fleet_drag.take().is_some();
+        if self.sidebar.drag.take().is_some() || scoped {
             self.rebuild_sidebar(cx);
             self.selection_changed(cx);
         }
@@ -261,5 +282,145 @@ impl AppState {
                 state.run_drop_steps(steps, cx);
             }
         });
+    }
+}
+
+impl AppState {
+    pub fn start_scoped_thread_drag(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, cx: &mut Context<Self>) {
+        let Some(from) = self.sidebar.fleet.section_of(key).filter(|from| *from != Section::Working) else { return };
+        self.sidebar.fleet_drag = Some((key.clone(), from)); self.rebuild_sidebar(cx); cx.emit(AppEvent::Selection);
+    }
+
+    fn scoped_drag_id(key: &t3_core::sidebar::tag_filter::ThreadKey) -> String { serde_json::to_string(&(&key.environment_id, &key.thread_id)).unwrap() }
+
+    pub fn scoped_thread_drop_target(&self, slot: usize, cx: &gpui::App) -> Option<(DropTarget, DropPlan)> {
+        use t3_core::sidebar::fleet::ScopedSidebarRow;
+        use t3_core::sidebar::drag::{DropItem, Marker};
+        let (key, from) = self.sidebar.fleet_drag.as_ref()?;
+        let model = &self.sidebar.fleet;
+        let mut items = Vec::new(); let mut before = 0;
+        for (row_index, row) in model.rows.iter().enumerate() {
+            let item = match row {
+                ScopedSidebarRow::Thread { index, section } => Some(DropItem::Thread { id: Self::scoped_drag_id(&model.threads[*index].key), section: *section }),
+                ScopedSidebarRow::Marker(marker) => Some(DropItem::Marker(*marker)),
+                ScopedSidebarRow::Shelf { shelf, .. } => Some(DropItem::Marker(match shelf { t3_core::sidebar::Shelf::Working => Marker::WorkingHeader, t3_core::sidebar::Shelf::Snoozed => Marker::SnoozedHeader, t3_core::sidebar::Shelf::Settled => Marker::SettledHeader })),
+                _ => None,
+            };
+            if let Some(item) = item { if row_index < slot { before += 1; } items.push(item); }
+        }
+        let id = Self::scoped_drag_id(key);
+        let target = resolve_drop_target_at_slot(&items, position_of(&items, &id)?, before)?;
+        let row = model.thread(key)?;
+        let ids = |list: &[usize]| list.iter().map(|index| Self::scoped_drag_id(&model.threads[*index].key)).collect::<Vec<_>>();
+        let pinned = ids(&model.partition.pinned); let active = ids(&model.partition.active);
+        let pinned_keys = model.threads.iter().map(|row| (Self::scoped_drag_id(&row.key), row.thread.pin_order_key.clone())).collect();
+        let active_keys = model.threads.iter().map(|row| (Self::scoped_drag_id(&row.key), row.thread.active_order_key.clone())).collect();
+        let writable = model.threads.iter().filter(|row| self.scoped_ready(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).map(|row| Self::scoped_drag_id(&row.key)).collect();
+        let plan = plan_thread_drop(&DropPlanInput { active_key: &id, active_section: *from, active_pinned: row.thread.pinned, active_settled: row.thread.is_settled(), supports_settlement: true,
+            target: &target, pinned_order: &pinned, pinned_keys_by_id: &pinned_keys, reorderable_keys: Some(&writable), active_order: &active, active_keys_by_id: &active_keys, active_reorderable_keys: Some(&writable), active_time_ordered: self.sidebar.settings.working_shelf_enabled || crate::settings::store::client(cx).boring_sidebar_enabled() });
+        (plan != DropPlan::None).then_some((target, plan))
+    }
+
+    pub fn drop_scoped_thread(&mut self, slot: usize, cx: &mut Context<Self>) {
+        let planned = self.sidebar.fleet_drag.as_ref().map(|(key, _)| key.clone()).zip(self.scoped_thread_drop_target(slot, cx));
+        self.end_thread_drag(cx);
+        let Some((key, (_, plan))) = planned else { return };
+        let id = Self::scoped_drag_id(&key);
+        let mut writes = Vec::new();
+        match plan {
+            DropPlan::None => return,
+            DropPlan::Settle => writes.push((id.clone(), actions::settle(&uuid(), &key.thread_id))),
+            DropPlan::Pin { order_key, extra_assignments, .. } => {
+                writes.push((id.clone(), actions::pin(&uuid(), &key.thread_id, order_key.as_deref())));
+                writes.extend(extra_assignments.into_iter().map(|a| { let command = actions::reorder_pin(&uuid(), "", &a.order_key); (a.id, command) }));
+            }
+            DropPlan::ReorderPinned { assignments, .. } => writes.extend(assignments.into_iter().map(|a| { let command = actions::reorder_pin(&uuid(), "", &a.order_key); (a.id, command) })),
+            DropPlan::MoveActive { assignments, unpin, unsettle, unsnooze, .. } => {
+                if unpin { writes.push((id.clone(), actions::unpin(&uuid(), &key.thread_id))); }
+                if unsettle { writes.push((id.clone(), actions::unsettle(&uuid(), &key.thread_id))); }
+                if unsnooze { writes.push((id, actions::unsnooze(&uuid(), &key.thread_id))); }
+                writes.extend(assignments.into_iter().map(|a| { let command = actions::reorder_active(&uuid(), "", &a.order_key); (a.id, command) }));
+            }
+        }
+        let mut steps = Vec::new();
+        for (id, mut command) in writes {
+            let Ok((environment, thread)) = serde_json::from_str::<(String, String)>(&id) else { return };
+            let key = t3_core::sidebar::tag_filter::ThreadKey::new(&environment, &thread);
+            let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(self, &key) else { return };
+            if !owner.can_operate_owner(self) { return; }
+            command["threadId"] = serde_json::json!(thread);
+            steps.push((owner, command));
+        }
+        self.run_scoped_drop_steps(steps, cx);
+    }
+
+    pub(crate) fn run_scoped_drop_steps(&mut self, steps: Vec<(crate::context_menu::ThreadMenuOwner, serde_json::Value)>, cx: &mut Context<Self>) {
+        let resolves = steps.iter().map(|(owner, _)| self.connections.destination(owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect::<Vec<_>>();
+        let undo = steps.iter().map(|(owner, command)| self.scoped_undo_claim(owner, command.get("type").and_then(serde_json::Value::as_str).unwrap_or_default())).collect::<Vec<_>>();
+        let stop = steps.iter().map(|(owner, command)| command.get("type").and_then(serde_json::Value::as_str) == Some("thread.delete") && owner.key().and_then(|key| self.scoped_thread(&key)).is_some_and(|row| row.thread.runtime.is_some())).collect::<Vec<_>>();
+        cx.spawn(async move |this, cx| {
+            let mut targets = Vec::new();
+            for resolve in resolves { let Ok(target) = resolve.await else { return }; targets.push(target); }
+            if !this.read_with(cx, |state, _| steps.iter().zip(&targets).all(|((owner, _), target)| target.is_current(&state.fleet) && owner.current(state) && owner.can_operate_owner(state)
+                && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))).unwrap_or(false) { return; }
+            for (completed, ((((owner, command), target), undo), stop_first)) in steps.into_iter().zip(targets).zip(undo).zip(stop).enumerate() {
+                if !this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.response_after_placement(state) && owner.can_operate_owner(state)
+                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) {
+                    let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped")
+                        .description(format!("{completed} change(s) saved before destination or permission changed")), cx));
+                    return;
+                }
+                if stop_first {
+                    if let Err(error) = target.client.dispatch(t3_core::commands::stop_thread(&uuid(), &owner.thread)).await {
+                        let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped")
+                            .description(format!("{completed} change(s) saved before {}: {error}", owner.thread)), cx));
+                        return;
+                    }
+                    if !this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.current(state) && owner.can_operate_owner(state)
+                        && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) {
+                        let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped")
+                            .description(format!("{completed} change(s) saved before destination or permission changed")), cx));
+                        return;
+                    }
+                }
+                if let Err(error) = target.client.dispatch(command).await {
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some((claim, _, _)) = &undo { state.sidebar.undo.finish(claim); }
+                        state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action stopped").description(format!("{completed} change(s) saved before {}: {error}", owner.thread)), cx);
+                    }); return;
+                }
+                let _ = this.update(cx, |state, cx| {
+                    if owner.response_after_placement(state) && owner.can_operate_owner(state) {
+                        if let Some((claim, action, plan)) = undo {
+                            state.sidebar.undo.show(action, claim, plan, now_ms()); state.after_undo_change(cx);
+                            cx.emit(AppEvent::Notice);
+                        }
+                        if let Some(key) = owner.key() { state.sidebar.fleet_selection.remove(&key); }
+                        cx.emit(AppEvent::SidebarSelection);
+                    }
+                });
+            }
+        }).detach();
+    }
+}
+
+impl AppState {
+    pub(crate) fn run_scoped_bulk_action(&mut self, owners: Vec<crate::context_menu::ThreadMenuOwner>, action: BulkAction, cx: &mut Context<Self>) {
+        if owners.iter().any(|owner| !owner.current(self) || !owner.can_operate_owner(self)) { return; }
+        let mut steps = Vec::new();
+        for owner in owners {
+            let Some(key) = owner.key() else { return };
+            let Some(row) = self.scoped_thread(&key) else { return };
+            let command = match action {
+                BulkAction::Unpin if row.thread.pinned => actions::unpin(&uuid(), &key.thread_id),
+                BulkAction::Settle if !row.thread.is_settled() => actions::settle(&uuid(), &key.thread_id),
+                BulkAction::RegenerateTitles if !row.thread.regenerating_title => actions::regenerate_title(&uuid(), &key.thread_id),
+                BulkAction::MarkUnread => actions::mark_unread(&uuid(), &key.thread_id),
+                BulkAction::Delete => actions::delete(&uuid(), &key.thread_id),
+                _ => continue,
+            };
+            steps.push((owner, command));
+        }
+        self.run_scoped_drop_steps(steps, cx);
     }
 }

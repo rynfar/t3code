@@ -2,6 +2,7 @@
 //! channel from the client's runtime and are applied in batches, one notify per batch.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::future::Future;
 
 use gpui::{Context, EventEmitter, Subscription, Task};
@@ -77,6 +78,10 @@ pub struct AppState {
     pub connect: ConnectScreen,
     pub cloud: crate::cloud::CloudState,
     pub shell: ShellState,
+    pub(crate) fleet: Arc<t3_client::environments::FleetView>,
+    pub(crate) project_preferences: t3_core::sidebar::grouping::ProjectPreferences,
+    pending_scoped_route: Option<ScopedRoute>,
+    _fleet_pump: Option<Task<()>>,
     pub sidebar: SidebarController,
     pub(crate) open_history: t3_core::sidebar::visits::OpenHistory,
     pub prompt_link_urls: VecDeque<String>,
@@ -128,6 +133,20 @@ pub struct AppState {
     _ssh_quit: Option<Subscription>,
 }
 
+#[derive(Clone)]
+pub(crate) enum ScopedRouteAction {
+    Thread(String),
+    Draft(String),
+    Branch(String),
+    ProjectSettings(String),
+}
+
+#[derive(Clone)]
+struct ScopedRoute {
+    owner: t3_core::sidebar::grouping::EnvironmentOwner,
+    action: ScopedRouteAction,
+}
+
 impl EventEmitter<AppEvent> for AppState {}
 
 impl AppState {
@@ -144,6 +163,14 @@ impl AppState {
         .detach();
         let settings = ClientSettings::from_json(&store::load_client_settings().unwrap_or_default());
         let (connections, mut events) = t3_client::environments::Environments::start(&runtime, settings.notification_mode != t3_core::notifications::NotificationMode::Off || settings.in_app_notifications_enabled);
+        let mut fleet_view = connections.view();
+        let fleet = fleet_view.borrow_and_update().clone();
+        let fleet_pump = cx.spawn(async move |this, cx| {
+            while fleet_view.changed().await.is_ok() {
+                let view = fleet_view.borrow_and_update().clone();
+                if this.update(cx, |state, cx| state.apply_fleet_view(view, cx)).is_err() { return; }
+            }
+        });
         let pump = cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this.update(cx, |state, cx| state.apply_environment_event(event, cx)).is_err() { return; }
@@ -159,6 +186,10 @@ impl AppState {
             connect: ConnectScreen::default(),
             cloud: Default::default(),
             shell: ShellState::default(),
+            fleet,
+            project_preferences: store::load_project_preferences(),
+            pending_scoped_route: None,
+            _fleet_pump: Some(fleet_pump),
             sidebar: SidebarController::default(),
             open_history: Default::default(),
             prompt_link_urls: Default::default(),
@@ -225,6 +256,7 @@ impl AppState {
     #[cfg(feature = "snapshot")]
     pub(crate) fn stop_pump(&mut self) {
         self._pump = None;
+        self._fleet_pump = None;
     }
 
     /// Turn-item fixtures keep asset RPCs alive while holding their projected UI state.
@@ -239,9 +271,22 @@ impl AppState {
         if let Some(client) = &self.client { client.close_all_threads(); }
         self.client = None;
         self.shell = ShellState::default();
-        let collapsed = self.sidebar.collapsed;
-        self.sidebar = SidebarController::default();
-        self.sidebar.collapsed = collapsed;
+        let mut previous = std::mem::take(&mut self.sidebar);
+        self.sidebar.collapsed = previous.collapsed;
+        self.sidebar.fleet = previous.fleet;
+        self.sidebar.fleet_state = previous.fleet_state;
+        self.sidebar.fleet_selection = previous.fleet_selection;
+        self.sidebar.fleet_anchor = previous.fleet_anchor;
+        self.sidebar.route_observed = previous.route_observed;
+        self.sidebar.route_pending = previous.route_pending;
+        self.sidebar.search_input = previous.search_input;
+        self.sidebar.owner_omitted = previous.owner_omitted;
+        self.sidebar.owner_favicons = previous.owner_favicons;
+        self.sidebar.owner_extra_threads = previous.owner_extra_threads;
+        self.sidebar.undo = previous.undo;
+        self.sidebar.undo_timer = previous.undo_timer;
+        self.sidebar.grouping_projects = std::mem::take(&mut previous.grouping_projects);
+        self.sidebar.grouping_threads = std::mem::take(&mut previous.grouping_threads);
         self.omitted = Default::default();
         self.selected_thread = None;
         self.select_when_listed = None;
@@ -297,7 +342,10 @@ impl AppState {
             }
             EnvironmentEvent::Visibility(visibility) => {
                 self.notifications.visibility = visibility;
+                self.refresh_grouping_cache();
+                self.rebuild_sidebar(cx);
                 self.retire_hidden_notifications(cx);
+                cx.emit(AppEvent::Shell);
             }
             EnvironmentEvent::Notifications { id, notifications, .. } => {
                 if self.environments.get(&id).is_none_or(|e| e.disabled || e.access_token.is_none()) { return; }
@@ -318,7 +366,100 @@ impl AppState {
         self.sync_server_config(cx);
         self.sync_shell_views(true, true, self.shell.synchronized, cx);
         self.finish_notification_route(cx);
-        self.land_home(cx);
+        let scoped_navigation = self.pending_scoped_route.is_some();
+        self.finish_scoped_route(cx);
+        if !scoped_navigation { self.land_home(cx); }
+    }
+
+    fn apply_fleet_view(&mut self, view: Arc<t3_client::environments::FleetView>, cx: &mut Context<Self>) {
+        if self.fleet.revision == view.revision { return; }
+        let summaries_changed = self.fleet.environments.len() != view.environments.len() || self.fleet.environments.iter().zip(&view.environments).any(|(previous, next)| !Arc::ptr_eq(&previous.summary, &next.summary));
+        let projects_changed = self.fleet.environments.len() != view.environments.len() || self.fleet.environments.iter().zip(&view.environments).any(|(previous, next)| !Arc::ptr_eq(&previous.summary, &next.summary) && previous.summary.projects != next.summary.projects);
+        let previous = projects_changed.then(|| self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx));
+        self.fleet = view;
+        if summaries_changed { self.refresh_grouping_cache(); }
+        if let Some(previous) = previous {
+            let next = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+            let before = self.project_preferences.clone();
+            self.project_preferences.reconcile(&previous, &next);
+            if self.project_preferences != before { self.save_project_preferences(cx); }
+        }
+        self.sync_scoped_omitted_rows(cx);
+        self.ensure_scoped_favicons(cx);
+        self.rebuild_sidebar(cx);
+        self.finish_scoped_route(cx);
+        cx.emit(AppEvent::Shell);
+        cx.emit(AppEvent::ServerConfig);
+    }
+
+    fn refresh_grouping_cache(&mut self) {
+        self.sidebar.grouping_projects = self.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+        self.sidebar.grouping_threads = self.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter()).filter(|thread| self.notifications.visibility.visible(&thread.key())).cloned().collect();
+    }
+
+    pub(crate) fn active_thread_key(&self, id: &str) -> Option<t3_core::sidebar::tag_filter::ThreadKey> {
+        Some(t3_core::sidebar::tag_filter::ThreadKey::new(self.environments.active.as_deref()?, id))
+    }
+
+    pub(crate) fn scoped_environment(&self, saved: &str) -> Option<&t3_client::environments::EnvironmentView> {
+        self.fleet.environments.iter().find(|entry| entry.summary.owner.saved_id == saved).map(AsRef::as_ref)
+    }
+
+    pub(crate) fn scoped_thread(&self, key: &t3_core::sidebar::tag_filter::ThreadKey) -> Option<&t3_core::sidebar::fleet::ScopedThread> {
+        let summary = &self.scoped_environment(&key.environment_id)?.summary;
+        summary.threads.iter().chain(self.sidebar.owner_extra_threads.get(&summary.owner).into_iter().flatten()).find(|thread| thread.thread.id == key.thread_id)
+    }
+
+    pub(crate) fn scoped_project(&self, key: &t3_core::sidebar::grouping::ProjectRef) -> Option<&t3_core::sidebar::grouping::ScopedProject> {
+        self.scoped_environment(&key.environment_id)?.summary.projects.iter().find(|project| project.project.id == key.project_id)
+    }
+
+    pub(crate) fn scoped_ready(&self, owner: &t3_core::sidebar::grouping::EnvironmentOwner, scope: &str) -> bool {
+        self.scoped_environment(&owner.saved_id).is_some_and(|entry| {
+            entry.summary.owner == *owner && entry.summary.synchronized
+                && entry.status == ConnectionStatus::Connected
+                && entry.grants.as_ref().is_some_and(|grants| grants.grants(scope))
+        })
+    }
+
+    pub(crate) fn navigate_scoped(&mut self, owner: t3_core::sidebar::grouping::EnvironmentOwner, action: ScopedRouteAction, cx: &mut Context<Self>) {
+        if !self.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) { return; }
+        if let ScopedRouteAction::Thread(id)=&action && self.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(&owner.saved_id,id)).is_some_and(|_| self.scoped_environment(&owner.saved_id).is_some_and(|entry| !entry.summary.threads.iter().any(|row| row.thread.id==*id))) {
+            self.read_scoped_family(&owner,id,cx);
+        }
+        if let ScopedRouteAction::Thread(id) = &action { self.observe_scoped_route(t3_core::sidebar::tag_filter::ThreadKey::new(&owner.saved_id, id)); }
+        self.pending_scoped_route = Some(ScopedRoute { owner: owner.clone(), action });
+        if self.environments.active.as_deref() == Some(&owner.saved_id) {
+            self.finish_scoped_route(cx);
+            return;
+        }
+        // The destination is already watched: navigation must not discover, pair or start it.
+        self.environments.active = Some(owner.saved_id.clone());
+        self.persist_environments();
+        self.clear_connection_state(cx);
+        self.connections.activate(Some(&owner.saved_id));
+    }
+
+    fn finish_scoped_route(&mut self, cx: &mut Context<Self>) {
+        let Some(route) = self.pending_scoped_route.clone() else { return; };
+        if !self.scoped_ready(&route.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+            self.pending_scoped_route = None;
+            return;
+        }
+        if self.environments.active.as_deref() != Some(&route.owner.saved_id)
+            || !self.shell.synchronized || self.shell.generation != route.owner.shell_generation
+            || self.client_handle().is_none_or(|client| *client.connection_generation().borrow() != route.owner.connection_generation)
+        { return; }
+        self.pending_scoped_route = None;
+        match route.action {
+            ScopedRouteAction::Thread(id) => {
+                if self.thread_shell(&id).is_none() { self.read_family(&id,true,cx); }
+                else { self.select_thread(&id,cx); }
+            },
+            ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
+            ScopedRouteAction::Branch(id) => self.start_branch_draft(&id, cx),
+            ScopedRouteAction::ProjectSettings(id) => crate::settings::open_project(&id, cx),
+        }
     }
 
     pub(crate) fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {

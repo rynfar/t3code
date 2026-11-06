@@ -5,6 +5,7 @@
 pub mod drag;
 pub mod drafts;
 pub mod favicon;
+pub mod fleet;
 pub mod grouping;
 pub mod history;
 pub mod inbox;

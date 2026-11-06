@@ -57,6 +57,7 @@ impl SnoozeOwner {
 #[derive(Clone)]
 pub(crate) struct SnoozeRequest {
     ids: Vec<String>,
+    scoped: Vec<crate::context_menu::ThreadMenuOwner>,
     owner: Option<SnoozeOwner>,
     bulk: bool,
     previous_focus: Option<FocusHandle>,
@@ -71,9 +72,30 @@ impl SnoozeRequest {
     ) -> Self {
         Self {
             ids,
+            scoped: Vec::new(),
             owner: SnoozeOwner::capture(state),
             bulk,
             previous_focus,
+        }
+    }
+
+    pub(crate) fn capture_scoped(state: &AppState, keys: Vec<t3_core::sidebar::tag_filter::ThreadKey>, bulk: bool, previous_focus: Option<FocusHandle>) -> Self {
+        let owners = keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key)).collect::<Option<Vec<_>>>().unwrap_or_default();
+        Self { ids: keys.iter().map(|key| key.thread_id.clone()).collect(), scoped: owners, owner: None, bulk, previous_focus }
+    }
+
+    fn scoped_plan(&self, state: &AppState, now: i64, snoozing: bool) -> bool {
+        !self.scoped.is_empty() && self.scoped.len() == self.ids.len() && self.scoped.iter().all(|owner| {
+            owner.current(state) && owner.can_operate_owner(state) && owner.key().and_then(|key| state.scoped_thread(&key)).is_some_and(|row| !snoozing || t3_core::sidebar::settled::can_snooze(&row.thread, now))
+        })
+    }
+
+    fn dispatch(&self, state: &mut AppState, until: i64, cx: &mut Context<AppState>) {
+        if !self.scoped.is_empty() {
+            if !self.scoped_plan(state, now_ms(), true) { return; }
+            state.run_scoped_drop_steps(self.scoped.iter().map(|owner| (owner.clone(), t3_core::thread_actions::snooze(&crate::sidebar::controller::uuid(), &owner.thread, until))).collect(), cx);
+        } else {
+            for id in &self.ids { state.snooze_thread(id, until, cx); }
         }
     }
 
@@ -107,11 +129,12 @@ impl SnoozeRequest {
         let Some(ids) = self.plan_for(state, now) else {
             return;
         };
+        let settings = self.scoped.first().and_then(|owner| owner.destination.as_ref()).and_then(|owner| state.scoped_environment(&owner.saved_id)).and_then(|entry| entry.config.config.as_ref()).map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).unwrap_or_else(|| state.snooze_settings());
         let Some(preset) = t3_core::sidebar::settled::pick_snooze_preset(
             shown,
             id,
             now,
-            &state.snooze_settings(),
+            &settings,
             &SystemZone,
             &crate::sidebar::controller::time_label,
         ) else {
@@ -128,9 +151,8 @@ impl SnoozeRequest {
         if self.bulk {
             state.clear_thread_selection(cx);
         }
-        for id in ids {
-            state.snooze_thread(&id, preset.snoozed_until, cx);
-        }
+        let _ = ids;
+        self.dispatch(state, preset.snoozed_until, cx);
     }
 
     pub(crate) fn plan_for(&self, state: &AppState, now: i64) -> Option<Vec<String>> {
@@ -143,6 +165,7 @@ impl SnoozeRequest {
         now: i64,
         snoozing: bool,
     ) -> Option<Vec<String>> {
+        if !self.scoped.is_empty() { return self.scoped_plan(state, now, snoozing).then(|| self.ids.clone()); }
         let current = SnoozeOwner::capture(state);
         let grants = state
             .client_handle()
@@ -426,7 +449,8 @@ impl SnoozeDialog {
                     event,
                     crate::app_state::AppEvent::Phase | crate::app_state::AppEvent::ServerConfig
                 ) && this.pending.as_ref().is_some_and(|request| {
-                    request.owner.is_none() || request.owner != SnoozeOwner::capture(state.read(cx))
+                    if request.scoped.is_empty() { request.owner.is_none() || request.owner != SnoozeOwner::capture(state.read(cx)) }
+                    else { !request.scoped_plan(state.read(cx), now_ms(), true) }
                 }) {
                     let previous = this.pending.as_ref().and_then(|request| request.previous_focus.clone());
                     this.close(window, cx);
@@ -673,9 +697,8 @@ impl SnoozeDialog {
             if request.bulk {
                 state.clear_thread_selection(cx);
             }
-            for thread_id in &thread_ids {
-                state.snooze_thread(thread_id, until, cx);
-            }
+            let _ = thread_ids;
+            request.dispatch(state, until, cx);
         });
     }
 
@@ -1023,6 +1046,7 @@ mod tests {
         };
         let request = SnoozeRequest {
             ids: vec!["same-id".into(), "second".into()],
+            scoped: Vec::new(),
             owner: Some(owner.clone()),
             bulk: true,
             previous_focus: None,

@@ -282,3 +282,146 @@ async fn removing_environment_cancels_its_in_flight_session_state_fetch() {
         "fixture: removing a closed its WebSocket and cancelled the in-flight authenticated HTTP fetch"
     );
 }
+
+
+#[cfg(feature = "test-support")]
+mod quiet_fleet {
+    use super::*;
+    use crate::supervisor::ClientFixture;
+    use t3_core::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE};
+
+    fn entry(saved: &str) -> (Entry, ClientFixture) {
+        let session: AuthSessionState = serde_json::from_value(json!({"authenticated":true,"permissions":[ORCHESTRATION_OPERATE_SCOPE]})).unwrap();
+        let (client, fixture) = ClientFixture::handle(session);
+        let mut config = ServerConfigState::default();
+        config.apply(serde_json::from_value(json!({"type":"snapshot","config":{"environment":{"environmentId":format!("canonical-{saved}"),"label":saved},"scratchWorkspaceRoot":"/scratch"}})).unwrap());
+        let row = json!({"id":"same","projectId":"p","title":saved,"providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},"runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":"same"},"status":"running","latestRunId":"run","activityRunStatus":"running","hasActionableProposedPlan":false,"itemCount":1,"visibleItemCount":1,"createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z"});
+        let mut shell = ShellState::default();
+        shell.apply(serde_json::from_value(json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[{"id":"p","title":saved,"workspaceRoot":"/scratch","createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z"}],"threads":[row]}})).unwrap());
+        shell.synchronized = true;
+        (Entry { client, credentials: Credentials { http_base:"http://fixture.invalid".into(), access_token:String::new() }, relay:tokio::spawn(std::future::pending()), generation:1, shell, config, status:ConnectionStatus::Connected }, fixture)
+    }
+
+    #[tokio::test]
+    async fn quiet_fleet_retains_latest_summaries_and_rechecks_current_owner_grants() {
+        let (a, _fa) = entry("a"); let (b, fb) = entry("b");
+        let mut entries = HashMap::from([("b".into(), b), ("a".into(), a)]);
+        let (views, mut view) = watch::channel(Arc::new(FleetView::default()));
+        publish(&entries, "b", true, &views); publish(&entries, "a", true, &views);
+        let initial = view.borrow_and_update().clone();
+        assert_eq!(initial.environments.iter().map(|environment| environment.summary.owner.saved_id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(initial.environments.iter().all(|environment| environment.summary.projects[0].is_scratch));
+        let a_arc = initial.environments[0].clone();
+        let b_summary = initial.environments[1].summary.clone();
+        let owner = initial.environments[1].summary.owner.clone();
+        let destination = entries["b"].destination(&owner, ORCHESTRATION_OPERATE_SCOPE).unwrap();
+        assert!(destination.is_current(&initial));
+        let b = entries.get_mut("b").unwrap();
+        let mut row = b.shell.thread("same").unwrap().clone(); row.updated_at = "2026-11-01T00:00:01Z".into(); row.item_count += 1;
+        assert!(!apply_shell(b, &t3_core::shell::ShellStreamItem::ThreadUpdated { sequence:2, location:"active".into(), thread:Box::new(row) }));
+        assert!(!view.has_changed().unwrap());
+        assert_eq!(view.borrow().revision, initial.revision);
+        let (event_tx, event_rx) = mpsc::channel(8); let (frame_tx, mut frames) = mpsc::channel(8);
+        let relay = tokio::spawn(relay_events(event_rx, entries["b"].client.session_state(), entries["b"].client.connection_generation(), frame_tx, "b".into(), 1));
+        fb.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":[]})).unwrap()));
+        assert!(matches!(frames.recv().await, Some((id, 1, RelayFrame::Permission)) if id == "b"));
+        publish(&entries, "b", false, &views);
+        view.changed().await.unwrap();
+        assert!(Arc::ptr_eq(&view.borrow().environments[1].summary, &b_summary));
+        assert!(Arc::ptr_eq(&view.borrow().environments[0], &a_arc));
+        assert!(matches!(entries["b"].destination(&owner, ORCHESTRATION_OPERATE_SCOPE), Err(DestinationError::Denied)));
+        fb.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":[ORCHESTRATION_OPERATE_SCOPE]})).unwrap()));
+        frames.recv().await.unwrap();
+        assert!(entries["b"].destination(&owner, ORCHESTRATION_OPERATE_SCOPE).is_ok());
+        fb.generation.send_replace(2);
+        frames.recv().await.unwrap();
+        assert!(matches!(entries["b"].destination(&owner, ORCHESTRATION_OPERATE_SCOPE), Err(DestinationError::Stale)));
+        assert!(!destination.is_current(&view.borrow()));
+        let b = entries.get_mut("b").unwrap();
+        b.status = ConnectionStatus::Connecting; b.shell.synchronized = false;
+        publish(&entries, "b", true, &views);
+        let current = b_owner(&view);
+        assert!(matches!(entries["b"].destination(&current, ORCHESTRATION_OPERATE_SCOPE), Err(DestinationError::Disconnected)));
+        let b = entries.get_mut("b").unwrap(); b.status = ConnectionStatus::Connected; b.shell.synchronized = true; b.shell.generation += 1;
+        assert!(matches!(b.destination(&current, ORCHESTRATION_OPERATE_SCOPE), Err(DestinationError::Stale)));
+        publish(&entries, "b", true, &views);
+        entries.remove("b"); publish(&entries, "b", true, &views);
+        assert_eq!(view.borrow().environments.len(), 1);
+        assert!(Arc::ptr_eq(&view.borrow().environments[0], &a_arc));
+        drop(event_tx); relay.abort();
+    }
+
+    #[tokio::test]
+    async fn quiet_fleet_reuses_linked_parent_request_rollup() {
+        let (a, _fa) = entry("a"); let (mut b, _fb) = entry("b");
+        let mut row = b.shell.thread("same").unwrap().clone();
+        row.delegated_from = Some(json!({"environmentId":"canonical-a","threadId":"same"}));
+        row.pending_runtime_request = Some(serde_json::from_value(json!({"id":"ask","kind":"command"})).unwrap());
+        b.shell.apply(t3_core::shell::ShellStreamItem::ThreadUpdated { sequence:2, location:"active".into(), thread:Box::new(row) });
+        let mut entries = HashMap::from([("a".into(),a),("b".into(),b)]);
+        let (views, view) = watch::channel(Arc::new(FleetView::default()));
+        publish(&entries,"a",true,&views); publish(&entries,"b",true,&views);
+        assert_eq!(view.borrow().environment("a").unwrap().summary.threads[0].thread.pending_subagent_request, Some(t3_core::sidebar::thread::SubagentRequest::Approval));
+        let mut row = entries["b"].shell.thread("same").unwrap().clone(); row.pending_runtime_request = None;
+        entries.get_mut("b").unwrap().shell.apply(t3_core::shell::ShellStreamItem::ThreadUpdated { sequence:3, location:"active".into(), thread:Box::new(row) });
+        publish(&entries,"b",true,&views);
+        assert_eq!(view.borrow().environment("a").unwrap().summary.threads[0].thread.pending_subagent_request, None);
+    }
+
+    #[tokio::test]
+    async fn quiet_fleet_fixture_uses_real_actor_destination_request_and_watches() {
+        let (entry, mut fixture) = entry("actor");
+        let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(), false);
+        let mut view = owner.view();
+        let events = owner.install_fixture("actor", entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await;
+        view.changed().await.unwrap();
+        let token = view.borrow_and_update().environment("actor").unwrap().summary.owner.clone();
+        let destination = owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await.unwrap();
+        let request = destination.client.request(t3_core::commands::method::DISPATCH_COMMAND, json!({"fixture":"scoped"}));
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload, json!({"fixture":"scoped"}));
+        reply.send(Ok(json!({"sequence":2}))).unwrap();
+        assert_eq!(request.await.unwrap(), json!({"sequence":2}));
+        fixture.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":[]})).unwrap()));
+        view.changed().await.unwrap(); view.borrow_and_update();
+        assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Denied)));
+        fixture.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":[ORCHESTRATION_OPERATE_SCOPE]})).unwrap()));
+        view.changed().await.unwrap(); view.borrow_and_update();
+        assert!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await.is_ok());
+        events.send(ClientEvent::Status(ConnectionStatus::Connecting)).await.unwrap();
+        view.changed().await.unwrap(); view.borrow_and_update();
+        assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Disconnected)));
+        owner.remove("actor");
+        view.changed().await.unwrap();
+        assert!(view.borrow().environments.is_empty());
+        assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Missing)));
+    }
+
+    #[tokio::test]
+    async fn quiet_fleet_config_updates_publish_revisions_and_reuse_quiet_summary() {
+        let (entry, _fixture) = entry("config");
+        let (mut owner, mut output) = Environments::start(&tokio::runtime::Handle::current(), false);
+        let mut view = owner.view();
+        let events = owner.install_fixture("config", entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await;
+        view.changed().await.unwrap();
+        let initial = view.borrow_and_update().clone();
+        let revision = initial.environment("config").unwrap().settings_revision;
+        let summary = initial.environment("config").unwrap().summary.clone();
+        owner.activate(Some("config"));
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Activated { .. })) { break; } }
+        let equal = entry.config.config.clone().unwrap();
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(equal) }))).await.unwrap();
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
+        assert_eq!(view.borrow().environment("config").unwrap().settings_revision, revision + 1);
+        assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));
+        let mut changed = entry.config.config.clone().unwrap(); changed.settings.guest_sharing_enabled = Some(false);
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(changed) }))).await.unwrap();
+        loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
+        assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));
+    }
+
+    fn b_owner(view: &watch::Receiver<Arc<FleetView>>) -> EnvironmentOwner {
+        view.borrow().environment("b").unwrap().summary.owner.clone()
+    }
+}

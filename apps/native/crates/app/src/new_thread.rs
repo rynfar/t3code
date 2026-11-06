@@ -23,6 +23,34 @@ use crate::theme::{hsla, palette};
 
 actions!(t3, [NewThread, NewThreadWithoutProject]);
 
+pub(crate) struct ProjectPickerEntry {
+    pub group: t3_core::sidebar::grouping::ScopedProjectGroup,
+    pub target: t3_core::sidebar::grouping::ScopedProjectMember,
+    pub is_preferred: bool,
+}
+
+pub(crate) fn picker_entries(
+    groups: Vec<t3_core::sidebar::grouping::ScopedProjectGroup>,
+    preferred: Option<&t3_core::sidebar::grouping::ProjectRef>,
+) -> Vec<ProjectPickerEntry> {
+    let mut entries = groups.into_iter().filter(|group| !group.archived).filter_map(|group| {
+        let target = t3_core::sidebar::grouping::pick_project_target(&group, preferred)?;
+        let is_preferred = preferred.is_some_and(|reference| group.member_refs.contains(reference));
+        Some(ProjectPickerEntry { group, target, is_preferred })
+    }).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| !entry.group.pinned);
+    if let Some(index) = entries.iter().position(|entry| entry.is_preferred && !entry.group.pinned) {
+        let entry = entries.remove(index);
+        let pinned = entries.iter().take_while(|entry| entry.group.pinned).count();
+        entries.insert(pinned, entry);
+    }
+    entries
+}
+
+pub(crate) fn draft_picker_entries(entries: Vec<ProjectPickerEntry>) -> impl Iterator<Item = ProjectPickerEntry> {
+    entries.into_iter().filter(|entry| !entry.target.project.is_scratch)
+}
+
 pub fn init(state: Entity<AppState>, cx: &mut App) {
     let scratch = state.clone();
     cx.on_action(move |_: &NewThread, cx| state.update(cx, start_new_thread));
@@ -129,7 +157,7 @@ impl DraftHero {
         let p = palette(cx);
         let app = self.state.read(cx);
         let current = app.draft_project.clone();
-        let projects: Vec<(String, String)> = app
+        let mut projects: Vec<(String, String, String, Option<t3_core::sidebar::grouping::EnvironmentOwner>)> = app
             .shell
             .snapshot
             .as_ref()
@@ -138,10 +166,15 @@ impl DraftHero {
                     .projects
                     .iter()
                     .filter(|project| project.archived_at.is_none() && !app.is_scratch_project(&project.id))
-                    .map(|project| (project.id.clone(), project.title.clone()))
+                    .map(|project| (project.id.clone(), project.id.clone(), project.title.clone(), None))
                     .collect()
             })
             .unwrap_or_default();
+        if !app.fleet.environments.is_empty() {
+            let preferred = current.as_ref().and_then(|id| Some(t3_core::sidebar::grouping::ProjectRef { environment_id: app.environments.active.clone()?, project_id:id.clone() }));
+            projects = draft_picker_entries(picker_entries(app.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::DraftPicker, cx), preferred.as_ref()))
+                .map(|entry| (entry.group.key, entry.target.project.project.id, entry.group.label, Some(entry.target.project.owner))).collect();
+        }
         div()
             .relative()
             .min_w_0()
@@ -179,11 +212,14 @@ impl DraftHero {
                             this.dismissed = Some(Instant::now());
                             cx.notify();
                         }))
-                        .children(projects.into_iter().map(|(id, title)| {
-                            let checked = current.as_deref() == Some(id.as_str());
-                            MenuItem::new(SharedString::from(format!("project-{id}")), title).checked(checked).on_click(cx.listener(move |this, _, window, cx| {
+                        .children(projects.into_iter().map(|(key, id, title, owner)| {
+                            let checked = current.as_deref() == Some(id.as_str()) && owner.as_ref().is_none_or(|owner| app.environments.active.as_deref() == Some(&owner.saved_id));
+                            MenuItem::new(SharedString::from(key), title).checked(checked).on_click(cx.listener(move |this, _, window, cx| {
                                 this.projects_open = false;
-                                this.state.update(cx, |state, cx| state.start_draft(&id, cx));
+                                this.state.update(cx, |state, cx| match &owner {
+                                    Some(owner) => state.navigate_scoped(owner.clone(), crate::app_state::ScopedRouteAction::Draft(id.clone()), cx),
+                                    None => state.start_draft(&id, cx),
+                                });
                                 this.composer.update(cx, |composer, cx| composer.focus(window, cx));
                             }))
                         }))

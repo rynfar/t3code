@@ -116,6 +116,11 @@ pub struct Toasts {
 }
 
 impl Toasts {
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn latest(&self) -> Option<&Toast> {
+        self.entries.first().map(|entry| &entry.toast)
+    }
+
     pub(crate) fn has_thread_notifications(&self) -> bool {
         self.entries.iter().any(|entry| entry.toast.open_thread.is_some())
     }

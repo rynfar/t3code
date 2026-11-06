@@ -13,12 +13,14 @@ import { notifyCases } from "./notifyCases.ts";
 import { providerFieldsFixture } from "./providerFields.ts";
 import { commandOutputCases } from "./commandOutputCases.ts";
 import { itemDetailCases } from "./itemDetailCases.ts";
+import { groupingCases } from "./groupingCases.ts";
 
 const OUTPUT_DIR = "apps/native/crates/core/tests/conformance";
 
 // One case per line: the formatter leaves .jsonl alone, and a changed case diffs as one line.
 function fixtures(): Record<string, ReadonlyArray<unknown>> {
   return {
+    "grouping.jsonl": groupingCases(),
     "reducer.jsonl": [...portedReducerCases(), collationCase(), ...fuzzReducerCases(20)],
     "thread.jsonl": threadCases(),
     "shell.jsonl": shellCases(),

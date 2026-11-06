@@ -81,12 +81,69 @@ pub fn time_label(time: LocalTime) -> String {
     settled::default_time_label(time)
 }
 
+#[derive(Clone, PartialEq)]
+pub(crate) enum UndoContext {
+    Thread(Box<crate::context_menu::ThreadMenuOwner>),
+    Draft { environment: Option<String>, canonical: Option<String>, connection: Option<u64>, generation: u64, project: Box<t3_core::shell::ProjectShell> },
+    Unavailable { id: String, draft: bool },
+}
+
+#[derive(Default)]
+pub struct UndoContexts {
+    store: ThreadUndoStore,
+    contexts: Vec<(String, UndoContext)>,
+    pending: Vec<actions::Claim>,
+    active_threads: std::collections::HashMap<String, UndoContext>,
+    active_drafts: std::collections::HashMap<String, UndoContext>,
+}
+
+impl UndoContexts {
+    fn token(&mut self, context: UndoContext) -> String {
+        if let Some((token, _)) = self.contexts.iter().find(|(_, current)| *current == context) { return token.clone(); }
+        let token = uuid(); self.contexts.push((token.clone(), context)); token
+    }
+    fn active_token(&mut self, kind: UndoKind, id: &str) -> String {
+        let draft = kind == UndoKind::Discard;
+        let context = if draft { &self.active_drafts } else { &self.active_threads }.get(id).cloned().unwrap_or_else(|| UndoContext::Unavailable { id:id.into(), draft });
+        self.token(context)
+    }
+    pub fn begin(&mut self, kind: UndoKind, id: &str) -> actions::Claim { let token = self.active_token(kind,id); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
+    fn begin_owned(&mut self, kind: UndoKind, owner: crate::context_menu::ThreadMenuOwner) -> actions::Claim { let token = self.token(UndoContext::Thread(Box::new(owner))); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
+    pub fn invalidate(&mut self, kind: UndoKind, id: &str) { let token = self.active_token(kind,id); self.store.invalidate(kind,&token); }
+    fn invalidate_owned(&mut self, kind: UndoKind, owner: &crate::context_menu::ThreadMenuOwner) { let token = self.token(UndoContext::Thread(Box::new(owner.clone()))); self.store.invalidate(kind,&token); }
+    pub fn expire_placement(&mut self, id: &str, archive: bool) { let token = self.active_token(UndoKind::Pin,id); self.store.expire_placement(&token,archive); }
+    fn expire_owned(&mut self, owner: &crate::context_menu::ThreadMenuOwner, archive: bool) { let token = self.token(UndoContext::Thread(Box::new(owner.clone()))); self.store.expire_placement(&token,archive); }
+    pub fn is_current(&self, claim: &actions::Claim) -> bool { self.store.is_current(claim) }
+    pub fn finish(&mut self, claim: &actions::Claim) { self.pending.retain(|pending| pending != claim); self.store.finish(claim); self.prune(); }
+    pub fn show(&mut self, action: UndoAction, claim: actions::Claim, plan: Vec<UndoStep>, now: Ms) { self.pending.retain(|pending| *pending != claim); self.store.show(action,claim,plan,now); }
+    pub fn notice(&self) -> Option<actions::UndoNotice> { self.store.notice() }
+    pub fn expires_at(&self) -> Option<Ms> { self.store.expires_at() }
+    pub fn expire(&mut self, now: Ms) -> bool { let expired=self.store.expire(now); self.prune(); expired }
+    fn prune(&mut self) { self.pending.retain(|claim| self.store.is_current(claim)); if self.pending.is_empty() && self.store.notice().is_none() { self.contexts.clear(); } }
+    pub(crate) fn take_latest_group(&mut self) -> Vec<(UndoContext,Vec<UndoStep>)> {
+        self.store.take_latest_group().into_iter().filter_map(|(token,plan)| self.contexts.iter().find(|(current,_)| *current == token).map(|(_,context)| (context.clone(),plan))).collect()
+    }
+}
+
 #[derive(Default)]
 pub struct SidebarController {
     pub model: Arc<SidebarModel>,
+    pub fleet: Arc<t3_core::sidebar::fleet::ScopedSidebarModel>,
+    pub fleet_state: t3_core::sidebar::fleet::ScopedSidebarState,
+    pub owner_extra_threads: std::collections::HashMap<t3_core::sidebar::grouping::EnvironmentOwner, Vec<t3_core::sidebar::fleet::ScopedThread>>,
+    pub owner_favicons: std::collections::HashMap<t3_core::sidebar::grouping::EnvironmentOwner, super::favicons::FaviconStore>,
+    pub owner_omitted: std::collections::HashMap<t3_core::sidebar::grouping::EnvironmentOwner, crate::omitted_rows::OmittedRows>,
+    pub fleet_selection: std::collections::HashSet<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub fleet_anchor: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) route_observed: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) route_pending: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) search_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
+    pub grouping_projects: Vec<t3_core::sidebar::grouping::ScopedProject>,
+    pub grouping_threads: Vec<t3_core::sidebar::fleet::ScopedThread>,
+    pub fleet_drag: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::sidebar::Section)>,
     pub shelves: ShelfState,
     pub settings: SidebarSettings,
-    pub undo: ThreadUndoStore,
+    pub undo: UndoContexts,
     pub capabilities: ThreadCapabilities,
     pub collapsed: bool,
     pub history: t3_core::sidebar::history::NavHistory,
@@ -106,7 +163,7 @@ pub struct SidebarController {
     visit_revision: u64,
     wake_timer: Option<Task<()>>,
     visit_timer: Option<Task<()>>,
-    undo_timer: Option<Task<()>>,
+    pub(crate) undo_timer: Option<Task<()>>,
     // The delete stream can precede its reply; only that request may hold the selected mount.
     pending_deletion: Option<PendingDeletion>,
     deletion_revision: u64,
@@ -256,6 +313,7 @@ fn connected(phase: &Phase) -> bool {
 impl AppState {
     /// Re-derives the sidebar from the shell. Cheap enough per batch; rows notify only the sidebar.
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sync_undo_contexts();
         self.release_stale_deletion(cx);
         let now = now_ms();
         let extras = self.omitted.mounts.extras(&self.shell);
@@ -320,9 +378,236 @@ impl AppState {
             })
         });
         self.track_visit(cx);
+        self.rebuild_fleet_sidebar(cx);
         if connected(&self.phase) {
             self.ensure_favicons(cx);
         }
+    }
+
+    fn rebuild_fleet_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.fleet.environments.is_empty() { return; }
+        self.reveal_scoped_route(cx);
+        let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
+        let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id));
+        let hidden = self.notifications.visibility.hidden.union(&self.notifications.visibility.delegated_under_parent).cloned().collect();
+        let owners: std::collections::HashSet<_> = environments.iter().map(|entry| entry.owner.clone()).collect();
+        self.sidebar.owner_omitted.retain(|owner, _| owners.contains(owner));
+        let older_values: Vec<_> = self.sidebar.owner_omitted.iter().filter_map(|(owner, omitted)| omitted.older().map(|older| (owner, older))).collect();
+        let older: Vec<_> = older_values.iter().map(|(owner, older)| t3_core::sidebar::fleet::ScopedOlderSettled {
+            owner, older, frontier: self.sidebar.owner_omitted.get(*owner).and_then(|omitted| omitted.pages.listing_frontier(Some(older))),
+        }).collect();
+        let extra_values = environments.iter().filter_map(|summary| {
+            let omitted = self.sidebar.owner_omitted.get(&summary.owner)?;
+            let ids = summary.threads.iter().map(|row| row.thread.id.clone()).collect();
+            let cut = summary.older_settled.as_ref().map_or(0, |cut| cut.as_of_sequence);
+            let threads = omitted.mounts.extras_for(summary.owner.shell_generation, cut, &ids, &summary.removed_at).into_iter().map(|thread| t3_core::sidebar::fleet::ScopedThread::from_shell(&summary.owner, thread, None)).collect::<Vec<_>>();
+            Some((&summary.owner, threads))
+        }).collect::<Vec<_>>();
+        let extras = extra_values.iter().map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads }).collect::<Vec<_>>();
+        let model = t3_core::sidebar::fleet::ScopedSidebarModel::build(&t3_core::sidebar::fleet::ScopedSidebarInput {
+            environments: &environments, groups: &groups, preferences: &self.project_preferences,
+            settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
+            older: &older, extra_threads: &extras, now: now_ms(), folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
+            dragging: self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section),
+        }, &mut self.sidebar.fleet_state);
+        self.sidebar.owner_extra_threads = extra_values.into_iter().map(|(owner, threads)| (owner.clone(), threads)).collect();
+        self.sidebar.fleet_selection.retain(|key| model.thread(key).is_some());
+        let next = model.next_change_at;
+        let listed = model.listed_settled_count;
+        self.sidebar.fleet = Arc::new(model);
+        self.grow_scoped_settled_shelf(listed, cx);
+        if let Some(at) = next {
+            self.sidebar.wake_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis((at - now_ms()).max(0) as u64 + 1)).await;
+                let _ = this.update(cx, |state, cx| { state.rebuild_sidebar(cx); cx.emit(AppEvent::Shell); cx.emit(AppEvent::Notice); });
+            }));
+        }
+    }
+
+
+    pub(crate) fn project_groups_for(&self, consumer: t3_core::sidebar::grouping::GroupConsumer, cx: &gpui::App) -> Vec<t3_core::sidebar::grouping::ScopedProjectGroup> {
+        let doc = crate::settings::store::client(cx);
+        t3_core::sidebar::grouping::build_scoped_project_groups(&t3_core::sidebar::grouping::GroupInput {
+            projects: &self.sidebar.grouping_projects, threads: &self.sidebar.grouping_threads, settings: &doc.project_grouping_settings(), preferences: &self.project_preferences,
+            preferred_environment: self.environments.active.as_deref(), consumer,
+            sort: match doc.project_sort_order() {
+                t3_core::client_settings::ProjectSortOrder::CreatedAt => t3_core::sidebar::grouping::ProjectSortOrder::CreatedAt,
+                t3_core::client_settings::ProjectSortOrder::Manual => t3_core::sidebar::grouping::ProjectSortOrder::Manual,
+                _ => t3_core::sidebar::grouping::ProjectSortOrder::UpdatedAt,
+            },
+        })
+    }
+
+    pub(crate) fn run_scoped_thread_action(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, action: ThreadAction, shown: &[SnoozePreset], cx: &mut Context<Self>) {
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(self, key) else { return; };
+        if !owner.allows(self, &action) { return; }
+        let id = &key.thread_id;
+        let command = match action {
+            ThreadAction::Settle => actions::settle(&uuid(), id),
+            ThreadAction::Unsettle => actions::unsettle(&uuid(), id),
+            ThreadAction::Pin => actions::pin(&uuid(), id, None),
+            ThreadAction::Unpin => actions::unpin(&uuid(), id),
+            ThreadAction::Unsnooze => actions::unsnooze(&uuid(), id),
+            ThreadAction::Archive => actions::archive(&uuid(), id),
+            ThreadAction::Delete => actions::delete(&uuid(), id),
+            ThreadAction::MarkUnread => actions::mark_unread(&uuid(), id),
+            ThreadAction::RegenerateTitle => actions::regenerate_title(&uuid(), id),
+            ThreadAction::AutoSettle | ThreadAction::AutoSettleEnabled => actions::set_auto_settle(&uuid(), id, true),
+            ThreadAction::AutoSettleDisabled => actions::set_auto_settle(&uuid(), id, false),
+            ThreadAction::SnoozePreset(preset) => {
+                let Some(environment) = self.scoped_environment(&key.environment_id) else { return; };
+                let settings = environment.config.config.as_ref().map(|config| menu_settings(&config.settings.threads.snooze_presets)).unwrap_or_default();
+                let Some(preset) = settled::pick_snooze_preset(shown, &preset, now_ms(), &settings, &SystemZone, &time_label) else { return; };
+                actions::snooze(&uuid(), id, preset.snoozed_until)
+            }
+            ThreadAction::NewThreadOnBranch => {
+                self.navigate_scoped(owner.destination.clone().unwrap(), crate::app_state::ScopedRouteAction::Branch(id.clone()), cx);
+                return;
+            }
+            ThreadAction::ProjectSettings => {
+                let project = owner.project_ref().unwrap();
+                self.navigate_scoped(owner.destination.clone().unwrap(), crate::app_state::ScopedRouteAction::ProjectSettings(project.project_id), cx);
+                return;
+            }
+            ThreadAction::FilterByProject => {
+                let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+                if let Some(reference) = owner.project_ref() && let Some(group) = groups.iter().find(|group| group.member_refs.contains(&reference)) {
+                    let keys = if self.scoped_project_scope(&groups).contains(&group.key) { Vec::new() } else { vec![group.key.clone()] };
+                    self.set_scoped_project_scope(keys, cx);
+                }
+                return;
+            }
+            ThreadAction::TurnIntoProject => { self.promote_scoped(owner, cx); return; }
+            ThreadAction::CopyThreadId => { self.copy(id.clone(), "Thread ID copied", Some(id.clone()), cx); return; }
+            ThreadAction::CopyPath => {
+                let path = self.scoped_thread(key).and_then(|row| row.thread.worktree_path.clone()).or_else(|| owner.project_ref().and_then(|key| self.scoped_project(&key)).map(|project| project.project.workspace_root.clone()));
+                if let Some(path) = path { self.copy(path.clone(), "Path copied", Some(path), cx); }
+                return;
+            }
+            ThreadAction::CopyBranch => {
+                if let Some(branch) = self.scoped_thread(key).and_then(|row| row.thread.branch.clone()) { self.copy(branch, "Copied branch name", None, cx); }
+                return;
+            }
+            ThreadAction::CopyThread => {
+                if let Some(environment) = self.scoped_environment(&key.environment_id)
+                    && let Some(row) = self.scoped_thread(key)
+                    && let Some(reference) = actions::thread_reference(&row.thread.title, environment.summary.owner.canonical_id.as_deref(), id) {
+                    crate::composer::clipboard::write(reference.text, reference.fragment, cx);
+                    self.show_toast(Toast::new(ToastKind::Success, "Thread copied").description(reference.description), cx);
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.run_scoped_command(owner, command, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE, "Thread action failed", cx);
+    }
+
+    pub(crate) fn observe_scoped_route(&mut self, key: t3_core::sidebar::tag_filter::ThreadKey) {
+        if self.sidebar.route_observed.as_ref() != Some(&key) {
+            self.sidebar.route_observed = Some(key.clone());
+            self.sidebar.route_pending = Some(key);
+        }
+    }
+
+    fn reveal_scoped_route(&mut self, cx: &mut Context<Self>) {
+        let Some(current) = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id)) else { return; };
+        self.observe_scoped_route(current.clone());
+        let Some(key) = self.sidebar.route_pending.clone().filter(|key| *key == current) else { return; };
+        if self.sidebar.search_input.as_ref().and_then(gpui::WeakEntity::upgrade).is_some_and(|input| !input.read(cx).value().trim().is_empty())
+            || !self.fleet.environments.iter().all(|entry| entry.summary.synchronized && entry.config.config.is_some()) { return; }
+        let Some(thread) = self.scoped_thread(&key) else { return; };
+        if self.notifications.visibility.hidden.contains(&key) || self.notifications.visibility.delegated_under_parent.contains(&key)
+            || (self.environments.active.as_deref() == Some(&key.environment_id) && self.sidebar.hidden_thread_ids.contains(&key.thread_id)) { return; }
+        let reference = thread.project_ref();
+        let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let Some(group) = groups.iter().find(|group| !group.archived && group.member_refs.contains(&reference)) else { return; };
+        let scope = self.scoped_project_scope(&groups);
+        self.sidebar.route_pending = None;
+        if !scope.is_empty() && !scope.contains(&group.key) {
+            self.project_preferences.scope_keys.clear();
+            self.sidebar.fleet_selection.clear();
+            self.save_project_preferences(cx);
+        }
+    }
+
+    pub(crate) fn scoped_project_scope(&self, groups: &[t3_core::sidebar::grouping::ScopedProjectGroup]) -> Vec<String> {
+        let ready = self.fleet.environments.iter().all(|entry| entry.summary.synchronized && entry.config.config.is_some());
+        self.project_preferences.resolved_scope(groups, ready)
+    }
+
+    pub(crate) fn set_scoped_project_scope(&mut self, keys: Vec<String>, cx: &mut Context<Self>) {
+        self.project_preferences.scope_keys = keys;
+        self.sidebar.fleet_selection.clear();
+        self.save_project_preferences(cx);
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Shell);
+    }
+
+    pub(crate) fn save_project_preferences(&mut self, cx: &mut Context<Self>) {
+        let save = t3_client::store::save_project_preferences(&self.project_preferences);
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = save.await {
+                let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not save sidebar preferences").description(error), cx));
+            }
+        }).detach();
+    }
+
+    fn sync_undo_contexts(&mut self) {
+        let ids = self.shell.snapshot.as_ref().map(|snapshot| snapshot.threads.iter().chain(&snapshot.archived_threads).chain(self.omitted.mounts.extras(&self.shell)).map(|thread| thread.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
+        let threads = ids.into_iter().filter_map(|id| crate::context_menu::ThreadMenuOwner::capture_undo(self,&id).map(|owner| (id,UndoContext::Thread(Box::new(owner))))).collect();
+        let drafts = self.shell.snapshot.as_ref().map(|snapshot| snapshot.projects.iter().map(|project| (project.id.clone(),UndoContext::Draft { environment:self.environments.active.clone(),canonical:self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()),connection:self.connection_id(),generation:self.shell.generation,project:Box::new(project.clone()) })).collect()).unwrap_or_default();
+        self.sidebar.undo.active_threads = threads;
+        self.sidebar.undo.active_drafts = drafts;
+    }
+
+    pub(crate) fn scoped_undo_claim(&mut self, owner: &crate::context_menu::ThreadMenuOwner, command: &str) -> Option<(actions::Claim, UndoAction, Vec<UndoStep>)> {
+        let thread = self.scoped_thread(&owner.key()?)?.thread.clone();
+        let store = &mut self.sidebar.undo;
+        for kind in match command { "thread.pin" => vec![UndoKind::Pin, UndoKind::Settle, UndoKind::Snooze], "thread.unsettle" => vec![UndoKind::Settle], "thread.unsnooze" => vec![UndoKind::Snooze], "thread.settle" => vec![UndoKind::Pin, UndoKind::Snooze], _ => Vec::new() } { store.invalidate_owned(kind, owner); }
+        if matches!(command, "thread.archive" | "thread.delete") { store.expire_owned(owner, command == "thread.delete"); }
+        let (kind, action, plan) = match command {
+            "thread.settle" => (UndoKind::Settle, UndoAction::Settled, actions::plan_undo(PlanFor::Settle, thread.pinned, thread.pin_order_key.as_deref(), thread.snoozed_until)),
+            "thread.unpin" => (UndoKind::Pin, UndoAction::Unpinned, actions::plan_undo(PlanFor::Unpin, thread.pinned, thread.pin_order_key.as_deref(), thread.snoozed_until)),
+            "thread.snooze" => (UndoKind::Snooze, UndoAction::Snoozed, vec![UndoStep::Unsnooze]),
+            "thread.archive" => (UndoKind::Archive, UndoAction::Archived, vec![UndoStep::Unarchive]), _ => return None,
+        };
+        Some((store.begin_owned(kind, owner.clone()), action, plan))
+    }
+
+    pub(crate) fn run_scoped_command(&mut self, owner: crate::context_menu::ThreadMenuOwner, command: Value, scope: &'static str, failure: &'static str, cx: &mut Context<Self>) {
+        let Some(destination) = owner.destination.clone() else { return; };
+        if !owner.current(self) || !self.scoped_ready(&destination, scope) { return; }
+        let kind = command.get("type").and_then(Value::as_str).unwrap_or_default();
+        let removes = matches!(kind, "thread.archive" | "thread.settle" | "thread.unpin" | "thread.delete");
+        let stop_first = kind == "thread.delete" && owner.key().and_then(|key| self.scoped_thread(&key)).is_some_and(|row| row.thread.runtime.is_some());
+        let undo = self.scoped_undo_claim(&owner, kind);
+        let resolve = self.connections.destination(&destination, scope);
+        cx.spawn(async move |this, cx| {
+            let Ok(target) = resolve.await else { return; };
+            let valid = this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.current(state) && state.scoped_ready(&destination, scope)
+                && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(scope))).unwrap_or(false);
+            if !valid { return; }
+            if stop_first {
+                if let Err(error) = target.client.dispatch(t3_core::commands::stop_thread(&uuid(), &owner.thread)).await {
+                    let _ = this.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, failure).description(error.to_string()), cx)); return;
+                }
+                if !this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.current(state) && owner.can_operate_owner(state)
+                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(scope))).unwrap_or(false) { return; }
+            }
+            let result = target.client.dispatch(command).await;
+            let _ = this.update(cx, |state, cx| {
+                if !(if removes { owner.response_after_placement(state) } else { owner.response_current(state) }) || !state.scoped_ready(&destination, scope) { return; }
+                if let Err(error) = result {
+                    if let Some((claim, _, _)) = &undo { state.sidebar.undo.finish(claim); }
+                    state.show_toast(Toast::new(ToastKind::Error, failure).description(error.to_string()), cx);
+                } else if let Some((claim, action, plan)) = undo {
+                    state.sidebar.undo.show(action, claim, plan, now_ms());
+                    state.after_undo_change(cx);
+                    cx.emit(AppEvent::Notice);
+                }
+            });
+        }).detach();
     }
 
     /// Applies the server config's keybindings and capabilities (`subscribeServerConfig`).
@@ -995,57 +1280,57 @@ impl AppState {
     /// `undoLatestThreadAction`: restores the latest group of same-kind actions.
     pub fn undo_latest(&mut self, cx: &mut Context<Self>) -> bool {
         let group = self.sidebar.undo.take_latest_group();
-        if group.is_empty() {
-            return false;
+        if group.is_empty() { return false; }
+        let mut threads = Vec::new();
+        for (context, plan) in group {
+            match context {
+                UndoContext::Thread(owner) => threads.push((*owner,plan)),
+                UndoContext::Draft { environment,canonical,connection,generation,project } => {
+                    if self.environments.active == environment && self.connection_id() == connection && self.shell.generation == generation
+                        && self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()) == canonical
+                        && self.shell.project(&project.id).is_some_and(|current| current.created_at == project.created_at && current.workspace_root == project.workspace_root)
+                        && plan.contains(&UndoStep::RestoreDraft) {
+                        self.sidebar.drafts_to_restore.push(project.id); cx.emit(AppEvent::RestoreDraft);
+                    }
+                }
+                UndoContext::Unavailable { .. } => {}
+            }
         }
-        for (thread_id, plan) in group {
-            self.run_undo_steps(thread_id, plan, cx);
-        }
-        self.after_undo_change(cx);
-        true
+        if !threads.is_empty() { self.run_owned_undo(threads,cx); }
+        self.after_undo_change(cx); true
     }
 
-    fn run_undo_steps(&mut self, thread_id: String, mut steps: Vec<UndoStep>, cx: &mut Context<Self>) {
-        let now = now_ms();
-        steps.retain(|step| actions::runnable_step(step, now));
-        if steps.is_empty() {
-            return;
-        }
-        let step = steps.remove(0);
-        // Each step goes through its action's claim invalidation, as `runUndoPlan` calls the actions.
-        let command = match &step {
-            UndoStep::RestoreDraft => {
-                self.sidebar.drafts_to_restore.push(thread_id);
-                cx.emit(AppEvent::RestoreDraft);
-                return;
+    fn run_owned_undo(&mut self, group: Vec<(crate::context_menu::ThreadMenuOwner,Vec<UndoStep>)>, cx: &mut Context<Self>) {
+        let clients = group.iter().map(|(owner,_)| {
+            let scoped = owner.destination.as_ref().map(|destination| self.connections.destination(destination,t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+            let local = owner.destination.is_none().then(|| self.client_handle()).flatten();
+            async move { match scoped { Some(resolve) => resolve.await.ok().map(|target| target.client), None => local } }
+        }).collect::<Vec<_>>();
+        cx.spawn(async move |this,cx| {
+            let mut targets = Vec::new();
+            for resolve in clients { let Some(target) = resolve.await else { return }; targets.push(target); }
+            let valid = |state:&AppState, owner:&crate::context_menu::ThreadMenuOwner, client:&t3_client::supervisor::ClientHandle| owner.response_after_placement(state) && owner.can_operate_owner(state)
+                && client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+                && owner.destination.as_ref().is_none_or(|destination| *client.connection_generation().borrow() == destination.connection_generation);
+            if !this.read_with(cx,|state,_| group.iter().zip(&targets).all(|((owner,_),client)| valid(state,owner,client))).unwrap_or(false) { return; }
+            for ((owner,steps),client) in group.into_iter().zip(targets) {
+                for step in steps.into_iter().filter(|step| actions::runnable_step(step,now_ms())) {
+                    if !this.read_with(cx,|state,_| valid(state,&owner,&client)).unwrap_or(false) { return; }
+                    let command = match step {
+                        UndoStep::Unsettle => actions::unsettle(&uuid(),&owner.thread), UndoStep::Unsnooze => actions::unsnooze(&uuid(),&owner.thread),
+                        UndoStep::Pin { order_key } => actions::pin(&uuid(),&owner.thread,order_key.as_deref()),
+                        UndoStep::Snooze { snoozed_until } => actions::snooze(&uuid(),&owner.thread,snoozed_until),
+                        UndoStep::Unarchive => actions::unarchive(&uuid(),&owner.thread), UndoStep::RestoreDraft => continue,
+                    };
+                    if let Err(error) = client.dispatch(command).await {
+                        let _ = this.update(cx,|state,cx| state.show_toast(Toast::new(ToastKind::Error,"Could not undo thread action").description(error.to_string()),cx)); return;
+                    }
+                }
             }
-            UndoStep::Unsettle => {
-                self.sidebar.undo.invalidate(UndoKind::Settle, &thread_id);
-                actions::unsettle(&uuid(), &thread_id)
-            }
-            UndoStep::Unsnooze => {
-                self.sidebar.undo.invalidate(UndoKind::Snooze, &thread_id);
-                actions::unsnooze(&uuid(), &thread_id)
-            }
-            UndoStep::Pin { order_key } => self.pin_command(&thread_id, order_key.clone()),
-            UndoStep::Snooze { snoozed_until } => actions::snooze(&uuid(), &thread_id, *snoozed_until),
-            UndoStep::Unarchive => {
-                self.sidebar.undo.invalidate(UndoKind::Archive, &thread_id);
-                actions::unarchive(&uuid(), &thread_id)
-            }
-        };
-        let title = match step {
-            UndoStep::Unarchive => "Failed to undo archive",
-            UndoStep::Pin { .. } => "Failed to undo unpin",
-            UndoStep::Unsnooze => "Failed to wake thread",
-            _ => "Failed to undo settle",
-        };
-        self.dispatch_then(command, Some(title), cx, move |state, ok, cx| {
-            if ok {
-                state.run_undo_steps(thread_id, steps, cx);
-            }
-        });
+        }).detach();
     }
+
+
 }
 
 pub fn uuid() -> String {

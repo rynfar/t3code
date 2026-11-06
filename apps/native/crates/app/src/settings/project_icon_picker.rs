@@ -17,11 +17,11 @@ use gpui_component::{
 use t3_core::settings::projects::{
     ProjectIcon,
     icon::{self, COLORS},
-    picker::{self, Draft, Mode, Target},
+    picker::{self, Draft, Mode},
 };
 
 pub(super) struct Picker {
-    pub target: Target,
+    pub target: super::projects::IconTarget,
     draft: Draft,
     automatic: ProjectIcon,
     query: Entity<InputState>,
@@ -48,7 +48,7 @@ impl SettingsView {
         let Some(shown) = self.shown_project(cx) else { return };
         let current = ProjectIcon::decode(shown.members[0].project_icon.as_ref());
         let draft = Draft::new(current.as_ref(), &shown.members[0].title);
-        let target = self.icon_target(&shown.members, cx);
+        let target = self.icon_target(cx);
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search available Lucide icons"));
         let letters = cx.new(|cx| InputState::new(window, cx).default_value(draft.letters.clone()));
         let custom = cx.new(|cx| InputState::new(window, cx).placeholder("Paste an emoji"));
@@ -133,12 +133,11 @@ impl SettingsView {
         let Some(picker) = self.projects.picker.as_ref() else { return };
         let Some(icon) = picker.draft.selected() else { return };
         let target = picker.target.clone();
-        let Some(shown) = self.shown_project(cx) else { return };
-        if !target.allows(&self.icon_target(&shown.members, cx), self.can_edit_projects(cx), self.projects.saving_icon) {
+        if !target.allows(&self.icon_target(cx), self.can_edit_projects(cx), self.projects.saving_icon) {
             return;
         }
         self.dismiss_project_icon_picker(window, cx);
-        let updates = target.members.iter().map(|(id, _)| (id.clone(), picker::update(icon.clone()))).collect();
+        let updates = target.members.iter().map(|project| (project.clone(), picker::update(icon.clone()))).collect();
         self.save_icon_updates(target, updates, cx);
     }
 
@@ -150,7 +149,7 @@ impl SettingsView {
         let target = self.projects.picker.as_ref()?.target.clone();
         if !self
             .shown_project(cx)
-            .is_some_and(|shown| target.allows(&self.icon_target(&shown.members, cx), self.can_edit_projects(cx), self.projects.saving_icon))
+            .is_some_and(|_| target.allows(&self.icon_target(cx), self.can_edit_projects(cx), self.projects.saving_icon))
         {
             self.dismiss_project_icon_picker(window, cx);
             return None;

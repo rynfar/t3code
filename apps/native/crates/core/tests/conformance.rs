@@ -524,3 +524,45 @@ fn item_detail_matches_typescript() {
     }
     report.finish("item-detail", 40);
 }
+
+
+#[test]
+fn grouping_current_typescript_parity() {
+    use t3_core::sidebar::grouping::*;
+    for case in fixture("grouping.jsonl") {
+        let kind = case["kind"].as_str().unwrap();
+        if kind == "reorder" {
+            let strings = |key: &str| list(&case, key).iter().map(|value| value.as_str().unwrap().to_owned()).collect::<Vec<_>>();
+            let mut preferences = ProjectPreferences::default();
+            preferences.reorder(&strings("current"), &strings("dragged"), &strings("target"));
+            assert_eq!(serde_json::json!(preferences.project_order), case["expected"], "{}", case["name"]);
+            continue;
+        }
+        let project_values = if kind == "expansion" { vec![serde_json::json!({"environmentId":"a","id":"p","title":"Repo","workspaceRoot":"/repo","repositoryIdentity":{"canonicalKey":"repo"},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"})] } else { list(&case, "projects").to_vec() };
+        let projects = project_values.iter().map(|project| {
+            let saved = project["environmentId"].as_str().unwrap();
+            ScopedProject { owner: EnvironmentOwner { saved_id: saved.into(), canonical_id: Some(saved.into()), ..Default::default() }, project: serde_json::from_value(project.clone()).unwrap(), is_scratch: project["isScratch"].as_bool().unwrap_or(false), environment_label: saved.into() }
+        }).collect::<Vec<_>>();
+        let settings = GroupingSettings { mode: case["settings"]["sidebarProjectGroupingMode"].as_str().and_then(GroupingMode::parse).unwrap_or_default(), overrides: case["settings"]["sidebarProjectGroupingOverrides"].as_object().into_iter().flatten().filter_map(|(key, value)| Some((key.clone(), GroupingMode::parse(value.as_str()?)?))).collect(), ..Default::default() };
+        let mut preferences = ProjectPreferences::default();
+        let groups = build_scoped_project_groups(&GroupInput { projects: &projects, threads: &[], settings: &settings, preferences: &preferences, preferred_environment: case["preferred"].as_str(), consumer: if case["scratch"].as_bool() == Some(true) { GroupConsumer::Sidebar } else { GroupConsumer::Palette }, sort: ProjectSortOrder::Manual });
+        if kind == "expansion" {
+            preferences.project_expanded = serde_json::from_value(case["record"].clone()).unwrap();
+            assert_eq!(serde_json::json!(preferences.expanded(&groups[0])), case["expected"], "{}", case["name"]);
+        } else if kind == "scope" {
+            preferences.scope_keys = serde_json::from_value(case["scope"].clone()).unwrap();
+            assert_eq!(serde_json::json!(preferences.resolved_scope(&groups, true)), case["expectedScope"], "{}", case["name"]);
+            assert_eq!(serde_json::json!(preferences.resolved_scope(&groups, false)), case["expectedLoading"], "{}", case["name"]);
+            let context = serde_json::from_value::<ProjectRef>(case["context"].clone()).unwrap();
+            let targets = groups.iter().filter_map(|group| pick_project_target(group, Some(&context))).map(|member| member.project.reference()).collect::<Vec<_>>();
+            assert_eq!(serde_json::json!(targets), case["expectedTargets"], "{}", case["name"]);
+        } else {
+            let actual = groups.iter().map(|group| serde_json::json!({
+                "key":group.key, "label":group.label, "representative":group.representative, "refs":group.member_refs,
+                "members":group.members.iter().map(|member| serde_json::json!({"physical":member.physical_key,"environmentId":member.project.owner.saved_id,"projectId":member.project.project.id})).collect::<Vec<_>>(),
+                "pinned":group.pinned, "archived":group.archived,
+            })).collect::<Vec<_>>();
+            assert_eq!(serde_json::json!(actual), case["expected"], "{}", case["name"]);
+        }
+    }
+}

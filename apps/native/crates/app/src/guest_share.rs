@@ -19,6 +19,46 @@ use gpui_component::{h_flex, v_flex};
 use t3_core::thread_actions::{ThreadAction, guest_share as rules};
 
 impl AppState {
+    pub(crate) fn can_share_scoped(&self, owner: &ThreadMenuOwner) -> bool {
+        let Some(destination) = &owner.destination else { return self.can_share_with_guest(); };
+        let Some(environment) = self.scoped_environment(&destination.saved_id) else { return false; };
+        rules::available(environment.config.config.as_ref(), self.scoped_ready(destination, t3_core::auth::ACCESS_WRITE_SCOPE))
+    }
+
+    pub(crate) fn can_promote_scoped(&self, owner: &ThreadMenuOwner) -> bool {
+        let Some(key) = owner.key() else { return self.can_turn_into_project(&owner.thread); };
+        let Some(environment) = self.scoped_environment(&key.environment_id) else { return false; };
+        environment.config.config.as_ref().is_some_and(|config| config.environment.capabilities.thread_project_from_scratch == Some(true))
+            && self.scoped_thread(&key).is_some_and(|row| row.thread.worktree_path.as_ref().is_some_and(|path| !path.is_empty()))
+            && owner.project_ref().and_then(|key| self.scoped_project(&key)).is_some_and(|project| project.is_scratch)
+    }
+
+    pub(crate) fn promote_scoped(&mut self, owner: ThreadMenuOwner, cx: &mut Context<Self>) {
+        if !owner.allows(self, &ThreadAction::TurnIntoProject) { return; }
+        let Some(key) = owner.key() else { return; };
+        let Some(row) = self.scoped_thread(&key).filter(|row| row.thread.can_archive()) else { return; };
+        let title = row.thread.title.clone();
+        let destination = owner.destination.clone().unwrap();
+        let target = self.connections.destination(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE);
+        cx.spawn(async move |this, cx| {
+            let Ok(target) = target.await else { return; };
+            if !this.read_with(cx, |state, _| target.is_current(&state.fleet) && owner.allows(state, &ThreadAction::TurnIntoProject)
+                && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false) { return; }
+            let response = target.client.request(t3_core::projects::PROJECTS_CREATE_FROM_THREAD, t3_core::projects::create_from_thread(&owner.thread)).await;
+            if response.as_ref().err().is_some_and(interrupted) { return; }
+            let result = response.map_err(|error| error.to_string()).and_then(|value| serde_json::from_value::<t3_core::projects::CreateFromThreadResult>(value).map_err(|error| error.to_string()));
+            let _ = this.update(cx, |state, cx| {
+                if !owner.response_current(state) || !owner.can_operate_owner(state) { return; }
+                let toast = match result {
+                    Ok(result) if !result.project_id.is_empty() => Toast::new(ToastKind::Success, "Project created").description(title),
+                    Ok(_) => Toast::new(ToastKind::Error, "Could not turn thread into a project").description("The server returned no project."),
+                    Err(error) => Toast::new(ToastKind::Error, "Could not turn thread into a project").description(error),
+                };
+                state.show_toast(toast, cx);
+            });
+        }).detach();
+    }
+
     pub(crate) fn can_share_with_guest(&self) -> bool {
         rules::available(
             self.server_config.config.as_ref(),
@@ -147,7 +187,7 @@ pub(crate) fn open(owner: ThreadMenuOwner, window: gpui::AnyWindowHandle, cx: &m
         }
         dialog.task = None;
         dialog.copied_reset = None;
-        dialog.active_share = dialog.state.read(cx).guest_share(&owner.thread).cloned();
+        dialog.active_share = owner.destination.is_none().then(|| dialog.state.read(cx).guest_share(&owner.thread).cloned()).flatten();
         dialog.pending = Some(Pending {
             owner: owner.clone(),
             state: CreateState::Idle,
@@ -259,12 +299,15 @@ impl GuestShareDialog {
     }
     fn watch_share(&mut self, owner: ThreadMenuOwner, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let Some(client) = state.client_handle() else {
-            return;
-        };
+        let local_client = state.client_handle();
+        let scoped_client = owner.destination.as_ref().map(|destination| state.connections.destination(destination, t3_core::auth::ACCESS_WRITE_SCOPE));
         let thread = owner.thread.clone();
         let (send, mut receive) = tokio::sync::watch::channel(self.active_share.clone());
         let net = ShareWatch(state.runtime().spawn(async move {
+            let client = match scoped_client {
+                Some(resolve) => match resolve.await { Ok(destination) => destination.client, Err(_) => return },
+                None => match local_client { Some(client) => client, None => return },
+            };
             let Ok(mut stream) = client
                 .stream(
                     t3_core::commands::method::SUBSCRIBE_THREAD,
@@ -336,12 +379,20 @@ impl GuestShareDialog {
         }
         let owner = pending.owner.clone();
         pending.state = CreateState::Creating;
-        let request = self
-            .state
-            .read(cx)
-            .rpc(rules::CREATE, rules::create(&owner.thread));
+        let state = self.state.read(cx);
+        let local_request = owner.destination.is_none().then(|| state.rpc(rules::CREATE, rules::create(&owner.thread)));
+        let destination = owner.destination.as_ref().map(|destination| state.connections.destination(destination, t3_core::auth::ACCESS_WRITE_SCOPE));
+        let target_thread = owner.thread.clone();
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
-            let response = request.await;
+            let response = match destination {
+                Some(resolve) => {
+                    let Ok(target) = resolve.await else { return; };
+                    if !this.read_with(cx,|dialog,cx| target.is_current(&dialog.state.read(cx).fleet) && owner.allows(dialog.state.read(cx),&ThreadAction::ShareGuest)
+                        && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ACCESS_WRITE_SCOPE))).unwrap_or(false) { return; }
+                    target.client.request(rules::CREATE,rules::create(&target_thread)).await
+                }
+                None => local_request.expect("local owner").await,
+            };
             let was_interrupted = response.as_ref().err().is_some_and(interrupted);
             let result = response.map_err(create_error).and_then(|value| {
                 serde_json::from_value::<rules::CreateResult>(value)

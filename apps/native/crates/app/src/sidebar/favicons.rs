@@ -104,3 +104,49 @@ impl AppState {
         }
     }
 }
+
+impl AppState {
+    pub(crate) fn ensure_scoped_favicons(&mut self, cx: &mut Context<Self>) {
+        let owners = self.fleet.environments.iter().map(|entry| entry.summary.owner.clone()).collect::<HashSet<_>>();
+        self.sidebar.owner_favicons.retain(|owner, _| owners.contains(owner));
+        let mut wanted = Vec::new();
+        for entry in &self.fleet.environments {
+            let owner = &entry.summary.owner;
+            let projects = entry.summary.projects.iter().map(|project| project.project.clone()).collect::<Vec<_>>();
+            let store = self.sidebar.owner_favicons.entry(owner.clone()).or_default();
+            store.sync_presentations(&projects);
+            for project in projects {
+                if !store.presentations.get(&project.id).is_some_and(|(_, _, p)| p.automatic()) || store.requested.get(&project.id) == Some(&project.favicon_path) { continue; }
+                wanted.push((owner.clone(), project));
+            }
+        }
+        for (owner, project) in wanted {
+            if !self.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) { continue; }
+            let resolve = self.connections.destination(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
+            self.sidebar.owner_favicons.entry(owner.clone()).or_default().requested.insert(project.id.clone(), project.favicon_path.clone());
+            let runtime = self.runtime().clone();
+            cx.spawn(async move |this, cx| {
+                let Ok(target) = resolve.await else { return };
+                let root = project.workspace_root.clone();
+                let Ok(Ok(fetched)) = runtime.spawn(async move { t3_client::favicon::fetch_project_favicon(&target.client, &root).await }).await else { return };
+                let _ = this.update(cx, |state, cx| {
+                    let reference = t3_core::sidebar::grouping::ProjectRef { environment_id: owner.saved_id.clone(), project_id: project.id.clone() };
+                    if !state.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) || state.scoped_project(&reference).is_none_or(|current| current.project.created_at != project.created_at || current.project.workspace_root != project.workspace_root || current.project.favicon_path != project.favicon_path) { return; }
+                    let store = state.sidebar.owner_favicons.entry(owner.clone()).or_default();
+                    let key = project_favicon_resource_key(&owner.identity(), &project.workspace_root, project.favicon_path.as_deref());
+                    match fetched {
+                        None => { store.cache.remove(&key); store.images.remove(&project.id); }
+                        Some(icon) => {
+                            let image = Arc::new(Image::from_bytes(image_format(icon.format), icon.bytes.clone()));
+                            if store.cache.insert(key.clone(), icon.revision, icon.bytes, icon.format) {
+                                store.images.insert(project.id.clone(), (key, image));
+                                let cache = &store.cache; store.images.retain(|_, (key, _)| cache.peek(key).is_some());
+                            }
+                        }
+                    }
+                    cx.emit(AppEvent::SidebarSelection);
+                });
+            }).detach();
+        }
+    }
+}

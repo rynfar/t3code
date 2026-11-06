@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Task, div, prelude::*, px, uniform_list};
-use t3_core::families::FamilyRead;
 use t3_core::sidebar::older_settled::{SEARCH_THREADS, search_request};
+use t3_core::sidebar::tag_filter::ThreadKey;
 
 use super::SidebarPane;
 use crate::app_state::AppState;
@@ -19,10 +19,10 @@ const RESULT_HEIGHT: f32 = 36.;
 #[derive(Default)]
 pub struct SearchState {
     query: String,
-    results: Vec<String>,
-    content_matches: Vec<(String, String)>,
+    results: Vec<ThreadKey>,
+    content_matches: Vec<(ThreadKey, String)>,
     highlighted: usize,
-    request: Option<Task<()>>,
+    requests: Vec<Task<()>>,
 }
 
 impl SearchState {
@@ -30,8 +30,8 @@ impl SearchState {
         !self.query.trim().is_empty()
     }
 
-    pub fn highlighted_id(&self) -> Option<&str> {
-        self.results.get(self.highlighted).map(String::as_str)
+    pub fn highlighted_key(&self) -> Option<&ThreadKey> {
+        self.results.get(self.highlighted)
     }
 
     pub fn move_highlight(&mut self, step: isize) {
@@ -46,44 +46,56 @@ impl SearchState {
             return;
         }
         self.query = query;
+        if self.query.trim().is_empty() {
+            state.update(cx, |state, cx| { state.rebuild_sidebar(cx); cx.emit(crate::app_state::AppEvent::Shell); });
+        }
         self.highlighted = 0;
         self.content_matches.clear();
-        self.request = None;
+        self.requests.clear();
         self.refresh(state, cx);
         let trimmed = self.query.trim().to_owned();
         let app = state.read(cx);
-        let generation = app.shell.generation;
-        let Some(payload) = search_request(&trimmed, app.omitted.older().as_ref().map(|older| older.before.as_str()), None) else {
-            state.update(cx, |state, cx| state.mount_search_rows(generation, None, cx));
-            return;
-        };
-        let Some(client) = app.client_handle() else { return };
         let runtime = app.runtime().clone();
-        let state = state.clone();
-        self.request = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            let result = runtime.spawn(async move { client.request(SEARCH_THREADS, payload).await }).await;
-            let Ok(Ok(value)) = result else { return };
-            let rows = serde_json::from_value::<FamilyRead>(value.clone()).ok();
-            let matches: Vec<(String, String)> = value
-                .get("matches")
-                .and_then(|matches| matches.as_array())
-                .map(|matches| {
-                    matches
-                        .iter()
-                        .filter_map(|m| Some((m.get("threadId")?.as_str()?.to_owned(), m.get("snippet").and_then(|s| s.as_str()).unwrap_or("").to_owned())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let _ = this.update(cx, |this, cx| {
-                if this.search.query.trim() == trimmed {
-                    this.search.content_matches = matches;
-                    state.update(cx, |state, cx| state.mount_search_rows(generation, rows, cx));
-                    this.search.refresh(&state, cx);
-                    cx.notify();
-                }
-            });
-        }));
+        let owners: Vec<_> = app.fleet.environments.iter().filter(|entry| app.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)).map(|entry| entry.summary.owner.clone()).collect();
+        if owners.is_empty() {
+            let generation = app.shell.generation;
+            let payload = search_request(&trimmed, app.omitted.older().as_ref().map(|older| older.before.as_str()), None);
+            let client = app.client_handle();
+            state.update(cx, |state, cx| state.mount_search_rows(generation, None, cx));
+            if let (Some(payload), Some(client)) = (payload, client) {
+                let state = state.clone();
+                self.requests.push(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+                    let Ok(Ok(value)) = runtime.spawn(async move { client.request(SEARCH_THREADS, payload).await }).await else { return };
+                    let _ = this.update(cx, |this, cx| {
+                        if this.search.query.trim() != trimmed { return; }
+                        this.search.content_matches = decode_matches(&value, "");
+                        state.update(cx, |state, cx| state.mount_search_rows(generation, serde_json::from_value(value).ok(), cx));
+                        this.search.refresh(&state, cx); cx.notify();
+                    });
+                }));
+            }
+            return;
+        }
+        for owner in owners {
+            let older = state.read(cx).sidebar.owner_omitted.get(&owner).and_then(|omitted| omitted.older());
+            let payload = search_request(&trimmed, older.as_ref().map(|older| older.before.as_str()), None);
+            state.update(cx, |state, cx| state.mount_scoped_search_rows(&owner, None, cx));
+            let Some(payload) = payload else { continue };
+            let resolve = state.read(cx).connections.destination(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
+            let state = state.clone(); let query = trimmed.clone(); let runtime = runtime.clone();
+            self.requests.push(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+                let Ok(target) = resolve.await else { return; };
+                let Ok(Ok(value)) = runtime.spawn(async move { target.client.request(SEARCH_THREADS, payload).await }).await else { return };
+                let _ = this.update(cx, |this, cx| {
+                    if this.search.query.trim() != query || !state.read(cx).scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) { return; }
+                    this.search.content_matches.extend(decode_matches(&value, &owner.saved_id));
+                    state.update(cx, |state, cx| state.mount_scoped_search_rows(&owner, serde_json::from_value(value).ok(), cx));
+                    this.search.refresh(&state, cx); cx.notify();
+                });
+            }));
+        }
     }
 
     /// Re-ranks against the current model, keeping the highlight on the same thread.
@@ -92,20 +104,32 @@ impl SearchState {
             self.results.clear();
             return;
         }
-        let previous = self.highlighted_id().map(str::to_owned);
-        let model = state.read(cx).sidebar.model.clone();
+        let previous = self.highlighted_key().cloned();
+        let app = state.read(cx);
         let now = crate::sidebar::controller::now_ms();
-        let mut results = t3_core::sidebar::search_titles(&model, &self.query, now);
-        for (id, _) in &self.content_matches {
-            if model.thread(id).is_some() && !results.contains(id) {
-                results.push(id.clone());
-            }
+        let mut results = if app.fleet.environments.is_empty() {
+            t3_core::sidebar::search_titles(&app.sidebar.model, &self.query, now).into_iter().map(|id| ThreadKey::new("", &id)).collect()
+        } else {
+            use t3_core::search::{ThreadSearchOptions, ThreadSearchSubject, fold_search_query, rank_search_items, score_thread_search};
+            let normalized = fold_search_query(&self.query);
+            let subjects = app.sidebar.fleet.threads.iter().map(|row| {
+                let thread = &row.thread;
+                (row.key.clone(), ThreadSearchSubject { id: Some(thread.id.clone()), title: thread.title.clone(), branch: thread.branch.clone(),
+                    project_title: app.sidebar.fleet.project_names.get(&row.project).cloned(),
+                    activity_at: thread.latest_user_authored_message_at.unwrap_or_else(|| t3_core::sidebar::sort::thread_sort_timestamp(thread, t3_core::sidebar::sort::ThreadSortOrder::UpdatedAt)),
+                    opens: thread.opens.clone(), ..Default::default() })
+            }).collect::<Vec<_>>();
+            rank_search_items(&subjects, |(_, subject), typos| score_thread_search(&normalized, subject, now, ThreadSearchOptions { typos, picks: false })).into_iter().map(|ranked| ranked.item.0.clone()).collect::<Vec<_>>()
+        };
+        for (key, _) in &self.content_matches {
+            let exists = if key.environment_id.is_empty() { app.sidebar.model.thread(&key.thread_id).is_some() } else { app.sidebar.fleet.thread(key).is_some() };
+            if exists && !results.contains(key) { results.push(key.clone()); }
         }
-        self.highlighted = previous.and_then(|id| results.iter().position(|candidate| *candidate == id)).unwrap_or(0);
+        self.highlighted = previous.and_then(|key| results.iter().position(|candidate| *candidate == key)).unwrap_or(0);
         self.results = results;
     }
 
-    fn snippet(&self, thread_id: &str) -> Option<&str> {
+    fn snippet(&self, thread_id: &ThreadKey) -> Option<&str> {
         self.content_matches.iter().find(|(id, _)| id == thread_id).map(|(_, snippet)| snippet.as_str()).filter(|s| !s.is_empty())
     }
 }
@@ -130,14 +154,15 @@ impl SidebarPane {
         let p = palette(cx);
         let Some(id) = self.search.results.get(index).cloned() else { return div().into_any_element() };
         let state = self.state.read(cx);
-        let Some(thread) = state.sidebar.model.thread(&id) else { return div().h(px(RESULT_HEIGHT)).into_any_element() };
-        let project = state.sidebar.model.project_names.get(&thread.project_id).cloned();
+        let scoped = state.sidebar.fleet.thread(&id);
+        let Some(thread) = scoped.map(|row| &row.thread).or_else(|| state.sidebar.model.thread(&id.thread_id).filter(|_| id.environment_id.is_empty())) else { return div().h(px(RESULT_HEIGHT)).into_any_element() };
+        let project = scoped.and_then(|row| state.sidebar.fleet.project_names.get(&row.project)).or_else(|| state.sidebar.model.project_names.get(&thread.project_id)).cloned();
         let highlighted = index == self.search.highlighted;
         let snippet = self.search.snippet(&id).map(|s| SharedString::from(s.to_owned()));
         let title: SharedString = thread.title.clone().into();
         div().h(px(RESULT_HEIGHT)).px(px(8.)).py(px(1.)).child(
             div()
-                .id(SharedString::from(format!("search-result-{id}")))
+                .id(SharedString::from(format!("search-result-{:?}", id)))
                 .size_full()
                 .flex()
                 .items_center()
@@ -159,9 +184,14 @@ impl SidebarPane {
                 .children(project.map(|name| div().flex_none().max_w(px(96.)).truncate().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(name)))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.clear_search(window, cx);
-                    this.state.update(cx, |state, cx| state.select_thread(&id, cx));
+                    this.state.update(cx, |state, cx| { if id.environment_id.is_empty() { state.select_thread(&id.thread_id, cx); }
+                        else if let Some(owner) = state.scoped_environment(&id.environment_id).map(|entry| entry.summary.owner.clone()) { state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id.thread_id.clone()), cx); } });
                 })),
         )
         .into_any_element()
     }
+}
+
+fn decode_matches(value: &serde_json::Value, environment: &str) -> Vec<(ThreadKey, String)> {
+    value.get("matches").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|row| Some((ThreadKey::new(environment, row.get("threadId")?.as_str()?), row.get("snippet").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()))).collect()
 }
