@@ -246,12 +246,7 @@ impl SidebarPane {
         let p = palette(cx);
         let now = self.now;
         let state = row_state(thread, active, now);
-        let app = self.state.read(cx);
-        let show_snooze = app.sidebar.capabilities.config_loaded
-            && app.server_config.config.is_some()
-            && app.sidebar.capabilities.can_operate
-            && app.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
-            && settled::can_snooze(thread, now);
+        let show_snooze = super::snooze_access(self.state.read(cx)) && settled::can_snooze(thread, now);
         let title_color = if state.recede {
             hsla(p.foreground).opacity(0.75)
         } else if state.status == ThreadStatus::Failed && !state.unread && !state.is_woke {
