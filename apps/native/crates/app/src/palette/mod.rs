@@ -859,7 +859,7 @@ mod scoped_project_tests {
     #[gpui::test]
     fn scoped_project_palette_empty_query_exposes_new_thread_group_browse(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (state, _fixture) = cx.update(|cx| {
+        let (state, fixture) = cx.update(|cx| {
             let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
             crate::composer::init(cx);
             crate::keymap::init(cx);
@@ -892,6 +892,9 @@ mod scoped_project_tests {
             assert!(palette.input.read(cx).focus_handle(cx).is_focused(window));
             window.blur();
         }));
+        state.update(cx, |state, _| state.stop_pump());
+        cx.cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(fixture); drop(runtime); cx.run_until_parked();
     }
 }
 
