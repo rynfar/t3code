@@ -110,10 +110,10 @@ impl AppState {
     /// One more older page while the expanded shelf lists fewer rows than it shows.
     pub(crate) fn grow_settled_shelf(&mut self, listed: usize, cx: &mut Context<Self>) {
         let visible = if self.sidebar.shelves.settled_expanded { self.sidebar.shelves.settled_visible } else { 0 };
+        if listed >= visible { return; }
         let older = self.omitted.older();
-        if self.omitted.pages.grow(older.as_ref(), listed, visible) {
-            self.request_settled_page(cx);
-        }
+        self.omitted.pages.grow(older.as_ref(), listed, visible);
+        self.request_settled_page(cx);
     }
 
     /// Reads a failed page again; the pages after it follow.
@@ -354,8 +354,10 @@ impl AppState {
         for (owner, _) in scopes {
             let omitted = self.sidebar.owner_omitted.get_mut(&owner).unwrap();
             let older = omitted.older();
-            if omitted.pages.listing_frontier(older.as_ref()) == Some(&frontier)
-                && omitted.pages.grow(older.as_ref(),listed,visible) { owners.push(owner); }
+            if omitted.pages.listing_frontier(older.as_ref()) == Some(&frontier) {
+                omitted.pages.grow(older.as_ref(),listed,visible);
+                owners.push(owner);
+            }
         }
         for owner in owners { self.request_scoped_settled_page(owner, cx); }
     }
@@ -532,6 +534,10 @@ mod tests {
             state.sidebar.owner_omitted.get_mut(&owner).unwrap().mounts.mount(&family,owner.shell_generation,vec![FamilyRead { snapshot_sequence:1,threads:vec![sample.clone()] }]);
         });
         state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
+        state.read_with(cx, |state, _| {
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_eq!(omitted.pages.status,PageStatus::Pending,"reopening the scoped Settled shelf must admit its preserved wanted page before awaiting the request");
+        });
         let (_,old_payload,old_reply) = fixture.next_request().await;
         assert_eq!(old_payload["limit"],25);
         state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
