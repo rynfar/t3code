@@ -368,6 +368,36 @@ mod quiet_fleet {
         assert_eq!(view.borrow().environment("a").unwrap().summary.threads[0].thread.pending_subagent_request, None);
     }
 
+    #[tokio::test]
+    async fn quiet_fleet_fixture_uses_real_actor_destination_request_and_watches() {
+        let (entry, mut fixture) = entry("actor");
+        let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(), false);
+        let mut view = owner.view();
+        let events = owner.install_fixture("actor", entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await;
+        view.changed().await.unwrap();
+        let token = view.borrow_and_update().environment("actor").unwrap().summary.owner.clone();
+        let destination = owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await.unwrap();
+        let request = destination.client.request(t3_core::commands::method::DISPATCH_COMMAND, json!({"fixture":"scoped"}));
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload, json!({"fixture":"scoped"}));
+        reply.send(Ok(json!({"sequence":2}))).unwrap();
+        assert_eq!(request.await.unwrap(), json!({"sequence":2}));
+        fixture.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":[]})).unwrap()));
+        view.changed().await.unwrap(); view.borrow_and_update();
+        assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Denied)));
+        fixture.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":[ORCHESTRATION_OPERATE_SCOPE]})).unwrap()));
+        view.changed().await.unwrap(); view.borrow_and_update();
+        assert!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await.is_ok());
+        events.send(ClientEvent::Status(ConnectionStatus::Connecting)).await.unwrap();
+        view.changed().await.unwrap(); view.borrow_and_update();
+        assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Disconnected)));
+        owner.remove("actor");
+        view.changed().await.unwrap();
+        assert!(view.borrow().environments.is_empty());
+        assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Missing)));
+    }
+
     fn b_owner(view: &watch::Receiver<Arc<FleetView>>) -> EnvironmentOwner {
         view.borrow().environment("b").unwrap().summary.owner.clone()
     }

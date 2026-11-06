@@ -99,6 +99,8 @@ pub enum EnvironmentEvent {
 }
 
 enum Command {
+    #[cfg(feature = "test-support")]
+    Fixture { id: String, generation: u64, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, reply: tokio::sync::oneshot::Sender<mpsc::Sender<ClientEvent>> },
     ApplySettings { owner: EnvironmentOwner, settings: t3_core::server_config::ServerSettings, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     ApplyKeybindings { owner: EnvironmentOwner, value: serde_json::Value, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     Destination { owner: EnvironmentOwner, scope: String, reply: tokio::sync::oneshot::Sender<Result<Destination, DestinationError>> },
@@ -147,6 +149,15 @@ impl Environments {
             },
             output,
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn install_fixture(&mut self, id: &str, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus) -> impl std::future::Future<Output = mpsc::Sender<ClientEvent>> + Send + 'static + use<> {
+        self.generation += 1;
+        self.leases.insert(id.into(), (Credentials { http_base: "http://fixture.invalid".into(), access_token: String::new() }, self.generation));
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(Command::Fixture { id: id.into(), generation: self.generation, client, shell, config, status, reply });
+        async move { response.await.expect("fixture environment owner stopped") }
     }
 
     pub fn watch(&mut self, id: &str, credentials: Credentials, prepare: Option<Prepare>) {
@@ -418,6 +429,16 @@ async fn run(
             _ = output.closed() => return,
             command = commands.recv() => match command {
                 None => return,
+                #[cfg(feature = "test-support")]
+                Some(Command::Fixture { id, generation, client, shell, config, status, reply }) => {
+                    let (tx, events) = mpsc::channel(128);
+                    let relay = tokio::spawn(relay_events(events, client.session_state(), client.connection_generation(), frames.clone(), id.clone(), generation));
+                    let credentials = Credentials { http_base: "http://fixture.invalid".into(), access_token: String::new() };
+                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status });
+                    publish(&entries, &id, true, &view);
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
+                    let _ = reply.send(tx);
+                }
                 Some(Command::ApplySettings { owner, settings, revision, reply }) => {
                     let result = entries.get_mut(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| {
                         if entry.owner(&owner.saved_id) != owner { return Err(DestinationError::Stale); }
