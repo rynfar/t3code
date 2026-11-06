@@ -26,6 +26,7 @@ fn base(id: &str) -> SidebarThread {
         id: id.to_owned(),
         project_id: "p1".into(),
         title: id.to_owned(),
+        model_selection: crate::model::ModelSelection { instance_id:"codex".into(), model:"gpt".into(), options:None },
         branch: None,
         worktree_path: None,
         interaction_mode: "default".into(),
@@ -1445,7 +1446,26 @@ fn scoped_sections_follow_loaded_config_per_owner_and_keep_cached_disconnects() 
         assert_eq!(model.section_of("settled"),Some(if config.config.is_some() { Section::Settled } else { Section::Pinned }));
         assert_eq!(model.section_of("working"),Some(Section::Working));
     }
+    let mut model_shell = shell.clone();
+    let mut changed_thread = shell.thread("working").unwrap().clone();
+    changed_thread.model_selection.model = "destination-model-v2".into();
+    assert!(model_shell.apply(serde_json::from_value(json!({
+        "kind":"thread.updated", "sequence":2, "location":"active", "thread":changed_thread,
+    })).unwrap()));
+    let model_changed = EnvironmentSummary::from_shell(owner("ready"), &model_shell, &loaded);
+    let before_thread = ready.threads.iter().find(|thread| thread.thread.id == "working").unwrap();
+    let changed_thread = model_changed.threads.iter().find(|thread| thread.thread.id == "working").unwrap();
+    assert_eq!(before_thread.owner, changed_thread.owner);
+    assert_ne!(before_thread.thread, changed_thread.thread, "a destination model-only change must reach shared sidebar metadata");
     for folder_mode in [false, true] {
+        let model_for = |environment: &EnvironmentSummary| ScopedSidebarModel::build(&ScopedSidebarInput {
+            environments:&[environment], groups:&[], preferences:&preferences, settings:&settings, shelves:&shelves,
+            selected:None, hidden:&hidden, older:&[], extra_threads:&[], now:iso(NOW), folder_mode, dragging:None,
+        }, &mut ScopedSidebarState::default());
+        let before_model = model_for(&ready);
+        let changed_model = model_for(&model_changed);
+        let key = ThreadKey::new("ready", "working");
+        assert_ne!(before_model.thread(&key).unwrap().thread, changed_model.thread(&key).unwrap().thread, "the scoped row consumer must retain destination model-only changes");
         let assert_sections = |environments: &[&EnvironmentSummary], pending_loaded: bool| {
             let model = ScopedSidebarModel::build(&ScopedSidebarInput {
                 environments, groups:&[], preferences:&preferences, settings:&settings, shelves:&shelves,
