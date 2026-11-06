@@ -314,6 +314,17 @@ impl ContextMenu {
         cx.notify();
     }
 
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn custom_snooze_keys(&self) -> Vec<&'static str> {
+        let open = self.open.as_ref().unwrap();
+        let main = Self::enabled(&open.items);
+        let index = main.iter().position(|i| open.items[*i].action == MenuAction::Thread(ThreadAction::SnoozeCustom) || open.items[*i].children.iter().any(|child| matches!(child.action, MenuAction::Thread(ThreadAction::SnoozeCustom) | MenuAction::Bulk(BulkAction::SnoozeCustom)))).unwrap();
+        let mut keys = vec!["down"; index + 1];
+        if !open.items[main[index]].children.is_empty() { keys.extend(["right", "up"]); }
+        keys.push("enter");
+        keys
+    }
+
     pub fn is_open(&self) -> bool {
         self.open.is_some()
     }
@@ -574,7 +585,7 @@ impl Render for ContextMenu {
 }
 
 #[cfg(all(test, feature = "snapshot"))]
-mod project_filter_tests {
+pub(crate) mod project_filter_tests {
     use super::*;
     use gpui::AppContext;
     use t3_client::supervisor::{ClientFixture, ConnectionStatus};
@@ -582,20 +593,20 @@ mod project_filter_tests {
     use t3_core::shell::{ShellSnapshot, ShellState};
     use t3_core::sidebar::grouping::{ProjectScope, build_project_groups};
 
-    fn session(operate: bool) -> AuthSessionState {
+    pub(crate) fn session(operate: bool) -> AuthSessionState {
         serde_json::from_value(serde_json::json!({
             "authenticated":true,
             "permissions": if operate { vec![t3_core::auth::ORCHESTRATION_OPERATE_SCOPE] } else { vec![] }
         })).unwrap()
     }
 
-    fn install(
-        cx: &mut gpui::TestAppContext,
-    ) -> (Entity<AppState>, ClientFixture, tokio::runtime::Runtime) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        cx.update(|cx| {
+    fn install(cx: &mut gpui::TestAppContext) -> (Entity<AppState>, ClientFixture, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (state, fixture) = cx.update(|cx| install_state(cx, runtime.handle().clone()));
+        (state, fixture, runtime)
+    }
+
+    pub(crate) fn install_state(cx: &mut App, runtime: tokio::runtime::Handle) -> (Entity<AppState>, ClientFixture) {
             gpui_component::init(cx);
             crate::theme::init(cx);
             crate::settings::store::init(cx);
@@ -604,8 +615,7 @@ mod project_filter_tests {
                 "auth":{"phase":"idle"},"install":{"phase":"idle"}
             })).unwrap();
             cx.set_global(fixture);
-        });
-        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        let state = cx.new(|cx| AppState::new(runtime, cx));
         let (client, mut fixture) = ClientFixture::handle(session(true));
         state.update(cx, |state, cx| {
             state.environments = serde_json::from_value(serde_json::json!({"active":"saved-fixture", "environments":[{
@@ -633,7 +643,7 @@ mod project_filter_tests {
             state.install_active_environment(client, shell, state.server_config.clone(), ConnectionStatus::Connected, cx);
         });
         fixture.take_commands();
-        (state, fixture, runtime)
+        (state, fixture)
     }
 
     fn select_groups(state: &Entity<AppState>, keys: &[&str], cx: &mut gpui::TestAppContext) {

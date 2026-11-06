@@ -57,6 +57,8 @@ impl Lineage {
 pub struct PendingRuntimeRequestSummary {
     pub id: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     #[serde(default)]
     pub blocking: Option<bool>,
 }

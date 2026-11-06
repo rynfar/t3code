@@ -2,7 +2,7 @@
 //! (`apps/web/src/components/Sidebar.tsx`, `sidebar/SidebarThreadHeader.tsx`,
 //! `sidebar/SidebarThreadUndoNotice.tsx`). Rows have three heights (card, slim, shelf), so the
 //! list is a variable-height `list` that splices only the rows that changed. The pane is
-//! rendered `.cached()` and notifies itself only on shell, selection and notice changes.
+//! rendered `.cached()` and notifies itself when visible sidebar state changes.
 
 mod bulk;
 mod drafts;
@@ -78,6 +78,8 @@ pub struct SidebarPane {
     drag: Option<drag::PaneDrag>,
     /// A thread or project menu is open; rows show no hover card over it.
     menu_open: bool,
+    snooze_grant_watch: Option<((u64, u64), Task<()>)>,
+    snooze_access: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -133,6 +135,7 @@ impl SidebarPane {
                     }
                     cx.notify();
                 },
+                AppEvent::Phase | AppEvent::ServerConfig => this.sync_snooze_grants(cx),
                 AppEvent::SidebarSelection => {
                     this.model_seen = this.state.read(cx).sidebar.model.clone();
                     this.sync_rows(cx);
@@ -203,10 +206,40 @@ impl SidebarPane {
             clock: None,
             drag: None,
             menu_open: false,
+            snooze_grant_watch: None,
+            snooze_access: false,
             _subscriptions: subscriptions,
         };
         pane.sync_rows(cx);
+        pane.sync_snooze_grants(cx);
         pane
+    }
+
+    fn sync_snooze_grants(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let owner = snooze_grant_owner(state);
+        let allowed = snooze_access(state);
+        let owner_changed = self.snooze_grant_watch.as_ref().map(|(owner, _)| *owner) != owner;
+        if owner_changed {
+            self.snooze_grant_watch = None;
+            if let (Some(owner), Some(client)) = (owner, self.state.read(cx).client_handle()) {
+                let mut grants = client.session_state();
+                self.snooze_grant_watch = Some((owner, cx.spawn(async move |this, cx| {
+                    while grants.changed().await.is_ok() {
+                        let current = this.update(cx, |this, cx| {
+                            if snooze_grant_owner(this.state.read(cx)) != Some(owner) { return false; }
+                            this.sync_snooze_grants(cx);
+                            true
+                        }).unwrap_or(false);
+                        if !current { break; }
+                    }
+                })));
+            }
+        }
+        if owner_changed || self.snooze_access != allowed {
+            self.snooze_access = allowed;
+            cx.notify();
+        }
     }
 
     /// Splices the list so scroll position and measured heights survive streaming updates.
@@ -631,6 +664,17 @@ impl SidebarPane {
     }
 }
 
+fn snooze_grant_owner(state: &AppState) -> Option<(u64, u64)> {
+    Some((state.connection_id()?, *state.client_handle()?.connection_generation().borrow()))
+}
+
+fn snooze_access(state: &AppState) -> bool {
+    state.sidebar.capabilities.config_loaded
+        && state.server_config.config.is_some()
+        && state.sidebar.capabilities.can_operate
+        && state.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
+}
+
 fn new_thread_label(cx: &App) -> String {
     crate::keymap::label("chat.new", cx).map_or_else(|| "New thread".to_owned(), |key| format!("New thread ({key})"))
 }
@@ -680,5 +724,156 @@ impl Render for SidebarPane {
             .child(self.updates.clone())
             .child(self.render_footer(cx))
             .children(self.render_project_filter(cx))
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod snooze_grant_tests {
+    use super::*;
+    use gpui::{AppContext, MouseButton, StyleRefinement};
+    use std::{cell::Cell, rc::Rc};
+    use crate::context_menu::project_filter_tests::{install_state, session};
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+
+    struct CachedSidebar {
+        pane: Entity<SidebarPane>,
+        menu: Entity<ContextMenu>,
+    }
+
+    impl Render for CachedSidebar {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(400.)).h_full()
+                .child(self.pane.clone().cached(StyleRefinement::default().size_full()))
+                .child(self.menu.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn cached_snooze_grants_notify_without_pointer_or_clock_changes(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |s, cx| {
+                s.shell.snapshot.as_mut().unwrap().threads.retain(|t| t.id == "menu-thread");
+                s.rebuild_sidebar(cx);
+                s.draft_project = None;
+                s.pull_requests_open = true;
+                assert!(s.selected_thread.is_none());
+                assert!(t3_core::sidebar::settled::can_snooze(s.sidebar.model.thread("menu-thread").unwrap(), now_ms()));
+            });
+            (state, fixture)
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedSidebar { pane, menu }
+        });
+        let pane = root.read_with(cx, |root, _| root.pane.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| { window.draw(cx).clear(); });
+        let target = gpui::point(px(306.), px(116.));
+        cx.simulate_mouse_move(target, None::<MouseButton>, Default::default());
+        cx.update(|window, cx| { window.draw(cx).clear(); });
+        let now = pane.read_with(cx, |pane, _| pane.now);
+        assert!(!pane.read_with(cx, |pane, _| pane.live_rendered));
+        let notifications = Rc::new(Cell::new(0));
+        let observed = notifications.clone();
+        let _subscription = cx.update(|_, cx| cx.observe(&pane, move |_, _| observed.set(observed.get() + 1)));
+        cx.run_until_parked();
+        let before = notifications.get();
+        fixture.grants.send(Some(session(false))).unwrap();
+        cx.run_until_parked();
+        assert!(notifications.get() > before, "grant-only revoke must notify the cached production pane");
+        cx.update(|window, cx| { assert_eq!(window.mouse_position(), target); window.draw(cx).clear(); });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.now), now);
+        assert!(!pane.read_with(cx, |pane, cx| snooze_access(pane.state.read(cx))));
+
+        let before = notifications.get();
+        fixture.grants.send(Some(session(true))).unwrap();
+        cx.run_until_parked();
+        assert!(notifications.get() > before, "grant-only regrant must notify the cached production pane");
+        cx.update(|window, cx| { assert_eq!(window.mouse_position(), target); window.draw(cx).clear(); });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.now), now);
+
+        assert!(pane.read_with(cx, |pane, cx| snooze_access(pane.state.read(cx))));
+        let before = notifications.get();
+        let mut unrelated = session(true);
+        unrelated.permissions.as_mut().unwrap().push("orchestration:read".into());
+        fixture.grants.send(Some(unrelated)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), before, "unrelated grant changes do not notify the pane");
+
+        // Queue an old-owner delivery before replacement; it must neither notify nor stay subscribed.
+        fixture.grants.send(Some(session(false))).unwrap();
+        let (client, mut replacement) = ClientFixture::handle(session(false));
+        replacement.grants.send(None).unwrap();
+        state.update(cx, |s, cx| s.install_active_environment(client.clone(), s.shell.clone(), s.server_config.clone(), ConnectionStatus::Connected, cx));
+        drop(client);
+        cx.run_until_parked();
+        assert_eq!(fixture.grants.receiver_count(), 0, "old owner watchers are released");
+        assert_eq!(pane.read_with(cx, |pane, _| pane.snooze_grant_watch.as_ref().map(|(owner, _)| *owner)), state.read_with(cx, |state, _| snooze_grant_owner(state)));
+        cx.update(|window, cx| { window.draw(cx).clear(); });
+        let before = notifications.get();
+        fixture.grants.send_replace(Some(session(true)));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), before, "old channel cannot invalidate the new owner");
+
+        replacement.grants.send(Some(session(true))).unwrap();
+        cx.run_until_parked();
+        assert!(notifications.get() > before, "initial current-owner grant must invalidate its cached pane");
+        cx.update(|window, cx| { assert_eq!(window.mouse_position(), target); window.draw(cx).clear(); });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.now), now);
+        assert!(pane.read_with(cx, |pane, cx| snooze_access(pane.state.read(cx))));
+        let receivers = replacement.grants.receiver_count();
+        replacement.generation.send(2).unwrap();
+        state.update(cx, |_, cx| cx.emit(AppEvent::Phase));
+        cx.run_until_parked();
+        assert_eq!(replacement.grants.receiver_count(), receivers, "reconnect replaces the owned watch rather than accumulating receivers");
+
+        for operate in [false, true] {
+            let before = notifications.get();
+            replacement.grants.send(Some(session(operate))).unwrap();
+            cx.run_until_parked();
+            assert!(notifications.get() > before, "reconnected current-owner grant still invalidates the pane");
+            cx.update(|window, _| assert_eq!(window.mouse_position(), target));
+            assert_eq!(pane.read_with(cx, |pane, _| pane.now), now);
+        }
+
+        for field in ["loaded", "capability", "config"] {
+            let config = state.read_with(cx, |state, _| state.server_config.config.clone());
+            for allowed in [false, true] {
+                let before = notifications.get();
+                state.update(cx, |s, cx| {
+                    match field {
+                        "loaded" => s.sidebar.capabilities.config_loaded = allowed,
+                        "capability" => s.sidebar.capabilities.can_operate = allowed,
+                        _ => s.server_config.config = allowed.then(|| config.clone().unwrap()),
+                    }
+                    cx.emit(AppEvent::ServerConfig);
+                });
+                cx.run_until_parked();
+                assert!(notifications.get() > before, "{field} change invalidates the pane");
+                assert_eq!(pane.read_with(cx, |pane, cx| snooze_access(pane.state.read(cx))), allowed);
+                cx.update(|window, cx| { assert_eq!(window.mouse_position(), target); window.draw(cx).clear(); });
+            }
+        }
+        assert_eq!(pane.read_with(cx, |pane, _| pane.now), now);
+        let receivers = replacement.grants.receiver_count();
+        pane.update(cx, |pane, _| pane.snooze_grant_watch = None);
+        cx.run_until_parked();
+        assert_eq!(replacement.grants.receiver_count(), receivers - 1, "dropping the owned task releases exactly its grant receiver");
+        assert!(!fixture.take_commands().contains(&"orchestration.dispatchCommand"));
+        assert!(!replacement.take_commands().contains(&"orchestration.dispatchCommand"));
+        state.update(cx, |state, _| state.stop_pump());
+        cx.cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(fixture); drop(replacement); drop(runtime); cx.run_until_parked();
+        println!("production cached-pane notification contract: revoke/regrant/initial grant, stale-owner release, reconnect and config; stationary pointer, unchanged clock; retained ebd row hit proof is separate");
     }
 }

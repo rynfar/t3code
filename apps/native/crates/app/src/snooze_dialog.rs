@@ -428,7 +428,14 @@ impl SnoozeDialog {
                 ) && this.pending.as_ref().is_some_and(|request| {
                     request.owner.is_none() || request.owner != SnoozeOwner::capture(state.read(cx))
                 }) {
+                    let previous = this.pending.as_ref().and_then(|request| request.previous_focus.clone());
                     this.close(window, cx);
+                    // Other owner-change subscribers may focus the composer after this one.
+                    if let Some(focus) = previous {
+                        cx.defer_in(window, move |this, window, cx| {
+                            if this.pending.is_none() { window.focus(&focus, cx); }
+                        });
+                    }
                 }
             }),
         );
@@ -1282,5 +1289,450 @@ mod calendar_tests {
         assert!(!calendar_disabled(today, before, &zone));
         assert!(calendar_disabled(yesterday, after, &zone));
         assert!(!calendar_disabled(today, after, &zone));
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod lifecycle {
+    use super::*;
+    use gpui::{AppContext, HeadlessAppContext, Keystroke, PlatformInput, size};
+    use std::sync::Arc;
+    use crate::context_menu::project_filter_tests::{install_state, session};
+
+    struct Flow {
+        state: Entity<AppState>,
+        rows: Entity<crate::sidebar::SidebarPane>,
+        menu: Entity<crate::context_menu::ContextMenu>,
+        dialog: Entity<SnoozeDialog>,
+        outside: FocusHandle,
+    }
+
+    impl Render for Flow {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().bg(hsla(palette(cx).background))
+                .child(div().w(px(400.)).h_full().child(self.rows.update(cx, |pane, cx| pane.render_snooze_rows(window, cx))))
+                .child(div().track_focus(&self.outside).absolute().right(px(20.)).top(px(20.)).child("Synthetic snooze lifecycle"))
+                .child(self.menu.clone()).child(self.dialog.clone())
+                .children(crate::settings::overlay(window, cx))
+                .children(crate::toast::stack(&self.state, window, cx))
+        }
+    }
+
+    fn accommodate(dialog: &Entity<SnoozeDialog>, window: &mut Window, cx: &mut App) {
+            // Focus assertions run before this test-only NSView raster accommodation.
+            dialog.update(cx, |d, cx| {
+                if d.pending.is_some() && [&d.date, &d.time, &d.amount].iter().any(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
+                    window.focus(&d.footer_focus[1], cx);
+                }
+            });
+    }
+
+    fn key(dialog: &Entity<SnoozeDialog>, window: &mut Window, cx: &mut App, key: &str) {
+        let input_focused = dialog.read(cx).pending.is_some() && [&dialog.read(cx).date, &dialog.read(cx).time, &dialog.read(cx).amount].iter().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        let keystroke = Keystroke::parse(key).unwrap();
+        // GPUI's raw key dispatcher draws dirty inputs first; use their action/capture boundaries here.
+        if input_focused {
+            if key == "enter" {
+                window.dispatch_action(Box::new(gpui_component::input::Enter { secondary:false, shift:false }), cx);
+            } else {
+                dialog.update(cx, |d, cx| d.on_key(&KeyDownEvent { keystroke, is_held:false, prefer_character_input:false }, window, cx));
+            }
+        } else { window.dispatch_keystroke(keystroke, cx); }
+    }
+
+    fn click(window: &mut Window, cx: &mut App, x: f32, y: f32) {
+        let position = point(px(x), px(y));
+        window.simulate_mouse_move(position, cx);
+        window.dispatch_event(PlatformInput::MouseDown(gpui::MouseDownEvent { button: MouseButton::Left, position, modifiers: Default::default(), click_count: 1, first_mouse: false }), cx);
+        window.dispatch_event(PlatformInput::MouseUp(gpui::MouseUpEvent { button: MouseButton::Left, position, modifiers: Default::default(), click_count: 1 }), cx);
+    }
+
+    #[test]
+    fn production_snooze_lifecycle() {
+        let Some(out) = std::env::var_os("T3_SNOOZE_CAPTURE") else { return };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets), gpui_platform::current_headless_renderer);
+        let (state, mut fixture) = cx.update(|cx| {
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            (state, fixture)
+        });
+        assert!(state.read_with(&cx, |state, _| state.selected_thread.is_none()));
+        let mut handles = None;
+        let mut flow = None;
+        let window = cx.open_window(size(px(1000.), px(740.)), |window, cx| {
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let dialog = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| crate::sidebar::SidebarPane::new(state.clone(), composer, menu.clone(), confirm, dialog.clone(), window, cx));
+            let rows = pane;
+            let outside = cx.focus_handle().tab_stop(true);
+            window.focus(&outside, cx);
+            handles = Some((menu.clone(), dialog.clone(), outside.clone()));
+            let view = cx.new(|_| Flow { state:state.clone(), rows, menu, dialog, outside });
+            flow = Some(view.clone());
+            view
+        }).unwrap();
+        let flow = flow.unwrap();
+        let (menu, dialog, outside) = handles.unwrap();
+        let mut records = Vec::new();
+        let draw = |cx: &mut HeadlessAppContext| {
+            cx.update_window(window.into(), |_, window, cx| accommodate(&dialog, window, cx)).unwrap();
+            flow.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(); }).unwrap();
+        };
+        let frame = |cx: &mut HeadlessAppContext, name: &str| {
+            draw(cx);
+            cx.capture_screenshot(window.into()).unwrap().save(out.join(format!("{name}.png"))).unwrap();
+        };
+        let edit = |cx: &mut HeadlessAppContext, f: &mut dyn FnMut(&mut Window, &mut App)| {
+            let was_pending = dialog.read_with(cx, |d, _| d.pending.is_some());
+            let dialog = dialog.clone();
+            cx.update_window(window.into(), |_, win, cx| {
+                f(win, cx);
+                cx.defer(move |cx| {
+                    cx.update_window(window.into(), |_, win, cx| {
+                        if !was_pending && dialog.read(cx).pending.is_some() {
+                            assert!(dialog.read(cx).date.read(cx).focus_handle(cx).is_focused(win));
+                        }
+                        accommodate(&dialog, win, cx);
+                    }).unwrap();
+                });
+            }).unwrap();
+            cx.run_until_parked();
+        };
+        frame(&mut cx, "00-rows");
+        edit(&mut cx, &mut |window, cx| window.simulate_mouse_move(point(px(320.), px(16.)), cx));
+        frame(&mut cx, "01-inline-hover");
+        fixture.grants.send(Some(session(false))).unwrap();
+        frame(&mut cx, "02-inline-revoked");
+        edit(&mut cx, &mut |window, cx| click(window, cx, 306., 16.));
+        assert!(!menu.read_with(&cx, |m, _| m.is_open()));
+        assert_eq!(state.read_with(&cx, |s, _| s.selected_thread.clone()).as_deref(), Some("menu-thread"));
+        state.update(&mut cx, |s, cx| s.close_selected_thread(cx));
+        let denied_commands = fixture.take_commands();
+        records.push(serde_json::json!({"inline":"denied click reaches row, not clock menu", "commands":denied_commands}));
+        fixture.grants.send(Some(session(true))).unwrap();
+        for denied in ["unsupported", "ineligible"] {
+            let caps = state.read_with(&cx, |s, _| s.sidebar.capabilities.clone());
+            let model = state.read_with(&cx, |s, _| s.sidebar.model.clone());
+            state.update(&mut cx, |s, _| {
+                if denied == "unsupported" { s.sidebar.capabilities.config_loaded = false; }
+                else { Arc::make_mut(&mut s.sidebar.model).threads.iter_mut().find(|t| t.id == "menu-thread").unwrap().has_pending_approvals = true; }
+            });
+            draw(&mut cx);
+            edit(&mut cx, &mut |window, cx| click(window, cx, 306., 16.));
+            assert!(!menu.read_with(&cx, |m, _| m.is_open()));
+            assert_eq!(state.read_with(&cx, |s, _| s.selected_thread.clone()).as_deref(), Some("menu-thread"));
+            state.update(&mut cx, |s, cx| { s.close_selected_thread(cx); s.sidebar.capabilities = caps.clone(); s.sidebar.model = model.clone(); });
+            records.push(serde_json::json!({"inlineDenied":denied,"commands":fixture.take_commands(),"hit":"row, not snooze menu"}));
+        }
+        frame(&mut cx, "03-inline-restored");
+        edit(&mut cx, &mut |window, cx| click(window, cx, 306., 16.));
+        assert!(menu.read_with(&cx, |menu, _| menu.is_open()), "actual hover clock click must open inline menu");
+        frame(&mut cx, "03-inline-menu");
+        // Up from no selection selects the final Custom item.
+        edit(&mut cx, &mut |window, cx| {
+            key(&dialog, window, cx, "up"); key(&dialog, window, cx, "enter");
+        });
+        assert!(dialog.read_with(&cx, |dialog, _| dialog.pending.is_some()));
+        frame(&mut cx, "04-inline-custom");
+        edit(&mut cx, &mut |window, cx| {
+            dialog.update(cx, |dialog, cx| { dialog.date.update(cx, |input, cx| { input.set_value("invalid", window, cx); input.focus(window, cx); assert!(input.focus_handle(cx).is_focused(window)); }); });
+            key(&dialog, window, cx, "enter");
+        });
+        assert_eq!(dialog.read_with(&cx, |d, _| d.error), Some("Choose a valid date and time in the future."));
+        frame(&mut cx, "05-invalid-date");
+        edit(&mut cx, &mut |window, cx| {
+            dialog.update(cx, |d, cx| window.focus(&d.mode_focus[1], cx)); key(&dialog, window, cx, "space");
+            assert!(dialog.read(cx).error.is_none());
+        });
+        draw(&mut cx);
+        edit(&mut cx, &mut |window, cx| {
+            dialog.update(cx, |d, cx| d.amount.update(cx, |input, cx| {
+                input.set_value("0", window, cx); input.focus(window, cx);
+                assert!(input.focus_handle(cx).is_focused(window));
+            }));
+            key(&dialog, window, cx, "enter");
+        });
+        assert_eq!(dialog.read_with(&cx, |d, _| d.error), Some("Enter a positive duration."));
+        frame(&mut cx, "06-invalid-duration");
+        edit(&mut cx, &mut |window, cx| {
+            dialog.update(cx, |d, cx| d.amount.update(cx, |input, cx| {
+                input.focus(window, cx);
+                assert!(input.focus_handle(cx).is_focused(window));
+                gpui::EntityInputHandler::replace_text_in_range(input, Some(0..1), "3", window, cx);
+            }));
+        });
+        assert!(dialog.read_with(&cx, |d, _| d.error.is_none()));
+        // The production tab handler wraps through the current mode and footer focus handles.
+        edit(&mut cx, &mut |window, cx| {
+            dialog.update(cx, |d, cx| window.focus(&d.mode_focus[0], cx));
+            let stops = dialog.read(cx).mode_focus.iter().cloned().chain([dialog.read(cx).amount.read(cx).focus_handle(cx)]).chain(dialog.read(cx).unit_focus.iter().cloned()).chain(dialog.read(cx).footer_focus.iter().cloned()).collect::<Vec<_>>();
+            for expected in stops.iter().cycle().skip(1).take(stops.len()) {
+                key(&dialog, window, cx, "tab"); assert!(expected.is_focused(window));
+            }
+            dialog.update(cx, |d, _| assert!(d.mode_focus[0].is_focused(window)));
+            key(&dialog, window, cx, "shift-tab");
+            dialog.update(cx, |d, _| assert!(d.footer_focus[2].is_focused(window)));
+            let previous = dialog.read(cx).pending.as_ref().unwrap().previous_focus.clone();
+            key(&dialog, window, cx, "escape");
+            assert_eq!(window.focused(cx), previous);
+        });
+        assert!(dialog.read_with(&cx, |d, _| d.pending.is_none() && d.clock.is_none() && !d.calendar_open));
+        let invalid_commands = fixture.take_commands();
+        assert!(!invalid_commands.contains(&"orchestration.dispatchCommand"));
+        records.push(serde_json::json!({"invalidEnter":"date and duration", "commands":invalid_commands}));
+        // Actual AppState capture/plan/guarded-submit reads watched grants and generation.
+        for mode in ["revoked", "unknown-grants", "unauthenticated", "capability", "config-loading", "config-missing", "disconnected", "generation", "environment", "connection", "missing-shell", "missing-model", "approval", "valid"] {
+            let shell = state.read_with(&cx, |s, _| s.shell.clone());
+            let config = state.read_with(&cx, |s, _| s.server_config.clone());
+            let caps = state.read_with(&cx, |s, _| s.sidebar.capabilities.clone());
+            let mut replacement_fixture = None;
+            edit(&mut cx, &mut |window, cx| {
+                state.update(cx, |s, _| { s.sidebar.selection.toggle("menu-thread"); s.sidebar.selection.toggle("sibling"); });
+                let request = SnoozeRequest::capture(state.read(cx), vec!["menu-thread".into(), "sibling".into()], true, Some(outside.clone()));
+                assert_eq!(request.plan_for(state.read(cx), now_ms()).unwrap(), ["menu-thread", "sibling"]);
+                dialog.update(cx, |d, cx| d.open(request.clone(), window, cx));
+                state.update(cx, |s, cx| match mode {
+                    "revoked" => { fixture.grants.send(Some(session(false))).unwrap(); },
+                    "unknown-grants" => { fixture.grants.send(None).unwrap(); },
+                    "unauthenticated" => { let mut grant = session(true); grant.authenticated = false; fixture.grants.send(Some(grant)).unwrap(); },
+                    "capability" => s.sidebar.capabilities.can_operate = false,
+                    "config-loading" => s.sidebar.capabilities.config_loaded = false,
+                    "config-missing" => s.server_config.config = None,
+                    "disconnected" => s.phase = Phase::Online(ConnectionStatus::Connecting),
+                    "generation" => { fixture.generation.send(2).unwrap(); },
+                    "environment" => s.server_config.config.as_mut().unwrap().environment.environment_id = "replacement-env".into(),
+                    "connection" => {
+                        let (client, observed) = t3_client::supervisor::ClientFixture::handle(session(true));
+                        replacement_fixture = Some(observed);
+                        s.install_active_environment(client, shell.clone(), config.clone(), ConnectionStatus::Connected, cx);
+                    },
+                    "missing-shell" => s.shell.snapshot.as_mut().unwrap().threads.retain(|t| t.id != "sibling"),
+                    "missing-model" => { s.sidebar.model = Arc::new(Default::default()); },
+                    "approval" => { Arc::make_mut(&mut s.sidebar.model).threads.iter_mut().find(|t| t.id == "sibling").unwrap().has_pending_approvals = true; },
+                    _ => {}
+                });
+                assert_eq!(request.plan_for(state.read(cx), now_ms()).is_some(), mode == "valid", "{mode}");
+                dialog.update(cx, |d, cx| {
+                    d.mode = Mode::Duration;
+                    d.amount.update(cx, |input, cx| input.set_value("2", window, cx));
+                    d.submit(window, cx);
+                });
+                if mode != "valid" {
+                    assert_eq!(state.read(cx).sidebar.selection.len(), 2, "{mode}");
+                } else { assert_eq!(state.read(cx).sidebar.selection.len(), 0); }
+                dialog.update(cx, |d, cx| d.close(window, cx));
+            });
+            let commands = fixture.take_commands();
+            let replacement_commands = replacement_fixture.as_mut().map(|fixture| fixture.take_commands()).unwrap_or_default();
+            assert!(!replacement_commands.contains(&"orchestration.dispatchCommand"));
+            records.push(serde_json::json!({"guard":mode,"commands":commands,"replacementCommands":replacement_commands}));
+            println!("guard {mode}: {commands:?}");
+            std::fs::write(out.join("actions.json"), serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+            assert_eq!(commands.iter().filter(|m| **m == "orchestration.dispatchCommand").count(), if mode == "valid" {2} else {0}, "{mode}: {commands:?}");
+            edit(&mut cx, &mut |_, cx| state.update(cx, |s, cx| {
+                let _ = s.sidebar.selection.clear();
+                let (client, replacement) = t3_client::supervisor::ClientFixture::handle(session(true));
+                fixture = replacement;
+                s.install_active_environment(client, shell.clone(), config.clone(), ConnectionStatus::Connected, cx);
+                s.sidebar.capabilities = caps.clone();
+            }));
+            fixture.take_commands();
+        }
+        for changed in ["phase", "generation", "environment"] {
+            let config = state.read_with(&cx, |s, _| s.server_config.clone());
+            edit(&mut cx, &mut |window, cx| {
+                window.focus(&outside, cx);
+                let request = SnoozeRequest::capture(state.read(cx), vec!["menu-thread".into()], false, Some(outside.clone()));
+                dialog.update(cx, |d, cx| d.open(request, window, cx));
+                state.update(cx, |s, cx| {
+                    match changed {
+                        "phase" => { s.phase = Phase::Online(ConnectionStatus::Connecting); },
+                        "generation" => { fixture.generation.send(2).unwrap(); },
+                        _ => s.server_config.config.as_mut().unwrap().environment.environment_id = "replacement-env".into(),
+                    }
+                    cx.emit(if changed == "environment" { crate::app_state::AppEvent::ServerConfig } else { crate::app_state::AppEvent::Phase });
+                });
+            });
+            assert!(dialog.read_with(&cx, |d, _| d.pending.is_none() && d.clock.is_none() && !d.calendar_open));
+            cx.update_window(window.into(), |_, win, _| assert!(outside.is_focused(win), "owner event: {changed}")).unwrap();
+            state.update(&mut cx, |s, _| { s.server_config = config.clone(); s.phase = Phase::Online(ConnectionStatus::Connected); });
+            fixture.generation.send(1).unwrap();
+            assert!(!fixture.take_commands().contains(&"orchestration.dispatchCommand"));
+            records.push(serde_json::json!({"invalidationEvent":changed,"requestCancelled":true,"timerReleased":true,"focusRestored":true}));
+        }
+        edit(&mut cx, &mut |window, cx| {
+            let first = SnoozeRequest::capture(state.read(cx), vec!["menu-thread".into()], false, Some(outside.clone()));
+            dialog.update(cx, |d, cx| {
+                d.open(first, window, cx);
+                let next = SnoozeRequest::capture(state.read(cx), vec!["sibling".into()], false, Some(d.footer_focus[0].clone()));
+                d.mode = Mode::Duration;
+                d.amount.update(cx, |input, cx| input.set_value("9", window, cx));
+                d.calendar.update(cx, |calendar, _| calendar.set_view(CalendarView::Year));
+                d.open(next, window, cx);
+                assert!(d.date.read(cx).focus_handle(cx).is_focused(window));
+                assert_eq!(d.pending.as_ref().unwrap().ids, ["sibling"]);
+                assert!(d.mode == Mode::Date && d.unit == DurationUnit::Hours);
+                assert_eq!(d.amount.read(cx).value().as_str(), "2");
+                assert_eq!(d.calendar.read(cx).view(), CalendarView::Day);
+                d.close(window, cx);
+                assert!(outside.is_focused(window));
+            });
+        });
+        edit(&mut cx, &mut |window, cx| {
+            window.focus(&outside, cx);
+            menu.update(cx, |m, cx| m.open_for_thread("menu-thread", point(px(20.), px(20.)), window, cx));
+        });
+        draw(&mut cx);
+        let keys = menu.read_with(&cx, |m, _| m.custom_snooze_keys());
+        for next in keys { edit(&mut cx, &mut |window, cx| key(&dialog, window, cx, next)); }
+        assert!(dialog.read_with(&cx, |d, _| d.pending.as_ref().is_some_and(|r| !r.bulk && r.ids == ["menu-thread"])));
+        edit(&mut cx, &mut |window, cx| key(&dialog, window, cx, "escape"));
+        // The expired fixed-time path keeps bulk selection and queues no command.
+        edit(&mut cx, &mut |_, cx| state.update(cx, |s, cx| {
+            s.toasts = Default::default();
+            s.sidebar.selection.toggle("menu-thread");
+            let request = SnoozeRequest::capture(s, vec!["menu-thread".into()], true, None);
+            let shown = [t3_core::sidebar::settled::SnoozePreset { id:"at:today:00:00".into(), label:"Expired".into(), when_label:"00:00".into(), snoozed_until:0 }];
+            request.pick_preset(&shown[0].id, &shown, s, cx);
+            assert_eq!(s.sidebar.selection.len(), 1);
+            s.sidebar.selection.clear();
+            let actions = t3_core::thread_actions::plan_undo(t3_core::thread_actions::PlanFor::Snooze, false, None, None);
+            assert_eq!(actions, [t3_core::thread_actions::UndoStep::Unsnooze]);
+            assert!(request.plan_for_action(s, now_ms(), false).is_some());
+        }));
+        assert!(!fixture.take_commands().contains(&"orchestration.dispatchCommand"));
+        frame(&mut cx, "expired-preset-warning");
+        edit(&mut cx, &mut |_, cx| state.update(cx, |s, cx| {
+            let original = s.server_config.config.as_ref().unwrap().settings.threads.snooze_presets.clone();
+            s.server_config.config.as_mut().unwrap().settings.threads.snooze_presets = vec![t3_core::settings::snooze::SnoozePreset::After { minutes:90 }];
+            let request = SnoozeRequest::capture(s, vec!["menu-thread".into()], true, None);
+            let shown = [t3_core::sidebar::settled::SnoozePreset { id:"after:90".into(), label:"In 90 minutes".into(), when_label:"Expired shown time".into(), snoozed_until:0 }];
+            s.sidebar.selection.toggle("menu-thread");
+            let fixed = t3_core::sidebar::settled::pick_snooze_preset(&shown, "after:90", 1_000, &s.snooze_settings(), &SystemZone, &crate::sidebar::controller::time_label).unwrap();
+            assert_eq!(fixed.snoozed_until, 1_000 + 90 * MINUTE_MS);
+            request.pick_preset("after:90", &shown, s, cx);
+            assert!(s.sidebar.selection.is_empty());
+            s.server_config.config.as_mut().unwrap().settings.threads.snooze_presets = original;
+        }));
+        let preset_commands = fixture.take_commands();
+        assert_eq!(preset_commands.iter().filter(|m| **m == "orchestration.dispatchCommand").count(), 1);
+        records.push(serde_json::json!({"preset":"re-resolved from current settings", "commands":preset_commands}));
+        edit(&mut cx, &mut |window, cx| {
+            window.focus(&outside, cx);
+            let request = SnoozeRequest::capture(state.read(cx), vec!["sibling".into()], false, Some(outside.clone()));
+            dialog.update(cx, |d, cx| { d.open(request, window, cx); d.mode = Mode::Duration; });
+        });
+        draw(&mut cx);
+        edit(&mut cx, &mut |window, cx| {
+            dialog.update(cx, |d, cx| d.amount.update(cx, |input, cx| {
+                input.focus(window, cx); assert!(input.focus_handle(cx).is_focused(window));
+            }));
+            key(&dialog, window, cx, "enter");
+        });
+        assert!(dialog.read_with(&cx, |d, _| d.pending.is_none() && d.clock.is_none()));
+        cx.update_window(window.into(), |_, win, _| assert!(outside.is_focused(win))).unwrap();
+        let enter_commands = fixture.take_commands();
+        assert_eq!(enter_commands.iter().filter(|m| **m == "orchestration.dispatchCommand").count(), 1);
+        records.push(serde_json::json!({"singleValidInputEnter":true,"target":"sibling","commands":enter_commands}));
+        // A fresh bulk request is cancelled through each actual event path without selection loss.
+        for route in ["cancel", "cancel-key", "backdrop", "escape", "settings-key", "settings-click"] {
+            edit(&mut cx, &mut |window, cx| {
+                state.update(cx, |s, _| { s.sidebar.selection.toggle("menu-thread"); s.sidebar.selection.toggle("sibling"); });
+                window.focus(&outside, cx);
+                menu.update(cx, |m, cx| m.open_for_selection(point(px(20.), px(20.)), window, cx));
+            });
+            draw(&mut cx);
+            let keys = menu.read_with(&cx, |m, _| m.custom_snooze_keys());
+            for next in keys { edit(&mut cx, &mut |window, cx| key(&dialog, window, cx, next)); }
+            assert!(dialog.read_with(&cx, |d, _| d.pending.as_ref().is_some_and(|r| r.bulk && r.ids.len() == 2)));
+            if route == "cancel" { frame(&mut cx, "07-bulk-custom"); } else { draw(&mut cx); }
+            edit(&mut cx, &mut |window, cx| {
+                dialog.update(cx, |d, cx| {
+                    assert!(d.mode == Mode::Date);
+                    assert_eq!(d.unit, DurationUnit::Hours);
+                    assert_eq!(d.amount.read(cx).value().as_str(), "2");
+                    assert!(d.error.is_none());
+                    window.focus(&d.mode_focus[0], cx);
+                });
+                let stops = dialog.read(cx).mode_focus.iter().cloned().chain([dialog.read(cx).date.read(cx).focus_handle(cx), dialog.read(cx).calendar_trigger.clone(), dialog.read(cx).time.read(cx).focus_handle(cx)]).chain(dialog.read(cx).footer_focus.iter().cloned()).collect::<Vec<_>>();
+                for expected in stops.iter().cycle().skip(1).take(stops.len()) {
+                    key(&dialog, window, cx, "tab"); assert!(expected.is_focused(window));
+                }
+                dialog.update(cx, |d, _| assert!(d.mode_focus[0].is_focused(window)));
+            });
+            edit(&mut cx, &mut |window, cx| {
+                if route.starts_with("settings") {
+                    dialog.update(cx, |d, cx| {
+                        d.amount.update(cx, |input, cx| input.set_value("9", window, cx));
+                        d.calendar.update(cx, |calendar, _| calendar.set_view(CalendarView::Year));
+                    });
+                }
+                match route {
+                    "cancel" => click(window, cx, 553., 485.),
+                    "cancel-key" => { dialog.update(cx, |d, cx| window.focus(&d.footer_focus[1], cx)); key(&dialog, window, cx, "space"); },
+                    "backdrop" => {
+                        click(window, cx, 500., 270.);
+                        assert!(dialog.read(cx).pending.is_some());
+                        click(window, cx, 950., 700.);
+                    },
+                    "escape" => {
+                        dialog.update(cx, |d, cx| window.focus(&d.calendar_trigger, cx)); key(&dialog, window, cx, "space");
+                        assert!(dialog.read(cx).calendar_open);
+                        key(&dialog, window, cx, "escape");
+                        assert!(!dialog.read(cx).calendar_open && dialog.read(cx).calendar_trigger.is_focused(window));
+                        key(&dialog, window, cx, "escape");
+                    },
+                    "settings-key" => {
+                        dialog.update(cx, |d, cx| window.focus(&d.calendar_trigger, cx)); key(&dialog, window, cx, "space");
+                        assert!(dialog.read(cx).calendar_open);
+                        dialog.update(cx, |d, cx| window.focus(&d.footer_focus[0], cx)); key(&dialog, window, cx, "enter");
+                    },
+                    "settings-click" => click(window, cx, 420., 483.),
+                    _ => unreachable!()
+                }
+            });
+            assert!(dialog.read_with(&cx, |d, _| d.pending.is_none() && d.clock.is_none() && !d.calendar_open), "{route}");
+            assert_eq!(state.read_with(&cx, |s, _| s.sidebar.selection.len()), 2, "{route}");
+            records.push(serde_json::json!({"cancelRoute":route,"pending":false,"timerOwned":false,"selection":2}));
+            println!("cancel route {route}: released request/timer, retained selection");
+            if route.starts_with("settings") {
+                frame(&mut cx, &format!("{route}-navigation"));
+                edit(&mut cx, &mut |window, cx| click(window, cx, 5., 5.));
+                cx.update_window(window.into(), |_, win, _| assert!(outside.is_focused(win))).unwrap();
+                edit(&mut cx, &mut |window, cx| {
+                    let request = SnoozeRequest::capture(state.read(cx), vec!["sibling".into()], false, Some(outside.clone()));
+                    dialog.update(cx, |d, cx| {
+                        d.open(request, window, cx);
+                        assert!(d.date.read(cx).focus_handle(cx).is_focused(window));
+                        assert_eq!(d.pending.as_ref().unwrap().ids, ["sibling"]);
+                        assert_eq!(d.pending.as_ref().unwrap().owner, SnoozeOwner::capture(state.read(cx)));
+                        assert!(d.mode == Mode::Date && d.unit == DurationUnit::Hours && d.error.is_none());
+                        assert_eq!(d.amount.read(cx).value().as_str(), "2");
+                        assert_eq!(d.calendar.read(cx).view(), CalendarView::Day);
+                        d.close(window, cx);
+                        assert!(outside.is_focused(window));
+                    });
+                });
+            } else { edit(&mut cx, &mut |window, _| assert!(outside.is_focused(window), "{route}")); }
+            state.update(&mut cx, |s, _| { s.sidebar.selection.clear(); });
+            let commands = fixture.take_commands();
+            assert!(!commands.contains(&"orchestration.dispatchCommand") && !commands.contains(&"server.updateSettings"));
+        }
+        assert!(state.read_with(&cx, |s, _| s.selected_thread.is_none()));
+        std::fs::write(out.join("actions.json"), serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+        std::fs::write(out.join("isolation.json"), serde_json::to_vec_pretty(&serde_json::json!({"selectedThread":state.read_with(&cx, |s, _| s.selected_thread.clone()),"client":"ClientFixture: in-memory channels, no supervisor", "networkWrites":0,"guards":["grant","capability","config","connection","generation","environment","target"],"validBulkSubmitCommands":2,"validSingleEnterCommands":1,"validPresetCommands":1})).unwrap()).unwrap();
+        state.update(&mut cx, |s, _| s.stop_pump());
+        cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(fixture); drop(runtime); cx.run_until_parked();
     }
 }

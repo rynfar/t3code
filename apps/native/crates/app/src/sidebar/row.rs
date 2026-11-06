@@ -246,7 +246,7 @@ impl SidebarPane {
         let p = palette(cx);
         let now = self.now;
         let state = row_state(thread, active, now);
-        let show_snooze = settled::can_snooze(thread, now);
+        let show_snooze = super::snooze_access(self.state.read(cx)) && settled::can_snooze(thread, now);
         let title_color = if state.recede {
             hsla(p.foreground).opacity(0.75)
         } else if state.status == ThreadStatus::Failed && !state.unread && !state.is_woke {
@@ -784,5 +784,17 @@ mod capture {
             cx.capture_screenshot(window.into()).unwrap().save(std::path::Path::new(&out).join(format!("{step}-{label}.png"))).unwrap();
         }
         std::fs::write(std::path::Path::new(&out).join("model.json"), serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+impl SidebarPane {
+    pub(crate) fn render_snooze_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.state.read(cx).sidebar.model.rows.len();
+        let mut rows = div().size_full().flex().flex_col().bg(hsla(palette(cx).sidebar));
+        for index in 0..count {
+            rows = rows.child(self.render_row(index, window, cx));
+        }
+        rows.into_any_element()
     }
 }
