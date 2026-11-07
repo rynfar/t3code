@@ -284,3 +284,202 @@ async fn watched_thread_navigation_preserves_same_scope_shelves(cx: &mut gpui::T
     drop(background_events);
     drop(destination);
 }
+
+#[gpui::test]
+async fn scoped_deadline_wakes_rebuild_without_new_shell_facts(cx: &mut gpui::TestAppContext) {
+    use t3_client::supervisor::ClientEvent;
+    use t3_core::shell::ShellStreamItem;
+    use crate::sidebar::controller::now_ms;
+    use std::sync::Arc;
+    use t3_core::sidebar::{Section as ThreadSection, Shelf};
+    use t3_core::sidebar::fleet::ScopedSidebarRow;
+    use t3_core::sidebar::tag_filter::ThreadKey;
+
+    // The production deadline timers and fixture actor advance through real scheduler parking.
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, mut original_fixture) = cx.update(|cx| {
+        let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::store::install_committed_client(&installed.0, serde_json::from_value(serde_json::json!({
+            "sidebarWorkingShelfEnabled":true,"boringSidebarEnabled":false
+        })).unwrap(), cx);
+        installed
+    });
+    let (actor, mut fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({
+        "authenticated":true,"permissions":["orchestration:read","orchestration:operate"]
+    })).unwrap());
+    let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
+    let snapshot = shell.snapshot.as_mut().unwrap();
+    snapshot.snapshot_sequence = 1;
+    let worker = snapshot.threads.iter_mut().find(|thread| thread.id == "menu-thread").unwrap();
+    worker.status = "running".into();
+    worker.latest_run_id = Some("wake-run".into());
+    worker.active_run_id = Some("wake-run".into());
+    let control = snapshot.threads.iter_mut().find(|thread| thread.id == "other-thread").unwrap();
+    control.created_at = "2026-01-02T00:00:00Z".into();
+    let (sent, loaded) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let loaded_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", actor, shell, config, ConnectionStatus::Connected));
+    let events = runtime.spawn(install).await.unwrap();
+    loaded.await.unwrap();
+    drop(loaded_subscription);
+    let (sent, activated) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let activated_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("menu-thread").is_some() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
+    activated.await.unwrap();
+    drop(activated_subscription);
+    state.update(cx, |state, cx| {
+        state.sidebar.shelves.working_expanded = true;
+        state.sidebar.shelves.snoozed_expanded = true;
+        state.rebuild_sidebar(cx);
+    });
+    let worker_key = ThreadKey::new("saved-fixture", "menu-thread");
+    let sleeper_key = ThreadKey::new("saved-fixture", "sibling");
+    let control_key = ThreadKey::new("saved-fixture", "other-thread");
+    let (owner, route) = state.read_with(cx, |state, _| {
+        let owner = state.scoped_environment("saved-fixture").unwrap().summary.owner.clone();
+        assert!(state.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        assert_eq!(state.fleet.environments.len(), 1);
+        assert!(state.selected_thread.is_none());
+        assert!(state.project_preferences.scope_keys.is_empty());
+        assert_eq!(state.sidebar.fleet.section_of(&worker_key), Some(ThreadSection::Working));
+        assert_eq!(state.sidebar.fleet.section_of(&sleeper_key), Some(ThreadSection::Active));
+        assert_eq!(state.sidebar.fleet.section_of(&control_key), Some(ThreadSection::Active));
+        assert_eq!(state.sidebar.fleet.next_change_at, None);
+        (owner, (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()))
+    });
+    let (sent, armed) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let armed_key = sleeper_key.clone();
+    let armed_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == AppEvent::Shell && state.shell.sequence() == Some(2) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
+            && state.sidebar.fleet.section_of(&armed_key) == Some(ThreadSection::Snoozed) {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    let (sent, woke) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let woke_key = sleeper_key.clone();
+    let woke_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == AppEvent::Shell && state.shell.sequence() == Some(2) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
+            && state.sidebar.fleet.section_of(&woke_key) == Some(ThreadSection::Active) && state.sidebar.fleet.next_change_at.is_none() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    let (snoozed, until) = state.read_with(cx, |state, _| {
+        let mut thread = state.thread_shell("sibling").unwrap().clone();
+        let now = now_ms();
+        let until = now + 1_000;
+        thread.snoozed_at = Some(t3_core::sidebar::time::format_iso(now));
+        thread.snoozed_until = Some(t3_core::sidebar::time::format_iso(until));
+        (thread, until)
+    });
+    let send_events = events.clone();
+    runtime.spawn(async move { send_events.send(ClientEvent::Shell(ShellStreamItem::ThreadUpdated {
+        sequence:2, location:"active".into(), thread:Box::new(snoozed),
+    })).await.unwrap(); }).await.unwrap();
+    armed.await.unwrap();
+    drop(armed_subscription);
+    let (held_snooze, snooze_summary) = state.read_with(cx, |state, _| {
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.owner, owner);
+        assert_eq!(state.sidebar.fleet.section_of(&sleeper_key), Some(ThreadSection::Snoozed));
+        assert!(until > now_ms(), "fixture must still be snoozed before its natural wake");
+        assert_eq!(state.sidebar.fleet.next_change_at, Some(until));
+        assert_eq!(state.sidebar.fleet.partition.snoozed.len(), 1);
+        assert!(state.sidebar.fleet.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Shelf { shelf:Shelf::Snoozed, count:1, expanded:true })));
+        (state.sidebar.fleet.clone(), state.scoped_environment("saved-fixture").unwrap().summary.clone())
+    });
+    woke.await.unwrap();
+    drop(woke_subscription);
+    state.read_with(cx, |state, _| {
+        assert!(!Arc::ptr_eq(&held_snooze, &state.sidebar.fleet));
+        assert!(Arc::ptr_eq(&snooze_summary, &state.scoped_environment("saved-fixture").unwrap().summary), "wake must not depend on new fleet facts");
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.owner, owner);
+        assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route);
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.snapshot_sequence, Some(2));
+        assert_eq!(state.sidebar.fleet.section_of(&worker_key), Some(ThreadSection::Working));
+        assert_eq!(state.sidebar.fleet.section_of(&sleeper_key), Some(ThreadSection::Active));
+        assert_eq!(state.sidebar.fleet.section_of(&control_key), Some(ThreadSection::Active));
+        assert!(state.sidebar.fleet.partition.snoozed.is_empty());
+        assert_eq!(state.sidebar.fleet.next_change_at, None);
+        assert_eq!(state.sidebar.fleet.partition.active.iter().map(|index| state.sidebar.fleet.threads[*index].key.clone()).collect::<Vec<_>>(), vec![control_key.clone(), sleeper_key.clone()]);
+    });
+    let (sent, completed) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let completed_key = worker_key.clone();
+    let completed_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == AppEvent::Shell && state.shell.sequence() == Some(3) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(3))
+            && state.sidebar.fleet.section_of(&completed_key) == Some(ThreadSection::Working) && state.sidebar.fleet.next_change_at.is_some() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    let (sent, returned) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let returned_key = worker_key.clone();
+    let returned_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == AppEvent::Shell && state.shell.sequence() == Some(3) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(3))
+            && state.sidebar.fleet.section_of(&returned_key) == Some(ThreadSection::Active) && state.sidebar.fleet.next_change_at.is_none() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    let terminal = state.read_with(cx, |state, _| {
+        let mut thread = state.thread_shell("menu-thread").unwrap().clone();
+        thread.status = "completed".into();
+        thread.active_run_id = None;
+        thread.latest_run_completed_at = Some(Some(t3_core::sidebar::time::format_iso(now_ms())));
+        thread
+    });
+    let send_events = events.clone();
+    runtime.spawn(async move { send_events.send(ClientEvent::Shell(ShellStreamItem::ThreadUpdated {
+        sequence:3, location:"active".into(), thread:Box::new(terminal),
+    })).await.unwrap(); }).await.unwrap();
+    completed.await.unwrap();
+    drop(completed_subscription);
+    let (held_working, working_summary) = state.read_with(cx, |state, _| {
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.owner, owner);
+        assert_eq!(state.sidebar.fleet.section_of(&worker_key), Some(ThreadSection::Working));
+        assert!(!t3_core::sidebar::inbox::is_thread_working(&state.sidebar.fleet.thread(&worker_key).unwrap().thread));
+        assert!(state.sidebar.fleet.next_change_at.is_some_and(|deadline| deadline > now_ms()));
+        assert_eq!(state.sidebar.fleet.partition.working.len(), 1);
+        assert!(state.sidebar.fleet.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Shelf { shelf:Shelf::Working, count:1, expanded:true })));
+        (state.sidebar.fleet.clone(), state.scoped_environment("saved-fixture").unwrap().summary.clone())
+    });
+    returned.await.unwrap();
+    drop(returned_subscription);
+    state.read_with(cx, |state, _| {
+        assert!(!Arc::ptr_eq(&held_working, &state.sidebar.fleet));
+        assert!(Arc::ptr_eq(&working_summary, &state.scoped_environment("saved-fixture").unwrap().summary), "grace exit must not depend on new fleet facts");
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.owner, owner);
+        assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route);
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.snapshot_sequence, Some(3));
+        assert_eq!(state.sidebar.fleet.section_of(&worker_key), Some(ThreadSection::Active));
+        assert!(state.sidebar.fleet.partition.working.is_empty());
+        assert!(state.sidebar.fleet.partition.snoozed.is_empty());
+        assert_eq!(state.sidebar.fleet.next_change_at, None);
+        assert_eq!(state.sidebar.fleet.partition.active.iter().map(|index| state.sidebar.fleet.threads[*index].key.clone()).collect::<Vec<_>>(), vec![worker_key, control_key, sleeper_key]);
+    });
+    assert!(original_fixture.take_commands().is_empty());
+    assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+    runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())).await
+        .expect("fixture writer barrier task").expect("fixture writes committed before teardown");
+    cx.run_until_parked();
+    state.update(cx, |state, _| state.stop_pump());
+    drop(events);
+    cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+    drop(original_fixture);
+    drop(fixture);
+    drop(runtime);
+    cx.run_until_parked();
+    println!("natural parked GPUI Snoozed and Working deadline callbacks rebuilt unchanged shell facts, emitted Shell; row membership/order/count and owner/route retained; no pane/label/render claim");
+}
+
