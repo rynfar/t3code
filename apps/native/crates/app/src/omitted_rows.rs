@@ -330,6 +330,27 @@ impl AppState {
         self.sidebar.owner_omitted.entry(owner).or_default().count_task = Some(task);
     }
 
+    pub(crate) fn reconcile_scoped_settled_scopes(&mut self, groups: &[t3_core::sidebar::grouping::ScopedProjectGroup]) {
+        let scope = self.project_preferences.scoped_members(groups,self.fleet.environments.iter().all(|entry| entry.summary.synchronized));
+        for entry in &self.fleet.environments {
+            let owner = &entry.summary.owner;
+            let projects = scope.as_ref().map(|members| {
+                let mut ids = members.iter().filter(|reference| reference.environment_id == owner.saved_id).map(|reference| reference.project_id.clone()).collect::<Vec<_>>();
+                ids.sort();
+                ids
+            });
+            let omitted = self.sidebar.owner_omitted.entry(owner.clone()).or_default();
+            if omitted.scoped_projects != projects {
+                omitted.page_task = None;
+                omitted.mounts.unmount(PAGES_KEY);
+                omitted.pages = SettledPages::default();
+                omitted.scoped_projects = projects;
+                let older = omitted.older();
+                omitted.pages.sync_generation(owner.shell_generation,older.as_ref());
+            }
+        }
+    }
+
     fn scoped_older_projects(&self, owner: &t3_core::sidebar::grouping::EnvironmentOwner, cx:&gpui::App) -> Option<Vec<String>> {
         let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar,cx);
         let scope = self.project_preferences.scoped_members(&groups,self.fleet.environments.iter().all(|entry| entry.summary.synchronized))?;
@@ -341,10 +362,6 @@ impl AppState {
         if listed >= visible { return; }
         let scopes = self.sidebar.owner_omitted.keys().filter(|owner| self.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == **owner))
             .map(|owner| (owner.clone(),self.scoped_older_projects(owner,cx))).filter(|(_, scope)| !scope.as_ref().is_some_and(Vec::is_empty)).collect::<Vec<_>>();
-        for (owner,scope) in &scopes {
-            let omitted = self.sidebar.owner_omitted.get_mut(owner).unwrap();
-            if omitted.scoped_projects != *scope { omitted.pages = SettledPages::default(); omitted.scoped_projects = scope.clone(); let older=omitted.older(); omitted.pages.sync_generation(owner.shell_generation,older.as_ref()); omitted.mounts.unmount(PAGES_KEY); }
-        }
         let frontier = t3_core::sidebar::older_settled::highest_frontier(scopes.iter().filter_map(|(owner, _)| {
             let omitted = self.sidebar.owner_omitted.get(owner)?;
             omitted.pages.listing_frontier(omitted.older().as_ref())
@@ -368,7 +385,7 @@ impl AppState {
         let project_ids = self.scoped_older_projects(&owner,cx);
         if project_ids.as_ref().is_some_and(Vec::is_empty) { return; }
         let omitted = self.sidebar.owner_omitted.entry(owner.clone()).or_default();
-        if omitted.scoped_projects != project_ids { omitted.pages=SettledPages::default(); omitted.scoped_projects=project_ids.clone(); let older=omitted.older(); omitted.pages.sync_generation(owner.shell_generation,older.as_ref()); omitted.mounts.unmount(PAGES_KEY); }
+        if omitted.scoped_projects != project_ids { return; }
         let Some((generation, before)) = omitted.pages.next_request() else { return };
         let resolve = self.connections.destination(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
         let runtime = self.runtime().clone();
@@ -757,6 +774,112 @@ mod tests {
         state.read_with(cx, |state, _| {
             assert_eq!(state.sidebar.shelves.settled_visible,t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT,"changing the effective chosen project scope resets the collapsed Settled tail too");
             assert!(!state.sidebar.shelves.settled_expanded);
+            assert!(state.selected_thread.is_none());
+        });
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+    }
+
+    #[gpui::test]
+    async fn physical_project_scope_releases_pages_before_a_filled_scope_is_derived(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx,runtime.handle().clone()));
+        let (client, mut fixture) = ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap());
+        let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
+        let snapshot = shell.snapshot.as_mut().unwrap();
+        let sample = snapshot.threads[0].clone();
+        let settled = |id: String, project: &str, at| {
+            let mut thread = sample.clone();
+            thread.id = id; thread.lineage.root_thread_id = thread.id.clone();
+            thread.project_id = project.into(); thread.settled_override = Some("settled".into());
+            thread.settled_at = Some(t3_core::sidebar::time::format_iso(at));
+            thread
+        };
+        snapshot.snapshot_sequence = 1;
+        snapshot.threads = (0..35).map(|index| settled(format!("b-{index:02}"),"other",110_000+index*1000)).collect();
+        snapshot.older_settled = Some(serde_json::from_value(serde_json::json!({
+            "before":t3_core::sidebar::time::format_iso(100_000),"asOfSequence":1,"counts":[{"projectId":"checkout-b","count":50}]
+        })).unwrap());
+        config.config.as_mut().unwrap().environment.environment_id = "physical-scope-server".into();
+        state.update(cx, |state, _| state.selected_thread = None);
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("physical-fixture").is_some_and(|entry| entry.summary.threads.len() == 35) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("physical-fixture",client,shell,config,ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        let (owner,scope_a,scope_b) = state.read_with(cx, |state, cx| {
+            let groups = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar,cx);
+            let key = |project| groups.iter().find(|group| group.member_refs.iter().any(|reference| reference.environment_id == "physical-fixture" && reference.project_id == project)).unwrap().key.clone();
+            (state.scoped_environment("physical-fixture").unwrap().summary.owner.clone(),key("checkout-b"),key("other"))
+        });
+        assert_ne!(scope_a,scope_b);
+        state.update(cx, |state, cx| {
+            state.set_scoped_project_scope(vec![scope_a.clone()],cx);
+            state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx);
+        });
+        let (method,payload,reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(payload["limit"],25);
+        assert!(payload["projectIds"].as_array().unwrap().iter().any(|id| id == "checkout-b"));
+        assert!(!payload["projectIds"].as_array().unwrap().iter().any(|id| id == "other"));
+        let page = (0..25).map(|index| settled(format!("a-page-{index:02}"),"checkout-b",90_000-index*1000)).collect::<Vec<_>>();
+        let applied_owner = owner.clone();
+        let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.sidebar.owner_omitted.get(&applied_owner).is_some_and(|omitted| omitted.pages.reads.len() == 1 && omitted.mounts.generation_of(PAGES_KEY) == Some(applied_owner.shell_generation)) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":page}))).unwrap(); applied.await.unwrap();
+        state.update(cx, |state, cx| state.show_more_settled(cx));
+        let (method,old_payload,old_reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(old_payload["limit"],25);
+        assert_eq!(old_payload["projectIds"],payload["projectIds"]);
+        state.update(cx, |state, cx| state.mount_scoped_search_rows(&owner,Some(FamilyRead { snapshot_sequence:1,threads:vec![settled("independent-search".into(),"other",150_000)] }),cx));
+        state.read_with(cx, |state, _| {
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_eq!(omitted.pages.status,PageStatus::Pending);
+            assert_eq!(omitted.pages.reads.len(),1);
+            assert!(omitted.page_task.is_some());
+            assert_eq!(omitted.mounts.generation_of(PAGES_KEY),Some(owner.shell_generation));
+        });
+        state.update(cx, |state, cx| state.set_scoped_project_scope(vec![scope_b],cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.shelves.settled_visible,t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT);
+            assert!(state.sidebar.fleet.listed_settled_count >= t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT);
+            assert!(state.selected_thread.is_none());
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert_eq!(omitted.mounts.generation_of(PAGES_KEY),None,"changing physical project scope must release old page rows even when the new scope already fills its tail");
+            assert_eq!(omitted.scoped_projects.as_deref(),Some(["other".to_owned()].as_slice()));
+            assert!(omitted.pages.reads.is_empty());
+            assert!(omitted.page_task.is_none());
+            assert_eq!(omitted.mounts.generation_of(SEARCH_KEY),Some(owner.shell_generation));
+        });
+        state.update(cx, |state, cx| state.set_scoped_project_scope(vec![scope_a],cx));
+        state.read_with(cx, |state, _| assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().pages.status,PageStatus::Pending,"returning to the empty A scope must admit a fresh page consumer"));
+        let (method,fresh_payload,fresh_reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(fresh_payload,payload);
+        let stale = settled("stale-old-scope".into(),"checkout-b",60_000);
+        let _ = old_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[stale]})));
+        let fresh_owner = owner.clone();
+        let (sent, fresh_applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _fresh_applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.sidebar.owner_omitted.get(&fresh_owner).is_some_and(|omitted| omitted.pages.reads.iter().any(|read| read.threads.iter().any(|thread| thread.id == "fresh-scope-page"))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        fresh_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[settled("fresh-scope-page".into(),"checkout-b",90_000)]}))).unwrap(); fresh_applied.await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.scoped_environment("physical-fixture").unwrap().summary.owner,owner);
+            let omitted = state.sidebar.owner_omitted.get(&owner).unwrap();
+            assert!(omitted.pages.reads.iter().flat_map(|read| &read.threads).all(|thread| thread.id != "stale-old-scope"));
+            assert_eq!(omitted.mounts.generation_of(SEARCH_KEY),Some(owner.shell_generation));
             assert!(state.selected_thread.is_none());
         });
         state.update(cx, |state, _| state.stop_pump());
