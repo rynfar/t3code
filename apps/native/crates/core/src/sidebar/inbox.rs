@@ -45,6 +45,7 @@ struct Placement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackedState {
+    created_at: Option<Ms>,
     working: bool,
     deadline: Option<Ms>,
     placement: Placement,
@@ -91,6 +92,10 @@ impl InboxReturnTracker {
         let mut present = std::collections::HashSet::with_capacity(threads.len());
         for thread in threads {
             present.insert(thread.id.as_str());
+            if self.states.get(&thread.id).is_some_and(|previous| previous.created_at != thread.created_at) {
+                self.states.remove(&thread.id);
+                self.returns.remove(&thread.id);
+            }
             let placement = Placement {
                 archived: thread.archived,
                 deleted: thread.deleted,
@@ -120,7 +125,7 @@ impl InboxReturnTracker {
             if was_working && !working {
                 self.returns.insert(thread.id.clone(), now);
             }
-            self.states.insert(thread.id.clone(), TrackedState { working, deadline: if working { deadline } else { None }, placement });
+            self.states.insert(thread.id.clone(), TrackedState { created_at:thread.created_at, working, deadline: if working { deadline } else { None }, placement });
         }
         self.states.retain(|key, _| present.contains(key.as_str()));
         self.returns.retain(|key, _| present.contains(key.as_str()));
