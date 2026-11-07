@@ -396,6 +396,7 @@ impl AppState {
             self.sidebar.settled_scope_keys = scope_keys;
             self.sidebar.shelves.settled_visible = t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT;
         }
+        self.reconcile_scoped_settled_scopes(&groups);
         let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
         let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id));
         let hidden = self.notifications.visibility.hidden.union(&self.notifications.visibility.delegated_under_parent).cloned().collect();
