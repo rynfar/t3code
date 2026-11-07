@@ -18,11 +18,17 @@ impl AppState {
     pub(crate) fn click_scoped_sidebar_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, modifiers: Modifiers, cx: &mut Context<Self>) {
         let toggle = if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control };
         if toggle {
-            if !self.sidebar.fleet_selection.remove(key) { self.sidebar.fleet_selection.insert(key.clone()); }
+            if !self.sidebar.fleet_selection.remove(key) {
+                self.sidebar.fleet_selection.insert(key.clone());
+                self.sidebar.fleet_anchor = Some(key.clone());
+            }
         } else if modifiers.shift {
             let ordered: Vec<_> = self.sidebar.fleet.ordered.iter().map(|index| self.sidebar.fleet.threads[*index].key.clone()).collect();
             if let (Some(start), Some(end)) = (self.sidebar.fleet_anchor.as_ref().and_then(|anchor| ordered.iter().position(|key| key == anchor)), ordered.iter().position(|candidate| candidate == key)) {
                 self.sidebar.fleet_selection.extend(ordered[start.min(end)..=start.max(end)].iter().cloned());
+            } else {
+                self.sidebar.fleet_selection.insert(key.clone());
+                self.sidebar.fleet_anchor = Some(key.clone());
             }
         } else {
             self.sidebar.fleet_selection.clear();
@@ -63,7 +69,8 @@ impl AppState {
     pub fn clear_thread_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let had = !self.sidebar.selection.is_empty() || !self.sidebar.fleet_selection.is_empty();
         let scoped = !self.sidebar.fleet_selection.is_empty(); self.sidebar.fleet_selection.clear();
-        if self.sidebar.selection.clear() || scoped {
+        let anchored = self.sidebar.fleet_anchor.take().is_some();
+        if self.sidebar.selection.clear() || scoped || anchored {
             self.selection_changed(cx);
         }
         had
