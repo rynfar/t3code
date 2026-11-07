@@ -142,7 +142,7 @@ pub struct SidebarController {
     pub grouping_threads: Vec<t3_core::sidebar::fleet::ScopedThread>,
     pub fleet_drag: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::sidebar::Section)>,
     pub shelves: ShelfState,
-    settled_scope_keys: Vec<String>,
+    pub(crate) settled_scope_keys: Vec<String>,
     pub settings: SidebarSettings,
     pub undo: UndoContexts,
     pub capabilities: ThreadCapabilities,

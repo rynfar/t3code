@@ -274,6 +274,8 @@ impl AppState {
         self.shell = ShellState::default();
         let mut previous = std::mem::take(&mut self.sidebar);
         self.sidebar.collapsed = previous.collapsed;
+        self.sidebar.shelves = previous.shelves;
+        self.sidebar.settled_scope_keys = previous.settled_scope_keys;
         self.sidebar.fleet = previous.fleet;
         self.sidebar.fleet_state = previous.fleet_state;
         self.sidebar.fleet_selection = previous.fleet_selection;
