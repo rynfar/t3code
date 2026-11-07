@@ -40,6 +40,12 @@ impl AppState {
         self.selection_changed(cx);
     }
 
+    pub(crate) fn remove_scoped_thread_selection(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey) {
+        if self.sidebar.fleet_selection.remove(key) && self.sidebar.fleet_anchor.as_ref() == Some(key) {
+            self.sidebar.fleet_anchor = None;
+        }
+    }
+
     fn selection_changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(AppEvent::SidebarSelection);
     }
@@ -402,7 +408,7 @@ impl AppState {
                             state.sidebar.undo.show(action, claim, plan, now_ms()); state.after_undo_change(cx);
                             cx.emit(AppEvent::Notice);
                         }
-                        if let Some(key) = owner.key() { state.sidebar.fleet_selection.remove(&key); }
+                        if let Some(key) = owner.key() { state.remove_scoped_thread_selection(&key); }
                         cx.emit(AppEvent::SidebarSelection);
                     }
                 });

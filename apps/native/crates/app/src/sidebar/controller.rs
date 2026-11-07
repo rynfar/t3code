@@ -536,6 +536,7 @@ impl AppState {
         if !scope.is_empty() && !scope.contains(&group.key) {
             self.project_preferences.scope_keys.clear();
             self.sidebar.fleet_selection.clear();
+            self.sidebar.fleet_anchor = None;
             self.save_project_preferences(cx);
         }
     }
@@ -665,7 +666,7 @@ impl AppState {
                     }
                     if ok && valid {
                         state.sidebar.undo.expire_owned(owner, true);
-                        if let Some(key) = owner.key() { state.sidebar.fleet_selection.remove(&key); }
+                        if let Some(key) = owner.key() { state.remove_scoped_thread_selection(&key); }
                         cx.emit(AppEvent::Notice);
                         cx.emit(AppEvent::SidebarSelection);
                     }
@@ -680,7 +681,7 @@ impl AppState {
                 for owner in &owners {
                     if state.scoped_deletion_missing(owner) && owner.can_operate_owner(state)
                         && let Some(key) = owner.key() {
-                        state.sidebar.fleet_selection.remove(&key);
+                        state.remove_scoped_thread_selection(&key);
                     }
                 }
                 if failures > 0 || interruption.is_some() {
@@ -2363,6 +2364,7 @@ mod deletion_tests {
     #[gpui::test]
     async fn scoped_bulk_delete_keeps_same_raw_id_results_local_to_each_owner(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
+        for mode in ["selected-anchor", "failed-anchor", "unselected-anchor"] {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (state, mut first, events) = scoped_delete_fixture(cx, &runtime).await;
         let (client, mut second) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
@@ -2379,7 +2381,16 @@ mod deletion_tests {
         let keys = ["bulk-fixture","second-fixture"].map(|environment| t3_core::sidebar::tag_filter::ThreadKey::new(environment,"menu-thread"));
         let owners = state.read_with(cx, |state, _| keys.iter().map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state,key).unwrap()).collect());
         let route = state.read_with(cx, |state, _| (state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()));
-        state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
+        let (selection, anchor) = state.update(cx, |state, cx| {
+            let modifier = gpui::Modifiers { platform:cfg!(target_os="macos"), control:!cfg!(target_os="macos"), ..Default::default() };
+            let order = if mode == "failed-anchor" { [1, 0] } else { [0, 1] };
+            for index in order { state.click_scoped_sidebar_thread(&keys[index], modifier, cx); }
+            if mode == "unselected-anchor" { state.click_scoped_sidebar_thread(&keys[1], modifier, cx); }
+            assert!(state.sidebar.fleet_selection.contains(&keys[0]));
+            assert_eq!(state.sidebar.fleet_selection.contains(&keys[1]), mode != "unselected-anchor");
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&keys[if mode == "failed-anchor" { 0 } else { 1 }]));
+            (state.sidebar.fleet_selection.clone(), state.sidebar.fleet_anchor.clone())
+        });
         let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
             if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
@@ -2398,6 +2409,8 @@ mod deletion_tests {
         state.read_with(cx, |state, _| {
             assert!(state.sidebar.fleet_selection.contains(&keys[0]));
             assert!(!state.sidebar.fleet_selection.contains(&keys[1]));
+            let expected_anchor = if selection.contains(&keys[1]) && anchor.as_ref() == Some(&keys[1]) { None } else { anchor.as_ref() };
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), expected_anchor, "deletion removes only an actually selected successful anchor: {mode}");
             assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),route);
             assert!(state.toasts.latest().unwrap().description.as_ref().unwrap().contains("1 thread(s) deleted, 1 failed"));
         });
@@ -2406,6 +2419,7 @@ mod deletion_tests {
         state.update(cx, |state, _| state.stop_pump());
         drop(second_events);
         drop(events);
+        }
     }
 
     #[cfg(feature = "snapshot")]

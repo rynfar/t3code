@@ -983,6 +983,50 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let (method,payload,reply)=background.next_request().await;
     assert_eq!(method,t3_core::commands::method::DISPATCH_COMMAND); assert_eq!(payload["type"],"thread.unsettle"); assert_eq!(payload["threadId"],"menu-thread");
     reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap();
+    for mode in ["selected-anchor", "unselected-anchor", "untouched-anchor", "failure"] {
+        let other = t3_core::sidebar::tag_filter::ThreadKey::new("background", "sibling");
+        let modifier = gpui::Modifiers { platform:cfg!(target_os="macos"), control:!cfg!(target_os="macos"), ..Default::default() };
+        let (selection, anchor, owner) = state.update(cx, |state, cx| {
+            state.clear_thread_selection(cx);
+            state.click_scoped_sidebar_thread(&other, modifier, cx);
+            state.click_scoped_sidebar_thread(&key, modifier, cx);
+            if mode == "unselected-anchor" { state.click_scoped_sidebar_thread(&key, modifier, cx); }
+            if mode == "untouched-anchor" {
+                state.click_scoped_sidebar_thread(&other, modifier, cx);
+                state.click_scoped_sidebar_thread(&other, modifier, cx);
+            }
+            let owner = ThreadMenuOwner::capture_scoped(state, &key).unwrap();
+            assert!(owner.current(state) && owner.can_operate_owner(state));
+            assert_eq!(state.sidebar.fleet_selection.contains(&key), mode != "unselected-anchor");
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(if mode == "untouched-anchor" { &other } else { &key }));
+            (state.sidebar.fleet_selection.clone(), state.sidebar.fleet_anchor.clone(), owner)
+        });
+        let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let failed = mode == "failure";
+        let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if (!failed && *event == crate::app_state::AppEvent::SidebarSelection)
+                || (failed && *event == crate::app_state::AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread action stopped")) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        state.update(cx, |state, cx| state.run_scoped_drop_steps(vec![(owner, t3_core::thread_actions::settle(&crate::sidebar::controller::uuid(), &key.thread_id))], cx));
+        let (method, payload, reply) = background.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["type"], "thread.settle");
+        assert_eq!(payload["threadId"], key.thread_id);
+        if failed {
+            reply.send(Err(t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()), message:"cannot settle".into(), error:serde_json::json!({"_tag":"OperationError"}) }))).unwrap();
+        } else { reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap(); }
+        finished.await.unwrap();
+        state.read_with(cx, |state, _| {
+            let mut expected = selection.clone();
+            if !failed { expected.remove(&key); }
+            assert_eq!(state.sidebar.fleet_selection, expected, "{mode}");
+            let expected_anchor = if !failed && selection.contains(&key) && anchor.as_ref() == Some(&key) { None } else { anchor.as_ref() };
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), expected_anchor, "valid placement removes only an actually selected anchor: {mode}");
+        });
+    }
+    state.update(cx, |state, cx| { state.clear_thread_selection(cx); });
     state.read_with(cx,|state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
     assert!(active_fixture.take_commands().is_empty());
     let captured = state.read_with(cx, |state, cx| state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.member_refs.contains(&t3_core::sidebar::grouping::ProjectRef { environment_id:"background".into(), project_id:"checkout-b".into() })).unwrap());
@@ -1216,10 +1260,18 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     }
     for action in [t3_core::thread_actions::ProjectAction::NewThread, t3_core::thread_actions::ProjectAction::Settings] {
         cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
+        let denied_owner = original_owner.clone();
+        let (ready, denied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.owner == denied_owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:operate"]})).unwrap()));
         let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
         assert!(matches!(runtime.spawn(barrier).await.unwrap(), Err(t3_client::environments::DestinationError::Denied)));
         cx.run_until_parked();
+        denied.await.unwrap();
         state.read_with(cx, |state, cx| {
             assert!(!state.scoped_ready(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
             assert!(state.scoped_ready(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
@@ -1244,10 +1296,18 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
             assert!(toast.description.as_ref().is_some_and(|description| !description.is_empty()));
         });
         assert!(background.take_commands().is_empty(), "read-refused project navigation must not send RPCs");
+        let restored_owner = original_owner.clone();
+        let (ready, restored) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.owner == restored_owner && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
         let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
         runtime.spawn(barrier).await.unwrap().unwrap();
         cx.run_until_parked();
+        restored.await.unwrap();
     }
     cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
     let split_ref = stable.member_refs.iter().find(|reference| **reference != representative).unwrap().clone();
@@ -1300,6 +1360,63 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     cx.run_until_parked();
     let route_retained = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()) == before);
     assert!(membership_refused && route_retained, "captured project menu must refuse changed logical membership and replaced representative navigation: membership_refused={membership_refused}, route_retained={route_retained}");
+    let (client, mut local) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
+    let (shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
+    let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+    let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, t3_client::supervisor::ConnectionStatus::Connected));
+    let local_events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+    let (sent, activated) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+    let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.connection_id() != connection && state.thread_shell("other-thread").is_some() {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
+    activated.await.unwrap();
+    let (owner, anchor) = state.update(cx, |state, cx| {
+        let owner = state.scoped_environment("saved-fixture").unwrap().summary.owner.clone();
+        assert_eq!(state.environments.active.as_deref(), Some(owner.saved_id.as_str()));
+        assert_eq!(state.shell.generation, owner.shell_generation);
+        assert_eq!(*state.client_handle().unwrap().connection_generation().borrow(), owner.connection_generation);
+        let reference = t3_core::sidebar::grouping::ProjectRef { environment_id:owner.saved_id.clone(), project_id:"checkout-a".into() };
+        let scope = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.member_refs.contains(&reference)).unwrap().key;
+        state.set_scoped_project_scope(vec![scope], cx);
+        let anchor = t3_core::sidebar::tag_filter::ThreadKey::new(&owner.saved_id, "sibling");
+        assert!(state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == anchor));
+        state.click_scoped_sidebar_thread(&anchor, gpui::Modifiers { platform:cfg!(target_os="macos"), control:!cfg!(target_os="macos"), ..Default::default() }, cx);
+        assert_eq!(state.sidebar.fleet_selection, [anchor.clone()].into_iter().collect());
+        assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&anchor));
+        (owner, anchor)
+    });
+    let (sent, selected) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+    let _selected = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Selection && state.environments.active.as_deref() == Some("saved-fixture") && state.selected_thread.as_deref() == Some("other-thread") {
+            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        }
+    }));
+    state.update(cx, |state, cx| state.navigate_scoped(owner.clone(), crate::app_state::ScopedRouteAction::Thread("other-thread".into()), cx));
+    selected.await.unwrap();
+    let (method, payload, reply) = local.next_request().await;
+    assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+    assert_eq!(payload["type"], "thread.visit"); assert_eq!(payload["threadId"], "other-thread");
+    reply.send(Ok(serde_json::json!({"sequence":1}))).unwrap();
+    state.read_with(cx, |state, _| {
+        assert_eq!(state.scoped_environment("saved-fixture").unwrap().summary.owner, owner);
+        assert!(state.project_preferences.scope_keys.is_empty());
+        assert!(state.sidebar.fleet_selection.is_empty());
+        assert!(state.sidebar.fleet_anchor.is_none(), "automatic route widening clears the previous scoped anchor: {anchor:?}");
+        assert!(state.sidebar.fleet.thread(&t3_core::sidebar::tag_filter::ThreadKey::new("saved-fixture", "other-thread")).is_some());
+    });
+    runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())).await
+        .expect("fixture writer barrier task").expect("route reveal preferences committed before teardown");
+    cx.run_until_parked();
+    state.update(cx, |state, _| state.stop_pump());
+    drop(local_events);
 }
 
 #[gpui::test]
