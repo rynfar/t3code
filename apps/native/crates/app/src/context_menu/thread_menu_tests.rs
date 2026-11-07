@@ -1026,6 +1026,500 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
             assert_eq!(state.sidebar.fleet_anchor.as_ref(), expected_anchor, "valid placement removes only an actually selected anchor: {mode}");
         });
     }
+    {
+        let (read_client, mut read_only) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap());
+        let (operate_client, mut operate) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
+        let mut fixture_events = Vec::new();
+        let (shell, config) = state.read_with(cx, |state, _| (state.shell.clone(), state.scoped_environment("background").unwrap().config.clone()));
+        for (id, client, settled) in [("bulk-settled", read_client, true), ("bulk-operate", operate_client, false)] {
+            let mut shell = shell.clone();
+            let snapshot = shell.snapshot.as_mut().unwrap();
+            snapshot.threads.retain(|thread| thread.id == "menu-thread");
+            snapshot.threads[0].settled_override = Some(if settled { "settled" } else { "active" }.into());
+            for project in &mut snapshot.projects { project.project_icon = Some(serde_json::json!({"kind":"monogram","text":"P","color":"blue"})); }
+            let mut config = config.clone();
+            config.config.as_mut().unwrap().environment.environment_id = id.into();
+            let (sent, published) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+            let _published = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+                if *event == crate::app_state::AppEvent::Shell && state.scoped_environment(id).is_some_and(|entry|
+                    entry.summary.owner.canonical_id.as_deref() == Some(id) && entry.config.config.is_some()
+                        && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                            && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) != settled))
+                    && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(id, "menu-thread")).is_some_and(|row| row.thread.is_settled() == settled) {
+                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                }
+            }));
+            let install = state.update(cx, |state, _| state.connections.install_fixture(id, client, shell, config, t3_client::supervisor::ConnectionStatus::Connected));
+            fixture_events.push(runtime.spawn(install).await.unwrap());
+            published.await.unwrap();
+        }
+        let settled_key = t3_core::sidebar::tag_filter::ThreadKey::new("bulk-settled", "menu-thread");
+        let operate_key = t3_core::sidebar::tag_filter::ThreadKey::new("bulk-operate", "menu-thread");
+        let (settled_owner, operate_owner, shelves) = state.update(cx, |state, cx| {
+            let shelves = state.sidebar.shelves.clone();
+            if !shelves.settled_expanded { state.toggle_shelf(t3_core::sidebar::Shelf::Settled, cx); }
+            state.clear_thread_selection(cx);
+            let modifier = gpui::Modifiers { platform:cfg!(target_os="macos"), control:!cfg!(target_os="macos"), ..Default::default() };
+            state.click_scoped_sidebar_thread(&settled_key, modifier, cx);
+            state.click_scoped_sidebar_thread(&operate_key, modifier, cx);
+            let settled_owner = ThreadMenuOwner::capture_scoped(state, &settled_key).unwrap();
+            let operate_owner = ThreadMenuOwner::capture_scoped(state, &operate_key).unwrap();
+            for (key, owner, settled) in [(&settled_key, &settled_owner, true), (&operate_key, &operate_owner, false)] {
+                assert!(state.sidebar.fleet.ordered.iter().any(|index| &state.sidebar.fleet.threads[*index].key == key));
+                assert!(owner.current(state));
+                assert_eq!(owner.key().as_ref(), Some(key));
+                assert_eq!(state.scoped_thread(key).unwrap().owner, *owner.destination.as_ref().unwrap());
+                assert_eq!(state.scoped_thread(key).unwrap().thread.is_settled(), settled);
+                assert!(state.scoped_environment(&key.environment_id).unwrap().config.config.is_some());
+                assert!(state.scoped_ready(owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_READ_SCOPE));
+                assert_eq!(owner.can_operate_owner(state), !settled);
+            }
+            assert_eq!(state.sidebar.fleet_selection, [settled_key.clone(), operate_key.clone()].into_iter().collect());
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&operate_key));
+            assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before);
+            (settled_owner, operate_owner, shelves)
+        });
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(settled_owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_READ_SCOPE));
+        assert_eq!(runtime.spawn(barrier).await.unwrap().unwrap().owner, *settled_owner.destination.as_ref().unwrap());
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(settled_owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        assert!(matches!(runtime.spawn(barrier).await.unwrap(), Err(t3_client::environments::DestinationError::Denied)));
+        let barrier = state.read_with(cx, |state, _| state.connections.destination(operate_owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        assert_eq!(runtime.spawn(barrier).await.unwrap().unwrap().owner, *operate_owner.destination.as_ref().unwrap());
+        assert!(read_only.take_commands().is_empty());
+        assert!(operate.take_commands().is_empty());
+        let (bulk_menu, bulk_cx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+        bulk_cx.update(|window, cx| bulk_menu.update(cx, |menu, cx| {
+            menu.open_for_selection(point(px(10.), px(10.)), window, cx);
+            let open = menu.open.as_ref().unwrap();
+            assert_eq!(open.scoped_selection.len(), 2);
+            assert!(open.scoped_selection.contains(&settled_owner));
+            assert!(open.scoped_selection.contains(&operate_owner));
+            let settle = open.items.iter().find(|item| item.action == MenuAction::Bulk(t3_core::sidebar::selection::BulkAction::Settle)).unwrap();
+            assert!(!settle.disabled, "settled READ-only non-target must not disable the unsettled OPERATE target");
+        }));
+        let expected_undo_count = state.read_with(bulk_cx, |state, _| state.sidebar.undo.notice().filter(|notice| notice.action == t3_core::thread_actions::UndoAction::Settled).map_or(1, |notice| notice.count + 1));
+        let (sent, completed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _completed = state.update(bulk_cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Notice && state.sidebar.undo.notice().is_some_and(|notice| notice.action == t3_core::thread_actions::UndoAction::Settled && notice.count == expected_undo_count) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        bulk_cx.update(|_, cx| bulk_menu.update(cx, |menu, cx| menu.activate(MenuAction::Bulk(t3_core::sidebar::selection::BulkAction::Settle), cx)));
+        let (method, payload, reply) = operate.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        let command_id = payload["commandId"].as_str().filter(|id| !id.is_empty()).unwrap();
+        assert_eq!(payload, t3_core::thread_actions::settle(command_id, "menu-thread"));
+        state.read_with(bulk_cx, |state, _| {
+            assert!(state.sidebar.fleet_selection.is_empty(), "accepted bulk settle clears the full original selection before the held reply");
+            assert!(state.sidebar.fleet_anchor.is_none(), "accepted bulk settle clears the non-target and target anchor together");
+            assert!(settled_owner.current(state) && operate_owner.current(state));
+            assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before);
+        });
+        reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+        completed.await.unwrap();
+        state.read_with(bulk_cx, |state, _| {
+            assert!(state.sidebar.fleet_selection.is_empty());
+            assert!(state.sidebar.fleet_anchor.is_none());
+            assert!(settled_owner.current(state) && operate_owner.current(state));
+            assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before);
+        });
+        assert!(read_only.take_commands().is_empty(), "completed eligible B action never dispatches to non-target A");
+        assert!(operate.take_commands().is_empty(), "one admitted target produces only its one completed command");
+        let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _removed = state.update(bulk_cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("bulk-settled").is_none() && state.scoped_environment("bulk-operate").is_none() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        state.update(bulk_cx, |state, _| {
+            state.connections.remove("bulk-settled");
+            state.connections.remove("bulk-operate");
+        });
+        removed.await.unwrap();
+        drop(fixture_events);
+        state.update(bulk_cx, |state, cx| { state.sidebar.shelves = shelves; state.rebuild_sidebar(cx); });
+    }
+    for action in [t3_core::sidebar::selection::BulkAction::Settle, t3_core::sidebar::selection::BulkAction::RegenerateTitles] {
+        let (task, original, anchor) = state.update(cx, |state, cx| {
+            state.clear_thread_selection(cx);
+            let keys = [key.clone(), t3_core::sidebar::tag_filter::ThreadKey::new("background", "sibling")];
+            let owners = keys.iter().map(|key| ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect::<Vec<_>>();
+            assert!(keys.iter().all(|key| state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == *key)));
+            assert!(owners.iter().all(|owner| state.scoped_bulk_target(owner).is_some_and(|target| action.eligible(&target) && action.ready(&target))));
+            state.sidebar.fleet_selection.extend(keys.iter().cloned());
+            state.sidebar.fleet_anchor = Some(keys[1].clone());
+            let original = state.sidebar.fleet_selection.clone(); let anchor = state.sidebar.fleet_anchor.clone();
+            let task = state.run_scoped_bulk(owners, action.clone(), None, true, cx);
+            (task, original, anchor)
+        });
+        let ((method, payload, reply), task) = {
+            let first = background.next_request();
+            futures::pin_mut!(first);
+            match futures::future::select(task, first).await {
+                futures::future::Either::Left(((), _)) => panic!("admitted action completed before its first request"),
+                futures::future::Either::Right((request, task)) => (request, task),
+            }
+        };
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["threadId"], "menu-thread");
+        let regenerate = action == t3_core::sidebar::selection::BulkAction::RegenerateTitles;
+        assert_eq!(payload["type"], if regenerate { "thread.metadata.update" } else { "thread.settle" });
+        let later = t3_core::sidebar::tag_filter::ThreadKey::new("background", "other-thread");
+        state.update(cx, |state, _| {
+            if regenerate { assert_eq!(state.sidebar.fleet_selection, original); assert_eq!(state.sidebar.fleet_anchor, anchor); }
+            else { assert!(state.sidebar.fleet_selection.is_empty()); assert!(state.sidebar.fleet_anchor.is_none()); }
+            state.sidebar.fleet_selection.insert(later.clone());
+            state.sidebar.fleet_anchor = Some(later.clone());
+        });
+        reply.send(Err(t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()), message:"fixture failure".into(), error:serde_json::json!({"_tag":"OperationError"}) }))).unwrap();
+        let next = background.next_request();
+        futures::pin_mut!(next);
+        match futures::future::select(task, next).await {
+            futures::future::Either::Left(((), _)) => assert!(regenerate, "independent settle must attempt its later target after ordinary failure"),
+            futures::future::Either::Right(((method, payload, reply), task)) => {
+                assert!(!regenerate, "title regeneration must stop before its second write");
+                assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+                assert_eq!(payload["type"], "thread.settle");
+                assert_eq!(payload["threadId"], "sibling");
+                reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+                task.await;
+            }
+        }
+        state.read_with(cx, |state, _| {
+            let mut expected = if regenerate { original } else { std::collections::HashSet::new() };
+            expected.insert(later.clone());
+            assert_eq!(state.sidebar.fleet_selection, expected);
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&later));
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+    }
+    let task = state.update(cx, |state, cx| {
+        state.clear_thread_selection(cx);
+        state.sidebar.fleet_selection.insert(key.clone());
+        state.sidebar.fleet_anchor = Some(key.clone());
+        let owner = ThreadMenuOwner::capture_scoped(state, &key).unwrap();
+        assert!(state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == key));
+        assert!(state.scoped_bulk_target(&owner).is_some_and(|target| t3_core::sidebar::selection::BulkAction::RegenerateTitles.ready(&target)));
+        state.run_scoped_bulk(vec![owner], t3_core::sidebar::selection::BulkAction::RegenerateTitles, None, true, cx)
+    });
+    let ((method, payload, reply), task) = {
+        let first = background.next_request();
+        futures::pin_mut!(first);
+        match futures::future::select(task, first).await {
+            futures::future::Either::Left(((), _)) => panic!("admitted regeneration completed before its first request"),
+            futures::future::Either::Right((request, task)) => (request, task),
+        }
+    };
+    assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+    assert_eq!(payload["type"], "thread.metadata.update");
+    state.update(cx, |state, _| {
+        state.sidebar.fleet_selection.insert(t3_core::sidebar::tag_filter::ThreadKey::new("background", "other-thread"));
+    });
+    reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+    task.await;
+    state.read_with(cx, |state, _| {
+        assert!(state.sidebar.fleet_selection.is_empty(), "all-success regeneration clears later picks too");
+        assert!(state.sidebar.fleet_anchor.is_none());
+    });
+    for interrupted in [
+        t3_client::session::RpcError::Closed,
+        t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure { tag:None, message:"Interrupted".into(), error:serde_json::Value::Null }),
+    ] {
+        let task = state.update(cx, |state, cx| {
+            state.clear_thread_selection(cx);
+            let keys = [key.clone(), t3_core::sidebar::tag_filter::ThreadKey::new("background", "sibling")];
+            assert!(keys.iter().all(|key| state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == *key)));
+            let owners = keys.iter().map(|key| ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect::<Vec<_>>();
+            assert!(owners.iter().all(|owner| state.scoped_bulk_target(owner).is_some_and(|target| t3_core::sidebar::selection::BulkAction::Settle.ready(&target))));
+            state.sidebar.fleet_selection.extend(keys);
+            state.sidebar.fleet_anchor = Some(key.clone());
+            state.run_scoped_bulk(owners, t3_core::sidebar::selection::BulkAction::Settle, None, true, cx)
+        });
+        let ((method, payload, reply), task) = {
+            let first = background.next_request();
+            futures::pin_mut!(first);
+            match futures::future::select(task, first).await {
+                futures::future::Either::Left(((), _)) => panic!("admitted settle completed before its first request"),
+                futures::future::Either::Right((request, task)) => (request, task),
+            }
+        };
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["type"], "thread.settle");
+        assert_eq!(payload["threadId"], "menu-thread");
+        state.read_with(cx, |state, _| { assert!(state.sidebar.fleet_selection.is_empty()); assert!(state.sidebar.fleet_anchor.is_none()); });
+        reply.send(Err(interrupted)).unwrap();
+        let next = background.next_request();
+        futures::pin_mut!(next);
+        match futures::future::select(task, next).await {
+            futures::future::Either::Left(((), _)) => {},
+            futures::future::Either::Right((_, _)) => panic!("interruption must stop the unattempted sequential suffix"),
+        }
+        state.read_with(cx, |state, _| {
+            assert!(state.toasts.latest().is_some_and(|toast| toast.title == "Thread actions incomplete"));
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+    }
+    for interrupted in [false, true] {
+        let until = crate::sidebar::controller::now_ms() + t3_core::sidebar::time::HOUR_MS;
+        let task = state.update(cx, |state, cx| {
+            state.clear_thread_selection(cx);
+            let keys = [key.clone(), t3_core::sidebar::tag_filter::ThreadKey::new("background", "sibling")];
+            assert!(keys.iter().all(|key| state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == *key)));
+            let owners = keys.iter().map(|key| ThreadMenuOwner::capture_scoped(state, key).unwrap()).collect::<Vec<_>>();
+            assert!(owners.iter().all(|owner| state.scoped_bulk_target(owner).is_some_and(|target| t3_core::sidebar::selection::BulkAction::Snooze.ready(&target))));
+            state.sidebar.fleet_selection.extend(keys);
+            state.sidebar.fleet_anchor = Some(key.clone());
+            state.run_scoped_bulk(owners, t3_core::sidebar::selection::BulkAction::Snooze, Some(until), true, cx)
+        });
+        let ((method, payload, first_reply), task) = {
+            let first = background.next_request();
+            futures::pin_mut!(first);
+            match futures::future::select(task, first).await {
+                futures::future::Either::Left(((), _)) => panic!("admitted snooze completed before its first request"),
+                futures::future::Either::Right((request, task)) => (request, task),
+            }
+        };
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["type"], "thread.snooze");
+        assert_eq!(payload["threadId"], "menu-thread");
+        assert_eq!(payload["snoozedUntil"], t3_core::sidebar::time::format_iso(until));
+        let (method, payload, second_reply) = futures::FutureExt::now_or_never(background.next_request()).expect("sibling snooze must already be queued while the first reply is held");
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["type"], "thread.snooze");
+        assert_eq!(payload["threadId"], "sibling");
+        assert_eq!(payload["snoozedUntil"], t3_core::sidebar::time::format_iso(until));
+        let later = t3_core::sidebar::tag_filter::ThreadKey::new("background", "other-thread");
+        state.update(cx, |state, _| {
+            assert!(state.sidebar.fleet_selection.is_empty());
+            assert!(state.sidebar.fleet_anchor.is_none());
+            state.sidebar.fleet_selection.insert(later.clone());
+            state.sidebar.fleet_anchor = Some(later.clone());
+        });
+        let error = if interrupted { t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure { tag:None, message:"Interrupted".into(), error:serde_json::Value::Null }) }
+            else { t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()), message:"fixture failure".into(), error:serde_json::json!({"_tag":"OperationError"}) }) };
+        first_reply.send(Err(error)).unwrap();
+        second_reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap();
+        task.await;
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.fleet_selection, std::collections::HashSet::from([later.clone()]));
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&later));
+            assert!(state.toasts.latest().is_some_and(|toast| toast.title == "Thread actions incomplete" && toast.description.as_deref() == Some("1 change(s) saved; 1 failed")));
+            assert!(state.sidebar.undo.notice().is_some_and(|notice| notice.action == t3_core::thread_actions::UndoAction::Snoozed));
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+    }
+    {
+        let owner = state.read_with(cx, |state, _| {
+            assert!(state.selected_thread.is_none());
+            assert!(state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == key));
+            let owner = ThreadMenuOwner::capture_scoped(state, &key).unwrap();
+            assert!(owner.current(state) && owner.can_operate_owner(state));
+            owner
+        });
+        let destination = owner.destination.clone().unwrap();
+        let denied_owner = destination.clone();
+        let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry|
+                entry.summary.owner == denied_owner && entry.summary.synchronized && entry.config.config.is_some()
+                    && entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                    && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && !grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()));
+        let receipt = state.read_with(cx, |state, _| state.connections.destination(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        assert!(matches!(runtime.spawn(receipt).await.unwrap(), Err(t3_client::environments::DestinationError::Denied)));
+        denied.await.unwrap();
+        let (task, selected, anchor, undo) = state.update(cx, |state, cx| {
+            assert!(owner.current(state) && !owner.can_operate_owner(state));
+            assert!(state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == key));
+            state.clear_thread_selection(cx);
+            state.sidebar.fleet_selection.insert(key.clone());
+            state.sidebar.fleet_selection.insert(t3_core::sidebar::tag_filter::ThreadKey::new("background", "sibling"));
+            state.sidebar.fleet_anchor = Some(key.clone());
+            let selected = state.sidebar.fleet_selection.clone(); let anchor = state.sidebar.fleet_anchor.clone(); let undo = state.sidebar.undo.notice();
+            let task = state.run_scoped_bulk(vec![owner.clone()], t3_core::sidebar::selection::BulkAction::MarkUnread, None, true, cx);
+            (task, selected, anchor, undo)
+        });
+        {
+            let request = background.next_request();
+            futures::pin_mut!(request);
+            match futures::future::select(task, request).await {
+                futures::future::Either::Left(((), _)) => {},
+                futures::future::Either::Right((_, _)) => panic!("READ-only modern unread must refuse without a request"),
+            }
+        }
+        assert!(futures::FutureExt::now_or_never(background.next_request()).is_none());
+        assert!(futures::FutureExt::now_or_never(active_fixture.next_request()).is_none());
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.fleet_selection, selected); assert_eq!(state.sidebar.fleet_anchor, anchor);
+            assert_eq!(state.sidebar.undo.notice(), undo);
+            assert!(state.toasts.latest().is_some_and(|toast| toast.title == "Thread action refused"));
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+        let restored_owner = destination.clone();
+        let (sent, restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry|
+                entry.summary.owner == restored_owner && entry.summary.synchronized && entry.config.config.is_some()
+                    && entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                    && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
+        let receipt = state.read_with(cx, |state, _| state.connections.destination(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+        runtime.spawn(receipt).await.unwrap().unwrap(); restored.await.unwrap();
+        let task = state.update(cx, |state, cx| {
+            assert!(owner.current(state) && owner.can_operate_owner(state));
+            assert_eq!(state.sidebar.fleet_selection, selected); assert_eq!(state.sidebar.fleet_anchor, anchor);
+            state.run_scoped_bulk(vec![owner.clone()], t3_core::sidebar::selection::BulkAction::MarkUnread, None, true, cx)
+        });
+        let ((method, payload, reply), task) = {
+            let request = background.next_request();
+            futures::pin_mut!(request);
+            match futures::future::select(task, request).await {
+                futures::future::Either::Left(((), _)) => panic!("restored original unread target completed before its request"),
+                futures::future::Either::Right((request, task)) => (request, task),
+            }
+        };
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["type"], "thread.mark-unread"); assert_eq!(payload["threadId"], key.thread_id);
+        assert!(futures::FutureExt::now_or_never(active_fixture.next_request()).is_none());
+        let later = t3_core::sidebar::tag_filter::ThreadKey::new("background", "other-thread");
+        state.update(cx, |state, _| {
+            assert!(state.sidebar.fleet_selection.is_empty()); assert!(state.sidebar.fleet_anchor.is_none());
+            assert_eq!(state.sidebar.undo.notice(), undo);
+            state.sidebar.fleet_selection.insert(later.clone()); state.sidebar.fleet_anchor = Some(later.clone());
+        });
+        reply.send(Ok(serde_json::json!({"sequence":4}))).unwrap(); task.await;
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.fleet_selection, std::collections::HashSet::from([later.clone()]));
+            assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&later)); assert_eq!(state.sidebar.undo.notice(), undo);
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+        assert!(futures::FutureExt::now_or_never(background.next_request()).is_none());
+        assert!(futures::FutureExt::now_or_never(active_fixture.next_request()).is_none());
+    }
+    {
+        let working_key = t3_core::sidebar::tag_filter::ThreadKey::new("bounded-working", "menu-thread");
+        let (client, mut working_fixture) = t3_client::supervisor::ClientFixture::handle(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap());
+        let (mut shell, mut config, original_owners, original_preferences, expanded) = state.read_with(cx, |state, cx| {
+            assert!(state.selected_thread.is_none());
+            assert!(state.sidebar.search_input.is_none());
+            assert!(crate::settings::client_settings(cx).working_shelf() && state.sidebar.settings.working_shelf_enabled);
+            assert!(state.sidebar.fleet.next_change_at.is_none());
+            (state.shell.clone(), state.scoped_environment("background").unwrap().config.clone(), state.fleet.environments.iter().map(|entry| entry.summary.owner.clone()).collect::<Vec<_>>(), state.project_preferences.clone(), state.sidebar.shelves.working_expanded)
+        });
+        let now = t3_core::sidebar::time::format_iso(crate::sidebar::controller::now_ms());
+        let snapshot = shell.snapshot.as_mut().unwrap();
+        snapshot.threads.retain(|thread| thread.id == working_key.thread_id);
+        assert_eq!(snapshot.threads.len(), 1);
+        let thread = &mut snapshot.threads[0];
+        assert!(thread.pending_runtime_request.is_none() && thread.pending_background_tasks.is_empty());
+        assert!(!thread.has_actionable_proposed_plan && thread.delegated_from.is_none());
+        assert!(thread.pinned_at.is_none() && thread.settled_override.is_none() && thread.snoozed_until.is_none());
+        assert!(thread.last_error.is_none() && thread.pending_guest_message_count.unwrap_or_default() == 0);
+        thread.status = "running".into(); thread.latest_run_id = Some("bounded-working-run".into());
+        thread.active_run_id = thread.latest_run_id.clone(); thread.activity_run_status = Some(Some("running".into()));
+        thread.latest_run_requested_at = Some(now.clone()); thread.latest_run_started_at = Some(now.clone());
+        thread.latest_run_completed_at = Some(None); thread.activity_run_started_at = Some(Some(now.clone())); thread.updated_at = now;
+        config.config.as_mut().unwrap().environment.environment_id = "bounded-working-env".into();
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let published_key = working_key.clone();
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("bounded-working").is_some_and(|entry|
+                entry.summary.owner.canonical_id.as_deref() == Some("bounded-working-env")
+                    && state.connections.view().borrow().environment("bounded-working").is_some_and(|actor| actor.summary.owner == entry.summary.owner)
+                    && entry.summary.synchronized && entry.config.config.is_some() && entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                    && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
+                && state.scoped_thread(&published_key).is_some_and(|row| row.owner == state.scoped_environment("bounded-working").unwrap().summary.owner
+                    && row.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("bounded-working-run"))) {
+                if let Some(sent) = sent.take() { let _ = sent.send(state.scoped_environment("bounded-working").unwrap().summary.owner.clone()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("bounded-working", client, shell, config, t3_client::supervisor::ConnectionStatus::Connected));
+        let working_events = runtime.spawn(install).await.unwrap();
+        let published_owner = loaded.await.unwrap();
+        let (task, owner, selected, anchor, undo) = state.update(cx, |state, cx| {
+            assert_eq!(state.connections.view().borrow().environment("bounded-working").unwrap().summary.owner, published_owner);
+            assert_eq!(state.scoped_environment("bounded-working").unwrap().summary.owner, published_owner);
+            assert!(original_owners.iter().all(|owner| state.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == *owner)));
+            assert!(state.selected_thread.is_none() && state.sidebar.search_input.is_none());
+            assert!(crate::settings::client_settings(cx).working_shelf() && state.sidebar.settings.working_shelf_enabled);
+            let row = state.scoped_thread(&working_key).unwrap();
+            assert!(!row.thread.has_pending_approvals && !row.thread.has_pending_user_input && !row.thread.has_pending_runtime_request);
+            assert!(row.thread.pending_subagent_request.is_none() && row.thread.pending_guest_message_count == 0);
+            assert!(row.thread.runtime.as_ref().is_some_and(|runtime| runtime.last_error.is_none()));
+            assert!(state.sidebar.fleet.partition.working.iter().any(|index| state.sidebar.fleet.threads[*index].key == working_key));
+            assert!(state.sidebar.fleet.next_change_at.is_none());
+            if !state.sidebar.shelves.working_expanded { state.toggle_shelf(t3_core::sidebar::Shelf::Working, cx); }
+            assert!(state.sidebar.shelves.working_expanded);
+            assert!(state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == working_key));
+            let owner = ThreadMenuOwner::capture_scoped(state, &working_key).unwrap();
+            assert!(owner.current(state) && owner.can_operate_owner(state));
+            assert!(state.scoped_bulk_target(&owner).is_some_and(|target| t3_core::sidebar::selection::BulkAction::MarkUnread.ready(&target)));
+            state.clear_thread_selection(cx); state.sidebar.fleet_selection.insert(working_key.clone()); state.sidebar.fleet_anchor = Some(working_key.clone());
+            let selected = state.sidebar.fleet_selection.clone(); let anchor = state.sidebar.fleet_anchor.clone(); let undo = state.sidebar.undo.notice();
+            let raw = state.scoped_thread(&working_key).unwrap().clone();
+            let task = state.run_scoped_bulk(vec![owner.clone()], t3_core::sidebar::selection::BulkAction::MarkUnread, None, true, cx);
+            state.toggle_shelf(t3_core::sidebar::Shelf::Working, cx);
+            assert!(!state.sidebar.shelves.working_expanded);
+            assert!(owner.current(state) && owner.can_operate_owner(state));
+            assert_eq!(state.scoped_thread(&working_key), Some(&raw));
+            assert!(!state.sidebar.fleet.ordered.iter().any(|index| state.sidebar.fleet.threads[*index].key == working_key));
+            assert_eq!(state.sidebar.fleet_selection, selected); assert_eq!(state.sidebar.fleet_anchor, anchor);
+            assert!(state.sidebar.fleet.next_change_at.is_none());
+            (task, owner, selected, anchor, undo)
+        });
+        {
+            let request = working_fixture.next_request();
+            futures::pin_mut!(request);
+            match futures::future::select(task, request).await {
+                futures::future::Either::Left(((), _)) => {},
+                futures::future::Either::Right((_, _)) => panic!("collapsed original must refuse before its queued admission is consumed"),
+            }
+        }
+        state.read_with(cx, |state, _| {
+            assert!(owner.current(state) && owner.can_operate_owner(state));
+            assert_eq!(state.sidebar.fleet_selection, selected); assert_eq!(state.sidebar.fleet_anchor, anchor);
+            assert_eq!(state.sidebar.undo.notice(), undo);
+            assert!(state.toasts.latest().is_some_and(|toast| toast.title == "Thread action refused"));
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+        assert!(futures::FutureExt::now_or_never(working_fixture.next_request()).is_none());
+        assert!(futures::FutureExt::now_or_never(background.next_request()).is_none());
+        assert!(futures::FutureExt::now_or_never(active_fixture.next_request()).is_none());
+        let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let retained = original_owners.clone();
+        let _removed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("bounded-working").is_none()
+                && state.fleet.environments.iter().all(|entry| entry.summary.owner != published_owner)
+                && retained.iter().all(|owner| state.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == *owner)) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        state.update(cx, |state, cx| {
+            if state.sidebar.shelves.working_expanded != expanded { state.toggle_shelf(t3_core::sidebar::Shelf::Working, cx); }
+            assert_eq!(state.sidebar.shelves.working_expanded, expanded);
+            state.clear_thread_selection(cx);
+            state.connections.remove("bounded-working");
+        });
+        removed.await.unwrap();
+        assert!(state.read_with(cx, |state, _| state.connections.view().borrow().environment("bounded-working").is_none()));
+        drop(working_events);
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.sidebar.shelves.working_expanded, expanded);
+            assert_eq!(state.project_preferences, original_preferences);
+            assert!(state.scoped_environment("bounded-working").is_none());
+            assert!(state.sidebar.fleet_selection.is_empty() && state.sidebar.fleet_anchor.is_none());
+            assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before);
+        });
+        assert!(working_fixture.take_commands().is_empty());
+        assert!(futures::FutureExt::now_or_never(background.next_request()).is_none());
+        assert!(futures::FutureExt::now_or_never(active_fixture.next_request()).is_none());
+    }
     state.update(cx, |state, cx| { state.clear_thread_selection(cx); });
     state.read_with(cx,|state,_| assert_eq!((state.environments.active.clone(),state.selected_thread.clone(),state.draft_project.clone()),before));
     assert!(active_fixture.take_commands().is_empty());

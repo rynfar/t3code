@@ -193,9 +193,12 @@ impl SidebarPane {
                 }
                 ContextMenuEvent::ScopedBulk(owners, action) => {
                     let owners = owners.clone(); let action = action.clone();
-                    let needs_confirm = match action { t3_core::sidebar::selection::BulkAction::Delete => crate::settings::client_settings(cx).confirm_thread_delete(), t3_core::sidebar::selection::BulkAction::Unpin => crate::settings::client_settings(cx).confirm_thread_unpin(), _ => false };
+                    if action == t3_core::sidebar::selection::BulkAction::Unpin {
+                        return this.state.update(cx, |state, cx| state.run_scoped_bulk_action(owners, action, cx));
+                    }
+                    let needs_confirm = match action { t3_core::sidebar::selection::BulkAction::Delete => crate::settings::client_settings(cx).confirm_thread_delete(), _ => false };
                     if !needs_confirm { return this.state.update(cx, |state, cx| state.run_scoped_bulk_action(owners, action, cx)); }
-                    let (heading, description) = if matches!(action, t3_core::sidebar::selection::BulkAction::Unpin) { (format!("Unpin {} threads?", owners.len()), "This will move the threads out of your pinned section.") } else { t3_core::sidebar::selection::bulk_delete_confirmation(owners.len()) };
+                    let (heading, description) = t3_core::sidebar::selection::bulk_delete_confirmation(owners.len());
                     dialog.update(cx, |dialog, cx| dialog.confirm(heading, description, "Confirm", move |state, cx| state.run_scoped_bulk_action(owners, action, cx), window, cx));
                 }
                 ContextMenuEvent::BulkDelete(thread_ids) => {

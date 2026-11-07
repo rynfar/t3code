@@ -119,21 +119,62 @@ pub enum BulkAction {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BulkTarget {
+    pub pinned: bool,
+    pub settled: bool,
+    pub regenerating: bool,
+    pub config_loaded: bool,
+    pub can_snooze: bool,
+    pub can_operate: bool,
+}
+
+impl BulkAction {
+    pub fn eligible(&self, target: &BulkTarget) -> bool {
+        match self {
+            Self::Unpin => target.config_loaded && target.pinned,
+            Self::Settle => !target.settled,
+            Self::RegenerateTitles => target.config_loaded && !target.regenerating,
+            _ => true,
+        }
+    }
+
+    pub fn ready(&self, target: &BulkTarget) -> bool {
+        target.can_operate && (matches!(self, Self::Delete) || target.config_loaded)
+            && (!matches!(self, Self::Snooze | Self::SnoozePreset(_) | Self::SnoozeCustom) || target.can_snooze)
+    }
+}
+
 /// What the bulk menu needs to know about the live selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BulkSelection {
     pub count: usize,
     pub pinned: usize,
-    /// Selected threads that are not settled yet.
     pub settling: usize,
-    /// Every selected thread can be snoozed now.
     pub can_snooze: bool,
-    /// Selected threads whose title is not already regenerating.
+    pub supported: usize,
     pub regeneratable: usize,
-    /// Older servers lack settle, snooze, pin and title regeneration.
-    pub config_loaded: bool,
-    /// `canOperateThreads`: the session may change threads.
-    pub can_operate: bool,
+    pub unpin_ready: bool,
+    pub settle_ready: bool,
+    pub snooze_ready: bool,
+    pub regenerate_ready: bool,
+    pub unread_ready: bool,
+    pub delete_ready: bool,
+}
+
+impl BulkSelection {
+    pub fn from_targets(targets: &[BulkTarget]) -> Self {
+        let count = |action: &BulkAction| targets.iter().filter(|target| action.eligible(target)).count();
+        let ready = |action: &BulkAction| targets.iter().filter(|target| action.eligible(target)).all(|target| action.ready(target));
+        Self {
+            count: targets.len(), pinned: count(&BulkAction::Unpin), settling: count(&BulkAction::Settle),
+            can_snooze: targets.iter().all(|target| target.config_loaded && target.can_snooze),
+            supported: targets.iter().filter(|target| target.config_loaded).count(),
+            regeneratable: count(&BulkAction::RegenerateTitles),
+            unpin_ready: ready(&BulkAction::Unpin), settle_ready: ready(&BulkAction::Settle), snooze_ready: ready(&BulkAction::Snooze),
+            regenerate_ready: ready(&BulkAction::RegenerateTitles), unread_ready: ready(&BulkAction::MarkUnread), delete_ready: ready(&BulkAction::Delete),
+        }
+    }
 }
 
 /// `buildBulkTitleRegenerationContextMenuItem`.
@@ -157,41 +198,41 @@ pub fn bulk_unpin_item(pinned: usize) -> Option<MenuItem<BulkAction>> {
 /// The multi-select context menu, in the web's order.
 pub fn build_bulk_menu(selection: &BulkSelection, presets: &[SnoozePreset]) -> Vec<MenuItem<BulkAction>> {
     let count = selection.count;
-    let blocked = !selection.can_operate;
     let mut items = Vec::new();
-    if let Some(mut unpin) = bulk_unpin_item(if selection.config_loaded { selection.pinned } else { 0 }) {
-        unpin.disabled = blocked;
+    if let Some(mut unpin) = bulk_unpin_item(selection.pinned) {
+        unpin.disabled = !selection.unpin_ready;
         items.push(unpin);
     }
     let mut settle = MenuItem::new(BulkAction::Settle, format!("Settle ({count})"), None);
-    settle.disabled = selection.settling == 0 || blocked;
+    settle.disabled = selection.settling == 0 || !selection.settle_ready;
     items.push(settle);
-    if selection.config_loaded && selection.can_snooze {
+    if selection.can_snooze {
         let mut snooze = MenuItem::new(BulkAction::Snooze, format!("Snooze ({count})"), None);
-        snooze.disabled = blocked;
+        snooze.disabled = !selection.snooze_ready;
         snooze.children = presets
             .iter()
             .map(|preset| {
                 let mut item = MenuItem::new(BulkAction::SnoozePreset(preset.id.clone()), format!("{} ({})", preset.label, preset.when_label), None);
-                item.disabled = blocked;
+                item.disabled = !selection.snooze_ready;
                 item
             })
             .collect();
         let mut custom = MenuItem::new(BulkAction::SnoozeCustom, "Custom…", None);
         custom.separator_before = !presets.is_empty();
-        custom.disabled = blocked;
+        custom.disabled = !selection.snooze_ready;
         snooze.children.push(custom);
         items.push(snooze);
     }
-    let supported = if selection.config_loaded { count } else { 0 };
-    if let Some(mut regenerate) = bulk_title_regeneration_item(supported, selection.regeneratable) {
-        regenerate.disabled = regenerate.disabled || blocked;
+    if let Some(mut regenerate) = bulk_title_regeneration_item(selection.supported, selection.regeneratable) {
+        regenerate.disabled = regenerate.disabled || !selection.regenerate_ready;
         items.push(regenerate);
     }
-    items.push(MenuItem::new(BulkAction::MarkUnread, format!("Mark unread ({count})"), None));
+    let mut unread = MenuItem::new(BulkAction::MarkUnread, format!("Mark unread ({count})"), None);
+    unread.disabled = !selection.unread_ready;
+    items.push(unread);
     let mut delete = MenuItem::new(BulkAction::Delete, format!("Delete ({count})"), None);
     delete.destructive = true;
-    delete.disabled = blocked;
+    delete.disabled = !selection.delete_ready;
     items.push(delete);
     items
 }
@@ -304,7 +345,8 @@ mod tests {
     #[test]
     fn the_bulk_menu_lists_actions_with_counts_in_the_web_order() {
         let presets = vec![SnoozePreset { id: "later".into(), label: "Later today".into(), when_label: "6:00 PM".into(), snoozed_until: 1 }];
-        let selection = BulkSelection { count: 3, pinned: 1, settling: 2, can_snooze: true, regeneratable: 3, config_loaded: true, can_operate: true };
+        let target = BulkTarget { pinned:false, settled:false, regenerating:false, config_loaded:true, can_snooze:true, can_operate:true };
+        let selection = BulkSelection::from_targets(&[BulkTarget { pinned:true, settled:true, ..target }, target, target]);
         let menu = build_bulk_menu(&selection, &presets);
         assert_eq!(
             labels(&menu),
@@ -326,5 +368,18 @@ mod tests {
         assert_eq!(menu[0].label, "Settle (3)");
         assert!(menu[0].disabled);
         assert!(menu.iter().all(|item| item.action != BulkAction::Snooze));
+        let denied_non_target = BulkTarget { settled:true, config_loaded:false, can_operate:false, ..target };
+        let subset = BulkSelection::from_targets(&[denied_non_target, BulkTarget { pinned:true, ..target }]);
+        let menu = build_bulk_menu(&subset, &presets);
+        for action in [BulkAction::Unpin, BulkAction::Settle, BulkAction::RegenerateTitles] {
+            assert!(!menu.iter().find(|item| item.action == action).unwrap().disabled);
+        }
+        assert!(menu.iter().find(|item| item.action == BulkAction::MarkUnread).unwrap().disabled);
+        assert!(!BulkAction::MarkUnread.ready(&denied_non_target));
+        let busy = BulkSelection::from_targets(&[BulkTarget { regenerating:true, settled:true, ..target }]);
+        let menu = build_bulk_menu(&busy, &presets);
+        for action in [BulkAction::Settle, BulkAction::RegenerateTitles] {
+            assert!(menu.iter().find(|item| item.action == action).unwrap().disabled);
+        }
     }
 }

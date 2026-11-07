@@ -1,5 +1,4 @@
 use super::*;
-use gpui::AppContext;
 use t3_client::environments::{EnvironmentEvent, Environments};
 use t3_client::supervisor::{ClientEvent, ClientFixture, ConnectionStatus};
 use t3_core::sidebar::grouping::GroupConsumer;
