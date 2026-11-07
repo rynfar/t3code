@@ -814,6 +814,8 @@ fn scoped_menu_keeps_background_owner_and_rejects_same_id_replacement(cx: &mut g
 
 #[gpui::test]
 fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut gpui::TestAppContext) {
+    // The scope setter persists preferences on the real UI-state writer thread.
+    cx.executor().allow_parking();
     use std::sync::Arc;
     use t3_core::sidebar::fleet::EnvironmentSummary;
     use t3_core::sidebar::grouping::EnvironmentOwner;
@@ -908,6 +910,9 @@ fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut 
         assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route, "explicit project scope changes do not navigate");
     });
     assert!(fixture.take_commands().is_empty());
+    runtime.block_on(runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())))
+        .expect("fixture writer barrier task").expect("prior fixture writes committed before teardown");
+    cx.run_until_parked();
 }
 
     #[gpui::test]
