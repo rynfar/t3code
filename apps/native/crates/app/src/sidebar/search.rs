@@ -77,9 +77,17 @@ impl SearchState {
             }
             return;
         }
+        let app = state.read(cx);
+        let groups = app.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let ready = app.fleet.environments.iter().all(|entry| entry.summary.synchronized && entry.config.config.is_some());
+        let projects = app.project_preferences.scoped_members(&groups, ready).map(|members| {
+            let mut ids = members.into_iter().map(|reference| reference.project_id).collect::<Vec<_>>();
+            ids.sort();
+            ids
+        });
         for owner in owners {
             let older = state.read(cx).sidebar.owner_omitted.get(&owner).and_then(|omitted| omitted.older());
-            let payload = search_request(&trimmed, older.as_ref().map(|older| older.before.as_str()), None);
+            let payload = search_request(&trimmed, older.as_ref().map(|older| older.before.as_str()), projects.as_deref());
             state.update(cx, |state, cx| state.mount_scoped_search_rows(&owner, None, cx));
             let Some(payload) = payload else { continue };
             let resolve = state.read(cx).connections.destination(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
@@ -194,4 +202,114 @@ impl SidebarPane {
 
 fn decode_matches(value: &serde_json::Value, environment: &str) -> Vec<(ThreadKey, String)> {
     value.get("matches").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|row| Some((ThreadKey::new(environment, row.get("threadId")?.as_str()?), row.get("snippet").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()))).collect()
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::AppContext;
+    use serde_json::json;
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+    use t3_core::sidebar::grouping::GroupConsumer;
+
+    #[gpui::test]
+    async fn cut_search_requests_the_chosen_project_scope(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, active_fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        let (client, mut fixture) = ClientFixture::handle(serde_json::from_value(json!({
+            "authenticated":true,"permissions":["orchestration:read"]
+        })).unwrap());
+        let (mut shell, mut config) = state.read_with(cx, |state, _| (state.shell.clone(),state.server_config.clone()));
+        let before = t3_core::sidebar::time::format_iso(100_000);
+        let snapshot = shell.snapshot.as_mut().unwrap();
+        snapshot.snapshot_sequence = 1;
+        snapshot.older_settled = Some(serde_json::from_value(json!({
+            "before":before,"asOfSequence":1,"counts":[
+                {"projectId":"checkout-a","count":2},
+                {"projectId":"checkout-b","count":3},
+                {"projectId":"other","count":4}
+            ]
+        })).unwrap());
+        config.config.as_mut().unwrap().environment.environment_id = "search-scope-server".into();
+        state.update(cx, |state, _| state.selected_thread = None);
+        let (sent, loaded) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+        let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("search-scope-fixture").is_some() {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture(
+            "search-scope-fixture",client,shell,config,ConnectionStatus::Connected,
+        ));
+        let events = runtime.spawn(install).await.unwrap();
+        loaded.await.unwrap();
+        let (owner, scope_a) = state.read_with(cx, |state, cx| {
+            let groups = state.project_groups_for(GroupConsumer::Sidebar,cx);
+            let group = groups.iter().find(|group| group.member_refs.iter().any(|reference|
+                reference.environment_id == "search-scope-fixture" && reference.project_id == "checkout-b"
+            )).unwrap();
+            (state.scoped_environment("search-scope-fixture").unwrap().summary.owner.clone(),group.key.clone())
+        });
+        state.update(cx, |state, cx| state.set_scoped_project_scope(vec![scope_a],cx));
+        let project_ids = state.read_with(cx, |state, cx| {
+            let groups = state.project_groups_for(GroupConsumer::Sidebar,cx);
+            let members = state.project_preferences.scoped_members(&groups,state.fleet.environments.iter().all(|entry| entry.summary.synchronized)).unwrap();
+            let mut ids = members.into_iter().map(|reference| reference.project_id).collect::<Vec<_>>();
+            ids.sort();
+            assert!(!ids.is_empty());
+            assert!(ids.iter().any(|id| id == "checkout-b"));
+            assert!(ids.iter().all(|id| id != "other"));
+            assert_eq!(state.fleet.environments.len(),1);
+            assert!(state.scoped_ready(&owner,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+            assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().older().unwrap().before,before);
+            assert!(!state.sidebar.shelves.settled_expanded);
+            ids
+        });
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(),cx));
+            let confirm = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(),cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(),window,cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(),window,cx));
+            SidebarPane::new(state.clone(),composer,menu,confirm,snooze,window,cx)
+        });
+        pane.update(cx, |pane, cx| pane.search.set_query("deploy".into(),&pane.state,cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(SEARCH_DEBOUNCE);
+        let (method,payload,reply) = fixture.next_request().await;
+        assert_eq!(method,SEARCH_THREADS);
+        assert_eq!(payload["query"],"deploy");
+        assert_eq!(payload["olderSettledBefore"],before);
+        assert_eq!(payload["projectIds"],json!(project_ids),"cut-present search must forward the chosen physical project ids");
+        let tasks = pane.update(cx, |pane, _| std::mem::take(&mut pane.search.requests));
+        assert_eq!(tasks.len(),1);
+        reply.send(Ok(json!({
+            "matches":[{"threadId":"menu-thread","snippet":"deployed"}],
+            "snapshotSequence":1,"threads":[]
+        }))).unwrap();
+        for task in tasks { task.await; }
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.search.content_matches,vec![(ThreadKey::new("search-scope-fixture","menu-thread"),"deployed".into())]);
+            assert_eq!(pane.search.query,"deploy");
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.scoped_environment("search-scope-fixture").unwrap().summary.owner,owner);
+            assert!(state.selected_thread.is_none());
+        });
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+        cx.cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(active_fixture);
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
 }
