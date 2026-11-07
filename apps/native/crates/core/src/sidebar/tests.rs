@@ -193,8 +193,10 @@ fn inbox_sort_orders_by_actual_return() {
     let mut tracker = InboxReturnTracker::default();
     let a = SidebarThread { created_at: Some(0), ..working("a", false) };
     let b = SidebarThread { created_at: Some(0), ..working("b", false) };
-    tracker.observe(&[working("a", true), working("b", true)], 10_000);
-    tracker.observe(&[a.clone(), working("b", true)], 10_000);
+    let running_a = SidebarThread { runtime: Some(runtime("running")), ..a.clone() };
+    let running_b = SidebarThread { runtime: Some(runtime("running")), ..b.clone() };
+    tracker.observe(&[running_a, running_b.clone()], 10_000);
+    tracker.observe(&[a.clone(), running_b], 10_000);
     tracker.observe(&[a.clone(), b.clone()], 10_500);
     let observation = tracker.observe(&[a.clone(), b.clone()], 12_500);
     let mut list = vec![&a, &b];
@@ -1490,6 +1492,71 @@ fn scoped_sections_follow_loaded_config_per_owner_and_keep_cached_disconnects() 
         let cached_pending = EnvironmentSummary::from_shell(owner("pending"), &disconnected, &loaded);
         let cached_ready = EnvironmentSummary::from_shell(owner("ready"), &disconnected, &loaded);
         assert_sections(&[&cached_pending,&cached_ready],true);
+    }
+    let mut grace_shell = shell.clone();
+    let mut running_snapshot = grace_shell.snapshot.as_ref().unwrap().clone();
+    running_snapshot.threads.retain(|thread| thread.id == "working");
+    running_snapshot.snapshot_sequence += 1;
+    assert!(grace_shell.apply(crate::shell::ShellStreamItem::Snapshot {
+        snapshot:Box::new(running_snapshot),resolved_repository_identity_roots:None,
+    }));
+    let running = EnvironmentSummary::from_shell(owner("ready"),&grace_shell,&loaded);
+    let key = ThreadKey::new("ready","working");
+    let at = iso(NOW);
+    let model_at = |environment: &EnvironmentSummary, state: &mut ScopedSidebarState, now| ScopedSidebarModel::build(&ScopedSidebarInput {
+        environments:&[environment],groups:&[],preferences:&preferences,settings:&settings,shelves:&shelves,
+        selected:None,hidden:&hidden,older:&[],extra_threads:&[],now,folder_mode:false,dragging:None,
+    },state);
+    let mut history = ScopedSidebarState::default();
+    assert_eq!(model_at(&running,&mut history,at).section_of(&key),Some(Section::Working));
+    let previous = grace_shell.thread("working").unwrap().clone();
+    let mut completed_snapshot = grace_shell.snapshot.as_ref().unwrap().clone();
+    completed_snapshot.snapshot_sequence += 1;
+    completed_snapshot.threads[0].status = "completed".into();
+    completed_snapshot.threads[0].active_run_id = None;
+    let expected_completed = completed_snapshot.threads[0].clone();
+    assert!(grace_shell.apply(crate::shell::ShellStreamItem::Snapshot {
+        snapshot:Box::new(completed_snapshot),resolved_repository_identity_roots:None,
+    }));
+    let completed = EnvironmentSummary::from_shell(owner("ready"),&grace_shell,&loaded);
+    assert_eq!(completed.owner.saved_id,running.owner.saved_id);
+    assert_eq!(completed.owner.canonical_id,running.owner.canonical_id);
+    assert_eq!(completed.owner.generation,running.owner.generation);
+    assert_eq!(completed.owner.connection_generation,running.owner.connection_generation);
+    assert_ne!(completed.owner.shell_generation,running.owner.shell_generation);
+    let mut unchanged = expected_completed;
+    unchanged.status = previous.status.clone();
+    unchanged.active_run_id = previous.active_run_id.clone();
+    assert_eq!(unchanged,previous,"snapshot completion changes execution only, not placement or thread identity");
+    assert!(!is_thread_working(&completed.threads[0].thread));
+    let held = model_at(&completed,&mut history,at+1);
+    assert_eq!(held.section_of(&key),Some(Section::Working),"an authoritative snapshot of the same thread must preserve Working exit grace");
+    let deadline = at+1+WORKING_EXIT_GRACE_MS;
+    assert_eq!(held.next_change_at,Some(deadline));
+    let after = model_at(&completed,&mut history,deadline);
+    assert_eq!(after.section_of(&key),Some(Section::Active));
+    assert_eq!(after.next_change_at,None);
+    for recreated_thread in [false,true] {
+        let mut prior_history = ScopedSidebarState::default();
+        assert_eq!(model_at(&running,&mut prior_history,at).section_of(&key),Some(Section::Working));
+        let mut replacement_shell = grace_shell.clone();
+        let mut replacement_snapshot = replacement_shell.snapshot.as_ref().unwrap().clone();
+        replacement_snapshot.snapshot_sequence += 1;
+        if recreated_thread {
+            replacement_snapshot.threads[0].created_at = "2026-04-02T00:00:00.000Z".into();
+        }
+        assert!(replacement_shell.apply(crate::shell::ShellStreamItem::Snapshot {
+            snapshot:Box::new(replacement_snapshot),resolved_repository_identity_roots:None,
+        }));
+        let mut replacement_owner = running.owner.clone();
+        if !recreated_thread {
+            replacement_owner.canonical_id = Some("replacement-environment".into());
+            replacement_owner.generation += 1;
+        }
+        let replacement = EnvironmentSummary::from_shell(replacement_owner,&replacement_shell,&loaded);
+        let replaced = model_at(&replacement,&mut prior_history,at+1);
+        assert_eq!(replaced.section_of(&key),Some(Section::Active),"a recreated thread or environment cannot inherit the old thread's grace");
+        assert_eq!(replaced.next_change_at,None);
     }
 }
 

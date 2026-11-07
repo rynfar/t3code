@@ -90,7 +90,7 @@ pub struct ScopedSidebarInput<'a> {
 
 #[derive(Default)]
 pub struct ScopedSidebarState {
-    trackers: HashMap<EnvironmentOwner, InboxReturnTracker>,
+    trackers: HashMap<(String, Option<String>, u64), InboxReturnTracker>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +146,9 @@ fn folder_dot(threads: &[&SidebarThread]) -> Option<FolderDot> {
 
 impl ScopedSidebarModel {
     pub fn build(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
-        state.trackers.retain(|owner, _| input.environments.iter().any(|environment| environment.owner == *owner));
+        state.trackers.retain(|(saved_id,canonical_id,generation), _| input.environments.iter().any(|environment| {
+            environment.owner.saved_id == *saved_id && environment.owner.canonical_id == *canonical_id && environment.owner.generation == *generation
+        }));
         let ready = input.environments.iter().all(|environment| environment.synchronized);
         let scope = input.preferences.scoped_members(input.groups, ready);
         let working_shelf_enabled = input.settings.working_shelf_enabled && !input.folder_mode;
@@ -213,7 +215,7 @@ impl ScopedSidebarModel {
         for (environment, candidates) in input.environments.iter().zip(candidates) {
             let scoped = candidates.into_iter().filter(|thread| aliases.get(&(environment.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key())).collect::<Vec<_>>();
             let local = scoped.iter().map(|thread| thread.thread.clone()).collect::<Vec<_>>();
-            let tracker = state.trackers.entry(environment.owner.clone()).or_default();
+            let tracker = state.trackers.entry((environment.owner.saved_id.clone(),environment.owner.canonical_id.clone(),environment.owner.generation)).or_default();
             let observation = if working_shelf_enabled { tracker.observe(&local, input.now) } else { tracker.clear(); Default::default() };
             let partition = super::partition(&PartitionInput { threads: &local, working_shelf_enabled, config_loaded: environment.config_loaded, now: input.now, inbox: &observation });
             let offset = model.threads.len();
