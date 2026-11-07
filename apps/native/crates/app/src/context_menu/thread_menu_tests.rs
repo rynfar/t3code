@@ -1260,10 +1260,18 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     }
     for action in [t3_core::thread_actions::ProjectAction::NewThread, t3_core::thread_actions::ProjectAction::Settings] {
         cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
+        let denied_owner = original_owner.clone();
+        let (ready, denied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.owner == denied_owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:operate"]})).unwrap()));
         let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
         assert!(matches!(runtime.spawn(barrier).await.unwrap(), Err(t3_client::environments::DestinationError::Denied)));
         cx.run_until_parked();
+        denied.await.unwrap();
         state.read_with(cx, |state, cx| {
             assert!(!state.scoped_ready(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
             assert!(state.scoped_ready(&original_owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
@@ -1288,10 +1296,18 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
             assert!(toast.description.as_ref().is_some_and(|description| !description.is_empty()));
         });
         assert!(background.take_commands().is_empty(), "read-refused project navigation must not send RPCs");
+        let restored_owner = original_owner.clone();
+        let (ready, restored) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
+        let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.owner == restored_owner && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
+                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            }
+        }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
         let barrier = state.read_with(cx, |state, _| state.connections.destination(&original_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
         runtime.spawn(barrier).await.unwrap().unwrap();
         cx.run_until_parked();
+        restored.await.unwrap();
     }
     cx.update(|window, cx| menu.update(cx, |menu, cx| menu.open_scoped_project(stable.clone(), point(px(10.), px(10.)), window, cx)));
     let split_ref = stable.member_refs.iter().find(|reference| **reference != representative).unwrap().clone();
