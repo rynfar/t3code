@@ -233,45 +233,61 @@ pub(crate) fn side_chat_request(thread: &ThreadShell) -> Option<SubagentRequest>
     (kind != "auth_refresh" && thread.lineage.side_chat == Some(true)).then(|| request_of(kind))
 }
 
-/// `pendingSubagentRequestsByThread`: which listed threads to flag for a child's request.
-pub fn pending_subagent_requests(threads: &[ThreadShell]) -> HashMap<String, SubagentRequest> {
-    pending_subagent_requests_with_delegated(threads, &[])
+/// Current requests retain their direct/propagating policy before ancestry is composed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestContribution {
+    Direct { parent_id: String, request: SubagentRequest },
+    Approval { parent_id: String, origin: Option<String> },
 }
 
-pub(crate) fn pending_subagent_requests_with_delegated(threads: &[ThreadShell], delegated: &[(&str, SubagentRequest)]) -> HashMap<String, SubagentRequest> {
-    let mut requests: HashMap<String, SubagentRequest> = HashMap::new();
-    let by_id: HashMap<&str, &ThreadShell> = threads.iter().map(|thread| (thread.id.as_str(), thread)).collect();
-    for child in threads {
-        let parent_id = child.lineage.parent_thread_id.clone();
+pub fn request_contributions<'a>(threads: impl IntoIterator<Item = &'a ThreadShell>) -> Vec<RequestContribution> {
+    threads.into_iter().filter_map(|child| {
+        let parent_id = child.lineage.parent_thread_id.as_ref()?;
         if child.lineage.side_chat == Some(true) {
-            if let (Some(parent_id), Some(request)) = (parent_id, side_chat_request(child))
-                && requests.get(&parent_id) != Some(&SubagentRequest::Approval)
-            {
-                requests.insert(parent_id, request);
+            return side_chat_request(child).map(|request| RequestContribution::Direct { parent_id: parent_id.clone(), request });
+        }
+        (child.lineage.relationship_to_parent.as_deref() == Some("subagent") && subagent_request(child) == Some(SubagentRequest::Approval))
+            .then(|| RequestContribution::Approval { parent_id: parent_id.clone(), origin: Some(child.id.clone()) })
+    }).collect()
+}
+
+pub fn requests_from_contributions<'a>(contributions: impl IntoIterator<Item = &'a RequestContribution>, by_id: &HashMap<&str, &crate::shell::Lineage>) -> HashMap<String, SubagentRequest> {
+    let mut requests = HashMap::new();
+    for contribution in contributions {
+        match contribution {
+            RequestContribution::Direct { parent_id, request } => {
+                if requests.get(parent_id) != Some(&SubagentRequest::Approval) { requests.insert(parent_id.clone(), *request); }
             }
-            continue;
+            RequestContribution::Approval { parent_id, origin } => {
+                let mut seen = origin.iter().map(String::as_str).collect::<Vec<_>>();
+                let mut next = Some(parent_id.as_str());
+                while let Some(parent_id) = next.filter(|id| !seen.contains(id)) {
+                    seen.push(parent_id);
+                    requests.insert(parent_id.to_owned(), SubagentRequest::Approval);
+                    next = by_id.get(parent_id).and_then(|parent| {
+                        let nested = parent.relationship_to_parent.as_deref() == Some("subagent") || parent.side_chat == Some(true);
+                        if nested { parent.parent_thread_id.as_deref() } else { None }
+                    });
+                }
+            }
         }
-        if child.lineage.relationship_to_parent.as_deref() != Some("subagent") {
-            continue;
-        }
-        // The coordinator answers child questions; only approvals need user attention.
-        let Some(SubagentRequest::Approval) = subagent_request(child) else { continue };
-        flag_approval(parent_id.as_deref(), &by_id, &mut requests, vec![child.id.as_str()]);
-    }
-    for (parent_id, request) in delegated {
-        if *request == SubagentRequest::Approval { flag_approval(Some(parent_id), &by_id, &mut requests, Vec::new()); }
     }
     requests
 }
 
-fn flag_approval<'a>(parent_id: Option<&'a str>, by_id: &HashMap<&str, &'a ThreadShell>, requests: &mut HashMap<String, SubagentRequest>, mut seen: Vec<&'a str>) {
-    let mut next = parent_id;
-    while let Some(parent_id) = next.filter(|id| !seen.contains(id)) {
-        seen.push(parent_id);
-        requests.insert(parent_id.to_owned(), SubagentRequest::Approval);
-        next = by_id.get(parent_id).and_then(|parent| {
-            let nested = parent.lineage.relationship_to_parent.as_deref() == Some("subagent") || parent.lineage.side_chat == Some(true);
-            if nested { parent.lineage.parent_thread_id.as_deref() } else { None }
-        });
-    }
+/// `pendingSubagentRequestsByThread`: requests may target an omitted parent.
+pub fn pending_subagent_requests(threads: &[ThreadShell]) -> HashMap<String, SubagentRequest> {
+    pending_subagent_requests_with_delegated(threads, &[])
+}
+
+pub(crate) fn contributions_with_delegated(threads: &[ThreadShell], delegated: &[(&str, SubagentRequest)]) -> Vec<RequestContribution> {
+    let mut contributions = request_contributions(threads);
+    contributions.extend(delegated.iter().filter(|(_, request)| *request == SubagentRequest::Approval)
+        .map(|(parent_id, _)| RequestContribution::Approval { parent_id: (*parent_id).to_owned(), origin: None }));
+    contributions
+}
+
+pub(crate) fn pending_subagent_requests_with_delegated(threads: &[ThreadShell], delegated: &[(&str, SubagentRequest)]) -> HashMap<String, SubagentRequest> {
+    let contributions = contributions_with_delegated(threads, delegated);
+    requests_from_contributions(&contributions, &threads.iter().map(|thread| (thread.id.as_str(), &thread.lineage)).collect())
 }

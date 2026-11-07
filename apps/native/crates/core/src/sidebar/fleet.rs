@@ -43,6 +43,9 @@ pub struct EnvironmentSummary {
     pub older_settled: Option<crate::shell::OlderSettledCut>,
     pub removed_at: HashMap<String, u64>,
     pub older_count_key: Option<String>,
+    pub request_contributions: Vec<thread::RequestContribution>,
+    /// Active rows precede archived rows in `threads`; only this prefix supplies ancestry.
+    pub request_ancestry_len: usize,
 }
 
 impl EnvironmentSummary {
@@ -51,14 +54,26 @@ impl EnvironmentSummary {
         let config = config.config.as_ref();
         let label = config.map_or_else(|| owner.saved_id.clone(), |config| config.environment.label.clone());
         let scratch = config.and_then(|config| config.scratch_workspace_root.as_deref());
+        let request_contributions = shell.snapshot.as_ref().map(|snapshot| thread::request_contributions(&snapshot.threads)).unwrap_or_default();
         let (projects, threads) = shell.snapshot.as_ref().map(|snapshot| {
-            let pending = thread::pending_subagent_requests(&snapshot.threads);
+            let ancestry = snapshot.threads.iter().map(|thread| (thread.id.as_str(), &thread.lineage)).collect();
+            let pending = thread::requests_from_contributions(&request_contributions, &ancestry);
             (snapshot.projects.iter().map(|project| ScopedProject { owner: owner.clone(), project: project.clone(), is_scratch: crate::settings::projects::is_scratch(&project.workspace_root, scratch), environment_label: label.clone() }).collect(),
              snapshot.threads.iter().chain(&snapshot.archived_threads).map(|thread| ScopedThread::from_shell(&owner, thread, pending.get(&thread.id).copied())).collect())
         }).unwrap_or_default();
         let older_settled = shell.snapshot.as_ref().and_then(|snapshot| snapshot.older_settled.clone());
         let older_count_key = shell.snapshot.as_ref().zip(older_settled.as_ref().and_then(OlderSettled::from_cut)).map(|(snapshot, older)| older_settled::count_key(&snapshot.threads, older.before_ms, &shell.removed_at));
-        Self { owner, projects, threads, synchronized: shell.synchronized, config_loaded: config.is_some(), snapshot_sequence: shell.sequence(), older_settled, removed_at: shell.removed_at.clone(), older_count_key }
+        let request_ancestry_len = shell.snapshot.as_ref().map_or(0, |snapshot| snapshot.threads.len());
+        Self { owner, projects, threads, synchronized: shell.synchronized, config_loaded: config.is_some(), snapshot_sequence: shell.sequence(), older_settled, removed_at: shell.removed_at.clone(), older_count_key, request_contributions, request_ancestry_len }
+    }
+
+    /// Reads have already passed MountedReads owner/generation/cut/tombstone/shell-id admission.
+    pub fn composed_requests(&self, reads: &[&ThreadShell]) -> HashMap<String, SubagentRequest> {
+        let ancestry = self.threads.iter().take(self.request_ancestry_len)
+            .map(|row| (row.thread.id.as_str(), &row.lineage))
+            .chain(reads.iter().map(|thread| (thread.id.as_str(), &thread.lineage))).collect();
+        let read_contributions = thread::request_contributions(reads.iter().copied());
+        thread::requests_from_contributions(self.request_contributions.iter().chain(&read_contributions), &ancestry)
     }
 }
 
@@ -146,6 +161,14 @@ fn folder_dot(threads: &[&SidebarThread]) -> Option<FolderDot> {
 
 impl ScopedSidebarModel {
     pub fn build(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
+        Self::build_with_overrides(input, state, false)
+    }
+
+    pub fn build_presented(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
+        Self::build_with_overrides(input, state, true)
+    }
+
+    fn build_with_overrides(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState, presented: bool) -> Self {
         state.trackers.retain(|(saved_id,canonical_id,generation), _| input.environments.iter().any(|environment| {
             environment.owner.saved_id == *saved_id && environment.owner.canonical_id == *canonical_id && environment.owner.generation == *generation
         }));
@@ -165,7 +188,8 @@ impl ScopedSidebarModel {
         let admitted = input.environments.iter().map(|environment| {
             let mut seen = HashSet::new();
             let extra = input.extra_threads.iter().filter(|extra| *extra.owner == environment.owner).flat_map(|extra| extra.threads);
-            environment.threads.iter().chain(extra).filter(|thread| thread.owner == environment.owner)
+            let overrides: HashMap<_, _> = if presented { extra.clone().map(|row| (row.thread.id.as_str(), row)).collect() } else { HashMap::new() };
+            environment.threads.iter().map(|row| overrides.get(row.thread.id.as_str()).copied().unwrap_or(row)).chain(extra).filter(|thread| thread.owner == environment.owner)
                 .filter(|thread| seen.insert(thread.thread.id.clone())).filter(eligible).collect::<Vec<_>>()
         }).collect::<Vec<_>>();
         let candidates = admitted.iter().map(|threads| threads.iter().copied().filter(in_scope).collect::<Vec<_>>()).collect::<Vec<_>>();

@@ -379,8 +379,13 @@ fn linked_approvals_cross_local_ancestry_and_delegated_cycles_with_web_precedenc
     let r = rollup(&a,&c);
     assert_eq!(request(&r,"b","task"), Some(Approval));
     assert_eq!(request(&r,"a","side"), Some(Approval));
+    for (env, threads) in [("a", a.as_slice()), ("b", b.as_slice()), ("c", c.as_slice())] {
+        let ancestry = threads.iter().map(|thread| (thread.id.as_str(), &thread.lineage)).collect();
+        assert_eq!(crate::sidebar::thread::requests_from_contributions(&r.contributions[env], &ancestry), r.requests[env], "final delegated seeds reproduce the existing fixed point");
+    }
     a[1].pending_runtime_request = None;
     assert!(rollup(&a,&c).requests.values().all(HashMap::is_empty), "retirement clears a cyclic fixed point");
+    assert!(rollup(&a,&c).contributions.values().all(Vec::is_empty), "retired delegated seeds are replaced, not retained");
 }
 
 #[test]

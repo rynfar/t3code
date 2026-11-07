@@ -366,6 +366,31 @@ mod quiet_fleet {
         entries.get_mut("b").unwrap().shell.apply(t3_core::shell::ShellStreamItem::ThreadUpdated { sequence:3, location:"active".into(), thread:Box::new(row) });
         publish(&entries,"b",true,&views);
         assert_eq!(view.borrow().environment("a").unwrap().summary.threads[0].thread.pending_subagent_request, None);
+        let before = view.borrow().environment("a").unwrap().summary.clone();
+        let mut row = entries["b"].shell.thread("same").unwrap().clone();
+        row.delegated_from = Some(json!({"environmentId":"canonical-a","threadId":"omitted"}));
+        row.pending_runtime_request = Some(serde_json::from_value(json!({"id":"ask","kind":"command"})).unwrap());
+        entries.get_mut("b").unwrap().shell.apply(t3_core::shell::ShellStreamItem::ThreadUpdated { sequence:4, location:"active".into(), thread:Box::new(row.clone()) });
+        publish(&entries,"b",true,&views);
+        let missing = view.borrow().environment("a").unwrap().summary.clone();
+        assert!(!Arc::ptr_eq(&before,&missing), "only an absent target changed");
+        assert!(missing.threads.iter().all(|row| row.thread.pending_subagent_request.is_none()));
+        assert_eq!(missing.composed_requests(&[]).get("omitted"), Some(&t3_core::sidebar::thread::SubagentRequest::Approval));
+        publish(&entries,"a",false,&views);
+        assert!(Arc::ptr_eq(&missing,&view.borrow().environment("a").unwrap().summary), "quiet publication reuses current missing-target inputs");
+        entries.get_mut("b").unwrap().status = ConnectionStatus::Connecting;
+        publish(&entries,"b",true,&views);
+        let disconnected = view.borrow().environment("a").unwrap().summary.clone();
+        assert!(!Arc::ptr_eq(&missing,&disconnected));
+        assert!(disconnected.composed_requests(&[]).is_empty(), "nonparticipating linked source retires its absent-target request");
+        entries.get_mut("b").unwrap().status = ConnectionStatus::Connected;
+        publish(&entries,"b",true,&views);
+        assert_eq!(view.borrow().environment("a").unwrap().summary.composed_requests(&[]).get("omitted"), Some(&t3_core::sidebar::thread::SubagentRequest::Approval));
+        row.pending_runtime_request = None;
+        entries.get_mut("b").unwrap().shell.apply(t3_core::shell::ShellStreamItem::ThreadUpdated { sequence:5, location:"active".into(), thread:Box::new(row) });
+        publish(&entries,"b",true,&views);
+        let cleared = view.borrow().environment("a").unwrap().summary.clone();
+        assert!(cleared.composed_requests(&[]).is_empty(), "authoritative request clear retires the absent-target contribution");
     }
 
     #[tokio::test]
