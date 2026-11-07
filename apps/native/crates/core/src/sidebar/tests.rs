@@ -1457,6 +1457,65 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let model = ScopedSidebarModel::build(&ScopedSidebarInput { groups: &archived, ..folder_input }, &mut ScopedSidebarState::default());
     assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Folder { archived:true, .. })));
     assert_eq!(model.ordered.len(), 2, "archived projects keep folders only for their Active rows");
+
+    let mut dot_a = ea.clone();
+    let mut dot_b = eb.clone();
+    dot_a.threads = vec![threads[0].clone(), threads[0].clone()];
+    dot_a.threads[0].thread.runtime = Some(runtime("failed"));
+    dot_a.threads[1].thread.id = "hidden-attention".into();
+    dot_a.threads[1].lineage.root_thread_id = "hidden-attention".into();
+    dot_b.threads = vec![threads[1].clone()];
+    dot_b.threads[0].thread.has_pending_approvals = true;
+    for (hidden_approval, expected_dot) in [(true, FolderDot::Attention), (false, FolderDot::Failed)] {
+        dot_a.threads[1].thread.has_pending_approvals = hidden_approval;
+        let environments = [&dot_a, &dot_b];
+        let model = ScopedSidebarModel::build(&ScopedSidebarInput {
+            environments: &environments, groups: &groups, preferences: &preferences,
+            selected: Some(&selected), older: &[], extra_threads: &[], ..input
+        }, &mut ScopedSidebarState::default());
+        assert_eq!(model.threads.len(), 3);
+        assert_eq!(model.thread(&selected).unwrap().owner, dot_b.owner);
+        assert!(model.thread(&selected).unwrap().thread.has_pending_approvals);
+        assert_eq!(model.ordered.iter().map(|index| model.threads[*index].key.clone()).collect::<Vec<_>>(), vec![selected.clone()]);
+        assert_eq!(model.rows.iter().filter_map(|row| match row {
+            ScopedSidebarRow::Folder { key, expanded, hidden_count, dot, .. } => Some((key.clone(), *expanded, *hidden_count, *dot)),
+            _ => None,
+        }).collect::<Vec<_>>(), vec![(groups[0].key.clone(), false, 2, Some(expected_dot))]);
+    }
+
+    let shelf_settings = SidebarSettings::default();
+    let closed_shelves = ShelfState::default();
+    for (shelf, section, thread) in [
+        (Shelf::Working, Section::Working, working("same", true)),
+        (Shelf::Snoozed, Section::Snoozed, SidebarThread { id: "same".into(), ..snoozed(FUTURE_WAKE) }),
+    ] {
+        let mut shelf_a = ea.clone();
+        let mut shelf_b = eb.clone();
+        shelf_a.threads = vec![threads[0].clone()];
+        shelf_b.threads = vec![threads[1].clone()];
+        shelf_a.threads[0].thread = thread.clone();
+        shelf_b.threads[0].thread = thread;
+        let environments = [&shelf_a, &shelf_b];
+        let model = ScopedSidebarModel::build(&ScopedSidebarInput {
+            environments: &environments, settings: &shelf_settings, shelves: &closed_shelves,
+            selected: Some(&selected), older: &[], extra_threads: &[], now: iso(NOW), folder_mode: false, ..input
+        }, &mut ScopedSidebarState::default());
+        let sibling = ThreadKey::new("a", "same");
+        assert_eq!(model.threads.len(), 2);
+        assert_eq!(model.thread(&selected).unwrap().owner, shelf_b.owner);
+        assert_eq!(model.thread(&sibling).unwrap().owner, shelf_a.owner);
+        assert_eq!(model.section_of(&selected), Some(section));
+        assert_eq!(model.section_of(&sibling), Some(section));
+        assert_eq!(model.ordered.iter().map(|index| model.threads[*index].key.clone()).collect::<Vec<_>>(), vec![selected.clone()]);
+        assert_eq!(model.rows.iter().filter_map(|row| match row {
+            ScopedSidebarRow::Thread { index, section } => Some((model.threads[*index].key.clone(), *section)),
+            _ => None,
+        }).collect::<Vec<_>>(), vec![(selected.clone(), section)]);
+        assert!(model.rows.iter().any(|row| matches!(row,
+            ScopedSidebarRow::Shelf { shelf: actual, count: 2, expanded: false } if *actual == shelf
+        )));
+    }
+
 }
 
 
