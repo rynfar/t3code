@@ -160,13 +160,15 @@ impl ScopedSidebarModel {
                 && scope.as_ref().is_none_or(|scope| scope.iter().any(|project| project.environment_id == older.owner.saved_id))
         }).filter_map(|older| older.frontier));
         let eligible = |thread: &&ScopedThread| !thread.thread.archived && !thread.thread.deleted && thread.thread.listed
-            && !input.hidden.contains(&thread.key()) && scope.as_ref().is_none_or(|scope| scope.contains(&thread.project_ref()));
-        let candidates = input.environments.iter().map(|environment| {
+            && !input.hidden.contains(&thread.key());
+        let in_scope = |thread: &&ScopedThread| scope.as_ref().is_none_or(|scope| scope.contains(&thread.project_ref()));
+        let admitted = input.environments.iter().map(|environment| {
             let mut seen = HashSet::new();
             let extra = input.extra_threads.iter().filter(|extra| *extra.owner == environment.owner).flat_map(|extra| extra.threads);
             environment.threads.iter().chain(extra).filter(|thread| thread.owner == environment.owner)
                 .filter(|thread| seen.insert(thread.thread.id.clone())).filter(eligible).collect::<Vec<_>>()
         }).collect::<Vec<_>>();
+        let candidates = admitted.iter().map(|threads| threads.iter().copied().filter(in_scope).collect::<Vec<_>>()).collect::<Vec<_>>();
         let mut aliases = HashMap::new();
         for (environment, threads) in input.environments.iter().zip(&candidates) {
             for thread in threads {
@@ -212,11 +214,12 @@ impl ScopedSidebarModel {
                 *held_counts.entry((*saved).clone()).or_default() += 1;
             }
         }
-        for (environment, candidates) in input.environments.iter().zip(candidates) {
-            let scoped = candidates.into_iter().filter(|thread| aliases.get(&(environment.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key())).collect::<Vec<_>>();
-            let local = scoped.iter().map(|thread| thread.thread.clone()).collect::<Vec<_>>();
+        for (environment, admitted) in input.environments.iter().zip(admitted) {
+            let local = admitted.iter().map(|thread| thread.thread.clone()).collect::<Vec<_>>();
             let tracker = state.trackers.entry((environment.owner.saved_id.clone(),environment.owner.canonical_id.clone(),environment.owner.generation)).or_default();
             let observation = if working_shelf_enabled { tracker.observe(&local, input.now) } else { tracker.clear(); Default::default() };
+            let (local,scoped): (Vec<_>,Vec<_>) = local.into_iter().zip(admitted).filter(|(_,thread)| in_scope(thread)
+                && aliases.get(&(environment.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key())).unzip();
             let partition = super::partition(&PartitionInput { threads: &local, working_shelf_enabled, config_loaded: environment.config_loaded, now: input.now, inbox: &observation });
             let offset = model.threads.len();
             for thread in scoped {
