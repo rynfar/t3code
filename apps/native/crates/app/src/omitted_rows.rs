@@ -330,7 +330,8 @@ impl AppState {
         self.sidebar.owner_omitted.entry(owner).or_default().count_task = Some(task);
     }
 
-    pub(crate) fn reconcile_scoped_settled_scopes(&mut self, groups: &[t3_core::sidebar::grouping::ScopedProjectGroup]) {
+    pub(crate) fn reconcile_scoped_settled_scopes(&mut self, groups: &[t3_core::sidebar::grouping::ScopedProjectGroup]) -> bool {
+        let mut unmounted = false;
         let scope = self.project_preferences.scoped_members(groups,self.fleet.environments.iter().all(|entry| entry.summary.synchronized));
         for entry in &self.fleet.environments {
             let owner = &entry.summary.owner;
@@ -342,6 +343,7 @@ impl AppState {
             let omitted = self.sidebar.owner_omitted.entry(owner.clone()).or_default();
             if omitted.scoped_projects != projects {
                 omitted.page_task = None;
+                unmounted |= omitted.mounts.generation_of(PAGES_KEY).is_some();
                 omitted.mounts.unmount(PAGES_KEY);
                 omitted.pages = SettledPages::default();
                 omitted.scoped_projects = projects;
@@ -349,6 +351,7 @@ impl AppState {
                 omitted.pages.sync_generation(owner.shell_generation,older.as_ref());
             }
         }
+        unmounted
     }
 
     fn scoped_older_projects(&self, owner: &t3_core::sidebar::grouping::EnvironmentOwner, cx:&gpui::App) -> Option<Vec<String>> {
@@ -962,5 +965,379 @@ mod tests {
         });
         state.update(cx, |state, _| state.stop_pump());
         drop(events);
+    }
+
+    #[gpui::test]
+    async fn newer_scoped_family_approval_reaches_its_settled_parent_before_shell(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+        use t3_client::supervisor::ClientEvent;
+        use t3_core::shell::{ShellState, ShellStreamItem};
+        use t3_core::sidebar::{Section, Shelf};
+        use t3_core::sidebar::tag_filter::ThreadKey;
+        use t3_core::sidebar::thread::SubagentRequest;
+        use t3_core::sidebar::status::{ThreadStatus, resolve_status};
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut original_fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::install_committed_client(&installed.0, serde_json::from_value(serde_json::json!({
+                "boringSidebarEnabled":false
+            })).unwrap(), cx);
+            installed
+        });
+        let thread_wire = |id: &str, settled_at: Option<String>| serde_json::json!({
+            "createdBy":"user","creationSource":"web","id":id,"projectId":"family-project","title":id,
+            "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
+            "runtimeMode":"auto","interactionMode":"default","branch":null,"worktreePath":null,
+            "lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":id},
+            "forkedFrom":null,"activeProviderThreadId":null,"latestRunId":null,
+            "latestRunRequestedAt":null,"latestRunStartedAt":null,"latestRunCompletedAt":null,
+            "activeRunId":null,"status":"idle","pendingRuntimeRequest":null,"latestVisibleMessage":null,
+            "latestUserMessageAt":null,"hasActionableProposedPlan":false,"pendingBackgroundTasks":[],
+            "itemCount":0,"visibleItemCount":0,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-04T00:00:00Z",
+            "archivedAt":null,"settledOverride":settled_at.as_ref().map(|_| "settled"),"settledAt":settled_at,"deletedAt":null
+        });
+        let cut_ms = t3_core::sidebar::time::parse_iso("2026-01-03T00:00:00Z").unwrap();
+        let cut = t3_core::sidebar::time::format_iso(cut_ms);
+        let mut full_history = (0..25).map(|index| thread_wire(&format!("retained-{index:02}"),
+            Some(t3_core::sidebar::time::format_iso(cut_ms + (24-index)*1_000)))).collect::<Vec<_>>();
+        let mut parent_wire = thread_wire("family-parent", Some("2026-01-02T00:00:00Z".into()));
+        parent_wire["title"] = serde_json::json!("page-parent");
+        let mut idle_child_wire = thread_wire("family-child", None);
+        idle_child_wire["createdBy"] = serde_json::json!("agent");
+        idle_child_wire["lineage"] = serde_json::json!({"parentThreadId":"family-parent","relationshipToParent":"subagent","rootThreadId":"family-parent"});
+        full_history.push(parent_wire.clone());
+        full_history.push(idle_child_wire.clone());
+        let decoded_history: Vec<ThreadShell> = serde_json::from_value(serde_json::json!(full_history)).unwrap();
+        assert_eq!(decoded_history.iter().filter(|thread| thread.lineage.is_listed() && thread.is_settled()).count(),26);
+        assert_eq!(decoded_history.iter().filter(|thread| t3_core::sidebar::older_settled::is_older_settled(thread,cut_ms)).count(),1);
+        assert!(!decoded_history[26].is_live());
+        assert!(decoded_history[26].pending_runtime_request.is_none());
+        // This snapshot represents server trimming, not execution of the server trim service.
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "schemaVersion":1,"snapshotSequence":100,"threads":&full_history[..25],"archivedThreads":[],
+            "projects":[{"id":"family-project","title":"Family","workspaceRoot":"/fixture/family",
+                "projectIcon":{"kind":"monogram","text":"P","color":"blue"},
+                "defaultModelSelection":null,"scripts":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}],
+            "olderSettled":{"before":cut,"asOfSequence":100,"counts":[{"projectId":"family-project","count":1}]}
+        })).unwrap();
+        let mut shell = ShellState::default();
+        shell.apply(ShellStreamItem::Snapshot { snapshot:Box::new(snapshot), resolved_repository_identity_roots:None });
+        shell.apply(ShellStreamItem::Synchronized);
+        let mut config = state.read_with(cx, |state, _| state.server_config.clone());
+        let mut target_config = t3_core::server_config::ServerConfig::default();
+        target_config.environment.environment_id = "family-server".into();
+        target_config.environment.label = "Family".into();
+        target_config.shell_thread_families = true;
+        target_config.shell_older_settled = true;
+        config.config = Some(target_config);
+        let session = |read| serde_json::from_value(serde_json::json!({"authenticated":true,
+            "permissions":if read { vec!["orchestration:read"] } else { Vec::new() }})).unwrap();
+        let (client, mut fixture) = ClientFixture::handle(session(true));
+        let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let loaded_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("family-fixture").is_some_and(|entry|
+                entry.status == ConnectionStatus::Connected && entry.summary.synchronized && entry.summary.snapshot_sequence == Some(100)
+                && entry.summary.threads.len() == 25 && state.scoped_ready(&entry.summary.owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && entry.config.config.as_ref().is_some_and(|config| config.shell_thread_families && config.shell_older_settled)) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let install = state.update(cx, |state, _| state.connections.install_fixture("family-fixture",client,shell,config,ConnectionStatus::Connected));
+        let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
+        drop(loaded_subscription);
+        let parent_key = ThreadKey::new("family-fixture","family-parent");
+        let child_key = ThreadKey::new("family-fixture","family-child");
+        let (owner, summary_q) = state.read_with(cx, |state, _| {
+            let entry = state.scoped_environment("family-fixture").unwrap();
+            assert!(state.scoped_ready(&entry.summary.owner,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+            assert!(entry.summary.threads.iter().all(|thread| thread.thread.id != "family-parent" && thread.thread.id != "family-child"));
+            assert_eq!(state.sidebar.fleet.listed_settled_count,25);
+            assert!(!state.sidebar.shelves.settled_expanded);
+            (entry.summary.owner.clone(),entry.summary.clone())
+        });
+        state.update(cx, |state, cx| {
+            state.toggle_shelf(Shelf::Settled,cx);
+            assert_eq!(state.sidebar.shelves.settled_visible,10);
+            assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().pages.status,PageStatus::Ready);
+            state.show_more_settled(cx);
+            assert_eq!(state.sidebar.shelves.settled_visible,35);
+            assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().pages.status,PageStatus::Pending);
+        });
+        let (method,payload,reply) = fixture.next_request().await;
+        assert_eq!(method,GET_OLDER_SETTLED_THREADS);
+        assert_eq!(payload,serde_json::json!({"before":{"settledAt":cut},"limit":25}));
+        let page_owner = owner.clone(); let page_summary = summary_q.clone();
+        let (sent, paged) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let page_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell
+                && state.scoped_environment("family-fixture").is_some_and(|entry| entry.summary.owner == page_owner && Arc::ptr_eq(&entry.summary,&page_summary) && entry.summary.snapshot_sequence == Some(100))
+                && state.scoped_ready(&page_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state.sidebar.owner_omitted.get(&page_owner).is_some_and(|omitted| omitted.pages.reads.len() == 1 && omitted.mounts.generation_of(PAGES_KEY) == Some(page_owner.shell_generation))
+                && state.scoped_thread(&ThreadKey::new("family-fixture","family-parent")).is_some_and(|row| row.thread.title == "page-parent") {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        reply.send(Ok(serde_json::json!({"snapshotSequence":100,"threads":[parent_wire.clone()],"counts":[]}))).unwrap();
+        paged.await.unwrap(); drop(page_subscription);
+        let mut family_parent_wire = parent_wire.clone();
+        family_parent_wire["title"] = serde_json::json!("family-parent-new");
+        family_parent_wire["updatedAt"] = serde_json::json!("2026-01-05T00:00:00Z");
+        let mut live_child_wire = idle_child_wire;
+        live_child_wire["latestRunId"] = serde_json::json!("family-run");
+        live_child_wire["activeRunId"] = serde_json::json!("family-run");
+        live_child_wire["latestRunRequestedAt"] = serde_json::json!("2026-01-05T00:00:00Z");
+        live_child_wire["latestRunStartedAt"] = serde_json::json!("2026-01-05T00:00:01Z");
+        live_child_wire["activityRunStartedAt"] = serde_json::json!("2026-01-05T00:00:01Z");
+        live_child_wire["activityRunStatus"] = serde_json::json!("running");
+        live_child_wire["status"] = serde_json::json!("running");
+        live_child_wire["updatedAt"] = serde_json::json!("2026-01-05T00:00:02Z");
+        live_child_wire["pendingRuntimeRequest"] = serde_json::json!({"id":"family-command-approval","kind":"command","createdAt":"2026-01-05T00:00:02Z","blocking":true});
+        let mounted_owner = owner.clone(); let mounted_summary = summary_q.clone();
+        let (sent, mounted) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let family_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell
+                && state.scoped_ready(&mounted_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state.scoped_environment("family-fixture").is_some_and(|entry| entry.summary.owner == mounted_owner && Arc::ptr_eq(&entry.summary,&mounted_summary) && entry.summary.snapshot_sequence == Some(100)
+                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent" && row.thread.id != "family-child"))
+                && state.sidebar.owner_omitted.get(&mounted_owner).is_some_and(|omitted| omitted.mounts.generation_of(PAGES_KEY) == Some(mounted_owner.shell_generation)
+                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(mounted_owner.shell_generation))
+                && state.sidebar.owner_extra_threads.get(&mounted_owner).is_some_and(|rows| rows.iter().any(|row|
+                    row.thread.id == "family-child" && row.owner == mounted_owner && row.thread.has_pending_approvals
+                    && row.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("family-run"))
+                    && row.lineage.parent_thread_id.as_deref() == Some("family-parent") && row.lineage.root_thread_id == "family-parent"
+                    && row.lineage.relationship_to_parent.as_deref() == Some("subagent") && !row.thread.listed)) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        state.update(cx, |state, cx| state.read_scoped_family(&owner,"family-parent",cx));
+        let (method,payload,reply) = fixture.next_request().await;
+        assert_eq!(method,GET_THREAD_FAMILY);
+        assert_eq!(payload,serde_json::json!({"threadId":"family-parent"}));
+        reply.send(Ok(serde_json::json!({"snapshotSequence":102,"threads":[family_parent_wire.clone(),live_child_wire.clone()]}))).unwrap();
+        mounted.await.unwrap(); drop(family_subscription);
+        state.read_with(cx, |state, _| {
+            assert!(Arc::ptr_eq(&summary_q,&state.scoped_environment("family-fixture").unwrap().summary));
+            let parent = &state.sidebar.fleet.thread(&parent_key).unwrap().thread;
+            assert_eq!(parent.pending_subagent_request,Some(SubagentRequest::Approval),"accepted newer family child approval must reach its listed parent before shell catch-up");
+            assert_eq!(resolve_status(parent),ThreadStatus::Approval);
+            assert!(parent.is_settled());
+            assert_eq!(state.sidebar.fleet.section_of(&parent_key),Some(Section::Settled));
+            assert_eq!(parent.title,"page-parent","first mounted page wins the family duplicate");
+            assert!(state.scoped_thread(&child_key).is_some_and(|row| !row.thread.listed));
+            assert!(state.sidebar.fleet.thread(&child_key).is_none());
+        });
+
+        let child_first_owner = owner.clone();
+        let (sent, child_first) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let child_first_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell
+                && state.scoped_ready(&child_first_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state.scoped_environment("family-fixture").is_some_and(|entry|
+                    entry.summary.owner == child_first_owner && entry.summary.snapshot_sequence == Some(101)
+                    && entry.summary.older_settled.as_ref().is_some_and(|cut| cut.as_of_sequence == 100)
+                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent")
+                    && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && row.thread.has_pending_approvals))
+                && state.sidebar.owner_omitted.get(&child_first_owner).is_some_and(|omitted|
+                    omitted.mounts.generation_of(PAGES_KEY) == Some(child_first_owner.shell_generation)
+                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(child_first_owner.shell_generation))
+                && state.sidebar.owner_extra_threads.get(&child_first_owner).is_some_and(|rows|
+                    rows.iter().any(|row| row.owner == child_first_owner && row.thread.id == "family-parent" && row.thread.title == "page-parent")
+                    && rows.iter().all(|row| row.thread.id != "family-child")) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let child_first_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":101,"location":"active","thread":live_child_wire.clone()})).unwrap();
+        let send_events = events.clone();
+        runtime.spawn(async move { send_events.send(ClientEvent::Shell(child_first_delta)).await.unwrap(); }).await.unwrap();
+        child_first.await.unwrap(); drop(child_first_subscription);
+        state.read_with(cx, |state, _| {
+            let entry = state.scoped_environment("family-fixture").unwrap();
+            assert_eq!(entry.summary.owner,owner);
+            assert_eq!(entry.summary.snapshot_sequence,Some(101));
+            assert!(!Arc::ptr_eq(&summary_q,&entry.summary));
+            assert!(state.scoped_ready(&owner,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+            assert_eq!(entry.summary.older_settled,summary_q.older_settled);
+            assert!(entry.summary.threads.iter().all(|row| row.thread.id != "family-parent"));
+            let child = state.scoped_thread(&child_key).unwrap();
+            assert_eq!(child.owner,owner);
+            assert!(child.thread.has_pending_approvals);
+            assert!(!child.thread.listed);
+            assert!(child.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("family-run")));
+            assert!(state.sidebar.owner_extra_threads.get(&owner).is_some_and(|rows|
+                rows.iter().any(|row| row.thread.id == "family-parent" && row.thread.title == "page-parent")
+                && rows.iter().all(|row| row.thread.id != "family-child")));
+            let parent = &state.sidebar.fleet.thread(&parent_key).unwrap().thread;
+            assert_eq!(parent.pending_subagent_request,Some(SubagentRequest::Approval),"authoritative child approval must still reach its mounted parent before parent catch-up");
+            assert_eq!(resolve_status(parent),ThreadStatus::Approval);
+            assert_eq!(parent.title,"page-parent","first mounted page still wins while only the child is authoritative");
+            assert!(parent.is_settled());
+            assert_eq!(state.sidebar.fleet.section_of(&parent_key),Some(Section::Settled));
+            assert!(state.sidebar.fleet.thread(&child_key).is_none());
+        });
+
+        let child_cleared_owner = owner.clone();
+        let (sent, child_cleared) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let child_cleared_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell
+                && state.scoped_ready(&child_cleared_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state.scoped_environment("family-fixture").is_some_and(|entry|
+                    entry.summary.owner == child_cleared_owner && entry.summary.snapshot_sequence == Some(102)
+                    && entry.summary.older_settled.as_ref().is_some_and(|cut| cut.as_of_sequence == 100)
+                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent")
+                    && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && !row.thread.has_pending_runtime_request && !row.thread.has_pending_approvals))
+                && state.sidebar.owner_omitted.get(&child_cleared_owner).is_some_and(|omitted|
+                    omitted.mounts.generation_of(PAGES_KEY) == Some(child_cleared_owner.shell_generation)
+                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(child_cleared_owner.shell_generation))
+                && state.sidebar.owner_extra_threads.get(&child_cleared_owner).is_some_and(|rows|
+                    rows.iter().any(|row| row.owner == child_cleared_owner && row.thread.id == "family-parent" && row.thread.title == "page-parent")
+                    && rows.iter().all(|row| row.thread.id != "family-child")) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let mut cleared_child_wire = live_child_wire.clone();
+        cleared_child_wire["pendingRuntimeRequest"] = serde_json::Value::Null;
+        let child_cleared_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":102,"location":"active","thread":cleared_child_wire})).unwrap();
+        let send_events = events.clone();
+        runtime.spawn(async move { send_events.send(ClientEvent::Shell(child_cleared_delta)).await.unwrap(); }).await.unwrap();
+        child_cleared.await.unwrap(); drop(child_cleared_subscription);
+        state.read_with(cx, |state, _| {
+            let entry = state.scoped_environment("family-fixture").unwrap();
+            assert_eq!(entry.summary.owner,owner);
+            assert_eq!(entry.summary.snapshot_sequence,Some(102));
+            assert!(!Arc::ptr_eq(&summary_q,&entry.summary));
+            assert!(state.scoped_ready(&owner,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+            assert_eq!(entry.summary.older_settled,summary_q.older_settled);
+            assert!(entry.summary.threads.iter().all(|row| row.thread.id != "family-parent"));
+            let child = state.scoped_thread(&child_key).unwrap();
+            assert_eq!(child.owner,owner);
+            assert!(!child.thread.has_pending_approvals);
+            assert!(!child.thread.has_pending_runtime_request);
+            assert!(!child.thread.listed);
+            assert!(child.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("family-run")));
+            assert!(state.sidebar.owner_extra_threads.get(&owner).is_some_and(|rows|
+                rows.iter().any(|row| row.thread.id == "family-parent" && row.thread.title == "page-parent")
+                && rows.iter().all(|row| row.thread.id != "family-child")));
+            let parent = &state.sidebar.fleet.thread(&parent_key).unwrap().thread;
+            assert_eq!(parent.pending_subagent_request,None,"authoritative child request clear must retire the stale family approval while its parent remains mounted");
+            assert_eq!(resolve_status(parent),ThreadStatus::Ready);
+            assert_eq!(parent.title,"page-parent","first mounted page still wins while only the child is authoritative");
+            assert!(parent.is_settled());
+            assert_eq!(state.sidebar.fleet.section_of(&parent_key),Some(Section::Settled));
+            assert!(state.sidebar.fleet.thread(&child_key).is_none());
+        });
+
+        let child_restored_owner = owner.clone();
+        let (sent, child_restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let child_restored_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell
+                && state.scoped_ready(&child_restored_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state.scoped_environment("family-fixture").is_some_and(|entry|
+                    entry.summary.owner == child_restored_owner && entry.summary.snapshot_sequence == Some(103)
+                    && entry.summary.older_settled.as_ref().is_some_and(|cut| cut.as_of_sequence == 100)
+                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent")
+                    && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && row.thread.has_pending_approvals))
+                && state.sidebar.owner_omitted.get(&child_restored_owner).is_some_and(|omitted|
+                    omitted.mounts.generation_of(PAGES_KEY) == Some(child_restored_owner.shell_generation)
+                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(child_restored_owner.shell_generation))
+                && state.sidebar.owner_extra_threads.get(&child_restored_owner).is_some_and(|rows|
+                    rows.iter().any(|row| row.owner == child_restored_owner && row.thread.id == "family-parent" && row.thread.title == "page-parent")
+                    && rows.iter().all(|row| row.thread.id != "family-child")) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let child_restored_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":103,"location":"active","thread":live_child_wire.clone()})).unwrap();
+        let send_events = events.clone();
+        runtime.spawn(async move { send_events.send(ClientEvent::Shell(child_restored_delta)).await.unwrap(); }).await.unwrap();
+        child_restored.await.unwrap(); drop(child_restored_subscription);
+        state.read_with(cx, |state, _| {
+            let entry = state.scoped_environment("family-fixture").unwrap();
+            assert_eq!(entry.summary.owner,owner);
+            assert_eq!(entry.summary.snapshot_sequence,Some(103));
+            assert!(!Arc::ptr_eq(&summary_q,&entry.summary));
+            assert!(state.scoped_ready(&owner,t3_core::auth::ORCHESTRATION_READ_SCOPE));
+            assert_eq!(entry.summary.older_settled,summary_q.older_settled);
+            assert!(entry.summary.threads.iter().all(|row| row.thread.id != "family-parent"));
+            let child = state.scoped_thread(&child_key).unwrap();
+            assert_eq!(child.owner,owner);
+            assert!(child.thread.has_pending_approvals);
+            assert!(!child.thread.listed);
+            assert!(child.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("family-run")));
+            assert!(state.sidebar.owner_extra_threads.get(&owner).is_some_and(|rows|
+                rows.iter().any(|row| row.thread.id == "family-parent" && row.thread.title == "page-parent")
+                && rows.iter().all(|row| row.thread.id != "family-child")));
+            let parent = &state.sidebar.fleet.thread(&parent_key).unwrap().thread;
+            assert_eq!(parent.pending_subagent_request,Some(SubagentRequest::Approval),"restored authoritative child approval must reach its still-mounted parent");
+            assert_eq!(resolve_status(parent),ThreadStatus::Approval);
+            assert_eq!(parent.title,"page-parent","first mounted page still wins while only the child is authoritative");
+            assert!(parent.is_settled());
+            assert_eq!(state.sidebar.fleet.section_of(&parent_key),Some(Section::Settled));
+            assert!(state.sidebar.fleet.thread(&child_key).is_none());
+        });
+
+        let caught_owner = owner.clone();
+        let (sent, caught_up) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let catchup_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("family-fixture").is_some_and(|entry|
+                entry.summary.owner == caught_owner && entry.summary.snapshot_sequence == Some(104)
+                && entry.summary.threads.iter().any(|row| row.thread.id == "family-parent" && row.thread.title == "family-parent-new" && row.thread.pending_subagent_request == Some(SubagentRequest::Approval))
+                && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && row.thread.has_pending_approvals)) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let parent_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":104,"location":"active","thread":family_parent_wire})).unwrap();
+        let child_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":105,"location":"active","thread":live_child_wire})).unwrap();
+        let send_events = events.clone();
+        runtime.spawn(async move { send_events.send(ClientEvent::Shell(parent_delta)).await.unwrap(); }).await.unwrap();
+        caught_up.await.unwrap(); drop(catchup_subscription);
+        let send_events = events.clone();
+        runtime.spawn(async move { send_events.send(ClientEvent::Shell(child_delta)).await.unwrap(); }).await.unwrap();
+        state.read_with(cx, |state, _| {
+            let entry = state.scoped_environment("family-fixture").unwrap();
+            assert_eq!(entry.summary.owner,owner);
+            assert!(!Arc::ptr_eq(&summary_q,&entry.summary));
+            let parent = &state.sidebar.fleet.thread(&parent_key).unwrap().thread;
+            assert_eq!(parent.title,"family-parent-new");
+            assert_eq!(parent.pending_subagent_request,Some(SubagentRequest::Approval));
+            assert_eq!(resolve_status(parent),ThreadStatus::Approval);
+            assert!(parent.is_settled());
+            assert_eq!(state.sidebar.fleet.section_of(&parent_key),Some(Section::Settled));
+            assert!(state.sidebar.fleet.thread(&child_key).is_none());
+            assert!(state.sidebar.owner_extra_threads.get(&owner).is_none_or(|rows| rows.iter().all(|row| row.thread.id != "family-parent" && row.thread.id != "family-child")));
+        });
+        let removed_owner = owner.clone();
+        let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
+        let removal_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::Shell && state.scoped_environment("family-fixture").is_some_and(|entry|
+                entry.summary.owner == removed_owner && entry.summary.snapshot_sequence == Some(106)
+                && entry.summary.removed_at.get("family-child") == Some(&106)
+                && entry.summary.threads.iter().all(|row| row.thread.id != "family-child")
+                && entry.summary.threads.iter().any(|row| row.thread.id == "family-parent" && row.thread.pending_subagent_request.is_none())) {
+                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            }
+        }));
+        let removal: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.removed","sequence":106,"location":"active","threadId":"family-child"})).unwrap();
+        let send_events = events.clone();
+        runtime.spawn(async move { send_events.send(ClientEvent::Shell(removal)).await.unwrap(); }).await.unwrap();
+        removed.await.unwrap(); drop(removal_subscription);
+        state.read_with(cx, |state, _| {
+            assert!(state.scoped_thread(&child_key).is_none());
+            assert!(state.sidebar.fleet.thread(&child_key).is_none());
+            let parent = &state.sidebar.fleet.thread(&parent_key).unwrap().thread;
+            assert_eq!(parent.pending_subagent_request,None);
+            assert_eq!(resolve_status(parent),ThreadStatus::Ready);
+            assert!(parent.is_settled());
+            assert_eq!(state.sidebar.fleet.section_of(&parent_key),Some(Section::Settled));
+            assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().mounts.generation_of(&family_key("family-parent")),Some(owner.shell_generation));
+        });
+        assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        assert!(!original_fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+        runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())).await.unwrap().unwrap();
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
+        cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
+        drop(original_fixture); drop(fixture); drop(runtime);
+        cx.run_until_parked();
     }
 }

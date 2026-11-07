@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::shell::ThreadShell;
 use crate::sidebar::tag_filter::ThreadKey;
-use crate::sidebar::thread::{SubagentRequest, pending_subagent_requests, pending_subagent_requests_with_delegated, subagent_request};
+use crate::sidebar::thread::{SubagentRequest, pending_subagent_requests, requests_from_contributions, subagent_request, contributions_with_delegated, RequestContribution};
 
 pub struct LinkedEnvironment<'a> {
     pub saved_id: &'a str,
@@ -17,6 +17,7 @@ pub struct LinkedEnvironment<'a> {
 pub struct LinkedRequests {
     pub delegated_under_parent: HashSet<ThreadKey>,
     pub requests: HashMap<String, HashMap<String, SubagentRequest>>,
+    pub contributions: HashMap<String, Vec<RequestContribution>>,
 }
 
 impl LinkedRequests {
@@ -54,6 +55,7 @@ impl LinkedRequests {
         // Each pass crosses one delegated edge; approval flags only grow, even in cycles.
         for _ in 0..=tasks.len() {
             let mut next = HashMap::new();
+            let mut contributions = HashMap::new();
             for environment in environments {
                 let delegated = tasks
                     .iter()
@@ -69,11 +71,12 @@ impl LinkedRequests {
                         Some((*parent_id, request))
                     })
                     .collect::<Vec<_>>();
-                next.insert(
-                    environment.saved_id.to_owned(),
-                    pending_subagent_requests_with_delegated(environment.threads, &delegated),
-                );
+                let current = contributions_with_delegated(environment.threads, &delegated);
+                let ancestry = environment.threads.iter().map(|thread| (thread.id.as_str(), &thread.lineage)).collect();
+                next.insert(environment.saved_id.to_owned(), requests_from_contributions(&current, &ancestry));
+                contributions.insert(environment.saved_id.to_owned(), current);
             }
+            result.contributions = contributions;
             if next == result.requests {
                 break;
             }

@@ -273,6 +273,83 @@ async fn watched_thread_navigation_preserves_same_scope_shelves(cx: &mut gpui::T
         assert_eq!(state.environments.active.as_deref(), Some(owner.saved_id.as_str()));
         assert_eq!(state.selected_thread.as_deref(), Some(target.thread_id.as_str()));
     });
+    state.update(cx, |state, cx| {
+        let mut child = state.shell.thread(&target.thread_id).unwrap().clone();
+        child.id = "requesting-child".into();
+        child.lineage.parent_thread_id = Some(target.thread_id.clone());
+        child.lineage.relationship_to_parent = Some("subagent".into());
+        child.status = "running".into();
+        child.activity_run_status = Some(Some("running".into()));
+        child.pending_runtime_request = Some(serde_json::from_value(serde_json::json!({"id":"approval", "kind":"approval"})).unwrap());
+        state.mount_scoped_search_rows(&owner, Some(t3_core::families::FamilyRead {
+            snapshot_sequence: state.shell.sequence().unwrap_or(0), threads: vec![child],
+        }), cx);
+        assert!(state.sidebar.owner_extra_threads.get(&owner).unwrap().iter().any(|row|
+            row.key() == target && row.thread.project_id == "checkout-b"
+                && row.thread.pending_subagent_request == Some(t3_core::sidebar::thread::SubagentRequest::Approval)));
+        let mut waiting = state.fleet.as_ref().clone();
+        waiting.revision += 1;
+        let entry = waiting.environments.iter_mut().find(|entry| entry.summary.owner.saved_id == "saved-fixture").unwrap();
+        Arc::make_mut(&mut Arc::make_mut(entry).summary).synchronized = false;
+        state.sidebar.route_observed = None;
+        state.apply_fleet_view(Arc::new(waiting), cx);
+        assert_eq!(state.sidebar.route_pending.as_ref(), Some(&target));
+        let old = state.scoped_thread(&target).unwrap().clone();
+        let mut current_shell = state.shell.clone();
+        let raw = current_shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|thread| thread.id == target.thread_id).unwrap();
+        raw.project_id = "other".into();
+        raw.title = "Current canonical title".into();
+        raw.created_at = "2026-02-01T00:00:00Z".into();
+        let expected = raw.clone();
+        let mut current = state.fleet.as_ref().clone();
+        current.revision += 1;
+        for entry in &mut current.environments {
+            if entry.summary.owner == owner {
+                let entry = Arc::make_mut(entry);
+                entry.summary = Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(owner.clone(), &current_shell, &entry.config));
+            } else {
+                Arc::make_mut(&mut Arc::make_mut(entry).summary).synchronized = true;
+            }
+        }
+        state.shell = current_shell;
+        state.sidebar.fleet_selection.insert(target.clone());
+        let scope = state.project_preferences.scope_keys.clone();
+        assert!(!scope.is_empty());
+        state.apply_fleet_view(Arc::new(current), cx);
+        assert_eq!(state.scoped_environment(&owner.saved_id).unwrap().summary.owner, owner);
+        assert!(state.sidebar.route_pending.is_none());
+        assert_eq!(state.project_preferences.scope_keys, scope, "route reveal must use the current canonical project before consuming the route");
+        assert!(state.sidebar.fleet_selection.contains(&target));
+        let row = state.scoped_thread(&target).unwrap();
+        assert_ne!(old.thread.project_id, row.thread.project_id);
+        assert_ne!(old.created_at, row.created_at);
+        assert_eq!(row.thread.project_id, expected.project_id);
+        assert_eq!(row.thread.title, expected.title);
+        assert_eq!(row.created_at, expected.created_at);
+        assert_eq!(row.thread.pending_subagent_request, Some(t3_core::sidebar::thread::SubagentRequest::Approval));
+        assert_eq!(state.sidebar.fleet.thread(&target).unwrap().thread, row.thread);
+        assert_eq!(state.selected_thread.as_deref(), Some(target.thread_id.as_str()));
+        state.mount_scoped_search_rows(&owner, None, cx);
+        assert_eq!(state.scoped_thread(&target).unwrap().thread.pending_subagent_request, None);
+        let mut page_child = expected;
+        page_child.id = "page-child".into();
+        page_child.lineage.parent_thread_id = Some(target.thread_id.clone());
+        page_child.lineage.relationship_to_parent = Some("subagent".into());
+        page_child.status = "running".into();
+        page_child.activity_run_status = Some(Some("running".into()));
+        page_child.pending_runtime_request = Some(serde_json::from_value(serde_json::json!({"id":"page-approval", "kind":"approval"})).unwrap());
+        state.sidebar.owner_omitted.get_mut(&owner).unwrap().mounts.mount("older-settled", owner.shell_generation, vec![t3_core::families::FamilyRead {
+            snapshot_sequence: state.shell.sequence().unwrap_or(0), threads: vec![page_child],
+        }]);
+        state.rebuild_sidebar(cx);
+        assert_eq!(state.scoped_thread(&target).unwrap().thread.pending_subagent_request, Some(t3_core::sidebar::thread::SubagentRequest::Approval));
+        assert!(state.scoped_thread(&ThreadKey::new(&owner.saved_id, "page-child")).is_some());
+        state.set_scoped_project_scope(vec![chosen.clone()], cx);
+        assert_eq!(state.sidebar.owner_omitted.get(&owner).unwrap().mounts.generation_of("older-settled"), None);
+        assert!(state.scoped_thread(&ThreadKey::new(&owner.saved_id, "page-child")).is_none());
+        assert_eq!(state.scoped_thread(&target).unwrap().thread.pending_subagent_request, None);
+        assert!(state.sidebar.owner_extra_threads.get(&owner).unwrap().iter().all(|row| row.key() != target));
+    });
     runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())).await.unwrap().unwrap();
     cx.run_until_parked();
     assert!(!original.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));

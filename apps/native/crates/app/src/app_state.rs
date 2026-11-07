@@ -410,7 +410,7 @@ impl AppState {
 
     pub(crate) fn scoped_thread(&self, key: &t3_core::sidebar::tag_filter::ThreadKey) -> Option<&t3_core::sidebar::fleet::ScopedThread> {
         let summary = &self.scoped_environment(&key.environment_id)?.summary;
-        summary.threads.iter().chain(self.sidebar.owner_extra_threads.get(&summary.owner).into_iter().flatten()).find(|thread| thread.thread.id == key.thread_id)
+        self.sidebar.owner_extra_threads.get(&summary.owner).into_iter().flatten().chain(&summary.threads).find(|thread| thread.thread.id == key.thread_id)
     }
 
     pub(crate) fn scoped_project(&self, key: &t3_core::sidebar::grouping::ProjectRef) -> Option<&t3_core::sidebar::grouping::ScopedProject> {

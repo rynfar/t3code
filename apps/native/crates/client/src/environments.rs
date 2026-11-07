@@ -295,9 +295,12 @@ fn publish(entries: &HashMap<String, Entry>, changed: &str, material: bool, outp
         let linked = LinkedRequests::build(&linked_environments);
         for environment in &mut environments {
             let requests = linked.requests.get(&environment.summary.owner.saved_id);
-            let changed = environment.summary.threads.iter().any(|thread| thread.thread.pending_subagent_request != requests.and_then(|requests| requests.get(&thread.thread.id)).copied());
+            let contributions = linked.contributions.get(&environment.summary.owner.saved_id).cloned().unwrap_or_default();
+            let changed = environment.summary.request_contributions != contributions
+                || environment.summary.threads.iter().any(|thread| thread.thread.pending_subagent_request != requests.and_then(|requests| requests.get(&thread.thread.id)).copied());
             if changed {
                 let mut summary = (*environment.summary).clone();
+                summary.request_contributions = contributions;
                 for thread in &mut summary.threads { thread.thread.pending_subagent_request = requests.and_then(|requests| requests.get(&thread.thread.id)).copied(); }
                 let mut view = (**environment).clone(); view.summary = Arc::new(summary); *environment = Arc::new(view);
                 dirty = true;

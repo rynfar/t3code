@@ -863,6 +863,44 @@ fn subagent_approvals_flag_their_listed_parent() {
     assert_eq!(parent.pending_subagent_request, Some(SubagentRequest::Approval));
     assert_eq!(resolve_status(parent), ThreadStatus::Approval);
     assert!(model.thread("child").is_none());
+
+    use super::fleet::EnvironmentSummary;
+    use super::thread::requests_from_contributions;
+    use crate::server_config::ServerConfigState;
+    use crate::shell::{ShellState, ShellStreamItem};
+    let decode = |id: &str, patch| serde_json::from_value::<ThreadShell>(wire_thread(id, patch)).unwrap();
+    let child = decode("child", json!({"lineage":{"parentThreadId":"parent","relationshipToParent":"subagent","rootThreadId":"grand"},
+        "status":"running","pendingRuntimeRequest":{"id":"ask","kind":"command"}}));
+    let parent = decode("parent", json!({"lineage":{"parentThreadId":"grand","relationshipToParent":"subagent","rootThreadId":"grand"}}));
+    let grand = decode("grand", json!({}));
+    let mut shell = ShellState::default();
+    shell.apply(ShellStreamItem::Snapshot { snapshot: Box::new(self::snapshot(vec![serde_json::to_value(&child).unwrap(),serde_json::to_value(&grand).unwrap()])), resolved_repository_identity_roots: None });
+    let summary = EnvironmentSummary::from_shell(super::grouping::EnvironmentOwner { saved_id:"local".into(), canonical_id:None, generation:1, connection_generation:1, shell_generation:1 }, &shell, &ServerConfigState::default());
+    let pending = summary.composed_requests(&[&parent]);
+    assert_eq!(pending.get("parent"), Some(&SubagentRequest::Approval));
+    assert_eq!(pending.get("grand"), Some(&SubagentRequest::Approval), "admitted ancestry bridges an omitted parent");
+    let mut cyclic_parent = parent.clone(); cyclic_parent.lineage.parent_thread_id = Some("child".into());
+    let cyclic = summary.composed_requests(&[&cyclic_parent]);
+    assert_eq!(cyclic.get("parent"), Some(&SubagentRequest::Approval));
+    assert!(!cyclic.contains_key("child"), "origin is excluded when ancestry returns to the approving child");
+    let mut direct = child.clone(); direct.lineage.side_chat = Some(true);
+    for (kind, expected) in [("command", SubagentRequest::Approval), ("user_input", SubagentRequest::UserInput)] {
+        direct.pending_runtime_request.as_mut().unwrap().kind = kind.into();
+        let contributions = super::thread::request_contributions([&direct]);
+        let ancestry = [("parent", &parent.lineage),("grand", &grand.lineage)].into_iter().collect();
+        let pending = requests_from_contributions(&contributions, &ancestry);
+        assert_eq!(pending.get("parent"), Some(&expected));
+        assert!(!pending.contains_key("grand"), "both side-chat request kinds stop at their direct parent");
+    }
+    let mut archived_parent = parent.clone(); archived_parent.archived_at = Some(NOW.into());
+    let mut archived_snapshot = shell.snapshot.as_ref().unwrap().clone(); archived_snapshot.archived_threads.push(archived_parent);
+    shell.apply(ShellStreamItem::Snapshot { snapshot: Box::new(archived_snapshot), resolved_repository_identity_roots: None });
+    let summary = EnvironmentSummary::from_shell(super::grouping::EnvironmentOwner { saved_id:"local".into(), canonical_id:None, generation:1, connection_generation:1, shell_generation:1 }, &shell, &ServerConfigState::default());
+    assert!(!summary.composed_requests(&[]).contains_key("grand"), "archived presentation lineage is not active ancestry");
+    let mut cleared = child.clone(); cleared.pending_runtime_request = None;
+    shell.apply(ShellStreamItem::ThreadUpdated { sequence: shell.sequence().unwrap() + 1, location:"active".into(), thread:Box::new(cleared) });
+    let summary = EnvironmentSummary::from_shell(super::grouping::EnvironmentOwner { saved_id:"local".into(), canonical_id:None, generation:1, connection_generation:1, shell_generation:1 }, &shell, &ServerConfigState::default());
+    assert!(summary.composed_requests(&[&parent]).is_empty(), "current authoritative clear replaces missing-target contributions");
 }
 
 #[test]
@@ -1305,8 +1343,8 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let mut preferences = ProjectPreferences::default();
     let groups = build_scoped_project_groups(&GroupInput { projects: &projects, threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::UpdatedAt });
     preferences.set_expanded(&groups[0], false);
-    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
-    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None };
+    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None, request_contributions: Vec::new(), request_ancestry_len: 0 };
+    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None, request_contributions: Vec::new(), request_ancestry_len: 0 };
     let selected = ThreadKey::new("b", "same");
     let sidebar = SidebarSettings::default(); let shelves = ShelfState::default(); let hidden = HashSet::new();
     let mut state = ScopedSidebarState::default();
@@ -1320,6 +1358,14 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let normal = ScopedSidebarModel::build(&ScopedSidebarInput { folder_mode: false, ..input }, &mut state);
     assert_eq!(normal.ordered.len(), 2);
     assert_ne!(normal.row_keys()[0], normal.row_keys()[1]);
+    let mut presented_row = ea.threads[0].clone();
+    presented_row.thread.pending_subagent_request = Some(SubagentRequest::Approval);
+    let presented_rows = [presented_row];
+    let presented = [ScopedExtraThreads { owner: &ea.owner, threads: &presented_rows }];
+    let presented_model = ScopedSidebarModel::build_presented(&ScopedSidebarInput { extra_threads: &presented, folder_mode: false, ..input }, &mut state);
+    assert_eq!(presented_model.thread(&ThreadKey::new("a", "same")).unwrap().thread.pending_subagent_request, Some(SubagentRequest::Approval));
+    assert_eq!(presented_model.threads.len(), 2, "presentation override does not duplicate canonical identity");
+    assert_eq!(ea.threads[0].thread.pending_subagent_request, None, "canonical summary remains unchanged");
     let mut alias = ea.clone(); alias.owner.saved_id = "alias".into();
     for thread in &mut alias.threads { thread.owner = alias.owner.clone(); }
     let aliases = [&ea, &eb, &alias];

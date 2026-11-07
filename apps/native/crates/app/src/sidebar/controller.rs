@@ -315,6 +315,7 @@ impl AppState {
     /// Re-derives the sidebar from the shell. Cheap enough per batch; rows notify only the sidebar.
     pub(crate) fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar.settings.working_shelf_enabled = crate::settings::store::client(cx).working_shelf();
+        self.prepare_scoped_threads();
         self.sync_undo_contexts();
         self.release_stale_deletion(cx);
         let now = now_ms();
@@ -387,6 +388,28 @@ impl AppState {
         }
     }
 
+    fn prepare_scoped_threads(&mut self) {
+        let owners: std::collections::HashSet<_> = self.fleet.environments.iter().map(|entry| entry.summary.owner.clone()).collect();
+        self.sidebar.owner_omitted.retain(|owner, _| owners.contains(owner));
+        self.sidebar.owner_extra_threads = self.fleet.environments.iter().map(|entry| {
+            let summary = &entry.summary;
+            let ids = summary.threads.iter().map(|row| row.thread.id.clone()).collect();
+            let cut = summary.older_settled.as_ref().map_or(0, |cut| cut.as_of_sequence);
+            let reads = self.sidebar.owner_omitted.get(&summary.owner).map(|omitted|
+                omitted.mounts.extras_for(summary.owner.shell_generation, cut, &ids, &summary.removed_at)).unwrap_or_default();
+            let pending = summary.composed_requests(&reads);
+            let mut threads = summary.threads.iter().filter_map(|row| {
+                let request = pending.get(&row.thread.id).copied();
+                if row.thread.pending_subagent_request == request { return None; }
+                let mut row = row.clone();
+                row.thread.pending_subagent_request = request;
+                Some(row)
+            }).collect::<Vec<_>>();
+            threads.extend(reads.into_iter().map(|thread| t3_core::sidebar::fleet::ScopedThread::from_shell(&summary.owner, thread, pending.get(&thread.id).copied())));
+            (summary.owner.clone(), threads)
+        }).collect();
+    }
+
     fn rebuild_fleet_sidebar(&mut self, cx: &mut Context<Self>) {
         if self.fleet.environments.is_empty() { return; }
         self.reveal_scoped_route(cx);
@@ -396,31 +419,23 @@ impl AppState {
             self.sidebar.settled_scope_keys = scope_keys;
             self.sidebar.shelves.settled_visible = t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT;
         }
-        self.reconcile_scoped_settled_scopes(&groups);
+        if self.reconcile_scoped_settled_scopes(&groups) {
+            self.prepare_scoped_threads();
+        }
         let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
         let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id));
         let hidden = self.notifications.visibility.hidden.union(&self.notifications.visibility.delegated_under_parent).cloned().collect();
-        let owners: std::collections::HashSet<_> = environments.iter().map(|entry| entry.owner.clone()).collect();
-        self.sidebar.owner_omitted.retain(|owner, _| owners.contains(owner));
         let older_values: Vec<_> = self.sidebar.owner_omitted.iter().filter_map(|(owner, omitted)| omitted.older().map(|older| (owner, older))).collect();
         let older: Vec<_> = older_values.iter().map(|(owner, older)| t3_core::sidebar::fleet::ScopedOlderSettled {
             owner, older, frontier: self.sidebar.owner_omitted.get(*owner).and_then(|omitted| omitted.pages.listing_frontier(Some(older))),
         }).collect();
-        let extra_values = environments.iter().filter_map(|summary| {
-            let omitted = self.sidebar.owner_omitted.get(&summary.owner)?;
-            let ids = summary.threads.iter().map(|row| row.thread.id.clone()).collect();
-            let cut = summary.older_settled.as_ref().map_or(0, |cut| cut.as_of_sequence);
-            let threads = omitted.mounts.extras_for(summary.owner.shell_generation, cut, &ids, &summary.removed_at).into_iter().map(|thread| t3_core::sidebar::fleet::ScopedThread::from_shell(&summary.owner, thread, None)).collect::<Vec<_>>();
-            Some((&summary.owner, threads))
-        }).collect::<Vec<_>>();
-        let extras = extra_values.iter().map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads }).collect::<Vec<_>>();
-        let model = t3_core::sidebar::fleet::ScopedSidebarModel::build(&t3_core::sidebar::fleet::ScopedSidebarInput {
+        let extras = self.sidebar.owner_extra_threads.iter().map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads }).collect::<Vec<_>>();
+        let model = t3_core::sidebar::fleet::ScopedSidebarModel::build_presented(&t3_core::sidebar::fleet::ScopedSidebarInput {
             environments: &environments, groups: &groups, preferences: &self.project_preferences,
             settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
             older: &older, extra_threads: &extras, now: now_ms(), folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
             dragging: self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section),
         }, &mut self.sidebar.fleet_state);
-        self.sidebar.owner_extra_threads = extra_values.into_iter().map(|(owner, threads)| (owner.clone(), threads)).collect();
         self.sidebar.fleet_selection.retain(|key| model.thread(key).is_some());
         let next = model.next_change_at;
         let listed = model.listed_settled_count;
