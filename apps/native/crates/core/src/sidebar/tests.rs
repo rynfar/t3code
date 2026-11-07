@@ -1558,6 +1558,68 @@ fn scoped_sections_follow_loaded_config_per_owner_and_keep_cached_disconnects() 
         assert_eq!(replaced.section_of(&key),Some(Section::Active),"a recreated thread or environment cannot inherit the old thread's grace");
         assert_eq!(replaced.next_change_at,None);
     }
+    let mut scoped_shell = shell.clone();
+    let scoped_snapshot = scoped_shell.snapshot.as_mut().unwrap();
+    scoped_snapshot.threads.retain(|thread| thread.id == "working");
+    let mut other_project = scoped_snapshot.projects[0].clone();
+    other_project.id = "p2".into();
+    other_project.workspace_root = "/other-scope".into();
+    scoped_snapshot.projects.push(other_project);
+    let scope_running = EnvironmentSummary::from_shell(owner("ready"),&scoped_shell,&loaded);
+    let scope_preferences = ProjectPreferences::default();
+    let scope_groups = build_scoped_project_groups(&GroupInput {
+        projects:&scope_running.projects,threads:&scope_running.threads,settings:&settings.grouping,preferences:&scope_preferences,
+        preferred_environment:None,consumer:GroupConsumer::Sidebar,sort:ProjectSortOrder::UpdatedAt,
+    });
+    let scope_key = |project| scope_groups.iter().find(|group| group.member_refs.iter().any(|reference| reference.project_id == project)).unwrap().key.clone();
+    let scope_a = scope_key("p1");
+    let scope_b = scope_key("p2");
+    assert_ne!(scope_a,scope_b);
+    let mut scoped_preferences = scope_preferences;
+    let scope_model = |environment: &EnvironmentSummary, preferences: &ProjectPreferences, state: &mut ScopedSidebarState, now| ScopedSidebarModel::build(&ScopedSidebarInput {
+        environments:&[environment],groups:&scope_groups,preferences,settings:&settings,shelves:&shelves,
+        selected:None,hidden:&hidden,older:&[],extra_threads:&[],now,folder_mode:false,dragging:None,
+    },state);
+    let mut scoped_history = ScopedSidebarState::default();
+    scoped_preferences.scope_keys = vec![scope_a.clone()];
+    let observed = scope_model(&scope_running,&scoped_preferences,&mut scoped_history,at);
+    assert_eq!(observed.section_of(&key),Some(Section::Working));
+    assert_eq!(observed.next_change_at,None);
+    scoped_preferences.scope_keys = vec![scope_b.clone()];
+    assert!(scope_model(&scope_running,&scoped_preferences,&mut scoped_history,at+1).thread(&key).is_none());
+    scoped_preferences.scope_keys = vec![scope_a.clone()];
+    let no_event = scope_model(&scope_running,&scoped_preferences,&mut scoped_history,at+2);
+    assert_eq!(no_event.section_of(&key),Some(Section::Working));
+    assert_eq!(no_event.next_change_at,None,"scope changes without completion create no grace deadline");
+    scoped_preferences.scope_keys = vec![scope_b];
+    assert!(scope_model(&scope_running,&scoped_preferences,&mut scoped_history,at+3).thread(&key).is_none());
+    let before_completion = scoped_shell.thread("working").unwrap().clone();
+    let mut terminal = before_completion.clone();
+    terminal.status = "completed".into();
+    terminal.active_run_id = None;
+    let expected_terminal = terminal.clone();
+    assert!(scoped_shell.apply(serde_json::from_value(json!({
+        "kind":"thread.updated","sequence":2,"location":"active","thread":terminal,
+    })).unwrap()));
+    let scope_completed = EnvironmentSummary::from_shell(owner("ready"),&scoped_shell,&loaded);
+    assert_eq!(scope_completed.owner,scope_running.owner,"ThreadUpdated must keep the same full owner, including shell generation");
+    assert_eq!(scoped_shell.thread("working"),Some(&expected_terminal));
+    let mut unchanged_terminal = expected_terminal;
+    unchanged_terminal.status = before_completion.status.clone();
+    unchanged_terminal.active_run_id = before_completion.active_run_id.clone();
+    assert_eq!(unchanged_terminal,before_completion,"hidden completion changes no placement or creation identity");
+    assert!(!is_thread_working(&scope_completed.threads[0].thread));
+    let completed_at = at+10;
+    let hidden_completion = scope_model(&scope_completed,&scoped_preferences,&mut scoped_history,completed_at);
+    assert!(hidden_completion.thread(&key).is_none(),"completed A stays absent while project B is selected");
+    scoped_preferences.scope_keys = vec![scope_a];
+    let returned = scope_model(&scope_completed,&scoped_preferences,&mut scoped_history,completed_at+1);
+    assert_eq!(returned.section_of(&key),Some(Section::Working),"completion observed outside the chosen project scope must retain its Working exit grace on return");
+    let scope_deadline = completed_at+WORKING_EXIT_GRACE_MS;
+    assert_eq!(returned.next_change_at,Some(scope_deadline),"grace starts at hidden completion, not when scope A returns");
+    let expired_scope = scope_model(&scope_completed,&scoped_preferences,&mut scoped_history,scope_deadline);
+    assert_eq!(expired_scope.section_of(&key),Some(Section::Active));
+    assert_eq!(expired_scope.next_change_at,None);
 }
 
 #[test]
