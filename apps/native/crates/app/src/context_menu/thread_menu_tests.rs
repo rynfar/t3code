@@ -814,6 +814,8 @@ fn scoped_menu_keeps_background_owner_and_rejects_same_id_replacement(cx: &mut g
 
 #[gpui::test]
 fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut gpui::TestAppContext) {
+    // The scope setter persists preferences on the real UI-state writer thread.
+    cx.executor().allow_parking();
     use std::sync::Arc;
     use t3_core::sidebar::fleet::EnvironmentSummary;
     use t3_core::sidebar::grouping::EnvironmentOwner;
@@ -893,7 +895,24 @@ fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut 
             state.end_thread_drag(cx);
         });
     }
+    state.update(cx, |state, cx| {
+        let key = state.sidebar.fleet.ordered.first().map(|index| state.sidebar.fleet.threads[*index].key.clone()).unwrap();
+        let scope = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| !group.archived).unwrap().key;
+        let modifier = gpui::Modifiers { platform:cfg!(target_os="macos"), control:!cfg!(target_os="macos"), ..Default::default() };
+        state.click_scoped_sidebar_thread(&key, modifier, cx);
+        assert_eq!(state.sidebar.fleet_selection, [key.clone()].into_iter().collect());
+        assert_eq!(state.sidebar.fleet_anchor.as_ref(), Some(&key));
+        let route = (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone());
+        state.set_scoped_project_scope(vec![scope.clone()], cx);
+        assert_eq!(state.project_preferences.scope_keys, vec![scope]);
+        assert!(state.sidebar.fleet_selection.is_empty());
+        assert!(state.sidebar.fleet_anchor.is_none(), "explicit project scope changes clear the scoped selection anchor");
+        assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), route, "explicit project scope changes do not navigate");
+    });
     assert!(fixture.take_commands().is_empty());
+    runtime.block_on(runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())))
+        .expect("fixture writer barrier task").expect("prior fixture writes committed before teardown");
+    cx.run_until_parked();
 }
 
     #[gpui::test]

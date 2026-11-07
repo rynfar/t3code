@@ -548,6 +548,7 @@ impl AppState {
     pub(crate) fn set_scoped_project_scope(&mut self, keys: Vec<String>, cx: &mut Context<Self>) {
         self.project_preferences.scope_keys = keys;
         self.sidebar.fleet_selection.clear();
+        self.sidebar.fleet_anchor = None;
         self.save_project_preferences(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Shell);
