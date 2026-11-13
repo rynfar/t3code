@@ -477,7 +477,7 @@ impl AppState {
         self.pending_scoped_route = None;
         match route.action {
             ScopedRouteAction::Thread(id) => {
-                if self.thread_shell(&id).is_none() { self.read_family(&id,true,cx); }
+                if self.thread_shell(&id).is_none() { self.read_family(&id, crate::omitted_rows::FamilySelect::Always, cx); }
                 else { self.select_thread(&id,cx); }
             },
             ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
@@ -574,7 +574,7 @@ impl AppState {
             && let Some(id) = self.restore_thread.take()
         {
             // A shell that omits older settled or idle threads can still hold it: ask its family.
-            self.read_family(&id, true, cx);
+            self.read_family(&id, crate::omitted_rows::FamilySelect::IfIdle, cx);
         }
     }
 
@@ -880,7 +880,7 @@ impl AppState {
             if self.thread_route_visible(&key.thread_id) {
                 self.select_thread(&key.thread_id, cx);
             } else if self.server_config.config.as_ref().is_some_and(|config| config.shell_thread_families) {
-                self.read_family(&key.thread_id, true, cx);
+                self.read_family(&key.thread_id, crate::omitted_rows::FamilySelect::Always, cx);
             } else {
                 self.pending_composer_file_drop = None;
             }
@@ -918,8 +918,8 @@ impl AppState {
         }
     }
 
-    pub(crate) fn clear_pending_composer_file_drop_for(&mut self, thread_id: &str) {
-        if self.pending_composer_file_drop.as_ref().is_some_and(|(key, _)| key.thread_id == thread_id) {
+    pub(crate) fn clear_pending_composer_file_drop_for(&mut self, environment_id: Option<&str>, thread_id: &str) {
+        if self.pending_composer_file_drop.as_ref().is_some_and(|(key, _)| pending_drop_matches(key, environment_id, thread_id)) {
             self.pending_composer_file_drop = None;
         }
     }
@@ -927,6 +927,15 @@ impl AppState {
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn has_pending_composer_file_drop(&self) -> bool {
         self.pending_composer_file_drop.is_some()
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn set_pending_composer_file_drop_for_test(
+        &mut self,
+        key: t3_core::sidebar::tag_filter::ThreadKey,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        self.pending_composer_file_drop = Some((key, paths));
     }
 
     pub(crate) fn client_handle(&self) -> Option<ClientHandle> {

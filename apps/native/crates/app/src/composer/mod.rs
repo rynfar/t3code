@@ -760,12 +760,12 @@ impl Composer {
             return;
         }
         let Some(thread_id) = self.thread_id() else { return };
-        if !self.can_attach(cx) {
-            return;
-        }
         let Some(paths) = self.state.update(cx, |state, _| state.take_pending_composer_file_drop(&thread_id)) else {
             return;
         };
+        if !self.can_attach(cx) {
+            return;
+        }
         self.attach_paths(paths, window, cx);
         self.focus(window, cx);
     }

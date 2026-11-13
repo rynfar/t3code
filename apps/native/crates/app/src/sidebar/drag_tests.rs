@@ -295,6 +295,36 @@ async fn drag_scroll_stability_and_conditional_settled_overflow_reveal(cx: &mut 
     assert!(after_settled_top.item_ix > 0, "Settled target must reveal SettledPlaceholder (#293), got {after_settled_top:?}");
 
     pane.update(vcx, |p, cx| p.finish_drag(false, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+
+    // Start and end drag while already scrolled down (item_ix > 0, offset > 0) when both Pinned (top) and Settled (bottom) insert markers (#293).
+    pane.update(vcx, |p, _| {
+        p.list.scroll_to(gpui::ListOffset { item_ix: 8, offset_in_item: px(12.) });
+    });
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    let scrolled_before = pane.read_with(vcx, |p, _| p.list.logical_scroll_top());
+    assert_eq!(scrolled_before.item_ix, 8);
+    assert_eq!(scrolled_before.offset_in_item, px(12.));
+    let anchor_key = pane.read_with(vcx, |p, _| p.row_keys[scrolled_before.item_ix].clone());
+
+    pane.update(vcx, |p, cx| {
+        let preview = cx.new(|_| drag::ThreadDragPreview::new("Thread 10".into(), None, Default::default()));
+        p.begin_drag("act-10", None, preview, cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    let scrolled_during = pane.read_with(vcx, |p, _| p.list.logical_scroll_top());
+    let expected_during_ix = pane.read_with(vcx, |p, _| p.row_keys.iter().position(|k| k == &anchor_key).unwrap());
+    assert_eq!(scrolled_during.item_ix, expected_during_ix, "starting drag while scrolled must re-anchor instead of jumping to top (#293)");
+    assert_eq!(scrolled_during.offset_in_item, px(12.));
+
+    pane.update(vcx, |p, cx| p.finish_drag(false, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    let scrolled_after = pane.read_with(vcx, |p, _| p.list.logical_scroll_top());
+    assert_eq!(scrolled_after.item_ix, 8, "ending drag while scrolled must re-anchor back without jumping to top (#293)");
+    assert_eq!(scrolled_after.offset_in_item, px(12.));
     state.update(vcx, |s, _| s.stop_pump());
 }
 
@@ -577,4 +607,246 @@ async fn external_file_drop_on_sidebar_and_search_navigates_with_key_isolation(c
         assert!(!s.has_pending_composer_file_drop(), "leaving route must clear pending drop");
         s.stop_pump();
     });
+}
+
+#[gpui::test]
+async fn omitted_thread_file_drop_selects_over_active_thread_or_draft_and_is_env_scoped(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, mut fixture) = setup_app(cx, &runtime);
+    let tmp = TempDir::new("omitted-drop");
+    let file_a = tmp.path().join("drop.txt");
+    std::fs::write(&file_a, "omitted").unwrap();
+
+    state.update(cx, |s, cx| {
+        s.environments.active = Some("env-a".into());
+        if let Some(cfg) = s.server_config.config.as_mut() {
+            cfg.shell_thread_families = true;
+            cfg.settings.hide_tagged_threads = true;
+            cfg.settings.hidden_thread_tags = vec!["review".into()];
+            cfg.environment.capabilities.file_attachments = Some(t3_core::server_config::FileAttachmentsCapability {
+                max_upload_bytes: 1_000_000,
+            });
+        }
+        let snap = s.shell.snapshot.as_mut().unwrap();
+        snap.projects = vec![serde_json::from_value(json!({
+            "id": "proj-1",
+            "title": "App",
+            "workspaceRoot": "/app",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z"
+        })).unwrap()];
+        snap.threads = vec![
+            serde_json::from_value(thread_json("act-1", "Active One", "idle", "2026-01-02T00:00:00.000Z")).unwrap(),
+        ];
+        s.rebuild_sidebar(cx);
+        s.select_thread("act-1", cx);
+        assert_eq!(s.selected_thread.as_deref(), Some("act-1"));
+    });
+
+    let (root, vcx) = cx.add_window_view(|window, cx| {
+        let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+        let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+        let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+        let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), confirm, snooze, window, cx));
+        DragHost { pane, composer, menu, height: px(600.) }
+    });
+    let composer = root.read_with(vcx, |host, _| host.composer.clone());
+    vcx.run_until_parked();
+    let _ = fixture.take_commands();
+    assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.clone()), Some("act-1".into()), "act-1 must stay open before drop");
+
+    // 1) Drop onto an unloaded omitted thread while another thread (`act-1`) is already open.
+    let (tx1, rx1) = tokio::sync::oneshot::channel();
+    let mut tx1 = Some(tx1);
+    let sub1 = state.update(vcx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.omitted.mounts.generation_of(&t3_core::families::family_key("omitted-1")).is_some() {
+            if let Some(tx) = tx1.take() { let _ = tx.send(()); }
+        }
+    }));
+    state.update(vcx, |s, cx| {
+        s.drop_files_on_sidebar_thread(t3_core::sidebar::tag_filter::ThreadKey::new("", "omitted-1"), vec![file_a.clone()], cx);
+    });
+    let ((method, payload, reply), mut fixture) = runtime.spawn(async move {
+        let req = fixture.next_request().await;
+        (req, fixture)
+    }).await.unwrap();
+    assert_eq!(method, t3_core::families::GET_THREAD_FAMILY);
+    assert_eq!(payload, json!({"threadId": "omitted-1"}));
+    reply.send(Ok(json!({
+        "snapshotSequence": 2,
+        "threads": [thread_json("omitted-1", "Omitted One", "idle", "2026-01-01T00:00:00.000Z")]
+    }))).unwrap();
+    rx1.await.unwrap();
+    drop(sub1);
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.clone()), Some("omitted-1".into()), "omitted thread drop must select over active thread");
+    assert!(!state.read_with(vcx, |s, _| s.has_pending_composer_file_drop()), "drop must be consumed");
+    assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(1));
+
+    // 2) Drop onto another unloaded omitted thread while a draft is open.
+    let (tx2, rx2) = tokio::sync::oneshot::channel();
+    let mut tx2 = Some(tx2);
+    let sub2 = state.update(vcx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+        if *event == crate::app_state::AppEvent::Shell && state.omitted.mounts.generation_of(&t3_core::families::family_key("omitted-2")).is_some() {
+            if let Some(tx) = tx2.take() { let _ = tx.send(()); }
+        }
+    }));
+    state.update(vcx, |s, cx| {
+        s.start_draft("proj-1", cx);
+        assert_eq!(s.draft_project.as_deref(), Some("proj-1"));
+        s.drop_files_on_sidebar_thread(t3_core::sidebar::tag_filter::ThreadKey::new("", "omitted-2"), vec![file_a.clone()], cx);
+    });
+    assert_eq!(state.read_with(vcx, |s, _| s.draft_project.clone()), Some("proj-1".into()), "draft must stay open while family read is in flight");
+    let ((method2, payload2, reply2), fixture) = runtime.spawn(async move {
+        loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == t3_core::families::GET_THREAD_FAMILY {
+                return ((m, p, r), fixture);
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(method2, t3_core::families::GET_THREAD_FAMILY);
+    assert_eq!(payload2, json!({"threadId": "omitted-2"}));
+    reply2.send(Ok(json!({
+        "snapshotSequence": 3,
+        "threads": [thread_json("omitted-2", "Omitted Two", "idle", "2026-01-01T00:00:00.000Z")]
+    }))).unwrap();
+    rx2.await.unwrap();
+    drop(sub2);
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.clone()), Some("omitted-2".into()), "omitted thread drop must select over open draft");
+    assert_eq!(state.read_with(vcx, |s, _| s.draft_project.clone()), None);
+    assert!(!state.read_with(vcx, |s, _| s.has_pending_composer_file_drop()));
+    assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(1));
+
+    // 3) Environment-scoped clear must not wipe another environment's pending drop with the same raw thread_id.
+    state.update(vcx, |s, _cx| {
+        s.set_pending_composer_file_drop_for_test(t3_core::sidebar::tag_filter::ThreadKey::new("env-b", "shared-id"), vec![file_a]);
+        s.clear_pending_composer_file_drop_for(Some("env-a"), "shared-id");
+        assert!(s.has_pending_composer_file_drop(), "env-a clear must not wipe env-b pending drop");
+        s.clear_pending_composer_file_drop_for(Some("env-b"), "shared-id");
+        assert!(!s.has_pending_composer_file_drop(), "env-b clear must clear env-b pending drop");
+        s.stop_pump();
+    });
+    drop(fixture);
+}
+
+#[gpui::test]
+async fn pending_file_drop_is_consumed_when_target_thread_cannot_attach(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _fixture) = setup_app(cx, &runtime);
+    let tmp = TempDir::new("blocked-drop");
+    let file_a = tmp.path().join("blocked.txt");
+    std::fs::write(&file_a, "blocked").unwrap();
+
+    state.update(cx, |s, cx| {
+        if let Some(cfg) = s.server_config.config.as_mut() {
+            cfg.environment.capabilities.file_attachments = Some(t3_core::server_config::FileAttachmentsCapability {
+                max_upload_bytes: 1_000_000,
+            });
+        }
+        let snap = s.shell.snapshot.as_mut().unwrap();
+        snap.projects = vec![serde_json::from_value(json!({
+            "id": "proj-1",
+            "title": "App",
+            "workspaceRoot": "/app",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z"
+        })).unwrap()];
+        snap.threads = vec![
+            serde_json::from_value(thread_json("th-blocked", "Blocked Thread", "idle", "2026-01-02T00:00:00.000Z")).unwrap(),
+        ];
+        s.rebuild_sidebar(cx);
+        s.select_thread("th-blocked", cx);
+        assert_eq!(s.selected_thread.as_deref(), Some("th-blocked"));
+        let projection: t3_core::thread::ThreadProjection = serde_json::from_value(json!({
+            "thread": {
+                "id": "th-blocked",
+                "projectId": "proj-1",
+                "title": "Blocked Thread",
+                "providerInstanceId": "inst-1",
+                "modelSelection": {"instanceId": "inst-1", "model": "gpt-5"},
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "lineage": {"rootThreadId": "th-blocked"},
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "runs": [],
+            "attempts": [],
+            "nodes": [],
+            "subagents": [],
+            "providerSessions": [],
+            "providerThreads": [],
+            "providerTurns": [],
+            "runtimeRequests": [{
+                "id": "req-1",
+                "kind": "user_input",
+                "status": "pending",
+                "createdAt": "2026-01-02T00:00:00.000Z",
+                "responseCapability": {"type": "form"}
+            }],
+            "messages": [],
+            "plans": [],
+            "turnItems": [{
+                "id": "item-1",
+                "threadId": "th-blocked",
+                "runId": null,
+                "nodeId": null,
+                "parentItemId": null,
+                "ordinal": 1,
+                "status": "pending",
+                "title": null,
+                "startedAt": null,
+                "completedAt": null,
+                "updatedAt": "2026-01-02T00:00:00.000Z",
+                "type": "user_input_request",
+                "requestId": "req-1",
+                "questions": [],
+                "responseMode": "form"
+            }],
+            "checkpointScopes": [],
+            "checkpoints": [],
+            "contextHandoffs": [],
+            "contextTransfers": [],
+            "visibleTurnItems": [],
+            "updatedAt": "2026-01-02T00:00:00.000Z"
+        })).unwrap();
+        s.thread.projection = Some(projection);
+        cx.emit(crate::app_state::AppEvent::Thread);
+    });
+
+    let (root, vcx) = cx.add_window_view(|window, cx| {
+        let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+        let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+        let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+        let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), confirm, snooze, window, cx));
+        DragHost { pane, composer, menu, height: px(600.) }
+    });
+    let composer = root.read_with(vcx, |host, _| host.composer.clone());
+    vcx.run_until_parked();
+
+    // Drop files while `!can_attach(cx)` (pending user_input with no question attachment support).
+    state.update(vcx, |s, cx| {
+        s.drop_files_on_sidebar_thread(t3_core::sidebar::tag_filter::ThreadKey::new("", "th-blocked"), vec![file_a], cx);
+    });
+    vcx.run_until_parked();
+    assert!(!state.read_with(vcx, |s, _| s.has_pending_composer_file_drop()), "unattachable drop must still be consumed on thread arrival");
+    assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(0));
+
+    // Clearing pending user_inputs later must NOT retroactively attach the old consumed drop.
+    state.update(vcx, |s, cx| {
+        if let Some(proj) = s.thread.projection.as_mut() {
+            proj.runtime_requests.clear();
+            proj.turn_items.clear();
+        }
+        cx.emit(crate::app_state::AppEvent::Thread);
+        s.stop_pump();
+    });
+    vcx.run_until_parked();
+    assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(0));
 }

@@ -55,8 +55,38 @@ pub(crate) enum ClockRate {
     Minute,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum PaneRowKey { Draft(String), Divider, Thread(RowKey), Scoped(t3_core::sidebar::fleet::ScopedRowKey) }
+
+fn reanchored_scroll_top(
+    old: &[PaneRowKey],
+    new: &[PaneRowKey],
+    scroll_top: gpui::ListOffset,
+    range: &std::ops::Range<usize>,
+    count: usize,
+    dragging: bool,
+) -> Option<gpui::ListOffset> {
+    if new.is_empty() {
+        return None;
+    }
+    if scroll_top.item_ix == 0 && scroll_top.offset_in_item == px(0.) {
+        return (dragging && range.start == 0 && range.is_empty() && count > 0)
+            .then_some(gpui::ListOffset { item_ix: 0, offset_in_item: px(0.) });
+    }
+    if let Some(key) = old.get(scroll_top.item_ix)
+        && let Some(item_ix) = new.iter().position(|candidate| candidate == key)
+    {
+        return Some(gpui::ListOffset { item_ix, offset_in_item: scroll_top.offset_in_item });
+    }
+    let neighbor_ix = (scroll_top.item_ix.saturating_add(1)..old.len())
+        .find_map(|ix| new.iter().position(|candidate| candidate == &old[ix]))
+        .or_else(|| {
+            (0..scroll_top.item_ix.min(old.len()))
+                .rev()
+                .find_map(|ix| new.iter().position(|candidate| candidate == &old[ix]))
+        });
+    neighbor_ix.map(|item_ix| gpui::ListOffset { item_ix, offset_in_item: px(0.) })
+}
 
 pub struct SidebarPane {
     updates: Entity<crate::updates::UpdateControl>,
@@ -410,14 +440,11 @@ impl SidebarPane {
         if let Some((range, count)) = t3_core::sidebar::splice_range(&self.row_keys, &keys) {
             let scroll_top = self.list.logical_scroll_top();
             self.list.splice(range.clone(), count);
-            if self.drag.is_some()
-                && range.start == 0
-                && range.is_empty()
-                && count > 0
-                && scroll_top.item_ix == 0
-                && scroll_top.offset_in_item == px(0.)
-            {
-                self.list.scroll_to(gpui::ListOffset { item_ix: 0, offset_in_item: px(0.) });
+            if let Some(target) = reanchored_scroll_top(&self.row_keys, &keys, scroll_top, &range, count, self.drag.is_some()) {
+                let after = self.list.logical_scroll_top();
+                if (after.item_ix, after.offset_in_item) != (target.item_ix, target.offset_in_item) {
+                    self.list.scroll_to(target);
+                }
             }
         }
         self.row_keys = keys;
