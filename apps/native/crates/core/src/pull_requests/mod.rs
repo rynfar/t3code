@@ -9,6 +9,7 @@ pub mod link;
 pub mod target;
 pub mod list;
 pub mod query;
+pub mod thread_badge;
 pub mod wire;
 
 use serde::{Deserialize, Serialize};
