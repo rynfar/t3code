@@ -551,3 +551,42 @@ async fn thread_stream_keeps_syncing_after_stream_defect_and_protocol_defect() {
         .await;
     assert_eq!(next_thread_sequence(&mut events).await, Some(8));
 }
+
+#[tokio::test]
+async fn thread_stream_stops_retrying_on_authorization_error_and_caps_backoff() {
+    assert_eq!(next_thread_retry(Duration::from_millis(250), 0), Duration::from_millis(250));
+    assert_eq!(next_thread_retry(Duration::from_millis(250), 1), Duration::from_millis(500));
+    assert_eq!(next_thread_retry(Duration::from_millis(250), 7), Duration::from_secs(30));
+
+    let mut server = FakeServer::start().await;
+    let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    client.open_thread("t1");
+
+    let mut conn = server.connection().await;
+    answer_config(&mut conn, None).await;
+    let shell = conn.request(method::SUBSCRIBE_SHELL).await;
+    let sub1 = conn.request(method::SUBSCRIBE_THREAD).await;
+    conn.chunk(&shell, json!([{"kind": "snapshot", "snapshot": {"snapshotSequence": 1, "projects": [], "threads": []}}])).await;
+    conn.send(json!({
+        "_tag": "Exit",
+        "requestId": sub1["id"],
+        "exit": {"_tag": "Failure", "cause": [{"_tag": "Fail", "error": {"_tag": "EnvironmentAuthorizationError", "message": "Missing orchestration:read"}}]}
+    }))
+    .await;
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("stream error event") {
+            Some(ClientEvent::StreamError { context, message }) if context == "thread t1" => {
+                assert!(message.contains("Missing orchestration:read"), "{message}");
+                break;
+            }
+            Some(_) => {}
+            None => panic!("events closed"),
+        }
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), conn.request(method::SUBSCRIBE_THREAD)).await.is_err(),
+        "EnvironmentAuthorizationError must stop thread stream retries"
+    );
+}

@@ -1069,6 +1069,9 @@ impl AppState {
 
     pub(crate) fn visited_shell_for(&self, id: &str, now: Ms) -> Option<VisitedShell> {
         let thread = self.thread_shell(id)?;
+        if self.server_tracks_visits() && !thread.tracks_visits() {
+            return None;
+        }
         let model_thread = self.sidebar.model.thread(id);
         Some(VisitedShell {
             updated_at: t3_core::sidebar::time::parse_iso(&thread.updated_at)?,

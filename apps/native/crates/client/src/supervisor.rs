@@ -211,10 +211,6 @@ impl ClientHandle {
         crate::history::fetch_history_page_with(&self.credentials, thread_id, &query).await
     }
 
-    pub async fn bounded_snapshot(&self, thread_id: &str) -> Result<t3_core::thread::ThreadStreamItem, String> {
-        crate::history::fetch_bounded_snapshot(&self.credentials, thread_id).await
-    }
-
     /// Dispatches commands one after another, each only once the previous one committed, and
     /// stops at the first failure, returning its index. A send's prerequisites (declining
     /// approvals, persisting permissions) must land before its message, as the web awaits them.
@@ -286,9 +282,10 @@ impl ClientHandle {
 /// Bounded so a stalled UI pushes back through acks to the server instead of buffering forever.
 const EVENT_QUEUE: usize = 1024;
 #[cfg(not(test))]
-const THREAD_RETRY: Duration = Duration::from_secs(2);
+const THREAD_RETRY_BASE: Duration = Duration::from_millis(250);
 #[cfg(test)]
-const THREAD_RETRY: Duration = Duration::from_millis(20);
+const THREAD_RETRY_BASE: Duration = Duration::from_millis(20);
+const THREAD_RETRY_MAX: Duration = Duration::from_secs(30);
 /// `SESSION_STATE_RETRY_BASE_MS` and `SESSION_STATE_RETRY_MAX_MS`.
 const SESSION_STATE_RETRY: Duration = Duration::from_secs(2);
 const SESSION_STATE_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -740,39 +737,60 @@ struct ThreadForwarder(JoinHandle<()>);
 impl ThreadForwarder { fn abort(&self) { self.0.abort(); } }
 impl Drop for ThreadForwarder { fn drop(&mut self) { self.abort(); } }
 
+fn next_thread_retry(base: Duration, attempt: u32) -> Duration {
+    let factor = 1u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX);
+    base.saturating_mul(factor).min(THREAD_RETRY_MAX)
+}
+
+fn is_thread_auth_failure(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::Failure(failure) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError")
+    )
+}
+
 /// Keeps one thread subscribed for the life of the session. A stream that ends or fails on a
-/// healthy connection resubscribes from the last sequence it delivered, as `threads.ts` retries.
+/// healthy connection resubscribes with exponential backoff from the last delivered sequence,
+/// stopping on `EnvironmentAuthorizationError` or socket close (`client.ts` / `threads.ts`).
 fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx: mpsc::Sender<ThreadFrame>) -> ThreadForwarder {
     let session = session.clone();
     let thread_id = thread_id.to_owned();
     ThreadForwarder(tokio::spawn(async move {
         let mut sequence = sequence;
+        let mut retry_attempt = 0u32;
         loop {
             let mut stream = match session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, sequence)) {
                 Ok(stream) => stream,
                 Err(RpcError::Closed) => return,
                 Err(error) => {
-                    if tx.send((thread_id.clone(), Some(Err(error)))).await.is_err() {
+                    let stop = is_thread_auth_failure(&error);
+                    if tx.send((thread_id.clone(), Some(Err(error)))).await.is_err() || stop {
                         return;
                     }
-                    tokio::time::sleep(THREAD_RETRY).await;
+                    tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;
+                    retry_attempt = retry_attempt.saturating_add(1);
                     continue;
                 }
             };
             while let Some(value) = stream.receiver.recv().await {
                 if let Ok(item) = &value {
+                    retry_attempt = 0;
                     sequence = item.get("snapshotSequence").or_else(|| item.get("sequence")).and_then(Value::as_u64).or(sequence);
                 }
-                let closed = matches!(value, Err(RpcError::Closed));
+                let stop = match &value {
+                    Err(error) => matches!(error, RpcError::Closed) || is_thread_auth_failure(error),
+                    Ok(_) => false,
+                };
                 let failed = value.is_err();
-                if tx.send((thread_id.clone(), Some(value))).await.is_err() || closed {
+                if tx.send((thread_id.clone(), Some(value))).await.is_err() || stop {
                     return;
                 }
                 if failed {
                     break;
                 }
             }
-            tokio::time::sleep(THREAD_RETRY).await;
+            tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;
+            retry_attempt = retry_attempt.saturating_add(1);
         }
     }))
 }

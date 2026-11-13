@@ -37,7 +37,15 @@ impl SideChatPane {
         let composer = cx.new(|cx| Composer::embedded(state.clone(), thread_id.clone(), window, cx));
         transcript.update(cx, |view, cx| view.bind_composer(&composer, cx));
         let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
-            if matches!(event, AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase | AppEvent::SideThread) {
+            if matches!(
+                event,
+                AppEvent::Shell
+                    | AppEvent::ServerConfig
+                    | AppEvent::Phase
+                    | AppEvent::SideThread
+                    | AppEvent::RightPanel
+                    | AppEvent::Selection
+            ) {
                 this.sync_visit(cx);
             }
             if matches!(event, AppEvent::Shell | AppEvent::SideThread | AppEvent::Selection) {
@@ -69,6 +77,13 @@ impl SideChatPane {
         let thread_id = self.thread_id.clone();
         let state_entity = self.state.clone();
         let decision = state_entity.update(cx, |state, cx| {
+            if !is_pane_visible(state, &thread_id) {
+                self.visit = None;
+                self.visit_scope = None;
+                self.visit_timer = None;
+                self.visit_revision += 1;
+                return None;
+            }
             let environment = state.visit_environment();
             let connection = state.connection_id();
             let Some(environment) = environment else {
@@ -89,6 +104,8 @@ impl SideChatPane {
             let shell = state.visited_shell_for(&thread_id, now)?;
             let decision = self.visit.as_mut()?.on_shell(shell, now);
             if let VisitDecision::Now { visited_at, opened } = decision {
+                self.visit_timer = None;
+                self.visit_revision += 1;
                 state.send_visit_with(&thread_id, visited_at, opened, None, cx);
                 return None;
             }
@@ -121,6 +138,9 @@ impl SideChatPane {
         }
         let thread_id = self.thread_id.clone();
         self.state.update(cx, |state, cx| {
+            if !is_pane_visible(state, &thread_id) {
+                return;
+            }
             let Some(environment) = state.visit_environment() else { return };
             let connection = state.connection_id();
             if (&environment, connection) != (&expected_scope.0, expected_scope.1) {
@@ -128,6 +148,8 @@ impl SideChatPane {
             }
             let Some(tracker) = self.visit.as_mut() else { return };
             if let VisitDecision::Now { visited_at, opened } = tracker.fire(visited_at, now_ms()) {
+                self.visit_timer = None;
+                self.visit_revision += 1;
                 state.send_visit_with(&thread_id, visited_at, opened, None, cx);
             }
         });
@@ -278,8 +300,12 @@ mod tests {
             })).unwrap();
             side.last_visited_at = Some(Some("2026-04-02T00:00:00.000Z".into()));
             state.shell.snapshot.as_mut().unwrap().threads.push(side);
+            state.select_thread("menu-thread", cx);
+            state.panels.panels.open("menu-thread", Surface::side_chat("side-t"));
+            cx.emit(AppEvent::RightPanel);
             state.rebuild_sidebar(cx);
         });
+        while fixture.next_request().await.1["type"] != "thread.visit" {}
 
         let (pane, _pcx) = cx.add_window_view(|window, cx| SideChatPane::new(state.clone(), "side-t".into(), window, cx));
         let (method, command, reply) = fixture.next_request().await;
@@ -289,9 +315,34 @@ mod tests {
         assert_eq!(command["opened"], true);
         reply.send(Ok(serde_json::json!({"sequence": 1}))).unwrap();
 
+        // Hiding the right panel suppresses background visit sync when shell updated_at advances.
+        state.update(cx, |state, cx| {
+            state.panels.panels.toggle_visibility("menu-thread");
+            cx.emit(AppEvent::RightPanel);
+            if let Some(side) = state.shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|t| t.id == "side-t") {
+                side.updated_at = "2026-04-03T00:00:00.000Z".into();
+            }
+            cx.emit(AppEvent::Shell);
+        });
+        assert!(fixture.take_commands().is_empty(), "hidden side chat pane must not record visits");
+
         drop(pane);
-        // Reopening within 10 minutes must not resend an opened visit while already read.
+        // Reopening within 10 minutes with read state must not resend an opened visit.
+        state.update(cx, |state, cx| {
+            if let Some(side) = state.shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|t| t.id == "side-t") {
+                side.updated_at = "2026-04-02T00:00:00.000Z".into();
+            }
+            state.panels.panels.toggle_visibility("menu-thread");
+            cx.emit(AppEvent::RightPanel);
+        });
         let (_reopened, _rcx) = cx.add_window_view(|window, cx| SideChatPane::new(state.clone(), "side-t".into(), window, cx));
         assert!(fixture.take_commands().is_empty());
     }
+}
+
+fn is_pane_visible(state: &AppState, thread_id: &str) -> bool {
+    state.selected_thread.as_deref().is_some_and(|parent| {
+        let panel = state.panels.panels.panel(parent);
+        panel.is_open && panel.active().is_some_and(|surface| surface.side_chat_thread() == Some(thread_id))
+    })
 }

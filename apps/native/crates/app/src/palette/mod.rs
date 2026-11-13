@@ -581,33 +581,43 @@ impl CommandPalette {
                     {
                         let now = now_ms();
                         let visited_at = row.thread.updated_at.unwrap_or(now);
-                        if let Some(env) = state.open_history.environment(Some(&row.owner.saved_id), row.owner.canonical_id.as_deref()) {
+                        let env = state.open_history.environment(Some(&row.owner.saved_id), row.owner.canonical_id.as_deref());
+                        if let Some(env) = env.clone() {
                             state.open_history.claim(&env, &key.thread_id, now);
-                            if active_matches {
-                                state.sidebar.note_palette_visit(env, &key.thread_id, visited_at, now);
-                            }
                         }
-                        if active_matches {
-                            state.send_visit_with(&key.thread_id, visited_at, true, Some(query), cx);
-                        } else if row.thread.last_visited_at.is_some()
-                            || state.scoped_environment(&row.owner.saved_id).is_some_and(|entry| {
-                                entry.summary.threads.iter().any(|t| t.thread.last_visited_at.is_some())
-                            })
-                        {
-                            let command = t3_core::thread_actions::visit_with(
-                                &crate::sidebar::controller::uuid(),
-                                &key.thread_id,
-                                visited_at,
-                                true,
-                                Some(query),
-                            );
-                            let resolve = state.connections.destination(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE);
-                            cx.spawn(async move |_, _| {
-                                if let Ok(target) = resolve.await {
-                                    let _ = target.client.dispatch(command).await;
+                        let watermark_ready = if active_matches {
+                            !state.server_tracks_visits()
+                                || state
+                                    .thread_shell(&key.thread_id)
+                                    .map_or(row.thread.last_visited_at.is_some(), t3_core::shell::ThreadShell::tracks_visits)
+                        } else {
+                            row.thread.last_visited_at.is_some()
+                                || state.scoped_environment(&row.owner.saved_id).is_some_and(|entry| {
+                                    entry.summary.threads.iter().any(|t| t.thread.last_visited_at.is_some())
+                                })
+                        };
+                        if watermark_ready {
+                            if active_matches {
+                                if let Some(env) = env {
+                                    state.sidebar.note_palette_visit(env, &key.thread_id, visited_at, now);
                                 }
-                            })
-                            .detach();
+                                state.send_visit_with(&key.thread_id, visited_at, true, Some(query), cx);
+                            } else {
+                                let command = t3_core::thread_actions::visit_with(
+                                    &crate::sidebar::controller::uuid(),
+                                    &key.thread_id,
+                                    visited_at,
+                                    true,
+                                    Some(query),
+                                );
+                                let resolve = state.connections.destination(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE);
+                                cx.spawn(async move |_, _| {
+                                    if let Ok(target) = resolve.await {
+                                        let _ = target.client.dispatch(command).await;
+                                    }
+                                })
+                                .detach();
+                            }
                         }
                     }
                     state.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx);
@@ -659,11 +669,20 @@ impl CommandPalette {
                         .thread_shell(&thread_id)
                         .and_then(|thread| parse_iso(&thread.updated_at))
                         .unwrap_or(now);
-                    if let Some(env) = state.visit_environment() {
+                    let env = state.visit_environment();
+                    if let Some(env) = env.clone() {
                         state.open_history.claim(&env, &thread_id, now);
-                        state.sidebar.note_palette_visit(env, &thread_id, visited_at, now);
                     }
-                    state.send_visit_with(&thread_id, visited_at, true, Some(query), cx);
+                    let watermark_ready = !state.server_tracks_visits()
+                        || state
+                            .thread_shell(&thread_id)
+                            .is_some_and(t3_core::shell::ThreadShell::tracks_visits);
+                    if watermark_ready {
+                        if let Some(env) = env {
+                            state.sidebar.note_palette_visit(env, &thread_id, visited_at, now);
+                        }
+                        state.send_visit_with(&thread_id, visited_at, true, Some(query), cx);
+                    }
                 }
                 state.select_thread(&thread_id, cx);
             });
@@ -1251,6 +1270,34 @@ mod visit_recency_tests {
                     CommandPaletteSearchAction::Query("other".into()),
                 );
                 palette.activate("thread:other-thread", window, cx);
+            });
+        });
+        assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+
+        // 4. Server with capability enabled still skips thread.visit when a thread lacks lastVisitedAt.
+        pcx.update(|window, cx| {
+            state.update(cx, |state, _| {
+                state.server_config.config = Some(serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "modern", "label": "Modern", "capabilities": { "threadVisitedTracking": true } },
+                    "providers": [], "settings": {}, "issues": [], "keybindings": []
+                })).unwrap());
+                let mut unready: t3_core::shell::ThreadShell = serde_json::from_value(serde_json::json!({
+                    "id": "unready-thread", "projectId": "checkout-a", "title": "Unready",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-02T00:00:00.000Z",
+                    "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"unready-thread"},
+                    "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0
+                })).unwrap();
+                unready.last_visited_at = None;
+                state.shell.snapshot.as_mut().unwrap().threads.push(unready);
+            });
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query("unready".into()),
+                );
+                palette.activate("thread:unready-thread", window, cx);
             });
         });
         assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));

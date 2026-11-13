@@ -194,6 +194,69 @@ impl ThreadProjection {
     }
 }
 
+/// `isOrchestrationV2WorkActive`: work still open on the server or in flight locally.
+pub fn is_work_active(status: &str) -> bool {
+    matches!(status, "pending" | "running" | "waiting")
+}
+
+/// Whether `item` is active background work that Stop / `reconcilePendingWork` tracks.
+pub fn is_background_turn_item_pending(item: &TurnItem, rolled_back_runs: &[&str]) -> bool {
+    let background = match &item.kind {
+        TurnItemKind::CommandExecution { .. } | TurnItemKind::Subagent { .. } => true,
+        TurnItemKind::DynamicTool { input, .. } => input.get("persistent") != Some(&Value::Bool(true)),
+        _ => false,
+    };
+    background
+        && is_work_active(&item.status)
+        && item.run_id.as_deref().is_none_or(|run_id| !rolled_back_runs.contains(&run_id))
+}
+
+/// `pendingBackgroundTurnItems`: active non-rolled-back background items to check after Stop.
+pub fn pending_background_turn_item_ids(projection: &ThreadProjection) -> Vec<String> {
+    let rolled_back: Vec<&str> = projection
+        .runs
+        .iter()
+        .filter(|run| run.status == "rolled_back")
+        .map(|run| run.id.as_str())
+        .collect();
+    projection
+        .turn_items
+        .iter()
+        .filter(|item| is_background_turn_item_pending(item, &rolled_back))
+        .map(|item| item.id.clone())
+        .collect()
+}
+
+/// `settleTurnItems`: updates still-active local items with server-settled items from
+/// `orchestration.getTurnItem`; events applied meanwhile and inherited rows win.
+pub fn settle_turn_items(
+    thread_id: &str,
+    projection: &mut ThreadProjection,
+    settled: &std::collections::HashMap<String, Arc<TurnItem>>,
+) -> bool {
+    let mut changed = false;
+    for item in &mut projection.turn_items {
+        if let Some(server) = settled.get(&item.id)
+            && is_work_active(&item.status)
+        {
+            *item = server.clone();
+            changed = true;
+        }
+    }
+    for row in &mut projection.visible_turn_items {
+        if row.source_thread_id != thread_id {
+            continue;
+        }
+        if let Some(server) = settled.get(&row.source_item_id)
+            && is_work_active(&row.item.status)
+        {
+            row.item = server.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn known_turn_items<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Arc<TurnItem>>, D::Error> {
     let items = Vec::<TurnItem>::deserialize(d)?;
     Ok(items.into_iter().filter(TurnItem::is_known).map(Arc::new).collect())
@@ -481,6 +544,15 @@ impl ThreadState {
         for event in pending {
             self.apply_live_event(event);
         }
+    }
+
+    pub fn settle_turn_items(&mut self, thread_id: &str, settled: &std::collections::HashMap<String, Arc<TurnItem>>) -> bool {
+        let Some(projection) = self.projection.as_mut() else { return false };
+        let changed = settle_turn_items(thread_id, projection, settled);
+        if changed {
+            self.history.reconcile_pending_work(self.projection.as_ref());
+        }
+        changed
     }
 }
 

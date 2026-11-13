@@ -1,13 +1,12 @@
 //! `GET /api/orchestration/threads/:threadId/history`, as
 //! `client-runtime/src/state/threadHistoryHttp.ts` requests it: bearer auth, the orchestration
-//! protocol header, compact IDs. Collapsed work (`deferWork`) is not requested. The page is
-//! decoded here, on the network runtime.
+//! protocol header, compact IDs, plus `throughEntryId` / `view=work` / `deferWork` parameters.
+//! The page is decoded here, on the network runtime.
 
 use std::time::Duration;
 
 use serde_json::Value;
 use t3_core::history::{HistoryPage, decode_history_page};
-use t3_core::thread::{ThreadStreamItem, decode_thread_stream_item};
 
 use crate::auth::{Credentials, ORCHESTRATION_PROTOCOL_VERSION};
 
@@ -67,17 +66,6 @@ pub fn history_url_with(http_base: &str, thread_id: &str, query: &HistoryQuery) 
     Some(url)
 }
 
-pub fn bounded_snapshot_url(http_base: &str, thread_id: &str) -> Option<url::Url> {
-    let mut url = url::Url::parse(http_base).ok()?;
-    url.path_segments_mut().ok()?.pop_if_empty().extend(["api", "orchestration", "threads", thread_id, "bounded"]);
-    url.query_pairs_mut()
-        .append_pair("deferWork", "1")
-        .append_pair("compactTurnItems", "1")
-        .append_pair("dedupeBodies", "1")
-        .append_pair("compactIds", "1");
-    Some(url)
-}
-
 pub async fn fetch_history_page(credentials: &Credentials, thread_id: &str, cursor: &str) -> Result<HistoryPage, String> {
     fetch_history_page_with(credentials, thread_id, &HistoryQuery::older(cursor)).await
 }
@@ -87,20 +75,6 @@ pub async fn fetch_history_page_with(credentials: &Credentials, thread_id: &str,
     let value = fetch_authed_json(credentials, url).await?;
     decode_history_page(value).map_err(|error| {
         tracing::warn!(%error, "undecodable history page");
-        FALLBACK.to_owned()
-    })
-}
-
-pub async fn fetch_bounded_snapshot(credentials: &Credentials, thread_id: &str) -> Result<ThreadStreamItem, String> {
-    let url = bounded_snapshot_url(&credentials.http_base, thread_id).ok_or_else(|| FALLBACK.to_owned())?;
-    let mut value = fetch_authed_json(credentials, url).await?;
-    if let Some(object) = value.as_object_mut()
-        && !object.contains_key("kind")
-    {
-        object.insert("kind".into(), serde_json::json!("snapshot"));
-    }
-    decode_thread_stream_item(value).map_err(|error| {
-        tracing::warn!(%error, "undecodable bounded snapshot");
         FALLBACK.to_owned()
     })
 }
@@ -176,16 +150,5 @@ mod bounded_and_work_tests {
         let work_pairs: Vec<(String, String)> = work_url.query_pairs().into_owned().collect();
         assert!(work_pairs.contains(&("view".into(), "work".into())));
         assert!(!work_pairs.iter().any(|(k, _)| k == "deferWork"));
-
-        let bounded = bounded_snapshot_url("http://127.0.0.1:3773/prefix/", "t/1").unwrap();
-        assert_eq!(
-            bounded.path(),
-            "/prefix/api/orchestration/threads/t%2F1/bounded"
-        );
-        let bounded_pairs: Vec<(String, String)> = bounded.query_pairs().into_owned().collect();
-        assert!(bounded_pairs.contains(&("deferWork".into(), "1".into())));
-        assert!(bounded_pairs.contains(&("compactTurnItems".into(), "1".into())));
-        assert!(bounded_pairs.contains(&("dedupeBodies".into(), "1".into())));
-        assert!(bounded_pairs.contains(&("compactIds".into(), "1".into())));
     }
 }

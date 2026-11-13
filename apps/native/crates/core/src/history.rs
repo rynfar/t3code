@@ -1,9 +1,8 @@
-//! Bounded thread windows and paging earlier history. Ports
+//! Bounded thread windows, deferred work anchors, and earlier-history paging. Ports
 //! `client-runtime/src/state/threadHistoryMerge.ts` and the `loadEarlier` loop of
 //! `client-runtime/src/state/threads.ts` as a pure state machine; `t3-client` fetches pages
-//! (`threadHistoryHttp.ts`) and `AppState` drives the loop for its one open thread, which is all
-//! `threadHistoryController.ts` routes. Collapsed work (`deferWork`, `view=work`) and
-//! `throughEntryId` targeting are not requested, so their branches are not ported.
+//! (`threadHistoryHttp.ts`), `AppState` drives cursor paging, and `ThreadView` drives
+//! `throughEntryId` and `view=work` deferred-work paging.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -375,7 +374,9 @@ impl ThreadState {
         auto_page: bool,
     ) -> PageOutcome {
         let keep_paging = complete && auto_page && page.has_more_history && !page.has_user_turn;
-        if keep_paging && page.next_cursor.as_deref().is_none_or(|next| next == request_cursor) {
+        let stuck_cursor =
+            complete && page.has_more_history && page.next_cursor.as_deref().is_none_or(|next| next == request_cursor);
+        if stuck_cursor {
             return PageOutcome::Step(self.fail_history_load(request_cursor, "History did not advance.".into()));
         }
         if !self.history.is_active_request(request_cursor) {

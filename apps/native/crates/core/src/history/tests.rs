@@ -199,3 +199,21 @@ fn stale_work_merge_or_removed_anchor_reconciles_pending_work() {
     assert!(!state.history.is_loading_work("a"));
     assert_eq!(visible(&state), ["b"]);
 }
+
+#[test]
+fn non_advancing_complete_page_fails_even_when_auto_page_is_off() {
+    let (mut state, cursor) = loading_state();
+    let stuck = HistoryPage {
+        snapshot_sequence: 5,
+        items: vec![serde_json::from_value(row("old-1", 1, 0)).unwrap()],
+        next_cursor: Some(cursor.clone()),
+        has_more_history: true,
+        has_user_turn: false,
+    };
+    let PageOutcome::Step(step) = state.begin_history_merge_with(&cursor, stuck, true, false) else {
+        panic!("expected non-advancing step");
+    };
+    assert_eq!(step, HistoryStep::Failed("History did not advance.".into()));
+    assert!(!state.history.loading);
+    assert_eq!(state.history.error.as_deref(), Some("History did not advance."));
+}
