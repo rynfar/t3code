@@ -4,9 +4,12 @@
 //! `rightPanelStore.ts`, and `threadPanel.toggle`. Inline at the canvas's top-right when the
 //! transcript lane still fits beside it, else a popover under the header's toggle.
 
+mod automations;
 pub(crate) mod controls;
 mod items;
 mod sections;
+mod servers;
+mod usage;
 mod view;
 
 use std::collections::HashMap;
@@ -69,6 +72,7 @@ impl Default for PanelVisibility {
 struct Persisted {
     panels: HashMap<String, PanelVisibility>,
     items: HashMap<String, bool>,
+    legacy_usage_cleared: bool,
     last_scripts: HashMap<String, String>,
     last_editor: Option<String>,
 }
@@ -83,6 +87,8 @@ pub struct Details {
     pub git: Entity<GitStore>,
     panels: HashMap<String, PanelVisibility>,
     pub items: items::Visibility,
+    legacy_usage_enabled: Option<bool>,
+    legacy_usage_cleared: bool,
     last_scripts: HashMap<String, String>,
     last_editor: Option<String>,
     /// The mode the card last rendered in, so the toggle acts on what is on screen.
@@ -101,13 +107,31 @@ pub fn details(cx: &App) -> Option<Entity<Details>> {
     cx.try_global::<DetailsGlobal>().map(|global| global.0.clone())
 }
 
+fn legacy_usage_flag(cleared: bool, raw_client_settings: Option<&str>) -> Option<bool> {
+    if cleared {
+        return None;
+    }
+    raw_client_settings
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("threadDetailsUsageEnabled").and_then(serde_json::Value::as_bool))
+}
+
+fn clear_open_popovers(panels: &mut HashMap<String, PanelVisibility>) {
+    for visibility in panels.values_mut() {
+        visibility.popover_open = false;
+    }
+}
+
 impl Details {
     fn new(git: Entity<GitStore>) -> Self {
         let persisted: Persisted = store::load_ui_state(STORE).and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+        let legacy_usage_enabled = legacy_usage_flag(persisted.legacy_usage_cleared, store::load_client_settings().as_deref());
         Details {
             git,
             panels: persisted.panels,
             items: items::Visibility::from_overrides(persisted.items),
+            legacy_usage_enabled,
+            legacy_usage_cleared: persisted.legacy_usage_cleared,
             last_scripts: persisted.last_scripts,
             last_editor: persisted.last_editor,
             presentation: Presentation::Inline,
@@ -115,10 +139,19 @@ impl Details {
         }
     }
 
+    pub fn shows(&self, id: &str) -> bool {
+        self.items.shows_with_legacy_usage(id, self.legacy_usage_enabled)
+    }
+
+    pub fn items_are_default(&self) -> bool {
+        self.items.is_default_with_legacy_usage(self.legacy_usage_enabled)
+    }
+
     fn save(&self, cx: &mut Context<Self>) {
         let persisted = Persisted {
             panels: self.panels.iter().filter(|(_, visibility)| **visibility != PanelVisibility::default()).map(|(id, v)| (id.clone(), *v)).collect(),
             items: self.items.overrides().clone(),
+            legacy_usage_cleared: self.legacy_usage_cleared,
             last_scripts: self.last_scripts.clone(),
             last_editor: self.last_editor.clone(),
         };
@@ -135,6 +168,9 @@ impl Details {
     }
 
     pub(crate) fn set_presentation(&mut self, presentation: Presentation) {
+        if presentation == Presentation::Inline && self.presentation != Presentation::Inline {
+            clear_open_popovers(&mut self.panels);
+        }
         self.presentation = presentation;
     }
 
@@ -159,11 +195,13 @@ impl Details {
     }
 
     pub fn set_item(&mut self, id: &str, visible: bool, cx: &mut Context<Self>) {
-        self.items.set(id, visible);
+        self.items.set_with_legacy_usage(id, visible, self.legacy_usage_enabled);
         self.save(cx);
     }
 
     pub fn reset_items(&mut self, cx: &mut Context<Self>) {
+        self.legacy_usage_enabled = None;
+        self.legacy_usage_cleared = true;
         self.items.reset();
         self.save(cx);
     }
@@ -259,6 +297,10 @@ pub fn layout(state: &Entity<AppState>, window: &Window, cx: &App) -> Layout {
     Layout { presentation, card_open, lane_inset }
 }
 
+pub fn available_height(window: &Window) -> f32 {
+    (f32::from(window.viewport_size().height) - crate::workspace::TITLEBAR_HEIGHT - 2. * CARD_GAP - 24.).max(0.)
+}
+
 /// Creates the card's model and registers `threadPanel.toggle`, `script.<id>.run` and
 /// `editor.openFavorite`.
 pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
@@ -309,5 +351,23 @@ mod tests {
         assert_eq!(lane_inset_for(1384.), 0.);
         assert_eq!(lane_inset_for(1200.), 184.);
         assert_eq!(lane_inset_for(1012.), 276.);
+    }
+
+    #[test]
+    fn legacy_usage_flag_respects_reset_and_client_settings() {
+        assert_eq!(legacy_usage_flag(false, Some(r#"{"threadDetailsUsageEnabled":true}"#)), Some(true));
+        assert_eq!(legacy_usage_flag(true, Some(r#"{"threadDetailsUsageEnabled":true}"#)), None);
+        assert_eq!(legacy_usage_flag(false, Some("not-json")), None);
+    }
+
+    #[test]
+    fn clearing_popovers_preserves_inline_visibility() {
+        let mut panels = HashMap::from([
+            ("t1".to_owned(), PanelVisibility { inline_open: false, popover_open: true }),
+            ("t2".to_owned(), PanelVisibility { inline_open: true, popover_open: true }),
+        ]);
+        clear_open_popovers(&mut panels);
+        assert_eq!(panels["t1"], PanelVisibility { inline_open: false, popover_open: false });
+        assert_eq!(panels["t2"], PanelVisibility { inline_open: true, popover_open: false });
     }
 }

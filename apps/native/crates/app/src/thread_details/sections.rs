@@ -10,9 +10,10 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script, menu_label};
 use t3_core::shell::ThreadShell;
+use t3_core::thread_details::{CardDensity, item_visible_at_density};
 use t3_core::vcs::{self, editor_label, editor_options};
 
-use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, split_row};
+use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, section_with_options, split_row};
 use super::{Details, project_scripts, run_button_script};
 use crate::app_state::AppState;
 use crate::lineage::{LineageRow, MergeBack, Relationships, StopAction};
@@ -89,18 +90,19 @@ fn environment_row(ctx: &Ctx, thread: &ThreadShell, project_root: &str, cx: &App
 /// another (the shortcut is `editor.openFavorite`).
 fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
     let available = ctx.state.read(cx).server_config.config.as_ref().map(|config| config.available_editors.clone()).unwrap_or_default();
+    let can_operate = ctx.git.read(cx).can_operate_thread();
     let preferred = ctx.details.read(cx).preferred_editor(&available);
     let mac = cfg!(target_os = "macos");
     let label = format!("Open in {}", preferred.map_or("editor", |id| editor_label(id, mac)));
     let details = ctx.details.clone();
-    let primary = Row::new("details-open-in", label).icon(Icon::SquareArrowOutUpRight).disabled(preferred.is_none()).on_click(move |_, _, cx| {
+    let primary = Row::new("details-open-in", label).icon(Icon::SquareArrowOutUpRight).disabled(preferred.is_none() || !can_operate).on_click(move |_, _, cx| {
         if let Some(editor) = preferred {
             details.update(cx, |details, cx| details.open_in_editor(editor, cx));
         }
     });
     let details = ctx.details.clone();
     let shortcut = crate::keymap::label("editor.openFavorite", cx);
-    let trigger = MenuTrigger::new("details-open-in-menu", "Choose editor").dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+    let trigger = MenuTrigger::new("details-open-in-menu", "Choose editor").disabled(!can_operate).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
         let options = editor_options(&available);
         let mut menu = menu.min_w(px(ROW_WIDTH));
         if options.is_empty() {
@@ -128,11 +130,12 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
         return None;
     }
     let git = ctx.git.read(cx);
+    let can_operate = git.can_operate_thread();
     let primary = run_button_script(ctx.details.read(cx), &project_id, &scripts).cloned();
     let running: Vec<bool> = scripts.iter().map(|script| git.script_running(&script.id)).collect();
     let menu = {
         let (details, project_id, scripts, running) = (ctx.details.clone(), project_id.clone(), scripts.clone(), running.clone());
-        MenuTrigger::new("details-scripts-menu", "Script actions").dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+        MenuTrigger::new("details-scripts-menu", "Script actions").disabled(!can_operate).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
             scripts.iter().zip(running.iter().copied()).fold(menu.min_w(px(ROW_WIDTH)), |menu, (script, running)| {
                 let (details, project_id, script) = (details.clone(), project_id.clone(), script.clone());
                 let label = menu_label(&script);
@@ -141,7 +144,7 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
                     let shortcut = shortcut.as_deref().and_then(|command| crate::keymap::label(command, cx));
                     h_flex().w_full().gap(px(8.)).child(div().flex_1().min_w_0().truncate().child(label.clone())).child(running_indicator(running, cx)).children(shortcut.map(|shortcut| menu_shortcut(shortcut, cx)))
                 });
-                menu.item(item.icon(menu_icon(script_icon(script.icon))).on_click(move |_, _, cx| details.update(cx, |details, cx| details.run_script(&project_id, &script, cx))))
+                menu.item(item.icon(menu_icon(script_icon(script.icon))).disabled(!can_operate).on_click(move |_, _, cx| details.update(cx, |details, cx| details.run_script(&project_id, &script, cx))))
             })
         })
     };
@@ -151,11 +154,12 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
             let running = git.script_running(&script.id);
             Row::new("details-run-script", script.name.clone())
                 .icon(script_icon(script.icon))
+                .disabled(!can_operate)
                 .trailing(running_indicator(running, cx))
                 .tooltip(format!("Run {}", script.name))
                 .on_click(move |_, _, cx| run_script(&details, &project_id, &script, cx))
         }
-        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench),
+        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench).disabled(!can_operate),
     };
     Some(split_row("details-scripts", primary_row, menu, cx).into_any_element())
 }
@@ -164,20 +168,20 @@ fn run_script(details: &Entity<Details>, project_id: &str, script: &ProjectScrip
     details.update(cx, |details, cx| details.run_script(project_id, script, cx));
 }
 
-pub fn workspace(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
+pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
     let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
     let project_root = app.shell.project(&thread.project_id)?.workspace_root.clone();
-    let items = &ctx.details.read(cx).items;
+    let details = ctx.details.read(cx);
     let rows: Vec<AnyElement> = [
-        items.shows("environment").then(|| environment_row(ctx, thread, &project_root, cx)),
-        items.shows("openIn").then(|| open_in_row(ctx, cx)),
-        items.shows("scripts").then(|| scripts_row(ctx, cx)).flatten(),
+        (details.shows("environment") && item_visible_at_density("environment", density)).then(|| environment_row(ctx, thread, &project_root, cx)),
+        (details.shows("openIn") && item_visible_at_density("openIn", density)).then(|| open_in_row(ctx, cx)),
+        (details.shows("scripts") && item_visible_at_density("scripts", density)).then(|| scripts_row(ctx, cx)).flatten(),
     ]
     .into_iter()
     .flatten()
     .collect();
-    (!rows.is_empty()).then(|| section(false, None, cx).child(v_flex().children(rows)).into_any_element())
+    (!rows.is_empty()).then(|| section_with_options(false, None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
 }
 
 /// The branch row and its picker, and the PR row under it while the checkout is the thread's
@@ -233,21 +237,21 @@ fn branch_rows(ctx: &Ctx, thread: &ThreadShell, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-pub fn version_control(ctx: &Ctx, separated: bool, cx: &App) -> Option<AnyElement> {
+pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
     let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
-    let items = &ctx.details.read(cx).items;
+    let details = ctx.details.read(cx);
     let is_repo = ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
     let no_runs_yet = thread.latest_run_id.is_none();
     let rows: Vec<AnyElement> = [
-        (is_repo && items.shows("branch")).then(|| branch_rows(ctx, thread, cx)),
-        items.shows("gitActions").then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, cx)).flatten(),
-        items.shows("changes").then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
+        (is_repo && details.shows("branch") && item_visible_at_density("branch", density)).then(|| branch_rows(ctx, thread, cx)),
+        (details.shows("gitActions") && item_visible_at_density("gitActions", density)).then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, cx)).flatten(),
+        (details.shows("changes") && item_visible_at_density("changes", density)).then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
     ]
     .into_iter()
     .flatten()
     .collect();
-    (!rows.is_empty()).then(|| section(separated, None, cx).child(v_flex().children(rows)).into_any_element())
+    (!rows.is_empty()).then(|| section_with_options(separated, None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
 }
 
 /// One related thread: opens it (a side chat in its tab), with Merge back on the fork's source
@@ -288,8 +292,8 @@ fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, cx: 
     primary.into_any_element()
 }
 
-pub fn lineage(ctx: &Ctx, rows: &Relationships, shown: usize, separated: bool, on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> Option<AnyElement> {
-    if !ctx.details.read(cx).items.shows("lineage") || rows.lineage.is_empty() {
+pub fn lineage(ctx: &Ctx, rows: &Relationships, shown: usize, separated: bool, density: CardDensity, on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> Option<AnyElement> {
+    if !ctx.details.read(cx).shows("lineage") || !item_visible_at_density("lineage", density) || rows.lineage.is_empty() {
         return None;
     }
     let hidden = rows.lineage.len().saturating_sub(shown);
@@ -300,8 +304,8 @@ pub fn lineage(ctx: &Ctx, rows: &Relationships, shown: usize, separated: bool, o
 }
 
 /// The thread's side chats, which open in their right panel tab.
-pub fn side_chats(ctx: &Ctx, rows: &Relationships, separated: bool, cx: &App) -> Option<AnyElement> {
-    if !ctx.details.read(cx).items.shows("sideChats") || rows.side_chats.is_empty() {
+pub fn side_chats(ctx: &Ctx, rows: &Relationships, separated: bool, density: CardDensity, cx: &App) -> Option<AnyElement> {
+    if !ctx.details.read(cx).shows("sideChats") || !item_visible_at_density("sideChats", density) || rows.side_chats.is_empty() {
         return None;
     }
     let rendered: Vec<AnyElement> = rows.side_chats.iter().map(|row| relationship_row(ctx, row, None, cx)).collect();
