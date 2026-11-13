@@ -137,7 +137,7 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         RowKind::Message { message, .. } if message.role == Role::User => messages::user_row(row, env, markdown, cx),
         RowKind::Message { .. } => messages::assistant_row(row, env, markdown, cx),
         RowKind::AssistantMeta { message, show_copy, copy_streaming } => messages::assistant_meta_row(message, *show_copy, *copy_streaming, env, cx),
-        RowKind::Event { item, subagents, resource_summary } => notices::event_row(id, item, subagents, *resource_summary, env, cx),
+        RowKind::Event { item, visibility, subagents, resource_summary } => notices::event_row(id, item, *visibility, subagents, *resource_summary, env, cx),
         RowKind::ProposedPlan(plan) => messages::plan_card(id, plan, env, markdown, cx),
         RowKind::McpApp(entry) => mcp_app::frame_row(id, entry, cx),
         RowKind::HtmlRender(entry) => html_render::frame_row(id, entry, env.thread_id, cx),

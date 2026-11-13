@@ -415,4 +415,104 @@ impl Composer {
             }))
             .into_any_element()
     }
+
+    pub(super) fn render_plan_follow_up_banner(
+        &self,
+        plan: &t3_core::timeline::plan::ActiveProposedPlan,
+        cx: &App,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let content = h_flex()
+            .px(px(12.))
+            .py(px(8.))
+            .gap(px(8.))
+            .items_center()
+            .child(Icon::ListChecks.render(px(14.), hsla(p.primary)))
+            .child(div().flex_none().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Plan ready"))
+            .children(plan.title.clone().map(|title| {
+                div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(title)
+            }));
+        banner_surface(false, content, cx).into_any_element()
+    }
+
+    pub(super) fn render_plan_primary(&self, has_text: bool, disabled: bool, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        if has_text {
+            return super::controls::Pill::new("composer-refine-plan", "Refine")
+                .disabled(disabled)
+                .on_click(cx.listener(|this, _, window, cx| this.submit_plan_follow_up(window, cx)))
+                .into_any_element();
+        }
+        let open = self.plan_menu_open;
+        div()
+            .relative()
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .rounded_full()
+                    .bg(hsla(p.message_action))
+                    .text_color(hsla(p.message_action_foreground))
+                    .when(disabled, |this| this.opacity(0.64))
+                    .child(
+                        h_flex()
+                            .id("composer-implement-plan")
+                            .h_full()
+                            .pl(px(14.))
+                            .pr(px(10.))
+                            .rounded_l_full()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Implement")
+                            .when(!disabled, |this| {
+                                this.cursor_pointer()
+                                    .hover(|this| this.bg(hsla(p.message_action_hover)))
+                                    .on_click(cx.listener(|this, _, window, cx| this.submit_plan_follow_up(window, cx)))
+                            }),
+                    )
+                    .child(div().w(px(1.)).h(px(16.)).bg(hsla(p.message_action_foreground).opacity(0.24)))
+                    .child(
+                        h_flex()
+                            .id("composer-implement-plan-menu")
+                            .h_full()
+                            .px(px(8.))
+                            .rounded_r_full()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::ChevronDown.render(px(14.), hsla(p.message_action_foreground)))
+                            .when(!disabled, |this| {
+                                this.cursor_pointer()
+                                    .hover(|this| this.bg(hsla(p.message_action_hover)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if Self::guard_reopen(&mut this.menu_dismissed) {
+                                            return;
+                                        }
+                                        this.plan_menu_open = !this.plan_menu_open;
+                                        cx.notify();
+                                    }))
+                            }),
+                    ),
+            )
+            .when(open, |this| {
+                this.child(floating(
+                    Float::AboveEnd,
+                    menu_surface(cx)
+                        .occlude()
+                        .mb(px(4.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.plan_menu_open = false;
+                            this.menu_dismissed = Some(std::time::Instant::now());
+                            cx.notify();
+                        }))
+                        .child(
+                            MenuItem::new("composer-implement-new-thread", "Implement in a new thread")
+                                .icon(Icon::GitBranchPlus, hsla(p.muted_foreground))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.plan_menu_open = false;
+                                    this.submit_plan_in_new_thread(window, cx);
+                                })),
+                        ),
+                ))
+            })
+            .into_any_element()
+    }
 }

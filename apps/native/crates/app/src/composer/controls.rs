@@ -467,12 +467,13 @@ pub struct MenuItem {
     icon: Option<(Icon, Hsla)>,
     checked: Option<bool>,
     highlighted: bool,
+    disabled: bool,
     on_click: Option<Handler>,
 }
 
 impl MenuItem {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
-        MenuItem { id: id.into(), label: label.into(), icon: None, checked: None, highlighted: false, on_click: None }
+        MenuItem { id: id.into(), label: label.into(), icon: None, checked: None, highlighted: false, disabled: false, on_click: None }
     }
 
     pub fn icon(mut self, icon: Icon, color: Hsla) -> Self {
@@ -481,6 +482,11 @@ impl MenuItem {
     }
 
     pub fn highlighted(mut self, highlighted: bool) -> Self {self.highlighted = highlighted; self}
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
 
     /// Reserves the check column and fills it when `checked`.
     pub fn checked(mut self, checked: bool) -> Self {
@@ -506,15 +512,17 @@ impl RenderOnce for MenuItem {
             .rounded(px(4.))
             .text_sm()
             .text_color(hsla(p.foreground))
-            .when(self.highlighted, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
-            .cursor_pointer()
-            .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+            .when(self.highlighted && !self.disabled, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+            .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
+            .when(!self.disabled, |this| {
+                this.cursor_pointer().hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+            })
             .children(self.checked.map(|checked| {
                 div().size(px(16.)).flex_none().children(checked.then(|| Icon::Check.render(px(16.), hsla(p.foreground))))
             }))
             .children(self.icon.map(|(glyph, color)| glyph.render(px(16.), color.opacity(0.8))))
             .child(div().min_w_0().flex_1().child(self.label))
-            .when_some(self.on_click, |this, handler| {
+            .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| handler(event, window, cx))
             })
     }

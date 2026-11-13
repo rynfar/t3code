@@ -223,16 +223,55 @@ pub(crate) fn copyable_unresolved(shell: gpui::Stateful<gpui::Div>, record: &Val
 
 pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
     let p = palette(cx);
-    let heading = match field(record, "kind") {
-        "terminal" => field(record, "terminalLabel"),
-        "preview-annotation" | "element" => field(record, "pageTitle"),
-        _ => field(record, "filePath"),
+    let kind = field(record, "kind");
+    let heading = match kind {
+        "terminal" => field(record, "terminalLabel").to_owned(),
+        "preview-annotation" => {
+            let title = field(record, "pageTitle");
+            if !title.is_empty() { title.to_owned() } else if !field(record, "url").is_empty() { field(record, "url").to_owned() } else { "Browser annotation".to_owned() }
+        }
+        "element" => {
+            let title = field(record, "pageTitle");
+            if !title.is_empty() { title.to_owned() } else if !field(record, "url").is_empty() { field(record, "url").to_owned() } else { "Selected element".to_owned() }
+        }
+        _ => field(record, "filePath").to_owned(),
     };
-    let text = match field(record, "kind") {
+    let subtitle = match kind {
+        "terminal" => format!("Lines {}–{}", record["lineStart"], record["lineEnd"]),
+        "review-comment" => {
+            let section = field(record, "sectionTitle");
+            let range = field(record, "rangeLabel");
+            if !section.is_empty() && !range.is_empty() {
+                format!("{section} · {range}")
+            } else if !section.is_empty() {
+                section.to_owned()
+            } else {
+                range.to_owned()
+            }
+        }
+        "preview-annotation" | "element" => {
+            let selector = field(record, "selector");
+            let url = field(record, "url");
+            if !selector.is_empty() && !url.is_empty() {
+                format!("{selector} · {url}")
+            } else if !selector.is_empty() {
+                selector.to_owned()
+            } else {
+                url.to_owned()
+            }
+        }
+        _ => field(record, "rangeLabel").to_owned(),
+    };
+    let text = match kind {
         "preview-annotation" => field(record, "comment"),
-        "element" => field(record, "htmlPreview"),
+        "element" => "",
         _ => field(record, "text"),
     };
+    let html_preview = if kind == "element" { field(record, "htmlPreview") } else { "" };
+    let diff = field(record, "diff");
+    let has_screenshot = kind == "preview-annotation"
+        && (!field(record, "attachmentId").is_empty() || !field(&record["attachment"], "id").is_empty());
+    let mono = cx.theme().mono_font_family.clone();
     v_flex()
         .id(SharedString::from(format!(
             "context-details-{}",
@@ -254,25 +293,66 @@ pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
             div()
                 .text_size(px(12.))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .child(heading.to_owned()),
+                .child(heading),
         )
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(hsla(p.secondary_label))
-                .child(if field(record, "kind") == "terminal" {
-                    format!("Lines {}–{}", record["lineStart"], record["lineEnd"])
-                } else {
-                    field(record, "rangeLabel").to_owned()
-                }),
-        )
-        .child(div().text_size(px(14.)).child(text.to_owned()))
-        .when(!field(record, "diff").is_empty(), |s| {
+        .when(!subtitle.is_empty(), |s| {
             s.child(
                 div()
                     .text_size(px(11.))
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .child(field(record, "diff").to_owned()),
+                    .text_color(hsla(p.secondary_label))
+                    .child(subtitle),
+            )
+        })
+        .when(has_screenshot, |s| {
+            s.child(
+                div()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(hsla(p.secondary))
+                    .text_size(px(11.))
+                    .text_color(hsla(p.muted_foreground))
+                    .child("Screenshot attached"),
+            )
+        })
+        .when(!text.is_empty(), |s| s.child(div().text_size(px(13.)).child(text.to_owned())))
+        .when(!html_preview.is_empty(), |s| {
+            s.child(
+                div()
+                    .p(px(8.))
+                    .rounded(px(6.))
+                    .bg(hsla(p.secondary).opacity(0.6))
+                    .font_family(mono.clone())
+                    .text_size(px(11.))
+                    .child(html_preview.to_owned()),
+            )
+        })
+        .when(!diff.is_empty(), |s| {
+            let lines: Vec<_> = diff
+                .lines()
+                .map(|line| {
+                    let (fg, bg) = if line.starts_with('+') {
+                        (hsla(p.diff_addition_foreground), hsla(p.diff_addition_foreground).opacity(0.15))
+                    } else if line.starts_with('-') {
+                        (hsla(p.diff_deletion_foreground), hsla(p.diff_deletion_foreground).opacity(0.15))
+                    } else {
+                        (hsla(p.muted_foreground), gpui::transparent_black())
+                    };
+                    div()
+                        .px(px(4.))
+                        .bg(bg)
+                        .text_color(fg)
+                        .font_family(mono.clone())
+                        .text_size(px(11.))
+                        .child(line.to_owned())
+                })
+                .collect();
+            s.child(
+                v_flex()
+                    .p(px(6.))
+                    .rounded(px(6.))
+                    .bg(hsla(p.secondary).opacity(0.45))
+                    .children(lines),
             )
         })
         .into_any_element()

@@ -28,7 +28,7 @@ impl TimelineEntry {
 
     pub(super) fn event(&self) -> Option<&Arc<TurnItem>> {
         match &self.kind {
-            EntryKind::Event(item) => Some(item),
+            EntryKind::Event { item, .. } => Some(item),
             _ => None,
         }
     }
@@ -89,7 +89,7 @@ pub(super) fn is_compaction_command(message: &ChatMessage) -> bool {
 
 pub(super) fn failed_item(entry: &TimelineEntry) -> Option<&TurnItem> {
     let item = match &entry.kind {
-        EntryKind::Event(item) => Some(item.as_ref()),
+        EntryKind::Event { item, .. } => Some(item.as_ref()),
         EntryKind::Work(work) => work.item.as_deref(),
         _ => None,
     }?;
@@ -186,7 +186,7 @@ pub(super) fn fold_run_id(entry: &TimelineEntry, runless: Option<&str>) -> Optio
         EntryKind::Work(w) if w.item_type == Some("system_notice") => None,
         EntryKind::Message(m) if m.role == Role::Assistant => m.run_id.as_deref().or(runless).map(str::to_owned),
         EntryKind::Work(w) => w.run_id.as_deref().or(runless).map(str::to_owned),
-        EntryKind::Event(item) if is_persistent_resource(entry) || is_subagent(item) => item.run_id.as_deref().or(runless).map(str::to_owned),
+        EntryKind::Event { item, .. } if is_persistent_resource(entry) || is_subagent(item) => item.run_id.as_deref().or(runless).map(str::to_owned),
         _ => None,
     }
 }

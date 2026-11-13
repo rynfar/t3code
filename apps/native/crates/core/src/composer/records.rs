@@ -515,6 +515,28 @@ impl SentPresentation {
     }
 }
 
+/// Replaces `t3-context://` inline tokens, stripping those that correspond to `attachments`
+/// (files, audio, images) so attachment-only messages check remaining body text accurately.
+pub fn body_text_without_attachment_refs(text: &str, records: &[Value], attachments: &[Value]) -> String {
+    let occurrences = sent_references(text);
+    if occurrences.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = text.to_owned();
+    for r in occurrences.iter().rev() {
+        let attachment_ref = r.kind == "image"
+            || records
+                .iter()
+                .find(|v| field(v, "contextId") == r.context_id && field(v, "kind") == r.kind)
+                .is_some_and(|v| {
+                    let att_id = field(v, "attachmentId");
+                    !att_id.is_empty() && attachments.iter().any(|a| field(a, "id") == att_id)
+                });
+        out.replace_range(r.start..r.end, if attachment_ref { "" } else { r.label });
+    }
+    out
+}
+
 pub fn presentation_records<'a>(text: &str, records: &'a [Value]) -> Vec<std::borrow::Cow<'a, Value>> {
     SentPresentation::new(&std::sync::Arc::from(text)).records(records)
 }

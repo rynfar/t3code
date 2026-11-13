@@ -79,6 +79,11 @@ impl Composer {
         if self.snapshot.setup_blocks_send {
             return;
         }
+        let plan_follow_up = self.active_plan_follow_up(cx).is_some();
+        if plan_follow_up && !self.has_text && !self.snapshot.can_resume {
+            self.submit_plan_follow_up(window, cx);
+            return;
+        }
         let prompt = self.prompt(cx);
         let staged = self.staged_attachments();
         // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
@@ -111,6 +116,10 @@ impl Composer {
             self.set_prompt("", window, cx);
             self.draft_changed(cx);
             cx.notify();
+            return;
+        }
+        if plan_follow_up {
+            self.submit_plan_follow_up(window, cx);
             return;
         }
         let outgoing = self.outgoing(text, &staged);
@@ -201,6 +210,176 @@ impl Composer {
                 cx.notify();
             });
         }).detach();
+    }
+
+    pub(super) fn submit_plan_follow_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sending || self.snapshot.setup_blocks_send {
+            return;
+        }
+        let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
+        let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
+        let raw_prompt = self.prompt(cx);
+        let terminals = TerminalSend::of(&raw_prompt, self.current_terminals());
+        if terminals.expired > 0 {
+            self.expired_toast(terminals.expired, ExpiredNotice::Omitted, cx);
+        }
+        let stripped_prompt = terminals.text;
+        let follow_up = t3_core::timeline::plan::resolve_plan_follow_up_submission(&stripped_prompt, &plan.markdown);
+        let staged = self.staged_attachments();
+        let prompt_for_outgoing = if stripped_prompt.trim().is_empty() { follow_up.text.clone() } else { stripped_prompt };
+        let mut outgoing = self.outgoing(prompt_for_outgoing, &staged);
+        outgoing.text = follow_up.text;
+
+        let resolved = self.resolve(cx);
+        let Some(selection) = Self::dispatch_selection(&resolved) else {
+            self.error = Some(NO_PROVIDER.into());
+            cx.notify();
+            return;
+        };
+        let previous_interaction_mode = self.choices().and_then(|choices| choices.interaction_mode);
+        if let Some(choices) = self.choices_mut() {
+            choices.interaction_mode = Some(follow_up.interaction_mode);
+        }
+        let mut steps: Vec<(Value, &'static str)> = Vec::new();
+        if Some(resolved.runtime_mode) != self.snapshot.thread_runtime {
+            steps.push((commands::set_runtime_mode(&uuid_v4(), &thread_id, resolved.runtime_mode), "Failed to send message."));
+        }
+        if Some(follow_up.interaction_mode) != self.snapshot.thread_interaction {
+            steps.push((commands::set_interaction_mode(&uuid_v4(), &thread_id, follow_up.interaction_mode), "Failed to send message."));
+        }
+        let (command_id, message_id) = (uuid_v4(), uuid_v4());
+        let mut message = commands::composer_message(&ComposerMessage {
+            command_id: &command_id,
+            thread_id: &thread_id,
+            message_id: &message_id,
+            text: &outgoing.text,
+            title_seed: &outgoing.title,
+            model_selection: &selection,
+            dispatch: commands::ComposerDispatch::Auto,
+            context: outgoing.context.as_ref(),
+            attachments: &outgoing.attachments,
+        });
+        if follow_up.interaction_mode == InteractionMode::Default {
+            message = commands::with_source_plan_ref(message, &thread_id, &plan.id);
+        }
+        steps.push((message, "Failed to send message."));
+        let star_origin = self.state.read(cx).star_prompt_origin();
+        let failures: Vec<&'static str> = steps.iter().map(|(_, f)| *f).collect();
+        let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(c, _)| c).collect());
+        let target = Target::Thread(thread_id);
+        let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let failure = request.await.err().map(|(index, error)| {
+                format!("{} {error}", failures.get(index).copied().unwrap_or("Failed to send message."))
+            });
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.sending = false;
+                if let Some(error) = failure {
+                    if let Some(choices) = this.choices.get_mut(&taken.target) {
+                        choices.interaction_mode = previous_interaction_mode;
+                    }
+                    this.restore(taken, error, window, cx);
+                } else {
+                    this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn submit_plan_in_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sending || self.snapshot.setup_blocks_send {
+            return;
+        }
+        let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
+        let Some(Target::Thread(source_thread_id)) = self.snapshot.target.clone() else { return };
+        let Some(project_id) = self.snapshot.project_id.clone() else { return };
+        let resolved = self.resolve(cx);
+        if !resolved.plan_enabled {
+            return;
+        }
+        let Some(selection) = Self::dispatch_selection(&resolved) else {
+            self.error = Some(NO_PROVIDER.into());
+            cx.notify();
+            return;
+        };
+        let state = self.state.read(cx);
+        let shell = state.thread_shell(&source_thread_id);
+        let branch = shell.and_then(|t| t.branch.clone());
+        let worktree_path = shell.and_then(|t| t.worktree_path.clone());
+        let star_origin = state.star_prompt_origin();
+        let title = rules::title_seed(&t3_core::timeline::plan::build_plan_implementation_thread_title(&plan.markdown));
+        let text = t3_core::timeline::plan::build_plan_implementation_prompt(&plan.markdown);
+        let new_thread_id = uuid_v4();
+        let message_id = uuid_v4();
+        let create_cmd = commands::create_thread(
+            &uuid_v4(),
+            &new_thread_id,
+            &project_id,
+            &title,
+            &selection,
+            resolved.default_runtime_mode,
+            InteractionMode::Default,
+            branch.as_deref(),
+            worktree_path.as_deref(),
+        );
+        let msg_cmd = commands::with_source_plan_ref(
+            commands::composer_message(&ComposerMessage {
+                command_id: &uuid_v4(),
+                thread_id: &new_thread_id,
+                message_id: &message_id,
+                text: &text,
+                title_seed: &title,
+                model_selection: &selection,
+                dispatch: commands::ComposerDispatch::Auto,
+                context: None,
+                attachments: &[],
+            }),
+            &source_thread_id,
+            &plan.id,
+        );
+        let request = state.dispatch_in_order(vec![create_cmd, msg_cmd]);
+        self.sending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            let cleanup_task = match &result {
+                Err((index, _)) if *index > 0 => this
+                    .update(cx, |this, cx| {
+                        this.state.read(cx).rpc(
+                            method::DISPATCH_COMMAND,
+                            t3_core::thread_actions::delete(&uuid_v4(), &new_thread_id),
+                        )
+                    })
+                    .ok(),
+                _ => None,
+            };
+            let cleanup_error = match cleanup_task {
+                Some(task) => task.await.err().map(|e| e.to_string()),
+                None => None,
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.sending = false;
+                match result {
+                    Ok(_) => {
+                        this.state.update(cx, |state, cx| {
+                            state.record_prompt_sent(star_origin, cx);
+                            state.select_when_listed(&new_thread_id, cx);
+                        });
+                    }
+                    Err((_, error)) => {
+                        if let Some(cleanup_err) = cleanup_error {
+                            tracing::warn!(%new_thread_id, error = %cleanup_err, "failed to clean up implementation thread after start failure");
+                        }
+                        this.error = Some(format!("Failed to implement plan in new thread. {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn outgoing(&self, prompt: String, staged: &[Attachment]) -> Outgoing {

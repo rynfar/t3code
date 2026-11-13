@@ -3,6 +3,7 @@
 //! folders, Open diff, then the tree. A file opens the diff panel on that turn and file.
 
 use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px};
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::diff::TurnDiffSummary;
 use t3_core::timeline::{DiffStat, TreeNode, changed_file_rows, changed_file_tree, changed_files_label, has_directories, hidden_files_label};
@@ -12,6 +13,30 @@ use super::parts::{focusable, ghost_icon_button, ghost_text_button};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::thread_view::ThreadView;
+
+fn file_icon(path: &str) -> Icon {
+    let ext = path.rsplit('/').next().unwrap_or(path).rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("json" | "jsonc" | "json5" | "jsonl" | "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "toml" | "yaml" | "yml" | "lock") => Icon::FileBraces,
+        Some("rs" | "py" | "pyi" | "go" | "html" | "htm" | "xml" | "svg" | "css" | "scss" | "sh" | "bash" | "zsh" | "sql") => Icon::CodeXml,
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tif" | "tiff" | "avif") => Icon::Image,
+        Some("md" | "mdx" | "markdown" | "mdown" | "mkd" | "txt" | "log" | "diff" | "patch") => Icon::FileText,
+        _ => Icon::File,
+    }
+}
+
+fn middle_truncate(name: &str, max_chars: usize) -> String {
+    let count = name.chars().count();
+    if count <= max_chars || max_chars < 5 {
+        return name.to_owned();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(count.saturating_sub(tail)).collect();
+    format!("{start}…{end}")
+}
 
 /// `DiffStatLabel`: `+N` in the addition color, `-N` in the deletion color, mono. `aligned` puts
 /// them in two 4ch columns.
@@ -107,12 +132,34 @@ pub fn changed_files_card(message_id: &str, summary: &TurnDiffSummary, env: &Row
             }
             TreeNode::File { name, path, stat } => {
                 let (run_id, file) = (run_id.clone(), path.clone());
+                let (menu_run, menu_file, thread_entity, app_state) =
+                    (run_id.clone(), path.clone(), cx.entity(), env.state.clone());
                 let element = row_base(SharedString::from(format!("changed-file:{run_id}:{path}")), row.depth)
                     .when(directories || row.depth > 0, |this| this.child(div().flex_none().size(px(14.))))
-                    .child(div().min_w_0().truncate().font_family(mono.clone()).text_xs().text_color(hsla(p.foreground).opacity(0.85)).child(name.clone()))
+                    .child(file_icon(path).render(px(14.), hsla(p.muted_foreground).opacity(0.75)))
+                    .child(div().min_w_0().truncate().font_family(mono.clone()).text_xs().text_color(hsla(p.foreground).opacity(0.85)).child(middle_truncate(name, 48)))
                     .child(div().ml_auto().child(stat_label(*stat, true, 10., cx)))
                     .on_click(cx.listener(move |view, _, _, cx| view.open_turn_diff(&run_id, Some(&file), cx)));
-                focusable(element, cx).into_any_element()
+                focusable(element, cx)
+                    .context_menu(move |menu, _, _| {
+                        let open_diff_view = thread_entity.clone();
+                        let open_diff_run = menu_run.clone();
+                        let open_diff_file = menu_file.clone();
+                        let item = |label: &'static str, run: fn(&mut crate::app_state::AppState, &str, &mut Context<crate::app_state::AppState>)| {
+                            let state = app_state.clone();
+                            let path = menu_file.clone();
+                            PopupMenuItem::new(label).on_click(move |_, _, cx| state.update(cx, |state, cx| run(state, &path, cx)))
+                        };
+                        menu.item(PopupMenuItem::new("Open diff").on_click(move |_, _, cx| {
+                            open_diff_view.update(cx, |view, cx| view.open_turn_diff(&open_diff_run, Some(&open_diff_file), cx));
+                        }))
+                        .item(item("Open file", |state, path, cx| state.open_file(path, None, cx)))
+                        .separator()
+                        .item(item("Copy path", |state, path, cx| state.copy_file_path(path, cx)))
+                        .item(item("Copy mention", |state, path, cx| state.copy_file_mention(path, cx)))
+                        .item(item("Add to chat", |state, path, cx| state.add_file_to_chat(path, cx)))
+                    })
+                    .into_any_element()
             }
         })
         .collect();
@@ -135,4 +182,25 @@ pub fn changed_files_card(message_id: &str, summary: &TurnDiffSummary, env: &Row
             })
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn middle_truncate_preserves_utf8_and_short_names() {
+        assert_eq!(middle_truncate("short.rs", 12), "short.rs");
+        assert_eq!(middle_truncate("abcdefghij", 4), "abcdefghij");
+        assert_eq!(middle_truncate("αβγδεζηθικλμ", 7), "αβγ…κλμ");
+    }
+
+    #[test]
+    fn file_icon_maps_extensions_case_insensitively() {
+        assert!(matches!(file_icon("src/App.TSX"), Icon::FileBraces));
+        assert!(matches!(file_icon("crates/main.rs"), Icon::CodeXml));
+        assert!(matches!(file_icon("assets/shot.PNG"), Icon::Image));
+        assert!(matches!(file_icon("docs/notes.md"), Icon::FileText));
+        assert!(matches!(file_icon("Makefile"), Icon::File));
+    }
 }
