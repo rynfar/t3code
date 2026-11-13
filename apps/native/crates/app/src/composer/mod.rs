@@ -631,6 +631,10 @@ impl Composer {
         }
     }
 
+    pub(crate) fn resolved_provider_instance(&self, cx: &App) -> Option<String> {
+        self.resolve(cx).model.map(|model| model.instance_id)
+    }
+
     fn picker_input(&self, cx: &App) -> PickerInput {
         let resolved = self.resolve(cx);
         PickerInput {

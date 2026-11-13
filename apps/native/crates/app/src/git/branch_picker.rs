@@ -186,7 +186,7 @@ impl BranchPicker {
                 let checkout = git.target.as_ref();
                 let badge = ref_badge(target, checkout.map(|checkout| checkout.project_cwd.as_str()));
                 // Moving to a worktree that already has the ref only records it on the thread.
-                let reuses = checkout.is_some_and(|checkout| branch_selection_target(&checkout.project_cwd, checkout.worktree_path.as_deref(), target).reuse_existing_worktree);
+                let reuses = checkout.is_some_and(|checkout| !checkout.is_draft && branch_selection_target(&checkout.project_cwd, checkout.worktree_path.as_deref(), target).reuse_existing_worktree);
                 let enabled = git.can_change_branch() || (reuses && git.can_operate_thread());
                 let row = MenuRow::new(id, target.name.clone()).trailing(div().children(badge.map(|badge| div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.45)).child(badge))));
                 (row, enabled)

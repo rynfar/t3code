@@ -24,6 +24,7 @@ pub mod method {
     pub const LIST: &str = "preview.list";
     pub const SUBSCRIBE_EVENTS: &str = "subscribePreviewEvents";
     pub const SUBSCRIBE_DISCOVERED_SERVERS: &str = "subscribeDiscoveredLocalServers";
+    pub const STOP_LOCAL_SERVER: &str = "preview.stopLocalServer";
 }
 
 /// `AuthPreviewOperateScope`: open, drive and close previews.
@@ -677,7 +678,22 @@ impl PreviewThreads {
     }
 }
 
-/// `DiscoveredLocalServer`, as the empty state lists it.
+/// `DiscoveredLocalServer.terminal`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredServerTerminal {
+    pub thread_id: String,
+    pub terminal_id: String,
+}
+
+/// `DiscoveredLocalServer.agent`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredServerAgent {
+    pub thread_id: String,
+}
+
+/// `DiscoveredLocalServer`, as the empty state and thread details panel list it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredServer {
@@ -688,6 +704,10 @@ pub struct DiscoveredServer {
     pub process_name: Option<String>,
     #[serde(default)]
     pub pid: Option<i64>,
+    #[serde(default)]
+    pub terminal: Option<DiscoveredServerTerminal>,
+    #[serde(default)]
+    pub agent: Option<DiscoveredServerAgent>,
 }
 
 impl DiscoveredServer {

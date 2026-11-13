@@ -479,7 +479,11 @@ impl RenderOnce for CollapsibleAttributionCard {
                 Some(Icon::ExternalLink),
                 move |_, _, cx| {
                     cx.stop_propagation();
-                    crate::settings::open_scheduled_task(scheduled_task_id.as_deref(), cx);
+                    if let Some(task_id) = scheduled_task_id.as_deref() {
+                        crate::settings::open_scheduled_task(task_id, cx);
+                    } else {
+                        crate::settings::open_scheduled_tasks(cx);
+                    }
                 },
                 cx,
             ))

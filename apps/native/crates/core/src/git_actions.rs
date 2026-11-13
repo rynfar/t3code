@@ -292,6 +292,7 @@ pub struct RunRequest<'a> {
     pub feature_branch: bool,
     pub file_paths: Option<&'a [String]>,
     pub thread_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
 }
 
 /// `GitRunStackedActionInput`.
@@ -311,6 +312,9 @@ pub fn run_stacked_action(action_id: &str, cwd: &str, action: StackedAction, req
     }
     if let Some(thread_id) = request.thread_id {
         payload.insert("threadId".into(), json!(thread_id));
+    }
+    if let Some(project_id) = request.project_id {
+        payload.insert("projectId".into(), json!(project_id));
     }
     Value::Object(payload)
 }

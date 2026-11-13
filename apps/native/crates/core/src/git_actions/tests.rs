@@ -179,12 +179,16 @@ fn run_payload_omits_unset_options() {
     let payload = run_stacked_action("a", "/r", StackedAction::CommitPush, &RunRequest::default());
     assert_eq!(payload, json!({ "actionId": "a", "cwd": "/r", "action": "commit_push" }));
     let files = vec!["a.rs".to_owned()];
-    let request = RunRequest { commit_message: Some("  fix  "), feature_branch: true, file_paths: Some(&files), thread_id: Some("t") };
+    let request = RunRequest { commit_message: Some("  fix  "), feature_branch: true, file_paths: Some(&files), thread_id: Some("t"), project_id: None };
     let payload = run_stacked_action("a", "/r", StackedAction::Commit, &request);
     assert_eq!(payload["commitMessage"], "fix");
     assert_eq!(payload["featureBranch"], true);
     assert_eq!(payload["filePaths"], json!(["a.rs"]));
     assert_eq!(payload["threadId"], "t");
+    assert!(payload.get("projectId").is_none());
+    let draft = run_stacked_action("a", "/r", StackedAction::Commit, &RunRequest { project_id: Some("p"), ..RunRequest::default() });
+    assert!(draft.get("threadId").is_none());
+    assert_eq!(draft["projectId"], "p");
     let empty = run_stacked_action("a", "/r", StackedAction::Commit, &RunRequest { commit_message: Some("  "), ..RunRequest::default() });
     assert!(empty.get("commitMessage").is_none());
 }

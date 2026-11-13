@@ -21,6 +21,7 @@ use crate::theme::{hsla, palette};
 pub enum Variant {
     Ghost,
     GhostMuted,
+    DestructiveGhost,
     Secondary,
     /// The ghost `Toggle`: pressed shows `accent`.
     Toggle,
@@ -183,13 +184,14 @@ impl RenderOnce for Button {
         let m = self.size.metrics();
         let disabled = self.disabled;
         let base = focusable(self.base, self.id.clone(), !disabled, window, cx);
-        let (text, icon_color, rest, hover, hover_text): (u32, Hsla, Option<u32>, u32, u32) = match self.variant {
-            Variant::Ghost => (p.foreground, hsla(p.muted_foreground), None, p.accent, p.foreground),
-            Variant::GhostMuted => (p.muted_foreground, hsla(p.muted_foreground), None, p.accent, p.foreground),
+        let (text, icon_color, rest, hover, hover_text, hover_opacity): (u32, Hsla, Option<u32>, u32, u32, f32) = match self.variant {
+            Variant::Ghost => (p.foreground, hsla(p.muted_foreground), None, p.accent, p.foreground, 1.),
+            Variant::GhostMuted => (p.muted_foreground, hsla(p.muted_foreground), None, p.accent, p.foreground, 1.),
+            Variant::DestructiveGhost => (p.muted_foreground, hsla(p.muted_foreground), None, p.destructive, p.destructive, 0.12),
             Variant::Secondary => {
-                (p.secondary_foreground, hsla(p.secondary_foreground), Some(p.secondary), p.secondary, p.secondary_foreground)
+                (p.secondary_foreground, hsla(p.secondary_foreground), Some(p.secondary), p.secondary, p.secondary_foreground, 0.9)
             }
-            Variant::Toggle => (p.foreground, hsla(p.foreground).opacity(0.8), None, p.accent, p.foreground),
+            Variant::Toggle => (p.foreground, hsla(p.foreground).opacity(0.8), None, p.accent, p.foreground, 1.),
         };
         let pressed_fill = match self.variant {
             Variant::Secondary => None,
@@ -200,7 +202,7 @@ impl RenderOnce for Button {
         let icon_size = self.icon_size.unwrap_or(m.icon);
         let tooltip = self.tooltip.clone();
         let on_click = self.on_click.clone();
-        let follows_hover = self.variant == Variant::GhostMuted;
+        let follows_hover = matches!(self.variant, Variant::GhostMuted | Variant::DestructiveGhost);
         base.group(CONTROL_GROUP)
             .flex()
             .flex_none()
@@ -218,8 +220,7 @@ impl RenderOnce for Button {
             .when(self.disabled, |this| this.opacity(0.64))
             .when(!self.disabled, |this| {
                 this.cursor_pointer().hover(move |style| {
-                    let style = style.text_color(hsla(hover_text));
-                    if self.variant == Variant::Secondary { style.bg(hsla(hover).opacity(0.9)) } else { style.bg(hsla(hover)) }
+                    style.text_color(hsla(hover_text)).bg(hsla(hover).opacity(hover_opacity))
                 })
             })
             .when_some(self.icon, |this, icon| {

@@ -132,7 +132,7 @@ impl AppState {
             });
         }))
     }
-    fn guest_share(&self, id: &str) -> Option<&rules::GuestShare> {
+    pub(crate) fn guest_share(&self, id: &str) -> Option<&rules::GuestShare> {
         self.thread_state(id)
             .projection
             .as_ref()

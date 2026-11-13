@@ -50,7 +50,7 @@ struct Host {
     pending: Option<(Section, Option<String>)>,
     /// The project a "Project settings" entry point opens the Projects page on.
     pending_project: Option<String>,
-    /// The scheduled task an "Open automation" link opens the editor for once tasks load.
+    /// The scheduled task an "Edit automation" / "Open automation" link opens the editor for once tasks load.
     pending_scheduled_task: Option<String>,
     pending_provider: Option<providers::ProviderSettingsTarget>,
     /// What had focus when the modal opened, focused again when it closes.
@@ -332,9 +332,15 @@ pub fn open_project(project_id: &str, cx: &mut App) {
     open_at(Section::Projects, None, cx);
 }
 
-/// Opens Settings → Scheduled tasks, opening the editor for `task_id` once tasks load.
-pub fn open_scheduled_task(task_id: Option<&str>, cx: &mut App) {
-    cx.global_mut::<Host>().pending_scheduled_task = task_id.map(str::to_owned);
+/// Opens Settings → Scheduled tasks and opens the editor on `task_id` once loaded.
+pub fn open_scheduled_task(task_id: &str, cx: &mut App) {
+    cx.global_mut::<Host>().pending_scheduled_task = Some(task_id.to_owned());
+    open_at(Section::ScheduledTasks, None, cx);
+}
+
+/// Opens Settings → Scheduled tasks without selecting a specific task.
+pub fn open_scheduled_tasks(cx: &mut App) {
+    cx.global_mut::<Host>().pending_scheduled_task = None;
     open_at(Section::ScheduledTasks, None, cx);
 }
 

@@ -173,7 +173,7 @@ impl FilesPanel {
         let state = self.state.read(cx);
         let root = state.environment().zip(state.file_workspace()).map(|(environment, workspace)| Root { environment: environment.to_owned(), workspace });
         let connected = matches!(state.phase, Phase::Online(ConnectionStatus::Connected));
-        let shown = state.selected_thread.as_deref().and_then(|thread| state.panels.panels.active_surface(thread)).and_then(|surface| match &surface.kind {
+        let shown = state.panel_thread().as_deref().and_then(|thread| state.panels.panels.active_surface(thread)).and_then(|surface| match &surface.kind {
             SurfaceKind::Files => Some(Shown { surface_id: surface.id.clone(), path: None, reveal_line: None, reveal_request_id: 0 }),
             SurfaceKind::File { relative_path, reveal_line, reveal_request_id } => Some(Shown {
                 surface_id: surface.id.clone(),
