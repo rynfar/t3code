@@ -562,8 +562,9 @@ pub fn pull_request_matches_search_query(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPrBadge {
+    pub glyph: crate::pull_requests::thread_badge::PrGlyph,
+    pub tone: crate::pull_requests::thread_badge::PrTone,
     pub text: String,
-    pub state: crate::pull_requests::detail::StateKind,
     pub has_snapshot: bool,
 }
 
@@ -576,40 +577,27 @@ pub fn matching_search_pr_badge(
     if !pull_request_matches_search_query(links, query) {
         return None;
     }
-    let visible = crate::pull_requests::link::visible_links(links);
-    let current = *visible.first()?;
-    let others = visible.len().saturating_sub(1);
-    let state = if others > 0 {
-        use crate::pull_requests::wire::PrState;
-        if visible
-            .iter()
-            .all(|link| link.snapshot.as_ref().is_some_and(|s| s.state == PrState::Open && s.is_draft))
-        {
-            crate::pull_requests::detail::StateKind::Draft
-        } else if visible
-            .iter()
-            .any(|link| link.snapshot.as_ref().is_none_or(|s| s.state == PrState::Open))
-        {
-            crate::pull_requests::detail::StateKind::Open
-        } else if visible
-            .iter()
-            .all(|link| link.snapshot.as_ref().is_some_and(|s| s.state == PrState::Merged))
-        {
-            crate::pull_requests::detail::StateKind::Merged
-        } else {
-            crate::pull_requests::detail::StateKind::Closed
-        }
-    } else {
-        current
-            .snapshot
-            .as_ref()
-            .map_or(crate::pull_requests::detail::StateKind::Open, |s| {
-                crate::pull_requests::detail::StateKind::of(s.state, s.is_draft)
-            })
+    use crate::pull_requests::thread_badge::{
+        PrTone, linked_snapshot_status, pr_status_indicator, resolve_badge_presentation,
+        resolve_thread_current_pull_request_link, resolve_thread_pull_request_badge,
     };
-    let text = if others > 0 { format!("+{}", others + 1) } else { current.number.to_string() };
-    let has_snapshot = others > 0 || current.snapshot.is_some();
-    Some(SearchPrBadge { text, state, has_snapshot })
+    let badge = resolve_thread_pull_request_badge(links);
+    let current = resolve_thread_current_pull_request_link(links);
+    let status = current
+        .and_then(linked_snapshot_status)
+        .map(|linked| pr_status_indicator(&linked.pr, Some(linked.provider)));
+    let presentation = resolve_badge_presentation(
+        badge.as_ref(),
+        current.map(|link| link.number),
+        current.map(|link| link.url.as_str()),
+        status.as_ref(),
+    )?;
+    Some(SearchPrBadge {
+        glyph: presentation.glyph,
+        tone: presentation.tone,
+        text: presentation.text,
+        has_snapshot: presentation.tone != PrTone::Muted || badge.is_some_and(|badge| badge.opens_list()),
+    })
 }
 
 /// Merges this client's latest local open into server `opens` (`buildThreadSearchSubject`).

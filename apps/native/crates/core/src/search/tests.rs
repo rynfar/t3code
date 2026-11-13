@@ -817,7 +817,7 @@ fn find_for_message_match_picks_phrase_or_longest_whole_word_and_preserves_snipp
 
 #[test]
 fn pull_request_matches_search_query_and_resolves_badge() {
-    use crate::pull_requests::detail::StateKind;
+    use crate::pull_requests::thread_badge::{PrGlyph, PrTone};
     let links: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
         {"host": "github.com", "repository": "ping/t3", "number": 10, "url": "https://github.com/ping/t3/pull/10", "source": "stack-dismissed", "linkedAt": "2026-10-25T00:00:00Z", "snapshot": {"state": "open", "title": "Dismissed", "headBranch": "a", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-25T00:00:00Z"}},
         {"host": "github.com", "repository": "ping/t3", "number": 22889, "url": "https://github.com/ping/t3/pull/22889", "source": "manual", "linkedAt": "2026-10-24T00:00:00Z", "snapshot": {"state": "open", "title": "Smaller MCP payloads", "headBranch": "b", "baseBranch": "main", "isDraft": true, "updatedAt": "2026-10-24T00:00:00Z"}}
@@ -832,8 +832,20 @@ fn pull_request_matches_search_query_and_resolves_badge() {
 
     let badge = matching_search_pr_badge(&links, "#22889").expect("matching PR badge");
     assert_eq!(badge.text, "22889");
-    assert_eq!(badge.state, StateKind::Draft);
+    assert_eq!(badge.glyph, PrGlyph::Draft);
+    assert_eq!(badge.tone, PrTone::Draft);
+    assert!(badge.has_snapshot);
     assert!(matching_search_pr_badge(&links, "unrelated").is_none());
+
+    let pending: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
+        {"host": "github.com", "repository": "ping/t3", "number": 22890, "url": "https://github.com/ping/t3/pull/22890", "source": "manual", "linkedAt": "2026-10-24T00:00:00Z"}
+    ]))
+    .unwrap();
+    let pending_badge = matching_search_pr_badge(&pending, "#22890").expect("pending PR badge");
+    assert_eq!(pending_badge.text, "22890");
+    assert_eq!(pending_badge.glyph, PrGlyph::PullRequest);
+    assert_eq!(pending_badge.tone, PrTone::Muted);
+    assert!(!pending_badge.has_snapshot);
 
     let multi: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
         {"host": "github.com", "repository": "ping/t3", "number": 101, "url": "https://github.com/ping/t3/pull/101", "source": "manual", "linkedAt": "2026-10-23T00:00:00Z", "snapshot": {"state": "merged", "title": "First", "headBranch": "a", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-23T00:00:00Z"}},
@@ -842,5 +854,18 @@ fn pull_request_matches_search_query_and_resolves_badge() {
     .unwrap();
     let multi_badge = matching_search_pr_badge(&multi, "102").expect("multi PR badge");
     assert_eq!(multi_badge.text, "+2");
-    assert_eq!(multi_badge.state, StateKind::Open);
+    assert_eq!(multi_badge.glyph, PrGlyph::PullRequest);
+    assert_eq!(multi_badge.tone, PrTone::Open);
+    assert!(multi_badge.has_snapshot);
+
+    let stack: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
+        {"host": "github.com", "repository": "ping/t3", "number": 201, "url": "https://github.com/ping/t3/pull/201", "source": "manual", "linkedAt": "2026-10-23T00:00:00Z", "snapshot": {"state": "merged", "title": "Stack base", "headBranch": "feat/base", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-23T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 202, "url": "https://github.com/ping/t3/pull/202", "source": "manual", "linkedAt": "2026-10-24T00:00:00Z", "snapshot": {"state": "open", "title": "Stack top", "headBranch": "feat/top", "baseBranch": "feat/base", "isDraft": false, "updatedAt": "2026-10-24T00:00:00Z"}}
+    ]))
+    .unwrap();
+    let stack_badge = matching_search_pr_badge(&stack, "stack top").expect("stack PR badge");
+    assert_eq!(stack_badge.text, "2");
+    assert_eq!(stack_badge.glyph, PrGlyph::Stack);
+    assert_eq!(stack_badge.tone, PrTone::Open);
+    assert!(stack_badge.has_snapshot);
 }

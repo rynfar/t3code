@@ -11,6 +11,7 @@ use gpui::{
     ParentElement, SharedString, Styled, StyledText, Task, Window, div, list, point, prelude::*, px,
 };
 use t3_core::families::FamilyRead;
+use t3_core::pull_requests::thread_badge::{PrGlyph, PrTone};
 use t3_core::search::{
     MessageRankOptions, SearchRange, ServerThreadSearchMatch, SettledThreadSearch, ShownOrder,
     ThreadSearchOptions, ThreadSearchSubject, decode_search_matches, find_for_message_match,
@@ -32,8 +33,8 @@ use t3_core::sidebar::SidebarRow;
 use super::SidebarPane;
 use super::row::AppearanceExt;
 use crate::app_state::AppState;
+use crate::icons::Icon;
 use crate::project_icon::ProjectVisual;
-use crate::pull_requests::state_glyph;
 use crate::theme::{hsla, palette};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -623,7 +624,7 @@ fn is_search_thread_settled(app: &AppState, id: &ThreadKey, thread: &SidebarThre
             .rows
             .iter()
             .find_map(|row| match row {
-                ScopedSidebarRow::Thread { index, section }
+                ScopedSidebarRow::Thread { index, section, .. }
                     if app.sidebar.fleet.threads.get(*index).is_some_and(|item| item.key == *id) =>
                 {
                     Some(*section == Section::Settled)
@@ -701,8 +702,20 @@ impl SidebarPane {
         let pr_badge = matching_search_pr_badge(pr_links, &self.search.normalized_query)
             .or_else(|| matching_search_pr_badge(pr_links, &self.search.settled_query))
             .map(|badge| {
-                let (icon, tone) = state_glyph(badge.state, cx);
-                let hover_color = if badge.has_snapshot { tone } else { hsla(p.muted_foreground) };
+                let icon = match badge.glyph {
+                    PrGlyph::PullRequest => Icon::GitPullRequestArrow,
+                    PrGlyph::Draft => Icon::GitPullRequestDraft,
+                    PrGlyph::Closed => Icon::GitPullRequestClosed,
+                    PrGlyph::Merged => Icon::GitMerge,
+                    PrGlyph::Stack => Icon::Layers,
+                };
+                let tone = match badge.tone {
+                    PrTone::Open => p.pill_completed,
+                    PrTone::Draft | PrTone::Muted => p.muted_foreground,
+                    PrTone::Closed => p.pill_failed,
+                    PrTone::Merged => p.pill_plan,
+                };
+                let hover_color = hsla(tone);
                 let base_color = if settled { hsla(p.secondary_label) } else { hover_color };
                 (icon, base_color, hover_color, badge.has_snapshot, badge.text)
             });
@@ -1091,6 +1104,32 @@ mod tests {
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.search.results, vec![ThreadKey::new("search-lifetime-fixture", "older-other")]);
         });
+
+        // Phase-only transitions (e.g. non-active environment status changes) must refresh active search without Shell.
+        state.update(cx, |state, cx| {
+            let mut env = (*state.fleet.environments[0]).clone();
+            env.status = ConnectionStatus::Reconnecting { reason: "lost".into(), attempt: 1 };
+            std::sync::Arc::make_mut(&mut state.fleet).environments[0] = std::sync::Arc::new(env);
+            cx.emit(crate::app_state::AppEvent::Phase);
+        });
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| assert!(pane.search.results.is_empty(), "Phase offline must clear stale search results"));
+        state.update(cx, |state, cx| {
+            let mut env = (*state.fleet.environments[0]).clone();
+            env.status = ConnectionStatus::Connected;
+            std::sync::Arc::make_mut(&mut state.fleet).environments[0] = std::sync::Arc::new(env);
+            cx.emit(crate::app_state::AppEvent::Phase);
+        });
+        cx.run_until_parked();
+        let phase_req = fixture.next_request().await;
+        assert_eq!(phase_req.0, SEARCH_THREADS);
+        let phase_tasks = pane.update(cx, |pane, _| std::mem::take(&mut pane.search.requests));
+        phase_req.2.send(Ok(json!({
+            "matches": [{"threadId": "older-other", "snippet": "deploy other"}],
+            "snapshotSequence": 1,
+            "threads": [older_row("older-other", "other", "Unrelated other")]
+        }))).unwrap();
+        for task in phase_tasks { task.await; }
 
         // Revoking orchestration:read while search is active must unmount SEARCH_KEY and clear stale hits.
         let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
@@ -1742,6 +1781,39 @@ mod tests {
         regen_hit.title_regeneration = Some(json!({ "status": "running" }));
         regen_hit.lineage.root_thread_id = "regen-hit".into();
         regen_hit.latest_user_message_at = Some("2026-11-01T09:00:00Z".into());
+        regen_hit.pull_requests = serde_json::from_value(json!([
+            {
+                "host": "github.com",
+                "repository": "ping/t3",
+                "number": 22890,
+                "url": "https://github.com/ping/t3/pull/22890",
+                "source": "manual",
+                "linkedAt": "2026-10-23T00:00:00Z",
+                "snapshot": {
+                    "state": "merged",
+                    "title": "Cafe stack base",
+                    "headBranch": "feat/cafe-base",
+                    "baseBranch": "main",
+                    "isDraft": false
+                }
+            },
+            {
+                "host": "github.com",
+                "repository": "ping/t3",
+                "number": 22891,
+                "url": "https://github.com/ping/t3/pull/22891",
+                "source": "manual",
+                "linkedAt": "2026-10-24T00:00:00Z",
+                "snapshot": {
+                    "state": "open",
+                    "title": "Cafe stack top",
+                    "headBranch": "feat/cafe-top",
+                    "baseBranch": "feat/cafe-base",
+                    "isDraft": false
+                }
+            }
+        ]))
+        .unwrap();
 
         let mut settled_hit = sample.clone();
         settled_hit.id = "settled-hit".into();
