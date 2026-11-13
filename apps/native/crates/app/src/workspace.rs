@@ -297,24 +297,15 @@ impl Render for Workspace {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
                 this.pull_requests.update(cx, |page, cx| page.set_modifiers(event.modifiers, cx));
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    let overlay_open = this.menu.read(cx).is_open() || crate::updates::overlay(cx).is_some() || this.welcome.read(cx).is_open();
-                    let decision = this.state.update(cx, |state, cx| {
-                        let has_selection = !state.sidebar.selection.is_empty() || !state.sidebar.fleet_selection.is_empty();
-                        let decision = t3_core::sidebar::selection::sidebar_escape(t3_core::sidebar::selection::EscapeContext {
-                            composing: false,
-                            search_focused: false,
-                            searching: false,
-                            overlay_open,
-                            has_selection,
-                        });
-                        if decision == t3_core::sidebar::selection::SidebarEscape::ClearSelection {
-                            state.clear_thread_selection(cx);
-                        }
-                        decision
-                    });
-                    if decision == t3_core::sidebar::selection::SidebarEscape::ClearSelection {
+                    let overlay_open = this.menu.read(cx).is_open()
+                        || this.dialog.read(cx).is_open()
+                        || this.snooze.read(cx).is_open()
+                        || this.palette.read(cx).is_open()
+                        || crate::updates::overlay(cx).is_some()
+                        || this.welcome.read(cx).is_open();
+                    if this.sidebar.update(cx, |sidebar, cx| sidebar.handle_escape(overlay_open, window, cx)) {
                         cx.stop_propagation();
                     }
                 }

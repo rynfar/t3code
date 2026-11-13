@@ -154,9 +154,14 @@ impl Composer {
     }
 
     pub(super) fn schedule_draft_save(&mut self, target: &Target, cx: &mut Context<Self>) {
-        if let Target::Draft(project_id) = target { cx.emit(DraftsChanged { project_id: project_id.clone() }); }
+        match target {
+            Target::Draft(project_id) => cx.emit(DraftsChanged { project_id: project_id.clone() }),
+            Target::Thread(_) => cx.emit(ThreadDraftsChanged),
+            Target::Question(_) => {}
+        }
         for key in self.drafts.store.take_pruned_keys() {
             if let Some(project_id) = key.strip_prefix("draft:") { cx.emit(DraftsChanged { project_id: project_id.to_owned() }); }
+            if key.starts_with("thread:") { cx.emit(ThreadDraftsChanged); }
         }
         self.drafts.save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(rules::PERSIST_DEBOUNCE_MS)).await;
@@ -173,11 +178,18 @@ pub(crate) struct DiscardedDraft {
 pub(crate) struct DraftsChanged { pub project_id: String }
 impl EventEmitter<DraftsChanged> for Composer {}
 
+pub(crate) struct ThreadDraftsChanged;
+impl EventEmitter<ThreadDraftsChanged> for Composer {}
+
 impl Composer {
     pub(crate) fn sidebar_drafts(&self) -> &DraftStore { &self.drafts.store }
 
     pub(crate) fn discard_sidebar_draft(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
         self.discard_target_draft(&Target::Draft(project.into()), false, window, cx)
+    }
+
+    pub(crate) fn discard_thread_draft(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
+        self.discard_target_draft(&Target::Thread(thread_id.into()), true, window, cx)
     }
 
     fn discard_target_draft(&mut self, target: &Target, keep_choices: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
@@ -201,6 +213,10 @@ impl Composer {
 
     pub(crate) fn restore_sidebar_draft(&mut self, project: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
         self.restore_target_draft(&Target::Draft(project.into()), discarded, window, cx);
+    }
+
+    pub(crate) fn restore_thread_draft(&mut self, thread_id: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_target_draft(&Target::Thread(thread_id.into()), discarded, window, cx);
     }
 
     fn restore_target_draft(&mut self, target: &Target, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
@@ -229,5 +245,24 @@ impl Composer {
         for attachment in discarded.attachments {
             if let Some(id) = attachment.attachment.attachment_id() { self.release_upload(id, cx); }
         }
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn set_thread_draft_fixture(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        model_selection: Option<t3_core::model::ModelSelection>,
+        updated_at: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let target = Target::Thread(thread_id.to_owned());
+        let draft = Draft { prompt: prompt.to_owned(), model_selection, updated_at, ..Default::default() };
+        self.restore_draft_choices(&target, &draft, cx);
+        let key = key(&target);
+        if self.drafts.store.set(&key, draft) {
+            cx.emit(ThreadDraftsChanged);
+        }
+        cx.notify();
     }
 }

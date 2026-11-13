@@ -85,6 +85,7 @@ pub fn time_label(time: LocalTime) -> String {
 pub(crate) enum UndoContext {
     Thread(Box<crate::context_menu::ThreadMenuOwner>),
     Draft { environment: Option<String>, canonical: Option<String>, connection: Option<u64>, generation: u64, project: Box<t3_core::shell::ProjectShell> },
+    ThreadDraft { thread_id: String },
     Unavailable { id: String, draft: bool },
 }
 
@@ -108,6 +109,7 @@ impl UndoContexts {
         self.token(context)
     }
     pub fn begin(&mut self, kind: UndoKind, id: &str) -> actions::Claim { let token = self.active_token(kind,id); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
+    pub(super) fn begin_thread_draft(&mut self, thread_id: &str) -> actions::Claim { let token = self.token(UndoContext::ThreadDraft { thread_id: thread_id.to_owned() }); let claim = self.store.begin(UndoKind::Discard, &token); self.pending.push(claim.clone()); claim }
     fn begin_owned(&mut self, kind: UndoKind, owner: crate::context_menu::ThreadMenuOwner) -> actions::Claim { let token = self.token(UndoContext::Thread(Box::new(owner))); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
     pub fn invalidate(&mut self, kind: UndoKind, id: &str) { let token = self.active_token(kind,id); self.store.invalidate(kind,&token); }
     fn invalidate_owned(&mut self, kind: UndoKind, owner: &crate::context_menu::ThreadMenuOwner) { let token = self.token(UndoContext::Thread(Box::new(owner.clone()))); self.store.invalidate(kind,&token); }
@@ -163,6 +165,7 @@ pub struct SidebarController {
     pub drag: Option<(String, t3_core::sidebar::Section)>,
     pub favicons: super::favicons::FaviconStore,
     pub drafts_to_restore: Vec<String>,
+    pub thread_drafts_to_restore: Vec<String>,
     pub hidden_thread_ids: std::collections::HashSet<String>,
     hiding_tags: bool,
     tracker: InboxReturnTracker,
@@ -659,6 +662,7 @@ impl AppState {
 
     pub(crate) fn delete_scoped_threads(&mut self, owners: Vec<crate::context_menu::ThreadMenuOwner>, cx: &mut Context<Self>) {
         if owners.is_empty() { return; }
+        let selected_at_start: Vec<_> = self.sidebar.fleet_selection.iter().cloned().collect();
         if owners.iter().any(|owner| !(owner.current(self) || self.scoped_deletion_missing(owner)) || !owner.can_operate_owner(self)) {
             self.show_toast(Toast::new(ToastKind::Error, "Thread deletion incomplete").description("0 thread(s) deleted; stopped: destination or permission changed"), cx);
             return;
@@ -684,6 +688,7 @@ impl AppState {
             let mut completed = 0;
             let mut failures = 0;
             let mut interruption = None;
+            let mut deleted = std::collections::HashSet::new();
             for (owner, destination) in owners.iter().zip(&destinations) {
                 let current = |state: &AppState| destination.is_current(&state.fleet) && owner.current(state) && owner.can_operate_owner(state)
                     && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
@@ -725,7 +730,10 @@ impl AppState {
                     }
                     if ok && valid {
                         state.sidebar.undo.expire_owned(owner, true);
-                        if let Some(key) = owner.key() { state.remove_scoped_thread_selection(&key); }
+                        if let Some(key) = owner.key() {
+                            deleted.insert(key.clone());
+                            state.remove_scoped_thread_selection(&key);
+                        }
                         cx.emit(AppEvent::Notice);
                         cx.emit(AppEvent::SidebarSelection);
                     }
@@ -737,6 +745,9 @@ impl AppState {
                 }
             }
             let _ = this.update(cx, |state, cx| {
+                for key in t3_core::sidebar::selection::keys_to_deselect_after_delete(&selected_at_start, &deleted, |key| state.scoped_thread(key).is_some()) {
+                    state.remove_scoped_thread_selection(&key);
+                }
                 for owner in &owners {
                     if state.scoped_deletion_missing(owner) && owner.can_operate_owner(state)
                         && let Some(key) = owner.key() {
@@ -1341,6 +1352,11 @@ impl AppState {
         self.send_visit(thread_id, woke_at, false, cx);
     }
 
+    pub(crate) fn acknowledge_woke_scoped(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, woke_at: Ms, cx: &mut Context<Self>) {
+        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(self, key) else { return };
+        self.run_scoped_command(owner, actions::visit(&uuid(), &key.thread_id, woke_at), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE, "Failed to dismiss woke notification", cx);
+    }
+
     pub fn rename_thread(&mut self, thread_id: &str, title: &str, cx: &mut Context<Self>) {
         let Some(original) = self.snapshot_thread(thread_id).map(|thread| thread.title) else { return };
         match actions::resolve_rename(title, &original) {
@@ -1470,6 +1486,11 @@ impl AppState {
                         && self.shell.project(&project.id).is_some_and(|current| current.created_at == project.created_at && current.workspace_root == project.workspace_root)
                         && plan.contains(&UndoStep::RestoreDraft) {
                         self.sidebar.drafts_to_restore.push(project.id); cx.emit(AppEvent::RestoreDraft);
+                    }
+                }
+                UndoContext::ThreadDraft { thread_id } => {
+                    if plan.contains(&UndoStep::RestoreDraft) {
+                        self.sidebar.thread_drafts_to_restore.push(thread_id); cx.emit(AppEvent::RestoreDraft);
                     }
                 }
                 UndoContext::Unavailable { .. } => {}

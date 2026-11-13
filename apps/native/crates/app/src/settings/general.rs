@@ -106,6 +106,10 @@ impl SettingsView {
                 Row::new("boring-sidebar", "Boring sidebar")
                     .control(switch(state, "boring-sidebar-switch", doc.boring_sidebar_enabled(), ClientSettingChange::BoringSidebarEnabled))
                     .into_any_element(),
+                Row::new("boring-sidebar-multiline", "Two-line folder rows")
+                    .description("In the boring sidebar, show folder threads on two lines: the title, then the branch, pull request, and agent.")
+                    .control(switch(state, "boring-sidebar-multiline-switch", doc.boring_sidebar_multiline_rows(), ClientSettingChange::BoringSidebarMultilineRows))
+                    .into_any_element(),
                 Row::new("working-shelf", "Working section")
                     .description("Fold working and monitoring threads into a Working section. They return to the top of the inbox when they need you. The boring sidebar in Labs has no Working section.")
                     .highlighted(self.is_target("working-shelf"))

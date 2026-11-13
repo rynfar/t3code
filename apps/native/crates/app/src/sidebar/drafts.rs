@@ -24,6 +24,22 @@ impl SidebarPane {
         cx.notify();
     }
 
+    pub(super) fn discard_thread_draft(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.composer.update(cx, |composer, cx| composer.discard_thread_draft(thread_id, window, cx));
+        if let Some(draft) = draft {
+            let claim = self.state.update(cx, |state, cx| {
+                let claim = state.sidebar.undo.begin_thread_draft(thread_id);
+                state.sidebar.undo.show(UndoAction::Discarded, claim.clone(), vec![UndoStep::RestoreDraft], super::controller::now_ms());
+                state.after_undo_change(cx);
+                claim
+            });
+            if let Some((_, previous)) = self.discarded_threads.insert(thread_id.into(), (claim, draft)) {
+                self.composer.update(cx, |composer, cx| composer.commit_sidebar_discard(previous, cx));
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_draft_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let row = &self.drafts.rows[index];
         let p = palette(cx);

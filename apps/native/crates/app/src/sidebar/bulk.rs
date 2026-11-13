@@ -325,7 +325,7 @@ impl AppState {
         let mut items = Vec::new(); let mut before = 0;
         for (row_index, row) in model.rows.iter().enumerate() {
             let item = match row {
-                ScopedSidebarRow::Thread { index, section } => Some(DropItem::Thread { id: Self::scoped_drag_id(&model.threads[*index].key), section: *section }),
+                ScopedSidebarRow::Thread { index, section, .. } => Some(DropItem::Thread { id: Self::scoped_drag_id(&model.threads[*index].key), section: *section }),
                 ScopedSidebarRow::Marker(marker) => Some(DropItem::Marker(*marker)),
                 ScopedSidebarRow::Shelf { shelf, .. } => Some(DropItem::Marker(match shelf { t3_core::sidebar::Shelf::Working => Marker::WorkingHeader, t3_core::sidebar::Shelf::Snoozed => Marker::SnoozedHeader, t3_core::sidebar::Shelf::Settled => Marker::SettledHeader })),
                 _ => None,

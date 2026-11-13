@@ -168,7 +168,7 @@ fn apply_client(
     state.update(cx, |state, cx| {
         state.client_settings = composer;
         let grouping = client(cx).project_grouping_settings();
-        if client(cx).working_shelf() != state.sidebar.settings.working_shelf_enabled || grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides || matches!(change, ClientSettingChange::ProjectSortOrder(_) | ClientSettingChange::BoringSidebarEnabled(_)) {
+        if client(cx).working_shelf() != state.sidebar.settings.working_shelf_enabled || grouping.mode != state.sidebar.settings.grouping.mode || grouping.overrides != state.sidebar.settings.grouping.overrides || matches!(change, ClientSettingChange::ProjectSortOrder(_) | ClientSettingChange::BoringSidebarEnabled(_) | ClientSettingChange::BoringSidebarMultilineRows(_)) {
             state.rebuild_sidebar(cx);
             cx.emit(AppEvent::Shell);
         }

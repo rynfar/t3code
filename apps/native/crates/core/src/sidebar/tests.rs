@@ -1387,7 +1387,17 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     assert_eq!(model.ordered.len(), 1);
     assert_eq!(model.jump_target(0), Some(selected.clone()));
     assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Folder { hidden_count: 1, expanded: false, .. })));
+    assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Thread { section: Section::Active, in_folder: true, .. })));
     let normal = ScopedSidebarModel::build(&ScopedSidebarInput { folder_mode: false, ..input }, &mut state);
+    assert!(normal.rows.iter().all(|row| !matches!(row, ScopedSidebarRow::Thread { in_folder: true, .. })));
+    let mut scratch_a = projects[0].clone(); scratch_a.is_scratch = true; scratch_a.environment_label = "Mac Studio".into();
+    let mut scratch_b = projects[1].clone(); scratch_b.is_scratch = false; scratch_b.environment_label = "Cloud VM".into();
+    let scratch_groups = build_scoped_project_groups(&GroupInput { projects: &[scratch_a.clone(), scratch_b], threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::UpdatedAt });
+    let scratch_model = ScopedSidebarModel::build(&ScopedSidebarInput { groups: &scratch_groups, folder_mode: false, ..input }, &mut state);
+    assert_eq!(scratch_model.scratch_machine_labels.get(&scratch_a.reference()).map(String::as_str), Some("Mac Studio"));
+    assert_eq!(scratch_model.scratch_machine_labels.len(), 1);
+    let single_env = ScopedSidebarModel::build(&ScopedSidebarInput { groups: &scratch_groups[..1], folder_mode: false, ..input }, &mut state);
+    assert!(single_env.scratch_machine_labels.is_empty());
     assert_eq!(normal.ordered.len(), 2);
     assert_ne!(normal.row_keys()[0], normal.row_keys()[1]);
     let mut presented_row = ea.threads[0].clone();
@@ -1540,7 +1550,7 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
         assert_eq!(model.section_of(&sibling), Some(section));
         assert_eq!(model.ordered.iter().map(|index| model.threads[*index].key.clone()).collect::<Vec<_>>(), vec![selected.clone()]);
         assert_eq!(model.rows.iter().filter_map(|row| match row {
-            ScopedSidebarRow::Thread { index, section } => Some((model.threads[*index].key.clone(), *section)),
+            ScopedSidebarRow::Thread { index, section, .. } => Some((model.threads[*index].key.clone(), *section)),
             _ => None,
         }).collect::<Vec<_>>(), vec![(selected.clone(), section)]);
         assert!(model.rows.iter().any(|row| matches!(row,

@@ -158,6 +158,8 @@ impl ConfirmDialog {
 
     pub(crate) fn set_previous_focus(&mut self, focus: Option<FocusHandle>) { self.previous_focus = focus; }
 
+    pub(crate) fn is_open(&self) -> bool { self.pending.is_some() }
+
     fn resolve(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.take() else { return };
         if self.focus.is_focused(window) && let Some(focus) = self.previous_focus.take() { window.focus(&focus, cx); }

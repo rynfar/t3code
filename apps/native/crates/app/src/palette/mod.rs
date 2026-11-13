@@ -219,6 +219,10 @@ fn palette_threads(
 }
 
 impl CommandPalette {
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+
     pub fn new(state: Entity<AppState>, composer: Entity<crate::composer::Composer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands, projects, and threads..."));
         let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {

@@ -212,6 +212,7 @@ pub enum ClientSettingChange {
     ProjectSortOrder(ProjectSortOrder),
     WorkingShelf(bool),
     BoringSidebarEnabled(bool),
+    BoringSidebarMultilineRows(bool),
     ConfirmThreadUnpin(bool),
     ConfirmThreadArchive(bool),
     ConfirmThreadDelete(bool),
@@ -278,6 +279,7 @@ impl ClientSettingChange {
             ClientSettingChange::ProjectSortOrder(order) => ("sidebarProjectSortOrder", text(order.as_str())),
             ClientSettingChange::WorkingShelf(on) => ("sidebarWorkingShelfEnabled", Value::Bool(*on)),
             ClientSettingChange::BoringSidebarEnabled(on) => ("boringSidebarEnabled", Value::Bool(*on)),
+            ClientSettingChange::BoringSidebarMultilineRows(on) => ("boringSidebarMultilineRows", Value::Bool(*on)),
             ClientSettingChange::ConfirmThreadUnpin(on) => ("confirmThreadUnpin", Value::Bool(*on)),
             ClientSettingChange::ConfirmThreadArchive(on) => ("confirmThreadArchive", Value::Bool(*on)),
             ClientSettingChange::ConfirmThreadDelete(on) => ("confirmThreadDelete", Value::Bool(*on)),
@@ -520,6 +522,8 @@ impl ClientSettingsDoc {
     }
 
     pub fn boring_sidebar_enabled(&self) -> bool { self.flag("boringSidebarEnabled", false) }
+
+    pub fn boring_sidebar_multiline_rows(&self) -> bool { self.flag("boringSidebarMultilineRows", false) }
 
     pub fn working_shelf(&self) -> bool {
         self.flag("sidebarWorkingShelfEnabled", true)
