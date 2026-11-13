@@ -93,6 +93,8 @@ export function turnItem(
               senderThreadId: "thread-sender",
               idleCompaction: "onReturn",
               modelSwitch: { from: MODEL, to: { ...MODEL, model: "gpt-5.5" } },
+              workflowScript: true,
+              freshContext: true,
               context: { version: 1, records: [] },
             }
           : {}),
@@ -136,7 +138,16 @@ export function turnItem(
         childThreadId: null,
         prompt: `brief ${id}`,
         result: null,
-        ...(options.rich ? { progress: "halfway" } : {}),
+        ...(options.rich
+          ? {
+              progress: "halfway",
+              remoteChild: {
+                environmentId: "env-remote",
+                threadId: "thread-remote",
+                label: "GPU Box",
+              },
+            }
+          : {}),
       } as Item;
   }
 }

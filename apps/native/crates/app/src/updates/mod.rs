@@ -1233,6 +1233,7 @@ fn render_capsule_popover(
     let close_this = this.clone();
     let panel = div()
         .id("update-capsule-popover")
+        .debug_selector(|| "update-capsule-popover".to_owned())
         .relative()
         .occlude()
         .w(rem(272.))
@@ -1303,11 +1304,11 @@ fn render_capsule_popover(
     div()
         .absolute()
         .top_0()
-        .left_0()
+        .right_0()
         .child(
             deferred(
                 anchored()
-                    .anchor(gpui::Anchor::BottomLeft)
+                    .anchor(gpui::Anchor::BottomRight)
                     .snap_to_window_with_margin(px(8.))
                     .child(div().mb(rem(6.)).child(panel)),
             )
@@ -1316,10 +1317,9 @@ fn render_capsule_popover(
         .into_any_element()
 }
 
-impl Render for UpdateControl {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let mut body = div()
+impl UpdateControl {
+    fn key_boundary(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
             .key_context(CONTROL_CONTEXT)
             .on_action(|_: &FocusNextUpdate, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPreviousUpdate, window, cx| window.focus_prev(cx))
@@ -1329,15 +1329,44 @@ impl Render for UpdateControl {
                     cx.notify();
                 }
             }))
+    }
+
+    pub(crate) fn render_notices(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let denial = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|c| updates::managed_denial(c.managed_policy.as_ref(), Some(target_version())));
+        if denial.is_none() && self.pill.is_none() {
+            return None;
+        }
+        let p = palette(cx);
+        let mut body = self
+            .key_boundary(cx)
             .flex_none()
             .flex()
             .flex_col()
             .gap(rem(6.))
             .px(rem(8.));
-        let denial = self.state.read(cx).server_config.config.as_ref().and_then(|c| updates::managed_denial(c.managed_policy.as_ref(), Some(target_version())));
         if let Some(reason) = denial {
             use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
-            body = body.child(crate::components::managed::ManagedControl::new("managed-server-update", Some(reason.clone()), Button::new("managed-server-update-button", ButtonVariant::Outline, ButtonSize::Compact).label("Update T3 Code")))
+            body = body
+                .child(crate::components::managed::ManagedControl::new(
+                    "managed-server-update",
+                    Some(reason.clone()),
+                    Button::new(
+                        "managed-server-update-button",
+                        ButtonVariant::Outline,
+                        ButtonSize::Compact,
+                    )
+                    .label("Update T3 Code"),
+                ))
                 .child(crate::components::managed::notice(reason, cx));
         }
         if let Some(view) = &self.pill {
@@ -1372,6 +1401,7 @@ impl Render for UpdateControl {
             row = row.child(keyboard_button(
                 div()
                     .id("provider-update-main")
+                    .debug_selector(|| "provider-update-main".to_owned())
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -1437,6 +1467,15 @@ impl Render for UpdateControl {
             }
             body = body.child(row);
         }
+        Some(body.into_any_element())
+    }
+
+    pub(crate) fn render_footer_control(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let p = palette(cx);
         if let Some(run) = &self.run {
             let now = self.current_now_ms();
             let view = updates::describe_update_capsule(run, &self.stages, now);
@@ -1468,8 +1507,11 @@ impl Render for UpdateControl {
             let this = cx.weak_entity();
             let mut capsule_row = div()
                 .id("update-capsule")
+                .debug_selector(|| "update-capsule".to_owned())
                 .w_full()
-                .min_h(rem(28.))
+                .min_w_0()
+                .h(px(32.))
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .rounded(rem(8.))
@@ -1481,13 +1523,15 @@ impl Render for UpdateControl {
                 .child(keyboard_button(
                     div()
                         .id("update-capsule-trigger")
+                        .debug_selector(|| "update-capsule-trigger".to_owned())
                         .flex_1()
                         .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
                         .flex()
                         .items_center()
-                        .gap(rem(8.))
-                        .px(rem(8.))
-                        .py(rem(6.))
+                        .gap(px(6.))
+                        .px(px(8.))
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.85))
                         .child(icon.sized(px(14.)).text_color(hsla(text_color)))
@@ -1497,6 +1541,7 @@ impl Render for UpdateControl {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()
+                                .whitespace_nowrap()
                                 .child(trigger_label),
                         ),
                     "update-capsule-trigger",
@@ -1543,7 +1588,7 @@ impl Render for UpdateControl {
                     cx,
                 ));
             }
-            let mut capsule_wrap = div().relative().w_full().child(capsule_row);
+            let mut capsule_wrap = div().relative().w_full().min_w_0().child(capsule_row);
             if self.capsule_open {
                 capsule_wrap = capsule_wrap.child(render_capsule_popover(
                     run,
@@ -1554,33 +1599,40 @@ impl Render for UpdateControl {
                     cx,
                 ));
             }
-            body = body.child(capsule_wrap);
+            return Some(
+                self.key_boundary(cx)
+                    .ml_auto()
+                    .flex_1()
+                    .min_w_0()
+                    .child(capsule_wrap)
+                    .into_any_element(),
+            );
         }
         if self.plan.has_updates() {
             let label = self.plan.summary();
             let this = cx.weak_entity();
-            body = body.child(keyboard_button(
+            let button = keyboard_button(
                 div()
                     .id("update-everything")
-                    .w_full()
-                    .min_h(rem(28.))
+                    .debug_selector(|| "update-everything".to_owned())
+                    .size(px(32.))
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(rem(8.))
-                    .px(rem(8.))
-                    .py(rem(6.))
-                    .rounded(rem(8.))
+                    .justify_center()
+                    .rounded_full()
                     .bg(hsla(p.sidebar_control_surface))
-                    .text_color(hsla(p.update_foreground))
-                    .text_size(px(11.))
+                    .text_color(hsla(p.sidebar_foreground))
                     .cursor_pointer()
                     .hover(|s| s.bg(hsla(p.sidebar_row_hover)))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+                    })
                     .child(
                         Icon::CircleArrowUp
-                            .sized(px(14.))
-                            .text_color(hsla(p.update_foreground)),
-                    )
-                    .child(label),
+                            .sized(px(16.))
+                            .text_color(hsla(p.sidebar_foreground)),
+                    ),
                 "update-everything",
                 true,
                 move |window, cx| {
@@ -1593,9 +1645,31 @@ impl Render for UpdateControl {
                 },
                 window,
                 cx,
-            ));
+            );
+            return Some(
+                self.key_boundary(cx)
+                    .ml_auto()
+                    .flex_none()
+                    .child(button)
+                    .into_any_element(),
+            );
         }
-        body
+        None
+    }
+}
+
+impl Render for UpdateControl {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(rem(6.))
+            .children(self.render_notices(window, cx))
+            .children(
+                self.render_footer_control(window, cx)
+                    .map(|control| div().px(rem(8.)).flex().items_center().child(control)),
+            )
     }
 }
 #[cfg(feature = "snapshot")]

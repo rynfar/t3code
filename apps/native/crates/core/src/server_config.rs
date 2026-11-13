@@ -535,6 +535,9 @@ pub struct EnvironmentCapabilities {
     /// The server hosts headless Chromium tabs streamed over `/api/preview-stream`.
     #[serde(default)]
     pub server_browser: Option<bool>,
+    /// The server supports stopping discovered local servers via `preview.stopLocalServer`.
+    #[serde(default)]
+    pub local_server_stop: Option<bool>,
     /// The server answers `orchestration.subscribeCommandOutput`; older servers never send it.
     #[serde(default)]
     pub command_output_streaming: Option<bool>,

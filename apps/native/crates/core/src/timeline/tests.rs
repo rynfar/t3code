@@ -1787,3 +1787,69 @@ fn named_timestamp_zone_keeps_the_label_and_offsets_together() {
     assert_eq!(format_day_aware("2026-01-01T16:30:00Z", winter, &zone, TwelveHour, &TimestampEnglish { british: false }), "11:30 AM");
     assert!(NamedZone::new("not/a-zone").is_none());
 }
+
+#[test]
+fn inherited_event_visibility_survives_entries_to_rows_projection() {
+    use crate::thread::{ProjectedTurnItem, Visibility};
+    use serde_json::json;
+    let mut projection = rewind_projection();
+    projection.visible_turn_items = vec![
+        ProjectedTurnItem {
+            position: 0,
+            visibility: Visibility::Inherited,
+            source_thread_id: "parent-thread".into(),
+            source_item_id: "src-secret".into(),
+            item: Arc::new(
+                serde_json::from_value(json!({
+                    "id": "item-secret",
+                    "threadId": "t1",
+                    "runId": "r1",
+                    "nodeId": "n1",
+                    "ordinal": 1,
+                    "status": "pending",
+                    "createdAt": "2026-11-01T00:00:00Z",
+                    "updatedAt": "2026-11-01T00:00:00Z",
+                    "type": "secret_request",
+                    "label": "API Key",
+                    "reason": "Need key",
+                    "secretStatus": "pending"
+                }))
+                .unwrap(),
+            ),
+        },
+        ProjectedTurnItem {
+            position: 1,
+            visibility: Visibility::Local,
+            source_thread_id: "t1".into(),
+            source_item_id: "item-link".into(),
+            item: Arc::new(
+                serde_json::from_value(json!({
+                    "id": "item-link",
+                    "threadId": "t1",
+                    "runId": "r1",
+                    "nodeId": "n1",
+                    "ordinal": 2,
+                    "status": "pending",
+                    "createdAt": "2026-11-01T00:00:01Z",
+                    "updatedAt": "2026-11-01T00:00:01Z",
+                    "type": "link_request",
+                    "reason": "Need link",
+                    "linkStatus": "pending"
+                }))
+                .unwrap(),
+            ),
+        },
+    ];
+    let entries = derive_entries(&mut EntriesCache::default(), &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
+    let activity = derive_activity(&projection);
+    let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None };
+    let rows = derive_rows(&input, &mut RowsCache::default());
+    let visibilities: Vec<_> = rows
+        .iter()
+        .filter_map(|row| match &row.kind {
+            RowKind::Event { item, visibility, .. } => Some((item.id.as_str(), *visibility)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(visibilities, vec![("item-secret", Visibility::Inherited), ("item-link", Visibility::Local)]);
+}

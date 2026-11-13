@@ -114,6 +114,10 @@ struct Snapshot {
     setup_blocks_send: bool,
     /// The run is being prepared, so a send queues behind it (`sendQueuesBehindSetup`).
     setup_queues: bool,
+    /// Latest actionable proposed plan on a settled run (`findLatestProposedPlan`).
+    active_proposed_plan: Option<t3_core::timeline::plan::ActiveProposedPlan>,
+    /// Whether the thread currently offers a resume primary action (`resumableRunId !== null || hasHeldQueuedRuns`).
+    can_resume: bool,
 }
 
 /// The corresponding transcript follows this composer's effective selection (`ChatView.tsx`).
@@ -165,6 +169,7 @@ pub struct Composer {
     picker_open: bool,
     permissions_open: bool,
     approval_menu_open: bool,
+    plan_menu_open: bool,
     choices: HashMap<Target, Choices>,
     /// The model and mode a new draft starts from: what the thread before it ran.
     carry: (Option<ModelSelection>, Option<InteractionMode>),
@@ -216,12 +221,38 @@ pub(crate) struct SnapshotAudit { pub submissions: std::cell::Cell<usize> }
 #[cfg(feature = "snapshot")]
 impl gpui::Global for SnapshotAudit {}
 
+#[derive(Default)]
+struct RegisteredComposers(Vec<gpui::WeakEntity<Composer>>);
+impl gpui::Global for RegisteredComposers {}
+
 #[cfg(feature = "snapshot")]
 struct SnapshotComposer(Entity<Composer>);
 #[cfg(feature = "snapshot")]
 impl gpui::Global for SnapshotComposer {}
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot_composer(cx: &App) -> Entity<Composer> {cx.global::<SnapshotComposer>().0.clone()}
+
+pub(crate) fn insert_artifact_template(
+    thread_id: Option<&str>,
+    template: &t3_core::timeline::CodexArtifactTemplate,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let live: Vec<Entity<Composer>> = cx
+        .try_global::<RegisteredComposers>()
+        .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
+        .unwrap_or_default();
+    let target = match thread_id {
+        Some(tid) => live
+            .iter()
+            .find(|composer| composer.read(cx).thread_id().as_deref() == Some(tid))
+            .cloned(),
+        None => live.iter().find(|composer| composer.read(cx).fixed.is_none()).cloned().or_else(|| live.first().cloned()),
+    };
+    if let Some(composer) = target {
+        composer.update(cx, |composer, cx| composer.insert_artifact_template(template, window, cx));
+    }
+}
 
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -325,6 +356,7 @@ impl Composer {
             picker_open: false,
             permissions_open: false,
             approval_menu_open: false,
+            plan_menu_open: false,
             choices: HashMap::new(),
             carry: (None, None),
             snapshot: Snapshot::default(),
@@ -358,6 +390,11 @@ impl Composer {
             setup,
             _subscriptions: subscriptions,
         };
+        let weak_composer = cx.entity().downgrade();
+        cx.update_default_global::<RegisteredComposers, _>(|reg, _cx| {
+            reg.0.retain(|weak| weak.upgrade().is_some());
+            reg.0.push(weak_composer);
+        });
         #[cfg(feature = "snapshot")]
         if composer.fixed.is_none() {cx.set_global(SnapshotComposer(cx.entity()));}
         composer.load_drafts(cx);
@@ -413,8 +450,26 @@ impl Composer {
             pending_key,
             pending,
             queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
+            active_proposed_plan: projection.and_then(t3_core::timeline::plan::find_active_proposed_plan),
+            can_resume: projection.is_some_and(t3_core::timeline::plan::can_resume_thread),
             target,
         }
+    }
+
+    pub(super) fn active_plan_follow_up(&self, cx: &App) -> Option<&t3_core::timeline::plan::ActiveProposedPlan> {
+        let resolved = self.resolve(cx);
+        let target = self.snapshot.target.as_ref();
+        let has_attachments = target.is_some_and(|t| !self.staged_for(t).is_empty());
+        let plan = self.snapshot.active_proposed_plan.as_ref();
+        t3_core::timeline::plan::should_show_plan_follow_up_prompt(
+            self.snapshot.pending.user_inputs.len(),
+            resolved.interaction_mode,
+            self.snapshot.running,
+            plan,
+            has_attachments,
+        )
+        .then_some(plan)
+        .flatten()
     }
 
     /// Re-reads app state. Notifies only when something the composer shows changed.
@@ -574,6 +629,10 @@ impl Composer {
             interaction_mode,
             locked_instance,
         }
+    }
+
+    pub(crate) fn resolved_provider_instance(&self, cx: &App) -> Option<String> {
+        self.resolve(cx).model.map(|model| model.instance_id)
     }
 
     fn picker_input(&self, cx: &App) -> PickerInput {

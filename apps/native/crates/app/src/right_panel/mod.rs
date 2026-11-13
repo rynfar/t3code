@@ -110,7 +110,7 @@ impl RightPanelView {
     fn prune_side_chats(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let open: Vec<String> = state
-            .selected_thread
+            .panel_thread()
             .as_deref()
             .map(|thread| state.panels.panels.panel(thread).surfaces.iter().filter_map(|surface| surface.side_chat_thread().map(str::to_owned)).collect())
             .unwrap_or_default();
@@ -206,7 +206,7 @@ impl RightPanelView {
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
-        let thread_id = state.selected_thread.clone();
+        let thread_id = state.panel_thread();
         let panel = thread_id.as_deref().map(|thread_id| state.panels.panels.panel(thread_id).clone());
         self.sync_previews(thread_id.as_deref(), panel.as_ref(), window, cx);
         self.sync_devices(thread_id.as_deref(), panel.as_ref(), cx);
@@ -265,9 +265,9 @@ impl Render for RightPanelView {
 /// `RightPanelMaximizeControl`): in the tab bar while the panel shows, else in the header.
 pub fn header_controls(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let app = state.read(cx);
-    let thread = app.selected_thread.as_deref();
-    let open = thread.is_some_and(|thread| app.panels.panels.is_open(thread));
-    let maximized = thread.is_some_and(|thread| app.panels.panels.panel(thread).maximized);
+    let thread = app.panel_thread();
+    let open = thread.as_deref().is_some_and(|thread| app.panels.panels.is_open(thread));
+    let maximized = thread.as_deref().is_some_and(|thread| app.panels.panels.panel(thread).maximized);
     let toggle_state = state.clone();
     let maximize_state = state.clone();
     div()

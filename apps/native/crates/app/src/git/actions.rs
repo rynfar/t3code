@@ -79,11 +79,16 @@ fn run_quick_action(quick: &QuickAction, git: &Entity<GitStore>, dialogs: &Entit
 }
 
 /// The Git actions split row, or `None` while a thread with no runs has nothing to act on.
-pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_runs_yet: bool, cx: &App) -> Option<AnyElement> {
+/// When `compact` is true (`CardDensity::Compact` or `Essential`), only active progress or an inline
+/// success indicator renders.
+pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_runs_yet: bool, compact: bool, cx: &App) -> Option<AnyElement> {
     let store = git.read(cx);
     let p = palette(cx);
     let status = store.status.as_ref();
     if status.is_some_and(|status| !status.local.is_repo) {
+        if compact {
+            return None;
+        }
         let label = if store.initializing { "Initializing..." } else { "Initialize Git" };
         let git = git.clone();
         return Some(Row::new("git-init", label).icon(Icon::GitBranchPlus).disabled(store.initializing).on_click(move |_, _, cx| git.update(cx, |git, cx| git.init_repo(cx))).into_any_element());
@@ -116,6 +121,9 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
         let check = Icon::Check.sized(px(14.)).text_color(hsla(p.success_foreground)).into_any_element();
         let cell = status_cell(check, success.title.clone().into(), success.description.clone().map(SharedString::from), cx);
         return Some(split_row("git-actions", cell, menu, cx).into_any_element());
+    }
+    if compact {
+        return None;
     }
     let icon = quick_icon(quick.icon());
     let disabled_reason = match quick.kind {
@@ -213,5 +221,13 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
         .child(count("+", insertions, p.diff_addition_foreground))
         .child(count("-", deletions, p.diff_deletion_foreground));
     let state = state.clone();
-    Some(Row::new("git-changes", "Changes").icon(Icon::FileDiff).trailing(totals).on_click(move |_, _, cx| state.update(cx, |state, cx| state.add_diff_surface(cx))).into_any_element())
+    let can_open = state.read(cx).selected_thread.is_some();
+    Some(
+        Row::new("git-changes", "Changes")
+            .icon(Icon::FileDiff)
+            .trailing(totals)
+            .disabled(!can_open)
+            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.add_diff_surface(cx)))
+            .into_any_element(),
+    )
 }

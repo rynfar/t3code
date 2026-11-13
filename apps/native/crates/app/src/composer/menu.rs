@@ -466,6 +466,32 @@ impl Composer {
         self.focus(window, cx);
     }
 
+    /// Appends a Codex artifact template prompt to the active composer (`insertArtifactTemplate`).
+    pub fn insert_artifact_template(
+        &mut self,
+        template: &t3_core::timeline::CodexArtifactTemplate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snapshot.target.is_none() || self.sending || self.answering.is_some() {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    crate::toast::Toast::new(crate::toast::ToastKind::Error, "Unable to add to chat")
+                        .description("The composer is busy; try again once it is ready."),
+                    cx,
+                );
+            });
+            return;
+        }
+        let text = self.prompt(cx);
+        if let Some(prompt) = t3_core::timeline::codex_artifact_template_prompt_to_append(&text, template) {
+            let boundary = if text.is_empty() || text.ends_with(char::is_whitespace) { "" } else { " " };
+            let end = text.len();
+            self.replace_prompt_range(end, end, &format!("{boundary}{prompt}"), window, cx);
+        }
+        self.focus(window, cx);
+    }
+
     /// The `context` a send to the current target carries: the terminal excerpts and threads
     /// its text still links, then its attachments.
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {

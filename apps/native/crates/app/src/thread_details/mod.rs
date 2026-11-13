@@ -4,9 +4,12 @@
 //! `rightPanelStore.ts`, and `threadPanel.toggle`. Inline at the canvas's top-right when the
 //! transcript lane still fits beside it, else a popover under the header's toggle.
 
+mod automations;
 pub(crate) mod controls;
 mod items;
 mod sections;
+mod servers;
+mod usage;
 mod view;
 
 use std::collections::HashMap;
@@ -20,6 +23,7 @@ use t3_core::right_panel::{DEFAULT_WIDTH, clamp_width};
 use t3_core::server_config::ServerSettings;
 use t3_core::vcs;
 
+pub(crate) use view::DetailsViewPeers;
 pub use view::DetailsView;
 
 use crate::app_state::AppState;
@@ -69,6 +73,7 @@ impl Default for PanelVisibility {
 struct Persisted {
     panels: HashMap<String, PanelVisibility>,
     items: HashMap<String, bool>,
+    legacy_usage_cleared: bool,
     last_scripts: HashMap<String, String>,
     last_editor: Option<String>,
 }
@@ -83,6 +88,8 @@ pub struct Details {
     pub git: Entity<GitStore>,
     panels: HashMap<String, PanelVisibility>,
     pub items: items::Visibility,
+    legacy_usage_enabled: Option<bool>,
+    legacy_usage_cleared: bool,
     last_scripts: HashMap<String, String>,
     last_editor: Option<String>,
     /// The mode the card last rendered in, so the toggle acts on what is on screen.
@@ -101,13 +108,31 @@ pub fn details(cx: &App) -> Option<Entity<Details>> {
     cx.try_global::<DetailsGlobal>().map(|global| global.0.clone())
 }
 
+fn legacy_usage_flag(cleared: bool, raw_client_settings: Option<&str>) -> Option<bool> {
+    if cleared {
+        return None;
+    }
+    raw_client_settings
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("threadDetailsUsageEnabled").and_then(serde_json::Value::as_bool))
+}
+
+fn clear_open_popovers(panels: &mut HashMap<String, PanelVisibility>) {
+    for visibility in panels.values_mut() {
+        visibility.popover_open = false;
+    }
+}
+
 impl Details {
     fn new(git: Entity<GitStore>) -> Self {
         let persisted: Persisted = store::load_ui_state(STORE).and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+        let legacy_usage_enabled = legacy_usage_flag(persisted.legacy_usage_cleared, store::load_client_settings().as_deref());
         Details {
             git,
             panels: persisted.panels,
             items: items::Visibility::from_overrides(persisted.items),
+            legacy_usage_enabled,
+            legacy_usage_cleared: persisted.legacy_usage_cleared,
             last_scripts: persisted.last_scripts,
             last_editor: persisted.last_editor,
             presentation: Presentation::Inline,
@@ -115,10 +140,19 @@ impl Details {
         }
     }
 
+    pub fn shows(&self, id: &str) -> bool {
+        self.items.shows_with_legacy_usage(id, self.legacy_usage_enabled)
+    }
+
+    pub fn items_are_default(&self) -> bool {
+        self.items.is_default_with_legacy_usage(self.legacy_usage_enabled)
+    }
+
     fn save(&self, cx: &mut Context<Self>) {
         let persisted = Persisted {
             panels: self.panels.iter().filter(|(_, visibility)| **visibility != PanelVisibility::default()).map(|(id, v)| (id.clone(), *v)).collect(),
             items: self.items.overrides().clone(),
+            legacy_usage_cleared: self.legacy_usage_cleared,
             last_scripts: self.last_scripts.clone(),
             last_editor: self.last_editor.clone(),
         };
@@ -135,6 +169,9 @@ impl Details {
     }
 
     pub(crate) fn set_presentation(&mut self, presentation: Presentation) {
+        if presentation == Presentation::Inline && self.presentation != Presentation::Inline {
+            clear_open_popovers(&mut self.panels);
+        }
         self.presentation = presentation;
     }
 
@@ -159,11 +196,13 @@ impl Details {
     }
 
     pub fn set_item(&mut self, id: &str, visible: bool, cx: &mut Context<Self>) {
-        self.items.set(id, visible);
+        self.items.set_with_legacy_usage(id, visible, self.legacy_usage_enabled);
         self.save(cx);
     }
 
     pub fn reset_items(&mut self, cx: &mut Context<Self>) {
+        self.legacy_usage_enabled = None;
+        self.legacy_usage_cleared = true;
         self.items.reset();
         self.save(cx);
     }
@@ -198,11 +237,25 @@ impl Details {
     }
 }
 
-/// The open thread's effective project scripts: the shell's, as server settings override them
-/// (`resolveProjectScripts` in `ChatView.tsx`).
+pub(crate) fn panel_key_for(selected_thread: Option<&str>, draft_project: Option<&str>) -> Option<String> {
+    selected_thread.map(str::to_owned).or_else(|| draft_project.map(|id| format!("draft:{id}")))
+}
+
+/// The active card target key: the selected thread id, or `draft:<project_id>` for a project draft.
+pub fn panel_key(state: &AppState) -> Option<String> {
+    panel_key_for(state.selected_thread.as_deref(), state.draft_project.as_deref())
+}
+
+/// The open thread or draft's effective project scripts: the shell's, as server settings override
+/// them (`resolveProjectScripts` in `ChatView.tsx`).
 pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)> {
-    let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
-    let project = state.shell.project(&thread.project_id)?;
+    let project_id = state
+        .selected_thread
+        .as_deref()
+        .and_then(|id| state.thread_shell(id))
+        .map(|thread| thread.project_id.as_str())
+        .or(state.draft_project.as_deref())?;
+    let project = state.shell.project(project_id)?;
     let own = project.scripts.iter().filter_map(|value| serde_json::from_value(value.clone()).ok()).collect();
     let scripts = match state.server_config.config.as_ref() {
         Some(config) => resolve_project_scripts(&config.settings, &project.id, own),
@@ -212,10 +265,10 @@ pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)>
 }
 
 /// How wide the chat canvas is: the window minus the sidebar and an inline right panel.
-fn canvas_width(state: &AppState, viewport_width: f32) -> f32 {
+pub(crate) fn canvas_width(state: &AppState, viewport_width: f32) -> f32 {
     let sidebar = sidebar_inline_width(state, viewport_width);
     let row = viewport_width - sidebar;
-    let panel = state.selected_thread.as_deref().map_or(0., |thread| {
+    let panel = state.panel_thread().as_deref().map_or(0., |thread| {
         let panel = state.panels.panels.panel(thread);
         if !panel.is_open || panel.maximized {
             return 0.;
@@ -251,12 +304,34 @@ pub fn layout(state: &Entity<AppState>, window: &Window, cx: &App) -> Layout {
     let viewport = window.viewport_size();
     let width = canvas_width(app, f32::from(viewport.width));
     let presentation = presentation_for(width);
-    let card_open = match (app.selected_thread.as_deref(), details(cx)) {
-        (Some(thread), Some(details)) => details.read(cx).is_open(thread, presentation),
+    let card_open = match (panel_key(app).as_deref(), details(cx)) {
+        (Some(key), Some(details)) => details.read(cx).is_open(key, presentation),
         _ => false,
     };
     let lane_inset = if card_open && presentation == Presentation::Inline { lane_inset_for(width) } else { 0. };
     Layout { presentation, card_open, lane_inset }
+}
+
+pub(crate) fn available_height_for(viewport_height: f32, terminal_height: f32, top_inset: f32) -> f32 {
+    (viewport_height - crate::workspace::TITLEBAR_HEIGHT - terminal_height.max(0.) - top_inset.max(0.) - 2. * CARD_GAP - 24.).max(0.)
+}
+
+pub fn available_height(window: &Window, terminal_height: f32, top_inset: f32) -> f32 {
+    available_height_for(f32::from(window.viewport_size().height), terminal_height, top_inset)
+}
+
+pub(crate) fn point_in_find_bar(find_open: bool, position: gpui::Point<gpui::Pixels>, state: &AppState, window: &Window) -> bool {
+    if !find_open {
+        return false;
+    }
+    let viewport_width = f32::from(window.viewport_size().width);
+    let canvas_right = sidebar_inline_width(state, viewport_width) + canvas_width(state, viewport_width);
+    let right = canvas_right - 12.;
+    let left = right - 280.;
+    let top = crate::workspace::TITLEBAR_HEIGHT + 12.;
+    let bottom = top + 36.;
+    let (x, y) = (f32::from(position.x), f32::from(position.y));
+    x >= left && x <= right && y >= top && y <= bottom
 }
 
 /// Creates the card's model and registers `threadPanel.toggle`, `script.<id>.run` and
@@ -267,8 +342,8 @@ pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
     cx.set_global(DetailsGlobal(details.clone()));
     let toggle = (state.clone(), details.clone());
     cx.on_action(move |_: &ToggleThreadPanel, cx| {
-        let Some(thread) = toggle.0.read(cx).selected_thread.clone() else { return };
-        toggle.1.update(cx, |details, cx| details.toggle(&thread, cx));
+        let Some(key) = panel_key(toggle.0.read(cx)) else { return };
+        toggle.1.update(cx, |details, cx| details.toggle(&key, cx));
     });
     let run = (state.clone(), details.clone());
     cx.on_action(move |action: &RunProjectScript, cx| {
@@ -309,5 +384,38 @@ mod tests {
         assert_eq!(lane_inset_for(1384.), 0.);
         assert_eq!(lane_inset_for(1200.), 184.);
         assert_eq!(lane_inset_for(1012.), 276.);
+    }
+
+    #[test]
+    fn legacy_usage_flag_respects_reset_and_client_settings() {
+        assert_eq!(legacy_usage_flag(false, Some(r#"{"threadDetailsUsageEnabled":true}"#)), Some(true));
+        assert_eq!(legacy_usage_flag(true, Some(r#"{"threadDetailsUsageEnabled":true}"#)), None);
+        assert_eq!(legacy_usage_flag(false, Some("not-json")), None);
+    }
+
+    #[test]
+    fn clearing_popovers_preserves_inline_visibility() {
+        let mut panels = HashMap::from([
+            ("t1".to_owned(), PanelVisibility { inline_open: false, popover_open: true }),
+            ("t2".to_owned(), PanelVisibility { inline_open: true, popover_open: true }),
+        ]);
+        clear_open_popovers(&mut panels);
+        assert_eq!(panels["t1"], PanelVisibility { inline_open: false, popover_open: false });
+        assert_eq!(panels["t2"], PanelVisibility { inline_open: true, popover_open: false });
+    }
+
+    #[test]
+    fn available_height_subtracts_open_terminal_drawer() {
+        assert_eq!(available_height_for(900., 0., 0.), 800.);
+        assert_eq!(available_height_for(900., 280., 0.), 520.);
+        assert_eq!(available_height_for(900., 0., 48.), 752.);
+        assert_eq!(available_height_for(200., 280., 0.), 0.);
+    }
+
+    #[test]
+    fn panel_key_covers_selected_threads_and_project_drafts() {
+        assert_eq!(panel_key_for(Some("thread-1"), Some("proj-1")), Some("thread-1".to_owned()));
+        assert_eq!(panel_key_for(None, Some("proj-1")), Some("draft:proj-1".to_owned()));
+        assert_eq!(panel_key_for(None, None), None);
     }
 }

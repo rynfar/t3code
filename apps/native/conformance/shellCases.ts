@@ -295,6 +295,11 @@ export function shellCases() {
               picks: [{ query: "side", at: 1_750_000_000_000 }],
             },
             titleRegeneration: { requestId: "command-regenerate", startedAt: thread.updatedAt },
+            linkOrigin: {
+              sessionId: "session-link-1",
+              label: "Paired browser",
+              access: "read-only",
+            },
           } as Partial<OrchestrationV2ThreadShell>),
         ],
         archivedThreads: [
@@ -325,6 +330,11 @@ export function shellCases() {
             autoSettleDisabledAt: null,
             opens: null,
             titleRegeneration: null,
+            linkOrigin: {
+              sessionId: "session-link-1",
+              label: "Paired browser",
+              access: "read-only",
+            },
           } as Partial<OrchestrationV2ThreadShell>),
         ],
       }),

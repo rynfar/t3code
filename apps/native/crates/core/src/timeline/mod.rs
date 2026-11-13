@@ -7,6 +7,7 @@ mod activity;
 pub mod anchor;
 mod compaction;
 mod detail;
+pub mod directives;
 mod entries;
 mod changed_files;
 mod find;
@@ -15,7 +16,9 @@ mod fork;
 mod inspector;
 pub mod minimap;
 mod now;
+pub mod plan;
 mod presentation;
+pub mod requests;
 mod rewind;
 mod rows;
 mod status;
@@ -39,8 +42,30 @@ use crate::thread::Visibility;
 use crate::turn_item::TurnItem;
 
 pub use activity::{
-    Attribution, LatestRun, ThreadActivity, derive_activity, plan_title, should_collapse_user_message, strip_displayed_plan_markdown,
-    user_message_attribution,
+    Attribution, LatestRun, ModelSwitchDisplay, ThreadActivity, UserAttachmentPartition, UserFileCard, UserMessagePresentation,
+    derive_activity, is_audio_attachment, is_workflow_script_message, partition_user_attachments, plan_title,
+    resolve_model_switch_change, resolve_user_message_presentation, scheduled_task_id_from_message,
+    should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution, user_message_file_label,
+};
+pub use directives::{
+    CodexArtifactTemplate, CodexAssistantSegment, codex_artifact_template_presentation_label,
+    codex_artifact_template_prompt_to_append, codex_artifact_template_use_prompt,
+    render_codex_directives_for_copy, split_codex_assistant_segments,
+};
+pub use plan::{
+    ActiveProposedPlan, DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, PlanFollowUpSubmission,
+    build_collapsed_proposed_plan_preview_markdown, build_plan_implementation_prompt,
+    build_plan_implementation_thread_title, build_proposed_plan_markdown_filename,
+    find_active_proposed_plan, normalize_plan_markdown_for_export, proposed_plan_title,
+    resolve_plan_follow_up_submission, should_show_plan_follow_up_prompt,
+};
+pub use requests::{
+    ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS, LinkRequestDisplay, LinkTone,
+    MachineCandidate, RPC_REQUEST_FALLBACK_ERROR, SecretRequestDisplay, SecretTone,
+    can_manage_peer_links, link_access_description, link_access_label,
+    link_request_default_access, link_request_display, linkable_machines, mcp_client_scopes,
+    rank_machines_by_hint, resolve_handoff_endpoints, sanitize_link_request_error,
+    sanitize_secret_request_error, secret_request_display, secret_request_privacy_note,
 };
 pub use detail::{
     GET_TURN_ITEM, MAX_TOOL_OUTPUT_IMAGES, ToolCallLines, command_output_text, decode_detail, detail_request, detail_revision, format_tool_value, needs_detail_fetch,
@@ -166,6 +191,8 @@ pub struct MessageMeta {
     pub guest_name: Option<String>,
     pub guest_text: Option<String>,
     pub model_switch: Option<Value>,
+    pub workflow_script: Option<bool>,
+    pub fresh_context: Option<bool>,
 }
 
 /// `ChatMessage`, built from a user or assistant turn item.
@@ -194,6 +221,7 @@ pub struct ProposedPlan {
     pub run_id: Option<String>,
     pub markdown: Arc<str>,
     pub status: String,
+    pub streaming: bool,
     pub updated_at: String,
 }
 
@@ -228,7 +256,10 @@ pub enum EntryKind {
     Message(Arc<ChatMessage>),
     ProposedPlan(Arc<ProposedPlan>),
     Work(Arc<WorkLogEntry>),
-    Event(Arc<TurnItem>),
+    Event {
+        item: Arc<TurnItem>,
+        visibility: crate::thread::Visibility,
+    },
     HtmlRender(Arc<HtmlRenderEntry>),
     McpApp(Arc<McpAppEntry>),
 }
@@ -324,6 +355,7 @@ pub enum RowKind {
     },
     Event {
         item: Arc<TurnItem>,
+        visibility: crate::thread::Visibility,
         subagents: Vec<Arc<TurnItem>>,
         resource_summary: bool,
     },
@@ -379,8 +411,11 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
             RowKind::AssistantMeta { message: ma, show_copy: a1, copy_streaming: a2 },
             RowKind::AssistantMeta { message: mb, show_copy: b1, copy_streaming: b2 },
         ) => Arc::ptr_eq(ma, mb) && (a1, a2) == (b1, b2),
-        (RowKind::Event { item: ia, subagents: sa, resource_summary: ra }, RowKind::Event { item: ib, subagents: sb, resource_summary: rb }) => {
-            Arc::ptr_eq(ia, ib) && ra == rb && sa.len() == sb.len() && sa.iter().zip(sb).all(|(l, r)| Arc::ptr_eq(l, r))
+        (
+            RowKind::Event { item: ia, visibility: va, subagents: sa, resource_summary: ra },
+            RowKind::Event { item: ib, visibility: vb, subagents: sb, resource_summary: rb },
+        ) => {
+            Arc::ptr_eq(ia, ib) && va == vb && ra == rb && sa.len() == sb.len() && sa.iter().zip(sb).all(|(l, r)| Arc::ptr_eq(l, r))
         }
         (RowKind::ProposedPlan(pa), RowKind::ProposedPlan(pb)) => Arc::ptr_eq(pa, pb),
         (RowKind::WorktreeSetup { snapshot: sa, embedded: ea }, RowKind::WorktreeSetup { snapshot: sb, embedded: eb }) => Arc::ptr_eq(sa, sb) && ea == eb,
