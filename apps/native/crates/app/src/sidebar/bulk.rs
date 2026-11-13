@@ -88,15 +88,10 @@ impl AppState {
         let now = now_ms();
         let threads: Vec<_> = self.sidebar.selection.selected().iter().filter_map(|id| model.thread(id)).collect();
         let caps = self.sidebar.capabilities;
-        let summary = BulkSelection {
-            count: threads.len(),
-            pinned: threads.iter().filter(|thread| thread.pinned).count(),
-            settling: threads.iter().filter(|thread| !thread.is_settled()).count(),
-            can_snooze: threads.iter().all(|thread| settled::can_snooze(thread, now)),
-            regeneratable: threads.iter().filter(|thread| !thread.regenerating_title).count(),
-            config_loaded: caps.config_loaded,
-            can_operate: caps.can_operate,
-        };
+        let summary = BulkSelection::from_targets(&threads.iter().map(|thread| t3_core::sidebar::selection::BulkTarget {
+            pinned:thread.pinned, settled:thread.is_settled(), regenerating:thread.regenerating_title,
+            can_snooze:settled::can_snooze(thread, now), config_loaded:caps.config_loaded, can_operate:caps.can_operate,
+        }).collect::<Vec<_>>());
         (threads.iter().map(|thread| thread.id.clone()).collect(), summary)
     }
 
@@ -418,22 +413,150 @@ impl AppState {
 }
 
 impl AppState {
+    pub(crate) fn scoped_bulk_target(&self, owner: &crate::context_menu::ThreadMenuOwner) -> Option<t3_core::sidebar::selection::BulkTarget> {
+        if !owner.current(self) { return None; }
+        let key = owner.key()?;
+        let row = self.scoped_thread(&key)?;
+        Some(t3_core::sidebar::selection::BulkTarget {
+            pinned:row.thread.pinned, settled:row.thread.is_settled(), regenerating:row.thread.regenerating_title,
+            config_loaded:self.scoped_environment(&key.environment_id)?.config.config.is_some(),
+            can_snooze:settled::can_snooze(&row.thread, now_ms()), can_operate:owner.can_operate_owner(self),
+        })
+    }
+
+    fn scoped_bulk_visible(&self, owner: &crate::context_menu::ThreadMenuOwner, selected_set: bool) -> bool {
+        !selected_set || owner.key().is_some_and(|key| self.sidebar.fleet.ordered.iter().any(|index| self.sidebar.fleet.threads[*index].key == key))
+    }
+
+    fn scoped_bulk_attempt(&mut self, owner: crate::context_menu::ThreadMenuOwner, target: t3_client::environments::Destination, action: BulkAction, snoozed_until: Option<i64>, selected_set: bool, cx: &mut Context<Self>) -> gpui::Task<(bool, bool)> {
+        let prepared = (|| {
+            let snoozing = matches!(action, BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom);
+            if (snoozing && snoozed_until.is_none_or(|until| until <= now_ms())) || !target.is_current(&self.fleet)
+                || !self.scoped_bulk_visible(&owner, selected_set) || !self.scoped_bulk_target(&owner).is_some_and(|row| action.eligible(&row) && action.ready(&row))
+                || !target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)) { return None; }
+            let command = match &action {
+                BulkAction::Unpin => actions::unpin(&uuid(), &owner.thread),
+                BulkAction::Settle => actions::settle(&uuid(), &owner.thread),
+                BulkAction::RegenerateTitles => actions::regenerate_title(&uuid(), &owner.thread),
+                BulkAction::MarkUnread => actions::mark_unread(&uuid(), &owner.thread),
+                BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom => actions::snooze(&uuid(), &owner.thread, snoozed_until?),
+                BulkAction::Delete => return None,
+            };
+            let undo = self.scoped_undo_claim(&owner, command.get("type").and_then(serde_json::Value::as_str).unwrap_or_default());
+            Some((command, undo))
+        })();
+        let Some((command, undo)) = prepared else { return gpui::Task::ready((false, false)); };
+        let dispatched = target.client.dispatch(command);
+        cx.spawn(async move |this, cx| {
+            let result = dispatched.await;
+            let interrupted = match &result {
+                Err(t3_client::session::RpcError::Closed) => true,
+                Err(t3_client::session::RpcError::Failure(failure)) => failure.tag.is_none() && failure.message == "Interrupted" && failure.error.is_null(),
+                Ok(_) => false,
+            };
+            let accepted = this.update(cx, |state, cx| {
+                let current = target.is_current(&state.fleet)
+                    && (owner.current(state) || (owner.key().is_some_and(|key| state.scoped_thread(&key).is_none()) && owner.response_after_placement(state))) && owner.can_operate_owner(state)
+                    && owner.destination.as_ref().and_then(|owner| state.scoped_environment(&owner.saved_id)).is_some_and(|entry| entry.config.config.is_some())
+                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
+                if result.is_ok() && current {
+                    if let Some((claim, action, plan)) = undo { state.sidebar.undo.show(action, claim, plan, now_ms()); state.after_undo_change(cx); cx.emit(AppEvent::Notice); }
+                    true
+                } else {
+                    if let Some((claim, _, _)) = undo { state.sidebar.undo.finish(&claim); }
+                    false
+                }
+            }).unwrap_or(false);
+            (accepted, interrupted)
+        })
+    }
+
     pub(crate) fn run_scoped_bulk_action(&mut self, owners: Vec<crate::context_menu::ThreadMenuOwner>, action: BulkAction, cx: &mut Context<Self>) {
         if action == BulkAction::Delete { self.delete_scoped_threads(owners, cx); return; }
-        if owners.iter().any(|owner| !owner.current(self) || !owner.can_operate_owner(self)) { return; }
-        let mut steps = Vec::new();
+        self.run_scoped_bulk(owners, action, None, true, cx).detach();
+    }
+
+    pub(crate) fn run_scoped_bulk(&mut self, owners: Vec<crate::context_menu::ThreadMenuOwner>, action: BulkAction, snoozed_until: Option<i64>, clear_selection: bool, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let mut eligible = Vec::new();
         for owner in owners {
-            let Some(key) = owner.key() else { return };
-            let Some(row) = self.scoped_thread(&key) else { return };
-            let command = match action {
-                BulkAction::Unpin if row.thread.pinned => actions::unpin(&uuid(), &key.thread_id),
-                BulkAction::Settle if !row.thread.is_settled() => actions::settle(&uuid(), &key.thread_id),
-                BulkAction::RegenerateTitles if !row.thread.regenerating_title => actions::regenerate_title(&uuid(), &key.thread_id),
-                BulkAction::MarkUnread => actions::mark_unread(&uuid(), &key.thread_id),
-                _ => continue,
+            if !self.scoped_bulk_visible(&owner, clear_selection) {
+                self.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action refused").description("The captured selection is no longer visible"), cx); return gpui::Task::ready(());
+            }
+            let Some(target) = self.scoped_bulk_target(&owner) else {
+                self.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action refused").description("The captured selection changed"), cx); return gpui::Task::ready(());
             };
-            steps.push((owner, command));
+            if !action.eligible(&target) { continue; }
+            if !action.ready(&target) {
+                self.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action refused").description("The destination cannot perform this action"), cx); return gpui::Task::ready(());
+            }
+            eligible.push(owner);
         }
-        self.run_scoped_drop_steps(steps, cx);
+        if eligible.is_empty() { return gpui::Task::ready(()); }
+        if matches!(action, BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom) && snoozed_until.is_none_or(|until| until <= now_ms()) { return gpui::Task::ready(()); }
+        let resolves = eligible.iter().map(|owner| self.connections.destination(owner.destination.as_ref().unwrap(), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).collect::<Vec<_>>();
+        cx.spawn(async move |this, cx| {
+            let mut targets = Vec::new();
+            for resolve in resolves {
+                match resolve.await {
+                    Ok(target) => targets.push(target),
+                    Err(error) => {
+                        let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action refused").description(format!("Destination unavailable: {error:?}")), cx));
+                        return;
+                    }
+                }
+            }
+            let admitted = this.read_with(cx, |state, _| eligible.iter().zip(&targets).all(|(owner, destination)|
+                destination.is_current(&state.fleet) && state.scoped_bulk_visible(owner, clear_selection) && state.scoped_bulk_target(owner).is_some_and(|target| action.eligible(&target) && action.ready(&target))
+                    && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))).unwrap_or(false);
+            let snoozing = matches!(action, BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom);
+            if !admitted || (snoozing && snoozed_until.is_none_or(|until| until <= now_ms())) {
+                let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action refused").description("The destination or permission changed"), cx));
+                return;
+            }
+            let regenerate = action == BulkAction::RegenerateTitles;
+            let unpin = action == BulkAction::Unpin;
+            let mut cleared = false;
+            if clear_selection && !regenerate && !unpin {
+                let _ = this.update(cx, |state, cx| { state.clear_thread_selection(cx); });
+                cleared = true;
+            }
+            let mut saved = 0;
+            let mut failed = 0;
+            let mut concurrent = Vec::new();
+            for (owner, target) in eligible.into_iter().zip(targets) {
+                let current = this.read_with(cx, |state, _| target.is_current(&state.fleet) && state.scoped_bulk_visible(&owner, clear_selection)
+                    && state.scoped_bulk_target(&owner).is_some_and(|row| action.eligible(&row) && action.ready(&row))
+                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false);
+                if !current { failed += 1; if regenerate { break; } else { continue; } }
+                if unpin {
+                    let (sent, confirmation) = tokio::sync::oneshot::channel();
+                    let asked = this.update(cx, |state, cx| {
+                        if !crate::settings::client_settings(cx).confirm_thread_unpin() { let _ = sent.send(true); return true; }
+                        let title = owner.key().and_then(|key| state.scoped_thread(&key)).map(|row| row.thread.title.clone()).unwrap_or_default();
+                        let (title, description) = t3_core::thread_actions::unpin_confirmation(&title);
+                        crate::dialog::ask_available(title, description, "Unpin", move |_, _| { let _ = sent.send(true); }, cx)
+                    }).unwrap_or(false);
+                    if !asked { failed += 1; continue; }
+                    if clear_selection && !cleared { let _ = this.update(cx, |state, cx| { state.clear_thread_selection(cx); }); cleared = true; }
+                    if confirmation.await != Ok(true) { continue; }
+                }
+                let attempt = this.update(cx, |state, cx| state.scoped_bulk_attempt(owner, target, action.clone(), snoozed_until, clear_selection, cx)).ok();
+                if let Some(attempt) = attempt {
+                    if snoozing { concurrent.push(attempt); continue; }
+                    let (accepted, interrupted) = attempt.await;
+                    if accepted { saved += 1; } else { failed += 1; }
+                    if interrupted || (regenerate && !accepted) { break; }
+                } else { failed += 1; if regenerate { break; } }
+            }
+            // Snooze owns every already-dispatched attempt; interruption cannot cancel remote writes.
+            for (accepted, _) in futures::future::join_all(concurrent).await {
+                if accepted { saved += 1; } else { failed += 1; }
+            }
+            let _ = this.update(cx, |state, cx| {
+                if regenerate && failed == 0 && clear_selection { state.clear_thread_selection(cx); }
+                if failed > 0 { state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread actions incomplete").description(format!("{saved} change(s) saved; {failed} failed")), cx); }
+                cx.emit(AppEvent::Notice);
+            });
+        })
     }
 }

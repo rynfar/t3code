@@ -48,6 +48,19 @@ pub(crate) fn ask(
     });
 }
 
+pub(crate) fn ask_available(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    confirm_label: impl Into<SharedString>,
+    on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
+    cx: &mut App,
+) -> bool {
+    let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return false; };
+    if dialog.read(cx).pending.is_some() { return false; }
+    ask(title, description, confirm_label, on_confirm, cx);
+    true
+}
+
 impl AppState {
     fn thread_title(&self, thread_id: &str) -> String {
         self.sidebar.model.thread(thread_id).map_or_else(|| "this thread".to_owned(), |thread| thread.title.clone())

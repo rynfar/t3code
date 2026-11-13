@@ -86,14 +86,15 @@ impl SnoozeRequest {
 
     fn scoped_plan(&self, state: &AppState, now: i64, snoozing: bool) -> bool {
         !self.scoped.is_empty() && self.scoped.len() == self.ids.len() && self.scoped.iter().all(|owner| {
-            owner.current(state) && owner.can_operate_owner(state) && owner.key().and_then(|key| state.scoped_thread(&key)).is_some_and(|row| !snoozing || t3_core::sidebar::settled::can_snooze(&row.thread, now))
+            owner.current(state) && owner.can_operate_owner(state)
+                && owner.destination.as_ref().and_then(|owner| state.scoped_environment(&owner.saved_id)).is_some_and(|entry| entry.config.config.is_some()) && owner.key().and_then(|key| state.scoped_thread(&key)).is_some_and(|row| !snoozing || t3_core::sidebar::settled::can_snooze(&row.thread, now))
         })
     }
 
     fn dispatch(&self, state: &mut AppState, until: i64, cx: &mut Context<AppState>) {
         if !self.scoped.is_empty() {
             if !self.scoped_plan(state, now_ms(), true) { return; }
-            state.run_scoped_drop_steps(self.scoped.iter().map(|owner| (owner.clone(), t3_core::thread_actions::snooze(&crate::sidebar::controller::uuid(), &owner.thread, until))).collect(), cx);
+            state.run_scoped_bulk(self.scoped.clone(), t3_core::sidebar::selection::BulkAction::Snooze, Some(until), self.bulk, cx).detach();
         } else {
             for id in &self.ids { state.snooze_thread(id, until, cx); }
         }
@@ -148,7 +149,7 @@ impl SnoozeRequest {
             );
             return;
         };
-        if self.bulk {
+        if self.bulk && self.scoped.is_empty() {
             state.clear_thread_selection(cx);
         }
         let _ = ids;
@@ -694,7 +695,7 @@ impl SnoozeDialog {
             let Some(thread_ids) = request.plan_for(state, now_ms()) else {
                 return;
             };
-            if request.bulk {
+            if request.bulk && request.scoped.is_empty() {
                 state.clear_thread_selection(cx);
             }
             let _ = thread_ids;
