@@ -40,6 +40,8 @@ enum Gesture {
     Hover(Point<Pixels>),
     /// Press, move in steps, release.
     Drag(Point<Pixels>, Point<Pixels>),
+    /// Press, move in steps, and keep held for capture.
+    DragHold(Point<Pixels>, Point<Pixels>),
     /// One wheel step of `dy` pixels with the pointer left there; positive scrolls toward the top.
     Scroll(Point<Pixels>, f32),
     /// Space-separated keystrokes, as `cmd-a escape`.
@@ -66,6 +68,7 @@ fn gestures(args: &[String]) -> Vec<Gesture> {
                 ("--press", Some(n @ [_, _])) => Gesture::Press(at(n)),
                 ("--hover", Some(n @ [_, _])) => Gesture::Hover(at(n)),
                 ("--drag", Some(n @ [_, _, _, _])) => Gesture::Drag(at(n), at(&n[2..])),
+                ("--drag-hold", Some(n @ [_, _, _, _])) => Gesture::DragHold(at(n), at(&n[2..])),
                 ("--scroll", Some(n @ [_, _, dy])) => Gesture::Scroll(at(n), *dy),
                 ("--resize-font", Some([size])) => Gesture::FontSize(*size),
                 ("--pause", Some([seconds])) if seconds.is_finite() && *seconds >= 0. => Gesture::Pause(*seconds),
@@ -103,6 +106,14 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
                 cx.simulate_mouse_move(window, point(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t), MouseButton::Left, none);
             }
             cx.simulate_mouse_up(window, *to, MouseButton::Left, none);
+        }
+        Gesture::DragHold(from, to) => {
+            cx.simulate_mouse_move(window, *from, None, none);
+            cx.simulate_mouse_down(window, *from, MouseButton::Left, none);
+            for step in 1..=8 {
+                let t = step as f32 / 8.;
+                cx.simulate_mouse_move(window, point(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t), MouseButton::Left, none);
+            }
         }
         Gesture::Press(at) => {
             cx.simulate_mouse_move(window, *at, None, none);

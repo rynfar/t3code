@@ -193,6 +193,11 @@ impl AppState {
     pub(crate) fn read_family(&mut self, thread_id: &str, select: bool, cx: &mut Context<Self>) {
         let families = self.server_config.config.as_ref().is_some_and(|config| config.shell_thread_families);
         if !families {
+            if select {
+                self.clear_pending_composer_file_drop_for(thread_id);
+                self.restoring_thread = false;
+                self.land_home(cx);
+            }
             return;
         }
         let generation = self.shell.generation;
@@ -219,6 +224,9 @@ impl AppState {
                 }
                 // A restore that finds nothing falls back to the home page.
                 if select {
+                    if state.selected_thread.as_deref() != Some(thread_id.as_str()) {
+                        state.clear_pending_composer_file_drop_for(&thread_id);
+                    }
                     state.restoring_thread = false;
                     state.land_home(cx);
                 }

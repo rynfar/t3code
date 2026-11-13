@@ -261,6 +261,9 @@ impl Composer {
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread | AppEvent::Phase) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
                 }
+                if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase | AppEvent::ComposerFileDrop) {
+                    this.consume_pending_file_drop(window, cx);
+                }
                 if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase) {
                     this.sync_workspace(*event == AppEvent::ServerConfig, cx);
                     this.sync_menu(false, cx);
@@ -750,6 +753,21 @@ impl Composer {
             self.has_text = has_text;
             cx.notify();
         }
+    }
+
+    fn consume_pending_file_drop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixed.is_some() {
+            return;
+        }
+        let Some(thread_id) = self.thread_id() else { return };
+        if !self.can_attach(cx) {
+            return;
+        }
+        let Some(paths) = self.state.update(cx, |state, _| state.take_pending_composer_file_drop(&thread_id)) else {
+            return;
+        };
+        self.attach_paths(paths, window, cx);
+        self.focus(window, cx);
     }
 
     fn thread_id(&self) -> Option<String> {

@@ -106,16 +106,29 @@ impl Render for ThreadDragPreview {
 impl SidebarPane {
     /// The drag constructor ran: the list shows its drop markers.
     pub(super) fn begin_drag(&mut self, thread_id: &str, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, preview: Entity<ThreadDragPreview>, cx: &mut Context<Self>) {
+        // Set pane drag before controller updates emit AppEvent::Shell so sync_list_rows sees an active drag for #293 scroll preservation.
         self.drag = Some(PaneDrag { preview: Some(preview), ..Default::default() });
         self.state.update(cx, |state, cx| match key { Some(key) => state.start_scoped_thread_drag(key, cx), None => state.start_thread_drag(thread_id, cx) });
+        let started = {
+            let state = self.state.read(cx);
+            state.sidebar.drag.is_some() || state.sidebar.fleet_drag.is_some()
+        };
+        if !started {
+            self.drag = None;
+        }
+        cx.notify();
     }
 
-    /// Tracks the gap under the pointer; listeners on every rendered row see each move.
-    pub(super) fn drag_moved(&mut self, row: usize, event: &DragMoveEvent<DraggedThread>, cx: &mut Context<Self>) {
-        if !event.bounds.contains(&event.event.position) {
-            return;
-        }
-        let after = event.event.position.y > event.bounds.center().y;
+    fn settled_placeholder_row_index(&self) -> Option<usize> {
+        self.row_keys.iter().position(|key| matches!(
+            key,
+            super::PaneRowKey::Thread(t3_core::sidebar::RowKey::Marker(Marker::SettledPlaceholder))
+                | super::PaneRowKey::Scoped(t3_core::sidebar::fleet::ScopedRowKey::Marker(Marker::SettledPlaceholder))
+        ))
+    }
+
+    fn update_thread_drag_position(&mut self, row: usize, after: bool, cx: &mut Context<Self>) {
+        let previous_target = self.drag.as_ref().and_then(|drag| drag.target);
         let Some(drag) = self.drag.as_mut().filter(|drag| drag.at != Some((row, after))) else { return };
         drag.at = Some((row, after));
         let state = self.state.read(cx);
@@ -132,7 +145,26 @@ impl SidebarPane {
                 }
             });
         }
+        if target == Some(Section::Settled) && previous_target != Some(Section::Settled)
+            && let Some(idx) = self.settled_placeholder_row_index()
+        {
+            self.list.scroll_to_reveal_item(idx);
+        }
         cx.notify();
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn set_drag_position_for_test(&mut self, row: usize, after: bool, cx: &mut Context<Self>) {
+        self.update_thread_drag_position(row, after, cx);
+    }
+
+    /// Tracks the gap under the pointer; listeners on every rendered row see each move.
+    pub(super) fn drag_moved(&mut self, row: usize, event: &DragMoveEvent<DraggedThread>, cx: &mut Context<Self>) {
+        if !event.bounds.contains(&event.event.position) {
+            return;
+        }
+        let after = event.event.position.y > event.bounds.center().y;
+        self.update_thread_drag_position(row, after, cx);
     }
 
     pub(super) fn finish_drag(&mut self, drop: bool, cx: &mut Context<Self>) {
@@ -171,8 +203,15 @@ impl SidebarPane {
         };
         let is_target = self.drop_target() == Some(section);
         match marker {
-            Marker::ActivePlaceholder | Marker::SettledPlaceholder => div()
-                .px(px(10.))
+            Marker::ActivePlaceholder | Marker::SettledPlaceholder => {
+                let marker_id = match marker {
+                    Marker::ActivePlaceholder => "sidebar-drag-marker-active-placeholder",
+                    _ => "sidebar-drag-marker-settled-placeholder",
+                };
+                div()
+                    .id(marker_id)
+                    .debug_selector(move || marker_id.to_owned())
+                    .px(px(10.))
                 .pb(px(1.))
                 .child(
                     div()
@@ -188,17 +227,148 @@ impl SidebarPane {
                         .when(!is_target, |this| this.border_color(hsla(p.sidebar_foreground).opacity(0.25)).text_color(hsla(p.sidebar_foreground).opacity(0.8)))
                         .child(label),
                 )
-                .into_any_element(),
-            _ => div()
-                .h(px(BOUNDARY_HEIGHT))
+                .into_any_element()
+            }
+            _ => {
+                let marker_id = match marker {
+                    Marker::PinnedHeader => "sidebar-drag-marker-pinned-header",
+                    Marker::PinnedDivider => "sidebar-drag-marker-pinned-divider",
+                    Marker::WorkingHeader => "sidebar-drag-marker-working-header",
+                    Marker::SnoozedHeader => "sidebar-drag-marker-snoozed-header",
+                    _ => "sidebar-drag-marker-settled-header",
+                };
+                div()
+                    .id(marker_id)
+                    .debug_selector(move || marker_id.to_owned())
+                    .h(px(BOUNDARY_HEIGHT))
                 .px(px(18.))
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .child(div().flex_none().text_xs().font_weight(FontWeight::MEDIUM).text_color(if is_target { hsla(p.primary) } else { hsla(p.sidebar_foreground).opacity(0.8) }).child(label))
-                .child(div().flex_1().h(px(1.)).bg(if is_target { hsla(p.primary).opacity(0.5) } else { hsla(p.sidebar_foreground).opacity(0.25) }))
-                .into_any_element(),
+                    .child(div().flex_1().h(px(1.)).bg(if is_target { hsla(p.primary).opacity(0.5) } else { hsla(p.sidebar_foreground).opacity(0.25) }))
+                    .into_any_element()
+            }
         }
+    }
+}
+
+/// The drag payload when manually reordering project folders in the sidebar.
+pub struct DraggedProject {
+    pub group_key: String,
+}
+
+#[derive(Default)]
+pub(super) struct PaneProjectDrag {
+    pub group_key: String,
+    pub at: Option<(String, bool)>,
+    #[allow(dead_code)]
+    pub preview: Option<Entity<ProjectDragPreview>>,
+}
+
+pub struct ProjectDragPreview {
+    label: SharedString,
+    visual: crate::project_icon::ProjectVisual,
+}
+
+impl ProjectDragPreview {
+    pub fn new(label: String, visual: crate::project_icon::ProjectVisual) -> Self {
+        ProjectDragPreview { label: label.into(), visual }
+    }
+}
+
+impl Render for ProjectDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        div()
+            .w(px(PREVIEW_WIDTH))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(6.))
+            .bg(hsla(p.sidebar))
+            .shadow_lg()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(self.visual.render(crate::project_icon::size(16., cx), hsla(p.sidebar_icon), cx))
+            .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.label.clone()))
+    }
+}
+
+impl SidebarPane {
+    pub(super) fn begin_project_drag_with_preview(
+        &mut self,
+        group_key: String,
+        preview: Entity<ProjectDragPreview>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_drag = Some(PaneProjectDrag { group_key, at: None, preview: Some(preview) });
+        cx.notify();
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn begin_project_drag(
+        &mut self,
+        group_key: String,
+        label: String,
+        visual: crate::project_icon::ProjectVisual,
+        cx: &mut Context<Self>,
+    ) -> Entity<ProjectDragPreview> {
+        let preview = cx.new(|_| ProjectDragPreview::new(label, visual));
+        self.begin_project_drag_with_preview(group_key, preview.clone(), cx);
+        preview
+    }
+
+    pub(super) fn project_drag_moved(&mut self, target_key: String, event: &DragMoveEvent<DraggedProject>, cx: &mut Context<Self>) {
+        if !event.bounds.contains(&event.event.position) {
+            return;
+        }
+        let after = event.event.position.y > event.bounds.center().y;
+        let Some(drag) = self.project_drag.as_ref() else { return };
+        if drag.group_key != event.drag(cx).group_key {
+            return;
+        }
+        let next = {
+            if crate::settings::store::client(cx).project_sort_order() != t3_core::client_settings::ProjectSortOrder::Manual {
+                None
+            } else {
+                let state = self.state.read(cx);
+                let groups = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+                t3_core::sidebar::grouping::resolve_project_drop_target(&groups, &drag.group_key, &target_key, after)
+            }
+        };
+        let Some(drag) = self.project_drag.as_mut() else { return };
+        if drag.at != next {
+            drag.at = next;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn finish_project_drag(&mut self, drop: bool, cx: &mut Context<Self>) {
+        let Some(drag) = self.project_drag.take() else { return };
+        if drop && let Some((target_key, after)) = drag.at {
+            self.state.update(cx, |state, cx| {
+                state.reorder_scoped_project(&drag.group_key, &target_key, after, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn project_drop_line(&self, group_key: &str, cx: &App) -> Option<AnyElement> {
+        let (_, after) = self.project_drag.as_ref()?.at.as_ref().filter(|(target, _)| target == group_key)?;
+        let p = palette(cx);
+        Some(
+            div()
+                .absolute()
+                .left(px(8.))
+                .right(px(8.))
+                .h(px(2.))
+                .rounded(px(1.))
+                .bg(hsla(p.primary))
+                .when(*after, |this| this.bottom(px(-1.)))
+                .when(!*after, |this| this.top(px(-1.)))
+                .into_any_element(),
+        )
     }
 }
 

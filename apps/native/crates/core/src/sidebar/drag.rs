@@ -659,4 +659,90 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn thread_drop_handles_snoozed_fixed_targets_collapsed_settled_and_read_only_guards() {
+        let items = vec![
+            marker(Marker::PinnedHeader),
+            row("p1", Section::Pinned),
+            marker(Marker::PinnedDivider),
+            row("a1", Section::Active),
+            marker(Marker::SnoozedHeader),
+            row("z1", Section::Snoozed),
+            marker(Marker::SettledHeader),
+            marker(Marker::SettledPlaceholder),
+        ];
+        // Cannot drop onto Snoozed rows or Snoozed header, and waking a snoozed thread into Active/Pinned works.
+        assert_eq!(target(&items, "a1", "z1"), None);
+        let wake_target = target(&items, "z1", "a1").unwrap();
+        assert_eq!(wake_target.section, Section::Active);
+        assert_eq!(resolve_drop_verb(Section::Snoozed, Some(Section::Active)), Some(DropVerb::Wake));
+
+        // Moving onto SettledPlaceholder settles an active, pinned, or snoozed thread when writable;
+        // dropping onto Active or Pinned when writable vs read-only respects reorderable guards.
+        let placeholder_slot = position_of_marker(&items, Marker::SettledPlaceholder).unwrap();
+        let settle_from_snoozed = resolve_drop_target_at_slot(&items, position_of(&items, "z1").unwrap(), placeholder_slot).unwrap();
+        assert_eq!(settle_from_snoozed.section, Section::Settled);
+        let empty = HashMap::new();
+        let ro_set = HashSet::new();
+        let plan_wake_ro = plan_thread_drop(&DropPlanInput {
+            active_key: "z1",
+            active_section: Section::Snoozed,
+            active_pinned: false,
+            active_settled: false,
+            supports_settlement: true,
+            target: &wake_target,
+            pinned_order: &strings(&["p1"]),
+            pinned_keys_by_id: &empty,
+            reorderable_keys: Some(&ro_set),
+            active_order: &strings(&["a1"]),
+            active_keys_by_id: &empty,
+            active_reorderable_keys: Some(&ro_set),
+            active_time_ordered: false,
+        });
+        assert_eq!(plan_wake_ro, DropPlan::None, "read-only reorderable set must refuse manual MoveActive");
+
+        let plan_wake_time = plan_thread_drop(&DropPlanInput {
+            active_key: "z1",
+            active_section: Section::Snoozed,
+            active_pinned: false,
+            active_settled: false,
+            supports_settlement: true,
+            target: &wake_target,
+            pinned_order: &strings(&["p1"]),
+            pinned_keys_by_id: &empty,
+            reorderable_keys: Some(&ro_set),
+            active_order: &strings(&["a1"]),
+            active_keys_by_id: &empty,
+            active_reorderable_keys: Some(&ro_set),
+            active_time_ordered: true,
+        });
+        assert_eq!(
+            plan_wake_time,
+            DropPlan::MoveActive { order: None, assignments: vec![], unpin: false, unsettle: false, unsnooze: true },
+        );
+
+        let plan_pin = plan_thread_drop(&DropPlanInput {
+            active_key: "z1",
+            active_section: Section::Snoozed,
+            active_pinned: false,
+            active_settled: false,
+            supports_settlement: false,
+            target: &target(&items, "z1", "p1").unwrap(),
+            pinned_order: &strings(&["p1"]),
+            pinned_keys_by_id: &empty,
+            reorderable_keys: Some(&ro_set),
+            active_order: &strings(&["a1"]),
+            active_keys_by_id: &empty,
+            active_reorderable_keys: None,
+            active_time_ordered: true,
+        });
+        assert_eq!(plan_pin, DropPlan::None, "read-only reorderable set must refuse Pin");
+        assert_eq!(resolve_drop_verb(Section::Settled, Some(Section::Active)), Some(DropVerb::Unsettle));
+        assert_eq!(resolve_drop_verb(Section::Pinned, Some(Section::Active)), Some(DropVerb::Unpin));
+    }
+
+    fn position_of_marker(items: &[DropItem], wanted: Marker) -> Option<usize> {
+        items.iter().position(|item| matches!(item, DropItem::Marker(marker) if *marker == wanted))
+    }
 }

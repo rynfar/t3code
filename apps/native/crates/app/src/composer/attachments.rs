@@ -116,7 +116,7 @@ impl Composer {
         self.snapshot.target.clone()
     }
 
-    fn can_attach(&self, cx: &App) -> bool {
+    pub(super) fn can_attach(&self, cx: &App) -> bool {
         if self.editing_queued().is_some() { return false; }
         if let Some(Target::Question(key)) = self.attachment_target() { return self.question_can_attach(&key, cx, IntakePhase::Start); }
         self.snapshot.target.is_some() && self.snapshot.pending.user_inputs.is_empty()

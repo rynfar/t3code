@@ -201,6 +201,9 @@ impl AppState {
 
     /// A row started dragging: the list shows its drop markers until the drag ends.
     pub fn start_thread_drag(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if !self.sidebar.capabilities.can_operate || !self.sidebar.capabilities.config_loaded {
+            return;
+        }
         let Some(from) = self.sidebar.model.section_of(thread_id).filter(|section| *section != Section::Working) else { return };
         self.sidebar.drag = Some((thread_id.to_owned(), from));
         self.rebuild_sidebar(cx);
@@ -234,14 +237,17 @@ impl AppState {
         let active_order = ids(&model.partition.active);
         let pinned_keys: HashMap<String, Option<String>> = snapshot.threads.iter().map(|thread| (thread.id.clone(), thread.pin_order_key.clone())).collect();
         let active_keys: HashMap<String, Option<String>> = snapshot.threads.iter().map(|thread| (thread.id.clone(), thread.active_order_key.clone())).collect();
-        // One environment: every row is writable while it is connected with a loaded config.
-        let writable: HashSet<String> = if self.sidebar.capabilities.config_loaded { model.threads.iter().map(|thread| thread.id.clone()).collect() } else { HashSet::new() };
+        // One environment: rows are writable only while connected with config loaded and operate access.
+        if !self.sidebar.capabilities.config_loaded || !self.sidebar.capabilities.can_operate {
+            return None;
+        }
+        let writable: HashSet<String> = model.threads.iter().map(|thread| thread.id.clone()).collect();
         let plan = plan_thread_drop(&DropPlanInput {
             active_key: id,
             active_section: from,
             active_pinned: thread.pinned,
             active_settled: thread.is_settled(),
-            supports_settlement: self.sidebar.capabilities.config_loaded,
+            supports_settlement: true,
             target,
             pinned_order: &pinned_order,
             pinned_keys_by_id: &pinned_keys,
@@ -312,7 +318,33 @@ impl AppState {
 impl AppState {
     pub fn start_scoped_thread_drag(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, cx: &mut Context<Self>) {
         let Some(from) = self.sidebar.fleet.section_of(key).filter(|from| *from != Section::Working) else { return };
-        self.sidebar.fleet_drag = Some((key.clone(), from)); self.rebuild_sidebar(cx); cx.emit(AppEvent::Selection);
+        let Some(row) = self.sidebar.fleet.thread(key) else { return };
+        if !self.scoped_ready(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) {
+            return;
+        }
+        self.sidebar.fleet_drag = Some((key.clone(), from));
+        self.rebuild_sidebar(cx);
+        self.selection_changed(cx);
+    }
+
+    pub fn reorder_scoped_project(&mut self, dragged_key: &str, target_key: &str, after: bool, cx: &mut Context<Self>) -> bool {
+        if self.fleet.environments.is_empty()
+            || crate::settings::store::client(cx).project_sort_order() != t3_core::client_settings::ProjectSortOrder::Manual
+        {
+            return false;
+        }
+        let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+        let Some(next_order) = t3_core::sidebar::grouping::reorder_project_groups(&groups, dragged_key, target_key, after) else {
+            return false;
+        };
+        if self.project_preferences.project_order == next_order {
+            return false;
+        }
+        self.project_preferences.project_order = next_order;
+        self.save_project_preferences(cx);
+        self.rebuild_sidebar(cx);
+        cx.emit(AppEvent::Shell);
+        true
     }
 
     fn scoped_drag_id(key: &t3_core::sidebar::tag_filter::ThreadKey) -> String { serde_json::to_string(&(&key.environment_id, &key.thread_id)).unwrap() }
@@ -335,12 +367,16 @@ impl AppState {
         let id = Self::scoped_drag_id(key);
         let target = resolve_drop_target_at_slot(&items, position_of(&items, &id)?, before)?;
         let row = model.thread(key)?;
+        if !self.scoped_ready(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) {
+            return None;
+        }
+        let supports_settlement = self.scoped_environment(&key.environment_id).is_some_and(|env| env.config.config.is_some());
         let ids = |list: &[usize]| list.iter().map(|index| Self::scoped_drag_id(&model.threads[*index].key)).collect::<Vec<_>>();
         let pinned = ids(&model.partition.pinned); let active = ids(&model.partition.active);
         let pinned_keys = model.threads.iter().map(|row| (Self::scoped_drag_id(&row.key), row.thread.pin_order_key.clone())).collect();
         let active_keys = model.threads.iter().map(|row| (Self::scoped_drag_id(&row.key), row.thread.active_order_key.clone())).collect();
         let writable = model.threads.iter().filter(|row| self.scoped_ready(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)).map(|row| Self::scoped_drag_id(&row.key)).collect();
-        let plan = plan_thread_drop(&DropPlanInput { active_key: &id, active_section: *from, active_pinned: row.thread.pinned, active_settled: row.thread.is_settled(), supports_settlement: true,
+        let plan = plan_thread_drop(&DropPlanInput { active_key: &id, active_section: *from, active_pinned: row.thread.pinned, active_settled: row.thread.is_settled(), supports_settlement,
             target: &target, pinned_order: &pinned, pinned_keys_by_id: &pinned_keys, reorderable_keys: Some(&writable), active_order: &active, active_keys_by_id: &active_keys, active_reorderable_keys: Some(&writable), active_time_ordered: self.sidebar.settings.working_shelf_enabled || crate::settings::store::client(cx).boring_sidebar_enabled() });
         (plan != DropPlan::None).then_some((target, plan))
     }
