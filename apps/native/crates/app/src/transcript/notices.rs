@@ -26,7 +26,7 @@ use super::parts::{
     system_divider_button, timestamp, work_line, work_row_frame,
 };
 use super::timer::{TimerKind, WorkingTimer};
-use super::RowEnv;
+use super::{FoldWorkState, RowEnv};
 use crate::app_state::AppState;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::icons::Icon;
@@ -34,42 +34,76 @@ use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 
+fn fold_label_text(label: &str, work: FoldWorkState) -> String {
+    if work.error {
+        format!("{label} · Couldn't load work. Click to retry.")
+    } else {
+        label.to_owned()
+    }
+}
+
+fn work_history_skeleton(cx: &App) -> AnyElement {
+    let p = palette(cx);
+    let fill = hsla(p.muted_foreground).opacity(0.15);
+    v_flex()
+        .gap(px(8.))
+        .px(px(4.))
+        .pt(px(12.))
+        .pb(px(4.))
+        .children([(2. / 5.), (3. / 5.), (1. / 3.)].into_iter().map(|fraction| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(8.))
+                .child(div().size(px(12.)).flex_none().rounded(px(4.)).bg(fill))
+                .child(div().h(px(10.)).w(gpui::relative(fraction)).rounded_full().bg(fill))
+        }))
+        .into_any_element()
+}
+
 pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at: Option<&str>, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
+    let work = if expanded { env.ui.work_fold_for_run(run_id) } else { FoldWorkState::default() };
     let run_id = run_id.to_owned();
-    h_flex()
+    v_flex()
         .id(SharedString::from(format!("fold:{id}")))
         .group(ROW_GROUP)
         .w_full()
-        .gap(px(4.))
         .pt(px(4.))
         .pb(px(8.))
         .pr(px(2.))
         .border_b_1()
         .border_color(hsla(p.border).opacity(0.6))
-        .child(focusable(
+        .child(
             h_flex()
-                .id(SharedString::from(format!("fold-button:{id}")))
+                .w_full()
                 .gap(px(4.))
-                .px(px(4.))
-                .rounded(px(6.))
-                .text_size(px(14.))
-                .line_height(px(22.75))
-                .text_color(hsla(p.muted_foreground))
-                .cursor_pointer()
-                .hover(|style| style.text_color(hsla(p.foreground)))
-                .on_click(cx.listener(move |view, _, _, cx| view.toggle_run(&run_id, cx)))
-                .child(label.to_owned())
-                .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(14.), hsla(p.muted_foreground))),
-            cx,
-        ))
-        .child(div().flex_1())
-        .children(created_at.map(|at| timestamp(&env.clock, at, false, cx)))
+                .child(focusable(
+                    h_flex()
+                        .id(SharedString::from(format!("fold-button:{id}")))
+                        .gap(px(4.))
+                        .px(px(4.))
+                        .rounded(px(6.))
+                        .text_size(px(14.))
+                        .line_height(px(22.75))
+                        .text_color(hsla(p.muted_foreground))
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(hsla(p.foreground)))
+                        .on_click(cx.listener(move |view, _, _, cx| view.toggle_run(&run_id, cx)))
+                        .child(fold_label_text(label, work))
+                        .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(14.), hsla(p.muted_foreground))),
+                    cx,
+                ))
+                .child(div().flex_1())
+                .children(created_at.map(|at| timestamp(&env.clock, at, false, cx))),
+        )
+        .when(work.loading, |this| this.child(work_history_skeleton(cx)))
         .into_any_element()
 }
 
-pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, work: FoldWorkState, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
+    let work = if expanded { work } else { FoldWorkState::default() };
     let attempt_id = attempt_id.to_owned();
     let fold = h_flex()
         .id(SharedString::from(format!("attempt:{id}")))
@@ -85,9 +119,13 @@ pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, cx:
         .hover(|style| style.bg(hsla(p.muted).opacity(0.35)))
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_attempt(&attempt_id, cx)))
         .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(14.), hsla(p.muted_foreground)))
-        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground).opacity(0.8)).child(label.to_owned()))
+        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground).opacity(0.8)).child(fold_label_text(label, work)))
         .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Cut off by a steer"));
-    focusable(fold, cx).into_any_element()
+    v_flex()
+        .w_full()
+        .child(focusable(fold, cx))
+        .when(work.loading, |this| this.child(work_history_skeleton(cx)))
+        .into_any_element()
 }
 
 /// `WorkingTimelineRow`: "Working for 12s", whose label is its own view that ticks itself, or

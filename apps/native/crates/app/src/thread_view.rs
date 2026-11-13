@@ -33,7 +33,7 @@ use t3_core::diff::TurnDiffSummary;
 use crate::app_state::{AppEvent, AppState};
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::MarkdownStore;
-use crate::transcript::{Clock, CommandOutputSlot, Detail, RowEnv, SetupEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+use crate::transcript::{Clock, CommandOutputSlot, Detail, FoldWorkState, RowEnv, SetupEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
 use crate::worktree_setup::{SetupEvent, WorktreeSetupStore};
 
 actions!(thread_view, [FindInThread]);
@@ -116,6 +116,7 @@ impl ThreadView {
             }
             AppEvent::History => {
                 this.sync_history(cx);
+                this.sync_work_folds(cx);
                 this.advance_citation_source(cx);
             }
             AppEvent::Shell => {
@@ -286,6 +287,8 @@ impl ThreadView {
         let follow = changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
         if follow { self.list.scroll_to_end(); } else { self.keep_place(visible); }
         if changed { self.disclosure.changed(); }
+        let pending_work = self.sync_work_folds(cx);
+        self.load_deferred_work(pending_work, cx);
         self.sync_revert_counts(cx);
         self.check_rewind(cx);
         self.sync_turn_diffs(cx);
@@ -552,6 +555,71 @@ impl ThreadView {
         self.load_deferred_work(anchors, cx);
     }
 
+    fn sync_work_folds(&mut self, cx: &mut Context<Self>) -> Vec<String> {
+        if self.ui.expanded_runs.is_empty() && self.ui.expanded_attempts.is_empty() {
+            if !self.ui.work_folds.is_empty() {
+                self.ui.work_folds.clear();
+                self.remeasure_where(|row| matches!(row.kind, RowKind::TurnFold { .. } | RowKind::AttemptFold { .. }));
+                cx.notify();
+            }
+            return Vec::new();
+        }
+        let mut next = HashMap::new();
+        let mut pending = Vec::new();
+        {
+            let state = self.state.read(cx);
+            let thread = self.thread_state(state);
+            if let Some(projection) = thread.projection.as_ref() {
+                let (runs, attempts) = t3_core::timeline::fold_membership(self.entries_cache.entries(), &self.activity);
+                let mut seen_pending = HashSet::new();
+                let mut collect = |key: String, map: &HashMap<String, String>, id: &str| {
+                    let entry_ids: HashSet<&str> = map
+                        .iter()
+                        .filter_map(|(entry_id, owner)| (owner == id).then_some(entry_id.as_str()))
+                        .collect();
+                    let anchors = deferred_anchors_for_entries(projection, &entry_ids);
+                    let loading = anchors.iter().any(|anchor| thread.history.is_loading_work(anchor));
+                    let error = !loading && anchors.iter().any(|anchor| thread.history.work_error(anchor).is_some());
+                    for anchor in anchors {
+                        if !thread.history.is_loading_work(&anchor)
+                            && thread.history.work_error(&anchor).is_none()
+                            && seen_pending.insert(anchor.clone())
+                        {
+                            pending.push(anchor);
+                        }
+                    }
+                    if loading || error {
+                        next.insert(key, FoldWorkState { loading, error });
+                    }
+                };
+                for run_id in &self.ui.expanded_runs {
+                    collect(format!("run:{run_id}"), &runs, run_id);
+                }
+                for attempt_id in &self.ui.expanded_attempts {
+                    collect(format!("attempt:{attempt_id}"), &attempts, attempt_id);
+                }
+            }
+        }
+        if next != self.ui.work_folds {
+            let changed: HashSet<String> = self
+                .ui
+                .work_folds
+                .keys()
+                .chain(next.keys())
+                .filter(|key| self.ui.work_folds.get(*key) != next.get(*key))
+                .cloned()
+                .collect();
+            self.ui.work_folds = next;
+            self.remeasure_where(|row| match &row.kind {
+                RowKind::TurnFold { run_id, .. } => changed.contains(&format!("run:{run_id}")),
+                RowKind::AttemptFold { attempt_id, .. } => changed.contains(&format!("attempt:{attempt_id}")),
+                _ => false,
+            });
+            cx.notify();
+        }
+        pending
+    }
+
     pub(super) fn load_work_for_group(&self, group_id: &str, cx: &mut Context<Self>) {
         let entry_ids: HashSet<&str> = self
             .rows
@@ -728,23 +796,35 @@ impl ThreadView {
     pub fn toggle_run(&mut self, run_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(&format!("turn-fold:{run_id}"));
         let visible = self.visible_rows();
+        if self.ui.expanded_runs.contains(run_id) && self.ui.work_fold_for_run(run_id).error {
+            self.load_work_for_run(run_id, cx);
+            self.sync_work_folds(cx);
+            return;
+        }
         let expanded = toggle(&mut self.ui.expanded_runs, run_id);
         self.rederive_rows(cx);
         self.keep_place(visible);
         if expanded {
             self.load_work_for_run(run_id, cx);
         }
+        self.sync_work_folds(cx);
     }
 
     pub fn toggle_attempt(&mut self, attempt_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(&format!("attempt-fold:{attempt_id}"));
         let visible = self.visible_rows();
+        if self.ui.expanded_attempts.contains(attempt_id) && self.ui.work_fold_for_attempt(attempt_id).error {
+            self.load_work_for_attempt(attempt_id, cx);
+            self.sync_work_folds(cx);
+            return;
+        }
         let expanded = toggle(&mut self.ui.expanded_attempts, attempt_id);
         self.rederive_rows(cx);
         self.keep_place(visible);
         if expanded {
             self.load_work_for_attempt(attempt_id, cx);
         }
+        self.sync_work_folds(cx);
     }
 
     pub fn toggle_group(&mut self, group_id: &str, row_id: &str, cx: &mut Context<Self>) {
@@ -1970,6 +2050,201 @@ mod tests {
             assert!(p.has_entry("w2-loaded"));
             assert!(!state.thread.history.is_loading_work("w-anchor-1"));
             assert!(!state.thread.history.is_loading_work("w-anchor-2"));
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn fold_work_loading_error_and_retry_keeps_fold_expanded(cx: &mut gpui::TestAppContext) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (req1_seen_tx, req1_seen_rx) = tokio::sync::oneshot::channel();
+        let (req1_go_tx, req1_go_rx) = tokio::sync::oneshot::channel();
+        let (req2_seen_tx, req2_seen_rx) = tokio::sync::oneshot::channel();
+        let (req2_go_tx, req2_go_rx) = tokio::sync::oneshot::channel();
+        let mut req1_seen_tx = Some(req1_seen_tx);
+        let mut req1_go_rx = Some(req1_go_rx);
+        let mut req2_seen_tx = Some(req2_seen_tx);
+        let mut req2_go_rx = Some(req2_go_rx);
+
+        let _server = runtime.spawn(async move {
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                if attempt == 0 {
+                    if let Some(tx) = req1_seen_tx.take() { let _ = tx.send(()); }
+                    if let Some(rx) = req1_go_rx.take() { let _ = rx.await; }
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                } else {
+                    if let Some(tx) = req2_seen_tx.take() { let _ = tx.send(()); }
+                    if let Some(rx) = req2_go_rx.take() { let _ = rx.await; }
+                    let body = serde_json::json!({
+                        "snapshotSequence": 1,
+                        "items": [{
+                            "position": 0, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "w-loaded",
+                            "item": {
+                                "id": "w-loaded", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                                "ordinal": 3, "type": "command_execution", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:02.000Z",
+                                "input": "echo ok", "output": ""
+                            }
+                        }],
+                        "nextCursor": null, "hasMoreHistory": false, "hasUserTurn": false
+                    });
+                    let json = serde_json::to_string(&body).unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        json.len(),
+                        json
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, _fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            })).unwrap(),
+            format!("http://127.0.0.1:{port}"),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell;
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 2, "visibleItemCount": 2
+            })).unwrap()];
+            state.install_active_environment(client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+                "projection": {
+                    "thread": {
+                        "id": "t1", "projectId": "checkout-a", "title": "T1",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "completed",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": null,
+                        "completedAt": "2026-04-01T00:00:02.000Z"
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                    "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                    "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [
+                        {
+                            "position": 0, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "m0",
+                            "item": {
+                                "id": "m0", "threadId": "t1", "runId": null, "nodeId": null, "parentItemId": null,
+                                "ordinal": 1, "type": "user_message", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                                "messageId": "m0", "text": "Run check", "inputIntent": "message"
+                            }
+                        },
+                        {
+                            "position": 1, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "w-anchor-1",
+                            "item": {
+                                "id": "w-anchor-1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                                "ordinal": 2, "type": "command_execution", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                                "input": "ls", "output": "",
+                                "deferredWork": { "cursor": "work-c1", "itemCount": 1, "lastOrdinal": 3 }
+                            }
+                        }
+                    ],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+            cx.emit(AppEvent::History);
+        });
+
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let err_tx = Arc::new(std::sync::Mutex::new(Some(err_tx)));
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let _sub = state.update(cx, |_, cx| {
+            let (err_tx, done_tx) = (err_tx.clone(), done_tx.clone());
+            cx.subscribe(&state, move |state, _, event, _| {
+                if matches!(event, AppEvent::History) && state.thread.history.work_error("w-anchor-1").is_some() {
+                    if let Some(tx) = err_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+                if matches!(event, AppEvent::Thread | AppEvent::History)
+                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w-loaded"))
+                {
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_run("r1", cx);
+            });
+        });
+        req1_seen_rx.await.unwrap();
+        view.read_with(vcx, |view, _| {
+            assert!(view.ui.expanded_runs.contains("r1"));
+            assert_eq!(view.ui.work_fold_for_run("r1"), FoldWorkState { loading: true, error: false });
+        });
+
+        let _ = req1_go_tx.send(());
+        err_rx.await.unwrap();
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(view.ui.expanded_runs.contains("r1"));
+            assert_eq!(view.ui.work_fold_for_run("r1"), FoldWorkState { loading: false, error: true });
+        });
+
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_run("r1", cx);
+            });
+        });
+        req2_seen_rx.await.unwrap();
+        view.read_with(vcx, |view, _| {
+            assert!(view.ui.expanded_runs.contains("r1"));
+            assert_eq!(view.ui.work_fold_for_run("r1"), FoldWorkState { loading: true, error: false });
+        });
+
+        let _ = req2_go_tx.send(());
+        done_rx.await.unwrap();
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(view.ui.expanded_runs.contains("r1"));
+            assert_eq!(view.ui.work_fold_for_run("r1"), FoldWorkState::default());
         });
     }
 }

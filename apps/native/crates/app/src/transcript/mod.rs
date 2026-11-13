@@ -33,6 +33,13 @@ pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_b
 pub use timer::{TimerKind, WorkingTimer};
 pub use worktree_setup::SetupEnv;
 
+/// Loading and retry error status for one expanded run or attempt fold (`useDeferredWorkLoading`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FoldWorkState {
+    pub loading: bool,
+    pub error: bool,
+}
+
 /// Disclosure state the user controls. Folds and groups feed row derivation; the rest only
 /// change how a row draws.
 #[derive(Default)]
@@ -49,6 +56,18 @@ pub struct TranscriptUi {
     pub changed_files_open: HashSet<String>,
     /// Folders opened or closed against that, by run, then folder path.
     pub changed_file_dirs: HashMap<String, HashMap<String, bool>>,
+    /// Per-fold deferred-work loading / error state, keyed by `"run:<id>"` or `"attempt:<id>"`.
+    pub work_folds: HashMap<String, FoldWorkState>,
+}
+
+impl TranscriptUi {
+    pub fn work_fold_for_run(&self, run_id: &str) -> FoldWorkState {
+        self.work_folds.get(&format!("run:{run_id}")).copied().unwrap_or_default()
+    }
+
+    pub fn work_fold_for_attempt(&self, attempt_id: &str) -> FoldWorkState {
+        self.work_folds.get(&format!("attempt:{attempt_id}")).copied().unwrap_or_default()
+    }
 }
 
 /// Withheld output fetched with `orchestration.getTurnItem`, keyed by item id.
@@ -130,7 +149,9 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         }
         RowKind::WorktreeSetup { snapshot, embedded } => worktree_setup::card("worktree-setup", snapshot, *embedded, env, cx),
         RowKind::TurnFold { run_id, label, expanded } => notices::turn_fold(id, run_id, label, *expanded, row.created_at.as_deref(), env, cx),
-        RowKind::AttemptFold { attempt_id, label, expanded } => notices::attempt_fold(id, attempt_id, label, *expanded, cx),
+        RowKind::AttemptFold { attempt_id, label, expanded } => {
+            notices::attempt_fold(id, attempt_id, label, *expanded, env.ui.work_fold_for_attempt(attempt_id), cx)
+        }
         RowKind::ContextCompaction { label, tokens, title, failed, failure, .. } => {
             notices::compaction_row(label, tokens.as_ref(), title.as_deref(), *failed, failure.as_deref(), cx)
         }
