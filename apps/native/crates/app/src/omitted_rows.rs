@@ -227,18 +227,6 @@ impl AppState {
         .detach();
     }
 
-    /// Mounts a search's older settled rows until newer results replace them, or the search ends
-    /// (`None`), so the sidebar's own ranking finds them as it finds shell rows (`useThreadSearch`).
-    pub(crate) fn mount_search_rows(&mut self, generation: u64, read: Option<FamilyRead>, cx: &mut Context<Self>) {
-        match read.filter(|read| !read.threads.is_empty()) {
-            Some(read) => self.omitted.mounts.mount(SEARCH_KEY, generation, vec![read]),
-            None if self.omitted.mounts.generation_of(SEARCH_KEY).is_none() => return,
-            None => self.omitted.mounts.unmount(SEARCH_KEY),
-        }
-        self.rebuild_sidebar(cx);
-        cx.emit(AppEvent::Shell);
-    }
-
     /// Families mount while their thread is open; switching threads lets them go.
     pub(crate) fn release_families(&mut self, keep: Option<&str>) {
         self.omitted.family_requested.retain(|thread_id, _| Some(thread_id.as_str()) == keep);
@@ -435,11 +423,66 @@ impl AppState {
         cx.emit(AppEvent::Notice);
     }
 
+    #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn mount_scoped_search_rows(&mut self, owner: &t3_core::sidebar::grouping::EnvironmentOwner, read: Option<FamilyRead>, cx: &mut Context<Self>) {
         if self.scoped_environment(&owner.saved_id).is_none_or(|entry| entry.summary.owner != *owner) { return; }
-        let omitted = self.sidebar.owner_omitted.entry(owner.clone()).or_default();
-        match read.filter(|read| !read.threads.is_empty()) { Some(read) => omitted.mounts.mount(SEARCH_KEY, owner.shell_generation, vec![read]), None => omitted.mounts.unmount(SEARCH_KEY) }
-        self.rebuild_sidebar(cx); cx.emit(AppEvent::Shell);
+        let changed = match read.filter(|read| !read.threads.is_empty()) {
+            Some(read) => self.sidebar.owner_omitted.entry(owner.clone()).or_default().mounts.sync(SEARCH_KEY, Some((owner.shell_generation, vec![read]))),
+            None => self.sidebar.owner_omitted.get_mut(owner).is_some_and(|omitted| omitted.mounts.sync(SEARCH_KEY, None)),
+        };
+        if changed { self.rebuild_sidebar(cx); cx.emit(AppEvent::Shell); }
+    }
+
+    /// Mounts older settled rows for the active search and unmounts stale or revoked owners.
+    pub(crate) fn sync_search_mounts(
+        &mut self,
+        local: Option<(u64, FamilyRead)>,
+        scoped: &[(t3_core::sidebar::grouping::EnvironmentOwner, FamilyRead)],
+        cx: &mut Context<Self>,
+    ) {
+        let local_target = local
+            .filter(|(generation, read)| *generation == self.shell.generation && !read.threads.is_empty())
+            .or_else(|| {
+                let active = self.environments.active.as_deref()?;
+                scoped.iter().find_map(|(owner, read)| {
+                    (owner.saved_id == active
+                        && owner.shell_generation == self.shell.generation
+                        && !read.threads.is_empty())
+                    .then(|| (owner.shell_generation, read.clone()))
+                })
+            })
+            .map(|(generation, read)| (generation, vec![read]));
+        let mut changed = self.omitted.mounts.sync(SEARCH_KEY, local_target);
+        for (owner, omitted) in &mut self.sidebar.owner_omitted {
+            let current = self.fleet.environments.iter().any(|entry| entry.summary.owner == *owner);
+            let target = current
+                .then(|| {
+                    scoped
+                        .iter()
+                        .find(|(candidate, read)| candidate == owner && !read.threads.is_empty())
+                        .map(|(_, read)| (owner.shell_generation, vec![read.clone()]))
+                })
+                .flatten();
+            changed |= omitted.mounts.sync(SEARCH_KEY, target);
+        }
+        for (owner, read) in scoped {
+            if !read.threads.is_empty()
+                && self.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == *owner)
+                && !self.sidebar.owner_omitted.contains_key(owner)
+            {
+                changed |= self
+                    .sidebar
+                    .owner_omitted
+                    .entry(owner.clone())
+                    .or_default()
+                    .mounts
+                    .sync(SEARCH_KEY, Some((owner.shell_generation, vec![read.clone()])));
+            }
+        }
+        if changed {
+            self.rebuild_sidebar(cx);
+            cx.emit(AppEvent::Shell);
+        }
     }
 }
 

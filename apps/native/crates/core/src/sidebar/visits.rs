@@ -107,6 +107,23 @@ impl OpenHistory {
             .map(|(_, local)| *local)
     }
 
+    pub fn opened_at(&self, saved: Option<&str>, canonical: Option<&str>, thread: &str) -> Option<Ms> {
+        let canonical = canonical.filter(|id| !id.is_empty());
+        let namespace = match saved.filter(|id| !id.is_empty()) {
+            Some(saved) => format!("saved:{saved}"),
+            None => format!("canonical:{}", canonical?),
+        };
+        let (known, _, _) = self.environments.get(&namespace)?;
+        if let Some(canonical) = canonical
+            && known.as_deref().is_some_and(|known| known != canonical)
+        {
+            return None;
+        }
+        self.opens
+            .get(&(namespace, thread.to_owned()))
+            .map(|(_, local)| *local)
+    }
+
     pub fn next_mount(&mut self) -> u64 {
         self.generation += 1;
         self.generation
@@ -369,6 +386,11 @@ mod tests {
         assert_eq!(history.opens.len(), OPEN_HISTORY_LIMIT);
         assert_eq!(history.local_opened_at(&env, "t0001"), None);
         assert_eq!(history.local_opened_at(&env, "t0000"), Some(5_000));
+        assert_eq!(history.opened_at(Some("saved"), None, "t0000"), Some(5_000));
+        let bound = history.environment(Some("saved"), Some("canon-a")).unwrap();
+        assert_eq!(history.local_opened_at(&bound, "t0000"), Some(5_000));
+        assert_eq!(history.opened_at(Some("saved"), Some("canon-a"), "t0000"), Some(5_000));
+        assert_eq!(history.opened_at(Some("saved"), Some("canon-b"), "t0000"), None);
         for n in 0..=OPEN_HISTORY_LIMIT {
             let env = history
                 .environment(Some(&format!("saved{n:04}")), None)

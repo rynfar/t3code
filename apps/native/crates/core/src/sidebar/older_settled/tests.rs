@@ -93,3 +93,24 @@ fn counts_hold_from_the_snapshot_until_what_they_count_changes() {
     shell.apply(snapshot(20, 19));
     assert!(counts.sync(&shell).is_some(), "a snapshot behind its cut's sequence reads at once");
 }
+
+#[test]
+fn search_requests_follow_message_token_rules_and_utf16_query_cap() {
+    assert!(searches_messages("部署"));
+    assert!(searches_messages(".ts"));
+    assert!(!searches_messages("ab"));
+    assert_eq!(search_request("ab", None, None), None);
+    let projects = vec!["p1".to_owned()];
+    assert_eq!(
+        search_request("ab", Some(CUT), Some(&projects)),
+        Some(json!({
+            "query": "ab",
+            "olderSettledBefore": CUT,
+            "projectIds": ["p1"],
+            "titlesOnly": true,
+        }))
+    );
+    let emoji_wall = "🚀".repeat(150);
+    let payload = search_request(&emoji_wall, None, None).unwrap();
+    assert!(payload["query"].as_str().unwrap().encode_utf16().count() <= 200);
+}

@@ -481,7 +481,6 @@ pub fn search_titles(model: &SidebarModel, query: &str, now: Ms) -> Vec<String> 
                 id: Some(thread.id.clone()),
                 title: thread.title.clone(),
                 branch: thread.branch.clone(),
-                project_title: model.project_names.get(&thread.project_id).cloned(),
                 activity_at,
                 opens: thread.opens.clone(),
                 ..Default::default()
