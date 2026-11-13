@@ -196,7 +196,13 @@ impl SidebarPane {
                     }
                     cx.notify();
                 },
-                AppEvent::Phase | AppEvent::ServerConfig => this.sync_snooze_grants(cx),
+                AppEvent::Phase | AppEvent::ServerConfig => {
+                    this.sync_snooze_grants(cx);
+                    this.search.refresh(&this.state, cx);
+                    if this.search.is_active() {
+                        cx.notify();
+                    }
+                }
                 AppEvent::SidebarSelection => {
                     let state = this.state.read(cx);
                     this.model_seen = state.sidebar.model.clone();

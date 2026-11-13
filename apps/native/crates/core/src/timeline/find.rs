@@ -53,6 +53,13 @@ pub struct FindStart {
     pub occurrence: u64,
 }
 
+/// Initial find state handed off from a search result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThreadFind {
+    pub query: String,
+    pub start: Option<FindStart>,
+}
+
 pub fn search_request(thread_id: &str, query: &str, start: Option<&FindStart>, offset: i64) -> Value {
     let mut input = json!({ "threadId": thread_id, "query": query.trim(), "skills": [] });
     if let Some(start) = start {

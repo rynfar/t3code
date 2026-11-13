@@ -537,6 +537,69 @@ pub fn search_pull_requests(links: &[crate::pull_requests::link::ThreadLink]) ->
         .collect()
 }
 
+/// `pullRequestMatchesSearchQuery` (`Sidebar.logic.ts`): every folded token of `query` matches
+/// a visible PR's `#number`, `repo#number`, URL, or (for the newest few) title.
+pub fn pull_request_matches_search_query(
+    links: &[crate::pull_requests::link::ThreadLink],
+    query: &str,
+) -> bool {
+    let normalized = fold_search_query(query);
+    if normalized.is_empty() {
+        return false;
+    }
+    let terms: String = search_pull_requests(links)
+        .into_iter()
+        .flat_map(|pr| {
+            iter::once(format!("#{}", pr.number))
+                .chain(pr.references)
+                .chain(pr.title)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let haystack = fold_search_query(&terms);
+    !haystack.is_empty() && normalized.split(' ').all(|token| haystack.contains(token))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPrBadge {
+    pub glyph: crate::pull_requests::thread_badge::PrGlyph,
+    pub tone: crate::pull_requests::thread_badge::PrTone,
+    pub text: String,
+    pub has_snapshot: bool,
+}
+
+/// `ThreadSearchPullRequestNumber` (`ThreadStatusIndicators.tsx`): badge presentation for a search
+/// row whose pull request metadata matched `query`.
+pub fn matching_search_pr_badge(
+    links: &[crate::pull_requests::link::ThreadLink],
+    query: &str,
+) -> Option<SearchPrBadge> {
+    if !pull_request_matches_search_query(links, query) {
+        return None;
+    }
+    use crate::pull_requests::thread_badge::{
+        PrTone, linked_snapshot_status, pr_status_indicator, resolve_badge_presentation,
+        resolve_thread_current_pull_request_link, resolve_thread_pull_request_badge,
+    };
+    let badge = resolve_thread_pull_request_badge(links);
+    let current = resolve_thread_current_pull_request_link(links);
+    let status = current
+        .and_then(linked_snapshot_status)
+        .map(|linked| pr_status_indicator(&linked.pr, Some(linked.provider)));
+    let presentation = resolve_badge_presentation(
+        badge.as_ref(),
+        current.map(|link| link.number),
+        current.map(|link| link.url.as_str()),
+        status.as_ref(),
+    )?;
+    Some(SearchPrBadge {
+        glyph: presentation.glyph,
+        tone: presentation.tone,
+        text: presentation.text,
+        has_snapshot: presentation.tone != PrTone::Muted || badge.is_some_and(|badge| badge.opens_list()),
+    })
+}
+
 /// Merges this client's latest local open into server `opens` (`buildThreadSearchSubject`).
 pub fn merge_local_open(
     opens: Option<&ThreadOpenStats>,

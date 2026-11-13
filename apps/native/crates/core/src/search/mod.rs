@@ -544,13 +544,18 @@ pub struct SearchTextPart<'a> {
     pub start: usize,
 }
 
+/// Slices `text` by char (Unicode scalar) `range`.
+pub fn slice_char_range(text: &str, range: SearchRange) -> &str {
+    let byte_at = |index: usize| text.char_indices().nth(index).map_or(text.len(), |(at, _)| at);
+    let start = byte_at(range.start);
+    let end = byte_at(range.end).max(start);
+    text.get(start..end).unwrap_or("")
+}
+
 /// `text` cut into plain and highlighted parts at sorted, non-overlapping char `ranges`.
 pub fn split_search_text<'a>(text: &'a str, ranges: &[SearchRange]) -> Vec<SearchTextPart<'a>> {
-    let byte_at = |index: usize| text.char_indices().nth(index).map_or(text.len(), |(at, _)| at);
-    let slice =
-        |start: usize, end: usize| text.get(byte_at(start)..byte_at(end).max(byte_at(start))).unwrap_or("");
     let part = |start: usize, end: usize, highlighted: bool| SearchTextPart {
-        text: slice(start, end),
+        text: slice_char_range(text, SearchRange { start, end }),
         highlighted,
         start,
     };
@@ -566,6 +571,91 @@ pub fn split_search_text<'a>(text: &'a str, ranges: &[SearchRange]) -> Vec<Searc
         parts.push(part(cursor, usize::MAX, false));
     }
     parts
+}
+
+/// First whole-word phrase match (`messagePhrase`) in `text`, returning a char range.
+pub fn message_phrase_range(text: &str, query: &str) -> Option<SearchRange> {
+    let words = message_search_tokens(query).words;
+    if words.len() <= 1 {
+        return None;
+    }
+    let straight: Vec<char> =
+        text.chars().map(|c| if matches!(c, '‘' | '’') { '\'' } else { c }).collect();
+    let word_chars: Vec<Vec<char>> = words.iter().map(|w| w.chars().collect()).collect();
+    for start in 0..straight.len() {
+        if start > 0 && is_alnum(straight[start - 1]) {
+            continue;
+        }
+        let mut cursor = start;
+        let mut matched = true;
+        for (idx, word) in word_chars.iter().enumerate() {
+            if idx > 0 {
+                let space_start = cursor;
+                while cursor < straight.len() && is_js_space(straight[cursor]) {
+                    cursor += 1;
+                }
+                if cursor == space_start {
+                    matched = false;
+                    break;
+                }
+            }
+            let mut w_pos = 0;
+            while w_pos < word.len() {
+                let Some(&ch) = straight.get(cursor) else {
+                    matched = false;
+                    break;
+                };
+                let mut lower = ch.to_lowercase();
+                if lower.any(|lc| {
+                    let ok = word.get(w_pos) == Some(&lc);
+                    w_pos += 1;
+                    ok
+                }) {
+                    cursor += 1;
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched || w_pos != word.len() {
+                matched = false;
+                break;
+            }
+        }
+        if matched && (cursor == straight.len() || !is_alnum(straight[cursor])) {
+            return Some(SearchRange { start, end: cursor });
+        }
+    }
+    None
+}
+
+/// `findForMessageMatch` (`apps/web/src/components/chat/threadFindStore.ts`): selects the initial
+/// find-in-thread query and starting entry when activating a sidebar or palette message match.
+pub fn find_for_message_match(
+    snippet: &str,
+    message_id: Option<&str>,
+    query: &str,
+) -> crate::timeline::PendingThreadFind {
+    let start = message_id.map(|entry_id| crate::timeline::FindStart { entry_id: entry_id.to_owned(), occurrence: 0 });
+    if let Some(phrase) = message_phrase_range(snippet, query) {
+        return crate::timeline::PendingThreadFind {
+            query: slice_char_range(snippet, phrase).to_owned(),
+            start,
+        };
+    }
+    let word = message_search_tokens(query).long.into_iter().fold(String::new(), |longest, token| {
+        if token.chars().count() > longest.chars().count() { token } else { longest }
+    });
+    let word = if word.is_empty() { query } else { word.as_str() };
+    let ranges = find_search_token_ranges(snippet, word);
+    let chars: Vec<char> = snippet.chars().collect();
+    let shown = ranges
+        .iter()
+        .find(|range| chars.get(range.end).is_none_or(|&ch| !is_alnum(ch)))
+        .or_else(|| ranges.first())
+        .copied();
+    let query = shown.map_or_else(|| word.to_owned(), |range| slice_char_range(snippet, range).to_owned());
+    crate::timeline::PendingThreadFind { query, start }
 }
 
 mod thread;
