@@ -54,6 +54,24 @@ fn can_operate_thread(state: &crate::app_state::AppState, key: Option<&t3_core::
     })
 }
 
+fn row_snooze_access(
+    state: &crate::app_state::AppState,
+    key: Option<&t3_core::sidebar::tag_filter::ThreadKey>,
+    config_loaded: bool,
+) -> bool {
+    key.map_or_else(
+        || super::snooze_access(state),
+        |k| config_loaded && can_operate_thread(state, Some(k)),
+    )
+}
+
+fn scoped_id(prefix: &str, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, id: &str) -> String {
+    match key {
+        Some(key) => format!("{prefix}{}-{id}", key.environment_id),
+        None => format!("{prefix}{id}"),
+    }
+}
+
 fn status_icon(icon: StatusIcon) -> Icon {
     match icon {
         StatusIcon::Working => Icon::CircleDashed,
@@ -410,10 +428,12 @@ impl SidebarPane {
             return Some(Icon::Pin.sized(px(12.)).text_color(hsla(p.muted_foreground).opacity(0.65)).into_any_element());
         }
         let id = thread.id.clone();
+        let debug_id = scoped_id("unpin-", key, &thread.id);
         let key = key.cloned();
         Some(
             div()
-                .id(SharedString::from(format!("unpin-{}", thread.id)))
+                .id(SharedString::from(debug_id.clone()))
+                .debug_selector(move || debug_id.clone())
                 .group("unpin")
                 .flex_none()
                 .cursor_pointer()
@@ -516,10 +536,12 @@ impl SidebarPane {
         let opens_list = pr.opens_list;
         let url = pr.url.clone();
         let id = thread.id.clone();
+        let debug_id = scoped_id("pr-badge-", key, &thread.id);
         let key = key.cloned();
         Some(
             div()
-                .id(SharedString::from(format!("pr-badge-{}", thread.id)))
+                .id(SharedString::from(debug_id.clone()))
+                .debug_selector(move || debug_id.clone())
                 .flex_none()
                 .flex()
                 .items_center()
@@ -578,8 +600,8 @@ impl SidebarPane {
         let terminal_id = running.first()?.clone();
         let label: SharedString = if running.len() == 1 { "1 terminal process running. Open terminal".into() } else { format!("{} terminal processes running. Open terminal", running.len()).into() };
         let id = thread.id.clone();
+        let debug_id = scoped_id("terminal-status-", key, &thread.id);
         let key = key.cloned();
-        let debug_id = format!("terminal-status-{}", thread.id);
         Some(
             div()
                 .id(SharedString::from(debug_id.clone()))
@@ -604,8 +626,8 @@ impl SidebarPane {
     }
 
     /// The pen that marks a thread holding an unsent draft (`draftIndicator`).
-    fn render_draft_pen(&self, thread: &SidebarThread, cx: &App) -> AnyElement {
-        let debug_id = format!("draft-indicator-{}", thread.id);
+    fn render_draft_pen(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, cx: &App) -> AnyElement {
+        let debug_id = scoped_id("draft-indicator-", key, &thread.id);
         div()
             .id(SharedString::from(debug_id.clone()))
             .debug_selector(move || debug_id.clone())
@@ -616,11 +638,13 @@ impl SidebarPane {
     }
 
     /// `ThreadWorktreeIndicator`.
-    fn render_worktree_icon(&self, thread: &SidebarThread, cx: &App) -> Option<AnyElement> {
+    fn render_worktree_icon(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, cx: &App) -> Option<AnyElement> {
         let label: SharedString = thread.worktree_label()?.into();
+        let debug_id = scoped_id("thread-worktree-", key, &thread.id);
         Some(
             div()
-                .id(SharedString::from(format!("thread-worktree-{}", thread.id)))
+                .id(SharedString::from(debug_id.clone()))
+                .debug_selector(move || debug_id.clone())
                 .flex_none()
                 .child(Icon::FolderGit2.render(px(14.), hsla(palette(cx).icon_muted)))
                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
@@ -629,8 +653,8 @@ impl SidebarPane {
     }
 
     fn render_woke_badge(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, id: &str, woke_at: Option<i64>, icon_size: Pixels, color: u32, cx: &mut Context<Self>) -> AnyElement {
+        let debug_id = scoped_id("woke-", key, id);
         let id = id.to_owned();
-        let debug_id = format!("woke-{id}");
         let woke_key = key.cloned();
         div()
             .id(SharedString::from(debug_id.clone()))
@@ -673,7 +697,7 @@ impl SidebarPane {
         let p = palette(cx);
         let branch = thread.branch.clone().filter(|branch| !branch.is_empty());
         let (leading_icon, leading_label) = if let Some(branch) = branch {
-            (self.render_worktree_icon(thread, cx), Some(branch))
+            (self.render_worktree_icon(key, thread, cx), Some(branch))
         } else if let Some((icon, label)) = &extras.scratch_machine {
             (Some(icon.render(px(12.), hsla(p.sidebar_secondary_label)).into_any_element()), Some(label.clone()))
         } else {
@@ -705,7 +729,7 @@ impl SidebarPane {
         let extras = self.row_extras(key, thread, active, cx);
         let swept = self.sweep_action_for(key, &thread.id);
         let state = row_state(thread, active, self.is_selected(key, thread, active, cx), swept, extras.draft, now);
-        let show_snooze = super::snooze_access(self.state.read(cx)) && settled::can_snooze(thread, now);
+        let show_snooze = row_snooze_access(self.state.read(cx), key, extras.config_loaded) && settled::can_snooze(thread, now);
         let interactive_pin = extras.config_loaded && can_operate_thread(self.state.read(cx), key);
         let title_color = if state.recede {
             hsla(p.foreground).opacity(0.75)
@@ -754,7 +778,7 @@ impl SidebarPane {
             .invisible()
             .group_hover("sidebar-row", |this| this.visible())
             .when(extras.draft, |this| {
-                let debug_id = format!("discard-draft-thread-{}", thread.id);
+                let debug_id = scoped_id("discard-draft-thread-", key, &thread.id);
                 this.child(
                     hover_action(SharedString::from(debug_id.clone()), p)
                         .debug_selector(move || debug_id.clone())
@@ -768,7 +792,8 @@ impl SidebarPane {
                 )
             })
             .when(show_snooze, |this| {
-                this.child(hover_action(SharedString::from(format!("snooze-{}", thread.id)), p).child(Icon::Clock.render(px(12.), hsla(p.muted_foreground))).on_click(cx.listener(
+                let debug_id = scoped_id("snooze-", key, &thread.id);
+                this.child(hover_action(SharedString::from(debug_id.clone()), p).debug_selector(move || debug_id.clone()).child(Icon::Clock.render(px(12.), hsla(p.muted_foreground))).on_click(cx.listener(
                     move |this, event: &gpui::ClickEvent, window, cx| {
                         cx.stop_propagation();
                         if let Some(key) = &snooze_key { this.menu.update(cx, |menu, cx| menu.open_scoped_snooze(key, event.position(), window, cx)); }
@@ -777,7 +802,7 @@ impl SidebarPane {
                 )))
             })
             .when(extras.config_loaded, |this| {
-                let debug_id = format!("settle-{}", thread.id);
+                let debug_id = scoped_id("settle-", key, &thread.id);
                 let button = hover_action(SharedString::from(debug_id.clone()), p)
                     .debug_selector(move || debug_id.clone())
                     .mr(px(-4.))
@@ -814,7 +839,7 @@ impl SidebarPane {
                                 .items_center()
                                 .gap(px(6.))
                                 .min_w_0()
-                                .when(extras.draft, |this| this.child(self.render_draft_pen(thread, cx)))
+                                .when(extras.draft, |this| this.child(self.render_draft_pen(key, thread, cx)))
                                 .child(self.scoped_favicon(key, &thread.project_id, false, cx))
                                 .children(self.pin_indicator(key, thread, interactive_pin, cx))
                                 .child(
@@ -859,7 +884,6 @@ impl SidebarPane {
         let extras = self.row_extras(key, thread, active, cx);
         let swept = self.sweep_action_for(key, &thread.id);
         let state = row_state(thread, active, self.is_selected(key, thread, active, cx), swept, extras.draft, now);
-        let show_snooze = super::snooze_access(self.state.read(cx)) && settled::can_snooze(thread, now);
         let interactive_pin = extras.config_loaded && can_operate_thread(self.state.read(cx), key);
         let title_color = if state.recede {
             hsla(p.secondary_label)
@@ -894,8 +918,10 @@ impl SidebarPane {
         let id = thread.id.clone();
         let action_key = key.cloned();
         let action = match section {
-            Section::Snoozed => show_snooze.then(|| {
-                let button = hover_action(SharedString::from(format!("wake-{}", thread.id)), p)
+            Section::Snoozed => extras.config_loaded.then(|| {
+                let debug_id = scoped_id("wake-", key, &thread.id);
+                let button = hover_action(SharedString::from(debug_id.clone()), p)
+                    .debug_selector(move || debug_id.clone())
                     .child(Icon::AlarmClockOff.render(px(12.), hsla(p.muted_foreground)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -904,7 +930,9 @@ impl SidebarPane {
                 self.attach_sweep_drag(button, key, &thread.id, section, SweepAction::Unsnooze, cx)
             }),
             Section::Settled => extras.config_loaded.then(|| {
-                let button = hover_action(SharedString::from(format!("unsettle-{}", thread.id)), p)
+                let debug_id = scoped_id("unsettle-", key, &thread.id);
+                let button = hover_action(SharedString::from(debug_id.clone()), p)
+                    .debug_selector(move || debug_id.clone())
                     .child(Icon::Undo2.render(px(14.), hsla(p.muted_foreground)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -913,7 +941,9 @@ impl SidebarPane {
                 self.attach_sweep_drag(button, key, &thread.id, section, SweepAction::Unsettle, cx)
             }),
             _ => extras.config_loaded.then(|| {
-                let button = hover_action(SharedString::from(format!("settle-{}", thread.id)), p)
+                let debug_id = scoped_id("settle-", key, &thread.id);
+                let button = hover_action(SharedString::from(debug_id.clone()), p)
+                    .debug_selector(move || debug_id.clone())
                     .child(Icon::Check.render(px(12.), hsla(p.muted_foreground)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -959,7 +989,7 @@ impl SidebarPane {
             .when(!variant.in_folder(), |this| {
                 this.child(self.scoped_favicon(key, &thread.project_id, !active || section == Section::Settled, cx))
             })
-            .when(extras.draft, |this| this.child(self.render_draft_pen(thread, cx)))
+            .when(extras.draft, |this| this.child(self.render_draft_pen(key, thread, cx)))
             .child(self.render_title(key, thread, title_color, state.recede, cx))
             .children(title_icons)
             .children(self.pin_indicator(key, thread, interactive_pin, cx))

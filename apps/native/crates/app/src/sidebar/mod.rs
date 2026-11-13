@@ -2367,7 +2367,7 @@ mod sb_sections_pane_tests {
         fix_a.take_commands();
         fix_b.take_commands();
 
-        let woke_pos = vcx.debug_bounds("woke-th-env-b-woke").expect("remote woke badge rendered").center();
+        let woke_pos = vcx.debug_bounds("woke-env-b-th-env-b-woke").expect("remote woke badge rendered").center();
         vcx.simulate_mouse_move(woke_pos, None::<MouseButton>, Default::default());
         vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: woke_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
         vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: woke_pos, modifiers: Default::default(), click_count: 1 });
@@ -2638,6 +2638,184 @@ mod sb_sections_pane_tests {
         assert!(pane.read_with(vcx, |p, _| p.folder_multiline));
         let multi_height = vcx.debug_bounds(scratch_row_id).expect("multiline folder scratch row rendered").size.height;
         assert!(multi_height > px(45.), "multiline folder row with scratch machine meta line must grow, got {multi_height:?}");
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn snoozed_wake_queued_turn_mixed_fleet_snooze_and_scoped_inner_ids(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let now = t3_core::sidebar::time::parse_iso("2026-01-01T00:00:10Z").unwrap();
+        let (state, mut fixture_local) = cx.update(|cx| {
+            gpui_component::init(cx);
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+
+        let mut env_fixtures = Vec::new();
+        for (saved, operate, include_snoozed) in [("env-op", true, true), ("env-ro", false, false)] {
+            let (client, fix) = ClientFixture::handle(session(operate));
+            let mut shell = t3_core::shell::ShellState::default();
+            let mut shared = make_thread_json("shared-th", &format!("proj-{saved}"), "idle");
+            shared["snoozedUntil"] = json!("2026-01-01T00:00:05Z");
+            shared["pinnedAt"] = json!("2026-01-01T00:00:00Z");
+            shared["branch"] = json!(format!("feat/{saved}"));
+            shared["worktreePath"] = json!(format!("/worktrees/{saved}"));
+            let mut threads = vec![shared];
+            if include_snoozed {
+                let mut snoozed_queued = make_thread_json("snoozed-queued", &format!("proj-{saved}"), "idle");
+                snoozed_queued["snoozedUntil"] = json!("2026-01-01T01:00:00Z");
+                snoozed_queued["latestUserMessageAt"] = json!("2026-01-01T00:00:05Z");
+                threads.push(snoozed_queued);
+            }
+            shell.apply(serde_json::from_value(json!({
+                "kind": "snapshot",
+                "snapshot": {
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": format!("proj-{saved}"),
+                        "title": saved,
+                        "workspaceRoot": format!("/{saved}"),
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "threads": threads
+                }
+            })).unwrap());
+            shell.synchronized = true;
+            let mut config = t3_core::server_config::ServerConfigState::default();
+            config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": format!("id-{saved}"),
+                        "label": saved,
+                        "platform": {"os": "linux", "arch": "x64", "machine": "cloud"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": format!("/{saved}"),
+                    "settings": {}
+                }
+            })).unwrap());
+            let install = state.update(cx, |s, _| s.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
+            let _events = runtime.spawn(install).await.unwrap();
+            env_fixtures.push(fix);
+        }
+        let mut fix_op = env_fixtures.remove(0);
+        let mut fix_ro = env_fixtures.remove(0);
+
+        state.update(cx, |s, cx| {
+            s.draft_project = None;
+            s.shell.snapshot.as_mut().unwrap().threads.clear();
+            s.server_config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": "local-env",
+                        "label": "Local",
+                        "platform": {"os": "macos", "arch": "arm64", "machine": "laptop"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": "/local",
+                    "settings": {}
+                }
+            })).unwrap());
+            s.environments.active = Some("env-op".into());
+            s.sidebar.now_override = Some(now);
+            s.sidebar.shelves.snoozed_expanded = true;
+            s.rebuild_sidebar(cx);
+        });
+
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        pane.update(vcx, |p, cx| {
+            p.now_override = Some(now);
+            p.now = now;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        fixture_local.take_commands();
+        fix_op.take_commands();
+        fix_ro.take_commands();
+
+        // Shared raw thread.id ("shared-th") across two fleet environments must produce distinct, non-colliding inner element bounds.
+        let woke_op = vcx.debug_bounds("woke-env-op-shared-th").expect("env-op woke badge rendered");
+        let woke_ro = vcx.debug_bounds("woke-env-ro-shared-th").expect("env-ro woke badge rendered");
+        assert_ne!(woke_op.origin, woke_ro.origin);
+        let worktree_op = vcx.debug_bounds("thread-worktree-env-op-shared-th").expect("env-op worktree badge rendered");
+        let worktree_ro = vcx.debug_bounds("thread-worktree-env-ro-shared-th").expect("env-ro worktree badge rendered");
+        assert_ne!(worktree_op.origin, worktree_ro.origin);
+        assert!(vcx.debug_bounds("unpin-env-op-shared-th").is_some(), "operable pinned row must have scoped unpin id");
+
+        let op_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-op".into(), thread_id: "shared-th".into() };
+        let ro_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-ro".into(), thread_id: "shared-th".into() };
+        let queued_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-op".into(), thread_id: "snoozed-queued".into() };
+        let op_row_id: &'static str = Box::leak(format!("thread-row-{:?}-shared-th", Some(&op_key)).into_boxed_str());
+        let ro_row_id: &'static str = Box::leak(format!("thread-row-{:?}-shared-th", Some(&ro_key)).into_boxed_str());
+        let queued_row_id: &'static str = Box::leak(format!("thread-row-{:?}-snoozed-queued", Some(&queued_key)).into_boxed_str());
+
+        let op_center = vcx.debug_bounds(op_row_id).expect("env-op shared row rendered").center();
+        let ro_center = vcx.debug_bounds(ro_row_id).expect("env-ro shared row rendered").center();
+        let queued_center = vcx.debug_bounds(queued_row_id).expect("snoozed-queued row rendered").center();
+
+        // Mixed-capability Fleet Card Snooze when local ALSO has snooze_access: operable env-op shows Snooze; read-only env-ro hides it.
+        vcx.simulate_mouse_move(op_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-op-shared-th").is_some(), "operable fleet env must render Card Snooze");
+        let settle_op = vcx.debug_bounds("settle-env-op-shared-th").expect("env-op settle action rendered");
+
+        vcx.simulate_mouse_move(ro_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-ro-shared-th").is_none(), "read-only fleet env must hide Card Snooze even when local can snooze");
+        let settle_ro = vcx.debug_bounds("settle-env-ro-shared-th").expect("env-ro settle action rendered");
+        assert_ne!(settle_op.origin, settle_ro.origin);
+
+        // Reverse Fleet mixed-capability: drop local server_config so super::snooze_access(state) is false; env-op must keep Card Snooze.
+        state.update(vcx, |s, cx| {
+            s.server_config.config = None;
+            s.rebuild_sidebar(cx);
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(!state.read_with(vcx, |s, _| super::snooze_access(s)));
+        vcx.simulate_mouse_move(op_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-op-shared-th").is_some(), "operable remote env must keep Card Snooze when local lacks snooze_access");
+        vcx.simulate_mouse_move(ro_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-ro-shared-th").is_none(), "read-only remote env stays hidden");
+
+        // Snoozed row with has_queued_turn_start must still render Wake and dispatch thread.unsnooze on click.
+        vcx.simulate_mouse_move(queued_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        let wake_pos = vcx.debug_bounds("wake-env-op-snoozed-queued").expect("snoozed row with queued turn start must keep hover Wake button").center();
+        vcx.simulate_mouse_move(wake_pos, None::<MouseButton>, Default::default());
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: wake_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: wake_pos, modifiers: Default::default(), click_count: 1 });
+        let (method, params, _) = fix_op.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(params["type"], "thread.unsnooze");
+        assert_eq!(params["threadId"], "snoozed-queued");
+        assert!(fix_ro.take_commands().is_empty());
+
         state.update(vcx, |s, _| s.stop_pump());
     }
 }
