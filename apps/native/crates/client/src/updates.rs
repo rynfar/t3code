@@ -7,8 +7,41 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use t3_core::server_config::{ServerConfig, ServerProvider};
 use t3_core::sidebar::grouping::EnvironmentOwner;
-use t3_core::updates::{self, Plan, ProviderTarget, ServerTarget};
-use tokio::sync::watch;
+use t3_core::updates::{
+    self, ChannelSwitchPlan, Plan, ProviderOutcome, ProviderTarget, ServerOutcome, ServerTarget,
+    ServerUpdateStage, UpdateEverythingResult, UpdateTrack,
+};
+use tokio::sync::{mpsc, watch};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateEvent {
+    ProvidersFinished {
+        updated_providers: usize,
+        failures: Vec<String>,
+    },
+    ServerStage {
+        environment_id: String,
+        stage: ServerUpdateStage,
+    },
+    ServerHandedOff {
+        environment_id: String,
+        target_version: String,
+    },
+    MachineSettled {
+        environment_id: String,
+        failure: Option<String>,
+        server_updated: bool,
+        provider_failure: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ServerRequestOptions {
+    pub channel: Option<UpdateTrack>,
+    pub release_channel: Option<UpdateTrack>,
+    pub target_database_migration: Option<u64>,
+    pub track_only: bool,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct AdvisoryFacts {
@@ -74,16 +107,32 @@ fn ready(entry: &EnvironmentView) -> bool {
 }
 
 pub fn capture(plan: &Plan, view: &FleetView) -> Result<Vec<CapturedUpdateOwner>, String> {
-    let mut ids: Vec<_> = plan.providers.iter().map(|p| p.environment_id.as_str())
-        .chain(plan.servers.iter().map(|s| s.environment_id.as_str())).collect();
+    capture_targets(&plan.providers, &plan.servers, view)
+}
+
+pub fn capture_channel_switch(
+    switch: &ChannelSwitchPlan,
+    view: &FleetView,
+) -> Result<Vec<CapturedUpdateOwner>, String> {
+    let servers: Vec<_> = switch.targets.iter().map(|t| t.server.clone()).collect();
+    capture_targets(&switch.plan.providers, &servers, view)
+}
+
+fn capture_targets(
+    providers: &[ProviderTarget],
+    servers: &[ServerTarget],
+    view: &FleetView,
+) -> Result<Vec<CapturedUpdateOwner>, String> {
+    let mut ids: Vec<_> = providers.iter().map(|p| p.environment_id.as_str())
+        .chain(servers.iter().map(|s| s.environment_id.as_str())).collect();
     ids.sort_unstable(); ids.dedup();
     ids.into_iter().map(|id| {
         let entry = view.environment(id).filter(|_| view.environments.iter().filter(|e| e.summary.owner.saved_id == id).count() == 1)
             .filter(|e| ready(e)).ok_or_else(|| format!("{id}: environment is not ready"))?;
         let config = entry.config.config.as_ref().unwrap();
-        let mut drivers: Vec<_> = plan.providers.iter().filter(|p| p.environment_id == id).map(|p| p.driver.as_str()).collect();
+        let mut drivers: Vec<_> = providers.iter().filter(|p| p.environment_id == id).map(|p| p.driver.as_str()).collect();
         drivers.sort_unstable(); drivers.dedup();
-        for target in plan.providers.iter().filter(|p| p.environment_id == id) {
+        for target in providers.iter().filter(|p| p.environment_id == id) {
             if config.providers.iter().filter(|p| p.driver == target.driver && p.instance_id == target.instance_id).count() != 1 {
                 return Err(format!("{id}: provider changed"));
             }
@@ -92,7 +141,7 @@ pub fn capture(plan: &Plan, view: &FleetView) -> Result<Vec<CapturedUpdateOwner>
             owner: entry.summary.owner.clone(), label: config.environment.label.clone(),
             providers: drivers.iter().flat_map(|driver| provider_facts(&config.providers, driver)).collect(),
             representatives: drivers.iter().map(|driver| ((*driver).to_owned(), representative(&config.providers, driver))).collect(),
-            server: plan.servers.iter().any(|s| s.environment_id == id).then(|| server_facts(config)),
+            server: servers.iter().any(|s| s.environment_id == id).then(|| server_facts(config)),
         })
     }).collect()
 }
@@ -162,31 +211,255 @@ fn provider_terminal(response: &Value, instance: &str) -> bool {
         .and_then(|p| p["updateState"]["status"].as_str()).is_some_and(|s| matches!(s, "succeeded" | "failed" | "unchanged"))
 }
 
-pub async fn run(plan: Plan, destinations: Vec<UpdateDestination>, view: watch::Receiver<Arc<FleetView>>) -> Vec<String> {
-    let mut failures = Vec::new();
+pub async fn run(
+    plan: Plan,
+    destinations: Vec<UpdateDestination>,
+    view: watch::Receiver<Arc<FleetView>>,
+) -> Vec<String> {
+    run_with_progress(plan, destinations, view, None).await.failures
+}
+
+pub async fn run_with_progress(
+    plan: Plan,
+    destinations: Vec<UpdateDestination>,
+    view: watch::Receiver<Arc<FleetView>>,
+    events: Option<mpsc::UnboundedSender<UpdateEvent>>,
+) -> UpdateEverythingResult {
+    let mut provider_outcomes = Vec::new();
+    let mut provider_failures_by_env: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut unresolved_provider = false;
+    let mut machine_ids = Vec::new();
+    for p in &plan.providers {
+        if !machine_ids.contains(&p.environment_id) {
+            machine_ids.push(p.environment_id.clone());
+        }
+    }
     for target in plan.providers {
-        let packet = match packet(&destinations, &target.environment_id, "providers:manage") { Ok(p) => p, Err(e) => { failures.push(e); continue; } };
-        let label = format!("{} / {}", packet.capture.label, t3_core::providers::driver_label(&target.driver));
+        let packet = match packet(&destinations, &target.environment_id, "providers:manage") {
+            Ok(p) => p,
+            Err(e) => {
+                provider_outcomes.push(ProviderOutcome::Failed(e.clone()));
+                provider_failures_by_env.entry(target.environment_id).or_insert(e);
+                continue;
+            }
+        };
+        let label = format!(
+            "{} / {}",
+            packet.capture.label,
+            t3_core::providers::driver_label(&target.driver)
+        );
         let (result, enqueued) = provider_attempt(packet, &target, &view).await;
         match result {
             Ok(value) => {
-                if !provider_terminal(&value, &target.instance_id) { unresolved_provider = true; failures.push(format!("{label}: remote update is unresolved")); }
-                if let Some(error) = provider_failure(&value, &target.instance_id) { failures.push(format!("{label}: {error}")); }
+                if !provider_terminal(&value, &target.instance_id) {
+                    unresolved_provider = true;
+                    let line = format!("{label}: remote update is unresolved");
+                    provider_outcomes.push(ProviderOutcome::Failed(line.clone()));
+                    provider_failures_by_env
+                        .entry(target.environment_id)
+                        .or_insert(line);
+                } else if let Some(error) = provider_failure(&value, &target.instance_id) {
+                    let line = format!("{label}: {error}");
+                    provider_outcomes.push(ProviderOutcome::Failed(line.clone()));
+                    provider_failures_by_env
+                        .entry(target.environment_id)
+                        .or_insert(line);
+                } else {
+                    provider_outcomes.push(ProviderOutcome::Updated);
+                }
             }
             Err(error) => {
                 unresolved_provider |= enqueued;
-                failures.push(format!("{label}: {error}{}", if enqueued { " (remote update is unresolved)" } else { "" }));
+                let line = format!(
+                    "{label}: {error}{}",
+                    if enqueued {
+                        " (remote update is unresolved)"
+                    } else {
+                        ""
+                    }
+                );
+                provider_outcomes.push(ProviderOutcome::Failed(line.clone()));
+                provider_failures_by_env
+                    .entry(target.environment_id)
+                    .or_insert(line);
             }
         }
     }
-    for target in plan.servers {
-        if unresolved_provider { failures.push(format!("{}: server restart withheld because a provider update is unresolved", target.label)); continue; }
-        let result = match packet(&destinations, &target.environment_id, "environment:maintain") {
-            Ok(packet) => update_server(packet, &target, &view).await,
+    if let Some(tx) = &events {
+        for id in &machine_ids {
+            if !plan.servers.iter().any(|s| &s.environment_id == id) {
+                let failure = provider_failures_by_env.get(id).cloned();
+                let _ = tx.send(UpdateEvent::MachineSettled {
+                    environment_id: id.clone(),
+                    failure: failure.clone(),
+                    server_updated: false,
+                    provider_failure: failure,
+                });
+            }
+        }
+        let updated_providers = provider_outcomes
+            .iter()
+            .filter(|o| matches!(o, ProviderOutcome::Updated))
+            .count();
+        let provider_failures = provider_outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ProviderOutcome::Failed(line) => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        let _ = tx.send(UpdateEvent::ProvidersFinished {
+            updated_providers,
+            failures: provider_failures,
+        });
+    }
+    let targets = plan
+        .servers
+        .into_iter()
+        .map(|target| (target, ServerRequestOptions::default()))
+        .collect();
+    execute_server_targets(
+        targets,
+        unresolved_provider,
+        &provider_outcomes,
+        &provider_failures_by_env,
+        &destinations,
+        &view,
+        events.as_ref(),
+    )
+    .await
+}
+
+pub async fn run_channel_switch_with_progress(
+    switch: ChannelSwitchPlan,
+    release_channel: UpdateTrack,
+    destinations: Vec<UpdateDestination>,
+    view: watch::Receiver<Arc<FleetView>>,
+    events: Option<mpsc::UnboundedSender<UpdateEvent>>,
+) -> UpdateEverythingResult {
+    if let Some(tx) = &events {
+        let _ = tx.send(UpdateEvent::ProvidersFinished {
+            updated_providers: 0,
+            failures: Vec::new(),
+        });
+    }
+    let targets = switch
+        .targets
+        .into_iter()
+        .map(|target| {
+            let options = ServerRequestOptions {
+                channel: target.channel,
+                release_channel: Some(release_channel),
+                target_database_migration: target.target_database_migration,
+                track_only: target.track_only,
+            };
+            (target.server, options)
+        })
+        .collect();
+    let provider_failures_by_env = std::collections::HashMap::new();
+    execute_server_targets(
+        targets,
+        false,
+        &[],
+        &provider_failures_by_env,
+        &destinations,
+        &view,
+        events.as_ref(),
+    )
+    .await
+}
+
+async fn execute_server_targets(
+    targets: Vec<(ServerTarget, ServerRequestOptions)>,
+    unresolved_provider: bool,
+    provider_outcomes: &[ProviderOutcome],
+    provider_failures_by_env: &std::collections::HashMap<String, String>,
+    destinations: &[UpdateDestination],
+    view: &watch::Receiver<Arc<FleetView>>,
+    events: Option<&mpsc::UnboundedSender<UpdateEvent>>,
+) -> UpdateEverythingResult {
+    let mut server_outcomes: Vec<(String, ServerOutcome)> = Vec::new();
+    for (target, options) in targets {
+        let provider_failure = provider_failures_by_env.get(&target.environment_id).cloned();
+        let outcome = if unresolved_provider {
+            ServerOutcome::Failed(
+                "server restart withheld because a provider update is unresolved".into(),
+            )
+        } else {
+            match packet(destinations, &target.environment_id, "environment:maintain") {
+                Ok(packet) => match update_server_with_events(
+                    packet,
+                    &target,
+                    view,
+                    &options,
+                    events,
+                )
+                .await
+                {
+                    Ok(()) => ServerOutcome::Updated,
+                    Err(error) => ServerOutcome::Failed(error),
+                },
+                Err(error) => ServerOutcome::Failed(error),
+            }
+        };
+        if let Some(tx) = events
+            && !options.track_only
+        {
+            let (failure, server_updated) = match &outcome {
+                ServerOutcome::Updated | ServerOutcome::Skipped => (provider_failure.clone(), true),
+                ServerOutcome::Failed(message) => (Some(message.clone()), false),
+            };
+            let _ = tx.send(UpdateEvent::MachineSettled {
+                environment_id: target.environment_id.clone(),
+                failure,
+                server_updated,
+                provider_failure,
+            });
+        }
+        server_outcomes.push((target.label.clone(), outcome));
+    }
+    let refs: Vec<(&str, &ServerOutcome)> = server_outcomes
+        .iter()
+        .map(|(label, outcome)| (label.as_str(), outcome))
+        .collect();
+    updates::collect_update_everything_result(&refs, provider_outcomes)
+}
+
+pub async fn retry_servers_with_progress(
+    targets: Vec<(ServerTarget, Option<String>)>,
+    destinations: Vec<UpdateDestination>,
+    view: watch::Receiver<Arc<FleetView>>,
+    events: Option<mpsc::UnboundedSender<UpdateEvent>>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (target, provider_failure) in targets {
+        let outcome = match packet(&destinations, &target.environment_id, "environment:maintain") {
+            Ok(packet) => update_server_with_events(
+                packet,
+                &target,
+                &view,
+                &ServerRequestOptions::default(),
+                events.as_ref(),
+            )
+            .await,
             Err(error) => Err(error),
         };
-        if let Err(error) = result { failures.push(format!("{}: {error}", target.label)); }
+        let (settled_failure, server_updated) = match &outcome {
+            Ok(()) => (provider_failure.clone(), true),
+            Err(error) => {
+                failures.push(format!("{}: {error}", target.label));
+                (Some(error.clone()), false)
+            }
+        };
+        if let Some(tx) = &events {
+            let _ = tx.send(UpdateEvent::MachineSettled {
+                environment_id: target.environment_id,
+                failure: settled_failure,
+                server_updated,
+                provider_failure,
+            });
+        }
     }
     failures
 }
@@ -217,18 +490,45 @@ fn handoff_loss(error: &crate::session::RpcError) -> bool {
     }
 }
 
+#[cfg(test)]
 async fn update_with(
     transport: &impl UpdateTransport,
     target: &str,
     capability: &str,
 ) -> Result<(), String> {
+    update_with_options(
+        transport,
+        target,
+        capability,
+        &ServerRequestOptions::default(),
+        |_, _| {},
+    )
+    .await
+}
+
+async fn update_with_options(
+    transport: &impl UpdateTransport,
+    target: &str,
+    capability: &str,
+    options: &ServerRequestOptions,
+    mut on_stage: impl FnMut(ServerUpdateStage, Option<&str>),
+) -> Result<(), String> {
+    let mut input = json!({"targetVersion": target});
+    if let Some(channel) = options.channel {
+        input["channel"] = json!(channel.as_str());
+    }
+    if let Some(migration) = options.target_database_migration {
+        input["targetDatabaseMigration"] = json!(migration);
+    }
+    on_stage(ServerUpdateStage::Downloading, None);
     let generation = transport.generation();
     let result = match transport
-        .request("server.updateServer", json!({"targetVersion":target}))
+        .request("server.updateServer", input)
         .await
     {
         Ok(result) => result,
         Err(error) if matches!(capability, "boot-service" | "respawn") && handoff_loss(&error) => {
+            on_stage(ServerUpdateStage::Resuming, Some(target));
             transport
                 .reconnected(generation)
                 .await
@@ -237,8 +537,14 @@ async fn update_with(
         }
         Err(error) => return Err(error.to_string()),
     };
-    if result["targetVersion"].as_str().is_none_or(|v| v.trim().is_empty()) {
-        return Err("The update host returned no target version.".into());
+    let response_version = result["targetVersion"]
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or("The update host returned no target version.")?
+        .to_owned();
+    if options.track_only && result["updateId"].is_null() {
+        return Ok(());
     }
     if result["method"] == "desktop-app" {
         let token = result["desktopUpdateToken"].as_str().filter(|token| !token.trim().is_empty())
@@ -255,6 +561,7 @@ async fn update_with(
                 .map_err(|e| e.to_string())?,
             Err(error) => return Err(error.to_string()),
         }
+        on_stage(ServerUpdateStage::Resuming, Some(&response_version));
         // Match waitForDesktopUpdateTarget: an old-version reconnect retries the same token,
         // with at most three readiness checks, and never consumes the pre-commit connection.
         for attempt in 1..=3 {
@@ -285,6 +592,7 @@ async fn update_with(
         }
         return Err("The desktop app resumed without installing the prepared update.".into());
     }
+    on_stage(ServerUpdateStage::Resuming, Some(&response_version));
     loop {
         let ready = transport
             .next_ready(&result)
@@ -415,7 +723,13 @@ impl UpdateTransport for GuardedUpdate<'_> {
         }
     }
 }
-async fn update_server(packet: &UpdateDestination, target: &ServerTarget, view: &watch::Receiver<Arc<FleetView>>) -> Result<(), String> {
+async fn update_server_with_events(
+    packet: &UpdateDestination,
+    target: &ServerTarget,
+    view: &watch::Receiver<Arc<FleetView>>,
+    options: &ServerRequestOptions,
+    events: Option<&mpsc::UnboundedSender<UpdateEvent>>,
+) -> Result<(), String> {
     let destination = packet.receipt.as_ref().map_err(|e| format!("Destination unavailable: {e:?}"))?;
     authorized(&packet.capture, destination, &view.borrow(), "environment:maintain").map_err(|e| e.to_string())?;
     let eligible = {
@@ -424,7 +738,19 @@ async fn update_server(packet: &UpdateDestination, target: &ServerTarget, view: 
         let machines = [updates::Machine { id: &target.environment_id, label: &target.label,
             config: entry.config.config.as_ref(), connected: ready(entry), hosted_by_this_app: false,
             can_maintain: true, can_manage_providers: false, updating: false }];
-        updates::collect(&machines, &target.target_version).servers.iter().any(|s| s == target)
+        if let Some(channel) = options.release_channel.or(options.channel) {
+            let release = updates::ChannelSwitchRelease {
+                channel,
+                version: target.target_version.clone(),
+                database_migration: options.target_database_migration,
+            };
+            updates::collect_channel_switch(&machines, &release)
+                .targets
+                .iter()
+                .any(|t| &t.server == target && t.track_only == options.track_only)
+        } else {
+            updates::collect(&machines, &target.target_version).servers.iter().any(|s| s == target)
+        }
     };
     if !eligible { return Err("server target is no longer eligible".into()); }
     let guard = GuardedUpdate {
@@ -432,8 +758,25 @@ async fn update_server(packet: &UpdateDestination, target: &ServerTarget, view: 
         generations: Mutex::new((packet.capture.owner.connection_generation, packet.capture.owner.shell_generation)),
     };
     guard.check().map_err(|e| e.to_string())?;
-    tokio::time::timeout(std::time::Duration::from_secs(32 * 60), async {
-        update_with(&guard, &target.target_version, &target.self_update).await?;
+    let timeout_secs = (updates::HANDOFF_TIMEOUT_MS / 1000) as u64;
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        update_with_options(&guard, &target.target_version, &target.self_update, options, |stage, response_version| {
+            if let Some(tx) = events {
+                let _ = tx.send(UpdateEvent::ServerStage {
+                    environment_id: target.environment_id.clone(),
+                    stage,
+                });
+                if stage == ServerUpdateStage::Resuming {
+                    let _ = tx.send(UpdateEvent::ServerHandedOff {
+                        environment_id: target.environment_id.clone(),
+                        target_version: response_version
+                            .unwrap_or(&target.target_version)
+                            .to_owned(),
+                    });
+                }
+            }
+        })
+        .await?;
         guard.until_ready(None).await.map_err(|e| e.to_string())
     }).await.map_err(|_| "Timed out waiting for the server to resume after updating.".to_owned())?
 }
@@ -472,6 +815,485 @@ mod tests {
             assert_eq!(provider_terminal(&json!({"providers":[{"instanceId":"codex","updateState":{"status":status}}]}), "codex"), matches!(status,"succeeded" | "failed" | "unchanged"));
         }
         assert!(!provider_terminal(&json!({}), "codex"));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn unresolved_provider_reply_reports_single_unresolved_failure() {
+        let session = serde_json::from_value(json!({"authenticated":true,"permissions":["providers:manage"]})).unwrap();
+        let (client, mut fixture) = crate::supervisor::ClientFixture::handle(session);
+        let grants_rx = client.session_state();
+        let mut config = t3_core::server_config::ServerConfigState::default();
+        config.apply(
+            serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": { "environmentId": "env-1", "label": "Work" },
+                    "providers": [{
+                        "instanceId": "codex",
+                        "driver": "codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "versionAdvisory": {
+                            "status": "behind_latest",
+                            "latestVersion": "2.0",
+                            "canUpdate": true,
+                            "updateCommand": "update"
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+        );
+        let owner = EnvironmentOwner {
+            saved_id: "env-1".into(),
+            canonical_id: Some("env-1".into()),
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 0,
+        };
+        let mut shell = t3_core::shell::ShellState::default();
+        shell.synchronized = true;
+        let summary = Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+            owner.clone(),
+            &shell,
+            &config,
+        ));
+        let entry = Arc::new(EnvironmentView {
+            summary,
+            status: ConnectionStatus::Connected,
+            config,
+            grants: grants_rx.borrow().clone(),
+            settings_revision: 1,
+            keybindings_revision: 1,
+        });
+        let (_view_tx, view_rx) = watch::channel(Arc::new(FleetView {
+            revision: 1,
+            environments: vec![entry],
+        }));
+        let plan = Plan {
+            providers: vec![ProviderTarget {
+                environment_id: "env-1".into(),
+                driver: "codex".into(),
+                instance_id: "codex".into(),
+            }],
+            ..Default::default()
+        };
+        let captures = capture(&plan, &view_rx.borrow()).unwrap();
+        let destinations = vec![UpdateDestination {
+            capture: captures.into_iter().next().unwrap(),
+            scope: "providers:manage",
+            receipt: Ok(Destination { owner, client }),
+        }];
+        let respond = tokio::spawn(async move {
+            let (method, _payload, reply) = fixture.next_request().await;
+            assert_eq!(method, "server.updateProvider");
+            let _ = reply.send(Ok(json!({
+                "providers": [{ "instanceId": "codex", "updateState": { "status": "running" } }]
+            })));
+            fixture
+        });
+        let failures = run(plan, destinations, view_rx).await;
+        let _fixture = respond.await.unwrap();
+        assert_eq!(failures, vec!["Work / Codex: remote update is unresolved"]);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn run_with_progress_emits_stages_and_retries_only_failed_servers() {
+        let session: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["providers:manage", "environment:maintain"]
+        }))
+        .unwrap();
+        let (client_a, mut fixture_a) = crate::supervisor::ClientFixture::handle(session.clone());
+        let (client_b, mut fixture_b) = crate::supervisor::ClientFixture::handle(session);
+        let grants_a = client_a.session_state();
+        let grants_b = client_b.session_state();
+        let make_entry = |id: &str,
+                          label: &str,
+                          with_provider: bool,
+                          client: &crate::supervisor::ClientHandle,
+                          grants_rx: &watch::Receiver<Option<t3_core::auth::AuthSessionState>>| {
+            let mut config = t3_core::server_config::ServerConfigState::default();
+            let providers = if with_provider {
+                json!([{
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "versionAdvisory": {
+                        "status": "behind_latest",
+                        "latestVersion": "2.0",
+                        "canUpdate": true,
+                        "updateCommand": "update"
+                    }
+                }])
+            } else {
+                json!([])
+            };
+            config.apply(
+                serde_json::from_value(json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": {
+                            "environmentId": id,
+                            "label": label,
+                            "serverVersion": "0.1.0",
+                            "capabilities": { "serverSelfUpdate": "npm" }
+                        },
+                        "providers": providers
+                    }
+                }))
+                .unwrap(),
+            );
+            let owner = EnvironmentOwner {
+                saved_id: id.into(),
+                canonical_id: Some(id.into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 0,
+            };
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.synchronized = true;
+            let summary = Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                owner.clone(),
+                &shell,
+                &config,
+            ));
+            let entry = Arc::new(EnvironmentView {
+                summary,
+                status: ConnectionStatus::Connected,
+                config,
+                grants: grants_rx.borrow().clone(),
+                settings_revision: 1,
+                keybindings_revision: 1,
+            });
+            (owner, entry, client.clone())
+        };
+        let (owner_a, entry_a, handle_a) = make_entry("env-a", "Alpha", true, &client_a, &grants_a);
+        let (owner_b, entry_b, handle_b) = make_entry("env-b", "Beta", false, &client_b, &grants_b);
+        let (_view_tx, view_rx) = watch::channel(Arc::new(FleetView {
+            revision: 1,
+            environments: vec![entry_a, entry_b],
+        }));
+        let plan = Plan {
+            providers: vec![ProviderTarget {
+                environment_id: "env-a".into(),
+                driver: "codex".into(),
+                instance_id: "codex".into(),
+            }],
+            servers: vec![ServerTarget {
+                environment_id: "env-b".into(),
+                label: "Beta".into(),
+                target_version: "0.2.0".into(),
+                self_update: "npm".into(),
+            }],
+            ..Default::default()
+        };
+        let captures = capture(&plan, &view_rx.borrow()).unwrap();
+        let destinations = captures
+            .into_iter()
+            .map(|capture| {
+                let (owner, scope, client) = if capture.owner.saved_id == "env-a" {
+                    (owner_a.clone(), "providers:manage", handle_a.clone())
+                } else {
+                    (owner_b.clone(), "environment:maintain", handle_b.clone())
+                };
+                UpdateDestination {
+                    capture,
+                    scope,
+                    receipt: Ok(Destination { owner, client }),
+                }
+            })
+            .collect();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let server_a = tokio::spawn(async move {
+            let (method, _, reply) = fixture_a.next_request().await;
+            assert_eq!(method, "server.updateProvider");
+            let _ = reply.send(Ok(json!({
+                "providers": [{ "instanceId": "codex", "updateState": { "status": "succeeded" } }]
+            })));
+            fixture_a
+        });
+        let server_b = tokio::spawn(async move {
+            let (method, _, reply) = fixture_b.next_request().await;
+            assert_eq!(method, "server.updateServer");
+            let _ = reply.send(Err(crate::session::RpcError::Failure(
+                t3_core::rpc::RpcFailure {
+                    tag: None,
+                    message: "network timeout".into(),
+                    error: Value::Null,
+                },
+            )));
+            // Second request is the retry targeting only env-b.
+            let (method2, _, reply2) = fixture_b.next_request().await;
+            assert_eq!(method2, "server.updateServer");
+            let _ = reply2.send(Err(crate::session::RpcError::Failure(
+                t3_core::rpc::RpcFailure {
+                    tag: None,
+                    message: "still offline".into(),
+                    error: Value::Null,
+                },
+            )));
+            fixture_b
+        });
+
+        let result = run_with_progress(plan.clone(), destinations, view_rx.clone(), Some(tx)).await;
+        assert_eq!(result.updated_providers, 1);
+        assert_eq!(result.updated_servers, 0);
+        assert_eq!(result.failures, vec!["Beta: network timeout"]);
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            seen.push(ev);
+        }
+        assert!(seen.contains(&UpdateEvent::ProvidersFinished {
+            updated_providers: 1,
+            failures: Vec::new(),
+        }));
+        assert!(seen.contains(&UpdateEvent::ServerStage {
+            environment_id: "env-b".into(),
+            stage: ServerUpdateStage::Downloading,
+        }));
+        assert!(seen.contains(&UpdateEvent::MachineSettled {
+            environment_id: "env-a".into(),
+            failure: None,
+            server_updated: false,
+            provider_failure: None,
+        }));
+        assert!(seen.contains(&UpdateEvent::MachineSettled {
+            environment_id: "env-b".into(),
+            failure: Some("network timeout".into()),
+            server_updated: false,
+            provider_failure: None,
+        }));
+
+        let retry_capture = capture(
+            &Plan {
+                servers: vec![plan.servers[0].clone()],
+                ..Default::default()
+            },
+            &view_rx.borrow(),
+        )
+        .unwrap();
+        let retry_dest = vec![UpdateDestination {
+            capture: retry_capture.into_iter().next().unwrap(),
+            scope: "environment:maintain",
+            receipt: Ok(Destination {
+                owner: owner_b,
+                client: handle_b,
+            }),
+        }];
+        let (rtx, mut rrx) = mpsc::unbounded_channel();
+        let retry_failures = retry_servers_with_progress(
+            vec![(plan.servers[0].clone(), None)],
+            retry_dest,
+            view_rx,
+            Some(rtx),
+        )
+        .await;
+        assert_eq!(retry_failures, vec!["Beta: still offline"]);
+        let mut retry_events = Vec::new();
+        while let Ok(ev) = rrx.try_recv() {
+            retry_events.push(ev);
+        }
+        assert!(retry_events.contains(&UpdateEvent::MachineSettled {
+            environment_id: "env-b".into(),
+            failure: Some("still offline".into()),
+            server_updated: false,
+            provider_failure: None,
+        }));
+        let mut fa = server_a.await.unwrap();
+        assert!(fa.take_commands().is_empty());
+        let _fb = server_b.await.unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn run_channel_switch_with_progress_dispatches_boot_service_and_track_only_hosts() {
+        let session_json = json!({"authenticated":true,"permissions":["environment:maintain"]});
+        let (handle_boot, mut fixture_boot) =
+            crate::supervisor::ClientFixture::handle(serde_json::from_value(session_json.clone()).unwrap());
+        let (handle_track, mut fixture_track) =
+            crate::supervisor::ClientFixture::handle(serde_json::from_value(session_json).unwrap());
+
+        let make_entry = |id: &str, config: Value, grants| {
+            let mut cfg = t3_core::server_config::ServerConfigState::default();
+            cfg.apply(serde_json::from_value(json!({"type":"snapshot","config":config})).unwrap());
+            let owner = EnvironmentOwner {
+                saved_id: id.into(),
+                canonical_id: Some(id.into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 0,
+            };
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.synchronized = true;
+            let summary = Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                owner.clone(),
+                &shell,
+                &cfg,
+            ));
+            (
+                owner,
+                Arc::new(EnvironmentView {
+                    summary,
+                    status: ConnectionStatus::Connected,
+                    config: cfg,
+                    grants,
+                    settings_revision: 1,
+                    keybindings_revision: 1,
+                }),
+            )
+        };
+        let (owner_boot, entry_boot) = make_entry(
+            "env-boot",
+            json!({
+                "environment": {
+                    "environmentId": "env-boot",
+                    "label": "Boot",
+                    "serverVersion": "0.1.3-nightly.20261001.3500",
+                    "databaseMigration": 69,
+                    "capabilities": { "serverSelfUpdate": "boot-service" }
+                },
+                "providers": []
+            }),
+            handle_boot.session_state().borrow().clone(),
+        );
+        let (owner_track, entry_track) = make_entry(
+            "env-track",
+            json!({
+                "environment": {
+                    "environmentId": "env-track",
+                    "label": "TrackOnly",
+                    "serverVersion": "0.1.3",
+                    "databaseMigration": 69,
+                    "platform": { "os": "darwin", "machine": "arm64" },
+                    "capabilities": {
+                        "serverSelfUpdate": "desktop-managed",
+                        "desktopAppUpdate": true,
+                        "desktopAppChannelSwitch": true
+                    }
+                },
+                "providers": []
+            }),
+            handle_track.session_state().borrow().clone(),
+        );
+        let (_tx, view_rx) = watch::channel(Arc::new(FleetView {
+            revision: 1,
+            environments: vec![entry_boot, entry_track],
+        }));
+
+        let release = updates::ChannelSwitchRelease {
+            channel: UpdateTrack::Latest,
+            version: "0.1.3".into(),
+            database_migration: Some(69),
+        };
+        let cfg_boot = view_rx.borrow().environment("env-boot").unwrap().config.config.clone();
+        let cfg_track = view_rx.borrow().environment("env-track").unwrap().config.config.clone();
+        let machines = [
+            updates::Machine {
+                id: "env-boot",
+                label: "Boot",
+                config: cfg_boot.as_ref(),
+                connected: true,
+                hosted_by_this_app: false,
+                can_maintain: true,
+                can_manage_providers: false,
+                updating: false,
+            },
+            updates::Machine {
+                id: "env-track",
+                label: "TrackOnly",
+                config: cfg_track.as_ref(),
+                connected: true,
+                hosted_by_this_app: false,
+                can_maintain: true,
+                can_manage_providers: false,
+                updating: false,
+            },
+        ];
+        let switch = updates::collect_channel_switch(&machines, &release);
+        assert_eq!(switch.targets.len(), 2);
+        let captures = capture_channel_switch(&switch, &view_rx.borrow()).unwrap();
+        let destinations = captures
+            .into_iter()
+            .map(|capture| {
+                let (owner, client) = if capture.owner.saved_id == "env-boot" {
+                    (owner_boot.clone(), handle_boot.clone())
+                } else {
+                    (owner_track.clone(), handle_track.clone())
+                };
+                UpdateDestination {
+                    capture,
+                    scope: "environment:maintain",
+                    receipt: Ok(Destination { owner, client }),
+                }
+            })
+            .collect();
+
+        let boot_task = tokio::spawn(async move {
+            let (method, input, reply) = fixture_boot.next_request().await;
+            assert_eq!(method, "server.updateServer");
+            assert!(
+                input.get("channel").is_none(),
+                "boot-service channel switch must omit RPC channel field"
+            );
+            assert_eq!(input["targetVersion"], "0.1.3");
+            assert_eq!(input["targetDatabaseMigration"], 69);
+            let _ = reply.send(Err(crate::session::RpcError::Failure(
+                t3_core::rpc::RpcFailure {
+                    tag: None,
+                    message: "restart failed".into(),
+                    error: Value::Null,
+                },
+            )));
+            fixture_boot
+        });
+        let track_task = tokio::spawn(async move {
+            let (method, input, reply) = fixture_track.next_request().await;
+            assert_eq!(method, "server.updateServer");
+            assert_eq!(input["channel"], "latest");
+            assert_eq!(input["targetVersion"], "0.1.3");
+            assert_eq!(input["targetDatabaseMigration"], 69);
+            let _ = reply.send(Ok(json!({
+                "targetVersion": "0.1.3",
+                "method": "desktop-app"
+            })));
+            fixture_track
+        });
+
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let result = run_channel_switch_with_progress(
+            switch,
+            UpdateTrack::Latest,
+            destinations,
+            view_rx,
+            Some(ev_tx),
+        )
+        .await;
+        assert_eq!(result.updated_servers, 1);
+        assert_eq!(result.failures, vec!["Boot: restart failed"]);
+        let mut seen = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            seen.push(ev);
+        }
+        assert!(seen.iter().any(|ev| matches!(
+            ev,
+            UpdateEvent::MachineSettled {
+                environment_id,
+                server_updated: false,
+                ..
+            } if environment_id == "env-boot"
+        )));
+        assert!(!seen.iter().any(|ev| matches!(
+            ev,
+            UpdateEvent::MachineSettled { environment_id, .. } if environment_id == "env-track"
+        )));
+        let _ = boot_task.await.unwrap();
+        let _ = track_task.await.unwrap();
     }
 }
 

@@ -1,10 +1,9 @@
-use super::{Host, plan};
-use t3_client::updates::{CapturedUpdateOwner, UpdateDestination};
+use super::{Host, plan_with};
+use t3_client::updates::CapturedUpdateOwner;
 use crate::{
     app_state::{AppEvent, AppState},
     icons::Icon,
     theme::{hsla, palette, rem},
-    toast::{Toast, ToastKind},
 };
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, KeyDownEvent, MouseButton, ParentElement,
@@ -82,13 +81,25 @@ impl UpdateDialog {
             (restart.environment_id.clone(), count)
         }).collect()
     }
-    fn disabled_reason(&self, cx: &App) -> Option<&'static str> {
-        if self.fixture { return None; }
+    pub(super) fn disabled_reason(&self, cx: &App) -> Option<&'static str> {
+        if self.fixture {
+            return None;
+        }
         let state = self.state.read(cx);
-        let Some(opening) = &self.plan else { return Some("No updates are selected."); };
-        if opening != &plan(state, false)
-            || self.captures.as_ref().ok() != t3_client::updates::capture(opening, &state.fleet).as_ref().ok()
-            || self.captures.is_err() {
+        let Some(opening) = &self.plan else {
+            return Some("No updates are selected.");
+        };
+        let control = cx.try_global::<Host>().and_then(|h| h.control.upgrade());
+        let current_plan = plan_with(state, |id| {
+            control
+                .as_ref()
+                .is_some_and(|c| c.read(cx).is_updating(id))
+        });
+        if opening != &current_plan
+            || self.captures.as_ref().ok()
+                != t3_client::updates::capture(opening, &state.fleet).as_ref().ok()
+            || self.captures.is_err()
+        {
             return Some("Updates changed. Close this dialog and review them again.");
         }
         None
@@ -138,50 +149,14 @@ impl UpdateDialog {
         let Some(plan) = self.plan.clone() else {
             return;
         };
-        let state = self.state.read(cx);
-        let Ok(captures) = self.captures.clone() else { return; };
-        let mut lookups = Vec::new();
-        for capture in captures {
-            for (scope, needed) in [
-                ("providers:manage", plan.providers.iter().any(|p| p.environment_id == capture.owner.saved_id)),
-                ("environment:maintain", plan.servers.iter().any(|s| s.environment_id == capture.owner.saved_id)),
-            ] {
-                if needed {
-                    let receipt = state.connections.destination(&capture.owner, scope);
-                    lookups.push((capture.clone(), scope, receipt));
-                }
-            }
-        }
-        let view = state.connections.view();
-        let runtime = state.runtime().clone();
-        let state = self.state.clone();
+        let Ok(captures) = self.captures.clone() else {
+            return;
+        };
         let control = cx.global::<Host>().control.clone();
         self.close(window, cx);
         if let Some(control) = control.upgrade() {
-            control.update(cx, |control, cx| control.busy(Some("Updating…".into()), cx));
+            control.update(cx, |control, cx| control.start_run(plan, captures, cx));
         }
-        let task = runtime.spawn(async move {
-            let mut destinations = Vec::new();
-            for (capture, scope, receipt) in lookups {
-                destinations.push(UpdateDestination { capture, scope, receipt: receipt.await });
-            }
-            t3_client::updates::run(plan, destinations, view).await
-        });
-        cx.spawn(async move |_, cx| {
-            let failures = task.await.unwrap_or_else(|e| vec![e.to_string()]);
-            if let Some(control) = control.upgrade() {
-                control.update(cx, |control, cx| control.busy(None, cx));
-            }
-            state.update(cx, |state, cx| {
-                let (kind, title) = if failures.is_empty() {
-                    (ToastKind::Success, "Updates complete")
-                } else {
-                    (ToastKind::Error, "Some updates failed")
-                };
-                state.show_toast(Toast::new(kind, title).description(failures.join("\n")), cx);
-            });
-        })
-        .detach();
     }
 }
 impl Render for UpdateDialog {
