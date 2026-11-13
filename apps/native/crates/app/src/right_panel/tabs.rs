@@ -19,23 +19,31 @@ struct SurfaceAction {
     shortcut: &'static str,
     open: fn(&mut AppState, &mut gpui::Context<AppState>),
     /// Why the entry is unavailable, if it is.
-    unavailable: fn(&App) -> Option<&'static str>,
+    unavailable: fn(&AppState, &App) -> Option<&'static str>,
 }
 
-fn always(_: &App) -> Option<&'static str> {
+fn always(_: &AppState, _: &App) -> Option<&'static str> {
     None
 }
 
 /// `browserAvailable` with `SURFACE_UNAVAILABLE_HINTS.browser`.
-fn browser_unavailable(cx: &App) -> Option<&'static str> {
+fn browser_unavailable(_: &AppState, cx: &App) -> Option<&'static str> {
     crate::preview::previews(cx).and_then(|previews| previews.read(cx).availability().launcher_hint())
+}
+
+fn files_unavailable(state: &AppState, _: &App) -> Option<&'static str> {
+    state.file_workspace().is_none().then_some("Available when a project is open.")
+}
+
+fn server_thread_unavailable(state: &AppState, _: &App) -> Option<&'static str> {
+    state.selected_thread.is_none().then_some("Available for server threads.")
 }
 
 const SURFACE_ACTIONS: &[SurfaceAction] = &[
     SurfaceAction { label: "Browser", icon: Icon::Earth, shortcut: "B", open: crate::preview::add_browser_surface, unavailable: browser_unavailable },
-    SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface, unavailable: always },
-    SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: always },
-    SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: always },
+    SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface, unavailable: files_unavailable },
+    SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: server_thread_unavailable },
+    SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: server_thread_unavailable },
     SurfaceAction { label: "Device", icon: Icon::Smartphone, shortcut: "M", open: crate::device::add_device_surface, unavailable: always },
 ];
 
@@ -113,7 +121,7 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
         .collect();
     let add_state = state.clone();
     let side_chat = side_chat_entry(state.read(cx));
-    let unavailable: Vec<Option<&'static str>> = SURFACE_ACTIONS.iter().map(|action| (action.unavailable)(cx)).collect();
+    let unavailable: Vec<Option<&'static str>> = SURFACE_ACTIONS.iter().map(|action| (action.unavailable)(state.read(cx), cx)).collect();
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
         .flex_none()
@@ -165,7 +173,8 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
         (Some(thread), _) => thread.title.clone().into(),
         (None, Some(tab)) => {
             let previews = crate::preview::previews(cx);
-            let snapshot = previews.as_ref().zip(state.read(cx).selected_thread.as_deref()).and_then(|(previews, thread)| previews.read(cx).session(thread, tab));
+            let thread_key = state.read(cx).panel_thread();
+            let snapshot = previews.as_ref().zip(thread_key.as_deref()).and_then(|(previews, thread)| previews.read(cx).session(thread, tab));
             t3_core::preview::tab_title(snapshot).into()
         }
         (None, None) => surface.title().into(),
@@ -281,7 +290,7 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
         let state = state.clone();
         let open = action.open;
         let row_id = ElementId::from(("surface-launcher", index));
-        let reason = (action.unavailable)(cx);
+        let reason = (action.unavailable)(state.read(cx), cx);
         focusable(h_flex().id(row_id.clone()), row_id, reason.is_none(), window, cx)
             .h(px(32.))
             .w_full()

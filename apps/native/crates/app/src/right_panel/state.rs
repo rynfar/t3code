@@ -127,11 +127,17 @@ impl AppState {
 
     /// `diff.toggle` (`cmd-d`).
     pub fn toggle_diff(&mut self, cx: &mut Context<Self>) {
+        if self.selected_thread.is_none() {
+            return;
+        }
         self.mutate_panels(cx, |state, thread| state.panels.toggle(thread, Surface::diff()));
     }
 
     /// The "Linked pull requests" launcher entry and "Show linked pull requests".
     pub fn add_pull_requests_surface(&mut self, cx: &mut Context<Self>) {
+        if self.selected_thread.is_none() {
+            return;
+        }
         self.mutate_panels(cx, |state, thread| {
             state.panels.open(thread, Surface::pull_requests());
             true
@@ -140,7 +146,7 @@ impl AppState {
 
     /// The "Diff" launcher entry: always opens on the branch scope (`addDiffSurface`).
     pub fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.panel_thread() else { return };
+        let Some(thread_id) = self.selected_thread.clone() else { return };
         self.reset_diff_to_branch(&thread_id);
         self.panels.explicit_diff_open = Some(thread_id);
         self.mutate_panels(cx, |state, thread| {

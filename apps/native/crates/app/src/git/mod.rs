@@ -40,6 +40,8 @@ pub enum GitEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub thread_id: String,
+    pub project_id: String,
+    pub is_draft: bool,
     pub cwd: String,
     pub project_cwd: String,
     pub worktree_path: Option<String>,
@@ -176,6 +178,8 @@ impl GitStore {
             let project = state.shell.project(&thread.project_id)?;
             return Some(Target {
                 thread_id: thread.id.clone(),
+                project_id: thread.project_id.clone(),
+                is_draft: false,
                 cwd: thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
                 project_cwd: project.workspace_root.clone(),
                 worktree_path: thread.worktree_path.clone(),
@@ -189,6 +193,8 @@ impl GitStore {
         }
         Some(Target {
             thread_id: t3_core::composer::drafts::new_thread_key(project_id),
+            project_id: project_id.to_owned(),
+            is_draft: true,
             cwd: project.workspace_root.clone(),
             project_cwd: project.workspace_root.clone(),
             worktree_path: None,
@@ -409,7 +415,13 @@ impl GitStore {
         }
         let (Some(origin), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
         let action_id = uuid_v4();
-        let request = RunRequest { commit_message: commit_message.as_deref(), feature_branch, file_paths: file_paths.as_deref(), thread_id: Some(&origin.thread_id) };
+        let request = RunRequest {
+            commit_message: commit_message.as_deref(),
+            feature_branch,
+            file_paths: file_paths.as_deref(),
+            thread_id: (!origin.is_draft).then_some(origin.thread_id.as_str()),
+            project_id: origin.is_draft.then_some(origin.project_id.as_str()),
+        };
         let payload = git_actions::run_stacked_action(&action_id, &origin.cwd, action, &request);
         let terms = terminology(self.status.as_ref().and_then(VcsStatus::provider_kind));
         self.begin(Operation::RunChangeRequest, &action_id, cx);
@@ -458,7 +470,8 @@ impl GitStore {
         match result {
             Ok(result) => {
                 // `persistThreadBranchSync` for the thread the action ran for.
-                if let Some(branch) = result.created_branch()
+                if !origin.is_draft
+                    && let Some(branch) = result.created_branch()
                     && origin.branch.as_deref() != Some(branch)
                     && self.can_operate_thread()
                 {
@@ -590,12 +603,12 @@ impl GitStore {
     /// `selectBranch`: reuse the worktree a ref is checked out in, else check it out here.
     pub fn select_ref(&mut self, item: &VcsRef, cx: &mut Context<Self>) {
         let Some(origin) = self.target.clone() else { return };
-        if self.branch_pending || !self.can_operate_thread() {
+        if self.branch_pending || (!origin.is_draft && !self.can_operate_thread()) {
             return;
         }
         let selection = vcs::branch_selection_target(&origin.project_cwd, origin.worktree_path.as_deref(), item);
-        if selection.reuse_existing_worktree {
-            self.set_thread_branch(&origin.thread_id, Some(&item.name), selection.next_worktree_path.as_deref(), cx);
+        if !origin.is_draft && selection.reuse_existing_worktree {
+            self.set_thread_branch(&origin, Some(&item.name), selection.next_worktree_path.as_deref(), cx);
             return;
         }
         if !self.allow_branch_change(cx) {
@@ -659,7 +672,7 @@ impl GitStore {
                         if shown {
                             store.optimistic_branch = Some(Some(branch.clone()));
                         }
-                        store.set_thread_branch(&origin.thread_id, Some(&branch), worktree.as_deref(), cx);
+                        store.set_thread_branch(&origin, Some(&branch), worktree.as_deref(), cx);
                     }
                     Err(message) => {
                         if shown {
@@ -680,11 +693,11 @@ impl GitStore {
     }
 
     /// `setThreadBranch` for a server thread: record the branch and worktree it now follows.
-    fn set_thread_branch(&mut self, thread_id: &str, branch: Option<&str>, worktree_path: Option<&str>, cx: &mut Context<Self>) {
-        if !self.can_operate_thread() {
+    fn set_thread_branch(&mut self, origin: &Target, branch: Option<&str>, worktree_path: Option<&str>, cx: &mut Context<Self>) {
+        if origin.is_draft || !self.can_operate_thread() {
             return;
         }
-        let command = vcs::update_thread_branch(&uuid_v4(), thread_id, branch, worktree_path);
+        let command = vcs::update_thread_branch(&uuid_v4(), &origin.thread_id, branch, worktree_path);
         self.state.update(cx, |state, cx| state.dispatch_then(command, Some("Failed to update the thread's branch"), cx, |_, _, _| {}));
     }
 

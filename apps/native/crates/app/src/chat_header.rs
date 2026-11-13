@@ -364,8 +364,7 @@ impl Render for ChatHeader {
 /// toggles, so the header keeps Thread details (`ThreadPanelHeaderControl`).
 pub fn controls(state: &Entity<AppState>, terminal_toggle: Option<AnyElement>, window: &Window, cx: &App) -> impl IntoElement {
     let app = state.read(cx);
-    let thread = app.selected_thread.clone();
-    let panel_open = thread.as_deref().is_some_and(|thread| app.panels.panels.is_open(thread));
+    let panel_open = app.panel_thread().is_some_and(|thread| app.panels.panels.is_open(&thread));
     let details_available = thread_details::panel_key(app).is_some();
     let layout = thread_details::layout(state, window, cx);
     let label = keymap::label("threadPanel.toggle", cx).map_or_else(|| "Toggle thread details".to_owned(), |key| format!("Toggle thread details ({key})"));
