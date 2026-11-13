@@ -232,9 +232,7 @@ impl SidebarPane {
                 AppEvent::Phase | AppEvent::ServerConfig => {
                     this.sync_snooze_grants(cx);
                     this.search.refresh(&this.state, cx);
-                    if this.search.is_active() {
-                        cx.notify();
-                    }
+                    cx.notify();
                 }
                 AppEvent::SidebarSelection => {
                     let state = this.state.read(cx);
@@ -342,6 +340,8 @@ impl SidebarPane {
             }),
         ];
         let updates = cx.new(|cx| crate::updates::UpdateControl::new(state.clone(), cx));
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.observe(&updates, |_, _, cx| cx.notify()));
         let mut pane = SidebarPane {
             updates,
             composer,
@@ -890,12 +890,16 @@ impl SidebarPane {
 
     /// `SidebarChromeFooter`: a row of 32px utility buttons (Settings, Pull requests, Usage), or
     /// Back while the pull requests page is open, then the Undo notice in the space left.
-    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let on_pull_requests = self.state.read(cx).pull_requests_open;
+        let (on_pull_requests, show_pull_requests) = {
+            let state = self.state.read(cx);
+            (state.pull_requests_open, pull_requests_supported(state))
+        };
         let utility = |id: &'static str, glyph: Icon, label: &'static str| {
             div()
                 .id(id)
+                .debug_selector(move || id.to_owned())
                 .group(id)
                 .size(px(32.))
                 .flex()
@@ -909,7 +913,7 @@ impl SidebarPane {
                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
         };
         let state = self.state.clone();
-        let mut row = div().flex().items_center().gap(px(4.));
+        let mut row = div().w_full().flex().items_center().gap(px(4.));
         if on_pull_requests {
             row = row.child(
                 div()
@@ -934,19 +938,31 @@ impl SidebarPane {
         } else {
             row = row
                 .child(utility("sidebar-settings", Icon::Settings, "Settings").on_click(|_, _, cx| crate::settings::open(Section::General, cx)))
-                .child(
+                .children(show_pull_requests.then(|| {
+                    let state = state.clone();
                     utility("sidebar-pull-requests", Icon::GitPullRequestArrow, "Pull requests")
                         .on_click(move |_, _, cx| state.update(cx, |state, cx| {
                             state.close_sidebar_sheet(cx);
                             state.set_pull_requests_open(true, cx);
-                        })),
-                )
+                        }))
+                }))
                 .child(
                     utility("sidebar-usage", Icon::ChartNoAxesColumn, "Usage")
                         .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::usage::OpenUsage), cx)),
                 );
         }
-        div().flex_none().px(px(8.)).pt(px(4.)).pb(px(8.)).child(row.children(self.render_undo_notice(cx)))
+        let update_control = self
+            .updates
+            .update(cx, |updates, cx| updates.render_footer_control(window, cx));
+        div()
+            .flex_none()
+            .px(px(8.))
+            .pt(px(4.))
+            .pb(px(8.))
+            .child(
+                row.children(self.render_undo_notice(cx))
+                    .children(update_control),
+            )
     }
 
     /// `SidebarThreadUndoNotice`: "<summary>, ⌘Z to undo" in the footer row's free space.
@@ -995,6 +1011,32 @@ fn snooze_access(state: &AppState) -> bool {
         && state.server_config.config.is_some()
         && state.sidebar.capabilities.can_operate
         && state.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
+}
+
+fn pull_requests_supported(state: &AppState) -> bool {
+    if state.fleet.environments.is_empty() {
+        let active_disabled = state.environments.active.as_deref().is_some_and(|active| {
+            state
+                .environments
+                .environments
+                .iter()
+                .any(|record| record.id == active && record.disabled)
+        });
+        !active_disabled && state.server_config.config.is_some()
+    } else {
+        state.fleet.environments.iter().any(|entry| {
+            let disabled = state
+                .environments
+                .environments
+                .iter()
+                .any(|record| record.id == entry.summary.owner.saved_id && record.disabled);
+            !disabled
+                && (entry.config.config.is_some()
+                    || (state.environments.active.as_deref()
+                        == Some(entry.summary.owner.saved_id.as_str())
+                        && state.server_config.config.is_some()))
+        })
+    }
 }
 
 fn new_thread_label(cx: &App) -> String {
@@ -1077,6 +1119,9 @@ impl Render for SidebarPane {
                 .on_drop(cx.listener(|this, _: &drag::DraggedProject, _, cx| this.finish_project_drag(true, cx)))
                 .into_any_element()
         };
+        let notices = self
+            .updates
+            .update(cx, |updates, cx| updates.render_notices(window, cx));
         div()
             .size_full()
             .flex()
@@ -1095,8 +1140,8 @@ impl Render for SidebarPane {
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .child(self.updates.clone())
-            .child(self.render_footer(cx))
+            .children(notices)
+            .child(self.render_footer(window, cx))
             .children(self.render_project_filter(cx))
     }
 }
@@ -2883,6 +2928,331 @@ mod sb_sections_pane_tests {
         assert_eq!(params["threadId"], "snoozed-queued");
         assert!(fix_ro.take_commands().is_empty());
 
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod footer_tests {
+    use super::*;
+    use gpui::{AppContext, StyleRefinement};
+    use std::{cell::Cell, rc::Rc};
+    use crate::context_menu::project_filter_tests::install_state;
+    use t3_client::supervisor::ConnectionStatus;
+
+    struct NarrowCachedSidebar {
+        pane: Entity<SidebarPane>,
+        menu: Entity<ContextMenu>,
+        width: Pixels,
+    }
+
+    impl Render for NarrowCachedSidebar {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(self.width)
+                .h_full()
+                .child(self.pane.clone().cached(StyleRefinement::default().size_full()))
+                .child(self.menu.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn footer_gates_pull_requests_and_inlines_circular_update_and_capsule(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |s, cx| {
+                s.server_config.config = None;
+                s.rebuild_sidebar(cx);
+            });
+            (state, fixture)
+        });
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| {
+                SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx)
+            });
+            NarrowCachedSidebar {
+                pane,
+                menu,
+                width: px(208.),
+            }
+        });
+        let pane = root.read_with(vcx, |root, _| root.pane.clone());
+        let pane_notifications = Rc::new(Cell::new(0usize));
+        let observed = pane_notifications.clone();
+        let _observe_pane = vcx.update(|_, cx| {
+            cx.observe(&pane, move |_, cx| {
+                observed.set(observed.get() + 1);
+                cx.refresh_windows();
+            })
+        });
+        let draw_bounds = |vcx: &mut gpui::VisualTestContext| {
+            pane.update(vcx, |_, cx| cx.notify());
+            vcx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+        };
+
+        vcx.run_until_parked();
+        draw_bounds(vcx);
+
+        assert!(vcx.debug_bounds("sidebar-settings").is_some());
+        assert!(vcx.debug_bounds("sidebar-usage").is_some());
+        assert!(
+            vcx.debug_bounds("sidebar-pull-requests").is_none(),
+            "Pull requests utility button must hide when server_config is None"
+        );
+        assert!(vcx.debug_bounds("update-everything").is_none());
+
+        // ServerConfig load notifies cached SidebarPane and shows #sidebar-pull-requests.
+        let before_server_config = pane_notifications.get();
+        state.update(vcx, |s, cx| {
+            s.server_config.config = serde_json::from_value(serde_json::json!({
+                "environment": { "environmentId": "local", "label": "Local" },
+                "cwd": "/tmp",
+                "providers": []
+            }))
+            .ok();
+            cx.emit(AppEvent::ServerConfig);
+        });
+        vcx.run_until_parked();
+        assert!(
+            pane_notifications.get() > before_server_config,
+            "AppEvent::ServerConfig must notify SidebarPane"
+        );
+        draw_bounds(vcx);
+        assert!(
+            vcx.debug_bounds("sidebar-pull-requests").is_some(),
+            "Pull requests utility button must appear once server_config loads"
+        );
+
+        // Multi-environment fleet gating: disabled env does not expose PRs; enabled env with config does.
+        let mut config_loaded = t3_core::server_config::ServerConfigState::default();
+        config_loaded.apply(
+            serde_json::from_value(serde_json::json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": { "environmentId": "env-remote", "label": "Remote" },
+                    "cwd": "/tmp",
+                    "providers": []
+                }
+            }))
+            .unwrap(),
+        );
+        let owner = |saved_id: &str| t3_core::sidebar::grouping::EnvironmentOwner {
+            saved_id: saved_id.into(),
+            canonical_id: None,
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 1,
+        };
+        let disabled_env = Arc::new(t3_client::environments::EnvironmentView {
+            summary: Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                owner("saved-disabled"),
+                &t3_core::shell::ShellState::default(),
+                &config_loaded,
+            )),
+            status: ConnectionStatus::Connected,
+            config: config_loaded.clone(),
+            grants: None,
+            settings_revision: 0,
+            keybindings_revision: 0,
+        });
+        let enabled_env = Arc::new(t3_client::environments::EnvironmentView {
+            summary: Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                owner("saved-enabled"),
+                &t3_core::shell::ShellState::default(),
+                &config_loaded,
+            )),
+            status: ConnectionStatus::Connected,
+            config: config_loaded,
+            grants: None,
+            settings_revision: 0,
+            keybindings_revision: 0,
+        });
+        state.read_with(vcx, |s, _| {
+            assert!(pull_requests_supported(s));
+        });
+        state.update(vcx, |s, cx| {
+            s.server_config.config = None;
+            s.environments.environments = vec![
+                t3_client::store::SavedEnvironment {
+                    id: "saved-disabled".into(),
+                    environment_id: None,
+                    label: "Disabled".into(),
+                    http_base: "http://localhost:9001".into(),
+                    disabled: true,
+                    access_token: None,
+                    server_version: None,
+                    local: false,
+                    ssh: None,
+                },
+                t3_client::store::SavedEnvironment {
+                    id: "saved-enabled".into(),
+                    environment_id: None,
+                    label: "Enabled".into(),
+                    http_base: "http://localhost:9002".into(),
+                    disabled: false,
+                    access_token: None,
+                    server_version: None,
+                    local: false,
+                    ssh: None,
+                },
+            ];
+            s.fleet = Arc::new(t3_client::environments::FleetView {
+                revision: 1,
+                environments: vec![disabled_env.clone()],
+            });
+            assert!(!pull_requests_supported(s));
+            s.fleet = Arc::new(t3_client::environments::FleetView {
+                revision: 2,
+                environments: vec![disabled_env, enabled_env],
+            });
+            assert!(pull_requests_supported(s));
+            s.fleet = Arc::new(t3_client::environments::FleetView::default());
+            s.environments.environments.clear();
+            s.server_config.config = serde_json::from_value(serde_json::json!({
+                "environment": { "environmentId": "local", "label": "Local" },
+                "cwd": "/tmp",
+                "providers": []
+            }))
+            .ok();
+            cx.emit(AppEvent::ServerConfig);
+        });
+        vcx.run_until_parked();
+
+        // Provider pill renders stacked ABOVE footer while circular 32x32 #update-everything renders inline at right end.
+        let before_updates_fixture = pane_notifications.get();
+        vcx.update(|window, cx| {
+            crate::updates::show_fixture(
+                serde_json::json!({
+                    "providers": [{
+                        "instanceId": "codex",
+                        "driver": "codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "checkedAt": "2026-04-17T00:00:00.000Z",
+                        "versionAdvisory": {
+                            "status": "behind_latest",
+                            "latestVersion": "0.99.0",
+                            "canUpdate": true,
+                            "updateCommand": "npm i -g @openai/codex"
+                        }
+                    }],
+                    "plan": {
+                        "servers": [{
+                            "environmentId": "local",
+                            "label": "Local",
+                            "targetVersion": "0.2.0",
+                            "selfUpdate": "npm"
+                        }],
+                        "providers": [],
+                        "rows": [],
+                        "restarts": []
+                    }
+                }),
+                window,
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        assert!(
+            pane_notifications.get() > before_updates_fixture,
+            "UpdateControl changes must notify SidebarPane"
+        );
+        draw_bounds(vcx);
+
+        let settings = vcx.debug_bounds("sidebar-settings").unwrap();
+        let usage = vcx.debug_bounds("sidebar-usage").unwrap();
+        let pill = vcx
+            .debug_bounds("provider-update-main")
+            .expect("provider pill renders above footer");
+        let update_btn = vcx
+            .debug_bounds("update-everything")
+            .expect("circular #update-everything renders inline in footer");
+        assert!(
+            pill.bottom() <= settings.top(),
+            "provider pill ({pill:?}) must stay stacked above footer ({settings:?})"
+        );
+        assert_eq!(update_btn.size.width, px(32.));
+        assert_eq!(update_btn.size.height, px(32.));
+        assert!(
+            (update_btn.center().y - settings.center().y).abs() <= px(2.),
+            "update button ({update_btn:?}) must align inline on footer row ({settings:?})"
+        );
+        assert!(
+            update_btn.origin.x > usage.right(),
+            "update button ({update_btn:?}) must sit to the right of Usage ({usage:?})"
+        );
+        assert!(update_btn.right() <= px(208.));
+
+        // Active update run hides #update-everything and puts #update-capsule inline inside the 208px footer without overflowing, with upward popover.
+        vcx.update(|window, cx| {
+            crate::updates::show_fixture(
+                serde_json::json!({
+                    "plan": {
+                        "servers": [{
+                            "environmentId": "local",
+                            "label": "Local",
+                            "targetVersion": "0.2.0",
+                            "selfUpdate": "npm"
+                        }],
+                        "providers": [],
+                        "rows": [],
+                        "restarts": []
+                    },
+                    "busy": "Updating 2 machines",
+                    "capsuleOpen": true
+                }),
+                window,
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        draw_bounds(vcx);
+
+        assert!(vcx.debug_bounds("update-everything").is_none());
+        let settings = vcx.debug_bounds("sidebar-settings").unwrap();
+        let usage = vcx.debug_bounds("sidebar-usage").unwrap();
+        let capsule = vcx
+            .debug_bounds("update-capsule")
+            .expect("#update-capsule renders inline in narrow 208px footer");
+        let popover = vcx
+            .debug_bounds("update-capsule-popover")
+            .expect("#update-capsule-popover renders when capsule_open");
+        assert_eq!(capsule.size.height, px(32.));
+        assert!(
+            (capsule.center().y - settings.center().y).abs() <= px(2.),
+            "capsule ({capsule:?}) must sit inline on footer row ({settings:?})"
+        );
+        assert!(
+            capsule.origin.x > usage.right(),
+            "capsule ({capsule:?}) must sit to the right of Usage ({usage:?})"
+        );
+        assert!(
+            capsule.right() <= px(208.),
+            "capsule ({capsule:?}) must not overflow 208px narrow sidebar"
+        );
+        assert!(
+            popover.bottom() <= capsule.top(),
+            "capsule popover ({popover:?}) must open upward above capsule ({capsule:?})"
+        );
+
+        let _ = root;
         state.update(vcx, |s, _| s.stop_pump());
     }
 }
