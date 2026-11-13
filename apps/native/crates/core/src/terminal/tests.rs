@@ -55,6 +55,16 @@ fn metadata_upserts_replace_in_place_order_and_removes_drop() {
     let ids: Vec<&str> = terminals.iter().map(|t| t.terminal_id.as_str()).collect();
     assert_eq!(ids, ["term-2", "term-1"]);
     assert!(terminals[1].has_running_subprocess);
+    // The sidebar's per-thread running ids keep metadata order and skip idle shells.
+    let mut other = summary("term-9", true);
+    other.thread_id = "t2".into();
+    terminals.push(other);
+    apply_metadata(&mut terminals, MetadataEvent::Upsert { terminal: summary("term-3", true) });
+    assert_eq!(running_by_thread(&terminals), std::collections::BTreeMap::from([
+        ("t1".to_owned(), vec!["term-1".to_owned(), "term-3".to_owned()]),
+        ("t2".to_owned(), vec!["term-9".to_owned()]),
+    ]));
+    terminals.retain(|t| t.thread_id == "t1" && t.terminal_id != "term-3");
     let remove: MetadataEvent = serde_json::from_value(json!({ "type": "remove", "threadId": "t1", "terminalId": "term-2" })).unwrap();
     apply_metadata(&mut terminals, remove);
     assert_eq!(terminals.len(), 1);

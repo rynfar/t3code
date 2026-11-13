@@ -297,9 +297,17 @@ impl Render for Workspace {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
                 this.pull_requests.update(cx, |page, cx| page.set_modifiers(event.modifiers, cx));
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.state.update(cx, |state, cx| state.clear_thread_selection(cx)) {
-                    cx.stop_propagation();
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    let overlay_open = this.menu.read(cx).is_open()
+                        || this.dialog.read(cx).is_open()
+                        || this.snooze.read(cx).is_open()
+                        || this.palette.read(cx).is_open()
+                        || crate::updates::overlay(cx).is_some()
+                        || this.welcome.read(cx).is_open();
+                    if this.sidebar.update(cx, |sidebar, cx| sidebar.handle_escape(overlay_open, window, cx)) {
+                        cx.stop_propagation();
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &JumpToThread1, _, cx| this.jump(0, cx)))
@@ -408,8 +416,13 @@ impl Workspace {
 
     fn traverse(&mut self, next: bool, cx: &mut Context<Self>) {
         if !self.state.read(cx).fleet.environments.is_empty() {
-            let target = { let state = self.state.read(cx); let selected = state.selected_thread.as_deref().and_then(|id| state.active_thread_key(id)); state.sidebar.fleet.adjacent_thread(selected.as_ref(), next).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key.thread_id))) };
-            if let Some((owner, id)) = target { self.state.update(cx, |state, cx| state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id), cx)); }
+            let target = { let state = self.state.read(cx); let selected = state.selected_thread.as_deref().and_then(|id| state.active_thread_key(id)); state.sidebar.fleet.adjacent_thread(selected.as_ref(), next).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key))) };
+            if let Some((owner, key)) = target {
+                self.state.update(cx, |state, cx| {
+                    state.anchor_opened_scoped_thread(&key, cx);
+                    state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx);
+                });
+            }
             return;
         }
         let target = {
@@ -417,18 +430,29 @@ impl Workspace {
             state.sidebar.model.adjacent_thread(state.selected_thread.as_deref(), next).map(str::to_owned)
         };
         if let Some(id) = target {
-            self.state.update(cx, |state, cx| state.select_thread(&id, cx));
+            self.state.update(cx, |state, cx| {
+                state.anchor_opened_thread(&id, cx);
+                state.select_thread(&id, cx);
+            });
         }
     }
 
     fn jump(&mut self, index: usize, cx: &mut Context<Self>) {
         if !self.state.read(cx).fleet.environments.is_empty() {
-            let target = { let state = self.state.read(cx); state.sidebar.fleet.jump_target(index).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key.thread_id))) };
-            if let Some((owner, id)) = target { self.state.update(cx, |state, cx| state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id), cx)); }
+            let target = { let state = self.state.read(cx); state.sidebar.fleet.jump_target(index).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key))) };
+            if let Some((owner, key)) = target {
+                self.state.update(cx, |state, cx| {
+                    state.anchor_opened_scoped_thread(&key, cx);
+                    state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx);
+                });
+            }
             return;
         }
         if let Some(id) = self.state.read(cx).sidebar.model.jump_target(index).map(str::to_owned) {
-            self.state.update(cx, |state, cx| state.select_thread(&id, cx));
+            self.state.update(cx, |state, cx| {
+                state.anchor_opened_thread(&id, cx);
+                state.select_thread(&id, cx);
+            });
         }
     }
 
@@ -442,14 +466,18 @@ impl Workspace {
             }
             if !state.fleet.environments.is_empty() {
                 let Some(key) = state.active_thread_key(&id) else { return };
-                let next = state.sidebar.fleet.adjacent_thread(Some(&key), true).or_else(|| state.sidebar.fleet.adjacent_thread(Some(&key), false)).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key.thread_id)));
+                let next = state.sidebar.fleet.adjacent_thread(Some(&key), true).or_else(|| state.sidebar.fleet.adjacent_thread(Some(&key), false)).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key)));
                 state.run_scoped_thread_action(&key, t3_core::thread_actions::ThreadAction::Settle, &[], cx);
-                if let Some((owner, id)) = next { state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(id), cx); }
+                if let Some((owner, next_key)) = next {
+                    state.anchor_opened_scoped_thread(&next_key, cx);
+                    state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(next_key.thread_id), cx);
+                }
                 return;
             }
             let next = state.sidebar.model.adjacent_thread(Some(&id), true).or_else(|| state.sidebar.model.adjacent_thread(Some(&id), false)).map(str::to_owned);
             state.settle_thread(&id, cx);
             if let Some(next) = next {
+                state.anchor_opened_thread(&next, cx);
                 state.select_thread(&next, cx);
             }
         });

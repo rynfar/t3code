@@ -888,7 +888,7 @@ fn scoped_keyboard_order_and_undo_keep_same_raw_ids_in_separate_owners(cx: &mut 
             let dragged=active.last().unwrap().clone();
             let target=active[0].clone();
             state.start_scoped_thread_drag(&dragged, cx);
-            let slot=state.sidebar.fleet.rows.iter().position(|row| matches!(row, t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, section:t3_core::sidebar::Section::Active } if state.sidebar.fleet.threads[*index].key==target)).unwrap();
+            let slot=state.sidebar.fleet.rows.iter().position(|row| matches!(row, t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, section:t3_core::sidebar::Section::Active, .. } if state.sidebar.fleet.threads[*index].key==target)).unwrap();
             let plan=state.scoped_thread_drop_target(slot, cx);
             if folders { assert!(plan.is_none(), "folder Active rows are time-ordered, not manually reorderable"); }
             else { assert!(matches!(plan, Some((_, t3_core::sidebar::drag::DropPlan::MoveActive { assignments, .. })) if !assignments.is_empty()), "normal Active mode permits a real reorder"); }

@@ -699,6 +699,8 @@ mod tests {
         let read_only = build_menu(&ThreadActionMenuState { can_operate: false, ..state(&[]) });
         assert!(read_only.iter().find(|item| item.action == ThreadAction::Pin).unwrap().disabled);
         assert!(!read_only.iter().find(|item| item.action == ThreadAction::MarkUnread).unwrap().disabled);
+        assert!(!ThreadAction::MarkUnread.requires_operate());
+        assert!(ThreadAction::FilterByProject.requires_operate());
         assert!(!read_only.iter().find(|item| item.action == ThreadAction::Copy).unwrap().children[0].disabled);
     }
 

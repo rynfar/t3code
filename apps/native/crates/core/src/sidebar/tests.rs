@@ -61,6 +61,9 @@ fn base(id: &str) -> SidebarThread {
         last_visited_at: None,
         regenerating_title: false,
         opens: None,
+        provider_instance_id: "codex".into(),
+        provider_instance_history: Vec::new(),
+        pull_requests: Vec::new(),
     }
 }
 
@@ -491,8 +494,8 @@ fn sidebar_status_follows_the_web_priority() {
     for goal_active in [false, true] {
         assert_eq!(top_status(resolve_status(&preparing), goal_active, true, true), Some(TopStatus { label: "Setting up", icon: StatusIcon::Working, tone: StatusTone::Info }));
     }
-    assert!(should_recede(resolve_status(&preparing), true, true, false));
-    assert!(!should_recede(resolve_status(&preparing), false, false, true));
+    assert!(should_recede(resolve_status(&preparing), true, true, false, false));
+    assert!(!should_recede(resolve_status(&preparing), false, false, true, false));
     assert!(is_thread_working(&preparing));
     for (approval, input, subagent, guest, expected) in [
         (false, false, None, 1, ThreadStatus::Request),
@@ -562,10 +565,39 @@ fn unseen_completion_needs_a_visit_older_than_the_completion() {
     assert!(has_unseen_failure(&failed));
     assert_eq!(top_status(ThreadStatus::Ready, false, false, true).map(|s| s.label), Some("Done"));
     assert_eq!(top_status(ThreadStatus::Working, true, false, false).map(|s| s.label), Some("Goal"));
-    assert!(should_recede(ThreadStatus::Ready, false, false, false));
-    assert!(!should_recede(ThreadStatus::Ready, true, false, false));
-    assert!(!should_recede(ThreadStatus::Input, false, false, false));
-    assert!(!should_recede(ThreadStatus::Working, false, false, true));
+    assert!(should_recede(ThreadStatus::Ready, false, false, false, false));
+    assert!(!should_recede(ThreadStatus::Ready, true, false, false, false));
+    assert!(!should_recede(ThreadStatus::Input, false, false, false, false));
+    assert!(!should_recede(ThreadStatus::Working, false, false, true, false));
+    // A multi-selected row never recedes, like the current one.
+    assert!(!should_recede(ThreadStatus::Working, false, false, false, true));
+    assert!(!should_recede(ThreadStatus::Ready, false, false, false, true));
+}
+
+#[test]
+fn provider_stack_keeps_two_earlier_instances_and_the_live_one_last() {
+    let history = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    // Without a runtime the model selection (`codex`) names the current instance.
+    let idle = SidebarThread { provider_instance_id: "stale".into(), provider_instance_history: history(&["claude", "codex"]), ..base("s") };
+    assert_eq!(idle.provider_stack(), ["claude", "codex"]);
+    let live = SidebarThread {
+        runtime: Some(runtime("running")),
+        provider_instance_id: "cursor".into(),
+        provider_instance_history: history(&["a", "cursor", "b", "c"]),
+        ..base("l")
+    };
+    assert_eq!(live.provider_stack(), ["b", "c", "cursor"]);
+    assert_eq!(SidebarThread { runtime: Some(runtime("idle")), provider_instance_id: "codex".into(), ..base("o") }.provider_stack(), ["codex"]);
+}
+
+#[test]
+fn worktree_label_names_the_last_path_segment_and_branch() {
+    assert_eq!(base("n").worktree_label(), None);
+    assert_eq!(SidebarThread { worktree_path: Some("  ".into()), ..base("b") }.worktree_label(), None);
+    let worktree = SidebarThread { worktree_path: Some("/repo/.t3/worktrees/feature-x/".into()), branch: Some("t3/feature-x".into()), ..base("w") };
+    assert_eq!(worktree.worktree_label().as_deref(), Some("Worktree: feature-x (t3/feature-x)"));
+    assert_eq!(SidebarThread { branch: None, ..worktree.clone() }.worktree_label().as_deref(), Some("Worktree: feature-x"));
+    assert_eq!(worktree_display_name("C:\\work\\tree"), "tree");
 }
 
 #[test]
@@ -1355,7 +1387,17 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     assert_eq!(model.ordered.len(), 1);
     assert_eq!(model.jump_target(0), Some(selected.clone()));
     assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Folder { hidden_count: 1, expanded: false, .. })));
+    assert!(model.rows.iter().any(|row| matches!(row, ScopedSidebarRow::Thread { section: Section::Active, in_folder: true, .. })));
     let normal = ScopedSidebarModel::build(&ScopedSidebarInput { folder_mode: false, ..input }, &mut state);
+    assert!(normal.rows.iter().all(|row| !matches!(row, ScopedSidebarRow::Thread { in_folder: true, .. })));
+    let mut scratch_a = projects[0].clone(); scratch_a.is_scratch = true; scratch_a.environment_label = "Mac Studio".into();
+    let mut scratch_b = projects[1].clone(); scratch_b.is_scratch = false; scratch_b.environment_label = "Cloud VM".into();
+    let scratch_groups = build_scoped_project_groups(&GroupInput { projects: &[scratch_a.clone(), scratch_b], threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::UpdatedAt });
+    let scratch_model = ScopedSidebarModel::build(&ScopedSidebarInput { groups: &scratch_groups, folder_mode: false, ..input }, &mut state);
+    assert_eq!(scratch_model.scratch_machine_labels.get(&scratch_a.reference()).map(String::as_str), Some("Mac Studio"));
+    assert_eq!(scratch_model.scratch_machine_labels.len(), 1);
+    let single_env = ScopedSidebarModel::build(&ScopedSidebarInput { groups: &scratch_groups[..1], folder_mode: false, ..input }, &mut state);
+    assert!(single_env.scratch_machine_labels.is_empty());
     assert_eq!(normal.ordered.len(), 2);
     assert_ne!(normal.row_keys()[0], normal.row_keys()[1]);
     let mut presented_row = ea.threads[0].clone();
@@ -1508,7 +1550,7 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
         assert_eq!(model.section_of(&sibling), Some(section));
         assert_eq!(model.ordered.iter().map(|index| model.threads[*index].key.clone()).collect::<Vec<_>>(), vec![selected.clone()]);
         assert_eq!(model.rows.iter().filter_map(|row| match row {
-            ScopedSidebarRow::Thread { index, section } => Some((model.threads[*index].key.clone(), *section)),
+            ScopedSidebarRow::Thread { index, section, .. } => Some((model.threads[*index].key.clone(), *section)),
             _ => None,
         }).collect::<Vec<_>>(), vec![(selected.clone(), section)]);
         assert!(model.rows.iter().any(|row| matches!(row,

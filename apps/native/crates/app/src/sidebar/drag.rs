@@ -1,15 +1,18 @@
-//! Dragging rows and the thread hover card (design-system §7.2, `sidebar/SidebarThreadRow.tsx`,
-//! `sidebar/SidebarListMarkers.tsx`, `ThreadHoverCard.tsx`). The dragged row stays in place,
+//! Dragging rows (design-system §7.2, `sidebar/SidebarThreadRow.tsx`,
+//! `sidebar/SidebarListMarkers.tsx`). The dragged row stays in place,
 //! dimmed; a raised copy follows the pointer with the drop badge, and a line marks the gap the
 //! row will land in. Drop resolution and planning live in `t3_core::sidebar::drag`.
 
 use gpui::{AnyElement, App, Context, DragMoveEvent, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, prelude::*, px};
 use t3_core::sidebar::Section;
-use t3_core::sidebar::drag::{DropVerb, Marker, resolve_drop_verb};
+use t3_core::sidebar::drag::{DropVerb, Marker, SweepAction, resolve_drop_verb, sweep_keys};
+use t3_core::sidebar::selection::BulkAction;
+use t3_core::sidebar::tag_filter::ThreadKey;
+use t3_core::thread_actions::ThreadAction;
 
 use super::SidebarPane;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{Palette, hsla, palette};
 
 const PREVIEW_WIDTH: f32 = 240.;
 const BOUNDARY_HEIGHT: f32 = 24.;
@@ -43,7 +46,7 @@ impl ThreadDragPreview {
     }
 }
 
-fn verb_icon(verb: DropVerb) -> Icon {
+pub(super) fn verb_icon(verb: DropVerb) -> Icon {
     match verb {
         DropVerb::Pin => Icon::Pin,
         DropVerb::Unpin => Icon::PinOff,
@@ -53,27 +56,29 @@ fn verb_icon(verb: DropVerb) -> Icon {
     }
 }
 
+pub(super) fn drop_verb_badge(verb: DropVerb, p: Palette) -> gpui::Div {
+    div()
+        .flex_none()
+        .h(px(20.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(hsla(p.primary).opacity(0.4))
+        .bg(hsla(p.primary).opacity(0.1))
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(hsla(p.primary))
+        .child(verb_icon(verb).sized(px(12.)))
+        .child(verb.badge().1)
+}
+
 impl Render for ThreadDragPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let badge = self.verb.map(|verb| {
-            div()
-                .flex_none()
-                .h(px(20.))
-                .px(px(6.))
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .rounded(px(4.))
-                .border_1()
-                .border_color(hsla(p.primary).opacity(0.4))
-                .bg(hsla(p.primary).opacity(0.1))
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(hsla(p.primary))
-                .child(verb_icon(verb).sized(px(12.)))
-                .child(verb.badge().1)
-        });
+        let badge = self.verb.map(|verb| drop_verb_badge(verb, p));
         div()
             .w(px(PREVIEW_WIDTH))
             .px(px(10.))
@@ -197,70 +202,158 @@ impl SidebarPane {
     }
 }
 
-/// `ThreadHoverCard` in the glass tooltip: the title, then project, branch, model and any error.
-pub struct ThreadHoverCard {
-    pub title: SharedString,
-    pub project: Option<SharedString>,
-    pub favicon: crate::project_icon::ProjectVisual,
-    pub branch: Option<SharedString>,
-    pub model: Option<SharedString>,
-    /// The error line and whether it is a usage limit.
-    pub error: Option<bool>,
+/// The drag payload when pressing and sweeping across Settle / Unsettle / Unsnooze actions.
+pub struct DraggedSweep {
+    pub id: String,
+    pub key: Option<ThreadKey>,
+    pub action: SweepAction,
+    pub section: Section,
 }
 
-impl Render for ThreadHoverCard {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let line = |icon: Icon, text: SharedString| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .min_w_0()
-                .child(icon.sized(px(12.)).flex_none().text_color(hsla(p.muted_foreground)))
-                .child(div().min_w_0().truncate().text_color(hsla(p.foreground).opacity(0.75)).child(text))
-        };
-        let error = self.error.map(|usage_limit| {
-            let color = if usage_limit { hsla(p.warning) } else { hsla(p.error) };
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .text_color(color)
-                .child(Icon::CircleAlert.sized(px(12.)).flex_none())
-                .child(div().truncate().child(if usage_limit { "Usage limit reached" } else { "Error occurred" }))
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum PaneSweepKey {
+    Local(String),
+    Scoped(ThreadKey),
+}
+
+pub(super) struct PaneSweep {
+    pub action: SweepAction,
+    pub section: Section,
+    pub origin: PaneSweepKey,
+    pub keys: Vec<PaneSweepKey>,
+}
+
+impl SidebarPane {
+    pub(super) fn begin_sweep(&mut self, dragged: &DraggedSweep, cx: &mut Context<Self>) {
+        let origin = dragged.key.clone().map_or_else(|| PaneSweepKey::Local(dragged.id.clone()), PaneSweepKey::Scoped);
+        self.sweep = Some(PaneSweep {
+            action: dragged.action,
+            section: dragged.section,
+            origin: origin.clone(),
+            keys: vec![origin],
         });
-        div()
-            .relative()
-            .max_w(px(320.))
-            .rounded(px(6.))
-            .shadow_lg()
-            .child(crate::glass::backdrop(6., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
-            .child(
-                div()
-                    .relative()
-                    .px(px(12.))
-                    .py(px(12.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.title.clone()))
-                    .child(
-                        div()
-                            .pl(px(2.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .text_xs()
-                            .text_color(hsla(p.muted_foreground))
-                            .children(self.project.clone().map(|project| {
-                                let icon = self.favicon.render(crate::project_icon::size(12., cx), hsla(p.icon_muted), cx);
-                                div().flex().items_center().gap(px(8.)).min_w_0().child(icon).child(div().min_w_0().truncate().text_color(hsla(p.foreground).opacity(0.75)).child(project))
-                            }))
-                            .children(self.branch.clone().map(|branch| line(Icon::GitBranch, branch)))
-                            .children(self.model.clone().map(|model| line(Icon::Bot, model)))
-                            .children(error),
-                    ),
-            )
+        cx.notify();
+    }
+
+    pub(super) fn sweep_moved(&mut self, row: usize, event: &DragMoveEvent<DraggedSweep>, cx: &mut Context<Self>) {
+        if !event.bounds.contains(&event.event.position) {
+            return;
+        }
+        let Some(sweep) = self.sweep.as_mut() else { return };
+        let state = self.state.read(cx);
+        let keys = if !state.fleet.environments.is_empty() {
+            let Some(t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, .. }) = state.sidebar.fleet.rows.get(row) else {
+                return;
+            };
+            let target = PaneSweepKey::Scoped(state.sidebar.fleet.threads[*index].key.clone());
+            let entries: Vec<_> = state
+                .sidebar
+                .fleet
+                .rows
+                .iter()
+                .filter_map(|row| match row {
+                    t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, section, .. } => {
+                        let thread = &state.sidebar.fleet.threads[*index];
+                        let eligible = *section == sweep.section
+                            && state.fleet.environment(&thread.key.environment_id).is_some_and(|env| env.config.config.is_some());
+                        Some((PaneSweepKey::Scoped(thread.key.clone()), eligible))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let ordered: Vec<_> = entries.iter().map(|(key, _)| key.clone()).collect();
+            sweep_keys(&ordered, &sweep.origin, &target, |candidate| {
+                entries.iter().any(|(key, eligible)| *eligible && key == candidate)
+            })
+        } else {
+            let Some(t3_core::sidebar::SidebarRow::Thread { index, .. }) = state.sidebar.model.rows.get(row) else {
+                return;
+            };
+            let target = PaneSweepKey::Local(state.sidebar.model.threads[*index].id.clone());
+            let config_loaded = state.server_config.config.is_some();
+            let entries: Vec<_> = state
+                .sidebar
+                .model
+                .rows
+                .iter()
+                .filter_map(|row| match row {
+                    t3_core::sidebar::SidebarRow::Thread { index, section } => {
+                        let id = state.sidebar.model.threads[*index].id.clone();
+                        Some((PaneSweepKey::Local(id), config_loaded && *section == sweep.section))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let ordered: Vec<_> = entries.iter().map(|(key, _)| key.clone()).collect();
+            sweep_keys(&ordered, &sweep.origin, &target, |candidate| {
+                entries.iter().any(|(key, eligible)| *eligible && key == candidate)
+            })
+        };
+        if sweep.keys != keys {
+            sweep.keys = keys;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn finish_sweep(&mut self, drop: bool, cx: &mut Context<Self>) {
+        let Some(sweep) = self.sweep.take() else { return };
+        if drop {
+            self.state.update(cx, |state, cx| {
+                if !state.fleet.environments.is_empty() {
+                    let keys: Vec<_> = sweep
+                        .keys
+                        .iter()
+                        .filter_map(|key| match key {
+                            PaneSweepKey::Scoped(key) => Some(key.clone()),
+                            PaneSweepKey::Local(_) => None,
+                        })
+                        .filter(|key| {
+                            state.sidebar.fleet.section_of(key) == Some(sweep.section)
+                                && state.fleet.environment(&key.environment_id).is_some_and(|env| env.config.config.is_some())
+                        })
+                        .collect();
+                    match sweep.action {
+                        SweepAction::Settle => {
+                            let owners: Vec<_> = keys.iter().filter_map(|key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key)).collect();
+                            state.run_scoped_bulk(owners, BulkAction::Settle, None, false, cx).detach();
+                        }
+                        SweepAction::Unsettle => {
+                            for key in &keys {
+                                state.run_scoped_thread_action(key, ThreadAction::Unsettle, &[], cx);
+                            }
+                        }
+                        SweepAction::Unsnooze => {
+                            for key in &keys {
+                                state.run_scoped_thread_action(key, ThreadAction::Unsnooze, &[], cx);
+                            }
+                        }
+                    }
+                } else if state.server_config.config.is_some() {
+                    let ids: Vec<_> = sweep
+                        .keys
+                        .iter()
+                        .filter_map(|key| match key {
+                            PaneSweepKey::Local(id) => Some(id.clone()),
+                            PaneSweepKey::Scoped(_) => None,
+                        })
+                        .filter(|id| state.sidebar.model.section_of(id) == Some(sweep.section))
+                        .collect();
+                    for id in ids {
+                        match sweep.action {
+                            SweepAction::Settle => state.settle_thread(&id, cx),
+                            SweepAction::Unsettle => state.unsettle_thread(&id, cx),
+                            SweepAction::Unsnooze => state.unsnooze_thread(&id, cx),
+                        }
+                    }
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn sweep_action_for(&self, key: Option<&ThreadKey>, id: &str) -> Option<SweepAction> {
+        let sweep = self.sweep.as_ref()?;
+        let target = key.cloned().map_or_else(|| PaneSweepKey::Local(id.to_owned()), PaneSweepKey::Scoped);
+        sweep.keys.contains(&target).then_some(sweep.action)
     }
 }

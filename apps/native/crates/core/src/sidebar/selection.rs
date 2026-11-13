@@ -3,6 +3,7 @@
 //! context menu in `apps/web/src/components/Sidebar.tsx` (`handleMultiSelectContextMenu`).
 
 use std::collections::HashSet;
+use std::hash::Hash;
 
 use crate::sidebar::settled::SnoozePreset;
 use crate::thread_actions::MenuItem;
@@ -87,6 +88,15 @@ impl ThreadSelection {
         self.anchor = Some(id.to_owned());
     }
 
+    /// `navigateToThread`: opening a thread from any entry point drops the selection and anchors
+    /// there. Returns whether the selection changed.
+    pub fn open(&mut self, id: &str) -> bool {
+        let changed = !self.selected.is_empty() || self.anchor.as_deref() != Some(id);
+        self.selected.clear();
+        self.anchor = Some(id.to_owned());
+        changed
+    }
+
     /// `removeFromSelection`. Returns whether anything changed.
     pub fn remove(&mut self, ids: &[String]) -> bool {
         let remove: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -103,8 +113,63 @@ impl ThreadSelection {
 }
 
 /// `getThreadKeysToDeselectAfterDelete`: drop deleted threads and ones that no longer exist.
-pub fn keys_to_deselect_after_delete(selected: &[String], deleted: &HashSet<String>, has_thread: impl Fn(&str) -> bool) -> Vec<String> {
+/// `selected` is the selection captured when the deletion started, so later picks survive.
+pub fn keys_to_deselect_after_delete<K: Eq + Hash + Clone>(selected: &[K], deleted: &HashSet<K>, has_thread: impl Fn(&K) -> bool) -> Vec<K> {
     selected.iter().filter(|key| deleted.contains(*key) || !has_thread(key)).cloned().collect()
+}
+
+/// What Escape does in the sidebar: the search field's `handleThreadSearchKeyDown`, then the chat
+/// route's `onKeyDown` in `chatRouteCommands.ts`, which modal pages and the palette switch off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EscapeContext {
+    pub composing: bool,
+    pub search_focused: bool,
+    pub searching: bool,
+    pub overlay_open: bool,
+    pub has_selection: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarEscape {
+    /// Leave the key, and the range anchor, to other handlers.
+    Ignore,
+    ClearSearch,
+    /// `clearSelection`: the selection and its anchor, consuming the key.
+    ClearSelection,
+}
+
+pub fn sidebar_escape(context: EscapeContext) -> SidebarEscape {
+    if context.composing {
+        SidebarEscape::Ignore
+    } else if context.search_focused && context.searching {
+        SidebarEscape::ClearSearch
+    } else if context.has_selection && !context.overlay_open {
+        SidebarEscape::ClearSelection
+    } else {
+        SidebarEscape::Ignore
+    }
+}
+
+impl BulkAction {
+    pub fn selection_clear(&self) -> SelectionClear {
+        match self {
+            Self::RegenerateTitles => SelectionClear::AllSucceeded,
+            Self::Delete => SelectionClear::Results,
+            _ => SelectionClear::Started,
+        }
+    }
+}
+
+/// When a bulk action lets go of the selection (`handleMultiSelectContextMenu`). A refused or
+/// cancelled action keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionClear {
+    /// Once the writes are under way.
+    Started,
+    /// Only when every write succeeded; the first failure stops and keeps the selection.
+    AllSucceeded,
+    /// Per result: `keys_to_deselect_after_delete`.
+    Results,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,9 +326,55 @@ mod tests {
         let snapshot = selection.selected().to_vec();
         let existing: HashSet<&str> = ["thread-a", "thread-b"].into();
         let deleted: HashSet<String> = ["thread-a".to_owned()].into();
-        selection.remove(&keys_to_deselect_after_delete(&snapshot, &deleted, |key| existing.contains(key)));
+        selection.remove(&keys_to_deselect_after_delete(&snapshot, &deleted, |key: &String| existing.contains(key.as_str())));
         assert_eq!(selected(&selection), ["thread-b"]);
         assert_eq!(selection.anchor(), None);
+    }
+
+    #[test]
+    fn bulk_deletion_deselects_by_environment_scoped_key() {
+        let selected = [("env-a", "thread"), ("env-b", "thread"), ("env-a", "gone"), ("env-a", "failed")];
+        let deleted: HashSet<_> = [("env-a", "thread")].into();
+        let existing: HashSet<_> = [("env-a", "thread"), ("env-b", "thread"), ("env-a", "failed")].into();
+        assert_eq!(keys_to_deselect_after_delete(&selected, &deleted, |key| existing.contains(key)), [("env-a", "thread"), ("env-a", "gone")]);
+    }
+
+    #[test]
+    fn opening_a_thread_drops_the_selection_and_anchors_there() {
+        let mut selection = ThreadSelection::default();
+        selection.toggle("thread-a");
+        selection.toggle("thread-b");
+        assert!(selection.open("thread-d"));
+        assert!(selection.is_empty());
+        assert_eq!(selection.anchor(), Some("thread-d"));
+        assert!(!selection.open("thread-d"));
+        selection.range_select_to("thread-b", &ORDERED);
+        assert_eq!(selected(&selection), ["thread-b", "thread-c", "thread-d"]);
+    }
+
+    #[test]
+    fn escape_clears_search_first_then_a_selection_and_otherwise_passes() {
+        let selecting = EscapeContext { has_selection: true, ..EscapeContext::default() };
+        assert_eq!(sidebar_escape(selecting), SidebarEscape::ClearSelection);
+        assert_eq!(sidebar_escape(EscapeContext { search_focused: true, searching: true, ..selecting }), SidebarEscape::ClearSearch);
+        assert_eq!(sidebar_escape(EscapeContext { search_focused: true, ..selecting }), SidebarEscape::ClearSelection);
+        for context in [
+            EscapeContext { composing: true, search_focused: true, searching: true, ..selecting },
+            EscapeContext { overlay_open: true, ..selecting },
+            EscapeContext { search_focused: true, ..EscapeContext::default() },
+            EscapeContext::default(),
+        ] {
+            assert_eq!(sidebar_escape(context), SidebarEscape::Ignore);
+        }
+    }
+
+    #[test]
+    fn bulk_actions_release_the_selection_at_the_web_moment() {
+        for action in [BulkAction::Unpin, BulkAction::Settle, BulkAction::Snooze, BulkAction::SnoozePreset("later".into()), BulkAction::SnoozeCustom, BulkAction::MarkUnread] {
+            assert_eq!(action.selection_clear(), SelectionClear::Started);
+        }
+        assert_eq!(BulkAction::RegenerateTitles.selection_clear(), SelectionClear::AllSucceeded);
+        assert_eq!(BulkAction::Delete.selection_clear(), SelectionClear::Results);
     }
 
     #[test]
@@ -381,5 +492,29 @@ mod tests {
         for action in [BulkAction::Settle, BulkAction::RegenerateTitles] {
             assert!(menu.iter().find(|item| item.action == action).unwrap().disabled);
         }
+
+        let no_config_operate = BulkTarget { pinned: true, config_loaded: false, can_snooze: false, ..target };
+        let no_config_only = BulkSelection::from_targets(&[no_config_operate]);
+        let menu = build_bulk_menu(&no_config_only, &presets);
+        assert!(menu.iter().all(|item| item.action != BulkAction::Unpin && item.action != BulkAction::Snooze && item.action != BulkAction::RegenerateTitles));
+        assert!(!menu.iter().find(|item| item.action == BulkAction::Delete).unwrap().disabled);
+        assert!(menu.iter().find(|item| item.action == BulkAction::Settle).unwrap().disabled);
+        assert!(menu.iter().find(|item| item.action == BulkAction::MarkUnread).unwrap().disabled);
+
+        let mixed = BulkSelection::from_targets(&[
+            no_config_operate,
+            BulkTarget { pinned: true, regenerating: true, can_operate: false, ..target },
+            BulkTarget { pinned: true, ..target },
+        ]);
+        let menu = build_bulk_menu(&mixed, &presets);
+        assert_eq!(menu.iter().find(|item| item.action == BulkAction::Unpin).map(|i| (i.label.as_str(), i.disabled)), Some(("Unpin (2)", true)));
+        assert_eq!(menu.iter().find(|item| item.action == BulkAction::RegenerateTitles).map(|i| (i.label.as_str(), i.disabled)), Some(("Regenerate titles (1)", false)));
+        assert!(menu.iter().find(|item| item.action == BulkAction::Delete).unwrap().disabled);
+        assert!(menu.iter().all(|item| item.action != BulkAction::Snooze));
+
+        let read_only_snooze = BulkSelection::from_targets(&[target, BulkTarget { can_operate: false, ..target }]);
+        let menu = build_bulk_menu(&read_only_snooze, &presets);
+        let snooze = menu.iter().find(|item| item.action == BulkAction::Snooze).unwrap();
+        assert!(snooze.disabled && snooze.children.iter().all(|child| child.disabled));
     }
 }

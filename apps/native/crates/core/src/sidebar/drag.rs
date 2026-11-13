@@ -142,6 +142,32 @@ pub fn resolve_drop_verb(from: Section, to: Option<Section>) -> Option<DropVerb>
     })
 }
 
+/// The hover action a press can sweep across rows (`SidebarSweepAction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepAction {
+    Settle,
+    Unsettle,
+    Unsnooze,
+}
+
+impl SweepAction {
+    /// The destination badge swept rows show.
+    pub fn verb(self) -> DropVerb {
+        match self {
+            SweepAction::Settle => DropVerb::Settle,
+            SweepAction::Unsettle => DropVerb::Unsettle,
+            SweepAction::Unsnooze => DropVerb::Wake,
+        }
+    }
+}
+
+/// `resolveSidebarSweepKeys`: the rows from the sweep's origin to the one under the pointer,
+/// inclusive and in list order, that the action applies to.
+pub fn sweep_keys<K: PartialEq + Clone>(ordered: &[K], origin: &K, target: &K, can_apply: impl Fn(&K) -> bool) -> Vec<K> {
+    let (Some(origin), Some(target)) = (ordered.iter().position(|key| key == origin), ordered.iter().position(|key| key == target)) else { return Vec::new() };
+    ordered[origin.min(target)..=origin.max(target)].iter().filter(|key| can_apply(key)).cloned().collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub id: String,
@@ -361,6 +387,18 @@ mod tests {
         for (from, to, verb) in cases {
             assert_eq!(resolve_drop_verb(from, to), verb, "{from:?} -> {to:?}");
         }
+    }
+
+    #[test]
+    fn sweeps_take_every_applicable_row_between_origin_and_pointer() {
+        let rows = ["a", "b", "c", "d", "e"];
+        assert_eq!(sweep_keys(&rows, &"b", &"d", |_| true), ["b", "c", "d"]);
+        // Upward sweeps keep list order; rows the action cannot take are skipped.
+        assert_eq!(sweep_keys(&rows, &"d", &"a", |key| *key != "c"), ["a", "b", "d"]);
+        assert_eq!(sweep_keys(&rows, &"c", &"c", |_| true), ["c"]);
+        assert!(sweep_keys(&rows, &"z", &"a", |_| true).is_empty());
+        assert!(sweep_keys(&rows, &"a", &"z", |_| true).is_empty());
+        assert_eq!([SweepAction::Settle, SweepAction::Unsettle, SweepAction::Unsnooze].map(SweepAction::verb), [DropVerb::Settle, DropVerb::Unsettle, DropVerb::Wake]);
     }
 
     #[test]

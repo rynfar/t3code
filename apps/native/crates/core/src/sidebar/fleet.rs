@@ -123,7 +123,7 @@ pub enum FolderDot { Attention, Failed, Unread, Working }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopedSidebarRow {
-    Thread { index: usize, section: Section },
+    Thread { index: usize, section: Section, in_folder: bool },
     Shelf { shelf: Shelf, count: usize, expanded: bool },
     ShowMore { count: usize },
     Marker(Marker),
@@ -141,6 +141,7 @@ pub struct ScopedSidebarModel {
     pub threads: Vec<ScopedSidebarThread>,
     pub index_by_key: HashMap<ThreadKey, usize>,
     pub project_names: HashMap<ProjectRef, String>,
+    pub scratch_machine_labels: HashMap<ProjectRef, String>,
     pub folder_groups: HashMap<String, ScopedProjectGroup>,
     pub partition: Partition,
     pub rows: Vec<ScopedSidebarRow>,
@@ -287,16 +288,25 @@ impl ScopedSidebarModel {
         sort_indexes(&mut model.partition.settled, Section::Settled);
         model.index_by_key = model.threads.iter().enumerate().map(|(index, thread)| (thread.key.clone(), index)).collect();
         model.project_names = input.groups.iter().flat_map(|group| group.member_refs.iter().map(|reference| (reference.clone(), group.label.clone()))).collect();
+        if super::grouping::project_groups_span_environments(input.groups) {
+            model.scratch_machine_labels = input
+                .groups
+                .iter()
+                .flat_map(|group| &group.registrations)
+                .filter(|project| project.is_scratch && !project.environment_label.is_empty())
+                .map(|project| (project.reference(), project.environment_label.clone()))
+                .collect();
+        }
         model.next_change_at = model.next_change_at.into_iter().chain(model.threads.iter().filter_map(|thread| thread.thread.snoozed_until.filter(|wake| *wake > input.now))).min();
         let selected = input.selected.and_then(|key| model.index_by_key.get(key)).copied();
-        let push = |model: &mut Self, indexes: &[usize], section| {
-            for &index in indexes { model.rows.push(ScopedSidebarRow::Thread { index, section }); model.ordered.push(index); }
+        let push = |model: &mut Self, indexes: &[usize], section, in_folder| {
+            for &index in indexes { model.rows.push(ScopedSidebarRow::Thread { index, section, in_folder }); model.ordered.push(index); }
         };
         let marker = |model: &mut Self, marker| { if input.dragging.is_some() { model.rows.push(ScopedSidebarRow::Marker(marker)); } };
         let pinned = model.partition.pinned.clone();
         let active = model.partition.active.clone();
         marker(&mut model, Marker::PinnedHeader);
-        push(&mut model, &pinned, Section::Pinned);
+        push(&mut model, &pinned, Section::Pinned, false);
         marker(&mut model, Marker::PinnedDivider);
         if input.folder_mode {
             let resolved = input.preferences.resolved_scope(input.groups, ready);
@@ -312,12 +322,12 @@ impl ScopedSidebarModel {
                     model.folder_groups.insert(group.key.clone(), group.clone());
                     model.rows.push(ScopedSidebarRow::Folder { key: group.key.clone(), expanded, hidden_count: hidden.len(), dot, archived });
                     let visible = rows.into_iter().filter(|index| expanded || Some(*index) == selected).collect::<Vec<_>>();
-                    push(&mut model, &visible, Section::Active);
+                    push(&mut model, &visible, Section::Active, true);
                 }
             }
         } else {
             if active.is_empty() { marker(&mut model, Marker::ActivePlaceholder); }
-            push(&mut model, &active, Section::Active);
+            push(&mut model, &active, Section::Active, false);
         }
         for (shelf, section, indexes, expanded) in [
             (Shelf::Working, Section::Working, model.partition.working.clone(), input.shelves.working_expanded),
@@ -325,7 +335,7 @@ impl ScopedSidebarModel {
         ] {
             if indexes.is_empty() { continue; }
             model.rows.push(ScopedSidebarRow::Shelf { shelf, count: indexes.len(), expanded });
-            push(&mut model, &indexes.into_iter().filter(|index| expanded || Some(*index) == selected).collect::<Vec<_>>(), section);
+            push(&mut model, &indexes.into_iter().filter(|index| expanded || Some(*index) == selected).collect::<Vec<_>>(), section, false);
         }
         model.settled_count = model.partition.settled.len() + unloaded;
         if !model.threads.is_empty() || unloaded > 0 {
@@ -341,7 +351,7 @@ impl ScopedSidebarModel {
             model.hidden_settled_count = model.settled_count.saturating_sub(visible.len());
             visible.retain(|index| expanded || Some(*index) == selected);
             if visible.is_empty() { marker(&mut model, Marker::SettledPlaceholder); }
-            push(&mut model, &visible, Section::Settled);
+            push(&mut model, &visible, Section::Settled, false);
             if expanded && model.hidden_settled_count > 0 { model.rows.push(ScopedSidebarRow::ShowMore { count: model.hidden_settled_count.min(super::SETTLED_TAIL_PAGE_COUNT) }); }
         }
         model
@@ -354,7 +364,7 @@ impl ScopedSidebarModel {
     }
     pub fn row_key(&self, row: &ScopedSidebarRow) -> ScopedRowKey {
         match row {
-            ScopedSidebarRow::Thread { index, section } => ScopedRowKey::Thread { key: self.threads[*index].key.clone(), card: section.is_card(), meta: self.threads[*index].thread.branch.is_some() },
+            ScopedSidebarRow::Thread { index, section, in_folder } => ScopedRowKey::Thread { key: self.threads[*index].key.clone(), card: section.is_card() && !in_folder, meta: self.threads[*index].thread.branch.is_some() },
             ScopedSidebarRow::Shelf { shelf, .. } => ScopedRowKey::Shelf(*shelf),
             ScopedSidebarRow::ShowMore { .. } => ScopedRowKey::ShowMore,
             ScopedSidebarRow::Marker(marker) => ScopedRowKey::Marker(*marker),

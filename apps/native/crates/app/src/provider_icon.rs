@@ -49,11 +49,13 @@ pub struct ProviderIcon {
     badge: BadgeSize,
     /// The surface behind the badge, drawn as its border so it reads as cut out.
     ring: Option<Hsla>,
+    /// The mark's opacity and whether it drops its color, as sidebar provider stacks fade it.
+    fade: Option<(f32, bool)>,
 }
 
 impl ProviderIcon {
     pub fn new(mark: ProviderMark) -> Self {
-        ProviderIcon { mark, size: px(16.), badge: BadgeSize::Compact, ring: None }
+        ProviderIcon { mark, size: px(16.), badge: BadgeSize::Compact, ring: None, fade: None }
     }
 
     pub fn size(mut self, size: Pixels) -> Self {
@@ -66,17 +68,24 @@ impl ProviderIcon {
         self.ring = Some(ring);
         self
     }
+
+    /// Fades the mark (not its badge), optionally in grayscale.
+    pub fn faded(mut self, opacity: f32, grayscale: bool) -> Self {
+        self.fade = Some((opacity, grayscale));
+        self
+    }
 }
 
 impl RenderOnce for ProviderIcon {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
+        let (opacity, grayscale) = self.fade.unwrap_or((1., false));
         let mark = match provider_logo(&self.mark.driver) {
             Some(ProviderLogo::Mono(path)) => {
                 gpui::svg().path(path).size(self.size).flex_none().text_color(hsla(p.foreground)).into_any_element()
             }
             Some(ProviderLogo::Image { light, dark }) => {
-                img(if cx.theme().is_dark() { dark } else { light }).size(self.size).flex_none().into_any_element()
+                img(if cx.theme().is_dark() { dark } else { light }).size(self.size).flex_none().grayscale(grayscale).into_any_element()
             }
             None => div()
                 .text_size(px(metrics::TEXT_3XS))
@@ -114,6 +123,7 @@ impl RenderOnce for ProviderIcon {
                 .text_color(foreground)
                 .child(self.mark.initials)
         });
+        let mark = if self.fade.is_some() { div().opacity(opacity).child(mark).into_any_element() } else { mark };
         div().relative().flex_none().flex().items_center().justify_center().size(self.size).child(mark).children(badge)
     }
 }

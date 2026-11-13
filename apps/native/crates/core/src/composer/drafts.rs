@@ -204,6 +204,26 @@ impl DraftStore {
 
     pub fn take_pruned_keys(&mut self) -> Vec<String> { std::mem::take(&mut self.pruned_keys) }
 
+    /// Clears user content while keeping choices (`clearComposerContent`), dropping if empty.
+    pub fn clear_content(&mut self, key: &str, updated_at: i64) -> bool {
+        let Some(existing) = self.drafts.get(key).cloned() else { return false };
+        let had_content = existing.has_user_content();
+        let cleared = Draft {
+            workspace: existing.workspace,
+            model_selection: existing.model_selection,
+            runtime_mode: existing.runtime_mode,
+            interaction_mode: existing.interaction_mode,
+            created_at: existing.created_at,
+            updated_at,
+            ..Draft::default()
+        };
+        if cleared.is_empty() {
+            return self.drafts.remove(key).is_some();
+        }
+        self.drafts.insert(key.to_owned(), cleared);
+        had_content
+    }
+
     pub fn remove(&mut self, key: &str) -> bool {
         self.drafts.remove(key).is_some()
     }

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use gpui::{Context, Modifiers};
 use t3_core::sidebar::Section;
 use t3_core::sidebar::drag::{DropPlan, DropPlanInput, DropTarget, plan_thread_drop, position_of, resolve_drop_target_at_slot};
-use t3_core::sidebar::selection::{BulkAction, BulkSelection};
+use t3_core::sidebar::selection::{BulkAction, BulkSelection, SelectionClear};
 use t3_core::sidebar::settled::{self, SnoozePreset};
 use t3_core::thread_actions::{self as actions, UndoKind};
 
@@ -31,13 +31,32 @@ impl AppState {
                 self.sidebar.fleet_anchor = Some(key.clone());
             }
         } else {
-            self.sidebar.fleet_selection.clear();
-            self.sidebar.fleet_anchor = Some(key.clone());
+            self.open_scoped_selection(key);
             if let Some(row) = self.scoped_thread(key) {
                 self.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id.clone()), cx);
             }
         }
         self.selection_changed(cx);
+    }
+
+    fn open_scoped_selection(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey) -> bool {
+        let changed = !self.sidebar.fleet_selection.is_empty() || self.sidebar.fleet_anchor.as_ref() != Some(key);
+        self.sidebar.fleet_selection.clear();
+        self.sidebar.fleet_anchor = Some(key.clone());
+        changed
+    }
+
+    pub(crate) fn anchor_opened_scoped_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, cx: &mut Context<Self>) {
+        if self.open_scoped_selection(key) {
+            self.selection_changed(cx);
+        }
+    }
+
+    /// `navigateToThread`: every way of opening a thread drops the selection and anchors there.
+    pub(crate) fn anchor_opened_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if self.sidebar.selection.open(thread_id) {
+            self.selection_changed(cx);
+        }
     }
 
     pub(crate) fn remove_scoped_thread_selection(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey) {
@@ -64,10 +83,7 @@ impl AppState {
             self.sidebar.selection.range_select_to(thread_id, &ordered);
             return self.selection_changed(cx);
         }
-        if self.sidebar.selection.clear() {
-            self.selection_changed(cx);
-        }
-        self.sidebar.selection.set_anchor(thread_id);
+        self.anchor_opened_thread(thread_id, cx);
         self.select_thread(thread_id, cx);
     }
 
@@ -150,15 +166,15 @@ impl AppState {
     pub fn delete_threads(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
         let doomed = std::sync::Arc::new(ids.iter().cloned().collect());
         let target = self.delete_target();
-        self.delete_next(ids, Deletion { doomed, target }, cx);
+        let selected = self.sidebar.selection.selected().into();
+        self.delete_next(ids, Deletion { doomed, target }, selected, cx);
     }
 
-    fn delete_next(&mut self, mut ids: Vec<String>, deletion: Deletion, cx: &mut Context<Self>) {
+    fn delete_next(&mut self, mut ids: Vec<String>, deletion: Deletion, selected: std::sync::Arc<[String]>, cx: &mut Context<Self>) {
         if ids.is_empty() {
             let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-            let requested: Vec<_> = deletion.doomed.iter().cloned().collect();
             let missing = t3_core::sidebar::selection::keys_to_deselect_after_delete(
-                &requested,
+                &selected,
                 &HashSet::new(),
                 |id| mounts.thread(shell, id).is_some(),
             );
@@ -178,7 +194,7 @@ impl AppState {
                 if ok && state.sidebar.selection.remove(std::slice::from_ref(&id)) {
                     state.selection_changed(cx);
                 }
-                state.delete_next(ids, deletion, cx);
+                state.delete_next(ids, deletion, selected, cx);
             },
         );
     }
@@ -309,7 +325,7 @@ impl AppState {
         let mut items = Vec::new(); let mut before = 0;
         for (row_index, row) in model.rows.iter().enumerate() {
             let item = match row {
-                ScopedSidebarRow::Thread { index, section } => Some(DropItem::Thread { id: Self::scoped_drag_id(&model.threads[*index].key), section: *section }),
+                ScopedSidebarRow::Thread { index, section, .. } => Some(DropItem::Thread { id: Self::scoped_drag_id(&model.threads[*index].key), section: *section }),
                 ScopedSidebarRow::Marker(marker) => Some(DropItem::Marker(*marker)),
                 ScopedSidebarRow::Shelf { shelf, .. } => Some(DropItem::Marker(match shelf { t3_core::sidebar::Shelf::Working => Marker::WorkingHeader, t3_core::sidebar::Shelf::Snoozed => Marker::SnoozedHeader, t3_core::sidebar::Shelf::Settled => Marker::SettledHeader })),
                 _ => None,
@@ -513,10 +529,11 @@ impl AppState {
                 let _ = this.update(cx, |state, cx| state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread action refused").description("The destination or permission changed"), cx));
                 return;
             }
-            let regenerate = action == BulkAction::RegenerateTitles;
+            // Each unpin may ask first, so the selection goes once the first one is under way.
+            let regenerate = action.selection_clear() == SelectionClear::AllSucceeded;
             let unpin = action == BulkAction::Unpin;
             let mut cleared = false;
-            if clear_selection && !regenerate && !unpin {
+            if clear_selection && action.selection_clear() == SelectionClear::Started && !unpin {
                 let _ = this.update(cx, |state, cx| { state.clear_thread_selection(cx); });
                 cleared = true;
             }

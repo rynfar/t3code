@@ -165,3 +165,23 @@ fn workspace_only_draft_survives_restart_with_its_destination_scope() {
     assert_eq!(saved, &workspace);
     assert!(!saved.in_scope("env-b", "/repo"));
 }
+
+#[test]
+fn clearing_thread_draft_content_keeps_choices_and_allows_undo_restore() {
+    let mut store = DraftStore::default();
+    let key = thread_key("t-clear");
+    let saved = Draft {
+        prompt: "unsent reply".into(),
+        interaction_mode: Some(InteractionMode::Plan),
+        updated_at: 10,
+        ..Draft::default()
+    };
+    assert!(store.set(&key, saved.clone()));
+    assert!(store.clear_content(&key, 20));
+    let remaining = store.get(&key).expect("choices stay persisted");
+    assert!(!remaining.has_user_content());
+    assert_eq!(remaining.interaction_mode, Some(InteractionMode::Plan));
+    assert!(store.restore(&key, saved, &Draft::default()));
+    assert_eq!(store.get(&key).unwrap().prompt, "unsent reply");
+    assert!(!store.clear_content(&thread_key("missing"), 30));
+}

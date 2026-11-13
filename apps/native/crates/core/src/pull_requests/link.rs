@@ -6,7 +6,7 @@
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-use super::wire::{Actor, ChecksState, Mergeability, PrState, ReviewDecision, lenient};
+use super::wire::{Actor, ChecksState, Mergeability, PrState, ReviewDecision, Stack, lenient};
 use crate::timeline::parse_iso_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -45,8 +45,15 @@ pub struct ThreadLink {
     pub linked_at: String,
     #[serde(default)]
     pub snapshot: Option<LinkSnapshot>,
+    /// `ThreadPullRequestStack`: a stack that does not decode leaves the link without one.
+    #[serde(default, deserialize_with = "lenient_stack")]
+    pub stack: Option<Stack>,
     #[serde(default)]
     pub watch: Option<Value>,
+}
+
+fn lenient_stack<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Stack>, D::Error> {
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl ThreadLink {
@@ -139,24 +146,30 @@ fn canonical_url(value: &str) -> String {
 
 /// `sourceControlClients.parseChangeRequestUrl`.
 pub fn parse_change_request_url(value: &str) -> Option<ChangeRequestLink> {
+    parse_claimed(value).map(|(_, link)| link)
+}
+
+/// The kind of the host that claims a change request URL (`findByChangeRequestUrl(url).kind`).
+pub fn change_request_provider(value: &str) -> Option<&'static str> {
+    parse_claimed(value).map(|(kind, _)| kind)
+}
+
+fn parse_claimed(value: &str) -> Option<(&'static str, ChangeRequestLink)> {
     let url = url::Url::parse(value.trim()).ok()?;
     if url.scheme() != "https" && url.scheme() != "http" {
         return None;
     }
     let host = url.host_str()?.to_lowercase();
     if let Some((repository, number)) = parse_gitcafe(&url, &host) {
-        return Some(ChangeRequestLink { host, repository, number, url: value.trim().to_owned() });
+        return Some(("gitcafe", ChangeRequestLink { host, repository, number, url: value.trim().to_owned() }));
     }
     ROUTES.iter().find_map(|(kind, route)| {
         let (repository, rest) = repository_before(kind, url.path(), route)?;
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         let tail = &rest[digits.len()..];
         let number: u64 = digits.parse().ok().filter(|number| *number > 0)?;
-        (tail.is_empty() || tail.starts_with('/')).then(|| ChangeRequestLink {
-            host: host.clone(),
-            repository: repository.to_lowercase(),
-            number,
-            url: value.trim().to_owned(),
+        (tail.is_empty() || tail.starts_with('/')).then(|| {
+            (*kind, ChangeRequestLink { host: host.clone(), repository: repository.to_lowercase(), number, url: value.trim().to_owned() })
         })
     })
 }
@@ -349,13 +362,16 @@ mod tests {
             links: Vec<ThreadLink>,
         }
         let row: Row = serde_json::from_value(serde_json::json!({ "links": [
-            { "host": "github.com", "repository": "a/b", "number": 1, "url": "u1", "source": "manual", "linkedAt": "2026-01-01T00:00:00Z", "snapshot": null },
+            { "host": "github.com", "repository": "a/b", "number": 1, "url": "u1", "source": "manual", "linkedAt": "2026-01-01T00:00:00Z", "snapshot": null,
+              "stack": { "kind": "native", "id": "s", "number": 9, "url": "s9", "base": "main", "layers": [{ "number": 1, "headBranch": "a", "state": "open" }] } },
             { "host": "github.com", "repository": "a/b", "number": 2, "url": "u2", "source": "stack-dismissed", "linkedAt": "2026-01-03T00:00:00Z", "snapshot": null },
             { "host": "github.com", "number": "bad" },
-            { "host": "github.com", "repository": "a/b", "number": 3, "url": "u3", "source": "agent", "linkedAt": "2026-01-02T00:00:00Z", "snapshot": null }
+            { "host": "github.com", "repository": "a/b", "number": 3, "url": "u3", "source": "agent", "linkedAt": "2026-01-02T00:00:00Z", "snapshot": null, "stack": { "id": 4 } }
         ]}))
         .unwrap();
         assert_eq!(row.links.len(), 3);
+        assert_eq!(row.links[0].stack.as_ref().map(|stack| stack.layers.len()), Some(1));
+        assert_eq!(row.links[2].stack, None);
         let visible: Vec<u64> = visible_links(&row.links).iter().map(|link| link.number).collect();
         assert_eq!(visible, vec![3, 1]);
         let unlink = unlink_command("c", "t", &row.links[0]);

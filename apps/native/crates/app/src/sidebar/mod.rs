@@ -9,6 +9,7 @@ mod drafts;
 pub mod controller;
 mod drag;
 mod favicons;
+mod hover;
 mod project_filter;
 mod project_folders;
 mod row;
@@ -57,9 +58,10 @@ enum PaneRowKey { Draft(String), Divider, Thread(RowKey), Scoped(t3_core::sideba
 
 pub struct SidebarPane {
     updates: Entity<crate::updates::UpdateControl>,
-    composer: Entity<crate::composer::Composer>,
+    pub(crate) composer: Entity<crate::composer::Composer>,
     drafts: t3_core::sidebar::drafts::DraftRows,
     discarded: std::collections::HashMap<String, (t3_core::thread_actions::Claim, crate::composer::drafts::DiscardedDraft)>,
+    discarded_threads: std::collections::HashMap<String, (t3_core::thread_actions::Claim, crate::composer::drafts::DiscardedDraft)>,
     state: Entity<AppState>,
     menu: Entity<ContextMenu>,
     list: ListState,
@@ -89,6 +91,10 @@ pub struct SidebarPane {
     live_rendered: bool,
     pub(crate) clock: Option<(ClockRate, Task<()>)>,
     drag: Option<drag::PaneDrag>,
+    sweep: Option<drag::PaneSweep>,
+    #[cfg(all(test, feature = "snapshot"))]
+    row_focuses: std::cell::RefCell<std::collections::HashMap<gpui::SharedString, gpui::FocusHandle>>,
+    folder_multiline: bool,
     /// A thread or project menu is open; rows show no hover card over it.
     menu_open: bool,
     snooze_grant_watch: Option<((u64, u64), Task<()>)>,
@@ -118,12 +124,28 @@ impl SidebarPane {
                     cx.notify();
                 }
             }),
+            cx.subscribe(&composer, |_, _, _: &crate::composer::drafts::ThreadDraftsChanged, cx| {
+                cx.notify();
+            }),
+            cx.observe_global::<crate::terminal::RunningTerminals>(|_, cx| {
+                cx.notify();
+            }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
                 if *event == AppEvent::RestoreDraft {
-                    let projects = this.state.update(cx, |state, _| std::mem::take(&mut state.sidebar.drafts_to_restore));
+                    let (projects, threads) = this.state.update(cx, |state, _| {
+                        (
+                            std::mem::take(&mut state.sidebar.drafts_to_restore),
+                            std::mem::take(&mut state.sidebar.thread_drafts_to_restore),
+                        )
+                    });
                     for project in projects {
                         if let Some((_, draft)) = this.discarded.remove(&project) {
                             this.composer.update(cx, |composer, cx| composer.restore_sidebar_draft(&project, draft, window, cx));
+                        }
+                    }
+                    for thread_id in threads {
+                        if let Some((_, draft)) = this.discarded_threads.remove(&thread_id) {
+                            this.composer.update(cx, |composer, cx| composer.restore_thread_draft(&thread_id, draft, window, cx));
                         }
                     }
                     this.sync_rows(cx);
@@ -163,6 +185,12 @@ impl SidebarPane {
                     let expired: Vec<_> = this.discarded.iter().filter(|(project, (claim, _))| !this.state.read(cx).sidebar.undo.is_current(claim) && !this.state.read(cx).sidebar.drafts_to_restore.contains(*project)).map(|(project, _)| project.clone()).collect();
                     for project in expired {
                         if let Some((_, discarded)) = this.discarded.remove(&project) {
+                            this.composer.update(cx, |composer, cx| composer.commit_sidebar_discard(discarded, cx));
+                        }
+                    }
+                    let expired_threads: Vec<_> = this.discarded_threads.iter().filter(|(thread_id, (claim, _))| !this.state.read(cx).sidebar.undo.is_current(claim) && !this.state.read(cx).sidebar.thread_drafts_to_restore.contains(*thread_id)).map(|(thread_id, _)| thread_id.clone()).collect();
+                    for thread_id in expired_threads {
+                        if let Some((_, discarded)) = this.discarded_threads.remove(&thread_id) {
                             this.composer.update(cx, |composer, cx| composer.commit_sidebar_discard(discarded, cx));
                         }
                     }
@@ -279,6 +307,7 @@ impl SidebarPane {
             composer,
             drafts: Default::default(),
             discarded: Default::default(),
+            discarded_threads: Default::default(),
             state,
             menu,
             list: ListState::new(0, ListAlignment::Top, px(200.)),
@@ -306,6 +335,10 @@ impl SidebarPane {
             live_rendered: false,
             clock: None,
             drag: None,
+            sweep: None,
+            #[cfg(all(test, feature = "snapshot"))]
+            row_focuses: std::cell::RefCell::new(std::collections::HashMap::new()),
+            folder_multiline: crate::settings::store::client(cx).boring_sidebar_multiline_rows(),
             menu_open: false,
             snooze_grant_watch: None,
             snooze_access: false,
@@ -445,6 +478,7 @@ impl SidebarPane {
         let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
         let input_key = key.clone();
         let previous = window.focused(cx);
+        self.rename_previous_focus = previous.clone();
         let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) && this.rename_key.as_ref() == Some(&input_key) {
                 let title = input.read(cx).value().to_string();
@@ -499,6 +533,7 @@ impl SidebarPane {
     }
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.rename_key = None;
         if let Some((_, input)) = self.rename.take() {
             let input_focus = input.read(cx).focus_handle(cx);
             let previous = self.rename_previous_focus.take();
@@ -528,6 +563,44 @@ impl SidebarPane {
         self.search_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.search.set_query(String::new(), &self.state, cx);
         cx.notify();
+    }
+
+    pub(crate) fn handle_escape(&mut self, overlay_open: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let overlay_open = overlay_open || self.project_filter.is_some() || self.rename.is_some();
+        if overlay_open {
+            return false;
+        }
+        if self.drag.is_some() || self.sweep.is_some() {
+            self.finish_drag(false, cx);
+            self.finish_sweep(false, cx);
+            return true;
+        }
+        let search_focused = self.search_input.read(cx).focus_handle(cx).is_focused(window);
+        let composing = search_focused && is_composing(&self.search_input, window, cx);
+        let searching = self.search.is_active();
+        let has_selection = {
+            let state = self.state.read(cx);
+            !state.sidebar.selection.is_empty() || !state.sidebar.fleet_selection.is_empty()
+        };
+        match t3_core::sidebar::selection::sidebar_escape(t3_core::sidebar::selection::EscapeContext {
+            composing,
+            search_focused,
+            searching,
+            overlay_open,
+            has_selection,
+        }) {
+            t3_core::sidebar::selection::SidebarEscape::ClearSearch => {
+                self.clear_search(window, cx);
+                true
+            }
+            t3_core::sidebar::selection::SidebarEscape::ClearSelection => {
+                self.state.update(cx, |state, cx| {
+                    state.clear_thread_selection(cx);
+                });
+                true
+            }
+            t3_core::sidebar::selection::SidebarEscape::Ignore => false,
+        }
     }
 
     fn open_search_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -873,8 +946,10 @@ fn new_thread_label(cx: &App) -> String {
 impl Render for SidebarPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let font = (window.rem_size(), crate::theme::font_family(t3_core::client_settings::typography::FontRole::Interface, cx));
-        if self.measured_font.as_ref() != Some(&font) {
+        let multiline = crate::settings::store::client(cx).boring_sidebar_multiline_rows();
+        if self.measured_font.as_ref() != Some(&font) || self.folder_multiline != multiline {
             self.measured_font = Some(font);
+            self.folder_multiline = multiline;
             self.list.remeasure();
         }
         let (synchronized, no_projects) = {
@@ -934,6 +1009,7 @@ impl Render for SidebarPane {
                 .flex_col()
                 .child(list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx))).flex_1())
                 .on_drop(cx.listener(|this, _: &drag::DraggedThread, _, cx| this.finish_drag(true, cx)))
+                .on_drop(cx.listener(|this, _: &drag::DraggedSweep, _, cx| this.finish_sweep(true, cx)))
                 .into_any_element()
         };
         div()
@@ -941,8 +1017,14 @@ impl Render for SidebarPane {
             .flex()
             .flex_col()
             .bg(hsla(p.sidebar))
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.finish_drag(false, cx)))
-            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.finish_drag(false, cx)))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.finish_drag(false, cx);
+                this.finish_sweep(false, cx);
+            }))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.finish_drag(false, cx);
+                this.finish_sweep(false, cx);
+            }))
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
@@ -2070,5 +2152,670 @@ mod sb_sections_pane_tests {
             s.set_scoped_project_scope(Vec::new(), cx);
             s.stop_pump();
         });
+    }
+
+    fn make_thread_json(id: &str, project_id: &str, status: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "projectId": project_id,
+            "title": format!("Thread {id}"),
+            "createdAt": "2026-01-02T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "providerInstanceId": "replay",
+            "modelSelection": {"instanceId": "replay", "model": "replay"},
+            "runtimeMode": "auto",
+            "interactionMode": "default",
+            "lineage": {"rootThreadId": id},
+            "status": status,
+            "hasActionableProposedPlan": false,
+            "itemCount": 0,
+            "visibleItemCount": 0
+        })
+    }
+
+    #[gpui::test]
+    async fn row_running_terminals_and_thread_draft_discard_undo_cycle(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        state.update(cx, |s, cx| {
+            s.draft_project = None;
+            s.selected_thread = Some("th-active".into());
+            s.server_config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": "fixture-env",
+                        "label": "Fixture",
+                        "platform": {"os": "macos", "arch": "arm64", "machine": "laptop"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": "/fixture",
+                    "settings": {}
+                }
+            })).unwrap());
+            s.shell.snapshot.as_mut().unwrap().threads = vec![
+                serde_json::from_value(make_thread_json("th-active", "checkout-a", "idle")).unwrap(),
+                serde_json::from_value(make_thread_json("th-draft", "checkout-a", "idle")).unwrap(),
+            ];
+            s.rebuild_sidebar(cx);
+        });
+        let composer_slot: Rc<std::cell::RefCell<Option<Entity<crate::composer::Composer>>>> = Default::default();
+        let composer_out = composer_slot.clone();
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            *composer_out.borrow_mut() = Some(composer.clone());
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let composer = composer_slot.borrow().clone().unwrap();
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+
+        let choice = t3_core::model::ModelSelection { instance_id: "replay".into(), model: "replay-model".into(), options: None };
+        composer.update(vcx, |c, cx| {
+            c.set_thread_draft_fixture("th-draft", "unsent prompt", Some(choice.clone()), 1_780_000_000_000, cx);
+            c.set_thread_draft_fixture("th-active", "open prompt", None, 1_780_000_000_000, cx);
+        });
+        vcx.update(|_, cx| {
+            let mut running = crate::terminal::RunningTerminals::default();
+            running.by_thread.insert("th-draft".into(), vec!["term-1".into()]);
+            cx.set_global(running);
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        assert!(vcx.debug_bounds("terminal-status-th-draft").is_some(), "RunningTerminals global update must show terminal icon");
+        assert!(vcx.debug_bounds("draft-indicator-th-draft").is_some(), "inactive thread draft must show draft pen");
+        assert!(vcx.debug_bounds("draft-indicator-th-active").is_none(), "active thread must hide draft pen");
+
+        let row_center = vcx.debug_bounds("thread-row-None-th-draft").expect("draft row rendered").center();
+        vcx.simulate_mouse_move(row_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        let discard_center = vcx.debug_bounds("discard-draft-thread-th-draft").expect("discard draft hover action rendered").center();
+        vcx.simulate_mouse_move(discard_center, None::<MouseButton>, Default::default());
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: discard_center, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: discard_center, modifiers: Default::default(), click_count: 1 });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let saved = composer.read_with(vcx, |c, _| c.sidebar_drafts().get("thread:th-draft").cloned());
+        assert!(saved.as_ref().is_some_and(|d| d.prompt.is_empty() && !d.has_user_content() && d.model_selection.as_ref() == Some(&choice)), "discarding thread draft clears content while keeping choices");
+        assert!(state.read_with(vcx, |s, _| s.sidebar.undo.notice().is_some()), "discarding thread draft records undo notice");
+        assert!(vcx.debug_bounds("draft-indicator-th-draft").is_none(), "draft pen disappears after discard");
+
+        assert!(state.update(vcx, |s, cx| s.undo_latest(cx)));
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let restored = composer.read_with(vcx, |c, _| c.sidebar_drafts().get("thread:th-draft").cloned());
+        assert_eq!(restored.as_ref().map(|d| d.prompt.as_str()), Some("unsent prompt"));
+        assert!(vcx.debug_bounds("draft-indicator-th-draft").is_some(), "undo restores thread draft pen");
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn scoped_woke_acknowledge_delete_deselect_and_unpin_confirm(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture_local) = cx.update(|cx| {
+            gpui_component::init(cx);
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            crate::settings::store::install_committed_client(&installed.0, serde_json::from_value(json!({"confirmThreadUnpin": true})).unwrap(), cx);
+            installed
+        });
+
+        let mut env_fixtures = Vec::new();
+        for (saved, active) in [("env-a", true), ("env-b", false)] {
+            let (client, fix) = ClientFixture::handle(session(true));
+            let mut shell = t3_core::shell::ShellState::default();
+            let mut woke_thread = make_thread_json(&format!("th-{saved}-woke"), &format!("proj-{saved}"), "idle");
+            woke_thread["snoozedUntil"] = json!("2026-01-01T00:00:05Z");
+            woke_thread["pinnedAt"] = json!("2026-01-01T00:00:00Z");
+            let del_thread = make_thread_json(&format!("th-{saved}-del"), &format!("proj-{saved}"), "idle");
+            shell.apply(serde_json::from_value(json!({
+                "kind": "snapshot",
+                "snapshot": {
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": format!("proj-{saved}"),
+                        "title": saved,
+                        "workspaceRoot": format!("/{saved}"),
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "threads": [woke_thread, del_thread]
+                }
+            })).unwrap());
+            shell.synchronized = true;
+            let mut config = t3_core::server_config::ServerConfigState::default();
+            config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": format!("id-{saved}"),
+                        "label": saved,
+                        "platform": {"os": "linux", "arch": "x64", "machine": "cloud"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": format!("/{saved}"),
+                    "settings": {}
+                }
+            })).unwrap());
+            let install = state.update(cx, |s, _| s.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
+            let _events = runtime.spawn(install).await.unwrap();
+            if active {
+                state.update(cx, |s, _| s.environments.active = Some(saved.into()));
+            }
+            env_fixtures.push(fix);
+        }
+        let mut fix_a = env_fixtures.remove(0);
+        let mut fix_b = env_fixtures.remove(0);
+
+        state.update(cx, |s, cx| {
+            s.draft_project = None;
+            s.shell.snapshot.as_mut().unwrap().threads.clear();
+            s.rebuild_sidebar(cx);
+        });
+        let confirm_slot: Rc<std::cell::RefCell<Option<Entity<ConfirmDialog>>>> = Default::default();
+        let confirm_out = confirm_slot.clone();
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            *confirm_out.borrow_mut() = Some(confirm.clone());
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        let confirm = confirm_slot.borrow().clone().unwrap();
+        let woke_time = t3_core::sidebar::time::parse_iso("2026-01-01T00:00:10Z").unwrap();
+        pane.update(vcx, |p, cx| {
+            p.now_override = Some(woke_time);
+            p.now = woke_time;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        fixture_local.take_commands();
+        fix_a.take_commands();
+        fix_b.take_commands();
+
+        let woke_pos = vcx.debug_bounds("woke-env-b-th-env-b-woke").expect("remote woke badge rendered").center();
+        vcx.simulate_mouse_move(woke_pos, None::<MouseButton>, Default::default());
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: woke_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: woke_pos, modifiers: Default::default(), click_count: 1 });
+        let (method, params, _) = fix_b.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(params["type"], "thread.visit");
+        assert_eq!(params["threadId"], "th-env-b-woke");
+        assert!(fix_a.take_commands().is_empty(), "scoped acknowledge_woke must route to owning env-b, not active env-a");
+
+        // Verify delete_scoped_threads removes deleted keys from fleet_selection and preserves others.
+        let key_woke = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-b".into(), thread_id: "th-env-b-woke".into() };
+        let key_del = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-b".into(), thread_id: "th-env-b-del".into() };
+        state.update(vcx, |s, cx| {
+            s.sidebar.fleet_selection.insert(key_woke.clone());
+            s.sidebar.fleet_selection.insert(key_del.clone());
+            let owner_del = crate::context_menu::ThreadMenuOwner::capture_scoped(s, &key_del).unwrap();
+            s.delete_scoped_threads(vec![owner_del], cx);
+        });
+        let (del_method, del_params, reply_del) = fix_b.next_request().await;
+        assert_eq!(del_method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(del_params["type"], "thread.delete");
+        let _ = reply_del.send(Ok(json!({})));
+        vcx.run_until_parked();
+        state.read_with(vcx, |s, _| {
+            assert!(!s.sidebar.fleet_selection.contains(&key_del), "deleted scoped thread must be removed from selection");
+            assert!(s.sidebar.fleet_selection.contains(&key_woke), "surviving selected thread must remain selected");
+        });
+
+        // Verify ConfirmDialog unpin prompt opens on request_unpin_thread and canceling keeps thread pinned.
+        vcx.update(|window, cx| {
+            let key_local_woke = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-a".into(), thread_id: "th-env-a-woke".into() };
+            let owner = crate::context_menu::ThreadMenuOwner::capture_scoped(state.read(cx), &key_local_woke).unwrap();
+            let menu = root.read(cx).menu.clone();
+            menu.update(cx, |m, cx| m.confirm_scoped(owner, t3_core::thread_actions::ThreadAction::Unpin, cx));
+            let _ = window;
+        });
+        vcx.run_until_parked();
+        assert!(confirm.read_with(vcx, |d, _| d.is_open()) || !fix_a.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND), "unpin confirmation must prevent immediate dispatch");
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn sweep_settle_drag_escape_priority_and_row_keyboard(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        state.update(cx, |s, cx| {
+            s.draft_project = None;
+            s.server_config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": "fixture-env",
+                        "label": "Fixture",
+                        "platform": {"os": "macos", "arch": "arm64", "machine": "laptop"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": "/fixture",
+                    "settings": {}
+                }
+            })).unwrap());
+            let mut settled = make_thread_json("th-4", "checkout-a", "idle");
+            settled["settledOverride"] = json!("settled");
+            settled["settledAt"] = json!("2026-01-01T00:00:00Z");
+            s.shell.snapshot.as_mut().unwrap().threads = vec![
+                serde_json::from_value(make_thread_json("th-1", "checkout-a", "idle")).unwrap(),
+                serde_json::from_value(make_thread_json("th-2", "checkout-a", "idle")).unwrap(),
+                serde_json::from_value(make_thread_json("th-3", "checkout-a", "idle")).unwrap(),
+                serde_json::from_value(settled).unwrap(),
+            ];
+            s.sidebar.shelves.settled_expanded = true;
+            s.rebuild_sidebar(cx);
+        });
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        fixture.take_commands();
+
+        let th1_bounds = vcx.debug_bounds("thread-row-None-th-1").expect("th-1 row rendered");
+        let th2_bounds = vcx.debug_bounds("thread-row-None-th-2").expect("th-2 row rendered");
+        let th4_bounds = vcx.debug_bounds("thread-row-None-th-4").expect("th-4 row rendered");
+        vcx.simulate_mouse_move(th1_bounds.center(), None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        let settle1_center = vcx.debug_bounds("settle-th-1").expect("settle action rendered").center();
+
+        // Start sweep drag on th-1 Settle, sweep across th-2, ignore Settled th-4.
+        vcx.simulate_mouse_move(settle1_center, None::<MouseButton>, Default::default());
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: settle1_center, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_mouse_move(gpui::point(settle1_center.x - px(12.), settle1_center.y), Some(MouseButton::Left), Default::default());
+        vcx.run_until_parked();
+        vcx.simulate_mouse_move(th2_bounds.center(), Some(MouseButton::Left), Default::default());
+        vcx.run_until_parked();
+        assert_eq!(pane.read_with(vcx, |p, _| p.sweep.as_ref().map(|s| s.keys.len())), Some(2), "sweep drag covers th-1 and th-2");
+        vcx.simulate_mouse_move(th4_bounds.center(), Some(MouseButton::Left), Default::default());
+        vcx.run_until_parked();
+        assert_eq!(pane.read_with(vcx, |p, _| p.sweep.as_ref().map(|s| s.keys.len())), Some(3), "sweep range includes th-3 between th-1 and th-4");
+        assert!(!pane.read_with(vcx, |p, _| p.sweep.as_ref().is_some_and(|s| s.keys.contains(&drag::PaneSweepKey::Local("th-4".into())))), "sweep drag must not include rows from Settled section");
+
+        // Escape priority: overlay_open=true ignores Escape; overlay_open=false cancels sweep without settling.
+        vcx.update(|window, cx| {
+            state.update(cx, |s, _| s.sidebar.selection.toggle("th-3"));
+            assert!(!pane.update(cx, |p, cx| p.handle_escape(true, window, cx)));
+            assert!(pane.read(cx).sweep.is_some());
+            assert!(pane.update(cx, |p, cx| p.handle_escape(false, window, cx)));
+            assert!(pane.read(cx).sweep.is_none());
+            assert!(state.read(cx).sidebar.selection.contains("th-3"), "first Escape clears sweep before selection");
+        });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: th2_bounds.center(), modifiers: Default::default(), click_count: 1 });
+        vcx.run_until_parked();
+        assert!(fixture.take_commands().is_empty(), "canceled sweep must not dispatch settle");
+
+        // Complete a real sweep drop over th-1..th-2.
+        vcx.simulate_mouse_move(settle1_center, None::<MouseButton>, Default::default());
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: settle1_center, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_mouse_move(gpui::point(settle1_center.x - px(12.), settle1_center.y), Some(MouseButton::Left), Default::default());
+        vcx.run_until_parked();
+        vcx.simulate_mouse_move(th2_bounds.center(), Some(MouseButton::Left), Default::default());
+        vcx.run_until_parked();
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: th2_bounds.center(), modifiers: Default::default(), click_count: 1 });
+        let (m1, p1, _) = fixture.next_request().await;
+        let (m2, p2, _) = fixture.next_request().await;
+        assert_eq!((m1, m2), (t3_core::commands::method::DISPATCH_COMMAND, t3_core::commands::method::DISPATCH_COMMAND));
+        assert_eq!(p1["type"], "thread.settle");
+        assert_eq!(p2["type"], "thread.settle");
+        assert_eq!(state.read_with(vcx, |s, _| s.sidebar.selection.len()), 1, "sweep settle preserves multi-selection");
+
+        // Escape clears multi-selection when no sweep/search is active, then Space + F2 on th-3.
+        let th3_focus = pane.read_with(vcx, |p, _| p.row_focuses.borrow().get("thread-row-None-th-3").expect("th-3 focus handle registered").clone());
+        vcx.update(|window, cx| {
+            assert!(pane.update(cx, |p, cx| p.handle_escape(false, window, cx)));
+            assert!(state.read(cx).sidebar.selection.is_empty());
+            window.focus(&th3_focus, cx);
+            window.dispatch_event(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("space").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            }), cx);
+            assert_eq!(state.read(cx).selected_thread.as_deref(), Some("th-3"), "Space activates focused row");
+            window.dispatch_event(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("f2").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            }), cx);
+            assert!(pane.read(cx).rename.as_ref().is_some_and(|(id, _)| id == "th-3"), "F2 starts inline rename on focused row");
+            pane.update(cx, |p, cx| p.cancel_rename(cx));
+        });
+        vcx.run_until_parked();
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn folder_multiline_rows_and_scratch_machine_label(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _orig) = cx.update(|cx| {
+            gpui_component::init(cx);
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            crate::settings::store::install_committed_client(
+                &installed.0,
+                serde_json::from_value(json!({"boringSidebarEnabled": true, "boringSidebarMultilineRows": false})).unwrap(),
+                cx,
+            );
+            installed
+        });
+        for (saved, machine, label) in [("mac", "laptop", "Mac Studio"), ("cloud", "cloud", "Cloud VM")] {
+            let (client, _fix) = ClientFixture::handle(session(true));
+            let mut shell = t3_core::shell::ShellState::default();
+            let scratch_thread = make_thread_json(&format!("th-{saved}-scratch"), &format!("scratch-{saved}"), "idle");
+            let mut repo_thread = make_thread_json(&format!("th-{saved}-repo"), &format!("repo-{saved}"), "idle");
+            repo_thread["branch"] = json!("feat/parity");
+            shell.apply(serde_json::from_value(json!({
+                "kind": "snapshot",
+                "snapshot": {
+                    "snapshotSequence": 1,
+                    "projects": [
+                        {"id": format!("scratch-{saved}"), "title": "Scratch", "workspaceRoot": "/scratch", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"},
+                        {"id": format!("repo-{saved}"), "title": "App", "workspaceRoot": "/app", "repositoryIdentity": {"canonicalKey": "repo/app"}, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}
+                    ],
+                    "threads": [scratch_thread, repo_thread]
+                }
+            })).unwrap());
+            shell.synchronized = true;
+            let mut config = t3_core::server_config::ServerConfigState::default();
+            config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": format!("id-{saved}"),
+                        "label": label,
+                        "platform": {"os": "macos", "arch": "arm64", "machine": machine},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": "/",
+                    "scratchWorkspaceRoot": "/scratch",
+                    "settings": {}
+                }
+            })).unwrap());
+            let install = state.update(cx, |s, _| s.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
+            let _events = runtime.spawn(install).await.unwrap();
+        }
+        state.update(cx, |s, cx| {
+            s.draft_project = None;
+            s.shell.snapshot.as_mut().unwrap().threads.clear();
+            s.rebuild_sidebar(cx);
+        });
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(!pane.read_with(vcx, |p, _| p.folder_multiline));
+        let scratch_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "cloud".into(), thread_id: "th-cloud-scratch".into() };
+        let scratch_row_id: &'static str = Box::leak(format!("thread-row-{:?}-{}", Some(&scratch_key), "th-cloud-scratch").into_boxed_str());
+        let single_height = vcx.debug_bounds(scratch_row_id).expect("single-line folder scratch row rendered").size.height;
+        assert!(single_height <= px(38.), "single-line folder row stays ~36px, got {single_height:?}");
+
+        state.read_with(vcx, |s, _| {
+            assert_eq!(
+                s.sidebar.fleet.scratch_machine_labels.get(&t3_core::sidebar::grouping::ProjectRef { environment_id: "cloud".into(), project_id: "scratch-cloud".into() }).map(String::as_str),
+                Some("Cloud VM")
+            );
+        });
+
+        vcx.update(|_, cx| {
+            crate::settings::store::install_committed_client(
+                &state,
+                serde_json::from_value(json!({"boringSidebarEnabled": true, "boringSidebarMultilineRows": true})).unwrap(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(pane.read_with(vcx, |p, _| p.folder_multiline));
+        let multi_height = vcx.debug_bounds(scratch_row_id).expect("multiline folder scratch row rendered").size.height;
+        assert!(multi_height > px(45.), "multiline folder row with scratch machine meta line must grow, got {multi_height:?}");
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn snoozed_wake_queued_turn_mixed_fleet_snooze_and_scoped_inner_ids(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let now = t3_core::sidebar::time::parse_iso("2026-01-01T00:00:10Z").unwrap();
+        let (state, mut fixture_local) = cx.update(|cx| {
+            gpui_component::init(cx);
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+
+        let mut env_fixtures = Vec::new();
+        for (saved, operate, include_snoozed) in [("env-op", true, true), ("env-ro", false, false)] {
+            let (client, fix) = ClientFixture::handle(session(operate));
+            let mut shell = t3_core::shell::ShellState::default();
+            let mut shared = make_thread_json("shared-th", &format!("proj-{saved}"), "idle");
+            shared["snoozedUntil"] = json!("2026-01-01T00:00:05Z");
+            shared["pinnedAt"] = json!("2026-01-01T00:00:00Z");
+            shared["branch"] = json!(format!("feat/{saved}"));
+            shared["worktreePath"] = json!(format!("/worktrees/{saved}"));
+            let mut threads = vec![shared];
+            if include_snoozed {
+                let mut snoozed_queued = make_thread_json("snoozed-queued", &format!("proj-{saved}"), "idle");
+                snoozed_queued["snoozedUntil"] = json!("2026-01-01T01:00:00Z");
+                snoozed_queued["latestUserMessageAt"] = json!("2026-01-01T00:00:05Z");
+                threads.push(snoozed_queued);
+            }
+            shell.apply(serde_json::from_value(json!({
+                "kind": "snapshot",
+                "snapshot": {
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": format!("proj-{saved}"),
+                        "title": saved,
+                        "workspaceRoot": format!("/{saved}"),
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "threads": threads
+                }
+            })).unwrap());
+            shell.synchronized = true;
+            let mut config = t3_core::server_config::ServerConfigState::default();
+            config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": format!("id-{saved}"),
+                        "label": saved,
+                        "platform": {"os": "linux", "arch": "x64", "machine": "cloud"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": format!("/{saved}"),
+                    "settings": {}
+                }
+            })).unwrap());
+            let install = state.update(cx, |s, _| s.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
+            let _events = runtime.spawn(install).await.unwrap();
+            env_fixtures.push(fix);
+        }
+        let mut fix_op = env_fixtures.remove(0);
+        let mut fix_ro = env_fixtures.remove(0);
+
+        state.update(cx, |s, cx| {
+            s.draft_project = None;
+            s.shell.snapshot.as_mut().unwrap().threads.clear();
+            s.server_config.apply(serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": "local-env",
+                        "label": "Local",
+                        "platform": {"os": "macos", "arch": "arm64", "machine": "laptop"},
+                        "capabilities": {"projectOrganization": true}
+                    },
+                    "cwd": "/local",
+                    "settings": {}
+                }
+            })).unwrap());
+            s.environments.active = Some("env-op".into());
+            s.sidebar.now_override = Some(now);
+            s.sidebar.shelves.snoozed_expanded = true;
+            s.rebuild_sidebar(cx);
+        });
+
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        pane.update(vcx, |p, cx| {
+            p.now_override = Some(now);
+            p.now = now;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        fixture_local.take_commands();
+        fix_op.take_commands();
+        fix_ro.take_commands();
+
+        // Shared raw thread.id ("shared-th") across two fleet environments must produce distinct, non-colliding inner element bounds.
+        let woke_op = vcx.debug_bounds("woke-env-op-shared-th").expect("env-op woke badge rendered");
+        let woke_ro = vcx.debug_bounds("woke-env-ro-shared-th").expect("env-ro woke badge rendered");
+        assert_ne!(woke_op.origin, woke_ro.origin);
+        let worktree_op = vcx.debug_bounds("thread-worktree-env-op-shared-th").expect("env-op worktree badge rendered");
+        let worktree_ro = vcx.debug_bounds("thread-worktree-env-ro-shared-th").expect("env-ro worktree badge rendered");
+        assert_ne!(worktree_op.origin, worktree_ro.origin);
+        assert!(vcx.debug_bounds("unpin-env-op-shared-th").is_some(), "operable pinned row must have scoped unpin id");
+
+        let op_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-op".into(), thread_id: "shared-th".into() };
+        let ro_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-ro".into(), thread_id: "shared-th".into() };
+        let queued_key = t3_core::sidebar::tag_filter::ThreadKey { environment_id: "env-op".into(), thread_id: "snoozed-queued".into() };
+        let op_row_id: &'static str = Box::leak(format!("thread-row-{:?}-shared-th", Some(&op_key)).into_boxed_str());
+        let ro_row_id: &'static str = Box::leak(format!("thread-row-{:?}-shared-th", Some(&ro_key)).into_boxed_str());
+        let queued_row_id: &'static str = Box::leak(format!("thread-row-{:?}-snoozed-queued", Some(&queued_key)).into_boxed_str());
+
+        let op_center = vcx.debug_bounds(op_row_id).expect("env-op shared row rendered").center();
+        let ro_center = vcx.debug_bounds(ro_row_id).expect("env-ro shared row rendered").center();
+        let queued_center = vcx.debug_bounds(queued_row_id).expect("snoozed-queued row rendered").center();
+
+        // Mixed-capability Fleet Card Snooze when local ALSO has snooze_access: operable env-op shows Snooze; read-only env-ro hides it.
+        vcx.simulate_mouse_move(op_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-op-shared-th").is_some(), "operable fleet env must render Card Snooze");
+        let settle_op = vcx.debug_bounds("settle-env-op-shared-th").expect("env-op settle action rendered");
+
+        vcx.simulate_mouse_move(ro_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-ro-shared-th").is_none(), "read-only fleet env must hide Card Snooze even when local can snooze");
+        let settle_ro = vcx.debug_bounds("settle-env-ro-shared-th").expect("env-ro settle action rendered");
+        assert_ne!(settle_op.origin, settle_ro.origin);
+
+        // Reverse Fleet mixed-capability: drop local server_config so super::snooze_access(state) is false; env-op must keep Card Snooze.
+        state.update(vcx, |s, cx| {
+            s.server_config.config = None;
+            s.rebuild_sidebar(cx);
+        });
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(!state.read_with(vcx, |s, _| super::snooze_access(s)));
+        vcx.simulate_mouse_move(op_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-op-shared-th").is_some(), "operable remote env must keep Card Snooze when local lacks snooze_access");
+        vcx.simulate_mouse_move(ro_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("snooze-env-ro-shared-th").is_none(), "read-only remote env stays hidden");
+
+        // Snoozed row with has_queued_turn_start must still render Wake and dispatch thread.unsnooze on click.
+        vcx.simulate_mouse_move(queued_center, None::<MouseButton>, Default::default());
+        vcx.run_until_parked();
+        let wake_pos = vcx.debug_bounds("wake-env-op-snoozed-queued").expect("snoozed row with queued turn start must keep hover Wake button").center();
+        vcx.simulate_mouse_move(wake_pos, None::<MouseButton>, Default::default());
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: wake_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: wake_pos, modifiers: Default::default(), click_count: 1 });
+        let (method, params, _) = fix_op.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(params["type"], "thread.unsnooze");
+        assert_eq!(params["threadId"], "snoozed-queued");
+        assert!(fix_ro.take_commands().is_empty());
+
+        state.update(vcx, |s, _| s.stop_pump());
     }
 }

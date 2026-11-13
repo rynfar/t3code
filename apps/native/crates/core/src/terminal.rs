@@ -179,6 +179,16 @@ pub fn apply_metadata(current: &mut Vec<TerminalSummary>, event: MetadataEvent) 
 
 /// One thread's terminals in the order `terminalSessions.ts` lists them: terminal id with
 /// numeric collation, so `term-10` follows `term-9`.
+/// `selectRunningSubprocessTerminalIds` for every thread at once, in metadata order; threads with
+/// no running process are absent.
+pub fn running_by_thread(summaries: &[TerminalSummary]) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut running = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for terminal in summaries.iter().filter(|terminal| terminal.has_running_subprocess) {
+        running.entry(terminal.thread_id.clone()).or_default().push(terminal.terminal_id.clone());
+    }
+    running
+}
+
 pub fn thread_terminals<'a>(summaries: &'a [TerminalSummary], thread_id: &str) -> Vec<&'a TerminalSummary> {
     let mut terminals: Vec<_> = summaries.iter().filter(|t| t.thread_id == thread_id).collect();
     terminals.sort_by(|a, b| natural_cmp(&a.terminal_id, &b.terminal_id));

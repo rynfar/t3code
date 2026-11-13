@@ -56,8 +56,8 @@ pub fn has_unseen_failure(thread: &SidebarThread) -> bool {
     }
 }
 
-pub fn should_recede(status: ThreadStatus, is_unread: bool, is_woke: bool, is_active: bool) -> bool {
-    if is_active || matches!(status, ThreadStatus::Input | ThreadStatus::Request) {
+pub fn should_recede(status: ThreadStatus, is_unread: bool, is_woke: bool, is_active: bool, is_selected: bool) -> bool {
+    if is_active || is_selected || matches!(status, ThreadStatus::Input | ThreadStatus::Request) {
         return false;
     }
     match status {

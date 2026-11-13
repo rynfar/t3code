@@ -1099,8 +1099,10 @@ struct SidebarFleetEnvFixture {
     local: Option<bool>,
     machine: Option<String>,
     can_pin: Option<bool>,
+    scratch_workspace_root: Option<String>,
+    providers: Option<Vec<serde_json::Value>>,
     projects: Vec<t3_core::shell::ProjectShell>,
-    threads: Vec<t3_core::shell::ThreadShell>,
+    threads: Vec<serde_json::Value>,
     older_settled: Option<t3_core::shell::OlderSettledCut>,
 }
 
@@ -1110,13 +1112,18 @@ struct SidebarFixture {
     now_ms: Option<i64>,
     working_shelf_enabled: Option<bool>,
     boring_sidebar_enabled: Option<bool>,
+    boring_sidebar_multiline_rows: Option<bool>,
     shelves: Option<SidebarFixtureShelves>,
     clear_selected_thread: Option<bool>,
     selected_thread: Option<String>,
     draft_project: Option<String>,
     selected_threads: Option<Vec<String>>,
+    fleet_selected_threads: Option<Vec<(String, String)>>,
+    running_terminals: Option<Vec<(String, Vec<String>)>>,
+    thread_drafts: Option<Vec<(String, String)>>,
+    providers: Option<Vec<serde_json::Value>>,
     projects: Option<Vec<t3_core::shell::ProjectShell>>,
-    threads: Option<Vec<t3_core::shell::ThreadShell>>,
+    threads: Option<Vec<serde_json::Value>>,
     older_settled: Option<t3_core::shell::OlderSettledCut>,
     page_status: Option<String>,
     fleet: Option<Vec<SidebarFleetEnvFixture>>,
@@ -1150,12 +1157,20 @@ fn apply_sidebar_fixture(
     if let Some(enabled) = fixture.boring_sidebar_enabled {
         cx.update(|cx| crate::settings::store::update_client(state, ClientSettingChange::BoringSidebarEnabled(enabled), cx));
     }
+    if let Some(enabled) = fixture.boring_sidebar_multiline_rows {
+        cx.update(|cx| crate::settings::store::update_client(state, ClientSettingChange::BoringSidebarMultilineRows(enabled), cx));
+    }
 
     let highlighted_key = state.update(cx, |state, cx| {
         state.stop_pump();
         state.freeze_snapshot();
         state.sidebar.snapshot_fixture = true;
         state.sidebar.now_override = fixture.now_ms;
+        if let Some(providers) = &fixture.providers
+            && let Ok(parsed) = serde_json::from_value(serde_json::Value::Array(providers.clone()))
+        {
+            state.server_config.apply_providers(parsed);
+        }
         if fixture.clear_selected_thread == Some(true) {
             state.selected_thread = None;
             state.draft_project = None;
@@ -1171,6 +1186,15 @@ fn apply_sidebar_fixture(
             state.sidebar.selection = Default::default();
             for id in ids {
                 state.sidebar.selection.toggle(id);
+            }
+        }
+        if let Some(keys) = &fixture.fleet_selected_threads {
+            state.sidebar.fleet_selection = Default::default();
+            for (environment_id, thread_id) in keys {
+                state.sidebar.fleet_selection.insert(t3_core::sidebar::tag_filter::ThreadKey {
+                    environment_id: environment_id.clone(),
+                    thread_id: thread_id.clone(),
+                });
             }
         }
 
@@ -1212,19 +1236,26 @@ fn apply_sidebar_fixture(
                 let mut config = t3_core::server_config::ServerConfigState::default();
                 let machine = entry.machine.as_deref().unwrap_or(if local { "laptop" } else { "cloud" });
                 let can_pin = entry.can_pin.unwrap_or(true);
+                let mut config_json = serde_json::json!({
+                    "environment": {
+                        "environmentId": env_id,
+                        "label": entry.label,
+                        "platform": { "os": "macos", "arch": "arm64", "machine": machine },
+                        "capabilities": { "projectOrganization": can_pin }
+                    },
+                    "cwd": "/",
+                    "settings": {}
+                });
+                if let Some(scratch) = &entry.scratch_workspace_root {
+                    config_json["scratchWorkspaceRoot"] = serde_json::Value::String(scratch.clone());
+                }
+                if let Some(providers) = &entry.providers {
+                    config_json["providers"] = serde_json::Value::Array(providers.clone());
+                }
                 config.apply(
                     serde_json::from_value(serde_json::json!({
                         "type": "snapshot",
-                        "config": {
-                            "environment": {
-                                "environmentId": env_id,
-                                "label": entry.label,
-                                "platform": { "os": "macos", "arch": "arm64", "machine": machine },
-                                "capabilities": { "projectOrganization": can_pin }
-                            },
-                            "cwd": "/",
-                            "settings": {}
-                        }
+                        "config": config_json
                     }))
                     .expect("sidebar fleet server config"),
                 );
@@ -1302,7 +1333,8 @@ fn apply_sidebar_fixture(
                     snapshot.projects = projects.clone();
                 }
                 if let Some(threads) = &fixture.threads {
-                    snapshot.threads = threads.clone();
+                    snapshot.threads = serde_json::from_value(serde_json::Value::Array(threads.clone()))
+                        .expect("sidebar fixture threads");
                 }
                 snapshot.older_settled = fixture.older_settled.clone();
             }
@@ -1310,6 +1342,19 @@ fn apply_sidebar_fixture(
             let _ = state.omitted.counts.sync(&state.shell);
             let older = state.omitted.older();
             state.omitted.pages.sync(&state.shell, older.as_ref());
+        }
+
+        if !matches!(state.phase, crate::app_state::Phase::Online(_)) {
+            state.phase = crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected);
+            state.shell.synchronized = true;
+            state.connect.switching = false;
+            if state.server_config.config.is_none()
+                && let Some(first) = state.fleet.environments.first()
+            {
+                state.server_config = first.config.clone();
+            }
+            cx.emit(crate::app_state::AppEvent::Phase);
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
         }
 
         state.rebuild_sidebar(cx);
@@ -1379,10 +1424,25 @@ fn apply_sidebar_fixture(
             if let Some(query) = &fixture.search_query {
                 pane.search_input.update(cx, |input, cx| input.set_value(query.clone(), window, cx));
             }
+            if let Some(drafts) = &fixture.thread_drafts {
+                let updated_at = fixture.now_ms.unwrap_or(0);
+                pane.composer.update(cx, |composer, cx| {
+                    for (thread_id, prompt) in drafts {
+                        composer.set_thread_draft_fixture(thread_id, prompt, None, updated_at, cx);
+                    }
+                });
+            }
             cx.notify();
         });
     })
     .map_err(|e| e.to_string())?;
+    if let Some(terminals) = &fixture.running_terminals {
+        let mut running = crate::terminal::RunningTerminals::default();
+        for (thread_id, ids) in terminals {
+            running.by_thread.insert(thread_id.clone(), ids.clone());
+        }
+        cx.update(|cx| cx.set_global(running));
+    }
     pump(cx, 0.2, |_| false);
     Ok(())
 }

@@ -484,6 +484,10 @@ impl SnoozeDialog {
         }
     }
 
+    pub(crate) fn is_open(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub fn open(
         &mut self,
         mut request: SnoozeRequest,

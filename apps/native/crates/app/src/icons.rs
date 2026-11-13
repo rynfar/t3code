@@ -123,6 +123,7 @@ icons! {
     KeyRound => "icons/lucide/key-round.svg",
     Keyboard => "icons/lucide/keyboard.svg",
     Laptop => "icons/lucide/laptop.svg",
+    Layers => "icons/lucide/layers.svg",
     Link => "icons/lucide/link.svg",
     Link2 => "icons/lucide/link-2.svg",
     ListChecks => "icons/lucide/list-checks.svg",
@@ -264,6 +265,21 @@ impl Icon {
     /// The bare icon, for callers that size it and style hover or position themselves.
     pub fn svg(self) -> Svg {
         svg().path(self.path()).flex_none()
+    }
+
+    /// `EnvironmentMachineIcon` for `resolveEnvironmentMachineKind`: the chosen icon, else the
+    /// reported machine, else a server.
+    pub fn machine(config: &t3_core::server_config::ServerConfig) -> Icon {
+        let kind = config.settings.environment_icon.as_deref().or(config.environment.platform.as_ref().map(|platform| platform.machine.as_str()));
+        match kind.unwrap_or("server") {
+            "laptop" => Icon::Laptop,
+            "desktop" => Icon::Monitor,
+            "cloud" => Icon::Cloud,
+            "linux" => Icon::Linux,
+            "mac-mini" => Icon::MacMini,
+            "mac-studio" => Icon::MacStudio,
+            _ => Icon::Server,
+        }
     }
 }
 
