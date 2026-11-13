@@ -75,6 +75,31 @@ impl MountedReads {
         self.mounts.clear();
     }
 
+    pub fn sync(&mut self, key: &str, next: Option<(u64, Vec<FamilyRead>)>) -> bool {
+        match next {
+            Some((generation, reads)) => {
+                if self.mounts.iter().any(|(existing, g, r)| existing == key && *g == generation && *r == reads) {
+                    return false;
+                }
+                self.mount(key, generation, reads);
+                true
+            }
+            None => {
+                let before = self.mounts.len();
+                self.unmount(key);
+                self.mounts.len() != before
+            }
+        }
+    }
+
+    pub fn mounted_thread(&self, generation: u64, id: &str) -> Option<&ThreadShell> {
+        self.mounts
+            .iter()
+            .filter(|(_, current, _)| *current == generation)
+            .flat_map(|(_, _, reads)| reads)
+            .find_map(|read| read.threads.iter().find(|thread| thread.id == id))
+    }
+
     /// The shell generation the reads under `key` were made for.
     pub fn generation_of(&self, key: &str) -> Option<u64> {
         self.mounts.iter().find(|(existing, ..)| existing == key).map(|(_, generation, _)| *generation)

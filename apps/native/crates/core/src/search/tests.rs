@@ -693,3 +693,101 @@ fn splits_text_at_char_ranges() {
     assert_eq!(texts, [("Le ", false, 0), ("Café", true, 3), (" résumé", false, 7)]);
     assert_eq!(split_search_text("", &[]).len(), 1);
 }
+
+#[test]
+fn retains_settled_results_across_related_queries_and_clears_unrelated_ones() {
+    let settled = SettledThreadSearch { query: "deploy".into(), matches: vec!["t1", "t2"] };
+    let ready = SettledThreadSearch { query: "deploys".into(), matches: vec!["t2"] };
+    assert_eq!(visible_thread_search("deploys", None, Some(&settled)), settled);
+    assert_eq!(visible_thread_search("dep", None, Some(&settled)), settled);
+    assert_eq!(visible_thread_search("\"Deploy\"", None, Some(&settled)), settled);
+    assert_eq!(visible_thread_search("deploys", Some(&ready), Some(&settled)), ready);
+    assert_eq!(
+        visible_thread_search("auth", None, Some(&settled)),
+        SettledThreadSearch { query: String::new(), matches: Vec::new() }
+    );
+    assert_eq!(
+        visible_thread_search("   ", None, Some(&settled)),
+        SettledThreadSearch { query: String::new(), matches: Vec::new() }
+    );
+}
+
+#[test]
+fn holds_shown_message_order_while_allowing_late_room_and_ranks_server_hits() {
+    let first = next_shown_order(None, "needle", &["a1", "a2"], 2);
+    assert_eq!(first, ShownOrder { query: "needle".into(), keys: vec!["a1", "a2"], shown: 2 });
+
+    // Late stronger matches from another environment keep shown rows in place and add up to LATE_ROOM (3).
+    let second = next_shown_order(
+        Some(&first),
+        "needle",
+        &["b1", "b2", "b3", "b4", "a1", "a2"],
+        2,
+    );
+    assert_eq!(
+        second,
+        ShownOrder {
+            query: "needle".into(),
+            keys: vec!["a1", "a2", "b1", "b2", "b3", "b4"],
+            shown: 5,
+        }
+    );
+    assert_eq!(next_shown_order(Some(&second), "needle", &["b1", "b2", "b3", "b4", "a1", "a2"], 2), second);
+
+    let reset = next_shown_order(Some(&second), "needles", &["b1", "a1"], usize::MAX);
+    assert_eq!(reset, ShownOrder { query: "needles".into(), keys: vec!["b1", "a1"], shown: 2 });
+
+    let decoded = decode_search_matches(
+        &serde_json::json!({
+            "matches": [
+                {"threadId": "mid", "snippet": "aneedlez", "quality": 0.3, "hits": 4, "messageCreatedAt": "2026-10-20T00:00:00.000Z"},
+                {"threadId": "whole", "snippet": "needle", "quality": 1.0, "hits": 2, "messageCreatedAt": "2026-10-19T00:00:00.000Z"},
+                {"threadId": "phrase", "snippet": "needle here", "quality": 1.25, "hits": 1, "messageCreatedAt": "2026-10-18T00:00:00.000Z"}
+            ]
+        }),
+        "env-b",
+    );
+    let subjects: HashMap<&str, ThreadSearchSubject> = [
+        ("mid", thread("Gamma")),
+        ("whole", thread("Beta")),
+        ("phrase", thread("Alpha")),
+    ]
+    .into_iter()
+    .collect();
+    let ranked = rank_message_matches(
+        &decoded,
+        |hit| subjects.get(hit.thread_id.as_str()),
+        "needle",
+        NOW,
+        MessageRankOptions { picks: false, without_title_matches: false },
+    );
+    let ids: Vec<&str> = ranked.into_iter().map(|hit| hit.thread_id.as_str()).collect();
+    assert_eq!(ids, ["phrase", "whole", "mid"]);
+}
+
+#[test]
+fn extracts_searchable_pull_requests_and_merges_newer_local_opens() {
+    let links: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
+        {"host": "github.com", "repository": "ping/t3", "number": 10, "url": "https://github.com/ping/t3/pull/10", "source": "stack-dismissed", "linkedAt": "2026-10-25T00:00:00Z", "snapshot": {"state": "open", "title": "Dismissed", "headBranch": "a", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-25T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 11, "url": "https://github.com/ping/t3/pull/11", "source": "manual", "linkedAt": "2026-10-21T00:00:00Z", "snapshot": {"state": "open", "title": "Oldest fourth title omitted", "headBranch": "b", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-21T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 12, "url": "https://github.com/ping/t3/pull/12", "source": "manual", "linkedAt": "2026-10-22T00:00:00Z", "snapshot": {"state": "open", "title": "Third", "headBranch": "c", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-22T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 13, "url": "https://github.com/ping/t3/pull/13", "source": "manual", "linkedAt": "2026-10-23T00:00:00Z", "snapshot": {"state": "open", "title": "Second", "headBranch": "d", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-23T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 14, "url": "https://github.com/ping/t3/pull/14", "source": "manual", "linkedAt": "2026-10-24T00:00:00Z", "snapshot": {"state": "open", "title": "Newest", "headBranch": "e", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-24T00:00:00Z"}}
+    ]))
+    .unwrap();
+    let prs = search_pull_requests(&links);
+    let summary: Vec<(u64, Option<&str>)> = prs.iter().map(|pr| (pr.number, pr.title.as_deref())).collect();
+    assert_eq!(summary, [(14, Some("Newest")), (13, Some("Second")), (12, Some("Third")), (11, None)]);
+    assert_eq!(prs[3].references, ["ping/t3#11", "https://github.com/ping/t3/pull/11"]);
+
+    let server = ThreadOpenStats { opened_at: 1_000, score: 3.5, picks: vec![pick("mcp", 900)] };
+    assert_eq!(merge_local_open(Some(&server), Some(900)), Some(server.clone()));
+    assert_eq!(
+        merge_local_open(Some(&server), Some(2_000)),
+        Some(ThreadOpenStats { opened_at: 2_000, score: 3.5, picks: vec![pick("mcp", 900)] })
+    );
+    assert_eq!(
+        merge_local_open(None, Some(2_000)),
+        Some(ThreadOpenStats { opened_at: 2_000, score: 1.0, picks: Vec::new() })
+    );
+}

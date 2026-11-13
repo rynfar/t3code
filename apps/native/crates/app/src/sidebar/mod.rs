@@ -474,11 +474,7 @@ impl SidebarPane {
 
     fn open_search_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.search.highlighted_key().cloned() else { return };
-        self.clear_search(window, cx);
-        self.state.update(cx, |state, cx| {
-            if key.environment_id.is_empty() { state.select_thread(&key.thread_id, cx); }
-            else if let Some(owner) = state.scoped_environment(&key.environment_id).map(|entry| entry.summary.owner.clone()) { state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx); }
-        });
+        self.activate_search_result(key, window, cx);
     }
 
     /// `SidebarChromeHeader`: the brand (a link home) and the history buttons, in the 52px drag

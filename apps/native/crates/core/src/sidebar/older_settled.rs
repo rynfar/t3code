@@ -128,21 +128,33 @@ pub fn count_request(before: &str) -> Value {
 
 pub const SEARCH_THREADS: &str = "orchestration.searchThreads";
 /// `THREAD_SEARCH_QUERY_MAX_LENGTH`: a pasted wall of text searches by its start.
-const SEARCH_QUERY_MAX_CHARS: usize = 200;
+const SEARCH_QUERY_MAX_UTF16: usize = 200;
 
-/// The server needs a word of three or more letters to match messages.
+pub fn truncate_search_query(query: &str) -> String {
+    let mut units = 0;
+    let cut: String = query
+        .trim()
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= SEARCH_QUERY_MAX_UTF16
+        })
+        .collect();
+    cut.trim().to_owned()
+}
+
+/// The server needs a word of three or more letters (or two CJK characters) to match messages.
 pub fn searches_messages(query: &str) -> bool {
-    query.split(|c: char| !c.is_alphanumeric()).any(|word| word.chars().count() >= 3)
+    !crate::search::message_search_tokens(query).long.is_empty()
 }
 
 /// The sidebar's `searchThreads` payload (`threadSearch.ts`, `useThreadSearch`), or `None` when the
 /// server has nothing to add. Below the shell's cut (`before`) the result also carries the rows of
 /// the best older settled matches, whose titles match from two letters.
 pub fn search_request(query: &str, before: Option<&str>, project_ids: Option<&[String]>) -> Option<Value> {
-    let query: String = query.trim().chars().take(SEARCH_QUERY_MAX_CHARS).collect();
-    let query = query.trim();
-    let messages = searches_messages(query);
-    if query.chars().count() < 2 || (!messages && before.is_none()) {
+    let query = truncate_search_query(query);
+    let messages = searches_messages(&query);
+    if query.encode_utf16().count() < 2 || (!messages && before.is_none()) {
         return None;
     }
     let mut payload = json!({ "query": query });

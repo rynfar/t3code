@@ -1,5 +1,10 @@
-//! Thread scoring and ranking from `packages/shared/src/paletteSearch.ts`: opens and picks,
-//! recency, reference matches, `scoreThreadSearch`, and the ranked item and group passes.
+//! Thread scoring and ranking from `packages/shared/src/paletteSearch.ts`,
+//! `packages/shared/src/threadPullRequests.ts`, and `packages/client-runtime/src/state/threadSearch.ts`:
+//! opens and picks, recency, reference matches, `scoreThreadSearch`, ranked passes, and server match
+//! lifetime (`visibleThreadSearch`, `nextShownOrder`).
+
+use std::collections::HashSet;
+use std::hash::Hash;
 
 use super::*;
 
@@ -511,4 +516,171 @@ pub fn score_search_terms<S: AsRef<str>>(
         picked_exactly: false,
         explain: Explain::None,
     })
+}
+
+const SEARCHED_PULL_REQUEST_TITLES: usize = 3;
+const LATE_ROOM: usize = 3;
+
+/// `threadSearchPullRequests` (`packages/shared/src/threadPullRequests.ts`): every visible PR
+/// matches by number and reference, while only the newest few match by title.
+pub fn search_pull_requests(links: &[crate::pull_requests::link::ThreadLink]) -> Vec<ThreadPullRequest> {
+    crate::pull_requests::link::visible_links(links)
+        .into_iter()
+        .enumerate()
+        .map(|(index, link)| ThreadPullRequest {
+            number: link.number,
+            title: (index < SEARCHED_PULL_REQUEST_TITLES)
+                .then(|| link.snapshot.as_ref().map(|snapshot| snapshot.title.clone()))
+                .flatten(),
+            references: vec![format!("{}#{}", link.repository, link.number), link.url.clone()],
+        })
+        .collect()
+}
+
+/// Merges this client's latest local open into server `opens` (`buildThreadSearchSubject`).
+pub fn merge_local_open(
+    opens: Option<&ThreadOpenStats>,
+    local_opened_at: Option<i64>,
+) -> Option<ThreadOpenStats> {
+    let server_at = opens.map_or(0, |stats| stats.opened_at);
+    match local_opened_at.filter(|&local| local > server_at) {
+        Some(opened_at) => Some(ThreadOpenStats {
+            opened_at,
+            score: opens.map_or(1.0, |stats| stats.score),
+            picks: opens.map_or_else(Vec::new, |stats| stats.picks.clone()),
+        }),
+        None => opens.cloned(),
+    }
+}
+
+/// `OrchestrationThreadSearchMatch` tagged with its `environmentId`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerThreadSearchMatch {
+    pub environment_id: String,
+    pub thread_id: String,
+    pub project_id: Option<String>,
+    pub source: Option<String>,
+    pub snippet: String,
+    pub message_created_at: Option<String>,
+    pub quality: Option<f64>,
+    pub hits: Option<u64>,
+    pub message_id: Option<String>,
+}
+
+impl MessageSearchHit for ServerThreadSearchMatch {
+    fn quality(&self) -> Option<f64> {
+        self.quality
+    }
+
+    fn hits(&self) -> Option<u64> {
+        self.hits
+    }
+
+    fn message_created_at(&self) -> Option<&str> {
+        self.message_created_at.as_deref()
+    }
+}
+
+pub fn decode_search_matches(
+    value: &serde_json::Value,
+    environment_id: &str,
+) -> Vec<ServerThreadSearchMatch> {
+    value
+        .get("matches")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some(ServerThreadSearchMatch {
+                environment_id: environment_id.to_owned(),
+                thread_id: row.get("threadId")?.as_str()?.to_owned(),
+                project_id: row.get("projectId").and_then(serde_json::Value::as_str).map(str::to_owned),
+                source: row.get("source").and_then(serde_json::Value::as_str).map(str::to_owned),
+                snippet: row.get("snippet").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+                message_created_at: row
+                    .get("messageCreatedAt")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                quality: row.get("quality").and_then(serde_json::Value::as_f64).filter(|q| q.is_finite()),
+                hits: row.get("hits").and_then(serde_json::Value::as_u64),
+                message_id: row.get("messageId").and_then(serde_json::Value::as_str).map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownOrder<K> {
+    pub query: String,
+    pub keys: Vec<K>,
+    pub shown: usize,
+}
+
+/// `nextShownOrder` (`threadSearch.ts`): keeps shown rows in place while slower environments reply.
+pub fn next_shown_order<K: Clone + Eq + Hash>(
+    previous: Option<&ShownOrder<K>>,
+    query: &str,
+    ranked: &[K],
+    limit: usize,
+) -> ShownOrder<K> {
+    let Some(previous) = previous.filter(|prev| prev.query == query) else {
+        return ShownOrder {
+            query: query.to_owned(),
+            keys: ranked.to_vec(),
+            shown: limit.min(ranked.len()),
+        };
+    };
+    let listed: HashSet<&K> = ranked.iter().collect();
+    let kept: Vec<K> = previous
+        .keys
+        .iter()
+        .take(previous.shown.min(previous.keys.len()))
+        .filter(|key| listed.contains(key))
+        .cloned()
+        .collect();
+    let held: HashSet<&K> = kept.iter().collect();
+    let seen: HashSet<&K> = previous.keys.iter().collect();
+    let rest: Vec<K> = ranked.iter().filter(|key| !held.contains(key)).cloned().collect();
+    let arrived = rest.iter().filter(|key| !seen.contains(key)).count();
+    let mut keys = Vec::with_capacity(kept.len() + rest.len());
+    keys.extend(kept.iter().cloned());
+    keys.extend(rest);
+    let shown = keys
+        .len()
+        .min(limit.saturating_add(LATE_ROOM))
+        .min(limit.max(kept.len().saturating_add(arrived.min(LATE_ROOM))));
+    if shown == previous.shown && keys == previous.keys {
+        previous.clone()
+    } else {
+        ShownOrder { query: query.to_owned(), keys, shown }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettledThreadSearch<M> {
+    pub query: String,
+    pub matches: Vec<M>,
+}
+
+pub fn queries_related(current: &str, previous: &str) -> bool {
+    let current = fold_search_query(current);
+    let before = fold_search_query(previous);
+    !current.is_empty()
+        && !before.is_empty()
+        && (current.starts_with(&before) || before.starts_with(&current))
+}
+
+/// `visibleThreadSearch` (`threadSearch.ts`): retains related settled results while loading.
+pub fn visible_thread_search<M: Clone>(
+    query: &str,
+    ready: Option<&SettledThreadSearch<M>>,
+    previous: Option<&SettledThreadSearch<M>>,
+) -> SettledThreadSearch<M> {
+    if let Some(ready) = ready {
+        return ready.clone();
+    }
+    match previous.filter(|prev| queries_related(query, &prev.query)) {
+        Some(prev) => prev.clone(),
+        None => SettledThreadSearch { query: String::new(), matches: Vec::new() },
+    }
 }
