@@ -35,7 +35,7 @@ pub fn strip_displayed_plan_markdown(plan_markdown: &str) -> String {
     strip_plan_markdown_body(plan_markdown)
 }
 
-pub const DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES: usize = 8;
+pub const DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES: usize = 10;
 
 /// Collapsed preview markdown for `ProposedPlanCard` (`buildCollapsedProposedPlanPreviewMarkdown`).
 /// Counts only non-whitespace lines toward `max_lines`, trims trailing blank lines, and
@@ -84,6 +84,9 @@ fn sanitize_plan_file_segment(input: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in input.to_ascii_lowercase().chars() {
+        if matches!(ch, '`' | '\'' | '"' | '.' | ',' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}') {
+            continue;
+        }
         if ch.is_ascii_alphanumeric() {
             out.push(ch);
             prev_dash = false;
@@ -293,6 +296,7 @@ mod tests {
     fn filename_and_thread_title_sanitize_headings() {
         let md = "# Refactor: Transcript / Messages (Wave 1C)\n\nBody";
         assert_eq!(build_proposed_plan_markdown_filename(md), "refactor-transcript-messages-wave-1c.md");
+        assert_eq!(build_proposed_plan_markdown_filename("# It's Bob's v1.2 plan!"), "its-bobs-v12-plan.md");
         assert_eq!(build_plan_implementation_thread_title(md), "Implement Refactor: Transcript / Messages (Wave 1C)");
         assert_eq!(build_plan_implementation_thread_title("plain body"), "Implement plan");
         assert_eq!(normalize_plan_markdown_for_export("# Hi\n\n  "), "# Hi\n");

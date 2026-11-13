@@ -44,6 +44,11 @@ pub fn secret_request_display(secret_status: &str, label: &str, can_answer_here:
             label: format!("Declined {trimmed}"),
             detail: "Not shared with the agent.".to_owned(),
         },
+        "cancelled" => SecretRequestDisplay {
+            tone: SecretTone::TimedOut,
+            label: "Request ended".to_owned(),
+            detail: String::new(),
+        },
         "timed_out" => SecretRequestDisplay {
             tone: SecretTone::TimedOut,
             label: format!("Timed out waiting for {trimmed}"),
@@ -137,6 +142,11 @@ pub fn link_request_display(
             tone: LinkTone::Failed,
             label: format!("Failed to link {target}"),
             detail: failure.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Linking did not succeed.").to_owned(),
+        },
+        "cancelled" => LinkRequestDisplay {
+            tone: LinkTone::TimedOut,
+            label: "Request ended".to_owned(),
+            detail: String::new(),
         },
         "timed_out" => LinkRequestDisplay {
             tone: LinkTone::TimedOut,
@@ -289,13 +299,41 @@ pub struct HandoffEndpoint {
     pub is_custom: bool,
 }
 
+fn latest_run_model_before<'a>(
+    runs: &'a [crate::thread::Run],
+    instance_id: &str,
+    before_ordinal: Option<u64>,
+) -> Option<&'a str> {
+    let mut latest: Option<&crate::thread::Run> = None;
+    for run in runs {
+        if run.provider_instance_id != instance_id {
+            continue;
+        }
+        if before_ordinal.is_some_and(|ord| run.ordinal >= ord) {
+            continue;
+        }
+        if latest.is_none_or(|cur| run.ordinal > cur.ordinal) {
+            latest = Some(run);
+        }
+    }
+    latest.map(|run| run.model_selection.model.as_str())
+}
+
 pub fn resolve_handoff_endpoints(
+    item_run_id: Option<&str>,
     from_model_selections: &[Value],
     from_provider_instance_ids: &[String],
     to_provider_instance_id: Option<&str>,
     to_model: Option<&str>,
+    runs: &[crate::thread::Run],
     providers: &[ProviderEntry<'_>],
 ) -> (Vec<HandoffEndpoint>, HandoffEndpoint) {
+    let handoff_run = item_run_id.and_then(|rid| runs.iter().find(|run| run.id == rid));
+    let resolved_to_model = to_model.or_else(|| {
+        handoff_run
+            .filter(|run| Some(run.provider_instance_id.as_str()) == to_provider_instance_id)
+            .map(|run| run.model_selection.model.as_str())
+    });
     let resolve_one = |instance_id: Option<&str>, model_slug: Option<&str>| -> HandoffEndpoint {
         let entry = instance_id.and_then(|id| providers.iter().find(|p| p.instance_id() == id));
         let driver = entry.map(|p| p.driver().to_owned());
@@ -323,11 +361,13 @@ pub fn resolve_handoff_endpoints(
             from_endpoints.push(resolve_one(inst, model));
         }
     } else {
+        let before_ordinal = handoff_run.map(|run| run.ordinal);
         for inst in from_provider_instance_ids {
-            from_endpoints.push(resolve_one(Some(inst.as_str()), None));
+            let inferred = latest_run_model_before(runs, inst.as_str(), before_ordinal);
+            from_endpoints.push(resolve_one(Some(inst.as_str()), inferred));
         }
     }
-    let to_endpoint = resolve_one(to_provider_instance_id, to_model);
+    let to_endpoint = resolve_one(to_provider_instance_id, resolved_to_model);
     (from_endpoints, to_endpoint)
 }
 
@@ -358,7 +398,48 @@ mod tests {
         assert_eq!(sanitize_secret_request_error(Some("SecretRequestError"), "Bad secret"), "Bad secret");
         assert_eq!(sanitize_secret_request_error(None, "raw error echoing sk-secret"), RPC_REQUEST_FALLBACK_ERROR);
         assert_eq!(sanitize_link_request_error(Some("PeerPairingCodeError"), "Invalid code"), "Invalid code");
+        assert_eq!(secret_request_display("cancelled", "OPENAI_API_KEY", true).tone, SecretTone::TimedOut);
+        assert_eq!(secret_request_display("cancelled", "OPENAI_API_KEY", true).label, "Request ended");
+        assert_eq!(link_request_display("cancelled", Some("Mac"), None, None, None, None, true).tone, LinkTone::TimedOut);
+        assert_eq!(link_request_display("cancelled", Some("Mac"), None, None, None, None, true).label, "Request ended");
         assert_eq!(sanitize_link_request_error(Some("UnknownError"), "raw error echoing code"), RPC_REQUEST_FALLBACK_ERROR);
+    }
+
+    #[test]
+    fn handoff_endpoints_infer_missing_models_from_runs() {
+        let runs: Vec<crate::thread::Run> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "run-1", "ordinal": 1, "providerInstanceId": "codex-1",
+                "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                "userMessageId": "m1", "rootNodeId": null, "status": "completed",
+                "requestedAt": "2026-01-01T00:00:00Z", "startedAt": null, "completedAt": null
+            },
+            {
+                "id": "run-2", "ordinal": 2, "providerInstanceId": "claude-1",
+                "modelSelection": { "instanceId": "claude-1", "model": "claude-sonnet-4-5" },
+                "userMessageId": "m2", "rootNodeId": null, "status": "completed",
+                "requestedAt": "2026-01-01T00:01:00Z", "startedAt": null, "completedAt": null
+            },
+            {
+                "id": "run-3", "ordinal": 3, "providerInstanceId": "codex-1",
+                "modelSelection": { "instanceId": "codex-1", "model": "gpt-5-future" },
+                "userMessageId": "m3", "rootNodeId": null, "status": "completed",
+                "requestedAt": "2026-01-01T00:02:00Z", "startedAt": null, "completedAt": null
+            }
+        ]))
+        .expect("runs");
+        let (from, to) = resolve_handoff_endpoints(
+            Some("run-2"),
+            &[],
+            &["codex-1".to_owned()],
+            Some("claude-1"),
+            None,
+            &runs,
+            &[],
+        );
+        assert_eq!(from.len(), 1);
+        assert_eq!(from[0].label, "gpt-5");
+        assert_eq!(to.label, "claude-sonnet-4-5");
     }
 
     #[test]

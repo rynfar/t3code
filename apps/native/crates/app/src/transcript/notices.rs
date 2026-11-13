@@ -656,6 +656,7 @@ impl RenderOnce for SecretRequestCard {
 struct LinkCardState {
     dialog_open: bool,
     manual_mode: bool,
+    default_manual_mode: bool,
     selected_machine_id: Option<String>,
     access: String,
     loading_links: bool,
@@ -670,7 +671,7 @@ struct LinkCardState {
 impl LinkCardState {
     fn reset(&mut self, default_access: String, default_url: &str, default_label: &str, window: &mut Window, cx: &mut App) {
         self.dialog_open = false;
-        self.manual_mode = false;
+        self.manual_mode = self.default_manual_mode;
         self.selected_machine_id = None;
         self.access = default_access;
         self.submitting = false;
@@ -711,13 +712,16 @@ impl RenderOnce for LinkRequestCard {
         let default_access = link_request_default_access(self.requested_access.as_deref()).to_owned();
         let default_url = self.default_url.clone().unwrap_or_default();
         let default_label = self.default_label.clone().unwrap_or_default();
+        let initial_manual_mode = self.default_environment_id.is_none()
+            && self.default_url.as_deref().is_some_and(|u| !u.trim().is_empty());
         let wh = window.window_handle();
         let init_access = default_access.clone();
         let init_url = default_url.clone();
         let init_label = default_label.clone();
         let card_state = window.use_keyed_state(SharedString::from(format!("link-ui:{}", self.id)), cx, |window, cx| LinkCardState {
             dialog_open: false,
-            manual_mode: false,
+            manual_mode: initial_manual_mode,
+            default_manual_mode: initial_manual_mode,
             selected_machine_id: None,
             access: init_access,
             loading_links: false,
@@ -997,7 +1001,16 @@ impl RenderOnce for LinkRequestCard {
                                     let existing = machine.existing_link_environment_id.clone();
                                     let machine_id = machine.id.clone();
                                     let machine_label = machine.label.clone();
-                                    let machine_urls = machine.urls.clone();
+                                    let mut effective_urls = machine.urls.clone();
+                                    if self.default_environment_id.as_deref() == Some(machine_id.as_str())
+                                        && let Some(url) = self
+                                            .default_url
+                                            .as_deref()
+                                            .map(str::trim)
+                                            .filter(|u| !u.is_empty() && !effective_urls.iter().any(|existing_url| existing_url == u))
+                                    {
+                                        effective_urls.push(url.to_owned());
+                                    }
                                     let creds = saved_envs
                                         .iter()
                                         .find(|e| e.environment_id.as_deref() == Some(machine_id.as_str()) || e.id == machine_id)
@@ -1010,7 +1023,13 @@ impl RenderOnce for LinkRequestCard {
                                     let reset_access = default_access.clone();
                                     let reset_url = default_url.clone();
                                     let reset_label = default_label.clone();
-                                    let button_label = if existing.is_some() { "Use existing link" } else { "Link" };
+                                    let button_label = if existing.is_some() {
+                                        "Use existing link"
+                                    } else if effective_urls.is_empty() {
+                                        "Enter address"
+                                    } else {
+                                        "Link"
+                                    };
                                     h_flex()
                                         .justify_between()
                                         .gap(px(8.))
@@ -1024,7 +1043,7 @@ impl RenderOnce for LinkRequestCard {
                                             v_flex()
                                                 .min_w_0()
                                                 .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(machine.label))
-                                                .when_some(machine_urls.first().cloned(), |row, url| {
+                                                .when_some(effective_urls.first().cloned(), |row, url| {
                                                     row.child(div().truncate().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(url))
                                                 }),
                                         )
@@ -1032,8 +1051,17 @@ impl RenderOnce for LinkRequestCard {
                                             Button::new(SharedString::from(format!("link-machine:{id_str}:{machine_id}")), ButtonVariant::Outline, ButtonSize::Xs)
                                                 .label(button_label)
                                                 .disabled(submitting || loading_links)
-                                                .on_click(move |_, _, cx| {
+                                                .on_click(move |_, window, cx| {
                                                     if submitting || loading_links {
+                                                        return;
+                                                    }
+                                                    if existing.is_none() && effective_urls.is_empty() {
+                                                        st.update(cx, |s, cx| {
+                                                            s.manual_mode = true;
+                                                            s.seed_manual_machine(&machine_id, None, &machine_label, window, cx);
+                                                            s.error = Some("No direct address is saved for that machine. Enter its URL and pairing code below.".to_owned());
+                                                            cx.notify();
+                                                        });
                                                         return;
                                                     }
                                                     st.update(cx, |s, cx| {
@@ -1069,7 +1097,9 @@ impl RenderOnce for LinkRequestCard {
                                                             });
                                                         })
                                                         .detach();
-                                                    } else if let Some(creds) = creds.clone() {
+                                                    } else if let Some(creds) = creds.clone()
+                                                        && !effective_urls.is_empty()
+                                                    {
                                                         let body = t3_core::settings::access::pairing_token_body(
                                                             "T3 Code peer link",
                                                             &mcp_client_scopes(&cur_access),
@@ -1080,7 +1110,7 @@ impl RenderOnce for LinkRequestCard {
                                                         let turn_item_id = turn_item_id.clone();
                                                         let machine_id = machine_id.clone();
                                                         let machine_label = machine_label.clone();
-                                                        let machine_urls = machine_urls.clone();
+                                                        let machine_urls = effective_urls.clone();
                                                         let cur_access = cur_access.clone();
                                                         let reset_access = reset_access.clone();
                                                         let reset_url = reset_url.clone();
@@ -1173,7 +1203,7 @@ impl RenderOnce for LinkRequestCard {
                                                     } else {
                                                         let machine_id = machine_id.clone();
                                                         let machine_label = machine_label.clone();
-                                                        let first_url = machine_urls.first().cloned();
+                                                        let first_url = effective_urls.first().cloned();
                                                         let _ = wh.update(cx, |_, window, cx| {
                                                             st.update(cx, |s, cx| {
                                                                 s.submitting = false;
@@ -1508,19 +1538,25 @@ pub fn event_row(
             summary,
             ..
         } => {
-            let providers = env
-                .state
-                .read(cx)
+            let app_read = env.state.read(cx);
+            let providers = app_read
                 .server_config
                 .config
                 .as_ref()
                 .map(|config| provider_entries(config, None))
                 .unwrap_or_default();
+            let runs = env
+                .thread_id
+                .and_then(|tid| app_read.thread_state(tid).projection.as_ref())
+                .map(|projection| projection.runs.as_slice())
+                .unwrap_or(&[]);
             let (from, to) = resolve_handoff_endpoints(
+                item.run_id.as_deref(),
                 from_model_selections,
                 from_provider_instance_ids,
                 to_provider_instance_id.as_deref(),
                 to_model.as_deref(),
+                runs,
                 &providers,
             );
             HandoffCard {

@@ -287,8 +287,17 @@ pub fn is_audio_attachment(attachment: &serde_json::Value) -> bool {
             .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("audio/"))
 }
 
+pub fn is_pasted_text_attachment(attachment: &serde_json::Value) -> bool {
+    attachment
+        .get("source")
+        .and_then(|s| s.get("_tag"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pasted-text")
+        || attachment.get("pastedText").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 pub fn user_message_file_label(attachment: &serde_json::Value) -> String {
-    if attachment.get("pastedText").and_then(serde_json::Value::as_bool) == Some(true) {
+    if is_pasted_text_attachment(attachment) {
         return "Pasted text".to_owned();
     }
     attachment
@@ -312,7 +321,7 @@ pub fn partition_user_attachments(attachments: &[serde_json::Value], display_tex
         } else if ty == Some("image") || kind == Some("image") || mime.to_ascii_lowercase().starts_with("image/") {
             out.images.push(att.clone());
         } else {
-            let pasted_text = att.get("pastedText").and_then(serde_json::Value::as_bool) == Some(true);
+            let pasted_text = is_pasted_text_attachment(att);
             let downloadable = att.get("downloadable").and_then(serde_json::Value::as_bool) != Some(false)
                 && att.get("id").and_then(serde_json::Value::as_str).is_some_and(|id| !id.is_empty());
             let size_bytes = att.get("sizeBytes").and_then(serde_json::Value::as_u64);
@@ -517,7 +526,7 @@ mod tests {
     #[test]
     fn partitions_user_attachments_for_pasted_text_audio_and_files() {
         let atts = vec![
-            json!({ "id": "a1", "kind": "file", "name": "notes.txt", "pastedText": true, "sizeBytes": 42 }),
+            json!({ "id": "a1", "type": "file", "name": "notes.txt", "mimeType": "text/plain", "sizeBytes": 42, "source": { "_tag": "pasted-text" } }),
             json!({ "id": "a2", "kind": "audio", "name": "voice.webm", "mimeType": "audio/webm" }),
         ];
         let part = partition_user_attachments(&atts, "");
