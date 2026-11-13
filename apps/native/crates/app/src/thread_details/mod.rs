@@ -236,11 +236,25 @@ impl Details {
     }
 }
 
-/// The open thread's effective project scripts: the shell's, as server settings override them
-/// (`resolveProjectScripts` in `ChatView.tsx`).
+pub(crate) fn panel_key_for(selected_thread: Option<&str>, draft_project: Option<&str>) -> Option<String> {
+    selected_thread.map(str::to_owned).or_else(|| draft_project.map(|id| format!("draft:{id}")))
+}
+
+/// The active card target key: the selected thread id, or `draft:<project_id>` for a project draft.
+pub fn panel_key(state: &AppState) -> Option<String> {
+    panel_key_for(state.selected_thread.as_deref(), state.draft_project.as_deref())
+}
+
+/// The open thread or draft's effective project scripts: the shell's, as server settings override
+/// them (`resolveProjectScripts` in `ChatView.tsx`).
 pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)> {
-    let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
-    let project = state.shell.project(&thread.project_id)?;
+    let project_id = state
+        .selected_thread
+        .as_deref()
+        .and_then(|id| state.thread_shell(id))
+        .map(|thread| thread.project_id.as_str())
+        .or(state.draft_project.as_deref())?;
+    let project = state.shell.project(project_id)?;
     let own = project.scripts.iter().filter_map(|value| serde_json::from_value(value.clone()).ok()).collect();
     let scripts = match state.server_config.config.as_ref() {
         Some(config) => resolve_project_scripts(&config.settings, &project.id, own),
@@ -250,7 +264,7 @@ pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)>
 }
 
 /// How wide the chat canvas is: the window minus the sidebar and an inline right panel.
-fn canvas_width(state: &AppState, viewport_width: f32) -> f32 {
+pub(crate) fn canvas_width(state: &AppState, viewport_width: f32) -> f32 {
     let sidebar = sidebar_inline_width(state, viewport_width);
     let row = viewport_width - sidebar;
     let panel = state.selected_thread.as_deref().map_or(0., |thread| {
@@ -289,16 +303,31 @@ pub fn layout(state: &Entity<AppState>, window: &Window, cx: &App) -> Layout {
     let viewport = window.viewport_size();
     let width = canvas_width(app, f32::from(viewport.width));
     let presentation = presentation_for(width);
-    let card_open = match (app.selected_thread.as_deref(), details(cx)) {
-        (Some(thread), Some(details)) => details.read(cx).is_open(thread, presentation),
+    let card_open = match (panel_key(app).as_deref(), details(cx)) {
+        (Some(key), Some(details)) => details.read(cx).is_open(key, presentation),
         _ => false,
     };
     let lane_inset = if card_open && presentation == Presentation::Inline { lane_inset_for(width) } else { 0. };
     Layout { presentation, card_open, lane_inset }
 }
 
-pub fn available_height(window: &Window) -> f32 {
-    (f32::from(window.viewport_size().height) - crate::workspace::TITLEBAR_HEIGHT - 2. * CARD_GAP - 24.).max(0.)
+pub(crate) fn available_height_for(viewport_height: f32, terminal_height: f32) -> f32 {
+    (viewport_height - crate::workspace::TITLEBAR_HEIGHT - terminal_height.max(0.) - 2. * CARD_GAP - 24.).max(0.)
+}
+
+pub fn available_height(window: &Window, terminal_height: f32) -> f32 {
+    available_height_for(f32::from(window.viewport_size().height), terminal_height)
+}
+
+pub(crate) fn point_in_find_bar(position: gpui::Point<gpui::Pixels>, state: &AppState, window: &Window) -> bool {
+    let viewport_width = f32::from(window.viewport_size().width);
+    let canvas_right = sidebar_inline_width(state, viewport_width) + canvas_width(state, viewport_width);
+    let right = canvas_right - 12.;
+    let left = right - 280.;
+    let top = crate::workspace::TITLEBAR_HEIGHT + 12.;
+    let bottom = top + 36.;
+    let (x, y) = (f32::from(position.x), f32::from(position.y));
+    x >= left && x <= right && y >= top && y <= bottom
 }
 
 /// Creates the card's model and registers `threadPanel.toggle`, `script.<id>.run` and
@@ -309,8 +338,8 @@ pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
     cx.set_global(DetailsGlobal(details.clone()));
     let toggle = (state.clone(), details.clone());
     cx.on_action(move |_: &ToggleThreadPanel, cx| {
-        let Some(thread) = toggle.0.read(cx).selected_thread.clone() else { return };
-        toggle.1.update(cx, |details, cx| details.toggle(&thread, cx));
+        let Some(key) = panel_key(toggle.0.read(cx)) else { return };
+        toggle.1.update(cx, |details, cx| details.toggle(&key, cx));
     });
     let run = (state.clone(), details.clone());
     cx.on_action(move |action: &RunProjectScript, cx| {
@@ -369,5 +398,19 @@ mod tests {
         clear_open_popovers(&mut panels);
         assert_eq!(panels["t1"], PanelVisibility { inline_open: false, popover_open: false });
         assert_eq!(panels["t2"], PanelVisibility { inline_open: true, popover_open: false });
+    }
+
+    #[test]
+    fn available_height_subtracts_open_terminal_drawer() {
+        assert_eq!(available_height_for(900., 0.), 800.);
+        assert_eq!(available_height_for(900., 280.), 520.);
+        assert_eq!(available_height_for(200., 280.), 0.);
+    }
+
+    #[test]
+    fn panel_key_covers_selected_threads_and_project_drafts() {
+        assert_eq!(panel_key_for(Some("thread-1"), Some("proj-1")), Some("thread-1".to_owned()));
+        assert_eq!(panel_key_for(None, Some("proj-1")), Some("draft:proj-1".to_owned()));
+        assert_eq!(panel_key_for(None, None), None);
     }
 }

@@ -101,6 +101,13 @@ impl TerminalDrawer {
         self.layout(cx).is_some_and(|(_, layout)| layout.terminal_open)
     }
 
+    pub fn visible_height(&self, viewport_height: f32, cx: &App) -> f32 {
+        match self.layout(cx) {
+            Some((_, layout)) if layout.terminal_open => terminal::clamp_drawer_height(layout.terminal_height, viewport_height),
+            _ => 0.,
+        }
+    }
+
     /// Follows the current connection; switching environments drops everything the last one
     /// started, which still holds its client.
     fn connection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {

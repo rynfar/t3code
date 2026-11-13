@@ -3,20 +3,23 @@
 //! `ThreadDetailsPanel.tsx`, `ThreadServersPanel.tsx`, `ThreadAutomationsPanel.tsx`).
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::preview::DiscoveredServer;
-use crate::settings::scheduled_tasks::ScheduledTask;
+use crate::preview::address::normalize_preview_url;
+use crate::settings::scheduled_tasks::{ScheduledTask, relative_run_label};
 use crate::shell::LinkOrigin;
 
 /// `THREAD_DETAILS_ITEMS` from `apps/web/src/components/chat/threadDetailsItems.ts`.
 /// Ids are persisted, so never rename one.
 pub const ITEMS: &[(&str, &str, bool)] = &[
-    ("environment", "Environment", true),
-    ("openIn", "Open in", true),
-    ("scripts", "Scripts", true),
-    ("branch", "Branch", true),
+    ("environment", "Environment and worktree", true),
+    ("openIn", "Open in editor", true),
+    ("scripts", "Project scripts", true),
+    ("branch", "Branch and pull request", true),
     ("gitActions", "Git actions", true),
     ("changes", "Changes", true),
     ("servers", "Servers", true),
@@ -149,9 +152,9 @@ const SECTION_PAD: f32 = 16.;
 const SECTION_TITLE_HEIGHT: f32 = 24.;
 const SEPARATOR_HEIGHT: f32 = 9.;
 const CARD_PADDING: f32 = 8.;
-/// Minimum viewport room reserved above/below the card (`titlebar + gaps + bottom clearance`).
-const LIST_MIN_HEIGHT: f32 = 104.;
 
+/// `fittingHeight` (`ThreadDetailsCard.tsx:82-87`): measures fixed sections and excludes scrolling
+/// list containers (`pr_row`, `automations`, `lineage`, `side_chats`, and server overflow).
 fn estimate_height(inputs: &DensityInputs, density: CardDensity) -> f32 {
     let mut height = CARD_PADDING;
     let mut sections = 0usize;
@@ -165,7 +168,6 @@ fn estimate_height(inputs: &DensityInputs, density: CardDensity) -> f32 {
     }
 
     let vc_rows = usize::from(inputs.branch && item_visible_at_density("branch", density))
-        + usize::from(inputs.branch && inputs.pr_row && item_visible_at_density("branch", density))
         + usize::from(inputs.git_actions && item_visible_at_density("gitActions", density))
         + usize::from(inputs.changes && item_visible_at_density("changes", density));
     if vc_rows > 0 {
@@ -177,28 +179,19 @@ fn estimate_height(inputs: &DensityInputs, density: CardDensity) -> f32 {
         sections += 1;
         height += SECTION_PAD + SECTION_TITLE_HEIGHT + inputs.servers_rows.min(SERVER_PAGE_COUNT) as f32 * 40.;
     }
-    if inputs.automations_rows > 0 && item_visible_at_density("automations", density) {
-        sections += 1;
-        height += SECTION_PAD + SECTION_TITLE_HEIGHT + inputs.automations_rows.min(3) as f32 * 48.;
-    }
-    if inputs.lineage_rows > 0 && item_visible_at_density("lineage", density) {
-        sections += 1;
-        height += SECTION_PAD + SECTION_TITLE_HEIGHT + (inputs.lineage_rows as f32 * ROW_HEIGHT).min(LIST_MIN_HEIGHT);
-    }
-    if inputs.side_chats_rows > 0 && item_visible_at_density("sideChats", density) {
-        sections += 1;
-        height += SECTION_PAD + SECTION_TITLE_HEIGHT + (inputs.side_chats_rows as f32 * ROW_HEIGHT).min(LIST_MIN_HEIGHT);
-    }
 
     let usage_rows = inputs.usage_rows * usize::from(item_visible_at_density("usage", density));
-    let ctx_rows = usize::from(inputs.context && item_visible_at_density("context", density));
-    if usage_rows > 0 || ctx_rows > 0 {
+    if usage_rows > 0 {
         sections += 1;
-        let title = if density.is_essential() { 0. } else { SECTION_TITLE_HEIGHT };
-        height += SECTION_PAD + title + usage_rows as f32 * 28. + ctx_rows as f32 * 30.;
+        height += if density.is_essential() { 8. } else { SECTION_PAD } + usage_rows as f32 * 28.;
+    }
+    let ctx_rows = usize::from(inputs.context && item_visible_at_density("context", density));
+    if ctx_rows > 0 {
+        sections += 1;
+        height += if density.is_essential() { 8. } else { SECTION_PAD } + ctx_rows as f32 * 30.;
     }
 
-    if sections > 1 && !density.is_essential() {
+    if sections > 1 && density.is_full() {
         height += (sections - 1) as f32 * SEPARATOR_HEIGHT;
     }
     height
@@ -245,8 +238,64 @@ pub fn server_subtitle(server: &DiscoveredServer) -> String {
     }
 }
 
-pub fn can_stop_server(server: &DiscoveredServer, can_operate_preview: bool, local_server_stop_supported: Option<bool>) -> bool {
-    can_operate_preview && local_server_stop_supported == Some(true) && server.pid.is_some_and(|pid| pid > 0)
+pub fn can_stop_server(server: &DiscoveredServer, can_operate_terminal: bool, local_server_stop_supported: Option<bool>) -> bool {
+    can_operate_terminal && local_server_stop_supported == Some(true) && server.pid.is_some_and(|pid| pid > 0)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if bare == "localhost" || bare.ends_with(".localhost") || bare == "0.0.0.0" || bare == "::" {
+        return true;
+    }
+    bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_private_network_host(host: &str) -> bool {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if bare.ends_with(".local") {
+        return true;
+    }
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            let [a, b, ..] = ip.octets();
+            a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168) || (a == 100 && (64..=127).contains(&b)) || (a == 169 && b == 254)
+        }
+        Ok(IpAddr::V6(ip)) => {
+            let seg = ip.segments()[0];
+            (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
+/// `resolveDiscoveredServerUrl` (`apps/web/src/browser/browserTargetResolver.ts`): rewrites a
+/// loopback discovered server URL to the remote environment's private-network hostname when paired
+/// to a private remote environment, keeping scheme, port, path, query, and fragment intact.
+pub fn resolve_discovered_server_url(raw_url: &str, environment_http_base: Option<&str>) -> String {
+    let normalized = normalize_preview_url(raw_url).unwrap_or_else(|_| raw_url.trim().to_owned());
+    let Ok(mut server_url) = Url::parse(&normalized) else {
+        return normalized;
+    };
+    let Some(server_host) = server_url.host_str() else {
+        return normalized;
+    };
+    if !is_loopback_host(server_host) {
+        return normalized;
+    }
+    let Some(env_base) = environment_http_base else {
+        return normalized;
+    };
+    let Ok(env_url) = Url::parse(env_base.trim()) else {
+        return normalized;
+    };
+    let Some(env_host) = env_url.host_str() else {
+        return normalized;
+    };
+    if is_loopback_host(env_host) || !is_private_network_host(env_host) {
+        return normalized;
+    }
+    let _ = server_url.set_host(Some(env_host));
+    server_url.into()
 }
 
 pub fn stop_server_payload(pid: i64, port: u16) -> Value {
@@ -270,18 +319,29 @@ pub fn stop_server_error_message(error: &str) -> String {
     }
 }
 
-/// Returns `(visible_count, hidden_count)` for `SERVER_PAGE_COUNT = 4`.
-pub fn visible_server_counts(total: usize, show_all: bool) -> (usize, usize) {
-    if show_all || total <= SERVER_PAGE_COUNT {
-        (total, 0)
-    } else {
-        (SERVER_PAGE_COUNT, total - SERVER_PAGE_COUNT)
-    }
+/// Returns `(visible_count, hidden_count)` for incremental `+ SERVER_PAGE_COUNT` paging.
+pub fn visible_server_page(total: usize, visible_limit: usize) -> (usize, usize) {
+    let visible = total.min(visible_limit.max(SERVER_PAGE_COUNT));
+    (visible, total.saturating_sub(visible))
 }
 
 /// Scheduled tasks bound to `thread_id` (`ThreadAutomationsPanel.tsx`).
 pub fn tasks_for_thread<'a>(tasks: &'a [ScheduledTask], thread_id: &str) -> Vec<&'a ScheduledTask> {
     tasks.iter().filter(|task| task.thread_id.as_deref() == Some(thread_id)).collect()
+}
+
+/// `taskScheduleLine` (`ThreadAutomationsPanel.tsx`): schedule + `blockedByPolicy`, or `next <rel>`, or `paused`.
+pub fn automation_schedule_line(task: &ScheduledTask, once_label: impl Fn(i64) -> String, now_ms: i64) -> String {
+    let schedule = task.schedule.label(once_label);
+    if let Some(reason) = &task.blocked_by_policy {
+        format!("{schedule} \u{00b7} {reason}")
+    } else if !task.enabled {
+        format!("{schedule} \u{00b7} paused")
+    } else if let Some(next_run_at) = task.next_run_at.as_deref() {
+        format!("{schedule} \u{00b7} next {}", relative_run_label(Some(next_run_at), now_ms))
+    } else {
+        schedule
+    }
 }
 
 /// `ChatHeader`: `"No project"` when `is_scratch` (`ChatView.tsx`).
@@ -299,26 +359,21 @@ pub fn resolve_rename_commit(initial: &str, draft: &str) -> Option<String> {
     }
 }
 
-/// `(badge_label, tooltip)` for a delegated thread's `linkOrigin` (`ChatHeader.tsx:332-347`).
+/// `(badge_label, tooltip)` for a delegated thread's `linkOrigin` (`ChatHeader.tsx:423-428`).
 pub fn link_origin_badge(origin: &LinkOrigin) -> Option<(String, String)> {
     let label = origin.label.trim();
     if label.is_empty() {
         return None;
     }
     let badge = format!("From {label}");
-    let tooltip = if origin.is_fenced() {
-        format!("Linked from {label} (fenced \u{2014} edits stay isolated)")
-    } else {
-        format!("Linked from {label}")
-    };
+    let tooltip = format!("Started by an agent on {label} through a linked environment.");
     Some((badge, tooltip))
 }
 
-/// Collapses the parent breadcrumb label to `"..."` when available header width is tight enough
-/// that project + parent + thread title would crowd each other (`ChatHeader.tsx` overflow guard).
-pub fn should_collapse_parent_crumb(header_width: f32, has_link_origin: bool, has_guest: bool) -> bool {
-    let threshold = 520. + if has_link_origin { 96. } else { 0. } + if has_guest { 140. } else { 0. };
-    header_width > 0. && header_width < threshold
+/// Collapses the parent breadcrumb label to `"..."` when the measured breadcrumb content exceeds
+/// the available header width (`ChatHeader.tsx` overflow observer).
+pub fn should_collapse_parent_crumb(available_width: f32, content_width: f32) -> bool {
+    available_width > 0. && content_width > available_width
 }
 
 #[cfg(test)]
@@ -368,19 +423,35 @@ mod tests {
             open_in: true,
             scripts: true,
             branch: true,
-            pr_row: true,
+            pr_row: false,
             git_actions: true,
             changes: true,
             servers_rows: 2,
-            automations_rows: 1,
-            lineage_rows: 3,
-            side_chats_rows: 1,
+            automations_rows: 0,
+            lineage_rows: 0,
+            side_chats_rows: 0,
             usage_rows: 2,
             context: true,
         };
         assert_eq!(resolve_card_density(900., &rich), CardDensity::Full);
-        assert_eq!(resolve_card_density(420., &rich), CardDensity::Compact);
-        assert_eq!(resolve_card_density(290., &rich), CardDensity::Essential);
+        assert_eq!(resolve_card_density(450., &rich), CardDensity::Compact);
+        assert_eq!(resolve_card_density(310., &rich), CardDensity::Essential);
+        let with_scrolling_lists = DensityInputs {
+            pr_row: true,
+            servers_rows: 20,
+            automations_rows: 10,
+            lineage_rows: 10,
+            side_chats_rows: 10,
+            ..rich
+        };
+        assert_eq!(
+            resolve_card_density(estimate_height(&with_scrolling_lists, CardDensity::Full), &with_scrolling_lists),
+            CardDensity::Full,
+        );
+        assert_eq!(
+            estimate_height(&DensityInputs { servers_rows: 4, ..rich }, CardDensity::Full),
+            estimate_height(&with_scrolling_lists, CardDensity::Full),
+        );
         assert!(item_visible_at_density("servers", CardDensity::Full));
         assert!(!item_visible_at_density("servers", CardDensity::Compact));
         assert!(item_visible_at_density("openIn", CardDensity::Compact));
@@ -406,13 +477,39 @@ mod tests {
         assert!(!can_stop_server(matched[0], false, Some(true)));
         assert!(!can_stop_server(matched[0], true, None));
         assert!(!can_stop_server(matched[1], true, Some(true)));
-        assert_eq!(visible_server_counts(6, false), (4, 2));
-        assert_eq!(visible_server_counts(6, true), (6, 0));
+        assert_eq!(visible_server_page(10, 4), (4, 6));
+        assert_eq!(visible_server_page(10, 8), (8, 2));
+        assert_eq!(visible_server_page(10, 12), (10, 0));
         assert!(stop_server_error_message("PreviewStopLocalServerError: shared-group").contains("process group"));
     }
 
     #[test]
-    fn tasks_filter_by_thread_id() {
+    fn resolves_loopback_discovered_server_urls_for_private_remote_environments() {
+        assert_eq!(
+            resolve_discovered_server_url("http://127.0.0.1:5173/app?tab=1#top", Some("https://192.168.1.40:3773")),
+            "http://192.168.1.40:5173/app?tab=1#top"
+        );
+        assert_eq!(
+            resolve_discovered_server_url("http://localhost:3000", Some("http://mac-studio.local:3773")),
+            "http://mac-studio.local:3000/"
+        );
+        assert_eq!(
+            resolve_discovered_server_url("http://[::1]:4000", Some("http://[fd00::1]:3773")),
+            "http://[fd00::1]:4000/"
+        );
+        // Public hosts or loopback environments keep the URL unchanged.
+        assert_eq!(
+            resolve_discovered_server_url("http://127.0.0.1:5173", Some("https://relay.example.com")),
+            "http://127.0.0.1:5173/"
+        );
+        assert_eq!(
+            resolve_discovered_server_url("http://127.0.0.1:5173", Some("http://localhost:3773")),
+            "http://127.0.0.1:5173/"
+        );
+    }
+
+    #[test]
+    fn tasks_filter_by_thread_id_and_format_schedule_line() {
         let list = crate::settings::scheduled_tasks::decode_list(&json!({
             "tasks": [
                 {
@@ -429,10 +526,11 @@ mod tests {
                     "id": "b",
                     "title": "Run B",
                     "prompt": "do b",
-                    "enabled": true,
+                    "enabled": false,
                     "schedule": { "type": "webhook" },
                     "projectId": "p1",
                     "threadId": "t2",
+                    "lastRunError": "boom",
                     "modelSelection": { "provider": "codex", "model": "gpt-5" }
                 }
             ]
@@ -441,21 +539,31 @@ mod tests {
         let filtered = tasks_for_thread(&list, "t1");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "a");
+        assert_eq!(automation_schedule_line(&list[0], |_| String::new(), 0), "Every 1 min");
+        assert_eq!(automation_schedule_line(&list[1], |_| String::new(), 0), "On webhook \u{00b7} paused");
+        let blocked = ScheduledTask { blocked_by_policy: Some("Turned off by organization".into()), ..list[0].clone() };
+        assert_eq!(automation_schedule_line(&blocked, |_| String::new(), 0), "Every 1 min \u{00b7} Turned off by organization");
+        let upcoming = ScheduledTask { next_run_at: Some("2026-01-01T00:10:00Z".into()), ..list[0].clone() };
+        assert_eq!(
+            automation_schedule_line(&upcoming, |_| String::new(), crate::sidebar::time::parse_iso("2026-01-01T00:00:00Z").unwrap()),
+            "Every 1 min \u{00b7} next in 10m"
+        );
     }
 
     #[test]
-    fn header_helpers_handle_scratch_rename_and_link_origin() {
+    fn header_helpers_handle_scratch_rename_link_origin_and_collapse() {
         assert_eq!(header_project_title("workspace", false), "workspace");
         assert_eq!(header_project_title("workspace", true), "No project");
         assert_eq!(resolve_rename_commit("Hello", "  Hello "), None);
         assert_eq!(resolve_rename_commit("Hello", "   "), None);
         assert_eq!(resolve_rename_commit("Hello", "  New Title "), Some("New Title".to_owned()));
 
-        let fenced = LinkOrigin { session_id: "s1".into(), label: "Mac Studio".into(), access: Some("read-only".into()) };
-        assert_eq!(link_origin_badge(&fenced).unwrap().0, "From Mac Studio");
-        assert!(link_origin_badge(&fenced).unwrap().1.contains("fenced"));
-
-        let full = LinkOrigin { session_id: "s2".into(), label: "Cloud".into(), access: Some("full-access".into()) };
-        assert_eq!(link_origin_badge(&full), Some(("From Cloud".into(), "Linked from Cloud".into())));
+        let origin = LinkOrigin { session_id: "s1".into(), label: "Mac Studio".into(), access: Some("read-only".into()) };
+        assert_eq!(
+            link_origin_badge(&origin),
+            Some(("From Mac Studio".into(), "Started by an agent on Mac Studio through a linked environment.".into()))
+        );
+        assert!(should_collapse_parent_crumb(300., 360.));
+        assert!(!should_collapse_parent_crumb(400., 360.));
     }
 }

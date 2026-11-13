@@ -59,10 +59,9 @@ fn running_indicator(running: bool, cx: &App) -> impl IntoElement {
 
 /// The run context row (`RunContextSelector` in panel mode, locked): the machine, then the
 /// checkout, whose path shows on hover and copies from the context menu.
-fn environment_row(ctx: &Ctx, thread: &ThreadShell, project_root: &str, cx: &App) -> AnyElement {
+fn environment_row(ctx: &Ctx, worktree: Option<&str>, project_root: &str, cx: &App) -> AnyElement {
     let app = ctx.state.read(cx);
     let label = app.server_config.config.as_ref().map(|config| config.environment.label.trim().to_owned()).filter(|label| !label.is_empty()).unwrap_or_else(|| "This device".to_owned());
-    let worktree = thread.worktree_path.as_deref();
     let path = worktree.unwrap_or(project_root).to_owned();
     let p = palette(cx);
     let workspace_icon = div()
@@ -170,11 +169,14 @@ fn run_script(details: &Entity<Details>, project_id: &str, script: &ProjectScrip
 
 pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
-    let project_root = app.shell.project(&thread.project_id)?.workspace_root.clone();
+    let (project_id, worktree) = match app.selected_thread.as_deref().and_then(|id| app.thread_shell(id)) {
+        Some(thread) => (thread.project_id.as_str(), thread.worktree_path.as_deref()),
+        None => (app.draft_project.as_deref()?, None),
+    };
+    let project_root = app.shell.project(project_id)?.workspace_root.clone();
     let details = ctx.details.read(cx);
     let rows: Vec<AnyElement> = [
-        (details.shows("environment") && item_visible_at_density("environment", density)).then(|| environment_row(ctx, thread, &project_root, cx)),
+        (details.shows("environment") && item_visible_at_density("environment", density)).then(|| environment_row(ctx, worktree, &project_root, cx)),
         (details.shows("openIn") && item_visible_at_density("openIn", density)).then(|| open_in_row(ctx, cx)),
         (details.shows("scripts") && item_visible_at_density("scripts", density)).then(|| scripts_row(ctx, cx)).flatten(),
     ]
@@ -243,15 +245,16 @@ pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &Ap
     let details = ctx.details.read(cx);
     let is_repo = ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
     let no_runs_yet = thread.latest_run_id.is_none();
+    let compact_actions = !density.is_full();
     let rows: Vec<AnyElement> = [
         (is_repo && details.shows("branch") && item_visible_at_density("branch", density)).then(|| branch_rows(ctx, thread, cx)),
-        (details.shows("gitActions") && item_visible_at_density("gitActions", density)).then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, cx)).flatten(),
+        (details.shows("gitActions") && item_visible_at_density("gitActions", density)).then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, compact_actions, cx)).flatten(),
         (details.shows("changes") && item_visible_at_density("changes", density)).then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
     ]
     .into_iter()
     .flatten()
     .collect();
-    (!rows.is_empty()).then(|| section_with_options(separated, None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
+    (!rows.is_empty()).then(|| section_with_options(separated && density.is_full(), None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
 }
 
 /// One related thread: opens it (a side chat in its tab), with Merge back on the fork's source

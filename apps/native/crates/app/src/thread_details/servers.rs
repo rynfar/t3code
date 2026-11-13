@@ -1,7 +1,7 @@
 //! `ThreadServersPanel` (`apps/web/src/components/chat/ThreadServersPanel.tsx`):
 //! discovered local servers bound to the open thread, paginated at 4 per page,
 //! opening in preview (or external browser on modifier/middle click) and stopping
-//! when `preview:operate` and `capabilities.localServerStop` permit it.
+//! when `terminal:operate` and `capabilities.localServerStop` permit it.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -11,9 +11,11 @@ use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::auth::TERMINAL_OPERATE_SCOPE;
 use t3_core::preview::{DiscoveredServer, PREVIEW_OPERATE_SCOPE, decode_discovered_servers, method};
 use t3_core::thread_details::{
-    SERVER_PAGE_COUNT, can_stop_server, filter_thread_servers, server_subtitle, stop_server_error_message, stop_server_payload, visible_server_counts,
+    SERVER_PAGE_COUNT, can_stop_server, filter_thread_servers, resolve_discovered_server_url, server_subtitle, stop_server_error_message,
+    stop_server_payload, visible_server_page,
 };
 
 use super::controls::{Row, hover_fill, section};
@@ -38,17 +40,17 @@ pub(super) struct ServersFeed {
     connection: Option<u64>,
     servers: Vec<DiscoveredServer>,
     stopping: HashSet<(i64, u16)>,
-    pub expanded: bool,
+    pub visible_limit: usize,
     feed: Option<(Abort, Task<()>)>,
 }
 
 impl ServersFeed {
     pub fn new() -> Self {
-        ServersFeed { connection: None, servers: Vec::new(), stopping: HashSet::new(), expanded: false, feed: None }
+        ServersFeed { connection: None, servers: Vec::new(), stopping: HashSet::new(), visible_limit: SERVER_PAGE_COUNT, feed: None }
     }
 
     pub fn reset_pagination(&mut self) {
-        self.expanded = false;
+        self.visible_limit = SERVER_PAGE_COUNT;
     }
 
     pub fn count_for(&self, thread_id: &str) -> usize {
@@ -165,25 +167,33 @@ impl ServersFeed {
             return None;
         }
         let app = state.read(cx);
-        let can_operate_preview = app.client_handle().is_some_and(|client| {
-            client.session_state().borrow().as_ref().is_none_or(|session| session.grants(PREVIEW_OPERATE_SCOPE))
-        });
+        let grants = |scope: &str| {
+            app.client_handle()
+                .is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(scope)))
+        };
+        let can_open = grants(PREVIEW_OPERATE_SCOPE);
+        let can_stop = grants(TERMINAL_OPERATE_SCOPE);
         let local_server_stop = app.server_config.config.as_ref().and_then(|config| config.environment.capabilities.local_server_stop);
-        let (visible_count, hidden_count) = visible_server_counts(matching.len(), self.expanded);
+        let env_http_base = app.active_environment().map(|env| env.http_base.clone());
+        let (visible_count, hidden_count) = visible_server_page(matching.len(), self.visible_limit);
+        let any_stopping = !self.stopping.is_empty();
         let p = palette(cx);
         let fill = hover_fill(cx);
+        let external_hint = if cfg!(target_os = "macos") { "\u{2318}-click" } else { "Ctrl-click" };
         let rows: Vec<AnyElement> = matching
             .iter()
             .take(visible_count)
             .map(|server| {
                 let port = server.port;
-                let url = server.url.clone();
-                let middle_url = url.clone();
+                let preview_url = server.url.clone();
+                let external_url = resolve_discovered_server_url(&server.url, env_http_base.as_deref());
+                let middle_url = external_url.clone();
                 let target_thread = thread_id.to_owned();
                 let subtitle = server_subtitle(server);
                 let row_id: SharedString = format!("details-server-{port}").into();
-                let tip: SharedString = format!("Open localhost:{port} (\u{2318}-click for external browser)").into();
-                let open_area = focusable(div().id(row_id.clone()), gpui::ElementId::Name(row_id), true, window, cx)
+                let row_group: SharedString = format!("details-server-row-{port}").into();
+                let tip: SharedString = format!("Open localhost:{port} ({external_hint} for external browser)").into();
+                let open_area = focusable(div().id(row_id.clone()), gpui::ElementId::Name(row_id), can_open, window, cx)
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -192,9 +202,22 @@ impl ServersFeed {
                     .px(px(6.))
                     .py(px(4.))
                     .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(fill))
-                    .tooltip(move |window, cx| tooltip_view(tip.clone(), window, cx))
+                    .when(!can_open, |this| this.opacity(0.64))
+                    .when(can_open, |this| {
+                        this.cursor_pointer()
+                            .hover(move |style| style.bg(fill))
+                            .tooltip(move |window, cx| tooltip_view(tip.clone(), window, cx))
+                            .on_mouse_down(MouseButton::Middle, move |_, _, cx| cx.open_url(&middle_url))
+                            .on_click(move |event, _, cx| {
+                                if event.modifiers().platform || event.modifiers().control {
+                                    cx.open_url(&external_url);
+                                } else if let Some(previews) = crate::preview::previews(cx) {
+                                    previews.update(cx, |previews, cx| previews.open_link(target_thread.clone(), preview_url.clone(), cx));
+                                } else {
+                                    cx.open_url(&external_url);
+                                }
+                            })
+                    })
                     .child(Icon::Globe.sized(px(16.)).text_color(hsla(p.muted_foreground)))
                     .child(
                         v_flex()
@@ -202,33 +225,29 @@ impl ServersFeed {
                             .min_w_0()
                             .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground).opacity(0.85)).child(format!("localhost:{port}")))
                             .child(div().truncate().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(subtitle)),
-                    )
-                    .on_mouse_down(MouseButton::Middle, move |_, _, cx| cx.open_url(&middle_url))
-                    .on_click(move |event, _, cx| {
-                        if event.modifiers().platform || event.modifiers().control {
-                            cx.open_url(&url);
-                        } else if let Some(previews) = crate::preview::previews(cx) {
-                            previews.update(cx, |previews, cx| previews.open_link(target_thread.clone(), url.clone(), cx));
-                        } else {
-                            cx.open_url(&url);
-                        }
-                    });
+                    );
 
-                let stop_btn = can_stop_server(server, can_operate_preview, local_server_stop)
+                let stop_btn = can_stop_server(server, can_stop, local_server_stop)
                     .then_some(server.pid)
                     .flatten()
                     .map(|pid| {
-                        let pending = self.stopping.contains(&(pid, port));
+                        let stopping_this = self.stopping.contains(&(pid, port));
                         let state = state.clone();
-                        right_panel::Button::new(SharedString::from(format!("details-server-stop-{pid}-{port}")))
-                            .icon(Icon::Square)
+                        let button = right_panel::Button::new(SharedString::from(format!("details-server-stop-{pid}-{port}")))
+                            .variant(right_panel::Variant::DestructiveGhost)
+                            .icon(if stopping_this { Icon::LoaderCircle } else { Icon::Square })
                             .icon_size(12.)
-                            .disabled(pending)
+                            .disabled(any_stopping)
                             .tooltip("Stop server")
-                            .on_click(cx.listener(move |view, _, _, cx| view.servers.stop_server(&state, pid, port, cx)))
+                            .on_click(cx.listener(move |view, _, _, cx| view.servers.stop_server(&state, pid, port, cx)));
+                        div()
+                            .flex_none()
+                            .when(!stopping_this, |this| this.invisible().group_hover(row_group.clone(), |style| style.visible()))
+                            .child(button)
                     });
 
                 h_flex()
+                    .group(row_group)
                     .w_full()
                     .min_w_0()
                     .items_center()
@@ -241,18 +260,18 @@ impl ServersFeed {
             .collect();
 
         let toggle_more = (matching.len() > SERVER_PAGE_COUNT).then(|| {
-            if self.expanded {
-                Row::new("details-servers-less", "Show less")
-                    .icon(Icon::ChevronUp)
+            if hidden_count > 0 {
+                Row::new("details-servers-more", format!("Show {} more", hidden_count.min(SERVER_PAGE_COUNT)))
+                    .icon(Icon::ChevronDown)
                     .on_click(cx.listener(|view, _, _, cx| {
-                        view.servers.expanded = false;
+                        view.servers.visible_limit += SERVER_PAGE_COUNT;
                         cx.notify();
                     }))
             } else {
-                Row::new("details-servers-more", format!("Show {hidden_count} more"))
-                    .icon(Icon::Plus)
+                Row::new("details-servers-less", "Show less")
+                    .icon(Icon::ChevronUp)
                     .on_click(cx.listener(|view, _, _, cx| {
-                        view.servers.expanded = true;
+                        view.servers.visible_limit = SERVER_PAGE_COUNT;
                         cx.notify();
                     }))
             }

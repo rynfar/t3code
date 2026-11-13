@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, SharedString, Styled,
-    Subscription, Task, Window, div, point, prelude::*, px,
+    Subscription, Task, TextRun, Window, div, point, prelude::*, px,
 };
+use gpui_component::ActiveTheme;
 use gpui_component::h_flex;
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -16,16 +17,29 @@ use gpui_component::tooltip::Tooltip;
 use t3_core::thread_details::{header_project_title, link_origin_badge, resolve_rename_commit, should_collapse_parent_crumb};
 
 use crate::app_state::{AppEvent, AppState};
+use crate::components::badge::{BadgeKind, badge};
 use crate::context_menu::ContextMenu;
 use crate::icons::Icon;
 use crate::keymap;
 use crate::right_panel::{self, Button, Variant};
 use crate::theme::{hsla, palette};
-use crate::thread_details::{self, ToggleThreadPanel};
+use crate::thread_details::{self, ToggleThreadPanel, canvas_width};
+use crate::toast::{Toast, ToastKind};
 use crate::workspace::sidebar_inline_width;
 
 /// `TITLE_MENU_OPEN_DELAY_MS`: the title's menu waits out a double-click that would rename.
 const TITLE_MENU_DELAY: Duration = Duration::from_millis(500);
+const PROJECT_CRUMB_MAX_WIDTH: f32 = 160.;
+const PARENT_CRUMB_MAX_WIDTH: f32 = 320.;
+
+fn measure_text_width(text: &str, font_size: Pixels, window: &Window, cx: &App) -> f32 {
+    if text.is_empty() {
+        return 0.;
+    }
+    let font = gpui::font(cx.theme().font_family.clone());
+    let run = TextRun { len: text.len(), font, color: gpui::black(), background_color: None, underline: None, strikethrough: None };
+    f32::from(window.text_system().shape_line(SharedString::from(text.to_owned()), font_size, &[run], None).width)
+}
 
 pub struct ChatHeader {
     state: Entity<AppState>,
@@ -33,6 +47,7 @@ pub struct ChatHeader {
     rename: Entity<InputState>,
     renaming: Option<String>,
     rename_initial: Option<String>,
+    rename_committed: bool,
     rename_owner: Option<crate::context_menu::ThreadMenuOwner>,
     rename_previous_focus: Option<gpui::FocusHandle>,
     guest: Entity<crate::guest_share::GuestIndicator>,
@@ -48,6 +63,7 @@ impl ChatHeader {
                 AppEvent::Selection => {
                     this.renaming = None;
                     this.rename_initial = None;
+                    this.rename_committed = false;
                     this.pending_menu = None;
                     cx.notify();
                 }
@@ -55,12 +71,36 @@ impl ChatHeader {
                 _ => {}
             }),
             cx.subscribe_in(&rename, window, |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(window, cx),
+                InputEvent::PressEnter { .. } => {
+                    if crate::sidebar::is_composing(&this.rename, window, cx) {
+                        return;
+                    }
+                    this.rename_committed = true;
+                    this.commit_rename(window, cx);
+                }
+                InputEvent::Blur => {
+                    if this.rename_committed {
+                        return;
+                    }
+                    this.commit_rename(window, cx);
+                }
                 _ => {}
             }),
         ];
         let guest = cx.new(|cx| crate::guest_share::GuestIndicator::new(state.clone(), cx));
-        ChatHeader { state, menu, rename, renaming: None, rename_initial: None, rename_owner: None, rename_previous_focus: None, guest, pending_menu: None, _subscriptions: subscriptions }
+        ChatHeader {
+            state,
+            menu,
+            rename,
+            renaming: None,
+            rename_initial: None,
+            rename_committed: false,
+            rename_owner: None,
+            rename_previous_focus: None,
+            guest,
+            pending_menu: None,
+            _subscriptions: subscriptions,
+        }
     }
 
     fn start_rename(&mut self, thread_id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -68,6 +108,7 @@ impl ChatHeader {
         if !owner.allows(self.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { return; }
         self.rename_owner = Some(owner);
         self.rename_initial = Some(title.clone());
+        self.rename_committed = false;
         self.rename_previous_focus = window.focused(cx);
         self.pending_menu = None;
         self.rename.update(cx, |input, cx| {
@@ -85,6 +126,13 @@ impl ChatHeader {
         let draft = self.rename.read(cx).value().to_string();
         if self.rename.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = self.rename_previous_focus.take() { window.focus(&focus, cx); }
         let owner = self.rename_owner.take();
+        if draft.trim().is_empty() {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(Toast::new(ToastKind::Warning, "Thread title cannot be empty"), cx);
+            });
+            cx.notify();
+            return;
+        }
         if let Some(title) = resolve_rename_commit(&initial, &draft) {
             self.state.update(cx, |state, cx| {
                 if owner.is_some_and(|owner| owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename)) {
@@ -185,17 +233,23 @@ impl Render for ChatHeader {
         let has_guest = app.guest_share(&thread.id).is_some();
         let viewport_width = f32::from(window.viewport_size().width);
         let sidebar_w = sidebar_inline_width(app, viewport_width);
-        let right_w = if app.panels.panels.is_open(&thread.id) {
-            t3_core::right_panel::clamp_width(
-                app.panels.panels.width(&thread.id).unwrap_or(t3_core::right_panel::DEFAULT_WIDTH),
-                viewport_width,
-                viewport_width - sidebar_w,
-            )
-        } else {
-            0.
-        };
-        let header_estimate = (viewport_width - sidebar_w - right_w - 240.).max(0.);
-        let parent_collapsed = should_collapse_parent_crumb(header_estimate, link_badge.is_some(), has_guest);
+        let panel_open = app.panels.panels.is_open(&thread.id);
+        let titlebar_left = if sidebar_w == 0. { 130. } else { 20. };
+        let controls_reserved = if panel_open { 40. } else { 104. };
+        let available_header = (canvas_width(app, viewport_width) - titlebar_left - 12. - controls_reserved - 48.).max(0.);
+        let font_sm = px(14.);
+        let font_xs = px(10.);
+        let project_w = project
+            .as_ref()
+            .map_or(0., |(_, name)| measure_text_width(name, font_sm, window, cx).min(PROJECT_CRUMB_MAX_WIDTH) + 20.);
+        let parent_w = parent.as_ref().map_or(0., |(_, parent_title)| {
+            measure_text_width(parent_title, font_sm, window, cx).min(PARENT_CRUMB_MAX_WIDTH) + 32.
+        });
+        let title_w = measure_text_width(&title, font_sm, window, cx).max(40.);
+        let link_w = link_badge.as_ref().map_or(0., |(text, _)| measure_text_width(text, font_xs, window, cx).min(160.) + 18.);
+        let guest_w = if has_guest { 120. } else { 0. };
+        let measured_content = project_w + 32. + parent_w + title_w + 18. + link_w + guest_w;
+        let parent_collapsed = should_collapse_parent_crumb(available_header, measured_content);
         let crumb = |id: &'static str, icon: Option<gpui::AnyElement>, text: String, max_w: f32, tooltip: String| {
             let tooltip: SharedString = tooltip.into();
             h_flex()
@@ -271,7 +325,7 @@ impl Render for ChatHeader {
             )
             .children(project.map(|(project_id, name)| {
                 let state = state.clone();
-                crumb("chat-header-project", Some(favicon), name.clone(), 256., format!("New thread in {name}"))
+                crumb("chat-header-project", Some(favicon), name.clone(), PROJECT_CRUMB_MAX_WIDTH, format!("New thread in {name}"))
                     .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_draft(&project_id, cx)))
             }))
             .child(separator())
@@ -282,24 +336,16 @@ impl Render for ChatHeader {
                     .flex_shrink(1.)
                     .min_w_0()
                     .gap(px(12.))
-                    .child(crumb("chat-header-parent", None, label, 320., parent_title).on_click(move |_, _, cx| state.update(cx, |state, cx| state.select_thread(&parent_id, cx))))
+                    .child(crumb("chat-header-parent", None, label, PARENT_CRUMB_MAX_WIDTH, parent_title).on_click(move |_, _, cx| state.update(cx, |state, cx| state.select_thread(&parent_id, cx))))
                     .child(separator())
             }))
             .child(title_element)
-            .children(link_badge.map(|(badge, tip)| {
+            .children(link_badge.map(|(text, tip)| {
                 let tip: SharedString = tip.into();
                 div()
                     .id("chat-header-link-origin")
                     .flex_none()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(hsla(p.border))
-                    .bg(hsla(p.card).opacity(0.6))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .text_xs()
-                    .text_color(hsla(p.muted_foreground))
-                    .child(badge)
+                    .child(badge(text, BadgeKind::Info, false, cx))
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             }))
             .child(self.guest.clone())
@@ -314,12 +360,13 @@ pub fn controls(state: &Entity<AppState>, terminal_toggle: Option<AnyElement>, w
     let app = state.read(cx);
     let thread = app.selected_thread.clone();
     let panel_open = thread.as_deref().is_some_and(|thread| app.panels.panels.is_open(thread));
+    let details_available = thread_details::panel_key(app).is_some();
     let layout = thread_details::layout(state, window, cx);
     let label = keymap::label("threadPanel.toggle", cx).map_or_else(|| "Toggle thread details".to_owned(), |key| format!("Toggle thread details ({key})"));
     h_flex()
         .flex_none()
         .gap(px(4.))
-        .when(thread.is_some(), |this| {
+        .when(details_available, |this| {
             this.child(
                 Button::new("thread-details-toggle")
                     .variant(Variant::Toggle)

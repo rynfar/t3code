@@ -100,7 +100,7 @@ impl Workspace {
         let details_model = thread_details::init(state.clone(), cx);
         let git = details_model.read(cx).git.clone();
         let git_dialogs = cx.new(|cx| GitDialogs::new(git, window, cx));
-        let details = cx.new(|cx| DetailsView::new(state.clone(), details_model.clone(), git_dialogs.clone(), window, cx));
+        let details = cx.new(|cx| DetailsView::new(state.clone(), details_model.clone(), git_dialogs.clone(), terminal.clone(), window, cx));
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
@@ -412,7 +412,17 @@ impl Render for Workspace {
                         )
                         .child(self.terminal.clone())
                     })
-                    .when(has_draft, |this| this.child(div().flex_1().min_h_0().child(self.draft.clone())))
+                    .when(has_draft, |this| {
+                        this.child(
+                            v_flex()
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .pr(px(details_layout.lane_inset))
+                                .child(div().flex_1().min_h_0().child(self.draft.clone()))
+                                .child(self.details.clone()),
+                        )
+                    })
                     .when(!has_thread && !has_draft, |this| this.child(div().flex_1().min_h_0().child(self.home.clone()))),
                 )
             })
