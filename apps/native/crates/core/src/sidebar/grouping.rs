@@ -185,6 +185,14 @@ impl ProjectScope {
         self.keys.is_empty()
     }
 
+    pub fn single(group: &ProjectGroup) -> Self {
+        let mut keys = HashSet::new();
+        if !group.archived {
+            keys.insert(group.key.clone());
+        }
+        Self { keys }
+    }
+
     pub fn toggle(&mut self, group: &ProjectGroup, groups: &[ProjectGroup], ready: bool) {
         self.keys = self.resolved_keys(groups, ready);
         if !self.keys.remove(&group.key) {
@@ -589,6 +597,116 @@ impl ProjectPreferences {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEnvironmentBadge {
+    pub environment_id: String,
+    pub description: String,
+}
+
+pub fn pickable_scoped_project_groups(groups: &[ScopedProjectGroup]) -> Vec<ScopedProjectGroup> {
+    let open = groups.iter().filter(|group| !group.archived && !group.is_scratch).cloned();
+    let (pinned, rest): (Vec<_>, Vec<_>) = open.partition(|group| group.pinned);
+    pinned.into_iter().chain(rest).collect()
+}
+
+pub fn project_groups_span_environments(groups: &[ScopedProjectGroup]) -> bool {
+    let mut seen = HashSet::new();
+    for group in groups {
+        for member in &group.members {
+            seen.insert(member.project.owner.saved_id.as_str());
+            if seen.len() > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn resolve_project_environment_badge(
+    group: &ScopedProjectGroup,
+    primary_environment_id: Option<&str>,
+) -> Option<ProjectEnvironmentBadge> {
+    struct Entry {
+        saved_id: String,
+        label: String,
+    }
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for member in &group.members {
+        let saved_id = member.project.owner.saved_id.clone();
+        if !seen.insert(saved_id.clone()) {
+            continue;
+        }
+        let trimmed = member.project.environment_label.trim();
+        let label = if trimmed.is_empty() { "Remote".to_owned() } else { trimmed.to_owned() };
+        entries.push(Entry { saved_id, label });
+    }
+    let sort_entries = |list: &mut Vec<Entry>| {
+        list.sort_by(|a, b| {
+            crate::thread::locale_compare(&a.label, &b.label)
+                .then_with(|| crate::thread::locale_compare(&a.saved_id, &b.saved_id))
+        });
+    };
+    if let Some(primary) = primary_environment_id {
+        let has_local = entries.iter().any(|entry| entry.saved_id == primary);
+        let mut remote: Vec<Entry> = entries.into_iter().filter(|entry| entry.saved_id != primary).collect();
+        if remote.is_empty() {
+            return None;
+        }
+        sort_entries(&mut remote);
+        let names = remote.iter().map(|entry| entry.label.as_str()).collect::<Vec<_>>().join(", ");
+        let description = if has_local { format!("Also on {names}") } else { format!("On {names}") };
+        Some(ProjectEnvironmentBadge {
+            environment_id: remote[0].saved_id.clone(),
+            description,
+        })
+    } else {
+        if entries.is_empty() {
+            return None;
+        }
+        sort_entries(&mut entries);
+        let names = entries.iter().map(|entry| entry.label.as_str()).collect::<Vec<_>>().join(", ");
+        Some(ProjectEnvironmentBadge {
+            environment_id: entries[0].saved_id.clone(),
+            description: format!("On {names}"),
+        })
+    }
+}
+
+pub fn order_while_open<T>(order: &mut Vec<String>, items: Vec<T>, key: impl Fn(&T) -> &str) -> Vec<T> {
+    for item in &items {
+        let k = key(item);
+        if !order.iter().any(|existing| existing == k) {
+            order.push(k.to_owned());
+        }
+    }
+    let mut indexed: Vec<(usize, T)> = items
+        .into_iter()
+        .map(|item| {
+            let pos = order.iter().position(|existing| existing == key(&item)).unwrap_or(usize::MAX);
+            (pos, item)
+        })
+        .collect();
+    indexed.sort_by_key(|(pos, _)| *pos);
+    indexed.into_iter().map(|(_, item)| item).collect()
+}
+
+pub fn filter_project_scope_items<T>(
+    items: Vec<T>,
+    query: &str,
+    value_of: impl Fn(&T) -> &str,
+    label_of: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| value_of(item) != "all" && label_of(item).to_lowercase().contains(&trimmed))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +845,93 @@ mod tests {
         let mut archived = split.clone();
         archived[1].archived = true;
         assert_eq!(scope.members(&archived, true), None);
+    }
+
+    #[test]
+    fn project_filter_scope_and_environment_badge_parity() {
+        let projects = [project("a", "/repo-a"), project("b", "/repo-b")];
+        let settings = GroupingSettings { mode: GroupingMode::Separate, ..Default::default() };
+        let groups = build_project_groups("env", &projects, &settings);
+        let single = ProjectScope::single(&groups[1]);
+        assert!(!single.is_selected(&groups[0]));
+        assert!(single.is_selected(&groups[1]));
+
+        let owner = |saved: &str| EnvironmentOwner {
+            saved_id: saved.into(),
+            canonical_id: Some(format!("canon-{saved}")),
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 1,
+        };
+        let mut pinned_proj = project("pinned", "/pinned");
+        pinned_proj.repository_identity = None;
+        pinned_proj.pinned_at = Some("2026-01-02T00:00:00.000Z".into());
+        let mut archived_proj = project("archived", "/archived");
+        archived_proj.repository_identity = None;
+        archived_proj.archived_at = Some("2026-01-02T00:00:00.000Z".into());
+        let shared_local = project("shared-l", "/shared");
+        let shared_remote = project("shared-r", "/shared");
+        let mut remote_only_a = project("rem-a", "/rem");
+        remote_only_a.repository_identity = Some(json!({"canonicalKey": "github.com/t3/rem", "rootPath": "/rem"}));
+        let mut remote_only_b = project("rem-b", "/rem");
+        remote_only_b.repository_identity = Some(json!({"canonicalKey": "github.com/t3/rem", "rootPath": "/rem"}));
+
+        let scoped_projects = [
+            ScopedProject { owner: owner("local"), project: shared_local, is_scratch: false, environment_label: "MacBook".into() },
+            ScopedProject { owner: owner("cloud"), project: shared_remote, is_scratch: false, environment_label: "Cloud VM".into() },
+            ScopedProject { owner: owner("remote-z"), project: remote_only_a, is_scratch: false, environment_label: String::new() },
+            ScopedProject { owner: owner("remote-a"), project: remote_only_b, is_scratch: false, environment_label: "Alpha".into() },
+            ScopedProject { owner: owner("local"), project: pinned_proj, is_scratch: false, environment_label: "MacBook".into() },
+            ScopedProject { owner: owner("local"), project: archived_proj, is_scratch: false, environment_label: "MacBook".into() },
+        ];
+        let built = build_scoped_project_groups(&GroupInput {
+            projects: &scoped_projects,
+            threads: &[],
+            settings: &GroupingSettings::default(),
+            preferences: &ProjectPreferences::default(),
+            preferred_environment: Some("local"),
+            consumer: GroupConsumer::Settings,
+            sort: ProjectSortOrder::UpdatedAt,
+        });
+        let pickable = pickable_scoped_project_groups(&built);
+        assert!(pickable.iter().all(|g| !g.archived));
+        assert!(pickable[0].pinned, "pickable groups place pinned groups before unpinned");
+        assert!(project_groups_span_environments(&pickable));
+        assert!(!project_groups_span_environments(&pickable[..1]));
+
+        let local_only = pickable.iter().find(|g| g.pinned).unwrap();
+        assert_eq!(resolve_project_environment_badge(local_only, Some("local")), None);
+
+        let mixed = pickable.iter().find(|g| g.key == "github.com/t3/code").unwrap();
+        assert_eq!(
+            resolve_project_environment_badge(mixed, Some("local")),
+            Some(ProjectEnvironmentBadge {
+                environment_id: "cloud".into(),
+                description: "Also on Cloud VM".into(),
+            })
+        );
+
+        let remote_only = pickable.iter().find(|g| g.key == "github.com/t3/rem").unwrap();
+        assert_eq!(
+            resolve_project_environment_badge(remote_only, Some("local")),
+            Some(ProjectEnvironmentBadge {
+                environment_id: "remote-a".into(),
+                description: "On Alpha, Remote".into(),
+            })
+        );
+
+        let mut open_order = Vec::new();
+        let initial = order_while_open(&mut open_order, vec!["alpha", "beta", "gamma"], |item| *item);
+        assert_eq!(initial, vec!["alpha", "beta", "gamma"]);
+        let pinned_reordered = order_while_open(&mut open_order, vec!["gamma", "alpha", "beta", "delta"], |item| *item);
+        assert_eq!(pinned_reordered, vec!["alpha", "beta", "gamma", "delta"]);
+        open_order.clear();
+        let reopened = order_while_open(&mut open_order, vec!["gamma", "alpha", "beta", "delta"], |item| *item);
+        assert_eq!(reopened, vec!["gamma", "alpha", "beta", "delta"]);
+
+        let items = vec![("all", "All projects"), ("p1", "Alligator"), ("p2", "Cloud App")];
+        assert_eq!(filter_project_scope_items(items.clone(), "   ", |i| i.0, |i| i.1), items);
+        assert_eq!(filter_project_scope_items(items.clone(), "all", |i| i.0, |i| i.1), vec![("p1", "Alligator")]);
+        assert!(filter_project_scope_items(items, "missing", |i| i.0, |i| i.1).is_empty());
     }
 }
