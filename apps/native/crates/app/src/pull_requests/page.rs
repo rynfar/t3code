@@ -636,9 +636,9 @@ impl PullRequestsPage {
         self.state.update(cx, |state, cx| state.show_toast(toast, cx));
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let collapsed = self.state.read(cx).sidebar.collapsed;
+        let collapsed = crate::workspace::sidebar_inline_width(self.state.read(cx), f32::from(window.viewport_size().width)) == 0.;
         h_flex()
             .window_control_area(WindowControlArea::Drag)
             .h(px(crate::workspace::TITLEBAR_HEIGHT))
@@ -687,7 +687,7 @@ impl Render for PullRequestsPage {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(self.render_header(cx))
+                    .child(self.render_header(window, cx))
                     .child(super::toolbar::render(self, window, cx))
                     .children(error_with_rows.map(|error| {
                         let retry = cx.listener(|this, _, _, cx| this.refetch(cx));

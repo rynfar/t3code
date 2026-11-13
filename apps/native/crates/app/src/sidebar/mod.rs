@@ -243,6 +243,7 @@ impl SidebarPane {
                     this.sync_rows(cx);
                     cx.notify();
                 }
+                AppEvent::SidebarVisibility => this.schedule_clock(cx),
                 _ => {}
             }),
             cx.subscribe_in(&search_input, window, |this, input, event: &InputEvent, window, cx| match event {
@@ -471,7 +472,7 @@ impl SidebarPane {
         } else {
             state.sidebar.fleet.rows.is_empty()
         };
-        if state.sidebar.collapsed || empty {
+        if state.sidebar_hidden() || empty {
             self.clock = None;
             return;
         }
@@ -935,7 +936,10 @@ impl SidebarPane {
                 .child(utility("sidebar-settings", Icon::Settings, "Settings").on_click(|_, _, cx| crate::settings::open(Section::General, cx)))
                 .child(
                     utility("sidebar-pull-requests", Icon::GitPullRequestArrow, "Pull requests")
-                        .on_click(move |_, _, cx| state.update(cx, |state, cx| state.set_pull_requests_open(true, cx))),
+                        .on_click(move |_, _, cx| state.update(cx, |state, cx| {
+                            state.close_sidebar_sheet(cx);
+                            state.set_pull_requests_open(true, cx);
+                        })),
                 )
                 .child(
                     utility("sidebar-usage", Icon::ChartNoAxesColumn, "Usage")

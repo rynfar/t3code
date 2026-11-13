@@ -52,6 +52,8 @@ pub enum AppEvent {
     ComposerMention,
     /// The sidebar's multi-selection or thread drag changed.
     SidebarSelection,
+    /// The narrow-window sheet opened or closed, or the window crossed the sheet breakpoint.
+    SidebarVisibility,
     /// A prompt is waiting for the composer (`take_composer_restore`).
     ComposerRestore,
     /// A terminal selection is waiting for the composer (`take_terminal_context`).
@@ -89,6 +91,7 @@ pub struct AppState {
     pub sidebar: SidebarController,
     /// The left sidebar's preferred width; views clamp it to the window (`sidebar::layout`).
     pub sidebar_width: f32,
+    pub sidebar_sheet: t3_core::sidebar::layout::SidebarSheet,
     pub(crate) open_history: t3_core::sidebar::visits::OpenHistory,
     pub prompt_link_urls: VecDeque<String>,
     pub toasts: crate::toast::Toasts,
@@ -201,6 +204,7 @@ impl AppState {
             _fleet_pump: Some(fleet_pump),
             sidebar: SidebarController::default(),
             sidebar_width: t3_core::sidebar::layout::preferred_width(store::load_ui_state(t3_core::sidebar::layout::STORAGE_KEY).and_then(|value| value.as_f64()).map(|width| width as f32)),
+            sidebar_sheet: Default::default(),
             open_history: Default::default(),
             prompt_link_urls: Default::default(),
             toasts: Default::default(),
@@ -1038,6 +1042,32 @@ impl AppState {
         self.sidebar_width = width;
         if persist {
             store::save_ui_state(t3_core::sidebar::layout::STORAGE_KEY, &width);
+        }
+    }
+
+    /// Whether the sidebar is out of sight, collapsed or a closed sheet; hidden views stop ticking.
+    pub fn sidebar_hidden(&self) -> bool {
+        self.sidebar_sheet.hidden(self.sidebar.collapsed)
+    }
+
+    pub fn set_sidebar_viewport(&mut self, viewport_width: f32, cx: &mut Context<Self>) {
+        if self.sidebar_sheet.set_viewport(viewport_width) {
+            cx.emit(AppEvent::SidebarVisibility);
+        }
+    }
+
+    /// `mod+b` and the toggle: the sheet below the breakpoint, the docked sidebar above it.
+    pub fn toggle_sidebar_or_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_sheet.toggle() {
+            cx.emit(AppEvent::SidebarVisibility);
+        } else {
+            self.toggle_sidebar(cx);
+        }
+    }
+
+    pub fn close_sidebar_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_sheet.close() {
+            cx.emit(AppEvent::SidebarVisibility);
         }
     }
 

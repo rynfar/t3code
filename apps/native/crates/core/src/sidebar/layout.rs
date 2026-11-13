@@ -70,6 +70,59 @@ pub fn inline_width(width: f32, collapsed: bool, viewport_width: f32, brand_widt
     if collapsed || is_sheet(viewport_width) { 0. } else { resolved_width(width, viewport_width, brand_width) }
 }
 
+/// The narrow-window sheet (`openMobile`), kept apart from the docked `collapsed` flag. Widening
+/// past the breakpoint closes it, so narrowing again never pops a stale sheet open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidebarSheet {
+    open: bool,
+    viewport_width: f32,
+}
+
+impl Default for SidebarSheet {
+    fn default() -> Self {
+        SidebarSheet { open: false, viewport_width: f32::INFINITY }
+    }
+}
+
+impl SidebarSheet {
+    pub fn is_sheet(&self) -> bool {
+        is_sheet(self.viewport_width)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open && self.is_sheet()
+    }
+
+    /// Whether the sidebar is out of sight: the closed sheet below the breakpoint, else `collapsed`.
+    pub fn hidden(&self, collapsed: bool) -> bool {
+        if self.is_sheet() { !self.open } else { collapsed }
+    }
+
+    /// Returns whether the window crossed the breakpoint.
+    pub fn set_viewport(&mut self, viewport_width: f32) -> bool {
+        let was_sheet = self.is_sheet();
+        self.viewport_width = viewport_width;
+        if !self.is_sheet() {
+            self.open = false;
+        }
+        was_sheet != self.is_sheet()
+    }
+
+    /// `toggleSidebar` below the breakpoint; `false` leaves the docked sidebar to the caller.
+    pub fn toggle(&mut self) -> bool {
+        if !self.is_sheet() {
+            return false;
+        }
+        self.open = !self.open;
+        true
+    }
+
+    /// Returns whether a visible sheet closed.
+    pub fn close(&mut self) -> bool {
+        std::mem::take(&mut self.open) && self.is_sheet()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +186,35 @@ mod tests {
         assert_eq!(inline_width(300., false, 767., 0.), 0.);
         assert_eq!(inline_width(300., true, 1440., 0.), 0.);
         assert_eq!(inline_width(300., false, 1440., 0.), 300.);
+    }
+
+    #[test]
+    fn sheet_toggles_only_below_the_breakpoint() {
+        let mut sheet = SidebarSheet::default();
+        assert!(!sheet.toggle());
+        assert!(!sheet.hidden(false));
+        assert!(sheet.hidden(true));
+        assert!(sheet.set_viewport(700.));
+        assert!(sheet.hidden(false));
+        assert!(sheet.toggle());
+        assert!(sheet.is_open());
+        assert!(!sheet.hidden(true));
+        assert!(sheet.close());
+        assert!(!sheet.close());
+        assert!(!sheet.is_open());
+    }
+
+    #[test]
+    fn widening_closes_the_sheet_for_good() {
+        let mut sheet = SidebarSheet::default();
+        sheet.set_viewport(700.);
+        sheet.toggle();
+        assert!(!sheet.set_viewport(720.));
+        assert!(sheet.is_open());
+        assert!(sheet.set_viewport(1024.));
+        assert!(!sheet.is_open());
+        assert!(!sheet.close());
+        sheet.set_viewport(700.);
+        assert!(!sheet.is_open());
     }
 }
