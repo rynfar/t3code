@@ -14,6 +14,8 @@ mod project_filter;
 mod project_folders;
 mod row;
 mod search;
+#[cfg(all(test, feature = "snapshot"))]
+mod drag_tests;
 
 use gpui::Focusable;
 use std::sync::Arc;
@@ -53,8 +55,38 @@ pub(crate) enum ClockRate {
     Minute,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum PaneRowKey { Draft(String), Divider, Thread(RowKey), Scoped(t3_core::sidebar::fleet::ScopedRowKey) }
+
+fn reanchored_scroll_top(
+    old: &[PaneRowKey],
+    new: &[PaneRowKey],
+    scroll_top: gpui::ListOffset,
+    range: &std::ops::Range<usize>,
+    count: usize,
+    dragging: bool,
+) -> Option<gpui::ListOffset> {
+    if new.is_empty() {
+        return None;
+    }
+    if scroll_top.item_ix == 0 && scroll_top.offset_in_item == px(0.) {
+        return (dragging && range.start == 0 && range.is_empty() && count > 0)
+            .then_some(gpui::ListOffset { item_ix: 0, offset_in_item: px(0.) });
+    }
+    if let Some(key) = old.get(scroll_top.item_ix)
+        && let Some(item_ix) = new.iter().position(|candidate| candidate == key)
+    {
+        return Some(gpui::ListOffset { item_ix, offset_in_item: scroll_top.offset_in_item });
+    }
+    let neighbor_ix = (scroll_top.item_ix.saturating_add(1)..old.len())
+        .find_map(|ix| new.iter().position(|candidate| candidate == &old[ix]))
+        .or_else(|| {
+            (0..scroll_top.item_ix.min(old.len()))
+                .rev()
+                .find_map(|ix| new.iter().position(|candidate| candidate == &old[ix]))
+        });
+    neighbor_ix.map(|item_ix| gpui::ListOffset { item_ix, offset_in_item: px(0.) })
+}
 
 pub struct SidebarPane {
     updates: Entity<crate::updates::UpdateControl>,
@@ -91,6 +123,7 @@ pub struct SidebarPane {
     live_rendered: bool,
     pub(crate) clock: Option<(ClockRate, Task<()>)>,
     drag: Option<drag::PaneDrag>,
+    project_drag: Option<drag::PaneProjectDrag>,
     sweep: Option<drag::PaneSweep>,
     #[cfg(all(test, feature = "snapshot"))]
     row_focuses: std::cell::RefCell<std::collections::HashMap<gpui::SharedString, gpui::FocusHandle>>,
@@ -341,6 +374,7 @@ impl SidebarPane {
             live_rendered: false,
             clock: None,
             drag: None,
+            project_drag: None,
             sweep: None,
             #[cfg(all(test, feature = "snapshot"))]
             row_focuses: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -393,12 +427,25 @@ impl SidebarPane {
 
     fn sync_list_rows(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
+        if self.drag.is_some() && state.sidebar.drag.is_none() && state.sidebar.fleet_drag.is_none() {
+            self.drag = None;
+        }
+        if self.project_drag.is_some() && crate::settings::store::client(cx).project_sort_order() != t3_core::client_settings::ProjectSortOrder::Manual {
+            self.project_drag = None;
+        }
         let mut keys: Vec<_> = self.drafts.rows.iter().map(|row| PaneRowKey::Draft(row.project_id.clone())).collect();
         if !keys.is_empty() { keys.push(PaneRowKey::Divider); }
         if state.fleet.environments.is_empty() { keys.extend(state.sidebar.model.row_keys().into_iter().map(PaneRowKey::Thread)); }
         else { keys.extend(state.sidebar.fleet.row_keys().into_iter().map(PaneRowKey::Scoped)); }
         if let Some((range, count)) = t3_core::sidebar::splice_range(&self.row_keys, &keys) {
-            self.list.splice(range, count);
+            let scroll_top = self.list.logical_scroll_top();
+            self.list.splice(range.clone(), count);
+            if let Some(target) = reanchored_scroll_top(&self.row_keys, &keys, scroll_top, &range, count, self.drag.is_some()) {
+                let after = self.list.logical_scroll_top();
+                if (after.item_ix, after.offset_in_item) != (target.item_ix, target.offset_in_item) {
+                    self.list.scroll_to(target);
+                }
+            }
         }
         self.row_keys = keys;
         self.schedule_clock(cx);
@@ -576,9 +623,10 @@ impl SidebarPane {
         if overlay_open {
             return false;
         }
-        if self.drag.is_some() || self.sweep.is_some() {
+        if self.drag.is_some() || self.sweep.is_some() || self.project_drag.is_some() {
             self.finish_drag(false, cx);
             self.finish_sweep(false, cx);
+            self.finish_project_drag(false, cx);
             return true;
         }
         let search_focused = self.search_input.read(cx).focus_handle(cx).is_focused(window);
@@ -1011,11 +1059,18 @@ impl Render for SidebarPane {
             div()
                 .id("sidebar-thread-list")
                 .flex_1()
+                .min_h_0()
                 .flex()
                 .flex_col()
-                .child(list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx))).flex_1())
+                .child(
+                    list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx)))
+                        .flex_1()
+                        .min_h_0()
+                        .when(self.drag.is_some(), |this| this.pb(px(40.))),
+                )
                 .on_drop(cx.listener(|this, _: &drag::DraggedThread, _, cx| this.finish_drag(true, cx)))
                 .on_drop(cx.listener(|this, _: &drag::DraggedSweep, _, cx| this.finish_sweep(true, cx)))
+                .on_drop(cx.listener(|this, _: &drag::DraggedProject, _, cx| this.finish_project_drag(true, cx)))
                 .into_any_element()
         };
         div()
@@ -1026,10 +1081,12 @@ impl Render for SidebarPane {
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.finish_drag(false, cx);
                 this.finish_sweep(false, cx);
+                this.finish_project_drag(false, cx);
             }))
             .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.finish_drag(false, cx);
                 this.finish_sweep(false, cx);
+                this.finish_project_drag(false, cx);
             }))
             .child(self.render_header(cx))
             .child(self.render_search(cx))

@@ -163,7 +163,7 @@ impl AppState {
         if !self.notification_visible(&target) { self.land_home(cx); return; }
         match route {
             NotificationRoute::OpenThread => self.select_thread(&target.thread_id, cx),
-            NotificationRoute::ReadFamily => self.read_family(&target.thread_id, true, cx),
+            NotificationRoute::ReadFamily => self.read_family(&target.thread_id, crate::omitted_rows::FamilySelect::Always, cx),
             _ => {}
         }
         self.land_home(cx);

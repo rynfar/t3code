@@ -363,29 +363,46 @@ impl AppState {
         ).into_iter().map(|key| key.thread_id).collect();
         let older = self.omitted.older();
         let frontier = self.omitted.pages.listing_frontier(older.as_ref());
-        let older_settled = older.as_ref().map(|older| OlderSettledShelf { older, frontier });
-        let model = match &self.shell.snapshot {
-            Some(snapshot) => SidebarModel::build(
+        let mut cancelled_drag = false;
+        if self.sidebar.drag.is_some() && (!self.sidebar.capabilities.can_operate || !self.sidebar.capabilities.config_loaded) {
+            self.sidebar.drag = None;
+            cancelled_drag = true;
+        }
+        let build_model = |snapshot, tracker: &mut _, dragging| {
+            SidebarModel::build(
                 &ModelInput {
                     snapshot,
                     config_loaded: self.server_config.config.is_some(),
                     extra_threads: &extras,
-                    older_settled,
+                    older_settled: older.as_ref().map(|older| OlderSettledShelf { older, frontier }),
                     settings: &self.sidebar.settings,
                     shelves: &self.sidebar.shelves,
                     selected_thread_id: self.selected_thread.as_deref(),
                     project_scope: self.sidebar.project_scope.as_ref(),
                     hidden_thread_ids: Some(&self.sidebar.hidden_thread_ids),
                     now,
-                    dragging: self.sidebar.drag.as_ref().map(|(_, from)| *from),
+                    dragging,
                 },
-                &mut self.sidebar.tracker,
-            ),
+                tracker,
+            )
+        };
+        let mut model = match &self.shell.snapshot {
+            Some(snapshot) => build_model(snapshot, &mut self.sidebar.tracker, self.sidebar.drag.as_ref().map(|(_, from)| *from)),
             None => SidebarModel::default(),
         };
+        if let (Some(snapshot), Some((drag_id, _))) = (&self.shell.snapshot, &self.sidebar.drag)
+            && model.section_of(drag_id).is_none_or(|section| section == t3_core::sidebar::Section::Working)
+        {
+            self.sidebar.drag = None;
+            cancelled_drag = true;
+            model = build_model(snapshot, &mut self.sidebar.tracker, None);
+        }
         let next = model.next_change_at;
         let listed_settled = model.listed_settled_count;
         self.sidebar.model = Arc::new(model);
+        if cancelled_drag {
+            cx.emit(AppEvent::SidebarSelection);
+        }
         self.retire_hidden_notifications(cx);
         if self.selected_thread.as_deref().is_some_and(|id| {
             t3_core::sidebar::tag_filter::route_visibility(id, self.thread_shell(id).is_some(), &self.sidebar.hidden_thread_ids, self.hiding_thread_tags())
@@ -463,16 +480,31 @@ impl AppState {
             owner, older, frontier: self.sidebar.owner_omitted.get(*owner).and_then(|omitted| omitted.pages.listing_frontier(Some(older))),
         }).collect();
         let extras = self.sidebar.owner_extra_threads.iter().map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads }).collect::<Vec<_>>();
-        let model = t3_core::sidebar::fleet::ScopedSidebarModel::build_presented(&t3_core::sidebar::fleet::ScopedSidebarInput {
-            environments: &environments, groups: &groups, preferences: &self.project_preferences,
-            settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
-            older: &older, extra_threads: &extras, now, folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
-            dragging: self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section),
-        }, &mut self.sidebar.fleet_state);
+        let build_fleet = |fleet_state: &mut _, dragging| {
+            t3_core::sidebar::fleet::ScopedSidebarModel::build_presented(&t3_core::sidebar::fleet::ScopedSidebarInput {
+                environments: &environments, groups: &groups, preferences: &self.project_preferences,
+                settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
+                older: &older, extra_threads: &extras, now, folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
+                dragging,
+            }, fleet_state)
+        };
+        let mut model = build_fleet(&mut self.sidebar.fleet_state, self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section));
+        let mut cancelled_fleet_drag = false;
+        if let Some((drag_key, _)) = &self.sidebar.fleet_drag
+            && (model.section_of(drag_key).is_none_or(|section| section == t3_core::sidebar::Section::Working)
+                || model.thread(drag_key).is_none_or(|row| !self.scoped_ready(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
+        {
+            self.sidebar.fleet_drag = None;
+            cancelled_fleet_drag = true;
+            model = build_fleet(&mut self.sidebar.fleet_state, None);
+        }
         self.sidebar.fleet_selection.retain(|key| model.thread(key).is_some());
         let next = model.next_change_at;
         let listed = model.listed_settled_count;
         self.sidebar.fleet = Arc::new(model);
+        if cancelled_fleet_drag {
+            cx.emit(AppEvent::SidebarSelection);
+        }
         #[cfg(feature = "snapshot")]
         if self.sidebar.snapshot_fixture {
             self.sidebar.wake_timer = None;

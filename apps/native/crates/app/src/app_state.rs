@@ -61,6 +61,8 @@ pub enum AppEvent {
     RemoveReviewComment,
     ComposerCitation,
     CitationSource,
+    /// Dropped files waiting for a thread route's composer (`take_pending_composer_file_drop`).
+    ComposerFileDrop,
     /// A side subscription (side chat tab, child approval) changed, or an action on one did.
     SideThread,
     /// A pending find-in-thread handoff arrived from sidebar search (`take_pending_thread_find`).
@@ -119,6 +121,7 @@ pub struct AppState {
     pub composer_citation: Option<t3_core::assistant_citations::Citation>,
     pub citation_source: Option<t3_core::assistant_citations::Citation>,
     pending_thread_find: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::timeline::PendingThreadFind)>,
+    pending_composer_file_drop: Option<(t3_core::sidebar::tag_filter::ThreadKey, Vec<std::path::PathBuf>)>,
     client: Option<ClientHandle>,
     /// Counts clients started, so state tied to one never outlives a switch to the next.
     connection: u64,
@@ -222,6 +225,7 @@ impl AppState {
             composer_citation: None,
             citation_source: None,
             pending_thread_find: None,
+            pending_composer_file_drop: None,
             client: None,
             connection: 0,
             runtime,
@@ -314,6 +318,14 @@ impl AppState {
         self.review_comments.clear();
         self.remove_review_comment = None;
         self.citation_source = None;
+        let keeping_scoped_drop = matches!(
+            (&self.pending_scoped_route, &self.pending_composer_file_drop),
+            (Some(ScopedRoute { owner, action: ScopedRouteAction::Thread(route_thread) }), Some((drop_key, _)))
+                if drop_key.environment_id == owner.saved_id && drop_key.thread_id == *route_thread
+        );
+        if !keeping_scoped_drop {
+            self.pending_composer_file_drop = None;
+        }
         self.last_error = None;
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::Selection);
@@ -321,7 +333,7 @@ impl AppState {
         cx.emit(AppEvent::Phase);
     }
 
-    fn apply_environment_event(&mut self, event: t3_client::environments::EnvironmentEvent, cx: &mut Context<Self>) {
+    pub(crate) fn apply_environment_event(&mut self, event: t3_client::environments::EnvironmentEvent, cx: &mut Context<Self>) {
         #[cfg(feature = "snapshot")]
         if self.snapshot_frozen { return; }
         use t3_client::environments::EnvironmentEvent;
@@ -378,7 +390,7 @@ impl AppState {
         if !scoped_navigation { self.land_home(cx); }
     }
 
-    fn apply_fleet_view(&mut self, view: Arc<t3_client::environments::FleetView>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_fleet_view(&mut self, view: Arc<t3_client::environments::FleetView>, cx: &mut Context<Self>) {
         if self.fleet.revision == view.revision { return; }
         let summaries_changed = self.fleet.environments.len() != view.environments.len() || self.fleet.environments.iter().zip(&view.environments).any(|(previous, next)| !Arc::ptr_eq(&previous.summary, &next.summary));
         let projects_changed = self.fleet.environments.len() != view.environments.len() || self.fleet.environments.iter().zip(&view.environments).any(|(previous, next)| !Arc::ptr_eq(&previous.summary, &next.summary) && previous.summary.projects != next.summary.projects);
@@ -452,6 +464,7 @@ impl AppState {
         if matches!(&route.action, ScopedRouteAction::Project { .. }) && self.client_handle().is_none() { return; }
         if !self.scoped_ready(&route.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
             self.pending_scoped_route = None;
+            self.pending_composer_file_drop = None;
             if let ScopedRouteAction::Project { group, action } = route.action {
                 self.finish_scoped_project_action(&group, action, cx);
             }
@@ -464,7 +477,7 @@ impl AppState {
         self.pending_scoped_route = None;
         match route.action {
             ScopedRouteAction::Thread(id) => {
-                if self.thread_shell(&id).is_none() { self.read_family(&id,true,cx); }
+                if self.thread_shell(&id).is_none() { self.read_family(&id, crate::omitted_rows::FamilySelect::Always, cx); }
                 else { self.select_thread(&id,cx); }
             },
             ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
@@ -561,7 +574,7 @@ impl AppState {
             && let Some(id) = self.restore_thread.take()
         {
             // A shell that omits older settled or idle threads can still hold it: ask its family.
-            self.read_family(&id, true, cx);
+            self.read_family(&id, crate::omitted_rows::FamilySelect::IfIdle, cx);
         }
     }
 
@@ -579,6 +592,7 @@ impl AppState {
     }
 
     pub(crate) fn close_selected_thread(&mut self, cx: &mut Context<Self>) {
+        self.pending_composer_file_drop = None;
         if let (Some(client), Some(thread_id)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&thread_id);
         }
@@ -612,7 +626,13 @@ impl AppState {
         }) {
             self.pending_thread_find = None;
         }
+        if self.pending_composer_file_drop.as_ref().is_some_and(|(key, _)| {
+            !pending_drop_matches(key, self.environments.active.as_deref(), thread_id)
+        }) {
+            self.pending_composer_file_drop = None;
+        }
         if !self.thread_route_visible(thread_id) {
+            self.pending_composer_file_drop = None;
             self.restore_thread = None;
             self.clear_selection(cx);
             return;
@@ -710,6 +730,7 @@ impl AppState {
     pub fn start_draft(&mut self, project_id: &str, cx: &mut Context<Self>) {
         self.notification_route = None;
         self.pending_thread_find = None;
+        self.pending_composer_file_drop = None;
         if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
             return self.set_pull_requests_open(false, cx);
         }
@@ -730,6 +751,7 @@ impl AppState {
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.notification_route = None;
         self.pending_thread_find = None;
+        self.pending_composer_file_drop = None;
         if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&previous);
         }
@@ -840,6 +862,82 @@ impl AppState {
         if matches { self.pending_thread_find.take().map(|(_, find)| find) } else { None }
     }
 
+    pub(crate) fn drop_files_on_sidebar_thread(
+        &mut self,
+        key: t3_core::sidebar::tag_filter::ThreadKey,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        if key.environment_id.is_empty() || self.fleet.environments.is_empty() {
+            if self.sidebar.selection.clear() {
+                cx.emit(AppEvent::SidebarSelection);
+            }
+            self.anchor_opened_thread(&key.thread_id, cx);
+            self.pending_composer_file_drop = Some((key.clone(), paths));
+            if self.thread_route_visible(&key.thread_id) {
+                self.select_thread(&key.thread_id, cx);
+            } else if self.server_config.config.as_ref().is_some_and(|config| config.shell_thread_families) {
+                self.read_family(&key.thread_id, crate::omitted_rows::FamilySelect::Always, cx);
+            } else {
+                self.pending_composer_file_drop = None;
+            }
+            if self.pending_composer_file_drop.is_some() {
+                cx.emit(AppEvent::ComposerFileDrop);
+            }
+            return;
+        }
+        if !self.sidebar.fleet_selection.is_empty() {
+            self.sidebar.fleet_selection.clear();
+            cx.emit(AppEvent::SidebarSelection);
+        }
+        self.sidebar.fleet_anchor = Some(key.clone());
+        let Some(owner) = self.scoped_environment(&key.environment_id).map(|entry| entry.summary.owner.clone()) else {
+            self.pending_composer_file_drop = None;
+            return;
+        };
+        if !self.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+            self.pending_composer_file_drop = None;
+            return;
+        }
+        self.pending_composer_file_drop = Some((key.clone(), paths));
+        self.navigate_scoped(owner, ScopedRouteAction::Thread(key.thread_id), cx);
+        if self.pending_composer_file_drop.is_some() {
+            cx.emit(AppEvent::ComposerFileDrop);
+        }
+    }
+
+    pub(crate) fn take_pending_composer_file_drop(&mut self, thread_id: &str) -> Option<Vec<std::path::PathBuf>> {
+        let active_env = self.environments.active.as_deref();
+        if self.pending_composer_file_drop.as_ref().is_some_and(|(key, _)| pending_drop_matches(key, active_env, thread_id)) {
+            self.pending_composer_file_drop.take().map(|(_, paths)| paths)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn clear_pending_composer_file_drop_for(&mut self, environment_id: Option<&str>, thread_id: &str) {
+        if self.pending_composer_file_drop.as_ref().is_some_and(|(key, _)| pending_drop_matches(key, environment_id, thread_id)) {
+            self.pending_composer_file_drop = None;
+        }
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn has_pending_composer_file_drop(&self) -> bool {
+        self.pending_composer_file_drop.is_some()
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn set_pending_composer_file_drop_for_test(
+        &mut self,
+        key: t3_core::sidebar::tag_filter::ThreadKey,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        self.pending_composer_file_drop = Some((key, paths));
+    }
+
     pub(crate) fn client_handle(&self) -> Option<ClientHandle> {
         self.client.clone()
     }
@@ -921,6 +1019,14 @@ impl AppState {
 
 pub fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+fn pending_drop_matches(
+    key: &t3_core::sidebar::tag_filter::ThreadKey,
+    active_env: Option<&str>,
+    thread_id: &str,
+) -> bool {
+    key.thread_id == thread_id && (key.environment_id.is_empty() || active_env == Some(key.environment_id.as_str()))
 }
 
 #[cfg(all(test, feature = "snapshot"))]

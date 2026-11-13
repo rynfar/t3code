@@ -21,6 +21,13 @@ const SEARCH_KEY: &str = "search";
 /// `COUNT_REREAD_DELAY`: a burst of changes (a PR sync touching many old threads) costs one read.
 const COUNT_REREAD_DELAY: Duration = Duration::from_millis(500);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FamilySelect {
+    None,
+    IfIdle,
+    Always,
+}
+
 #[derive(Default)]
 pub struct OmittedRows {
     pub mounts: MountedReads,
@@ -91,7 +98,7 @@ impl AppState {
             if self.omitted.mounts.generation_of(&family_key(&thread_id)) != Some(generation)
                 && self.omitted.family_requested.get(&thread_id) != Some(&generation)
             {
-                self.read_family(&thread_id, false, cx);
+                self.read_family(&thread_id, FamilySelect::None, cx);
             }
         }
         self.mount_selected_family(cx);
@@ -103,7 +110,7 @@ impl AppState {
         let Some(thread_id) = self.selected_thread.clone() else { return };
         let requested = self.omitted.family_requested.get(&thread_id).copied();
         if family_read_due(&self.shell, &self.omitted.mounts, &thread_id, requested) {
-            self.read_family(&thread_id, false, cx);
+            self.read_family(&thread_id, FamilySelect::None, cx);
         }
     }
 
@@ -188,17 +195,25 @@ impl AppState {
         }));
     }
 
-    /// Reads the family of a thread the shell omits and merges it. With `select`, selects the
-    /// thread once the family proves it exists (a restored thread that is now older or idle).
-    pub(crate) fn read_family(&mut self, thread_id: &str, select: bool, cx: &mut Context<Self>) {
+    /// Reads the family of a thread the shell omits and merges it. `FamilySelect` governs whether
+    /// resolving selects the thread (`IfIdle` for boot restore; `Always` for explicit navigation).
+    pub(crate) fn read_family(&mut self, thread_id: &str, select: FamilySelect, cx: &mut Context<Self>) {
+        let env_id = self.environments.active.clone();
+        let should_select = select != FamilySelect::None;
         let families = self.server_config.config.as_ref().is_some_and(|config| config.shell_thread_families);
         if !families {
+            if should_select {
+                self.clear_pending_composer_file_drop_for(env_id.as_deref(), thread_id);
+                self.restoring_thread = false;
+                self.land_home(cx);
+            }
             return;
         }
         let generation = self.shell.generation;
         let connection = self.connection_id();
+        let route_snapshot = (self.selected_thread.clone(), self.draft_project.clone());
         self.omitted.family_requested.insert(thread_id.to_owned(), generation);
-        self.restoring_thread |= select;
+        self.restoring_thread |= should_select;
         let rpc = self.rpc(GET_THREAD_FAMILY, family_request(thread_id));
         let thread_id = thread_id.to_owned();
         cx.spawn(async move |this, cx| {
@@ -211,14 +226,22 @@ impl AppState {
                     let exists = family.threads.iter().any(|thread| thread.id == thread_id);
                     state.omitted.mounts.mount(&family_key(&thread_id), generation, vec![family]);
                     state.rebuild_sidebar(cx);
-                    if select && exists && state.selected_thread.is_none() && state.draft_project.is_none() {
+                    let allow_select = match select {
+                        FamilySelect::None => false,
+                        FamilySelect::IfIdle => state.selected_thread.is_none() && state.draft_project.is_none(),
+                        FamilySelect::Always => (state.selected_thread.clone(), state.draft_project.clone()) == route_snapshot,
+                    };
+                    if allow_select && exists {
                         state.select_thread(&thread_id, cx);
                     }
                     state.sync_side_threads(cx);
                     cx.emit(AppEvent::Shell);
                 }
                 // A restore that finds nothing falls back to the home page.
-                if select {
+                if should_select {
+                    if state.selected_thread.as_deref() != Some(thread_id.as_str()) {
+                        state.clear_pending_composer_file_drop_for(env_id.as_deref(), &thread_id);
+                    }
                     state.restoring_thread = false;
                     state.land_home(cx);
                 }

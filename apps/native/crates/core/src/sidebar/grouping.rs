@@ -603,6 +603,69 @@ pub struct ProjectEnvironmentBadge {
     pub description: String,
 }
 
+/// Canonical `(target_group_key, insert_after)` when dragging `dragged_key` over `target_key` in
+/// manual sort mode, or `None` when the move crosses bands, touches scratch, or is a no-op.
+pub fn resolve_project_drop_target(
+    groups: &[ScopedProjectGroup],
+    dragged_key: &str,
+    target_key: &str,
+    after: bool,
+) -> Option<(String, bool)> {
+    let dragged = groups.iter().find(|group| group.key == dragged_key)?;
+    let target = groups.iter().find(|group| group.key == target_key)?;
+    if dragged.is_scratch || target.is_scratch || (dragged.pinned, dragged.archived) != (target.pinned, target.archived) {
+        return None;
+    }
+    let band: Vec<&ScopedProjectGroup> = groups
+        .iter()
+        .filter(|group| !group.is_scratch && (group.pinned, group.archived) == (dragged.pinned, dragged.archived))
+        .collect();
+    let dragged_idx = band.iter().position(|group| group.key == dragged_key)?;
+    let target_idx = band.iter().position(|group| group.key == target_key)?;
+    let insert_idx = target_idx + usize::from(after);
+    if insert_idx == dragged_idx || insert_idx == dragged_idx + 1 {
+        return None;
+    }
+    Some((target.key.clone(), after))
+}
+
+/// Computes the persisted `project_order` physical-key sequence after moving `dragged_key` before
+/// or after `target_key`, preserving contiguous multi-member groups and `(pinned, archived)` bands.
+pub fn reorder_project_groups(
+    groups: &[ScopedProjectGroup],
+    dragged_key: &str,
+    target_key: &str,
+    after: bool,
+) -> Option<Vec<String>> {
+    let (target_key, after) = resolve_project_drop_target(groups, dragged_key, target_key, after)?;
+    let dragged = groups.iter().find(|group| group.key == dragged_key)?;
+    let mut band: Vec<&ScopedProjectGroup> = groups
+        .iter()
+        .filter(|group| !group.is_scratch && (group.pinned, group.archived) == (dragged.pinned, dragged.archived))
+        .collect();
+    let dragged_idx = band.iter().position(|group| group.key == dragged_key)?;
+    let target_idx = band.iter().position(|group| group.key == target_key)?;
+    let insert_idx = target_idx + usize::from(after);
+    let moved = band.remove(dragged_idx);
+    let dest = if insert_idx > dragged_idx { insert_idx - 1 } else { insert_idx };
+    band.insert(dest, moved);
+
+    let mut band_iter = band.into_iter();
+    let mut order = Vec::new();
+    for group in groups {
+        if group.is_scratch {
+            continue;
+        }
+        let next = if (group.pinned, group.archived) == (dragged.pinned, dragged.archived) {
+            band_iter.next()?
+        } else {
+            group
+        };
+        order.extend(next.members.iter().map(|member| member.physical_key.clone()));
+    }
+    Some(order)
+}
+
 pub fn pickable_scoped_project_groups(groups: &[ScopedProjectGroup]) -> Vec<ScopedProjectGroup> {
     let open = groups.iter().filter(|group| !group.archived && !group.is_scratch).cloned();
     let (pinned, rest): (Vec<_>, Vec<_>) = open.partition(|group| group.pinned);
@@ -933,5 +996,87 @@ mod tests {
         assert_eq!(filter_project_scope_items(items.clone(), "   ", |i| i.0, |i| i.1), items);
         assert_eq!(filter_project_scope_items(items.clone(), "all", |i| i.0, |i| i.1), vec![("p1", "Alligator")]);
         assert!(filter_project_scope_items(items, "missing", |i| i.0, |i| i.1).is_empty());
+    }
+
+    #[test]
+    fn manual_project_drop_resolution_and_reorder_preserve_bands_and_multimember_groups() {
+        let owner = |saved: &str| EnvironmentOwner {
+            saved_id: saved.into(),
+            canonical_id: Some(format!("canon-{saved}")),
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 1,
+        };
+        let mut pinned = project("pin", "/pin");
+        pinned.repository_identity = None;
+        pinned.pinned_at = Some("2026-01-02T00:00:00.000Z".into());
+        let mut archived = project("arch", "/arch");
+        archived.repository_identity = None;
+        archived.archived_at = Some("2026-01-02T00:00:00.000Z".into());
+        let mut alpha = project("alpha", "/alpha");
+        alpha.repository_identity = None;
+        let mut beta_local = project("beta-l", "/beta-local");
+        beta_local.repository_identity = Some(json!({"canonicalKey": "github.com/t3/beta", "rootPath": "/beta-local"}));
+        let mut beta_cloud = project("beta-r", "/beta-cloud");
+        beta_cloud.repository_identity = Some(json!({"canonicalKey": "github.com/t3/beta", "rootPath": "/beta-cloud"}));
+        let mut gamma = project("gamma", "/gamma");
+        gamma.repository_identity = None;
+        let scratch = project("(no project)", "/scratch");
+
+        let scoped_projects = [
+            ScopedProject { owner: owner("local"), project: pinned, is_scratch: false, environment_label: "Local".into() },
+            ScopedProject { owner: owner("local"), project: alpha, is_scratch: false, environment_label: "Local".into() },
+            ScopedProject { owner: owner("local"), project: beta_local, is_scratch: false, environment_label: "Local".into() },
+            ScopedProject { owner: owner("cloud"), project: beta_cloud, is_scratch: false, environment_label: "Cloud".into() },
+            ScopedProject { owner: owner("local"), project: gamma, is_scratch: false, environment_label: "Local".into() },
+            ScopedProject { owner: owner("local"), project: scratch, is_scratch: true, environment_label: "Local".into() },
+            ScopedProject { owner: owner("local"), project: archived, is_scratch: false, environment_label: "Local".into() },
+        ];
+        let prefs = ProjectPreferences::default();
+        let groups = build_scoped_project_groups(&GroupInput {
+            projects: &scoped_projects,
+            threads: &[],
+            settings: &GroupingSettings::default(),
+            preferences: &prefs,
+            preferred_environment: Some("local"),
+            consumer: GroupConsumer::Sidebar,
+            sort: ProjectSortOrder::Manual,
+        });
+        let find_key = |id: &str| groups.iter().find(|group| group.member_refs.iter().any(|r| r.project_id == id)).unwrap().key.clone();
+        let k_pin = find_key("pin");
+        let k_alpha = find_key("alpha");
+        let k_beta = find_key("beta-l");
+        let k_gamma = find_key("gamma");
+        let k_scratch = groups.iter().find(|group| group.is_scratch).unwrap().key.clone();
+        let k_arch = find_key("arch");
+
+        assert_eq!(resolve_project_drop_target(&groups, &k_alpha, &k_alpha, false), None);
+        assert_eq!(resolve_project_drop_target(&groups, &k_alpha, &k_beta, false), None, "adjacent before is a no-op");
+        assert_eq!(resolve_project_drop_target(&groups, &k_alpha, &k_pin, true), None, "cross-band pinned<->regular rejected");
+        assert_eq!(resolve_project_drop_target(&groups, &k_alpha, &k_arch, false), None, "cross-band archived<->regular rejected");
+        assert_eq!(resolve_project_drop_target(&groups, &k_alpha, &k_scratch, false), None, "scratch rejected");
+        assert_eq!(resolve_project_drop_target(&groups, &k_scratch, &k_alpha, false), None, "scratch source rejected");
+
+        assert_eq!(
+            resolve_project_drop_target(&groups, &k_alpha, &k_beta, true),
+            Some((k_beta.clone(), true)),
+        );
+        let next_order = reorder_project_groups(&groups, &k_alpha, &k_beta, true).unwrap();
+        let reordered = build_scoped_project_groups(&GroupInput {
+            projects: &scoped_projects,
+            threads: &[],
+            settings: &GroupingSettings::default(),
+            preferences: &ProjectPreferences { project_order: next_order.clone(), ..Default::default() },
+            preferred_environment: Some("local"),
+            consumer: GroupConsumer::Sidebar,
+            sort: ProjectSortOrder::Manual,
+        });
+        let regular_keys: Vec<_> = reordered
+            .iter()
+            .filter(|group| !group.pinned && !group.archived && !group.is_scratch)
+            .map(|group| group.key.clone())
+            .collect();
+        assert_eq!(regular_keys, vec![k_beta, k_alpha.clone(), k_gamma]);
+        assert!(next_order.len() >= 6, "multi-member beta keys stay intact without splitting");
     }
 }

@@ -758,17 +758,21 @@ impl SidebarPane {
             inset: true,
         };
         let title: SharedString = thread.title.clone().into();
+        let drop_id = id.clone();
         let title_color = if active || highlighted || !settled {
             hsla(p.foreground)
         } else {
             hsla(p.secondary_label).opacity(0.7)
         };
+        let row_id = SharedString::from(format!("search-result-{:?}", id));
+        let debug_row_id = row_id.clone();
         div()
             .px(px(8.))
             .py(px(1.))
             .child(
                 div()
-                    .id(SharedString::from(format!("search-result-{:?}", id)))
+                    .id(row_id)
+                    .debug_selector(move || debug_row_id.to_string())
                     .group("sidebar-row")
                     .w_full()
                     .min_h(px(RESULT_HEIGHT))
@@ -783,6 +787,17 @@ impl SidebarPane {
                         this.bg(hsla(p.sidebar_row_active)).when(active && light, |this| this.shadow(vec![ring]))
                     })
                     .when(!active && !highlighted, |this| this.hover(|style| style.bg(hsla(p.sidebar_row_hover))))
+                    .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                        style.bg(hsla(p.primary).opacity(0.08))
+                    })
+                    .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                        let key = drop_id.clone();
+                        let files = paths.paths().to_vec();
+                        this.state.update(cx, |state, cx| {
+                            state.drop_files_on_sidebar_thread(key, files, cx);
+                        });
+                        this.clear_search(window, cx);
+                    }))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
                         if this.search.highlighted != index {
                             this.search.highlighted = index;

@@ -261,9 +261,11 @@ impl SidebarPane {
         let p = palette(cx);
         let light = !cx.window_appearance_is_dark();
         let id = thread.id.clone();
+        let drop_id = thread.id.clone();
         let key_id = thread.id.clone();
         let menu_id = thread.id.clone();
         let clicked_key = key.cloned();
+        let drop_key = key.cloned();
         let key_action = key.cloned();
         let menu_key = key.cloned();
         let row_id = SharedString::from(format!("thread-row-{:?}-{}", key, thread.id));
@@ -319,6 +321,16 @@ impl SidebarPane {
                     preview
                 })
             })
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                style.bg(hsla(p.primary).opacity(0.08))
+            })
+            .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, _, cx| {
+                let key = drop_key.clone().unwrap_or_else(|| t3_core::sidebar::tag_filter::ThreadKey::new("", &drop_id));
+                let files = paths.paths().to_vec();
+                this.state.update(cx, |state, cx| {
+                    state.drop_files_on_sidebar_thread(key, files, cx);
+                });
+            }))
             .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                 if !key_focus.is_focused(window) {
                     return;
