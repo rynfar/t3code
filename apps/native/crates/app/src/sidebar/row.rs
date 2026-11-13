@@ -100,15 +100,23 @@ struct RowExtras {
     /// Earlier instances first; the last is the current one, which carries the badge.
     stack: Vec<ProviderMark>,
     remote: Option<Icon>,
-    /// A pull request badge shows.
-    pr: bool,
+    pr: Option<PrBadge>,
+}
+
+struct PrBadge {
+    glyph: t3_core::pull_requests::thread_badge::PrGlyph,
+    tone: t3_core::pull_requests::thread_badge::PrTone,
+    label: SharedString,
+    text: SharedString,
+    opens_list: bool,
+    url: Option<String>,
 }
 
 impl RowExtras {
     /// Only the trailing icons would remain, so the card moves them to the title line instead
     /// (`metaLineEmpty`; diff counts are not collected, as on the web).
     fn meta_line_empty(&self, thread: &SidebarThread) -> bool {
-        thread.branch.as_deref().is_none_or(str::is_empty) && !self.pr && self.running.is_empty()
+        thread.branch.as_deref().is_none_or(str::is_empty) && self.pr.is_none() && self.running.is_empty()
     }
 }
 
@@ -332,11 +340,87 @@ impl SidebarPane {
             let Some(current) = entries.iter().find(|entry| entry.instance_id() == *current) else { return Vec::new() };
             previous.iter().filter_map(|id| entries.iter().find(|entry| entry.instance_id() == *id)).chain(std::iter::once(current)).map(|entry| ProviderMark::of(entry, &entries)).collect()
         }).unwrap_or_default();
-        RowExtras { draft, running, stack, remote: (!current_environment).then(|| config.map(Icon::machine).unwrap_or(Icon::Server)), pr: false }
+        let pr = if config.is_some() {
+            let badge = t3_core::pull_requests::thread_badge::resolve_thread_pull_request_badge(&thread.pull_requests);
+            let current = t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&thread.pull_requests);
+            let status = current.and_then(t3_core::pull_requests::thread_badge::linked_snapshot_status)
+                .map(|linked| t3_core::pull_requests::thread_badge::pr_status_indicator(&linked.pr, Some(linked.provider)));
+            t3_core::pull_requests::thread_badge::resolve_badge_presentation(
+                badge.as_ref(),
+                current.map(|link| link.number),
+                current.map(|link| link.url.as_str()),
+                status.as_ref(),
+            )
+            .map(|presentation| PrBadge {
+                glyph: presentation.glyph,
+                tone: presentation.tone,
+                label: presentation.label.into(),
+                text: presentation.text.into(),
+                opens_list: badge.is_some_and(|badge| badge.opens_list()),
+                url: current.map(|link| link.url.clone()),
+            })
+        } else {
+            None
+        };
+        RowExtras { draft, running, stack, remote: (!current_environment).then(|| config.map(Icon::machine).unwrap_or(Icon::Server)), pr }
     }
 
-    fn render_pr_badge(&self, _key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, _thread: &SidebarThread, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
+    fn render_pr_badge(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, pr: Option<&PrBadge>, active: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pr = pr?;
+        let p = palette(cx);
+        let icon = match pr.glyph {
+            t3_core::pull_requests::thread_badge::PrGlyph::PullRequest => Icon::GitPullRequestArrow,
+            t3_core::pull_requests::thread_badge::PrGlyph::Draft => Icon::GitPullRequestDraft,
+            t3_core::pull_requests::thread_badge::PrGlyph::Closed => Icon::GitPullRequestClosed,
+            t3_core::pull_requests::thread_badge::PrGlyph::Merged => Icon::GitMerge,
+            t3_core::pull_requests::thread_badge::PrGlyph::Stack => Icon::Layers,
+        };
+        let tone = match pr.tone {
+            t3_core::pull_requests::thread_badge::PrTone::Open => p.pill_completed,
+            t3_core::pull_requests::thread_badge::PrTone::Draft | t3_core::pull_requests::thread_badge::PrTone::Muted => p.muted_foreground,
+            t3_core::pull_requests::thread_badge::PrTone::Closed => p.pill_failed,
+            t3_core::pull_requests::thread_badge::PrTone::Merged => p.pill_plan,
+        };
+        let label = pr.label.clone();
+        let opens_list = pr.opens_list;
+        let url = pr.url.clone();
+        let id = thread.id.clone();
+        let key = key.cloned();
+        Some(
+            div()
+                .id(SharedString::from(format!("pr-badge-{}", thread.id)))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .text_xs()
+                .cursor_pointer()
+                .child(icon.render(px(12.), hsla(tone)))
+                .child(div().text_color(hsla(p.sidebar_secondary_label)).child(pr.text.clone()))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if opens_list {
+                        this.state.update(cx, |state, cx| {
+                            if !active {
+                                match &key {
+                                    Some(key) => state.click_scoped_sidebar_thread(key, gpui::Modifiers::default(), cx),
+                                    None => state.click_sidebar_thread(&id, gpui::Modifiers::default(), cx),
+                                }
+                            }
+                            state.add_pull_requests_surface(cx);
+                        });
+                    } else if let Some(url) = &url {
+                        if key.as_ref().is_none_or(|key| this.state.read(cx).environments.active.as_deref() == Some(key.environment_id.as_str())) {
+                            crate::pull_requests::open_context_link(&this.state, url, cx);
+                        } else {
+                            cx.open_url(url);
+                        }
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     /// `SidebarProviderStack` with the remote machine before it: earlier instances small, faded and
@@ -513,7 +597,7 @@ impl SidebarPane {
                 .children(branch.is_some().then(|| self.render_worktree_icon(thread, cx)).flatten())
                 .child(div().flex_1().min_w_0().truncate().children(branch))
                 .children(self.render_terminal_button(key, thread, &extras.running, cx))
-                .children(self.render_pr_badge(key, thread, cx))
+                .children(self.render_pr_badge(key, thread, extras.pr.as_ref(), active, cx))
                 .children(meta_icons.map(|icons| div().ml_auto().child(icons)))
         });
         let has_meta = meta.is_some();

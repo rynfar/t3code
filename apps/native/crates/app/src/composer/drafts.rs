@@ -177,35 +177,49 @@ impl Composer {
     pub(crate) fn sidebar_drafts(&self) -> &DraftStore { &self.drafts.store }
 
     pub(crate) fn discard_sidebar_draft(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
-        let target = Target::Draft(project.into());
-        self.record_draft(&target, cx);
-        let draft = self.drafts.store.get(&key(&target))?.clone();
-        self.discard_draft(&target, cx);
-        let attachments = self.take_draft_attachments(&target);
-        self.clear_mentions(&target);
-        if self.snapshot.target.as_ref() == Some(&target) { self.set_prompt("", window, cx); }
+        self.discard_target_draft(&Target::Draft(project.into()), false, window, cx)
+    }
+
+    fn discard_target_draft(&mut self, target: &Target, keep_choices: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
+        self.record_draft(target, cx);
+        let storage_key = key(target);
+        let draft = self.drafts.store.get(&storage_key)?.clone();
+        if keep_choices && !draft.has_user_content() { return None; }
+        if keep_choices {
+            if self.drafts.store.clear_content(&storage_key, now_ms()) {
+                self.schedule_draft_save(target, cx);
+            }
+        } else {
+            self.discard_draft(target, cx);
+        }
+        let attachments = self.take_draft_attachments(target);
+        self.clear_mentions(target);
+        if self.snapshot.target.as_ref() == Some(target) { self.set_prompt("", window, cx); }
         cx.notify();
         Some(DiscardedDraft { draft, attachments })
     }
 
     pub(crate) fn restore_sidebar_draft(&mut self, project: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
-        let target = Target::Draft(project.into());
+        self.restore_target_draft(&Target::Draft(project.into()), discarded, window, cx);
+    }
+
+    fn restore_target_draft(&mut self, target: &Target, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
         let DiscardedDraft { draft, attachments } = discarded;
-        let live = self.current_draft(&target, cx);
-        if !self.drafts.store.restore(&key(&target), draft.clone(), &live) {
+        let live = self.current_draft(target, cx);
+        if !self.drafts.store.restore(&key(target), draft.clone(), &live) {
             self.commit_sidebar_discard(DiscardedDraft { draft, attachments }, cx);
             self.error = Some("Failed to restore draft: The draft has new content.".into());
             cx.notify();
             return;
         }
-        self.restore_draft_choices(&target, &draft, cx);
-        self.seed_records(&target, draft.context_records.clone());
-            self.seed_mentions(&target, draft.thread_contexts());
-        self.seed_terminals(&target, draft.terminals.clone());
-        self.seed_reviews(&target, draft.review_comments.clone());
-        self.restore_draft_attachments(&target, attachments, cx);
-        if self.snapshot.target.as_ref() == Some(&target) { self.set_prompt(&draft.restored_prompt(), window, cx); }
-        self.schedule_draft_save(&target, cx);
+        self.restore_draft_choices(target, &draft, cx);
+        self.seed_records(target, draft.context_records.clone());
+        self.seed_mentions(target, draft.thread_contexts());
+        self.seed_terminals(target, draft.terminals.clone());
+        self.seed_reviews(target, draft.review_comments.clone());
+        self.restore_draft_attachments(target, attachments, cx);
+        if self.snapshot.target.as_ref() == Some(target) { self.set_prompt(&draft.restored_prompt(), window, cx); }
+        self.schedule_draft_save(target, cx);
         cx.notify();
     }
 }

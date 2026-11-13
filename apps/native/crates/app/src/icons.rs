@@ -123,6 +123,7 @@ icons! {
     KeyRound => "icons/lucide/key-round.svg",
     Keyboard => "icons/lucide/keyboard.svg",
     Laptop => "icons/lucide/laptop.svg",
+    Layers => "icons/lucide/layers.svg",
     Link => "icons/lucide/link.svg",
     Link2 => "icons/lucide/link-2.svg",
     ListChecks => "icons/lucide/list-checks.svg",
