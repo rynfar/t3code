@@ -96,7 +96,12 @@ impl SidebarPane {
                             .text_color(hsla(p.foreground).opacity(0.9))
                             .child(row.preview.clone()),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.start_draft(&open, cx))))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.clear_thread_selection(cx);
+                            state.start_draft(&open, cx);
+                        });
+                    }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {

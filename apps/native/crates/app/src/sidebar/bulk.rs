@@ -46,6 +46,12 @@ impl AppState {
         changed
     }
 
+    pub(crate) fn anchor_opened_scoped_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, cx: &mut Context<Self>) {
+        if self.open_scoped_selection(key) {
+            self.selection_changed(cx);
+        }
+    }
+
     /// `navigateToThread`: every way of opening a thread drops the selection and anchors there.
     pub(crate) fn anchor_opened_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.sidebar.selection.open(thread_id) {
