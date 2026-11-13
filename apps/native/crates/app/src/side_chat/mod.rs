@@ -353,22 +353,31 @@ impl AppState {
 
     fn fetch_side_history_page(&mut self, thread_id: String, cursor: String, client: t3_client::supervisor::ClientHandle, cx: &mut Context<Self>) {
         use t3_core::history::{HistoryStep, PageOutcome};
+        let merge_lock = self.history_merge_lock.clone();
         let task = {
             let (client, thread_id, cursor) = (client.clone(), thread_id.clone(), cursor.clone());
             self.runtime().spawn(async move { client.history_page(&thread_id, &cursor).await })
         };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Could not load earlier activity.".into()));
+            let _merge_guard = merge_lock.lock().await;
             let started = this.update(cx, |state, cx| {
                 let thread = state.side_threads.threads.get_mut(&thread_id)?;
                 let outcome = match result {
                     Ok(page) => thread.begin_history_merge(&cursor, page),
                     Err(message) => PageOutcome::Step(thread.fail_history_load(&cursor, message)),
                 };
-                cx.emit(AppEvent::SideThread);
                 match outcome {
-                    PageOutcome::Merge(merge) => Some(merge),
-                    PageOutcome::Step(_) => None,
+                    PageOutcome::Merge(merge) => {
+                        cx.emit(AppEvent::SideThread);
+                        Some(merge)
+                    }
+                    PageOutcome::Step(step) => {
+                        if step != HistoryStep::Stale {
+                            cx.emit(AppEvent::SideThread);
+                        }
+                        None
+                    }
                 }
             });
             let Ok(Some(merge)) = started else { return };
@@ -386,5 +395,179 @@ impl AppState {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod history_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[gpui::test]
+    async fn side_chat_history_page_serializes_with_deferred_work(cx: &mut gpui::TestAppContext) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let _server = runtime.spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_owned();
+                    let item = if path.contains("cursor=work-c1") {
+                        serde_json::json!({
+                            "position": 0, "visibility": "local", "sourceThreadId": "side-1", "sourceItemId": "w-loaded",
+                            "item": {
+                                "id": "w-loaded", "threadId": "side-1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                                "ordinal": 4, "type": "command_execution", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:02.000Z",
+                                "input": "echo ok", "output": ""
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "position": 0, "visibility": "local", "sourceThreadId": "side-1", "sourceItemId": "m-older",
+                            "item": {
+                                "id": "m-older", "threadId": "side-1", "runId": null, "nodeId": null, "parentItemId": null,
+                                "ordinal": 1, "type": "user_message", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:00.000Z",
+                                "messageId": "m-older", "text": "Earlier question", "inputIntent": "message"
+                            }
+                        })
+                    };
+                    let body = serde_json::json!({
+                        "snapshotSequence": 1,
+                        "items": [item],
+                        "nextCursor": null,
+                        "hasMoreHistory": false,
+                        "hasUserTurn": !path.contains("cursor=work-c1")
+                    });
+                    let json = serde_json::to_string(&body).unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        json.len(),
+                        json
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, _fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            })).unwrap(),
+            format!("http://127.0.0.1:{port}"),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell;
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "side-1", "projectId": "checkout-a", "title": "Side",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"main","parentThreadId":"main"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 2, "visibleItemCount": 2
+            })).unwrap()];
+            state.install_active_environment(client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": true, "historyCursor": "hist-c1",
+                "projection": {
+                    "thread": {
+                        "id": "side-1", "projectId": "checkout-a", "title": "Side",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"main","parentThreadId":"main"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "completed",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": null,
+                        "completedAt": "2026-04-01T00:00:02.000Z"
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                    "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                    "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [
+                        {
+                            "position": 0, "visibility": "local", "sourceThreadId": "side-1", "sourceItemId": "m0",
+                            "item": {
+                                "id": "m0", "threadId": "side-1", "runId": null, "nodeId": null, "parentItemId": null,
+                                "ordinal": 2, "type": "user_message", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                                "messageId": "m0", "text": "Side check", "inputIntent": "message"
+                            }
+                        },
+                        {
+                            "position": 1, "visibility": "local", "sourceThreadId": "side-1", "sourceItemId": "w-anchor-1",
+                            "item": {
+                                "id": "w-anchor-1", "threadId": "side-1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                                "ordinal": 3, "type": "command_execution", "status": "completed", "title": null,
+                                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                                "input": "ls", "output": "",
+                                "deferredWork": { "cursor": "work-c1", "itemCount": 1, "lastOrdinal": 4 }
+                            }
+                        }
+                    ],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }"#).unwrap();
+            let mut thread = ThreadState::default();
+            thread.apply(snapshot);
+            state.side_threads.threads.insert("side-1".into(), thread);
+            cx.emit(AppEvent::SideThread);
+        });
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let _sub = state.update(cx, |_, cx| {
+            let done_tx = done_tx.clone();
+            cx.subscribe(&state, move |state, _, event, _| {
+                if matches!(event, AppEvent::SideThread)
+                    && let Some(thread) = state.side_threads.threads.get("side-1")
+                    && !thread.history.loading
+                    && !thread.history.is_loading_work("w-anchor-1")
+                    && thread.projection.as_ref().is_some_and(|p| p.has_entry("m-older") && p.has_entry("w-loaded"))
+                {
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            crate::thread_view::ThreadView::embedded(state.clone(), "side-1".into(), window, cx)
+        });
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_run("r1", cx);
+            });
+            state.update(cx, |state, cx| {
+                state.load_older_side_history("side-1", cx);
+            });
+        });
+        done_rx.await.unwrap();
+        state.read_with(cx, |state, _| {
+            let thread = state.side_threads.threads.get("side-1").expect("side thread retained");
+            let p = thread.projection.as_ref().expect("projection not wiped by unserialized merge");
+            assert!(p.has_entry("m-older"));
+            assert!(p.has_entry("w-loaded"));
+            assert!(!thread.history.loading);
+            assert!(!thread.history.is_loading_work("w-anchor-1"));
+        });
     }
 }

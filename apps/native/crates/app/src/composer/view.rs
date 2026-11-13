@@ -263,7 +263,7 @@ impl Render for Composer {
         let resolved = self.resolve(cx);
         let p = palette(cx);
         let dark = cx.theme().is_dark();
-        let error = self.error.clone().or_else(|| self.state.read(cx).last_error.clone());
+        let error = self.error.clone().or_else(|| self.snapshot.last_error.clone());
         let approval = self.snapshot.pending.approvals.first().cloned();
         let approval_count = self.snapshot.pending.approvals.len();
         let question = self.active_input().cloned();
@@ -347,7 +347,7 @@ impl Render for Composer {
                 .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
                 .children(self.render_queue(cx))
                 .children(error.map(|error| {
-                    div().pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
+                    div().id("composer-stream-error").debug_selector(|| "composer-stream-error".to_owned()).pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
                 .when(self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
                 .children(question.as_ref().map(|input| self.render_question(input, cx)))
