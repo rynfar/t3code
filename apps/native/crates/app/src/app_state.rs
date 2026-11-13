@@ -709,6 +709,7 @@ impl AppState {
     /// Opens the new-thread draft for `project_id`, leaving the open thread.
     pub fn start_draft(&mut self, project_id: &str, cx: &mut Context<Self>) {
         self.notification_route = None;
+        self.pending_thread_find = None;
         if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
             return self.set_pull_requests_open(false, cx);
         }

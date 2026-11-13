@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, HighlightStyle, IntoElement, ListAlignment, ListState,
-    ParentElement, SharedString, Styled, StyledText, Task, Window, div, list, prelude::*, px,
+    AnyElement, App, BoxShadow, Context, Entity, FontWeight, HighlightStyle, IntoElement, ListAlignment, ListState,
+    ParentElement, SharedString, Styled, StyledText, Task, Window, div, list, point, prelude::*, px,
 };
 use t3_core::families::FamilyRead;
 use t3_core::search::{
@@ -30,6 +30,7 @@ use t3_core::sidebar::time::compact_relative_label;
 use t3_core::sidebar::SidebarRow;
 
 use super::SidebarPane;
+use super::row::AppearanceExt;
 use crate::app_state::AppState;
 use crate::project_icon::ProjectVisual;
 use crate::pull_requests::state_glyph;
@@ -701,14 +702,9 @@ impl SidebarPane {
             .or_else(|| matching_search_pr_badge(pr_links, &self.search.settled_query))
             .map(|badge| {
                 let (icon, tone) = state_glyph(badge.state, cx);
-                let color = if settled {
-                    hsla(p.sidebar_secondary_label)
-                } else if badge.has_snapshot {
-                    tone
-                } else {
-                    hsla(p.muted_foreground)
-                };
-                (icon, color, badge.text)
+                let hover_color = if badge.has_snapshot { tone } else { hsla(p.muted_foreground) };
+                let base_color = if settled { hsla(p.secondary_label) } else { hover_color };
+                (icon, base_color, hover_color, badge.has_snapshot, badge.text)
             });
 
         let visual = if scoped.is_some() {
@@ -740,14 +736,27 @@ impl SidebarPane {
         });
 
         let has_excerpt = excerpt.is_some();
+        let light = !cx.window_appearance_is_dark();
+        let ring = BoxShadow {
+            color: hsla(p.sidebar_border).opacity(0.7),
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(1.),
+            inset: true,
+        };
         let title: SharedString = thread.title.clone().into();
-        let title_color = if active || !settled { hsla(p.foreground) } else { hsla(p.sidebar_secondary_label) };
+        let title_color = if active || highlighted || !settled {
+            hsla(p.foreground)
+        } else {
+            hsla(p.secondary_label).opacity(0.7)
+        };
         div()
             .px(px(8.))
             .py(px(1.))
             .child(
                 div()
                     .id(SharedString::from(format!("search-result-{:?}", id)))
+                    .group("sidebar-row")
                     .w_full()
                     .min_h(px(RESULT_HEIGHT))
                     .flex()
@@ -757,9 +766,16 @@ impl SidebarPane {
                     .px(px(10.))
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .when(highlighted, |this| this.bg(hsla(p.sidebar_row_active)))
-                    .when(active && !highlighted, |this| this.bg(hsla(p.sidebar_row_hover)))
-                    .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
+                    .when(active || highlighted, |this| {
+                        this.bg(hsla(p.sidebar_row_active)).when(active && light, |this| this.shadow(vec![ring]))
+                    })
+                    .when(!active && !highlighted, |this| this.hover(|style| style.bg(hsla(p.sidebar_row_hover))))
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        if this.search.highlighted != index {
+                            this.search.highlighted = index;
+                            cx.notify();
+                        }
+                    }))
                     .child(div().flex_none().when(has_excerpt, |this| this.pt(px(2.))).child(favicon))
                     .child(
                         div()
@@ -780,20 +796,31 @@ impl SidebarPane {
                                             .min_w_0()
                                             .truncate()
                                             .text_sm()
-                                            .font_weight(if settled && !active { FontWeight::NORMAL } else { FontWeight::MEDIUM })
+                                            .font_weight(if settled { FontWeight::NORMAL } else { FontWeight::MEDIUM })
                                             .text_color(title_color)
+                                            .when(settled && !active && !highlighted, |this| {
+                                                this.group_hover("sidebar-row", move |style| style.text_color(hsla(p.foreground)))
+                                            })
                                             .when(thread.regenerating_title, |this| this.opacity(0.55))
                                             .child(title),
                                     )
-                                    .children(pr_badge.map(|(icon, color, text)| {
+                                    .children(pr_badge.map(|(icon, base_color, hover_color, has_snapshot, text)| {
                                         div()
                                             .flex_none()
                                             .flex()
                                             .items_center()
                                             .gap(px(3.))
                                             .text_xs()
-                                            .text_color(color)
-                                            .child(icon.sized(px(12.)).text_color(color))
+                                            .text_color(base_color)
+                                            .when(settled && has_snapshot, |this| {
+                                                this.group_hover("sidebar-row", move |style| style.text_color(hover_color))
+                                            })
+                                            .child(icon.sized(px(12.)).text_color(base_color).when(
+                                                settled && has_snapshot,
+                                                |this| {
+                                                    this.group_hover("sidebar-row", move |style| style.text_color(hover_color))
+                                                },
+                                            ))
                                             .child(text)
                                     }))
                                     .children(timestamp.map(|label| {
@@ -1419,6 +1446,7 @@ mod tests {
         );
 
         let mut remote_shell = active_shell.clone();
+        active_shell.snapshot.as_mut().unwrap().threads[0].title = "Cafe menu".into();
         let mut remote_pr_thread = sample.clone();
         remote_pr_thread.id = "remote-pr-hit".into();
         remote_pr_thread.title = "Background sync".into();
@@ -1504,7 +1532,11 @@ mod tests {
         }
         impl gpui::Render for SearchAndThread {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().flex().child(self.pane.clone()).child(self.thread.clone())
+                div()
+                    .size_full()
+                    .flex()
+                    .child(div().w(px(320.)).h_full().child(self.pane.clone()))
+                    .child(div().flex_1().h_full().child(self.thread.clone()))
             }
         }
 
@@ -1563,7 +1595,10 @@ mod tests {
         });
 
         // Raw typing ahead of debounce keeps settled_query at "cafe".
-        pane.update(cx, |pane, cx| pane.search.set_query("cafe open".into(), &pane.state, cx));
+        pane.update(cx, |pane, cx| {
+            pane.search.set_query("cafe open".into(), &pane.state, cx);
+            cx.notify();
+        });
         pane.read_with(cx, |pane, _| {
             assert!(pane.search.is_pending());
             assert_eq!(pane.search.settled_query(), "cafe");
@@ -1576,8 +1611,27 @@ mod tests {
             state.sidebar.fleet_selection.insert(match_key.clone());
         });
 
-        // Activating the search result clears selection, anchors target, clears search, and hands off find.
-        pane.update_in(cx, |pane, window, cx| pane.activate_search_result(match_key.clone(), window, cx));
+        // Pointer hover updates highlighted search row so PressEnter opens the hovered result.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let match_index = pane
+            .read_with(cx, |pane, _| pane.search.results.iter().position(|key| key == &match_key))
+            .expect("match-thread must remain visible in settled cafe results");
+        let row_center = pane
+            .read_with(cx, |pane, _| pane.search.list.bounds_for_item(match_index))
+            .expect("hovered search result row must have measured bounds")
+            .center();
+        cx.simulate_mouse_move(row_center, None::<gpui::MouseButton>, Default::default());
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.search.highlighted_key(), Some(&match_key), "pointer hover must sync search highlight");
+        });
+
+        // PressEnter (open_search_result) activates hovered hit: clears selection, anchors target, clears search, and hands off find.
+        pane.update_in(cx, |pane, window, cx| pane.open_search_result(window, cx));
         cx.run_until_parked();
 
         state.read_with(cx, |state, _| {
@@ -1608,6 +1662,20 @@ mod tests {
         cx.run_until_parked();
         thread_view.read_with(cx, |view, _| {
             assert_eq!(view.find_query_for_test(), None);
+        });
+
+        // Starting a draft clears any queued pending_thread_find.
+        let draft_project = state.read_with(cx, |state, _| state.sidebar.grouping_projects[0].project.id.clone());
+        state.update(cx, |state, cx| {
+            state.queue_thread_find(
+                match_key.clone(),
+                t3_core::timeline::PendingThreadFind { query: "Café".into(), start: None },
+                cx,
+            );
+            state.start_draft(&draft_project, cx);
+        });
+        state.update(cx, |state, _| {
+            assert!(state.take_pending_thread_find("match-thread").is_none(), "start_draft must clear pending_thread_find");
         });
 
         state.update(cx, |state, _| state.stop_pump());
@@ -1678,10 +1746,27 @@ mod tests {
         let mut settled_hit = sample.clone();
         settled_hit.id = "settled-hit".into();
         settled_hit.title = "Settled cafe thread".into();
+        settled_hit.settled_override = Some("settled".into());
         settled_hit.last_visited_at = Some("2026-11-01T08:00:00Z".into());
         settled_hit.updated_at = "2026-10-15T08:00:00Z".into();
         settled_hit.latest_user_message_at = Some("2026-10-15T08:00:00Z".into());
         settled_hit.lineage.root_thread_id = "settled-hit".into();
+        settled_hit.pull_requests = serde_json::from_value(json!([{
+            "host": "github.com",
+            "repository": "ping/t3",
+            "number": 22888,
+            "url": "https://github.com/ping/t3/pull/22888",
+            "source": "manual",
+            "linkedAt": "2026-10-15T00:00:00Z",
+            "snapshot": {
+                "state": "merged",
+                "title": "Cafe settled PR badge",
+                "headBranch": "fix/settled",
+                "baseBranch": "main",
+                "isDraft": false
+            }
+        }]))
+        .unwrap();
 
         let mut user_msg_hit = sample.clone();
         user_msg_hit.id = "user-msg-hit".into();
