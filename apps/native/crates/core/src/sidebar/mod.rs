@@ -8,6 +8,7 @@ pub mod favicon;
 pub mod fleet;
 pub mod grouping;
 pub mod history;
+pub mod hover;
 pub mod inbox;
 pub mod older_settled;
 pub mod selection;

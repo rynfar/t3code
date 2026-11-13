@@ -137,6 +137,11 @@ fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gest
 pub(crate) struct ProviderRefreshPending;
 impl gpui::Global for ProviderRefreshPending {}
 
+/// Each checkout's branch by workspace root, which sidebar hover cards read instead of a server.
+#[derive(Default)]
+pub(crate) struct CheckoutFixture(pub(crate) std::collections::HashMap<String, String>);
+impl gpui::Global for CheckoutFixture {}
+
 #[derive(Default)]
 struct FocusTargets(std::collections::HashMap<&'static str, gpui::FocusHandle>);
 impl gpui::Global for FocusTargets {}
@@ -1120,6 +1125,8 @@ struct SidebarFixture {
     selected_threads: Option<Vec<String>>,
     fleet_selected_threads: Option<Vec<(String, String)>>,
     running_terminals: Option<Vec<(String, Vec<String>)>>,
+    /// Each checkout's current branch, `(workspace root, branch)`, for hover card warnings.
+    checkout_branches: Option<Vec<(String, String)>>,
     thread_drafts: Option<Vec<(String, String)>>,
     providers: Option<Vec<serde_json::Value>>,
     projects: Option<Vec<t3_core::shell::ProjectShell>>,
@@ -1442,6 +1449,10 @@ fn apply_sidebar_fixture(
             running.by_thread.insert(thread_id.clone(), ids.clone());
         }
         cx.update(|cx| cx.set_global(running));
+    }
+    if let Some(branches) = &fixture.checkout_branches {
+        let checkouts = CheckoutFixture(branches.iter().cloned().collect());
+        cx.update(|cx| cx.set_global(checkouts));
     }
     pump(cx, 0.2, |_| false);
     Ok(())
