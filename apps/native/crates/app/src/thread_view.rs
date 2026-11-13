@@ -104,8 +104,15 @@ impl ThreadView {
     }
 
     fn new_for(state: Entity<AppState>, fixed: Option<String>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
-            AppEvent::Thread | AppEvent::Selection | AppEvent::SideThread => this.sync(cx),
+        let subscription = cx.subscribe_in(&state, _window, |this, _, event: &AppEvent, window, cx| match event {
+            AppEvent::Thread | AppEvent::Selection | AppEvent::SideThread => {
+                this.sync(cx);
+                this.consume_pending_find(window, cx);
+            }
+            AppEvent::ThreadFind => {
+                this.sync(cx);
+                this.consume_pending_find(window, cx);
+            }
             AppEvent::History => {
                 this.sync_history(cx);
                 this.advance_citation_source(cx);

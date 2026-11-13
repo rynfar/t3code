@@ -63,6 +63,8 @@ pub enum AppEvent {
     CitationSource,
     /// A side subscription (side chat tab, child approval) changed, or an action on one did.
     SideThread,
+    /// A pending find-in-thread handoff arrived from sidebar search (`take_pending_thread_find`).
+    ThreadFind,
     /// An SSH password prompt arrived or was answered (`ssh_prompts`).
     SshPrompt,
 }
@@ -116,6 +118,7 @@ pub struct AppState {
     composer_review_comment: Option<(String, t3_core::composer::review::ReviewComment)>,
     pub composer_citation: Option<t3_core::assistant_citations::Citation>,
     pub citation_source: Option<t3_core::assistant_citations::Citation>,
+    pending_thread_find: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::timeline::PendingThreadFind)>,
     client: Option<ClientHandle>,
     /// Counts clients started, so state tied to one never outlives a switch to the next.
     connection: u64,
@@ -218,6 +221,7 @@ impl AppState {
             composer_review_comment: None,
             composer_citation: None,
             citation_source: None,
+            pending_thread_find: None,
             client: None,
             connection: 0,
             runtime,
@@ -602,6 +606,12 @@ impl AppState {
 
     pub fn select_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.notification_route = None;
+        if self.pending_thread_find.as_ref().is_some_and(|(key, _)| {
+            key.thread_id != thread_id
+                || (!key.environment_id.is_empty() && self.environments.active.as_deref() != Some(key.environment_id.as_str()))
+        }) {
+            self.pending_thread_find = None;
+        }
         if !self.thread_route_visible(thread_id) {
             self.restore_thread = None;
             self.clear_selection(cx);
@@ -718,6 +728,7 @@ impl AppState {
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.notification_route = None;
+        self.pending_thread_find = None;
         if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&previous);
         }
@@ -807,6 +818,25 @@ impl AppState {
             Some((thread, _)) if thread == thread_id => self.composer_terminal_context.take().map(|(_, selection)| selection),
             _ => None,
         }
+    }
+
+    /// Queues a find-in-thread search opened from sidebar search once `key`'s thread is shown.
+    pub(crate) fn queue_thread_find(
+        &mut self,
+        key: t3_core::sidebar::tag_filter::ThreadKey,
+        find: t3_core::timeline::PendingThreadFind,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_thread_find = Some((key, find));
+        cx.emit(AppEvent::ThreadFind);
+    }
+
+    pub(crate) fn take_pending_thread_find(&mut self, thread_id: &str) -> Option<t3_core::timeline::PendingThreadFind> {
+        let active_env = self.environments.active.as_deref().unwrap_or("");
+        let matches = self.pending_thread_find.as_ref().is_some_and(|(key, _)| {
+            key.thread_id == thread_id && (key.environment_id.is_empty() || key.environment_id == active_env)
+        });
+        if matches { self.pending_thread_find.take().map(|(_, find)| find) } else { None }
     }
 
     pub(crate) fn client_handle(&self) -> Option<ClientHandle> {

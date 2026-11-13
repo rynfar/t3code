@@ -9,7 +9,7 @@ use gpui::{AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElem
 use gpui_component::h_flex;
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use t3_core::timeline::{
-    FindMatch, FindResult, FindStart, MAX_QUERY_CHARS, RowKind, SEARCH_THREAD, TimelineRow, bar_label, decode_result, fold_membership,
+    FindMatch, FindResult, FindStart, MAX_QUERY_CHARS, PendingThreadFind, RowKind, SEARCH_THREAD, TimelineRow, bar_label, decode_result, fold_membership,
     search_request, step_locally,
 };
 
@@ -70,24 +70,14 @@ fn row_entry(row: &TimelineRow) -> Option<&str> {
 }
 
 impl ThreadView {
-    /// Opens find, or refocuses it and restarts its search from the viewport.
-    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.disclosure.cancel();
-        if self.thread_id.is_none() {
-            return;
-        }
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn find_query_for_test(&self) -> Option<&str> {
+        self.find.as_ref().map(|find| find.query.as_str())
+    }
+
+    fn ensure_find_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         if let Some(find) = &self.find {
-            let input = find.input.clone();
-            input.update(cx, |input, cx| input.focus(window, cx));
-            if !find.query.trim().is_empty() {
-                let start = self.viewport_start();
-                if let Some(find) = self.find.as_mut() {
-                    find.start = start;
-                    find.offset = 0;
-                }
-                self.request_find(cx);
-            }
-            return;
+            return find.input.clone();
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in thread"));
         let subscription = cx.subscribe_in(&input, window, |view, input, event: &InputEvent, _window, cx| match event {
@@ -98,9 +88,8 @@ impl ThreadView {
             InputEvent::PressEnter { shift, .. } => view.step_find(if *shift { -1 } else { 1 }, cx),
             _ => {}
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
         self.find = Some(FindUi {
-            input,
+            input: input.clone(),
             query: String::new(),
             start: None,
             offset: 0,
@@ -113,7 +102,74 @@ impl ThreadView {
             refresh: None,
             _subscription: subscription,
         });
+        input
+    }
+
+    /// Opens find, or refocuses it and restarts its search from the viewport.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
+        if self.thread_id.is_none() {
+            return;
+        }
+        let had_find = self.find.is_some();
+        let input = self.ensure_find_ui(window, cx);
+        input.update(cx, |input, cx| input.focus(window, cx));
+        if had_find {
+            let has_query = self.find.as_ref().is_some_and(|find| !find.query.trim().is_empty());
+            if has_query {
+                let start = self.viewport_start();
+                if let Some(find) = self.find.as_mut() {
+                    find.start = start;
+                    find.offset = 0;
+                }
+                self.request_find(cx);
+            }
+            return;
+        }
         cx.notify();
+    }
+
+    /// Opens find on `pending.query` (e.g. from a sidebar search result), anchored at `pending.start`.
+    pub fn open_find_on_query(&mut self, pending: PendingThreadFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
+        if self.thread_id.is_none() {
+            return;
+        }
+        let query: String = pending.query.chars().take(MAX_QUERY_CHARS).collect();
+        let input = self.ensure_find_ui(window, cx);
+        if let Some(find) = self.find.as_mut() {
+            find.query = query.clone();
+            find.start = pending.start;
+            find.offset = 0;
+            find.result = None;
+            find.active = None;
+            find.loading = false;
+            find.failed = false;
+            find.pending_reveal = None;
+            find.request = None;
+            find.refresh = None;
+        }
+        input.update(cx, |input, cx| {
+            input.set_value(query.clone(), window, cx);
+            input.focus(window, cx);
+        });
+        if !query.trim().is_empty() {
+            self.request_find(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn consume_pending_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixed.is_some() {
+            return;
+        }
+        let Some(thread_id) = self.thread_id.clone() else {
+            return;
+        };
+        let pending = self.state.update(cx, |state, _| state.take_pending_thread_find(&thread_id));
+        if let Some(pending) = pending {
+            self.open_find_on_query(pending, window, cx);
+        }
     }
 
     pub fn close_find(&mut self, cx: &mut Context<Self>) {

@@ -1819,3 +1819,43 @@ fn scoped_quiet_metadata_keeps_existing_omitted_row_rules() {
     pages.sync_generation(5, counts.current().as_ref());
     assert!(!pages.apply_page(generation, &before, Ok(FamilyRead { snapshot_sequence:9, threads:vec![row] })));
 }
+
+#[test]
+fn environment_summary_preserves_pull_requests_for_non_active_remote_search() {
+    use super::fleet::EnvironmentSummary;
+    use super::grouping::EnvironmentOwner;
+    use crate::server_config::ServerConfigState;
+    use crate::shell::ShellState;
+
+    let mut remote_shell = ShellState::default();
+    let mut row = wire_thread("remote-pr-thread", json!({ "title": "Cleanup" }));
+    row["pullRequests"] = json!([{
+        "host": "github.com",
+        "repository": "ping/t3",
+        "number": 22889,
+        "url": "https://github.com/ping/t3/pull/22889",
+        "source": "manual",
+        "linkedAt": "2026-10-24T00:00:00Z",
+        "snapshot": {
+            "state": "open",
+            "title": "Smaller MCP payloads",
+            "headBranch": "b",
+            "baseBranch": "main",
+            "isDraft": false
+        }
+    }]);
+    remote_shell.snapshot = Some(snapshot(vec![row]));
+    let summary = EnvironmentSummary::from_shell(
+        EnvironmentOwner {
+            saved_id: "remote-1".into(),
+            canonical_id: Some("canonical-remote-1".into()),
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: remote_shell.generation,
+        },
+        &remote_shell,
+        &ServerConfigState::default(),
+    );
+    assert_eq!(summary.threads[0].thread.pull_requests.len(), 1);
+    assert_eq!(summary.threads[0].thread.pull_requests[0].number, 22889);
+}

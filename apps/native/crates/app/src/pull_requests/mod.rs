@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 pub use link_dialog::LinkPullRequestDialog;
 pub use page::PullRequestsPage;
 pub use thread_panel::ThreadPullRequestsPanel;
+pub(crate) use controls::state_glyph;
 
 use crate::app_state::{AppEvent, AppState};
 

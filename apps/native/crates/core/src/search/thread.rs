@@ -537,6 +537,81 @@ pub fn search_pull_requests(links: &[crate::pull_requests::link::ThreadLink]) ->
         .collect()
 }
 
+/// `pullRequestMatchesSearchQuery` (`Sidebar.logic.ts`): every folded token of `query` matches
+/// a visible PR's `#number`, `repo#number`, URL, or (for the newest few) title.
+pub fn pull_request_matches_search_query(
+    links: &[crate::pull_requests::link::ThreadLink],
+    query: &str,
+) -> bool {
+    let normalized = fold_search_query(query);
+    if normalized.is_empty() {
+        return false;
+    }
+    let terms: String = search_pull_requests(links)
+        .into_iter()
+        .flat_map(|pr| {
+            iter::once(format!("#{}", pr.number))
+                .chain(pr.references)
+                .chain(pr.title)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let haystack = fold_search_query(&terms);
+    !haystack.is_empty() && normalized.split(' ').all(|token| haystack.contains(token))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPrBadge {
+    pub text: String,
+    pub state: crate::pull_requests::detail::StateKind,
+    pub has_snapshot: bool,
+}
+
+/// `ThreadSearchPullRequestNumber` (`ThreadStatusIndicators.tsx`): badge presentation for a search
+/// row whose pull request metadata matched `query`.
+pub fn matching_search_pr_badge(
+    links: &[crate::pull_requests::link::ThreadLink],
+    query: &str,
+) -> Option<SearchPrBadge> {
+    if !pull_request_matches_search_query(links, query) {
+        return None;
+    }
+    let visible = crate::pull_requests::link::visible_links(links);
+    let current = *visible.first()?;
+    let others = visible.len().saturating_sub(1);
+    let state = if others > 0 {
+        use crate::pull_requests::wire::PrState;
+        if visible
+            .iter()
+            .all(|link| link.snapshot.as_ref().is_some_and(|s| s.state == PrState::Open && s.is_draft))
+        {
+            crate::pull_requests::detail::StateKind::Draft
+        } else if visible
+            .iter()
+            .any(|link| link.snapshot.as_ref().is_none_or(|s| s.state == PrState::Open))
+        {
+            crate::pull_requests::detail::StateKind::Open
+        } else if visible
+            .iter()
+            .all(|link| link.snapshot.as_ref().is_some_and(|s| s.state == PrState::Merged))
+        {
+            crate::pull_requests::detail::StateKind::Merged
+        } else {
+            crate::pull_requests::detail::StateKind::Closed
+        }
+    } else {
+        current
+            .snapshot
+            .as_ref()
+            .map_or(crate::pull_requests::detail::StateKind::Open, |s| {
+                crate::pull_requests::detail::StateKind::of(s.state, s.is_draft)
+            })
+    };
+    let text = if others > 0 { format!("+{}", others + 1) } else { current.number.to_string() };
+    let has_snapshot = others > 0 || current.snapshot.is_some();
+    Some(SearchPrBadge { text, state, has_snapshot })
+}
+
 /// Merges this client's latest local open into server `opens` (`buildThreadSearchSubject`).
 pub fn merge_local_open(
     opens: Option<&ThreadOpenStats>,

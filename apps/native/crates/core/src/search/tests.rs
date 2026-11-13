@@ -791,3 +791,56 @@ fn extracts_searchable_pull_requests_and_merges_newer_local_opens() {
         Some(ThreadOpenStats { opened_at: 2_000, score: 1.0, picks: Vec::new() })
     );
 }
+
+#[test]
+fn find_for_message_match_picks_phrase_or_longest_whole_word_and_preserves_snippet_casing() {
+    use crate::timeline::FindStart;
+
+    let phrase = find_for_message_match("Please don\u{2019}t stop now", Some("msg-1"), "don't stop");
+    assert_eq!(phrase.query, "don\u{2019}t stop");
+    assert_eq!(phrase.start, Some(FindStart { entry_id: "msg-1".into(), occurrence: 0 }));
+
+    // Accents & whole-word priority: "Café" beats "Cafe" inside "Cafeteria".
+    let accent = find_for_message_match("Cafeteria serves Café daily", Some("msg-2"), "fix cafe");
+    assert_eq!(accent.query, "Café");
+    assert_eq!(accent.start, Some(FindStart { entry_id: "msg-2".into(), occurrence: 0 }));
+
+    // Tie in token length keeps the first longest token (matches JS `>` reduce).
+    let tie = find_for_message_match("beta alpha", Some("msg-3"), "alpha beta");
+    assert_eq!(tie.query, "alpha");
+
+    // No long tokens falls back to raw query and preserves None message_id.
+    let short = find_for_message_match("nothing here", None, "go");
+    assert_eq!(short.query, "go");
+    assert_eq!(short.start, None);
+}
+
+#[test]
+fn pull_request_matches_search_query_and_resolves_badge() {
+    use crate::pull_requests::detail::StateKind;
+    let links: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
+        {"host": "github.com", "repository": "ping/t3", "number": 10, "url": "https://github.com/ping/t3/pull/10", "source": "stack-dismissed", "linkedAt": "2026-10-25T00:00:00Z", "snapshot": {"state": "open", "title": "Dismissed", "headBranch": "a", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-25T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 22889, "url": "https://github.com/ping/t3/pull/22889", "source": "manual", "linkedAt": "2026-10-24T00:00:00Z", "snapshot": {"state": "open", "title": "Smaller MCP payloads", "headBranch": "b", "baseBranch": "main", "isDraft": true, "updatedAt": "2026-10-24T00:00:00Z"}}
+    ]))
+    .unwrap();
+
+    assert!(pull_request_matches_search_query(&links, "#22889"));
+    assert!(pull_request_matches_search_query(&links, "smaller mcp"));
+    assert!(pull_request_matches_search_query(&links, "ping/t3#22889"));
+    assert!(!pull_request_matches_search_query(&links, "dismissed"));
+    assert!(!pull_request_matches_search_query(&links, "unrelated"));
+
+    let badge = matching_search_pr_badge(&links, "#22889").expect("matching PR badge");
+    assert_eq!(badge.text, "22889");
+    assert_eq!(badge.state, StateKind::Draft);
+    assert!(matching_search_pr_badge(&links, "unrelated").is_none());
+
+    let multi: Vec<crate::pull_requests::link::ThreadLink> = serde_json::from_value(serde_json::json!([
+        {"host": "github.com", "repository": "ping/t3", "number": 101, "url": "https://github.com/ping/t3/pull/101", "source": "manual", "linkedAt": "2026-10-23T00:00:00Z", "snapshot": {"state": "merged", "title": "First", "headBranch": "a", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-23T00:00:00Z"}},
+        {"host": "github.com", "repository": "ping/t3", "number": 102, "url": "https://github.com/ping/t3/pull/102", "source": "manual", "linkedAt": "2026-10-24T00:00:00Z", "snapshot": {"state": "open", "title": "Second", "headBranch": "b", "baseBranch": "main", "isDraft": false, "updatedAt": "2026-10-24T00:00:00Z"}}
+    ]))
+    .unwrap();
+    let multi_badge = matching_search_pr_badge(&multi, "102").expect("multi PR badge");
+    assert_eq!(multi_badge.text, "+2");
+    assert_eq!(multi_badge.state, StateKind::Open);
+}
