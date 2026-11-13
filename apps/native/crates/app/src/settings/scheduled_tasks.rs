@@ -79,6 +79,7 @@ pub(crate) struct ScheduledTasksState {
     editor_error: Option<Invalid>,
     saving: bool,
     save_error: Option<String>,
+    pending_task: Option<String>,
     inputs: EditorInputs,
 }
 
@@ -94,7 +95,7 @@ impl ScheduledTasksState {
             base_ref: input("main", window, cx),
             checkout: input("/path/to/checkout", window, cx),
         };
-        ScheduledTasksState { tasks: None, stream: None, busy: HashSet::new(), menu: None, editor: None, editor_error: None, saving: false, save_error: None, inputs }
+        ScheduledTasksState { tasks: None, stream: None, busy: HashSet::new(), menu: None, editor: None, editor_error: None, saving: false, save_error: None, pending_task: None, inputs }
     }
 
     pub(super) fn inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
@@ -270,8 +271,24 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub(super) fn scheduled_tasks_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+    pub(super) fn select_scheduled_task(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.scheduled.pending_task = Some(task_id.to_owned());
+        self.apply_pending_scheduled_task(window, cx);
+    }
+
+    fn apply_pending_scheduled_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self.scheduled.pending_task.as_deref() else { return };
+        let Some(Ok(tasks)) = &self.scheduled.tasks else { return };
+        let found = tasks.iter().find(|task| task.id == task_id).cloned();
+        self.scheduled.pending_task = None;
+        if let Some(task) = found {
+            self.open_editor(Draft::from_task(&task, local_field), window, cx);
+        }
+    }
+
+    pub(super) fn scheduled_tasks_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         self.ensure_task_stream(cx);
+        self.apply_pending_scheduled_task(window, cx);
         let Some(config) = self.thread_settings(cx).cloned() else {
             return vec![Block::new(&[], self.task_empty("No environments available", "Connect an environment to manage scheduled tasks.", cx))];
         };

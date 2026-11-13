@@ -204,8 +204,8 @@ impl AutomationsFeed {
                 let subtitle = automation_schedule_line(task, once_label, now);
                 let dot_color = match task.last_run_status {
                     RunStatus::Running => hsla(p.info),
-                    RunStatus::Succeeded => hsla(p.terminal_running),
-                    RunStatus::Failed => hsla(p.error),
+                    RunStatus::Succeeded => hsla(p.success),
+                    RunStatus::Failed => hsla(p.destructive),
                     RunStatus::Never => hsla(p.muted_foreground).opacity(0.4),
                 };
                 let task_id = task.id.clone();
@@ -253,13 +253,14 @@ impl AutomationsFeed {
                         }))
                 });
 
+                let edit_task_id = task.id.clone();
                 let edit_btn = right_panel::Button::new(SharedString::from(format!("details-automation-edit-{}", task.id)))
                     .variant(right_panel::Variant::GhostMuted)
                     .size(right_panel::Size::IconXs)
-                    .icon(Icon::SlidersHorizontal)
+                    .icon(Icon::Pencil)
                     .icon_size(14.)
                     .tooltip("Edit automation")
-                    .on_click(|_, _, cx| crate::settings::open(t3_core::settings::search::Section::ScheduledTasks, cx));
+                    .on_click(move |_, _, cx| crate::settings::open_scheduled_task(&edit_task_id, cx));
 
                 let info = v_flex()
                     .id(SharedString::from(format!("details-automation-info-{}", task.id)))
@@ -297,23 +298,28 @@ impl AutomationsFeed {
             })
             .collect();
 
-        let body = if let Some(err) = &self.error {
-            div()
-                .px(px(10.))
-                .py(px(6.))
-                .text_xs()
-                .text_color(hsla(p.error))
-                .child(format!("Could not load automations: {err}"))
-                .into_any_element()
-        } else {
-            v_flex()
-                .id("details-automations-list")
-                .max_h(px(216.))
-                .overflow_y_scroll()
-                .gap(px(2.))
-                .children(rows)
-                .into_any_element()
-        };
+        let body = v_flex()
+            .w_full()
+            .when(!rows.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .id("details-automations-list")
+                        .max_h(px(216.))
+                        .overflow_y_scroll()
+                        .gap(px(2.))
+                        .children(rows),
+                )
+            })
+            .when_some(self.error.clone(), |this, err| {
+                this.child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_xs()
+                        .text_color(hsla(p.destructive))
+                        .child(format!("Could not load automations: {err}")),
+                )
+            });
 
         Some(section_with_action(separated, Some("Automations".into()), Some(manage_btn), false, cx).child(body).into_any_element())
     }

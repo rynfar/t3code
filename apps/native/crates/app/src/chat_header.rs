@@ -325,10 +325,16 @@ impl Render for ChatHeader {
             )
             .children(project.map(|(project_id, name)| {
                 let state = state.clone();
-                crumb("chat-header-project", Some(favicon), name.clone(), PROJECT_CRUMB_MAX_WIDTH, format!("New thread in {name}"))
-                    .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_draft(&project_id, cx)))
+                h_flex()
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .gap(px(12.))
+                    .child(
+                        crumb("chat-header-project", Some(favicon), name.clone(), PROJECT_CRUMB_MAX_WIDTH, format!("New thread in {name}"))
+                            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_draft(&project_id, cx))),
+                    )
+                    .child(separator())
             }))
-            .child(separator())
             .children(parent.map(|(parent_id, parent_title)| {
                 let state = self.state.clone();
                 let label = if parent_collapsed { "...".to_owned() } else { parent_title.clone() };

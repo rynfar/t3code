@@ -88,7 +88,11 @@ impl TerminalDrawer {
     }
 
     pub(super) fn selected_thread(&self, cx: &App) -> Option<String> {
-        self.app.read(cx).selected_thread.clone()
+        let state = self.app.read(cx);
+        state
+            .selected_thread
+            .clone()
+            .or_else(|| state.draft_project.as_deref().map(t3_core::composer::drafts::new_thread_key))
     }
 
     pub(super) fn layout(&self, cx: &App) -> Option<(String, ThreadTerminalLayout)> {
@@ -268,18 +272,26 @@ impl TerminalDrawer {
     }
 
     /// Where a terminal runs: its server session's cwd when known (reopening elsewhere would
-    /// restart it), otherwise the thread's worktree or project root.
+    /// restart it), otherwise the thread's worktree or the thread/draft's project root.
     fn location(&self, thread_id: &str, terminal_id: Option<&str>, cx: &App) -> Option<LaunchLocation> {
         let app = self.app.read(cx);
-        let thread = app.thread_shell(thread_id)?;
-        let root = &app.shell.project(&thread.project_id)?.workspace_root;
+        let (root, thread_worktree) = if let Some(thread) = app.thread_shell(thread_id) {
+            (&app.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref())
+        } else {
+            let project_id = thread_id.strip_prefix("draft:")?;
+            let project = app.shell.project(project_id)?;
+            if project.workspace_root.is_empty() {
+                return None;
+            }
+            (&project.workspace_root, None)
+        };
         let known = terminal_id.and_then(|id| self.summary(thread_id, id)).filter(|summary| !summary.cwd.is_empty());
         Some(match known {
             Some(summary) => LaunchLocation {
                 cwd: summary.cwd.clone(),
                 ..LaunchLocation::new(root, summary.worktree_path.as_deref())
             },
-            None => LaunchLocation::new(root, thread.worktree_path.as_deref()),
+            None => LaunchLocation::new(root, thread_worktree),
         })
     }
 

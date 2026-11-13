@@ -50,6 +50,8 @@ struct Host {
     pending: Option<(Section, Option<String>)>,
     /// The project a "Project settings" entry point opens the Projects page on.
     pending_project: Option<String>,
+    /// The scheduled task an "Edit automation" link opens the Scheduled Tasks editor on.
+    pending_scheduled_task: Option<String>,
     pending_provider: Option<providers::ProviderSettingsTarget>,
     /// What had focus when the modal opened, focused again when it closes.
     previous_focus: Option<FocusHandle>,
@@ -85,6 +87,7 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
         view: None,
         pending: None,
         pending_project: None,
+        pending_scheduled_task: None,
         pending_provider: None,
         previous_focus: None,
         features,
@@ -329,6 +332,12 @@ pub fn open_project(project_id: &str, cx: &mut App) {
     open_at(Section::Projects, None, cx);
 }
 
+/// Opens Settings → Scheduled tasks and opens the editor on `task_id` once loaded.
+pub fn open_scheduled_task(task_id: &str, cx: &mut App) {
+    cx.global_mut::<Host>().pending_scheduled_task = Some(task_id.to_owned());
+    open_at(Section::ScheduledTasks, None, cx);
+}
+
 /// Opens the Add action editor on the shown project (snapshots).
 #[cfg(feature = "snapshot")]
 pub fn open_add_action(cx: &mut App) {
@@ -379,6 +388,7 @@ fn finish_close(window: &mut Window, cx: &mut App) {
     host.view = None;
     host.pending = None;
     host.pending_project = None;
+    host.pending_scheduled_task = None;
     host.pending_provider = None;
     let previous = host.previous_focus.take();
     store::clear_error(cx);
@@ -424,6 +434,9 @@ fn apply_pending(window: &mut Window, cx: &mut App) {
         }
         if let Some(project_id) = cx.global_mut::<Host>().pending_project.take() {
             view.update(cx, |view, cx| view.select_project_id(&project_id, cx));
+        }
+        if let Some(task_id) = cx.global_mut::<Host>().pending_scheduled_task.take() {
+            view.update(cx, |view, cx| view.select_scheduled_task(&task_id, window, cx));
         }
     }
 }
@@ -1033,7 +1046,7 @@ impl SettingsView {
             Section::Providers => self.providers_page(window, cx),
             Section::Worktrees => self.worktrees_page(window, cx),
             Section::SourceControl => self.source_control_page(window, cx),
-            Section::ScheduledTasks => self.scheduled_tasks_page(cx),
+            Section::ScheduledTasks => self.scheduled_tasks_page(window, cx),
             Section::Projects => self.projects_page(window, cx),
             Section::Access => self.access_page(window, cx),
             Section::Secrets => self.secrets_page(cx),

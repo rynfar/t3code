@@ -221,5 +221,13 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
         .child(count("+", insertions, p.diff_addition_foreground))
         .child(count("-", deletions, p.diff_deletion_foreground));
     let state = state.clone();
-    Some(Row::new("git-changes", "Changes").icon(Icon::FileDiff).trailing(totals).on_click(move |_, _, cx| state.update(cx, |state, cx| state.add_diff_surface(cx))).into_any_element())
+    let can_open = state.read(cx).selected_thread.is_some();
+    Some(
+        Row::new("git-changes", "Changes")
+            .icon(Icon::FileDiff)
+            .trailing(totals)
+            .disabled(!can_open)
+            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.add_diff_surface(cx)))
+            .into_any_element(),
+    )
 }

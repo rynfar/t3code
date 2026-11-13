@@ -23,6 +23,7 @@ use t3_core::right_panel::{DEFAULT_WIDTH, clamp_width};
 use t3_core::server_config::ServerSettings;
 use t3_core::vcs;
 
+pub(crate) use view::DetailsViewPeers;
 pub use view::DetailsView;
 
 use crate::app_state::AppState;
@@ -267,7 +268,7 @@ pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)>
 pub(crate) fn canvas_width(state: &AppState, viewport_width: f32) -> f32 {
     let sidebar = sidebar_inline_width(state, viewport_width);
     let row = viewport_width - sidebar;
-    let panel = state.selected_thread.as_deref().map_or(0., |thread| {
+    let panel = state.panel_thread().as_deref().map_or(0., |thread| {
         let panel = state.panels.panels.panel(thread);
         if !panel.is_open || panel.maximized {
             return 0.;
@@ -311,15 +312,18 @@ pub fn layout(state: &Entity<AppState>, window: &Window, cx: &App) -> Layout {
     Layout { presentation, card_open, lane_inset }
 }
 
-pub(crate) fn available_height_for(viewport_height: f32, terminal_height: f32) -> f32 {
-    (viewport_height - crate::workspace::TITLEBAR_HEIGHT - terminal_height.max(0.) - 2. * CARD_GAP - 24.).max(0.)
+pub(crate) fn available_height_for(viewport_height: f32, terminal_height: f32, top_inset: f32) -> f32 {
+    (viewport_height - crate::workspace::TITLEBAR_HEIGHT - terminal_height.max(0.) - top_inset.max(0.) - 2. * CARD_GAP - 24.).max(0.)
 }
 
-pub fn available_height(window: &Window, terminal_height: f32) -> f32 {
-    available_height_for(f32::from(window.viewport_size().height), terminal_height)
+pub fn available_height(window: &Window, terminal_height: f32, top_inset: f32) -> f32 {
+    available_height_for(f32::from(window.viewport_size().height), terminal_height, top_inset)
 }
 
-pub(crate) fn point_in_find_bar(position: gpui::Point<gpui::Pixels>, state: &AppState, window: &Window) -> bool {
+pub(crate) fn point_in_find_bar(find_open: bool, position: gpui::Point<gpui::Pixels>, state: &AppState, window: &Window) -> bool {
+    if !find_open {
+        return false;
+    }
     let viewport_width = f32::from(window.viewport_size().width);
     let canvas_right = sidebar_inline_width(state, viewport_width) + canvas_width(state, viewport_width);
     let right = canvas_right - 12.;
@@ -402,9 +406,10 @@ mod tests {
 
     #[test]
     fn available_height_subtracts_open_terminal_drawer() {
-        assert_eq!(available_height_for(900., 0.), 800.);
-        assert_eq!(available_height_for(900., 280.), 520.);
-        assert_eq!(available_height_for(200., 280.), 0.);
+        assert_eq!(available_height_for(900., 0., 0.), 800.);
+        assert_eq!(available_height_for(900., 280., 0.), 520.);
+        assert_eq!(available_height_for(900., 0., 48.), 752.);
+        assert_eq!(available_height_for(200., 280., 0.), 0.);
     }
 
     #[test]

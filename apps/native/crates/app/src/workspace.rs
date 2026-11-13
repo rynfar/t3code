@@ -100,7 +100,20 @@ impl Workspace {
         let details_model = thread_details::init(state.clone(), cx);
         let git = details_model.read(cx).git.clone();
         let git_dialogs = cx.new(|cx| GitDialogs::new(git, window, cx));
-        let details = cx.new(|cx| DetailsView::new(state.clone(), details_model.clone(), git_dialogs.clone(), terminal.clone(), window, cx));
+        let details = cx.new(|cx| {
+            DetailsView::new(
+                state.clone(),
+                details_model.clone(),
+                git_dialogs.clone(),
+                terminal.clone(),
+                crate::thread_details::DetailsViewPeers {
+                    composer: composer.clone(),
+                    thread: thread.clone(),
+                },
+                window,
+                cx,
+            )
+        });
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
@@ -215,7 +228,7 @@ impl Workspace {
     fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let status = self.render_connection_status(cx);
         let state = self.state.read(cx);
-        let terminal_toggle = state.selected_thread.is_some().then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
+        let terminal_toggle = (state.selected_thread.is_some() || state.draft_project.is_some()).then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
         let theme = cx.theme();
         let collapsed = sidebar_inline_width(state, f32::from(window.viewport_size().width)) == 0.;
         h_flex()
@@ -274,7 +287,7 @@ impl Render for Workspace {
         let sidebar_width = sidebar_inline_width(state, viewport);
         let sheet = state.sidebar_sheet.is_open().then(|| layout::sheet_width(viewport));
         let running = state.is_selected_thread_running();
-        let panel = state.selected_thread.as_deref().map(|thread| state.panels.panels.panel(thread));
+        let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
         let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
         let drawer = self.terminal.clone();
@@ -422,6 +435,7 @@ impl Render for Workspace {
                                 .child(div().flex_1().min_h_0().child(self.draft.clone()))
                                 .child(self.details.clone()),
                         )
+                        .child(self.terminal.clone())
                     })
                     .when(!has_thread && !has_draft, |this| this.child(div().flex_1().min_h_0().child(self.home.clone()))),
                 )

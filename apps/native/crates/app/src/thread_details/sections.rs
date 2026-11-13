@@ -9,7 +9,6 @@ use gpui::{AnyElement, App, ClickEvent, ClipboardItem, Entity, IntoElement, Pare
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script, menu_label};
-use t3_core::shell::ThreadShell;
 use t3_core::thread_details::{CardDensity, item_visible_at_density};
 use t3_core::vcs::{self, editor_label, editor_options};
 
@@ -188,7 +187,7 @@ pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement
 
 /// The branch row and its picker, and the PR row under it while the checkout is the thread's
 /// branch (`BranchToolbarBranchSelector` in panel mode).
-fn branch_rows(ctx: &Ctx, thread: &ThreadShell, cx: &App) -> AnyElement {
+fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
     let git = ctx.git.read(cx);
     let active = git.active_branch();
     let label = vcs::branch_trigger_label(false, active.as_deref(), None, false);
@@ -216,7 +215,7 @@ fn branch_rows(ctx: &Ctx, thread: &ThreadShell, cx: &App) -> AnyElement {
             None => menu,
         });
     let status = git.status.as_ref();
-    let pr = vcs::pr_branch(thread.branch.as_deref(), active.as_deref())
+    let pr = vcs::pr_branch(thread_branch, active.as_deref())
         .filter(|branch| status.and_then(|status| status.local.ref_name.as_deref()) == Some(*branch))
         .and_then(|_| status.and_then(|status| status.remote.pr.clone()));
     let terms = t3_core::git_actions::terminology(status.and_then(|status| status.provider_kind()));
@@ -241,15 +240,21 @@ fn branch_rows(ctx: &Ctx, thread: &ThreadShell, cx: &App) -> AnyElement {
 
 pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id))?;
+    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
+    let project_id = thread.map(|thread| thread.project_id.as_str()).or(app.draft_project.as_deref())?;
+    let project = app.shell.project(project_id)?;
+    if app.is_scratch_project(project_id) || project.workspace_root.is_empty() {
+        return None;
+    }
     let details = ctx.details.read(cx);
     let is_repo = ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
-    let no_runs_yet = thread.latest_run_id.is_none();
+    let no_runs_yet = thread.is_none_or(|thread| thread.latest_run_id.is_none());
+    let thread_branch = thread.and_then(|thread| thread.branch.as_deref());
     let compact_actions = !density.is_full();
     let rows: Vec<AnyElement> = [
-        (is_repo && details.shows("branch") && item_visible_at_density("branch", density)).then(|| branch_rows(ctx, thread, cx)),
+        (is_repo && details.shows("branch") && item_visible_at_density("branch", density)).then(|| branch_rows(ctx, thread_branch, cx)),
         (details.shows("gitActions") && item_visible_at_density("gitActions", density)).then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, compact_actions, cx)).flatten(),
-        (details.shows("changes") && item_visible_at_density("changes", density)).then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
+        (is_repo && details.shows("changes") && item_visible_at_density("changes", density)).then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
     ]
     .into_iter()
     .flatten()

@@ -170,16 +170,29 @@ impl GitStore {
         Some((state.client_handle()?, state.runtime().clone()))
     }
 
-    /// `gitCwd`: the thread's worktree, else its project root.
+    /// `gitCwd`: the thread's worktree, else the thread or draft project root.
     fn resolve_target(state: &AppState) -> Option<Target> {
-        let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
-        let project = state.shell.project(&thread.project_id)?;
+        if let Some(thread) = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)) {
+            let project = state.shell.project(&thread.project_id)?;
+            return Some(Target {
+                thread_id: thread.id.clone(),
+                cwd: thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
+                project_cwd: project.workspace_root.clone(),
+                worktree_path: thread.worktree_path.clone(),
+                branch: thread.branch.clone(),
+            });
+        }
+        let project_id = state.draft_project.as_deref()?;
+        let project = state.shell.project(project_id)?;
+        if state.is_scratch_project(project_id) || project.workspace_root.is_empty() {
+            return None;
+        }
         Some(Target {
-            thread_id: thread.id.clone(),
-            cwd: thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
+            thread_id: t3_core::composer::drafts::new_thread_key(project_id),
+            cwd: project.workspace_root.clone(),
             project_cwd: project.workspace_root.clone(),
-            worktree_path: thread.worktree_path.clone(),
-            branch: thread.branch.clone(),
+            worktree_path: None,
+            branch: None,
         })
     }
 

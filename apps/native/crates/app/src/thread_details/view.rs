@@ -21,10 +21,12 @@ use super::servers::ServersFeed;
 use super::usage::{context_available, context_window_section, limit_row_count, usage_limits_section};
 use super::{Details, DetailsEvent, Presentation, available_height, layout, panel_key, project_scripts};
 use crate::app_state::{AppEvent, AppState};
+use crate::composer::Composer;
 use crate::git::{BranchPicker, GitDialogs, GitEvent, GitStore};
 use crate::icons::Icon;
 use crate::terminal::TerminalDrawer;
 use crate::theme::{hsla, metrics, palette};
+use crate::thread_view::ThreadView;
 
 /// What the card shows from the shell; a shell update that leaves it alone skips the render.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,15 +76,24 @@ pub struct DetailsView {
     dialogs: Entity<GitDialogs>,
     picker: Entity<BranchPicker>,
     terminal: Entity<TerminalDrawer>,
+    composer: Entity<Composer>,
+    thread: Entity<ThreadView>,
     pub(super) servers: ServersFeed,
     pub(super) automations: AutomationsFeed,
     lineage_shown: usize,
     inputs: Option<Inputs>,
+    find_open: bool,
+    draft_provider: Option<String>,
     focus: FocusHandle,
     popover_shown: bool,
     row_menu_claim: Rc<Cell<bool>>,
     _usage_tick: Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+pub(crate) struct DetailsViewPeers {
+    pub(crate) composer: Entity<Composer>,
+    pub(crate) thread: Entity<ThreadView>,
 }
 
 impl DetailsView {
@@ -91,11 +102,15 @@ impl DetailsView {
         details: Entity<Details>,
         dialogs: Entity<GitDialogs>,
         terminal: Entity<TerminalDrawer>,
+        peers: DetailsViewPeers,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let DetailsViewPeers { composer, thread } = peers;
         let git = details.read(cx).git.clone();
         let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
+        let find_open = state.read(cx).selected_thread.is_some() && thread.read(cx).is_find_open();
+        let draft_provider = composer.read(cx).resolved_provider_instance(cx);
         let subscriptions = vec![
             cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {
                 AppEvent::Selection => {
@@ -103,6 +118,7 @@ impl DetailsView {
                     this.servers.reset_pagination();
                     this.picker.update(cx, |picker, cx| picker.close(cx));
                     this.inputs = inputs(state.read(cx));
+                    this.find_open = state.read(cx).selected_thread.is_some() && this.thread.read(cx).is_find_open();
                     cx.notify();
                 }
                 // Lineage reads the open thread's subagents and runs as well as the shell.
@@ -118,6 +134,23 @@ impl DetailsView {
             }),
             cx.subscribe(&details, |_, _, _: &DetailsEvent, cx| cx.notify()),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.observe(&thread, |this, thread, cx| {
+                let open = this.state.read(cx).selected_thread.is_some() && thread.read(cx).is_find_open();
+                if open != this.find_open {
+                    this.find_open = open;
+                    cx.notify();
+                }
+            }),
+            cx.observe(&composer, |this, composer, cx| {
+                if this.state.read(cx).selected_thread.is_some() {
+                    return;
+                }
+                let next = composer.read(cx).resolved_provider_instance(cx);
+                if next != this.draft_provider {
+                    this.draft_provider = next;
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&git, |_, git, _: &GitEvent, cx| {
                 git.update(cx, |git, _| git.settle_optimistic_branch());
                 cx.notify();
@@ -149,10 +182,14 @@ impl DetailsView {
             dialogs,
             picker,
             terminal,
+            composer,
+            thread,
             servers: ServersFeed::new(),
             automations: AutomationsFeed::new(),
             lineage_shown: sections::LINEAGE_INITIAL,
             inputs: initial,
+            find_open,
+            draft_provider,
             focus: cx.focus_handle(),
             popover_shown: false,
             row_menu_claim: Rc::default(),
@@ -217,13 +254,26 @@ impl Render for DetailsView {
         }
 
         let thread_id = active_thread.as_deref();
-        let has_thread = thread_id.is_some();
+        let find_open = self.state.read(cx).selected_thread.is_some() && self.thread.read(cx).is_find_open();
+        let top_inset = if find_open && !popover { 36. + super::CARD_GAP } else { 0. };
+        let draft_provider = self.composer.read(cx).resolved_provider_instance(cx);
+        self.find_open = find_open;
+        self.draft_provider = draft_provider.clone();
         let terminal_height = self.terminal.read(cx).visible_height(f32::from(window.viewport_size().height), cx);
         let density_inputs = {
             let details = self.details.read(cx);
             let app = self.state.read(cx);
             let git = self.git.read(cx);
-            let is_repo = has_thread && git.status.as_ref().is_none_or(|status| status.local.is_repo);
+            let project_id = app
+                .selected_thread
+                .as_deref()
+                .and_then(|id| app.thread_shell(id))
+                .map(|t| t.project_id.as_str())
+                .or(app.draft_project.as_deref());
+            let has_git_cwd = project_id.and_then(|id| app.shell.project(id).map(|p| (id, p))).is_some_and(|(id, p)| {
+                !app.is_scratch_project(id) && !p.workspace_root.is_empty()
+            });
+            let is_repo = has_git_cwd && git.status.as_ref().is_none_or(|status| status.local.is_repo);
             let has_scripts = project_scripts(app).is_some_and(|(_, s)| !s.is_empty());
             let rel = self.inputs.as_ref().map(|i| &i.lineage);
             DensityInputs {
@@ -232,17 +282,17 @@ impl Render for DetailsView {
                 scripts: details.shows("scripts") && has_scripts,
                 branch: details.shows("branch") && is_repo,
                 pr_row: false,
-                git_actions: details.shows("gitActions") && is_repo,
+                git_actions: details.shows("gitActions") && has_git_cwd,
                 changes: details.shows("changes") && is_repo,
                 servers_rows: if show_servers { thread_id.map_or(0, |id| self.servers.count_for(id)) } else { 0 },
                 automations_rows: if show_automations { thread_id.map_or(0, |id| self.automations.count_for(id)) } else { 0 },
                 lineage_rows: if details.shows("lineage") { rel.map_or(0, |r| r.lineage.len()) } else { 0 },
                 side_chats_rows: if details.shows("sideChats") { rel.map_or(0, |r| r.side_chats.len()) } else { 0 },
-                usage_rows: if show_usage { limit_row_count(app) } else { 0 },
+                usage_rows: if show_usage { limit_row_count(app, draft_provider.as_deref()) } else { 0 },
                 context: show_context && context_available(app),
             }
         };
-        let density = resolve_card_density(available_height(window, terminal_height), &density_inputs);
+        let density = resolve_card_density(available_height(window, terminal_height, top_inset), &density_inputs);
 
         let p = palette(cx);
         let ctx = self.ctx();
@@ -269,7 +319,7 @@ impl Render for DetailsView {
         let side_chats = sections::side_chats(&ctx, &relationships, any_above && density.is_full(), density, cx);
         any_above |= side_chats.is_some();
         let usage_limits = (show_usage && item_visible_at_density("usage", density))
-            .then(|| usage_limits_section(self.state.read(cx), any_above && density.is_full(), density.is_essential(), cx))
+            .then(|| usage_limits_section(self.state.read(cx), draft_provider.as_deref(), any_above && density.is_full(), density.is_essential(), cx))
             .flatten();
         any_above |= usage_limits.is_some();
         let context_window = (show_context && item_visible_at_density("context", density))
@@ -315,7 +365,7 @@ impl Render for DetailsView {
                 this.occlude()
                     .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
                     .on_mouse_down_out(cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                        if !super::point_in_find_bar(event.position, this.state.read(cx), window) {
+                        if !super::point_in_find_bar(this.find_open, event.position, this.state.read(cx), window) {
                             this.close_popover(cx);
                         }
                     }))
@@ -323,7 +373,7 @@ impl Render for DetailsView {
             .child(div().id("thread-details-scroll").relative().min_h_0().overflow_y_scroll().child(content))
             .context_menu(move |menu, _, cx| if claim.replace(false) { menu } else { items_menu(menu, &details, cx) });
         // Anchored top and bottom so the card never grows past the canvas (or under the drawer).
-        let top = if popover { 4. } else { super::CARD_GAP };
+        let top = if popover { 4. } else { super::CARD_GAP + top_inset };
         div()
             .id("thread-details")
             .absolute()
