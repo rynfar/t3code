@@ -1,6 +1,10 @@
-//! Window root: titlebar strip, sidebar, and the thread area, or the connect screen.
+//! Window root: titlebar strip, sidebar, and the thread area, or the connect screen. The sidebar
+//! resize rail and narrow-window sheet port `components/AppSidebarLayout.tsx` and `SidebarRail`
+//! in `components/ui/sidebar.tsx`.
 
-use gpui::{ Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window, WindowControlArea, div, prelude::*, px};
+use std::time::Duration;
+
+use gpui::{ ClickEvent, Context, DragMoveEvent, EmptyView, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
 
@@ -26,9 +30,18 @@ use crate::terminal::{self, TerminalDrawer, ToggleTerminal};
 use crate::theme::{hsla, palette};
 use crate::thread_details::{self, DetailsEvent, DetailsView};
 use crate::thread_view::ThreadView;
+use t3_core::sidebar::layout;
 
 pub const TITLEBAR_HEIGHT: f32 = 52.;
-pub const SIDEBAR_WIDTH: f32 = 256.;
+/// Native has no wordmark probe; its sidebar header fits inside `layout::MIN_WIDTH`.
+const BRAND_WIDTH: f32 = 0.;
+
+/// The row width the left sidebar occupies: zero while collapsed or shown as a sheet.
+pub fn sidebar_inline_width(state: &AppState, viewport_width: f32) -> f32 {
+    layout::inline_width(state.sidebar_width, state.sidebar.collapsed, viewport_width, BRAND_WIDTH)
+}
+
+struct SidebarResize;
 
 pub struct Workspace {
     state: Entity<AppState>,
@@ -58,6 +71,10 @@ pub struct Workspace {
     link_dialog: Entity<LinkPullRequestDialog>,
     device_setup: Entity<crate::device::DeviceSetupDialog>,
     ssh_prompt: Entity<crate::ssh_prompt::SshPromptDialog>,
+    /// The narrow-window sheet, kept apart from the docked `collapsed` state as the web's
+    /// `openMobile` is.
+    sheet_open: bool,
+    _save_sidebar_width: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -93,7 +110,11 @@ impl Workspace {
         let star_root = focus_observer.read(cx).root.clone();
         let star_focus = cx.new(|cx| crate::github_star_prompt::FocusObserver::new(state.clone(), &star_root, window, cx));
         let subscriptions = vec![
-            cx.subscribe(&state, |_, _, event: &AppEvent, cx| {
+            cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+                // Navigating from the sheet closes it, as the web's thread and project rows do.
+                if matches!(event, AppEvent::Selection) {
+                    this.sheet_open = false;
+                }
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel) {
                     cx.notify();
                 }
@@ -143,6 +164,8 @@ impl Workspace {
             link_dialog,
             device_setup,
             ssh_prompt,
+            sheet_open: false,
+            _save_sidebar_width: None,
             _subscriptions: subscriptions,
         }
     }
@@ -189,7 +212,7 @@ impl Workspace {
         let state = self.state.read(cx);
         let terminal_toggle = state.selected_thread.is_some().then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
         let theme = cx.theme();
-        let collapsed = state.sidebar.collapsed;
+        let collapsed = sidebar_inline_width(state, f32::from(window.viewport_size().width)) == 0.;
         h_flex()
             .window_control_area(WindowControlArea::Drag)
             .h(px(TITLEBAR_HEIGHT))
@@ -231,7 +254,9 @@ impl Render for Workspace {
         let state = self.state.read(cx);
         let has_thread = state.selected_thread.is_some();
         let has_draft = !has_thread && state.draft_project.is_some();
-        let collapsed = state.sidebar.collapsed;
+        let viewport = f32::from(window.viewport_size().width);
+        let sidebar_width = sidebar_inline_width(state, viewport);
+        let sheet = (layout::is_sheet(viewport) && self.sheet_open).then(|| layout::sheet_width(viewport));
         let running = state.is_selected_thread_running();
         let panel = state.selected_thread.as_deref().map(|thread| state.panels.panels.panel(thread));
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
@@ -260,7 +285,7 @@ impl Render for Workspace {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
             }))
             .key_context(keymap::root_context(right_panel_open, running))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar(cx))))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .on_action(cx.listener(|this, _: &PreviousThread, _, cx| this.traverse(false, cx)))
             .on_action(cx.listener(|this, _: &NextThread, _, cx| this.traverse(true, cx)))
             .on_action(cx.listener(|this, _: &SettleThread, _, cx| this.settle_selected(cx)))
@@ -307,6 +332,10 @@ impl Render for Workspace {
                         || this.welcome.read(cx).is_open();
                     if this.sidebar.update(cx, |sidebar, cx| sidebar.handle_escape(overlay_open, window, cx)) {
                         cx.stop_propagation();
+                    } else if this.sheet_open && !overlay_open {
+                        this.sheet_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
                     }
                 }
             }))
@@ -328,10 +357,10 @@ impl Render for Workspace {
             .on_action(move |action: &crate::worktree_setup::OpenSetupTerminal, window, cx| {
                 drawer.update(cx, |drawer, cx| drawer.open_terminal(&action.terminal_id, window, cx))
             })
-            .when(!collapsed, |this| {
+            .when(sidebar_width > 0., |this| {
                 this.child(
                     div()
-                        .w(px(SIDEBAR_WIDTH))
+                        .w(px(sidebar_width))
                         .h_full()
                         .flex_none()
                         .bg(theme.sidebar)
@@ -369,6 +398,8 @@ impl Render for Workspace {
                 )
             })
             .when(!on_pull_requests, |this| this.child(self.right_panel.clone()))
+            .when(sidebar_width > 0., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
+            .when_some(sheet, |this, width| this.child(self.render_sidebar_sheet(width, cx)))
             .child(self.render_sidebar_toggle(cx))
             .children(crate::transcript::html_render::fullscreen(window, cx))
             .child(self.prompt_links.clone())
@@ -393,6 +424,100 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// `mod+b` and the toggle: the sheet below the breakpoint, the docked sidebar above it.
+    fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if layout::is_sheet(f32::from(window.viewport_size().width)) {
+            self.sheet_open = !self.sheet_open;
+            cx.notify();
+        } else {
+            self.state.update(cx, |state, cx| state.toggle_sidebar(cx));
+        }
+    }
+
+    fn resize_sidebar(&mut self, event: &DragMoveEvent<SidebarResize>, window: &mut Window, cx: &mut Context<Self>) {
+        let viewport = f32::from(window.viewport_size().width);
+        let current = sidebar_inline_width(self.state.read(cx), viewport);
+        let width = layout::drag_width(current, f32::from(event.event.position.x), viewport, BRAND_WIDTH);
+        if width == current {
+            return;
+        }
+        self.state.update(cx, |state, _| state.set_sidebar_width(width, false));
+        cx.notify();
+        // Persist once the drag settles, not on every frame of it.
+        self._save_sidebar_width = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            let _ = this.update(cx, |this, cx| this.state.update(cx, |state, _| state.set_sidebar_width(width, true)));
+        }));
+    }
+
+    /// `SidebarRail`: a 16px hit target centred on the sidebar's right edge, above the thread so
+    /// its outer half still takes the pointer. Double-click forgets the stored width.
+    fn render_sidebar_rail(&self, sidebar_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = hsla(palette(cx).sidebar_border);
+        div()
+            .id("sidebar-rail")
+            .group("sidebar-rail")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(sidebar_width - layout::RAIL_WIDTH / 2.))
+            .w(px(layout::RAIL_WIDTH))
+            .cursor_ew_resize()
+            .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Drag to resize sidebar").build(window, cx))
+            .on_drag(SidebarResize, |_, _, _, cx| cx.new(|_| EmptyView))
+            .on_drag_move(cx.listener(Self::resize_sidebar))
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.click_count() >= 2 {
+                    this._save_sidebar_width = None;
+                    this.state.update(cx, |state, _| state.reset_sidebar_width());
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(layout::RAIL_WIDTH / 2. - 1.))
+                    .w(px(2.))
+                    .group_hover("sidebar-rail", move |this| this.bg(border))
+                    .drag_over::<SidebarResize>(move |this, _, _, _| this.bg(border)),
+            )
+    }
+
+    /// Below the breakpoint the sidebar is a sheet over a dimmed backdrop that dismisses it.
+    fn render_sidebar_sheet(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        div()
+            .id("sidebar-sheet")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .child(
+                div()
+                    .id("sidebar-sheet-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(hsla(p.background).opacity(0.6))
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.sheet_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(width))
+                    .bg(hsla(p.sidebar))
+                    .border_r_1()
+                    .border_color(hsla(p.sidebar_edge))
+                    .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
+            )
+    }
+
     /// The workspace control at x = 91 (design-system §5), present whether or not the sidebar shows.
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
@@ -411,7 +536,7 @@ impl Workspace {
             .hover(|this| this.bg(hsla(p.sidebar_accent)))
             .child(Icon::PanelLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
             .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
-            .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar(cx))))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
     }
 
     fn traverse(&mut self, next: bool, cx: &mut Context<Self>) {

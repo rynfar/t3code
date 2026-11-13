@@ -26,7 +26,7 @@ use crate::icons::Icon;
 use crate::diff::DiffPanel;
 use crate::files::FilesPanel;
 use crate::theme::{hsla, palette};
-use crate::workspace::SIDEBAR_WIDTH;
+use crate::workspace::sidebar_inline_width;
 
 actions!(right_panel, [ToggleRightPanel, ToggleDiff, CloseActiveSurface, ReopenClosedView, ToggleMaximized]);
 
@@ -95,7 +95,7 @@ impl RightPanelView {
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = f32::from(window.viewport_size().width);
-        let row = viewport - sidebar_width(self.state.read(cx));
+        let row = viewport - sidebar_inline_width(self.state.read(cx), viewport);
         let width = clamp_width(f32::from(event.bounds.right() - event.event.position.x), viewport, row);
         self.state.update(cx, |state, cx| state.set_right_panel_width(width, false, cx));
         // Persist once the drag settles, not on every frame of it.
@@ -217,10 +217,10 @@ impl Render for RightPanelView {
         }
         let viewport = f32::from(window.viewport_size().width);
         let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
-        let width = clamp_width(stored, viewport, viewport - sidebar_width(state));
+        let width = clamp_width(stored, viewport, viewport - sidebar_inline_width(state, viewport));
         // Maximized beside a hidden sidebar, the tab bar clears the traffic lights and the
         // sidebar toggle as the thread header does (design-system §5).
-        let titlebar_inset = panel.maximized && state.sidebar.collapsed;
+        let titlebar_inset = panel.maximized && sidebar_inline_width(state, viewport) == 0.;
         let p = palette(cx);
         let content = match panel.active().map(|surface| &surface.kind) {
             // Cached: transcript streaming redraws the window, but only diff changes repaint it.
@@ -259,10 +259,6 @@ impl Render for RightPanelView {
             .child(div().flex_1().min_h_0().flex().flex_col().child(content))
             .into_any_element()
     }
-}
-
-fn sidebar_width(state: &AppState) -> f32 {
-    if state.sidebar.collapsed { 0. } else { SIDEBAR_WIDTH }
 }
 
 /// The window's top-right controls (`PanelLayoutControls.tsx` right panel toggle and

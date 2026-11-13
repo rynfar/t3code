@@ -87,6 +87,8 @@ pub struct AppState {
     pending_scoped_route: Option<ScopedRoute>,
     _fleet_pump: Option<Task<()>>,
     pub sidebar: SidebarController,
+    /// The left sidebar's preferred width; views clamp it to the window (`sidebar::layout`).
+    pub sidebar_width: f32,
     pub(crate) open_history: t3_core::sidebar::visits::OpenHistory,
     pub prompt_link_urls: VecDeque<String>,
     pub toasts: crate::toast::Toasts,
@@ -198,6 +200,7 @@ impl AppState {
             pending_scoped_route: None,
             _fleet_pump: Some(fleet_pump),
             sidebar: SidebarController::default(),
+            sidebar_width: t3_core::sidebar::layout::preferred_width(store::load_ui_state(t3_core::sidebar::layout::STORAGE_KEY).and_then(|value| value.as_f64()).map(|width| width as f32)),
             open_history: Default::default(),
             prompt_link_urls: Default::default(),
             toasts: Default::default(),
@@ -1027,6 +1030,22 @@ fn pending_drop_matches(
     thread_id: &str,
 ) -> bool {
     key.thread_id == thread_id && (key.environment_id.is_empty() || active_env == Some(key.environment_id.as_str()))
+}
+
+impl AppState {
+    /// A sidebar drag step; `persist` once the drag settles, as the web writes on pointer up.
+    pub fn set_sidebar_width(&mut self, width: f32, persist: bool) {
+        self.sidebar_width = width;
+        if persist {
+            store::save_ui_state(t3_core::sidebar::layout::STORAGE_KEY, &width);
+        }
+    }
+
+    /// Rail double-click: forget the stored width and return to the default.
+    pub fn reset_sidebar_width(&mut self) {
+        self.sidebar_width = t3_core::sidebar::layout::preferred_width(None);
+        store::save_ui_state(t3_core::sidebar::layout::STORAGE_KEY, &Value::Null);
+    }
 }
 
 #[cfg(all(test, feature = "snapshot"))]
