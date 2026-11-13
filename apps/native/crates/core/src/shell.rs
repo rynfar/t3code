@@ -214,8 +214,8 @@ pub struct ThreadShell {
     pub pin_order_key: Option<String>,
     #[serde(default)]
     pub active_order_key: Option<String>,
-    #[serde(default)]
-    pub last_visited_at: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub last_visited_at: Option<Option<String>>,
     pub deleted_at: Option<String>,
     /// Linked pull requests; links that do not decode are dropped.
     #[serde(default, deserialize_with = "crate::pull_requests::link::thread_links", skip_serializing)]
@@ -223,6 +223,13 @@ pub struct ThreadShell {
 }
 
 impl ThreadShell {
+    pub fn visited_at_iso(&self) -> Option<&str> {
+        self.last_visited_at.as_ref().and_then(|value| value.as_deref())
+    }
+
+    pub fn tracks_visits(&self) -> bool {
+        self.last_visited_at.is_some()
+    }
     pub fn is_live(&self) -> bool {
         self.activity_run_status.as_ref().is_some_and(Option::is_some)
             || matches!(self.status.as_str(), "queued" | "preparing" | "starting" | "running" | "waiting")

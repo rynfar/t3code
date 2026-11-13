@@ -98,6 +98,9 @@ pub struct AppState {
     pub composer_mentions: Vec<crate::project_files::ComposerMention>,
     pub selected_thread: Option<String>,
     pub thread: ThreadState,
+    /// Serializes projection checkout/merge across `fetch_history_page`, `load_earlier_through`,
+    /// and parallel `load_deferred_work` tasks so sibling anchors do not collide on `projection.take()`.
+    pub(crate) history_merge_lock: Arc<futures::lock::Mutex<()>>,
     pub last_error: Option<String>,
     pub server_config: ServerConfigState,
     pub client_settings: ClientSettings,
@@ -211,6 +214,7 @@ impl AppState {
             composer_mentions: Vec::new(),
             selected_thread: None,
             thread: ThreadState::default(),
+            history_merge_lock: Arc::new(futures::lock::Mutex::new(())),
             last_error: None,
             server_config: ServerConfigState::default(),
             client_settings: settings,
@@ -495,7 +499,7 @@ impl AppState {
     }
 
     pub(crate) fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
-        let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut config_changed) = (false, false, false, false);
+        let (mut shell_changed, mut sidebar_changed, mut thread_changed, mut error_changed, mut config_changed) = (false, false, false, false, false);
         // A resubscribed shell is live again at its completion marker, even with nothing new.
         let mut resynchronized = false;
         let mut side_changed = false;
@@ -504,6 +508,7 @@ impl AppState {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => { if let Some(id) = self.environments.active.clone() { self.environment_credentials_rejected(&id, reason, cx); } },
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
                 ClientEvent::Shell(item) => {
+                    error_changed |= self.clear_stream_error("shell");
                     resynchronized |= matches!(item, ShellStreamItem::Synchronized);
                     let quiet = crate::sidebar::controller::is_streaming_tick(&self.shell, &item);
                     if self.shell.apply(item) {
@@ -512,15 +517,20 @@ impl AppState {
                     }
                 }
                 ClientEvent::Thread { thread_id, item } => {
+                    error_changed |= self.clear_stream_error(&format!("thread {thread_id}"));
                     if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
                         thread_changed |= self.thread.apply(*item);
                     } else {
                         side_changed |= self.apply_side_thread(&thread_id, *item);
                     }
                 }
-                ClientEvent::ServerConfig(event) => config_changed |= self.server_config.apply(*event),
+                ClientEvent::ServerConfig(event) => {
+                    error_changed |= self.clear_stream_error("server config");
+                    config_changed |= self.server_config.apply(*event);
+                }
                 ClientEvent::StreamError { context, message } => {
                     self.last_error = Some(format!("Could not read {context}: {message}"));
+                    error_changed = true;
                 }
                 ClientEvent::Moved { http_base } => { if let Some(id) = self.environments.active.clone() { self.environment_route_moved(&id, http_base, cx); } },
             }
@@ -534,7 +544,7 @@ impl AppState {
             if !self.hold_pending_thread_deletion() {
                 self.close_selected_thread(cx);
             }
-        } else if thread_changed {
+        } else if thread_changed || error_changed {
             cx.emit(AppEvent::Thread);
         }
         if shell_changed || resynchronized {
@@ -686,12 +696,14 @@ impl AppState {
     /// Fetches and decodes on the network runtime, merges on the background executor, and
     /// touches the UI thread only to check the projection out and swap the result back.
     fn fetch_history_page(&mut self, thread_id: String, cursor: String, client: ClientHandle, cx: &mut Context<Self>) {
+        let merge_lock = self.history_merge_lock.clone();
         let task = {
             let (client, thread_id, cursor) = (client.clone(), thread_id.clone(), cursor.clone());
             self.runtime.spawn(async move { client.history_page(&thread_id, &cursor).await })
         };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Could not load earlier activity.".into()));
+            let _merge_guard = merge_lock.lock().await;
             let started = this.update(cx, |state, cx| {
                 if state.selected_thread.as_deref() != Some(thread_id.as_str()) {
                     return None;
@@ -973,11 +985,99 @@ impl AppState {
         self.stop_thread(&thread_id, cx);
     }
 
-    /// `stop_selected_thread` for any thread, such as a side chat.
-    pub fn stop_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if let Some(command) = self.stop_command(thread_id) {
-            self.dispatch(command, cx);
+    fn clear_stream_error(&mut self, context: &str) -> bool {
+        let prefix = format!("Could not read {context}: ");
+        if self.last_error.as_deref().is_some_and(|err| err.starts_with(&prefix)) {
+            self.last_error = None;
+            true
+        } else {
+            false
         }
+    }
+
+    /// `stop_selected_thread` for any thread, such as a side chat. Awaits the stop dispatch (if
+    /// any) and then runs `reconcilePendingWork` (`threads.ts`) to settle any pending items the
+    /// server already ended outside the bounded window.
+    pub fn stop_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let stop_rpc = self.stop_command(thread_id).map(|command| self.rpc(method::DISPATCH_COMMAND, command));
+        let thread_id = thread_id.to_owned();
+        let connection = self.connection;
+        cx.spawn(async move |this, cx| {
+            if let Some(task) = stop_rpc
+                && let Err(error) = task.await
+            {
+                let _ = this.update(cx, |state, cx| {
+                    state.last_error = Some(error.to_string());
+                    cx.emit(AppEvent::Thread);
+                });
+            }
+            let Some((client, runtime, pending_ids)) = this
+                .update(cx, |state, _| {
+                    if state.connection != connection {
+                        return None;
+                    }
+                    let client = state.client.clone()?;
+                    let thread = state.thread_state(&thread_id);
+                    if thread.deleted {
+                        return None;
+                    }
+                    let projection = thread.projection.as_ref()?;
+                    let ids = t3_core::thread::pending_background_turn_item_ids(projection);
+                    if ids.is_empty() {
+                        return None;
+                    }
+                    Some((client, state.runtime.clone(), ids))
+                })
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+
+            let fetch_thread = thread_id.clone();
+            let settled = runtime
+                .spawn(async move {
+                    let permits = Arc::new(tokio::sync::Semaphore::new(4));
+                    let fetches = pending_ids.into_iter().map(|item_id| {
+                        let permits = permits.clone();
+                        let client = client.clone();
+                        let thread_id = fetch_thread.clone();
+                        async move {
+                            let Ok(_permit) = permits.acquire().await else { return None };
+                            let request = client.request(
+                                t3_core::timeline::GET_TURN_ITEM,
+                                serde_json::json!({ "threadId": thread_id, "itemId": item_id }),
+                            );
+                            let value = tokio::time::timeout(std::time::Duration::from_secs(10), request).await.ok()?.ok()?;
+                            let item = t3_core::timeline::decode_detail(value).ok()??;
+                            (!t3_core::thread::is_work_active(&item.status)).then(|| (item_id, Arc::new(item)))
+                        }
+                    });
+                    let items: std::collections::HashMap<String, Arc<t3_core::turn_item::TurnItem>> =
+                        futures::future::join_all(fetches).await.into_iter().flatten().collect();
+                    items
+                })
+                .await
+                .unwrap_or_default();
+
+            if settled.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if state.connection != connection {
+                    return;
+                }
+                let is_selected = state.selected_thread.as_deref() == Some(thread_id.as_str());
+                let Some(thread) = state.thread_state_mut(&thread_id) else { return };
+                if thread.deleted {
+                    return;
+                }
+                if thread.settle_turn_items(&thread_id, &settled) {
+                    cx.emit(if is_selected { AppEvent::Thread } else { AppEvent::SideThread });
+                }
+            });
+        })
+        .detach();
     }
 
     /// What `interruptThreadTurn` sends to stop `thread_id`; a thread whose detail is not loaded
@@ -1008,19 +1108,6 @@ impl AppState {
     /// The connected server's address, `None` while unpaired.
     pub fn environment(&self) -> Option<&str> {
         self.client.as_ref().map(ClientHandle::environment)
-    }
-
-    fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        let task = self.rpc(method::DISPATCH_COMMAND, command);
-        cx.spawn(async move |this, cx| {
-            if let Err(error) = task.await {
-                let _ = this.update(cx, |state, cx| {
-                    state.last_error = Some(error.to_string());
-                    cx.emit(AppEvent::Thread);
-                });
-            }
-        })
-        .detach();
     }
 }
 
@@ -1081,3 +1168,196 @@ impl AppState {
 #[cfg(all(test, feature = "snapshot"))]
 #[path = "scoped_route_tests.rs"]
 mod scoped_route_tests;
+
+#[cfg(all(test, feature = "snapshot"))]
+mod stream_and_stop_tests {
+    use super::*;
+    use t3_client::supervisor::{ClientEvent, ClientFixture, ConnectionStatus};
+    use t3_core::commands::method;
+
+    #[gpui::test]
+    async fn stream_error_emits_thread_update_and_recovers_on_next_thread_item(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let emits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let emits_log = emits.clone();
+        let _sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |_, _, event, _| {
+                if matches!(event, AppEvent::Thread) {
+                    emits_log.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        });
+
+        state.update(cx, |state, cx| {
+            state.select_thread("t1", cx);
+        });
+        let before = emits.load(std::sync::atomic::Ordering::SeqCst);
+
+        state.update(cx, |state, cx| {
+            state.apply_batch(
+                vec![ClientEvent::StreamError {
+                    context: "thread t1".into(),
+                    message: "stream boom".into(),
+                }],
+                cx,
+            );
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.last_error.as_deref(), Some("Could not read thread t1: stream boom"));
+        });
+        assert!(emits.load(std::sync::atomic::Ordering::SeqCst) > before, "StreamError must emit AppEvent::Thread");
+
+        let before_recovery = emits.load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+            "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+            "projection": {
+                "thread": {
+                    "id": "t1", "projectId": "checkout-a", "title": "T1",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"}
+                },
+                "runs": [], "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                "visibleTurnItems": [], "updatedAt": "2026-04-01T00:00:05.000Z"
+            }
+        }"#).unwrap();
+        state.update(cx, |state, cx| {
+            state.apply_batch(
+                vec![ClientEvent::Thread { thread_id: "t1".into(), item: Box::new(snapshot) }],
+                cx,
+            );
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.last_error, None, "valid thread item must clear thread stream error");
+        });
+        assert!(emits.load(std::sync::atomic::Ordering::SeqCst) > before_recovery);
+    }
+
+    #[gpui::test]
+    async fn stop_thread_queries_get_turn_item_and_settles_stale_background_work(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, mut requests) = ClientFixture::handle(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            })).unwrap(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell;
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+            })).unwrap()];
+            state.install_active_environment(client, shell, state.server_config.clone(), ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+                "projection": {
+                    "thread": {
+                        "id": "t1", "projectId": "checkout-a", "title": "T1",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "completed",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": null,
+                        "completedAt": "2026-04-01T00:00:02.000Z"
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                    "messages": [], "plans": [],
+                    "turnItems": [{
+                        "id": "cmd-1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                        "ordinal": 2, "type": "command_execution", "status": "running", "title": null,
+                        "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                        "input": "sleep 5", "output": ""
+                    }],
+                    "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [{
+                        "position": 0, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "cmd-1",
+                        "item": {
+                            "id": "cmd-1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                            "ordinal": 2, "type": "command_execution", "status": "running", "title": null,
+                            "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                            "input": "sleep 5", "output": ""
+                        }
+                    }],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let settled_tx = Arc::new(std::sync::Mutex::new(Some(settled_tx)));
+        let _sub = state.update(cx, |_, cx| {
+            let settled_tx = settled_tx.clone();
+            cx.subscribe(&state, move |state, _, event, _| {
+                if matches!(event, AppEvent::Thread)
+                    && state.thread.projection.as_ref().is_some_and(|p| p.turn_items[0].status == "interrupted")
+                {
+                    if let Some(tx) = settled_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+        });
+
+        let responder = runtime.spawn(async move {
+            let (stop_method, stop_payload, stop_reply) = loop {
+                let req = requests.next_request().await;
+                if req.0 == method::DISPATCH_COMMAND && req.1["type"] == "thread.visit" {
+                    let _ = req.2.send(Ok(serde_json::json!({"sequence": 1})));
+                    continue;
+                }
+                break req;
+            };
+            assert_eq!(stop_method, method::DISPATCH_COMMAND);
+            assert_ne!(stop_payload["type"], "thread.visit");
+            let _ = stop_reply.send(Ok(serde_json::json!({})));
+
+            let (item_method, item_payload, item_reply) = requests.next_request().await;
+            assert_eq!(item_method, t3_core::timeline::GET_TURN_ITEM);
+            assert_eq!(item_payload["threadId"], "t1");
+            assert_eq!(item_payload["itemId"], "cmd-1");
+            let _ = item_reply.send(Ok(serde_json::json!({
+                "item": {
+                    "id": "cmd-1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                    "ordinal": 2, "type": "command_execution", "status": "interrupted", "title": null,
+                    "startedAt": null, "completedAt": "2026-04-01T00:00:06.000Z",
+                    "updatedAt": "2026-04-01T00:00:06.000Z", "input": "sleep 5", "output": ""
+                }
+            })));
+        });
+
+        state.update(cx, |state, cx| {
+            state.stop_thread("t1", cx);
+        });
+
+        responder.await.unwrap();
+        settled_rx.await.unwrap();
+        state.read_with(cx, |state, _| {
+            let p = state.thread.projection.as_ref().unwrap();
+            assert_eq!(p.turn_items[0].status, "interrupted");
+            assert_eq!(p.visible_turn_items[0].item.status, "interrupted");
+        });
+    }
+}

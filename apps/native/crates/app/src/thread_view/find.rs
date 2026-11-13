@@ -297,7 +297,9 @@ impl ThreadView {
             if let Some(index) = self.rows.iter().position(|row| row_holds(row, entry_id)) {
                 let row = self.rows[index].clone();
                 if let RowKind::WorkToggle { group_id, .. } = &row.kind {
-                    self.ui.expanded_groups.insert(group_id.clone());
+                    if self.ui.expanded_groups.insert(group_id.clone()) {
+                        self.load_work_for_group(group_id, cx);
+                    }
                     self.rederive(cx);
                     continue;
                 }
@@ -313,8 +315,20 @@ impl ThreadView {
             }
             let (runs, attempts) = fold_membership(self.entries_cache.entries(), &self.activity);
             let opened = match (runs.get(entry_id), attempts.get(entry_id)) {
-                (Some(run), _) => self.ui.expanded_runs.insert(run.clone()),
-                (None, Some(attempt)) => self.ui.expanded_attempts.insert(attempt.clone()),
+                (Some(run), _) => {
+                    let newly_opened = self.ui.expanded_runs.insert(run.clone());
+                    if newly_opened {
+                        self.load_work_for_run(run, cx);
+                    }
+                    newly_opened
+                }
+                (None, Some(attempt)) => {
+                    let newly_opened = self.ui.expanded_attempts.insert(attempt.clone());
+                    if newly_opened {
+                        self.load_work_for_attempt(attempt, cx);
+                    }
+                    newly_opened
+                }
                 (None, None) => false,
             };
             if !opened {
@@ -326,7 +340,7 @@ impl ThreadView {
             && let Some(find) = self.find.as_mut()
         {
             find.pending_reveal = Some(entry_id.to_owned());
-            self.load_earlier(cx);
+            self.load_earlier_through(entry_id.to_owned(), cx);
         }
     }
 

@@ -213,7 +213,7 @@ pub fn present_thread(thread: &ThreadShell, pending_subagent_request: Option<Sub
         pin_order_key: thread.pin_order_key.clone(),
         active_order_key: thread.active_order_key.clone(),
         auto_settle_disabled: thread.auto_settle_disabled_at.is_some(),
-        last_visited_at: parse_opt(thread.last_visited_at.as_deref()),
+        last_visited_at: parse_opt(thread.visited_at_iso()),
         regenerating_title: thread.title_regeneration.as_ref().is_some_and(|value| !value.is_null()),
         opens: thread.opens.clone().and_then(|opens| serde_json::from_value(opens).ok()),
         provider_instance_id: thread.provider_instance_id.clone(),

@@ -179,3 +179,124 @@ fn media_mutation_id_uses_visible_items_and_last_app_checkpoint() {
     thread.visible_turn_items = visible;
     assert_eq!(crate::media::workspace_mutation_id(&thread), Some(json!(["visible-command", T]).to_string()));
 }
+
+#[test]
+fn turn_item_updated_preserves_existing_deferred_work() {
+    let mut item = assistant("i1", 1, Some("r1"), "initial");
+    item["deferredWork"] = serde_json::json!({ "cursor": "c1", "itemCount": 3, "lastOrdinal": 4 });
+    let mut proj = projection(vec![item], vec![run("r1", "running")]);
+    let updated = assistant("i1", 1, Some("r1"), "streamed");
+
+    let changed = apply_event(
+        &mut proj,
+        event("turn-item.updated", updated),
+        ApplyOptions::default(),
+    );
+    assert!(changed);
+    assert_eq!(
+        proj.visible_turn_items[0].item.deferred_work,
+        Some(crate::turn_item::DeferredWork {
+            cursor: "c1".into(),
+            item_count: 3,
+            last_ordinal: 4,
+        })
+    );
+}
+
+#[test]
+fn run_and_attempt_status_transitions_update_visibility_precisely() {
+    let mut queued = assistant("q1", 1, Some("r1"), "queued");
+    queued["type"] = serde_json::json!("user_message");
+    queued["inputIntent"] = serde_json::json!("queued_turn");
+    let kept = assistant("tool1", 2, Some("r1"), "ok");
+    let mut proj = projection(vec![queued, kept], vec![run("r1", "running")]);
+    assert_eq!(visible_ids(&proj), ["q1", "tool1"]);
+
+    // Non-hiding status update keeps everything visible.
+    apply_event(&mut proj, event("run.updated", run("r1", "completed")), ApplyOptions::default());
+    assert_eq!(visible_ids(&proj), ["q1", "tool1"]);
+
+    // Cancelled hides queued user messages while keeping non-queued items; rolled_back hides all.
+    apply_event(&mut proj, event("run.updated", run("r1", "cancelled")), ApplyOptions::default());
+    assert_eq!(visible_ids(&proj), ["tool1"]);
+    apply_event(&mut proj, event("run.updated", run("r1", "rolled_back")), ApplyOptions::default());
+    assert!(visible_ids(&proj).is_empty());
+
+    // Superseded attempt hides its run_interrupt_result unless the run has a run_interrupt_request.
+    let mut interrupt_result = base_item("ir1", 1, Some("r2"));
+    interrupt_result["nodeId"] = serde_json::json!("node-1");
+    interrupt_result["type"] = serde_json::json!("run_interrupt_result");
+    interrupt_result["message"] = serde_json::json!("stopped");
+    let mut proj2 = projection(vec![interrupt_result], vec![run("r2", "running")]);
+    apply_event(
+        &mut proj2,
+        event("run-attempt.updated", serde_json::json!({ "id": "a1", "threadId": "t1", "runId": "r2", "rootNodeId": "node-1", "status": "running", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" })),
+        ApplyOptions::default(),
+    );
+    assert_eq!(visible_ids(&proj2), ["ir1"]);
+    apply_event(
+        &mut proj2,
+        event("run-attempt.updated", serde_json::json!({ "id": "a1", "threadId": "t1", "runId": "r2", "rootNodeId": "node-1", "status": "superseded", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" })),
+        ApplyOptions::default(),
+    );
+    assert!(visible_ids(&proj2).is_empty());
+}
+
+#[test]
+fn pending_background_turn_items_and_settle_only_active_local_items() {
+    let mut cmd_active = base_item("cmd-active", 1, Some("r1"));
+    cmd_active["type"] = serde_json::json!("command_execution");
+    cmd_active["status"] = serde_json::json!("running");
+    cmd_active["input"] = serde_json::json!("sleep 5");
+    cmd_active["output"] = serde_json::json!("");
+
+    let mut cmd_done = base_item("cmd-done", 2, Some("r1"));
+    cmd_done["type"] = serde_json::json!("command_execution");
+    cmd_done["status"] = serde_json::json!("completed");
+    cmd_done["input"] = serde_json::json!("pwd");
+    cmd_done["output"] = serde_json::json!("");
+
+    let mut persistent_tool = base_item("tool-persist", 3, Some("r1"));
+    persistent_tool["type"] = serde_json::json!("dynamic_tool");
+    persistent_tool["status"] = serde_json::json!("running");
+    persistent_tool["toolName"] = serde_json::json!("t3_watch");
+    persistent_tool["input"] = serde_json::json!({ "persistent": true });
+
+    let mut rolled = base_item("cmd-rolled", 4, Some("r-rolled"));
+    rolled["type"] = serde_json::json!("command_execution");
+    rolled["status"] = serde_json::json!("running");
+    rolled["input"] = serde_json::json!("ls");
+    rolled["output"] = serde_json::json!("");
+
+    let mut proj = projection(vec![cmd_active, cmd_done, persistent_tool, rolled], vec![run("r1", "completed"), run("r-rolled", "rolled_back")]);
+    // Push an inherited running row that must never be overwritten by local thread settlement.
+    let mut inherited_item: TurnItem = serde_json::from_value(assistant("inherited-1", 5, None, "working")).unwrap();
+    inherited_item.status = "running".into();
+    proj.visible_turn_items.push(ProjectedTurnItem {
+        position: 99,
+        visibility: Visibility::Inherited,
+        source_thread_id: "parent-thread".into(),
+        source_item_id: "inherited-1".into(),
+        item: Arc::new(inherited_item),
+    });
+
+    assert_eq!(pending_background_turn_item_ids(&proj), ["cmd-active"]);
+
+    let mut settled_cmd = (*proj.turn_items[0]).clone();
+    settled_cmd.status = "interrupted".into();
+    let mut settled_done = (*proj.turn_items[1]).clone();
+    settled_done.status = "failed".into();
+    let mut settled_inherited = (*proj.visible_turn_items.last().unwrap().item).clone();
+    settled_inherited.status = "completed".into();
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("cmd-active".into(), Arc::new(settled_cmd));
+    map.insert("cmd-done".into(), Arc::new(settled_done));
+    map.insert("inherited-1".into(), Arc::new(settled_inherited));
+
+    assert!(settle_turn_items("t1", &mut proj, &map));
+    assert_eq!(proj.turn_items[0].status, "interrupted");
+    assert_eq!(proj.visible_turn_items[0].item.status, "interrupted");
+    assert_eq!(proj.turn_items[1].status, "completed");
+    assert_eq!(proj.visible_turn_items.last().unwrap().item.status, "running");
+}

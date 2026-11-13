@@ -74,7 +74,25 @@ pub fn set_auto_settle(command_id: &str, thread_id: &str, enabled: bool) -> Valu
 }
 
 pub fn visit(command_id: &str, thread_id: &str, visited_at: Ms) -> Value {
-    json!({ "type": "thread.visit", "commandId": command_id, "threadId": thread_id, "visitedAt": format_iso(visited_at) })
+    visit_with(command_id, thread_id, visited_at, false, None)
+}
+
+pub fn visit_with(command_id: &str, thread_id: &str, visited_at: Ms, opened: bool, search_query: Option<&str>) -> Value {
+    let mut command = json!({
+        "type": "thread.visit",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "visitedAt": format_iso(visited_at),
+    });
+    if opened {
+        command["opened"] = Value::Bool(true);
+    }
+    if let Some(query) = search_query.filter(|query| !query.is_empty()) {
+        // Contracts cap `thread.visit.searchQuery` at 200 chars (`isMaxLength(200)`).
+        let clamped: String = query.chars().take(200).collect();
+        command["searchQuery"] = json!(clamped);
+    }
+    command
 }
 
 pub fn mark_unread(command_id: &str, thread_id: &str) -> Value {
@@ -770,5 +788,16 @@ mod tests {
         assert_eq!(resolve_rename("  ", "x"), RenameOutcome::Empty);
         assert_eq!(resolve_rename(" x ", "x"), RenameOutcome::Unchanged);
         assert_eq!(resolve_rename(" y ", "x"), RenameOutcome::Rename("y".into()));
+    }
+
+    #[test]
+    fn visit_with_encodes_opened_and_clamps_search_query() {
+        let long_query = "q".repeat(250);
+        let cmd = visit_with("c1", "t1", 1_700_000_000_000, true, Some(&long_query));
+        assert_eq!(cmd["opened"], true);
+        assert_eq!(cmd["searchQuery"].as_str().map(|s| s.chars().count()), Some(200));
+        let plain = visit("c2", "t1", 1_700_000_000_000);
+        assert!(plain.get("opened").is_none());
+        assert!(plain.get("searchQuery").is_none());
     }
 }

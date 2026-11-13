@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::history::ThreadHistoryMeta;
 use crate::model::ModelSelection;
 use crate::shell::Lineage;
-use crate::turn_item::TurnItem;
+use crate::turn_item::{TurnItem, TurnItemKind};
 use crate::wire;
 
 mod reduce;
@@ -173,6 +173,88 @@ pub struct ThreadProjection {
     #[serde(deserialize_with = "known_projected_items")]
     pub visible_turn_items: Vec<ProjectedTurnItem>,
     pub updated_at: String,
+}
+
+impl ThreadProjection {
+    /// Whether `entry_id` (a message, turn item, source item, or plan id) is already projected.
+    pub fn has_entry(&self, entry_id: &str) -> bool {
+        fn turn_item_matches(item: &TurnItem, entry_id: &str) -> bool {
+            item.id == entry_id
+                || matches!(
+                    &item.kind,
+                    TurnItemKind::UserMessage { message_id, .. }
+                        | TurnItemKind::AssistantMessage { message_id, .. }
+                        if message_id == entry_id
+                )
+        }
+        self.visible_turn_items.iter().any(|row| row.source_item_id == entry_id || turn_item_matches(&row.item, entry_id))
+            || self.turn_items.iter().any(|item| turn_item_matches(item, entry_id))
+            || self.messages.iter().any(|message| message.id == entry_id)
+            || self.plans.iter().any(|plan| plan.id == entry_id)
+    }
+}
+
+/// `isOrchestrationV2WorkActive`: work still open on the server or in flight locally.
+pub fn is_work_active(status: &str) -> bool {
+    matches!(status, "pending" | "running" | "waiting")
+}
+
+/// Whether `item` is active background work that Stop / `reconcilePendingWork` tracks.
+pub fn is_background_turn_item_pending(item: &TurnItem, rolled_back_runs: &[&str]) -> bool {
+    let background = match &item.kind {
+        TurnItemKind::CommandExecution { .. } | TurnItemKind::Subagent { .. } => true,
+        TurnItemKind::DynamicTool { input, .. } => input.get("persistent") != Some(&Value::Bool(true)),
+        _ => false,
+    };
+    background
+        && is_work_active(&item.status)
+        && item.run_id.as_deref().is_none_or(|run_id| !rolled_back_runs.contains(&run_id))
+}
+
+/// `pendingBackgroundTurnItems`: active non-rolled-back background items to check after Stop.
+pub fn pending_background_turn_item_ids(projection: &ThreadProjection) -> Vec<String> {
+    let rolled_back: Vec<&str> = projection
+        .runs
+        .iter()
+        .filter(|run| run.status == "rolled_back")
+        .map(|run| run.id.as_str())
+        .collect();
+    projection
+        .turn_items
+        .iter()
+        .filter(|item| is_background_turn_item_pending(item, &rolled_back))
+        .map(|item| item.id.clone())
+        .collect()
+}
+
+/// `settleTurnItems`: updates still-active local items with server-settled items from
+/// `orchestration.getTurnItem`; events applied meanwhile and inherited rows win.
+pub fn settle_turn_items(
+    thread_id: &str,
+    projection: &mut ThreadProjection,
+    settled: &std::collections::HashMap<String, Arc<TurnItem>>,
+) -> bool {
+    let mut changed = false;
+    for item in &mut projection.turn_items {
+        if let Some(server) = settled.get(&item.id)
+            && is_work_active(&item.status)
+        {
+            *item = server.clone();
+            changed = true;
+        }
+    }
+    for row in &mut projection.visible_turn_items {
+        if row.source_thread_id != thread_id {
+            continue;
+        }
+        if let Some(server) = settled.get(&row.source_item_id)
+            && is_work_active(&row.item.status)
+        {
+            row.item = server.clone();
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn known_turn_items<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Arc<TurnItem>>, D::Error> {
@@ -445,12 +527,14 @@ impl ThreadState {
             _ => None,
         };
         let changed = apply_event(projection, event, options);
-        if changed
-            && options.partial_timeline
-            && let Some(ordinal) = ordinal
-            && self.history.latest_local_turn_ordinal.is_none_or(|watermark| ordinal > watermark)
-        {
-            self.history.latest_local_turn_ordinal = Some(ordinal);
+        if changed {
+            if options.partial_timeline
+                && let Some(ordinal) = ordinal
+                && self.history.latest_local_turn_ordinal.is_none_or(|watermark| ordinal > watermark)
+            {
+                self.history.latest_local_turn_ordinal = Some(ordinal);
+            }
+            self.history.reconcile_pending_work(self.projection.as_ref());
         }
         changed
     }
@@ -460,6 +544,15 @@ impl ThreadState {
         for event in pending {
             self.apply_live_event(event);
         }
+    }
+
+    pub fn settle_turn_items(&mut self, thread_id: &str, settled: &std::collections::HashMap<String, Arc<TurnItem>>) -> bool {
+        let Some(projection) = self.projection.as_mut() else { return false };
+        let changed = settle_turn_items(thread_id, projection, settled);
+        if changed {
+            self.history.reconcile_pending_work(self.projection.as_ref());
+        }
+        changed
     }
 }
 

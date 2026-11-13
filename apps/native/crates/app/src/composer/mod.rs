@@ -118,6 +118,7 @@ struct Snapshot {
     active_proposed_plan: Option<t3_core::timeline::plan::ActiveProposedPlan>,
     /// Whether the thread currently offers a resume primary action (`resumableRunId !== null || hasHeldQueuedRuns`).
     can_resume: bool,
+    last_error: Option<String>,
 }
 
 /// The corresponding transcript follows this composer's effective selection (`ChatView.tsx`).
@@ -416,9 +417,10 @@ impl Composer {
             (None, Some(project)) => Some(Target::Draft(project.clone())),
             _ => None,
         };
+        let last_error = state.last_error.clone();
         let Some(Target::Thread(thread_id)) = &target else {
             let project_id = state.draft_project.clone();
-            return Snapshot { environment, target, project_id, ..Snapshot::default() };
+            return Snapshot { environment, target, project_id, last_error, ..Snapshot::default() };
         };
         let shell = state.thread_shell(thread_id);
         let projection = state.thread_state(thread_id).projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
@@ -452,6 +454,7 @@ impl Composer {
             queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
             active_proposed_plan: projection.and_then(t3_core::timeline::plan::find_active_proposed_plan),
             can_resume: projection.is_some_and(t3_core::timeline::plan::can_resume_thread),
+            last_error,
             target,
         }
     }
@@ -866,5 +869,103 @@ impl Composer {
     pub(crate) fn type_banner_test_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_prompt("unsent text", window, cx);
         self.on_prompt_change(cx);
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod stream_error_tests {
+    use super::*;
+    use t3_client::supervisor::ClientEvent;
+
+    #[gpui::test]
+    fn stream_error_renders_and_clears_when_snapshot_is_otherwise_unchanged(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+            "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+            "projection": {
+                "thread": {
+                    "id": "t1", "projectId": "checkout-a", "title": "T1",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"}
+                },
+                "runs": [], "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                "visibleTurnItems": [], "updatedAt": "2026-04-01T00:00:05.000Z"
+            }
+        }"#).unwrap();
+        state.update(cx, |state, cx| {
+            state.select_thread("t1", cx);
+            state.thread.apply(snapshot.clone());
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
+        let notifications = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let obs_count = notifications.clone();
+        let _obs = vcx.update(|_, cx| {
+            cx.observe(&composer, move |_, _| {
+                obs_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("composer-stream-error").is_none());
+
+        let before_err = notifications.load(std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.apply_batch(
+                    vec![ClientEvent::StreamError { context: "thread t1".into(), message: "stream boom".into() }],
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(
+            notifications.load(std::sync::atomic::Ordering::SeqCst) > before_err,
+            "StreamError must notify Composer when snapshot is otherwise unchanged"
+        );
+        assert!(
+            vcx.debug_bounds("composer-stream-error").is_some(),
+            "StreamError must repaint Composer and render composer-stream-error"
+        );
+        composer.read_with(vcx, |composer, _| {
+            assert_eq!(composer.snapshot.last_error.as_deref(), Some("Could not read thread t1: stream boom"));
+        });
+
+        let before_clear = notifications.load(std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.apply_batch(
+                    vec![ClientEvent::Thread { thread_id: "t1".into(), item: Box::new(snapshot) }],
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(
+            notifications.load(std::sync::atomic::Ordering::SeqCst) > before_clear,
+            "Thread item recovery must notify Composer to clear error"
+        );
+        assert!(
+            vcx.debug_bounds("composer-stream-error").is_none(),
+            "Thread item recovery must repaint Composer and clear composer-stream-error"
+        );
+        composer.read_with(vcx, |composer, _| {
+            assert_eq!(composer.snapshot.last_error, None);
+        });
     }
 }

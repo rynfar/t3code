@@ -121,16 +121,10 @@ pub fn has_pending_background_work(projection: &ThreadProjection) -> bool {
         return true;
     }
     let rolled_back: Vec<&str> = projection.runs.iter().filter(|run| run.status == "rolled_back").map(|run| run.id.as_str()).collect();
-    projection.turn_items.iter().any(|item| {
-        let background = match &item.kind {
-            TurnItemKind::CommandExecution { .. } | TurnItemKind::Subagent { .. } => true,
-            TurnItemKind::DynamicTool { input, .. } => input.get("persistent") != Some(&Value::Bool(true)),
-            _ => false,
-        };
-        background
-            && matches!(item.status.as_str(), "pending" | "running" | "waiting")
-            && item.run_id.as_deref().is_none_or(|run_id| !rolled_back.contains(&run_id))
-    })
+    projection
+        .turn_items
+        .iter()
+        .any(|item| crate::thread::is_background_turn_item_pending(item, &rolled_back))
 }
 
 /// What Stop sends, as `interruptThreadTurn` decides it.

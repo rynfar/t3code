@@ -1,10 +1,18 @@
 //! `OrchestrationV2TurnItem`: base fields shared by every item, plus a `type`-tagged body.
 //! Unknown `type`s decode to `TurnItemKind::Unknown` and are filtered out, as the web's
 //! `ForwardCompatibleUnionArray` does. Nested shapes the native UI does not render yet stay
-//! as `Value`. `deferredWork` is never requested (no `acceptDeferredWork`), so it is not modeled.
+//! as `Value`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredWork {
+    pub cursor: String,
+    pub item_count: u64,
+    pub last_ordinal: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +52,8 @@ pub struct TurnItem {
     pub prompt_omitted: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub result_omitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_work: Option<DeferredWork>,
     #[serde(flatten)]
     pub kind: TurnItemKind,
 }

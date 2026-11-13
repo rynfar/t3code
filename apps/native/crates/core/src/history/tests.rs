@@ -117,3 +117,103 @@ fn a_snapshot_or_deletion_during_a_merge_drops_it() {
     assert!(state.deleted && state.projection.is_none());
     assert_eq!(state.history, ThreadHistoryMeta::default());
 }
+
+#[test]
+fn work_anchor_paging_resumes_from_updated_cursor_and_clears_when_done() {
+    let mut snap = snapshot(10, &[("a", 1)]);
+    if let ThreadStreamItem::Snapshot { ref mut projection, .. } = snap {
+        let deferred = Some(crate::turn_item::DeferredWork {
+            cursor: "w1".into(),
+            item_count: 2,
+            last_ordinal: 3,
+        });
+        std::sync::Arc::make_mut(&mut projection.turn_items[0]).deferred_work = deferred.clone();
+        std::sync::Arc::make_mut(&mut projection.visible_turn_items[0].item).deferred_work = deferred;
+    }
+    let mut state = ThreadState::default();
+    state.apply(snap);
+
+    let first = state.begin_work_load("a").expect("first work load");
+    assert_eq!(first.cursor, "w1");
+    assert!(state.begin_work_load("a").is_none(), "concurrent load for same anchor is deduped");
+    assert!(state.history.is_loading_work("a"));
+
+    let partial = HistoryPage {
+        snapshot_sequence: 10,
+        items: vec![serde_json::from_value(row("w-item-1", 2, 0)).unwrap()],
+        next_cursor: Some("w2".into()),
+        has_more_history: true,
+        has_user_turn: false,
+    };
+    assert_eq!(state.apply_work_page("a", "w1", partial), HistoryStep::Continue("w2".into()));
+    assert!(!state.history.is_loading_work("a"));
+    assert_eq!(visible(&state), ["a", "w-item-1"]);
+    assert_eq!(
+        state.projection.as_ref().unwrap().visible_turn_items[0].item.deferred_work.as_ref().map(|d| d.cursor.as_str()),
+        Some("w2")
+    );
+
+    let second = state.begin_work_load("a").expect("second work load");
+    assert_eq!(second.cursor, "w2");
+    assert_eq!(state.fail_work_load("a", "w2", "boom".into()), HistoryStep::Failed("boom".into()));
+    assert_eq!(state.history.work_error("a"), Some("boom"));
+
+    let retry = state.begin_work_load("a").expect("retry after failure");
+    assert_eq!(retry.cursor, "w2");
+    assert_eq!(state.history.work_error("a"), None);
+
+    let final_page = HistoryPage {
+        snapshot_sequence: 10,
+        items: vec![serde_json::from_value(row("w-item-2", 3, 0)).unwrap()],
+        next_cursor: None,
+        has_more_history: false,
+        has_user_turn: false,
+    };
+    assert_eq!(state.apply_work_page("a", "w2", final_page), HistoryStep::Done);
+    assert_eq!(visible(&state), ["a", "w-item-1", "w-item-2"]);
+    assert!(state.projection.as_ref().unwrap().visible_turn_items[0].item.deferred_work.is_none());
+}
+
+#[test]
+fn stale_work_merge_or_removed_anchor_reconciles_pending_work() {
+    let mut snap = snapshot(1, &[("a", 1)]);
+    if let ThreadStreamItem::Snapshot { ref mut projection, .. } = snap {
+        let deferred = Some(crate::turn_item::DeferredWork {
+            cursor: "w1".into(),
+            item_count: 1,
+            last_ordinal: 2,
+        });
+        std::sync::Arc::make_mut(&mut projection.turn_items[0]).deferred_work = deferred.clone();
+        std::sync::Arc::make_mut(&mut projection.visible_turn_items[0].item).deferred_work = deferred;
+    }
+    let mut state = ThreadState::default();
+    state.apply(snap);
+    let target = state.begin_work_load("a").unwrap();
+    let WorkPageOutcome::Ready(merge) = state.begin_work_merge("a", &target.cursor, page()) else {
+        panic!("expected ready merge");
+    };
+    let job = merge.run();
+    // Snapshot replacement invalidates the checked-out merge and clears pending work.
+    state.apply(snapshot(5, &[("b", 1)]));
+    assert_eq!(state.finish_work_merge(job), HistoryStep::Stale);
+    assert!(!state.history.is_loading_work("a"));
+    assert_eq!(visible(&state), ["b"]);
+}
+
+#[test]
+fn non_advancing_complete_page_fails_even_when_auto_page_is_off() {
+    let (mut state, cursor) = loading_state();
+    let stuck = HistoryPage {
+        snapshot_sequence: 5,
+        items: vec![serde_json::from_value(row("old-1", 1, 0)).unwrap()],
+        next_cursor: Some(cursor.clone()),
+        has_more_history: true,
+        has_user_turn: false,
+    };
+    let PageOutcome::Step(step) = state.begin_history_merge_with(&cursor, stuck, true, false) else {
+        panic!("expected non-advancing step");
+    };
+    assert_eq!(step, HistoryStep::Failed("History did not advance.".into()));
+    assert!(!state.history.loading);
+    assert_eq!(state.history.error.as_deref(), Some("History did not advance."));
+}
