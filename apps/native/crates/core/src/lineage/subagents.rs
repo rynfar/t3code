@@ -80,6 +80,12 @@ pub struct WorkflowAgent {
     pub model: Option<String>,
     #[serde(default)]
     pub result: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub completed_at: Option<i64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// The projection's subagents; a record this build cannot read is skipped.
@@ -174,6 +180,67 @@ pub fn subagent_pill(turn: Option<&TurnSubagents>) -> Option<PillSegment> {
     Some(PillSegment { label: format!("{} done", turn.settled_count), accessibility_label: format!("{} {noun} done", turn.settled_count) })
 }
 
+/// Group summary for adjacent subagents of one turn (`subagentGroupSummary` in `subagentDisplay.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentGroupSummary {
+    pub label: String,
+    pub active: bool,
+    pub failed: bool,
+}
+
+/// `subagentGroupSummary`: `"Kicked off N subagents"` while any member is active, else `"Ran N subagents"`.
+pub fn subagent_group_summary<'a>(statuses: impl IntoIterator<Item = &'a str>) -> SubagentGroupSummary {
+    let mut count = 0usize;
+    let mut active = false;
+    let mut failed = false;
+    for status in statuses {
+        count += 1;
+        if is_active_status(status) {
+            active = true;
+        }
+        if status == "failed" {
+            failed = true;
+        }
+    }
+    let noun = if count == 1 { "subagent" } else { "subagents" };
+    let verb = if active { "Kicked off" } else { "Ran" };
+    SubagentGroupSummary {
+        label: format!("{verb} {count} {noun}"),
+        active,
+        failed,
+    }
+}
+
+/// `summarizeSubagentStatuses`: `"2 working · 1 done · 1 stopped"`.
+pub fn summarize_subagent_statuses<'a>(statuses: impl IntoIterator<Item = &'a str>) -> String {
+    let (mut working, mut done, mut failed, mut stopped, mut idle) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for status in statuses {
+        if is_active_status(status) {
+            working += 1;
+        } else if status == "completed" {
+            done += 1;
+        } else if status == "failed" {
+            failed += 1;
+        } else if status == "idle" {
+            idle += 1;
+        } else {
+            stopped += 1;
+        }
+    }
+    [
+        (working, "working"),
+        (done, "done"),
+        (failed, "failed"),
+        (stopped, "stopped"),
+        (idle, "idle"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, name)| format!("{n} {name}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
 /// A workflow member as `workflowMembersToRuntime` sees it: its status follows a coordinator
 /// that ended while it was still queued or running.
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +250,10 @@ pub struct WorkflowMember {
     pub status: String,
     pub phase_index: Option<u32>,
     pub child_thread_id: Option<String>,
+    pub result: Option<String>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +296,17 @@ pub fn workflow_group(coordinator: &Subagent) -> Option<WorkflowGroup> {
             } else {
                 agent.state.clone()
             };
-            WorkflowMember { index: agent.index, label: agent.label.clone(), status, phase_index: agent.phase_index, child_thread_id: agent.child_thread_id.clone() }
+            WorkflowMember {
+                index: agent.index,
+                label: agent.label.clone(),
+                status,
+                phase_index: agent.phase_index,
+                child_thread_id: agent.child_thread_id.clone(),
+                result: agent.result.clone(),
+                started_at: agent.started_at,
+                completed_at: agent.completed_at,
+                duration_ms: agent.duration_ms,
+            }
         })
         .collect();
     // The declared plan lags its members: members seed the titles, declared ones overwrite.

@@ -49,6 +49,7 @@ pub use activity::{
 };
 pub use directives::{
     CodexArtifactTemplate, CodexAssistantSegment, codex_artifact_template_presentation_label,
+    codex_artifact_template_prompt_to_append, codex_artifact_template_use_prompt,
     render_codex_directives_for_copy, split_codex_assistant_segments,
 };
 pub use plan::{

@@ -75,6 +75,7 @@ pub(crate) struct ScheduledTasksState {
     pub(super) stream: Option<(u64, Stream)>,
     busy: HashSet<String>,
     menu: Option<String>,
+    pending_task: Option<String>,
     editor: Option<Draft>,
     editor_error: Option<Invalid>,
     saving: bool,
@@ -94,7 +95,7 @@ impl ScheduledTasksState {
             base_ref: input("main", window, cx),
             checkout: input("/path/to/checkout", window, cx),
         };
-        ScheduledTasksState { tasks: None, stream: None, busy: HashSet::new(), menu: None, editor: None, editor_error: None, saving: false, save_error: None, inputs }
+        ScheduledTasksState { tasks: None, stream: None, busy: HashSet::new(), menu: None, pending_task: None, editor: None, editor_error: None, saving: false, save_error: None, inputs }
     }
 
     pub(super) fn inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
@@ -270,11 +271,31 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub(super) fn scheduled_tasks_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+    pub(super) fn select_scheduled_task(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Ok(tasks)) = &self.scheduled.tasks
+            && let Some(task) = tasks.iter().find(|task| task.id == task_id).cloned()
+            && self.scheduled.editor.is_none()
+        {
+            self.scheduled.pending_task = None;
+            self.open_editor(Draft::from_task(&task, local_field), window, cx);
+            return;
+        }
+        self.scheduled.pending_task = Some(task_id.to_owned());
+        cx.notify();
+    }
+
+    pub(super) fn scheduled_tasks_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         self.ensure_task_stream(cx);
         let Some(config) = self.thread_settings(cx).cloned() else {
             return vec![Block::new(&[], self.task_empty("No environments available", "Connect an environment to manage scheduled tasks.", cx))];
         };
+        if let Some(Ok(tasks)) = &self.scheduled.tasks
+            && self.scheduled.editor.is_none()
+            && let Some(task_id) = self.scheduled.pending_task.take()
+            && let Some(task) = tasks.iter().find(|task| task.id == task_id).cloned()
+        {
+            self.open_editor(Draft::from_task(&task, local_field), window, cx);
+        }
         if self.scheduled.editor.is_some() {
             return vec![Block::new(&[], self.task_editor(&config, cx))];
         }

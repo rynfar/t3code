@@ -238,7 +238,7 @@ pub fn linkable_machines(
 ) -> Vec<LinkableMachine> {
     environments
         .iter()
-        .filter(|env| host_environment_id != Some(env.id.as_str()) && !env.urls.is_empty())
+        .filter(|env| host_environment_id != Some(env.id.as_str()))
         .map(|env| {
             let existing = linked
                 .iter()
@@ -362,12 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn ranks_machines_matching_hint_first() {
-        let m = vec![
-            LinkableMachine { id: "a".into(), label: "Alpha".into(), urls: vec!["http://a".into()], existing_link_environment_id: None, reachable: true },
-            LinkableMachine { id: "b".into(), label: "GPU Box".into(), urls: vec!["http://b".into()], existing_link_environment_id: None, reachable: true },
+    fn ranks_machines_matching_hint_first_and_keeps_urlless_machines() {
+        let candidates = vec![
+            MachineCandidate { id: "host".into(), label: "Host".into(), urls: vec!["http://host".into()], reachable: true },
+            MachineCandidate { id: "cloud-relay".into(), label: "Cloud Relay".into(), urls: Vec::new(), reachable: false },
+            MachineCandidate { id: "b".into(), label: "GPU Box".into(), urls: vec!["http://b".into()], reachable: true },
         ];
-        let ranked = rank_machines_by_hint(m, Some("gpu"), None, None);
+        let machines = linkable_machines(&candidates, &[], Some("host"));
+        assert_eq!(machines.len(), 2);
+        assert!(machines.iter().any(|m| m.id == "cloud-relay" && m.urls.is_empty()));
+        let ranked = rank_machines_by_hint(machines, Some("gpu"), None, None);
         assert_eq!(ranked[0].id, "b");
     }
 }

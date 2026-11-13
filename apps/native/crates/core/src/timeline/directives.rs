@@ -189,6 +189,37 @@ pub fn codex_artifact_template_presentation_label(artifact_kind: &str) -> Option
     }
 }
 
+/// Prompt text inserted when clicking "Use template" (`codexArtifactTemplateUsePrompt`).
+pub fn codex_artifact_template_use_prompt(template: &CodexArtifactTemplate) -> String {
+    let skill = format!("${}", template.skill_name);
+    match template.artifact_kind.as_str() {
+        "document" => format!("Create a document using this {skill} about\u{2026}"),
+        "presentation" => format!("Create a presentation using the {skill} template about\u{2026}"),
+        "spreadsheet" => format!("Create a spreadsheet using this {skill} about\u{2026}"),
+        "site" => format!("Create a Site using this {skill} about\u{2026}"),
+        "google-docs" => format!("Create a Google Doc using this {skill} about\u{2026}"),
+        "google-slides" => format!("Create a Google Slides presentation using this {skill} about\u{2026}"),
+        "google-sheets" => format!("Create a Google Sheet using this {skill} about\u{2026}"),
+        "image" => format!("Create an image using this {skill} of\u{2026}"),
+        "email" => format!("Draft an email using this {skill} about\u{2026}"),
+        "slack" => format!("Draft a Slack message using this {skill} about\u{2026}"),
+        _ => format!("Create an artifact using this {skill}"),
+    }
+}
+
+/// Appends the template use prompt to `draft`, avoiding duplicate trailing inserts (`appendCodexArtifactTemplateUsePrompt`).
+pub fn codex_artifact_template_prompt_to_append(draft: &str, template: &CodexArtifactTemplate) -> Option<String> {
+    let prompt = codex_artifact_template_use_prompt(template);
+    let trimmed = draft.trim_end();
+    if let Some(start) = trimmed.len().checked_sub(prompt.len())
+        && trimmed[start..] == prompt
+        && (start == 0 || trimmed[..start].chars().next_back().is_some_and(char::is_whitespace))
+    {
+        return None;
+    }
+    Some(prompt)
+}
+
 fn try_parse_artifact(input: &str) -> Option<(CodexArtifactTemplate, usize)> {
     let (_label, attrs, consumed) = parse_directive(input, ARTIFACT_PREFIX)?;
     let artifact_kind = attrs.get("artifact_kind")?.trim().to_owned();
@@ -332,5 +363,23 @@ mod tests {
         let super::CodexAssistantSegment::Markdown(tail) = &segs[2] else { panic!("expected markdown tail") };
         assert!(tail.contains(":codex-followup[Raw]{prompt=\"keep\"}"));
         assert!(tail.contains("Next **Ship it**"));
+    }
+
+    #[test]
+    fn template_use_prompt_avoids_duplicate_trailing_append() {
+        let template = super::CodexArtifactTemplate {
+            artifact_kind: "document".into(),
+            display_name: "RFC".into(),
+            skill_directory: "/skills/doc".into(),
+            skill_name: "artifact-template-rfc".into(),
+        };
+        let prompt = super::codex_artifact_template_use_prompt(&template);
+        assert_eq!(prompt, "Create a document using this $artifact-template-rfc about\u{2026}");
+        assert_eq!(super::codex_artifact_template_prompt_to_append("Write about otters", &template).as_deref(), Some(prompt.as_str()));
+        assert_eq!(super::codex_artifact_template_prompt_to_append(&format!("{prompt}\n"), &template), None);
+        assert_eq!(
+            super::codex_artifact_template_prompt_to_append(&format!("{prompt}\nExtra notes"), &template).as_deref(),
+            Some(prompt.as_str())
+        );
     }
 }

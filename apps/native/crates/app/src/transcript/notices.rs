@@ -201,7 +201,7 @@ fn status_label(status: &str) -> &'static str {
     }
 }
 
-fn plain_detail(text: &str) -> String {
+pub(super) fn plain_detail(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         let line = line.trim_start();
@@ -219,9 +219,9 @@ fn elapsed_label(item: &TurnItem, now_ms: i64) -> Option<String> {
 }
 
 #[derive(IntoElement)]
-struct SubagentLiveElapsed {
-    item_id: SharedString,
-    started_at: String,
+pub(super) struct SubagentLiveElapsed {
+    pub(super) item_id: SharedString,
+    pub(super) started_at: String,
 }
 
 impl RenderOnce for SubagentLiveElapsed {
@@ -236,7 +236,21 @@ impl RenderOnce for SubagentLiveElapsed {
     }
 }
 
-fn subagent_avatar(provider_instance_id: Option<&str>, marks: &[(String, ProviderMark)], size: f32, cx: &App) -> AnyElement {
+pub(super) fn provider_marks(app: &AppState) -> Vec<(String, ProviderMark)> {
+    app.server_config
+        .config
+        .as_ref()
+        .map(|config| {
+            let entries = provider_entries(config, None);
+            entries
+                .iter()
+                .map(|entry| (entry.instance_id().to_owned(), ProviderMark::of(entry, &entries)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn subagent_avatar(provider_instance_id: Option<&str>, marks: &[(String, ProviderMark)], size: f32, cx: &App) -> AnyElement {
     let p = palette(cx);
     if let Some(id) = provider_instance_id
         && let Some((_, mark)) = marks.iter().find(|(instance_id, _)| instance_id == id)
@@ -331,24 +345,15 @@ fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &Ro
     row.into_any_element()
 }
 
-/// `V2SubagentGroup`: adjacent subagents of one turn behind an "N subagents" disclosure.
+/// `V2SubagentGroup`: adjacent subagents of one turn behind a `"Kicked off / Ran N subagents"` disclosure.
 fn subagent_group(id: &str, members: &[Arc<TurnItem>], marks: &[(String, ProviderMark)], env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
     let expanded = env.ui.expanded_entries.contains(&format!("subagent-group:{id}"));
-    let running = members.iter().filter(|m| m.is_running()).count();
-    let failed = members.iter().filter(|m| m.status == "failed").count();
-    let done = members.iter().filter(|m| m.status == "completed").count();
-    let mut summary = Vec::new();
-    if running > 0 {
-        summary.push(format!("{running} running"));
-    }
-    if done > 0 {
-        summary.push(format!("{done} completed"));
-    }
-    if failed > 0 {
-        summary.push(format!("{failed} failed"));
-    }
-    let label = format!("{} {}", members.len(), if members.len() == 1 { "subagent" } else { "subagents" });
+    let group_summary = t3_core::lineage::subagent_group_summary(members.iter().map(|m| m.status.as_str()));
+    let summary = t3_core::lineage::summarize_subagent_statuses(members.iter().map(|m| m.status.as_str()));
+    let active = group_summary.active;
+    let failed = group_summary.failed;
+    let label = group_summary.label;
     let key = format!("subagent-group:{id}");
     let ring = hsla(p.ring);
     let visible_avatars: Vec<_> = members.iter().take(3).collect();
@@ -400,7 +405,7 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], marks: &[(String, Provide
         .py(px(8.))
         .pr(px(13.))
         .cursor_pointer()
-        .text_color(if expanded || running > 0 { hsla(p.foreground) } else { hsla(p.muted_foreground) })
+        .text_color(if expanded || active { hsla(p.foreground) } else { hsla(p.muted_foreground) })
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_entry(&key, cx)))
         .child(avatar_stack)
         .child(
@@ -408,13 +413,15 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], marks: &[(String, Provide
                 .flex_1()
                 .min_w_0()
                 .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(label))
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(10.))
-                        .text_color(if running > 0 { hsla(p.info_foreground) } else if failed > 0 { hsla(p.destructive) } else { hsla(p.muted_foreground) })
-                        .child(summary.join(", ")),
-                ),
+                .when(!summary.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(if active { hsla(p.info_foreground) } else if failed { hsla(p.destructive) } else { hsla(p.muted_foreground) })
+                            .child(summary),
+                    )
+                }),
         )
         .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(14.), hsla(p.muted_foreground)));
     let list = expanded.then(|| {
@@ -649,6 +656,7 @@ impl RenderOnce for SecretRequestCard {
 struct LinkCardState {
     dialog_open: bool,
     manual_mode: bool,
+    selected_machine_id: Option<String>,
     access: String,
     loading_links: bool,
     links: Vec<ExistingPeerLink>,
@@ -663,12 +671,23 @@ impl LinkCardState {
     fn reset(&mut self, default_access: String, default_url: &str, default_label: &str, window: &mut Window, cx: &mut App) {
         self.dialog_open = false;
         self.manual_mode = false;
+        self.selected_machine_id = None;
         self.access = default_access;
         self.submitting = false;
         self.error = None;
         self.url_input.update(cx, |input, cx| input.set_value(default_url.to_owned(), window, cx));
         self.label_input.update(cx, |input, cx| input.set_value(default_label.to_owned(), window, cx));
         self.code_input.update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
+    fn seed_manual_machine(&mut self, machine_id: &str, url: Option<&str>, label: &str, window: &mut Window, cx: &mut App) {
+        self.selected_machine_id = Some(machine_id.to_owned());
+        if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
+            self.url_input.update(cx, |input, cx| input.set_value(url.to_owned(), window, cx));
+        }
+        if !label.trim().is_empty() {
+            self.label_input.update(cx, |input, cx| input.set_value(label.to_owned(), window, cx));
+        }
     }
 }
 
@@ -699,6 +718,7 @@ impl RenderOnce for LinkRequestCard {
         let card_state = window.use_keyed_state(SharedString::from(format!("link-ui:{}", self.id)), cx, |window, cx| LinkCardState {
             dialog_open: false,
             manual_mode: false,
+            selected_machine_id: None,
             access: init_access,
             loading_links: false,
             links: Vec::new(),
@@ -1055,6 +1075,7 @@ impl RenderOnce for LinkRequestCard {
                                                             &mcp_client_scopes(&cur_access),
                                                         );
                                                         let app_handle = app.clone();
+                                                        let runtime = app.read(cx).runtime().clone();
                                                         let thread_id = thread_id.clone();
                                                         let turn_item_id = turn_item_id.clone();
                                                         let machine_id = machine_id.clone();
@@ -1065,39 +1086,57 @@ impl RenderOnce for LinkRequestCard {
                                                         let reset_url = reset_url.clone();
                                                         let reset_label = reset_label.clone();
                                                         cx.spawn(async move |cx| {
-                                                            let minted = cx
-                                                                .background_executor()
+                                                            let minted = runtime
                                                                 .spawn(async move {
-                                                                    tokio::runtime::Handle::current().block_on(t3_client::auth::post_access(
+                                                                    t3_client::auth::post_access(
                                                                         &creds,
                                                                         "/api/auth/pairing-token",
                                                                         Some(body),
-                                                                    ))
+                                                                    )
+                                                                    .await
                                                                 })
                                                                 .await;
                                                             let code = match minted {
-                                                                Ok(val) => val
+                                                                Ok(Ok(val)) => val
                                                                     .get("credential")
                                                                     .or_else(|| val.get("pairingCode"))
                                                                     .or_else(|| val.get("token"))
                                                                     .and_then(Value::as_str)
                                                                     .map(str::to_owned),
-                                                                Err(_) => {
-                                                                    let _ = weak.update(cx, |s, cx| {
-                                                                        s.submitting = false;
-                                                                        s.manual_mode = true;
-                                                                        s.error = Some("Could not reach that machine automatically. Enter a pairing code manually.".to_owned());
-                                                                        cx.notify();
+                                                                Ok(Err(_)) | Err(_) => {
+                                                                    let _ = wh.update(cx, |_, window, cx| {
+                                                                        let _ = weak.update(cx, |s, cx| {
+                                                                            s.submitting = false;
+                                                                            s.manual_mode = true;
+                                                                            s.seed_manual_machine(
+                                                                                &machine_id,
+                                                                                machine_urls.first().map(String::as_str),
+                                                                                &machine_label,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                            s.error = Some("Could not reach that machine automatically. Enter a pairing code manually.".to_owned());
+                                                                            cx.notify();
+                                                                        });
                                                                     });
                                                                     return;
                                                                 }
                                                             };
                                                             let Some(code) = code.filter(|c| !c.is_empty()) else {
-                                                                let _ = weak.update(cx, |s, cx| {
-                                                                    s.submitting = false;
-                                                                    s.manual_mode = true;
-                                                                    s.error = Some("Could not mint a pairing code automatically; paste one below.".to_owned());
-                                                                    cx.notify();
+                                                                let _ = wh.update(cx, |_, window, cx| {
+                                                                    let _ = weak.update(cx, |s, cx| {
+                                                                        s.submitting = false;
+                                                                        s.manual_mode = true;
+                                                                        s.seed_manual_machine(
+                                                                            &machine_id,
+                                                                            machine_urls.first().map(String::as_str),
+                                                                            &machine_label,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                        s.error = Some("Could not mint a pairing code automatically; paste one below.".to_owned());
+                                                                        cx.notify();
+                                                                    });
                                                                 });
                                                                 return;
                                                             };
@@ -1132,11 +1171,17 @@ impl RenderOnce for LinkRequestCard {
                                                         })
                                                         .detach();
                                                     } else {
-                                                        st.update(cx, |s, cx| {
-                                                            s.submitting = false;
-                                                            s.manual_mode = true;
-                                                            s.error = Some("No active credentials for that machine; enter a pairing code manually.".to_owned());
-                                                            cx.notify();
+                                                        let machine_id = machine_id.clone();
+                                                        let machine_label = machine_label.clone();
+                                                        let first_url = machine_urls.first().cloned();
+                                                        let _ = wh.update(cx, |_, window, cx| {
+                                                            st.update(cx, |s, cx| {
+                                                                s.submitting = false;
+                                                                s.manual_mode = true;
+                                                                s.seed_manual_machine(&machine_id, first_url.as_deref(), &machine_label, window, cx);
+                                                                s.error = Some("No active credentials for that machine; enter a pairing code manually.".to_owned());
+                                                                cx.notify();
+                                                            });
                                                         });
                                                     }
                                                 }),
@@ -1179,13 +1224,14 @@ impl RenderOnce for LinkRequestCard {
                                                         cx.notify();
                                                     });
                                                     let lbl_opt = (!lbl.is_empty()).then_some(lbl.as_str());
+                                                    let selected_env_id = manual_submit_state.read(cx).selected_machine_id.clone();
                                                     let task = manual_submit_app.update(cx, |app, _| {
                                                         app.rpc(
                                                             t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
                                                             t3_core::commands::link_request_answer_link(
                                                                 &manual_thread,
                                                                 &manual_item,
-                                                                None,
+                                                                selected_env_id.as_deref(),
                                                                 lbl_opt,
                                                                 &[url],
                                                                 &manual_access,
@@ -1227,6 +1273,7 @@ impl RenderOnce for LinkRequestCard {
                                 move |_, _, cx| {
                                     manual_toggle_state.update(cx, |s, cx| {
                                         s.manual_mode = !s.manual_mode;
+                                        s.selected_machine_id = None;
                                         s.error = None;
                                         cx.notify();
                                     });
@@ -1371,20 +1418,7 @@ pub fn event_row(
 ) -> AnyElement {
     let p = palette(cx);
     let can_answer_here = visibility == t3_core::thread::Visibility::Local && env.thread_id.is_some();
-    let marks: Vec<(String, ProviderMark)> = env
-        .state
-        .read(cx)
-        .server_config
-        .config
-        .as_ref()
-        .map(|config| {
-            let entries = provider_entries(config, None);
-            entries
-                .iter()
-                .map(|entry| (entry.instance_id().to_owned(), ProviderMark::of(entry, &entries)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let marks = provider_marks(env.state.read(cx));
     match &item.kind {
         TurnItemKind::Subagent { .. } if subagents.len() > 1 => subagent_group(id, subagents, &marks, env, cx),
         TurnItemKind::Subagent { .. } => subagent_row(item, &marks, env, cx),
@@ -1510,7 +1544,7 @@ pub fn event_row(
                 SharedString::from(format!("fork:{id}")),
                 if from_run { "Forked from conversation".into() } else { "Conversation fork".into() },
                 Some(Icon::GitFork),
-                if from_run { "Open source conversation" } else { "Open forked thread" },
+                if from_run { "Open source conversation" } else { "Open fork" },
                 cx.listener(move |view, _, _, cx| view.open_thread(&target, cx)),
                 cx,
             )
@@ -1638,5 +1672,26 @@ mod tests {
         });
         let (tag, msg) = rpc_error_tag_and_message(&raw_err);
         assert_eq!(sanitize_secret_request_error(tag, msg), t3_core::timeline::RPC_REQUEST_FALLBACK_ERROR);
+    }
+
+    #[test]
+    fn subagent_group_summary_matches_client_runtime_wording() {
+        let active = t3_core::lineage::subagent_group_summary(["running", "completed", "cancelled"]);
+        assert_eq!(active.label, "Kicked off 3 subagents");
+        assert!(active.active);
+        assert!(!active.failed);
+        assert_eq!(
+            t3_core::lineage::summarize_subagent_statuses(["running", "completed", "cancelled"]),
+            "1 working · 1 done · 1 stopped"
+        );
+
+        let done = t3_core::lineage::subagent_group_summary(["completed", "failed", "idle"]);
+        assert_eq!(done.label, "Ran 3 subagents");
+        assert!(!done.active);
+        assert!(done.failed);
+        assert_eq!(
+            t3_core::lineage::summarize_subagent_statuses(["completed", "failed", "idle"]),
+            "1 done · 1 failed · 1 idle"
+        );
     }
 }

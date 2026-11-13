@@ -221,12 +221,38 @@ pub(crate) struct SnapshotAudit { pub submissions: std::cell::Cell<usize> }
 #[cfg(feature = "snapshot")]
 impl gpui::Global for SnapshotAudit {}
 
+#[derive(Default)]
+struct RegisteredComposers(Vec<gpui::WeakEntity<Composer>>);
+impl gpui::Global for RegisteredComposers {}
+
 #[cfg(feature = "snapshot")]
 struct SnapshotComposer(Entity<Composer>);
 #[cfg(feature = "snapshot")]
 impl gpui::Global for SnapshotComposer {}
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot_composer(cx: &App) -> Entity<Composer> {cx.global::<SnapshotComposer>().0.clone()}
+
+pub(crate) fn insert_artifact_template(
+    thread_id: Option<&str>,
+    template: &t3_core::timeline::CodexArtifactTemplate,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let live: Vec<Entity<Composer>> = cx
+        .try_global::<RegisteredComposers>()
+        .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
+        .unwrap_or_default();
+    let target = match thread_id {
+        Some(tid) => live
+            .iter()
+            .find(|composer| composer.read(cx).thread_id().as_deref() == Some(tid))
+            .cloned(),
+        None => live.iter().find(|composer| composer.read(cx).fixed.is_none()).cloned().or_else(|| live.first().cloned()),
+    };
+    if let Some(composer) = target {
+        composer.update(cx, |composer, cx| composer.insert_artifact_template(template, window, cx));
+    }
+}
 
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -364,6 +390,11 @@ impl Composer {
             setup,
             _subscriptions: subscriptions,
         };
+        let weak_composer = cx.entity().downgrade();
+        cx.update_default_global::<RegisteredComposers, _>(|reg, _cx| {
+            reg.0.retain(|weak| weak.upgrade().is_some());
+            reg.0.push(weak_composer);
+        });
         #[cfg(feature = "snapshot")]
         if composer.fixed.is_none() {cx.set_global(SnapshotComposer(cx.entity()));}
         composer.load_drafts(cx);

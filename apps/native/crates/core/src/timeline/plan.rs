@@ -131,7 +131,21 @@ pub fn build_plan_implementation_thread_title(plan_markdown: &str) -> String {
     }
 }
 
-/// Find the latest actionable proposed plan on a settled projection (`findLatestProposedPlan`).
+fn plan_item_time<'a>(projection: &'a ThreadProjection, plan_id: &str, run_id: Option<&str>) -> &'a str {
+    if let Some(item) = projection.turn_items.iter().rev().find(|candidate| match &candidate.kind {
+        TurnItemKind::ProposedPlan { plan_id: id, .. } | TurnItemKind::TodoList { plan_id: id, .. } => id == plan_id,
+        _ => false,
+    }) {
+        return item.updated_at.as_str();
+    }
+    if let Some(run) = run_id.and_then(|id| projection.runs.iter().find(|r| r.id == id)) {
+        return run.completed_at.as_deref().or(run.started_at.as_deref()).unwrap_or(run.requested_at.as_str());
+    }
+    projection.thread.created_at.as_str()
+}
+
+/// Find the latest actionable proposed plan on a settled projection (`findLatestProposedPlan` +
+/// `hasActionableProposedPlan` in `session-logic.ts`).
 pub fn find_active_proposed_plan(projection: &ThreadProjection) -> Option<ActiveProposedPlan> {
     let latest_run = projection.runs.last()?;
     let settled = matches!(latest_run.status.as_str(), "completed" | "cancelled" | "interrupted" | "failed");
@@ -139,6 +153,43 @@ pub fn find_active_proposed_plan(projection: &ThreadProjection) -> Option<Active
         return None;
     }
     let latest_run_id = latest_run.id.as_str();
+    let proposed: Vec<_> = projection
+        .plans
+        .iter()
+        .filter(|plan| plan.value.get("kind").and_then(|v| v.as_str()) == Some("proposed_plan"))
+        .collect();
+    let latest_run_plans: Vec<_> = proposed
+        .iter()
+        .copied()
+        .filter(|plan| plan.value.get("runId").and_then(|v| v.as_str()) == Some(latest_run_id))
+        .collect();
+    let mut candidates = if latest_run_plans.is_empty() { proposed } else { latest_run_plans };
+    candidates.sort_by(|left, right| {
+        let left_run = left.value.get("runId").and_then(|v| v.as_str());
+        let right_run = right.value.get("runId").and_then(|v| v.as_str());
+        plan_item_time(projection, &left.id, left_run)
+            .cmp(plan_item_time(projection, &right.id, right_run))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if let Some(plan) = candidates.pop() {
+        let status = plan.value.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+        if status != "active" {
+            return None;
+        }
+        let streaming = projection.turn_items.iter().rev().any(|item| {
+            matches!(&item.kind, TurnItemKind::ProposedPlan { plan_id, streaming: true, .. } if plan_id == &plan.id)
+        });
+        let markdown = plan.value.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+        if streaming || markdown.trim().is_empty() {
+            return None;
+        }
+        return Some(ActiveProposedPlan {
+            id: plan.id.clone(),
+            run_id: plan.value.get("runId").and_then(|v| v.as_str()).map(str::to_owned),
+            markdown: markdown.to_owned(),
+            title: proposed_plan_title(markdown),
+        });
+    }
     let item = projection.turn_items.iter().rev().find(|item| {
         matches!(item.kind, TurnItemKind::ProposedPlan { streaming: false, .. })
             && item.run_id.as_deref() == Some(latest_run_id)
@@ -147,15 +198,6 @@ pub fn find_active_proposed_plan(projection: &ThreadProjection) -> Option<Active
         return None;
     };
     if *streaming || markdown.trim().is_empty() {
-        return None;
-    }
-    let status = projection
-        .plans
-        .iter()
-        .find(|p| p.id == *plan_id && p.value.get("kind").and_then(|v| v.as_str()) == Some("proposed_plan"))
-        .and_then(|p| p.value.get("status").and_then(|v| v.as_str()))
-        .unwrap_or("active");
-    if matches!(status, "implemented" | "superseded") {
         return None;
     }
     Some(ActiveProposedPlan {
@@ -254,5 +296,89 @@ mod tests {
         assert_eq!(build_plan_implementation_thread_title(md), "Implement Refactor: Transcript / Messages (Wave 1C)");
         assert_eq!(build_plan_implementation_thread_title("plain body"), "Implement plan");
         assert_eq!(normalize_plan_markdown_for_export("# Hi\n\n  "), "# Hi\n");
+    }
+
+    #[test]
+    fn find_active_proposed_plan_falls_back_across_earlier_settled_runs() {
+        let mut projection: ThreadProjection = serde_json::from_value(serde_json::json!({
+            "thread": {
+                "id": "th-1",
+                "projectId": "pr-1",
+                "title": "Plan thread",
+                "providerInstanceId": "codex-1",
+                "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                "runtimeMode": "full-access",
+                "interactionMode": "plan",
+                "branch": null,
+                "worktreePath": null,
+                "lineage": {
+                    "parentThreadId": null,
+                    "relationshipToParent": null,
+                    "rootThreadId": "th-1"
+                },
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:03:00Z",
+                "archivedAt": null
+            },
+            "runs": [
+                {
+                    "id": "run-1",
+                    "ordinal": 1,
+                    "providerInstanceId": "codex-1",
+                    "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                    "userMessageId": "msg-1",
+                    "rootNodeId": null,
+                    "status": "completed",
+                    "requestedAt": "2026-01-01T00:00:00Z",
+                    "startedAt": "2026-01-01T00:00:01Z",
+                    "completedAt": "2026-01-01T00:01:00Z"
+                },
+                {
+                    "id": "run-2",
+                    "ordinal": 2,
+                    "providerInstanceId": "codex-1",
+                    "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                    "userMessageId": "msg-2",
+                    "rootNodeId": null,
+                    "status": "completed",
+                    "requestedAt": "2026-01-01T00:02:00Z",
+                    "startedAt": "2026-01-01T00:02:01Z",
+                    "completedAt": "2026-01-01T00:03:00Z"
+                }
+            ],
+            "attempts": [],
+            "nodes": [],
+            "subagents": [],
+            "providerSessions": [],
+            "providerThreads": [],
+            "providerTurns": [],
+            "runtimeRequests": [],
+            "messages": [],
+            "plans": [
+                {
+                    "id": "plan-1",
+                    "kind": "proposed_plan",
+                    "runId": "run-1",
+                    "status": "active",
+                    "markdown": "# Ship It\n\n- Step 1"
+                }
+            ],
+            "turnItems": [],
+            "checkpointScopes": [],
+            "checkpoints": [],
+            "contextHandoffs": [],
+            "contextTransfers": [],
+            "visibleTurnItems": [],
+            "updatedAt": "2026-01-01T00:03:00Z"
+        }))
+        .expect("valid projection");
+
+        let found = find_active_proposed_plan(&projection).expect("earlier run active plan");
+        assert_eq!(found.id, "plan-1");
+        assert_eq!(found.run_id.as_deref(), Some("run-1"));
+        assert_eq!(found.title.as_deref(), Some("Ship It"));
+
+        projection.plans[0].value["status"] = serde_json::json!("implemented");
+        assert!(find_active_proposed_plan(&projection).is_none());
     }
 }

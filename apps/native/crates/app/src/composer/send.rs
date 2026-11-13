@@ -79,7 +79,8 @@ impl Composer {
         if self.snapshot.setup_blocks_send {
             return;
         }
-        if self.active_plan_follow_up(cx).is_some() && (self.has_text || !self.snapshot.can_resume) {
+        let plan_follow_up = self.active_plan_follow_up(cx).is_some();
+        if plan_follow_up && !self.has_text && !self.snapshot.can_resume {
             self.submit_plan_follow_up(window, cx);
             return;
         }
@@ -115,6 +116,10 @@ impl Composer {
             self.set_prompt("", window, cx);
             self.draft_changed(cx);
             cx.notify();
+            return;
+        }
+        if plan_follow_up {
+            self.submit_plan_follow_up(window, cx);
             return;
         }
         let outgoing = self.outgoing(text, &staged);
@@ -208,7 +213,7 @@ impl Composer {
     }
 
     pub(super) fn submit_plan_follow_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.snapshot.setup_blocks_send {
+        if self.sending || self.snapshot.setup_blocks_send {
             return;
         }
         let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
@@ -284,13 +289,16 @@ impl Composer {
     }
 
     pub(super) fn submit_plan_in_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.snapshot.setup_blocks_send {
+        if self.sending || self.snapshot.setup_blocks_send {
             return;
         }
         let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
         let Some(Target::Thread(source_thread_id)) = self.snapshot.target.clone() else { return };
         let Some(project_id) = self.snapshot.project_id.clone() else { return };
         let resolved = self.resolve(cx);
+        if !resolved.plan_enabled {
+            return;
+        }
         let Some(selection) = Self::dispatch_selection(&resolved) else {
             self.error = Some(NO_PROVIDER.into());
             cx.notify();
@@ -337,6 +345,21 @@ impl Composer {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = request.await;
+            let cleanup_task = match &result {
+                Err((index, _)) if *index > 0 => this
+                    .update(cx, |this, cx| {
+                        this.state.read(cx).rpc(
+                            method::DISPATCH_COMMAND,
+                            t3_core::thread_actions::delete(&uuid_v4(), &new_thread_id),
+                        )
+                    })
+                    .ok(),
+                _ => None,
+            };
+            let cleanup_error = match cleanup_task {
+                Some(task) => task.await.err().map(|e| e.to_string()),
+                None => None,
+            };
             let _ = this.update_in(cx, |this, _, cx| {
                 this.sending = false;
                 match result {
@@ -346,16 +369,9 @@ impl Composer {
                             state.select_when_listed(&new_thread_id, cx);
                         });
                     }
-                    Err((index, error)) => {
-                        if index > 0 {
-                            let cleanup = this.state.read(cx).rpc(
-                                method::DISPATCH_COMMAND,
-                                t3_core::thread_actions::delete(&uuid_v4(), &new_thread_id),
-                            );
-                            cx.background_executor().spawn(async move {
-                                let _ = cleanup.await;
-                            })
-                            .detach();
+                    Err((_, error)) => {
+                        if let Some(cleanup_err) = cleanup_error {
+                            tracing::warn!(%new_thread_id, error = %cleanup_err, "failed to clean up implementation thread after start failure");
                         }
                         this.error = Some(format!("Failed to implement plan in new thread. {error}"));
                     }

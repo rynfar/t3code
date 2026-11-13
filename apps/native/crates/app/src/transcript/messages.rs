@@ -2,6 +2,7 @@
 //! meta footer (`TimelineAssistantRows.tsx`, §7.6) and the proposed plan card
 //! (`ProposedPlanCard.tsx`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, div, linear_color_stop, linear_gradient, prelude::FluentBuilder, px, relative};
@@ -9,8 +10,8 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
 use t3_core::lineage::{
-    PhaseState, WorkflowGroup, WorkflowMember, is_terminal_status, subagent_display_title,
-    subagents_of, workflow_group,
+    PhaseState, WorkflowGroup, WorkflowMember, is_active_status, is_terminal_status,
+    subagent_display_title, subagents_of, workflow_group,
 };
 use t3_core::media::{AssetResource, MediaPlacement, MediaSource};
 use t3_core::timeline::{
@@ -18,18 +19,20 @@ use t3_core::timeline::{
     DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, EDIT_FROM_HERE, FORK_LABEL, ProposedPlan, RowKind,
     TimelineRow, build_collapsed_proposed_plan_preview_markdown,
     build_proposed_plan_markdown_filename, can_fork, codex_artifact_template_presentation_label,
-    is_workflow_script_message, normalize_plan_markdown_for_export, partition_user_attachments,
-    proposed_plan_title, render_codex_directives_for_copy, resolve_model_switch_change,
-    resolve_user_message_presentation, should_collapse_user_message,
+    format_duration, is_workflow_script_message, normalize_plan_markdown_for_export,
+    partition_user_attachments, proposed_plan_title, render_codex_directives_for_copy,
+    resolve_model_switch_change, resolve_user_message_presentation, should_collapse_user_message,
     split_codex_assistant_segments, strip_displayed_plan_markdown, user_message_file_label,
 };
 
 use super::markdown::{MarkdownStore, markdown_view, prose};
+use super::notices::{SubagentLiveElapsed, plain_detail, provider_marks, subagent_avatar};
 use super::parts::{CopyButton, DividerTone, ROW_GROUP, Clock, focusable, ghost_button, ghost_icon_button, ghost_text_button, mono_frame, system_divider, tooltip_icon_button};
 use super::RowEnv;
 use crate::app_state::AppState;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant, Float, MenuItem, floating, menu_surface};
 use crate::icons::Icon;
+use crate::provider_icon::ProviderMark;
 use crate::theme::{hsla, palette};
 use crate::thread_view::ThreadView;
 use crate::toast::{Toast, ToastKind};
@@ -64,12 +67,34 @@ fn first_line_preview(text: &str) -> String {
     trimmed.lines().next().unwrap_or_default().trim().to_owned()
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct WorkflowMemberMeta {
+    provider_instance_id: Option<String>,
+    detail: Option<String>,
+    started_at_iso: Option<String>,
+    elapsed: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct WorkflowOpeningView {
     title: String,
     description: Option<String>,
     agents_summary: Option<String>,
     group: Option<WorkflowGroup>,
+    provider_instance_id: Option<String>,
+    member_meta: HashMap<u32, WorkflowMemberMeta>,
+}
+
+fn format_epoch_elapsed(start_ms: Option<i64>, end_ms: Option<i64>, duration_ms: Option<u64>) -> Option<String> {
+    if let (Some(start), Some(end)) = (start_ms, end_ms) {
+        let clamped = ((end - start).max(0) / 1_000 * 1_000).max(1_000) as f64;
+        return Some(format_duration(clamped));
+    }
+    duration_ms.map(|ms| format_duration(((ms / 1_000) * 1_000).max(1_000) as f64))
+}
+
+fn epoch_ms_to_iso(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
 }
 
 fn resolve_workflow_opening_view(app: &AppState, thread_id: Option<&str>) -> WorkflowOpeningView {
@@ -85,11 +110,61 @@ fn resolve_workflow_opening_view(app: &AppState, thread_id: Option<&str>) -> Wor
             })
             .or_else(|| proj.and_then(|p| subagents_of(p).into_iter().find(|s| s.workflow.is_some())))
     });
+    let proj = thread_id.and_then(|tid| app.thread_state(tid).projection.as_ref());
+    let default_instance_id = coordinator
+        .as_ref()
+        .and_then(|c| c.run_id.as_deref())
+        .and_then(|run_id| proj.and_then(|p| p.runs.iter().find(|r| r.id == run_id)).map(|r| r.provider_instance_id.clone()))
+        .or_else(|| proj.map(|p| p.thread.model_selection.instance_id.clone()));
+    let proj_subagents = proj.map(subagents_of).unwrap_or_default();
     let group = coordinator.as_ref().and_then(workflow_group);
     let name = group.as_ref().and_then(|g| g.name.as_deref()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let raw_desc = coordinator.as_ref().and_then(|s| s.title.as_deref()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let title = name.or_else(|| raw_desc.clone()).unwrap_or_else(|| "Workflow".to_owned());
     let description = raw_desc.filter(|d| d != &title);
+
+    let mut member_meta = HashMap::new();
+    if let Some(group) = &group {
+        for m in group.phases.iter().flat_map(|p| p.members.iter()).chain(group.unphased.iter()) {
+            let child_subagent = m
+                .child_thread_id
+                .as_deref()
+                .and_then(|cid| proj_subagents.iter().find(|s| s.child_thread_id.as_deref() == Some(cid)));
+            let raw_detail = if is_terminal_status(&m.status) {
+                m.result
+                    .as_deref()
+                    .or_else(|| child_subagent.and_then(|s| s.result.as_deref().or(s.progress.as_deref())))
+            } else {
+                child_subagent
+                    .and_then(|s| s.progress.as_deref().or(s.result.as_deref()))
+                    .or(m.result.as_deref())
+            };
+            let detail = raw_detail
+                .map(plain_detail)
+                .filter(|d| !d.is_empty());
+            let started_at_iso = if is_active_status(&m.status) {
+                m.started_at
+                    .and_then(epoch_ms_to_iso)
+                    .or_else(|| child_subagent.and_then(|s| s.started_at.clone()))
+            } else {
+                None
+            };
+            let elapsed = if started_at_iso.is_none() {
+                format_epoch_elapsed(m.started_at, m.completed_at, m.duration_ms)
+            } else {
+                None
+            };
+            member_meta.insert(
+                m.index,
+                WorkflowMemberMeta {
+                    provider_instance_id: default_instance_id.clone(),
+                    detail,
+                    started_at_iso,
+                    elapsed,
+                },
+            );
+        }
+    }
 
     let agents_summary = group.as_ref().and_then(|g| {
         let members: Vec<&WorkflowMember> = g.phases.iter().flat_map(|p| p.members.iter()).chain(g.unphased.iter()).collect();
@@ -117,49 +192,106 @@ fn resolve_workflow_opening_view(app: &AppState, thread_id: Option<&str>) -> Wor
         Some(format!("{} {noun} · {}", members.len(), parts.join(" · ")))
     });
 
-    WorkflowOpeningView { title, description, agents_summary, group }
+    WorkflowOpeningView { title, description, agents_summary, group, provider_instance_id: default_instance_id, member_meta }
 }
 
-fn workflow_member_row(id_prefix: &str, member: &WorkflowMember, state: &Entity<AppState>, cx: &App) -> AnyElement {
+fn workflow_member_row(
+    id_prefix: &str,
+    member: &WorkflowMember,
+    meta: Option<&WorkflowMemberMeta>,
+    marks: &[(String, ProviderMark)],
+    state: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
     let p = palette(cx);
-    let dot_color = if member.status == "failed" {
-        hsla(p.destructive)
-    } else if is_terminal_status(&member.status) {
-        hsla(p.muted_foreground).opacity(0.6)
-    } else {
-        hsla(p.warning_foreground)
+    let failed = member.status == "failed";
+    let dot_color = match member.status.as_str() {
+        "pending" | "running" | "waiting" => hsla(p.info),
+        "completed" => hsla(p.success),
+        "failed" => hsla(p.destructive),
+        _ => hsla(p.muted_foreground).opacity(0.6),
     };
     let label = subagent_display_title(&member.label);
     let child_id = member.child_thread_id.clone();
     let app_state = state.clone();
+    let instance_id = meta.and_then(|m| m.provider_instance_id.as_deref());
+    let detail = meta.and_then(|m| m.detail.clone());
+    let elapsed_view = if let Some(started_at) = meta.and_then(|m| m.started_at_iso.clone()) {
+        Some(
+            SubagentLiveElapsed {
+                item_id: SharedString::from(format!("wf:{id_prefix}:{}", member.index)),
+                started_at,
+            }
+            .into_any_element(),
+        )
+    } else {
+        meta.and_then(|m| m.elapsed.clone())
+            .map(|e| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(e).into_any_element())
+    };
+    let avatar = div()
+        .relative()
+        .size(px(20.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(hsla(p.muted))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(subagent_avatar(instance_id, marks, 13., cx))
+        .child(
+            div()
+                .absolute()
+                .bottom_0()
+                .right_0()
+                .size(px(6.))
+                .rounded_full()
+                .border_1()
+                .border_color(hsla(p.background))
+                .bg(dot_color),
+        );
     let row = h_flex()
         .id(SharedString::from(format!("wf-member:{id_prefix}:{}", member.index)))
         .w_full()
         .min_w_0()
         .justify_between()
-        .gap(px(8.))
+        .gap(px(10.))
         .px(px(8.))
-        .py(px(5.))
+        .py(px(6.))
         .rounded(px(6.))
         .child(
             h_flex()
                 .min_w_0()
                 .flex_1()
-                .gap(px(8.))
-                .child(div().size(px(7.)).rounded_full().flex_shrink_0().bg(dot_color))
-                .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(label)),
+                .gap(px(10.))
+                .child(avatar)
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(label))
+                        .when_some(detail, |col, text| {
+                            col.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(hsla(if failed { p.destructive } else { p.muted_foreground }))
+                                    .child(text),
+                            )
+                        }),
+                ),
         )
         .child(
             h_flex()
                 .flex_shrink_0()
                 .gap(px(4.))
-                .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(member.status.clone()))
-                .when(child_id.is_some(), |r| r.child(Icon::ChevronRight.render(px(12.), hsla(p.muted_foreground)).into_any_element())),
+                .children(elapsed_view)
+                .when(child_id.is_some(), |r| r.child(Icon::ChevronRight.render(px(14.), hsla(p.muted_foreground).opacity(0.6)).into_any_element())),
         );
     if let Some(tid) = child_id {
         focusable(
             row.cursor_pointer()
-                .hover(|s| s.bg(hsla(p.accent).opacity(0.35)))
+                .hover(|s| s.bg(hsla(p.accent).opacity(0.2)))
                 .on_click(move |_, _, cx| {
                     let target = tid.clone();
                     app_state.update(cx, |app, cx| app.open_related_thread(&target, cx));
@@ -177,7 +309,7 @@ struct WorkflowOpeningCard {
     id: SharedString,
     script: String,
     view: WorkflowOpeningView,
-    surface: gpui::Hsla,
+    marks: Vec<(String, ProviderMark)>,
     state: Entity<AppState>,
     actions: AnyElement,
 }
@@ -201,20 +333,18 @@ impl RenderOnce for WorkflowOpeningCard {
             .as_ref()
             .map(|g| g.unphased.iter().collect())
             .unwrap_or_default();
+        let member_meta = &self.view.member_meta;
+        let marks = &self.marks;
         v_flex()
             .group(ROW_GROUP)
             .w_full()
-            .items_end()
             .gap(px(4.))
             .child(
                 v_flex()
                     .w_full()
-                    .gap(px(8.))
-                    .p(px(12.))
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(hsla(p.border).opacity(0.6))
-                    .bg(self.surface)
+                    .gap(px(12.))
+                    .px(px(4.))
+                    .py(px(2.))
                     .child(
                         h_flex()
                             .items_start()
@@ -250,17 +380,21 @@ impl RenderOnce for WorkflowOpeningCard {
                             .child(
                                 h_flex()
                                     .gap(px(6.))
-                                    .px(px(4.))
+                                    .px(px(8.))
                                     .text_size(px(11.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(if phase_done { hsla(p.muted_foreground).opacity(0.8) } else { hsla(p.muted_foreground) })
                                     .child(div().min_w_0().truncate().child(phase.title.clone()))
                                     .child(div().flex_shrink_0().child(format!("{}/{}", phase.settled_count, phase.members.len()))),
                             )
-                            .children(phase.members.iter().map(|m| workflow_member_row(&format!("{}:p{}", self.id, phase.index), m, &self.state, cx)))
+                            .children(phase.members.iter().map(|m| {
+                                workflow_member_row(&format!("{}:p{}", self.id, phase.index), m, member_meta.get(&m.index), marks, &self.state, cx)
+                            }))
                     }))
                     .when(!unphased.is_empty(), |card| {
-                        card.children(unphased.into_iter().map(|m| workflow_member_row(&format!("{}:u", self.id), m, &self.state, cx)))
+                        card.children(unphased.into_iter().map(|m| {
+                            workflow_member_row(&format!("{}:u", self.id), m, member_meta.get(&m.index), marks, &self.state, cx)
+                        }))
                     })
                     .child(
                         v_flex()
@@ -308,7 +442,7 @@ impl RenderOnce for WorkflowOpeningCard {
                             }),
                     ),
             )
-            .child(self.actions)
+            .child(h_flex().w_full().justify_end().child(self.actions))
     }
 }
 
@@ -316,6 +450,7 @@ impl RenderOnce for WorkflowOpeningCard {
 struct CollapsibleAttributionCard {
     id: SharedString,
     is_automation: bool,
+    scheduled_task_id: Option<String>,
     label: String,
     preview: String,
     surface: gpui::Hsla,
@@ -336,14 +471,15 @@ impl RenderOnce for CollapsibleAttributionCard {
         let icon = if self.is_automation { Icon::CalendarClock } else { Icon::MessagesSquare };
         let app_state = self.state.clone();
         let source_thread_id = self.source_thread_id.clone();
+        let scheduled_task_id = self.scheduled_task_id.clone();
         let open_action = if self.is_automation {
             Some(ghost_text_button(
                 SharedString::from(format!("open-automation:{}", self.id)),
                 "Open automation",
                 Some(Icon::ExternalLink),
-                |_, _, cx| {
+                move |_, _, cx| {
                     cx.stop_propagation();
-                    crate::settings::open(t3_core::settings::search::Section::ScheduledTasks, cx);
+                    crate::settings::open_scheduled_task(scheduled_task_id.as_deref(), cx);
                 },
                 cx,
             ))
@@ -423,6 +559,9 @@ fn file_extension_badge(label: &str) -> Option<String> {
 }
 
 fn user_file_card_meta(card: &t3_core::timeline::UserFileCard) -> Option<String> {
+    if !card.downloadable {
+        return Some("Sending\u{2026}".to_owned());
+    }
     let ext = (!card.pasted_text).then(|| file_extension_badge(&card.label)).flatten();
     let size = card.size_bytes.map(t3_core::composer::attachments::format_size);
     match (ext, size) {
@@ -503,47 +642,49 @@ fn render_user_file_cards(
                     .bg(hsla(p.secondary).opacity(0.35))
                     .hover(|style| style.bg(hsla(p.accent).opacity(0.45)))
                     .child(interactive_content)
-                    .when_some(download_id.filter(|_| card.downloadable), |row, aid| {
-                        row.child(
-                            Button::new(SharedString::from(format!("user-file-dl:{id}:{index}")), ButtonVariant::Ghost, ButtonSize::IconXs)
-                                .icon(Icon::Download)
-                                .tooltip("Download file")
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    let dir = download_dir.as_deref().map(std::path::Path::new).unwrap_or_else(|| std::path::Path::new("/"));
-                                    let rx = cx.prompt_for_new_path(dir, Some(&label_for_download));
-                                    let app_state = download_state.clone();
-                                    let aid = aid.clone();
-                                    cx.spawn(async move |cx| {
-                                        let Ok(Ok(Some(path))) = rx.await else { return };
-                                        let (client, runtime) = app_state.read_with(cx, |s, _| (s.client_handle(), s.runtime().clone()));
-                                        let Some(client) = client else {
-                                            app_state.update(cx, |s, cx| {
-                                                s.show_toast(Toast::new(ToastKind::Error, "Not connected to server"), cx);
-                                            });
-                                            return;
-                                        };
-                                        let source = MediaSource::Asset(AssetResource::Attachment { attachment_id: aid });
-                                        let fetched = runtime
-                                            .spawn(async move { t3_client::assets::fetch_media(&client, &source).await })
-                                            .await
-                                            .unwrap_or_else(|_| Err("Download cancelled".to_owned()));
-                                        let result = match fetched {
-                                            Ok(media) => cx
-                                                .background_executor()
-                                                .spawn(async move { std::fs::write(&path, &media.bytes).map_err(|e| e.to_string()) })
-                                                .await,
-                                            Err(err) => Err(err),
-                                        };
-                                        if let Err(err) = result {
-                                            app_state.update(cx, |s, cx| {
-                                                s.show_toast(Toast::new(ToastKind::Error, "Failed to download file").description(err), cx);
-                                            });
-                                        }
-                                    })
-                                    .detach();
-                                }),
-                        )
+                    .child(match download_id.filter(|_| card.downloadable) {
+                        Some(aid) => Button::new(SharedString::from(format!("user-file-dl:{id}:{index}")), ButtonVariant::Ghost, ButtonSize::IconXs)
+                            .icon(Icon::Download)
+                            .tooltip("Download file")
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let dir = download_dir.as_deref().map(std::path::Path::new).unwrap_or_else(|| std::path::Path::new("/"));
+                                let rx = cx.prompt_for_new_path(dir, Some(&label_for_download));
+                                let app_state = download_state.clone();
+                                let aid = aid.clone();
+                                cx.spawn(async move |cx| {
+                                    let Ok(Ok(Some(path))) = rx.await else { return };
+                                    let (client, runtime) = app_state.read_with(cx, |s, _| (s.client_handle(), s.runtime().clone()));
+                                    let Some(client) = client else {
+                                        app_state.update(cx, |s, cx| {
+                                            s.show_toast(Toast::new(ToastKind::Error, "Not connected to server"), cx);
+                                        });
+                                        return;
+                                    };
+                                    let source = MediaSource::Asset(AssetResource::Attachment { attachment_id: aid });
+                                    let fetched = runtime
+                                        .spawn(async move { t3_client::assets::fetch_media(&client, &source).await })
+                                        .await
+                                        .unwrap_or_else(|_| Err("Download cancelled".to_owned()));
+                                    let result = match fetched {
+                                        Ok(media) => cx
+                                            .background_executor()
+                                            .spawn(async move { std::fs::write(&path, &media.bytes).map_err(|e| e.to_string()) })
+                                            .await,
+                                        Err(err) => Err(err),
+                                    };
+                                    if let Err(err) = result {
+                                        app_state.update(cx, |s, cx| {
+                                            s.show_toast(Toast::new(ToastKind::Error, "Failed to download file").description(err), cx);
+                                        });
+                                    }
+                                })
+                                .detach();
+                            }),
+                        None => Button::new(SharedString::from(format!("user-file-dl:{id}:{index}")), ButtonVariant::Ghost, ButtonSize::IconXs)
+                            .icon(Icon::Download)
+                            .disabled(true)
+                            .tooltip("Sending attachment"),
                     })
                     .into_any_element()
             }))
@@ -644,7 +785,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
     let copy_item = context_item.clone();
     let copy_state = env.state.clone();
     let copy_thread_id = env.thread_id.map(str::to_owned);
-    let prompt_link = t3_core::prompt_links::user_message_prompt_link(&raw_text);
+    let prompt_link = t3_core::prompt_links::user_message_prompt_link(display_text);
     let sending = matches!(item_status, Some("pending" | "waiting"));
     let error_status = item_status.filter(|s| !s.is_empty() && *s != "completed" && !matches!(*s, "pending" | "waiting")).map(str::to_owned);
     let actions = h_flex()
@@ -711,7 +852,10 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
     let model_switch = message.meta.model_switch.as_ref().and_then(|value| model_switch(value, &providers, cx));
 
     if is_workflow_script_message(message.role, &message.text, workflow_script.or(message.meta.workflow_script)) {
-        let workflow_view = resolve_workflow_opening_view(env.state.read(cx), env.thread_id);
+        let app_read = env.state.read(cx);
+        let workflow_view = resolve_workflow_opening_view(app_read, env.thread_id);
+        let marks = provider_marks(app_read);
+        let _ = app_read;
         return v_flex()
             .w_full()
             .children(fresh_divider)
@@ -720,7 +864,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                 id: SharedString::from(id.to_owned()),
                 script: message.text.to_string(),
                 view: workflow_view,
-                surface,
+                marks,
                 state: env.state.clone(),
                 actions,
             })
@@ -835,6 +979,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
             .child(CollapsibleAttributionCard {
                 id: SharedString::from(id.to_owned()),
                 is_automation,
+                scheduled_task_id: resolved.scheduled_task_id,
                 label,
                 preview,
                 surface,
@@ -921,9 +1066,15 @@ fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, 
         .into_any_element()
 }
 
-fn render_artifact_template_card(template: CodexArtifactTemplate, cx: &App) -> AnyElement {
+fn render_artifact_template_card(
+    id: SharedString,
+    template: CodexArtifactTemplate,
+    thread_id: Option<String>,
+    cx: &App,
+) -> AnyElement {
     let p = palette(cx);
     let subtitle = codex_artifact_template_presentation_label(&template.artifact_kind).unwrap_or("Artifact template");
+    let display_name = template.display_name.clone();
     h_flex()
         .w_full()
         .gap(px(10.))
@@ -946,8 +1097,15 @@ fn render_artifact_template_card(template: CodexArtifactTemplate, cx: &App) -> A
                 .min_w_0()
                 .flex_1()
                 .gap(px(1.))
-                .child(div().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(template.display_name))
+                .child(div().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(display_name))
                 .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(subtitle)),
+        )
+        .child(
+            Button::new(id, ButtonVariant::Outline, ButtonSize::Xs)
+                .label("Use template")
+                .on_click(move |_, window, cx| {
+                    crate::composer::insert_artifact_template(thread_id.as_deref(), &template, window, cx);
+                }),
         )
         .into_any_element()
 }
@@ -959,12 +1117,14 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
     let (id, show_meta, show_copy, copy_streaming) = (row.id.as_str(), *show_assistant_meta, *show_copy, *copy_streaming);
     let text: Arc<str> = if message.text.is_empty() && !message.streaming { Arc::from("(empty response)") } else { message.text.clone() };
     let segments = split_codex_assistant_segments(&text);
-    let has_artifact = segments.iter().any(|s| matches!(s, CodexAssistantSegment::ArtifactTemplate(_)));
-    let body = if !has_artifact {
-        let state = markdown.state(&format!("assistant:{id}"), &text, cx);
+    let body = if segments.len() == 1
+        && let CodexAssistantSegment::Markdown(rewritten) = &segments[0]
+    {
+        let source: Arc<str> = Arc::from(rewritten.as_str());
+        let state = markdown.state(&format!("assistant:{id}"), &source, cx);
         let selection_state = state.clone();
         let message_id = message.id.clone();
-        let full_text = text.clone();
+        let full_text = source.clone();
         div()
             .id(SharedString::from(format!("assistant-select:{id}")))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
@@ -973,6 +1133,7 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
             .child(prose(&state, cx))
             .into_any_element()
     } else {
+        let thread_id = env.thread_id.map(str::to_owned);
         v_flex()
             .gap(px(8.))
             .children(segments.into_iter().enumerate().map(|(seg_idx, segment)| match segment {
@@ -989,7 +1150,12 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
                         .child(prose(&state, cx))
                         .into_any_element()
                 }
-                CodexAssistantSegment::ArtifactTemplate(template) => render_artifact_template_card(template, cx),
+                CodexAssistantSegment::ArtifactTemplate(template) => render_artifact_template_card(
+                    SharedString::from(format!("use-template:{id}:{seg_idx}")),
+                    template,
+                    thread_id.clone(),
+                    cx,
+                ),
             }))
             .into_any_element()
     };
@@ -1407,8 +1573,21 @@ mod tests {
         let hidden_dot = t3_core::timeline::UserFileCard {
             label: ".gitignore".to_owned(),
             size_bytes: None,
-            ..regular
+            ..regular.clone()
         };
         assert_eq!(user_file_card_meta(&hidden_dot), None);
+
+        let unsent = t3_core::timeline::UserFileCard {
+            downloadable: false,
+            ..regular
+        };
+        assert_eq!(user_file_card_meta(&unsent).as_deref(), Some("Sending\u{2026}"));
+    }
+
+    #[test]
+    fn format_epoch_elapsed_formats_terminal_workflow_durations() {
+        assert_eq!(format_epoch_elapsed(Some(1_000), Some(66_500), None).as_deref(), Some("1m 5s"));
+        assert_eq!(format_epoch_elapsed(None, None, Some(400)).as_deref(), Some("1s"));
+        assert_eq!(format_epoch_elapsed(None, None, None), None);
     }
 }
