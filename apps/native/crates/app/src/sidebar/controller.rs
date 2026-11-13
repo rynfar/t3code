@@ -143,6 +143,13 @@ pub struct SidebarController {
     pub fleet_drag: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::sidebar::Section)>,
     pub shelves: ShelfState,
     pub(crate) settled_scope_keys: Vec<String>,
+    pub(crate) local_settled_scope_keys: Vec<String>,
+    pub(crate) built_at: Ms,
+    pub(crate) last_wake_at: Option<Ms>,
+    #[cfg(feature = "snapshot")]
+    pub(crate) snapshot_fixture: bool,
+    #[cfg(feature = "snapshot")]
+    pub(crate) now_override: Option<Ms>,
     pub settings: SidebarSettings,
     pub undo: UndoContexts,
     pub capabilities: ThreadCapabilities,
@@ -318,21 +325,34 @@ impl AppState {
         self.prepare_scoped_threads();
         self.sync_undo_contexts();
         self.release_stale_deletion(cx);
+        #[cfg(feature = "snapshot")]
+        let now = self.sidebar.now_override.unwrap_or_else(now_ms);
+        #[cfg(not(feature = "snapshot"))]
         let now = now_ms();
+        self.sidebar.built_at = now;
         let extras = self.omitted.mounts.extras(&self.shell);
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
         self.sidebar.hiding_tags = tags.is_some();
         let environment_id = self.server_config.config.as_ref().map(|config| config.environment.environment_id.as_str()).unwrap_or("local");
         self.sidebar.settings.grouping = crate::settings::store::client(cx).project_grouping_settings();
         self.sidebar.settings.grouping.environment_id = Some(environment_id.to_owned());
+        let ready = self.shell.synchronized && self.server_config.config.is_some();
+        let local_groups = self.shell.snapshot.as_ref().map(|snapshot| {
+            t3_core::sidebar::grouping::build_project_groups(environment_id, &snapshot.projects, &self.sidebar.settings.grouping)
+        }).unwrap_or_default();
         self.sidebar.project_scope = if self.sidebar.project_filter_scope.is_empty() {
             None
         } else {
-            let groups = self.shell.snapshot.as_ref().map(|snapshot| {
-                t3_core::sidebar::grouping::build_project_groups(environment_id, &snapshot.projects, &self.sidebar.settings.grouping)
-            }).unwrap_or_default();
-            self.sidebar.project_filter_scope.members(&groups, self.shell.synchronized && self.server_config.config.is_some())
+            self.sidebar.project_filter_scope.members(&local_groups, ready)
         };
+        if self.fleet.environments.is_empty() {
+            let mut scope_keys: Vec<String> = self.sidebar.project_filter_scope.resolved_keys(&local_groups, ready).into_iter().collect();
+            scope_keys.sort();
+            if self.sidebar.local_settled_scope_keys != scope_keys {
+                self.sidebar.local_settled_scope_keys = scope_keys;
+                self.sidebar.shelves.settled_visible = t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT;
+            }
+        }
         let threads: Vec<_> = self.shell.snapshot.iter().flat_map(|snapshot| snapshot.threads.iter()).chain(extras.iter().copied()).collect();
         self.sidebar.hidden_thread_ids = t3_core::sidebar::tag_filter::hidden_thread_keys(
             &[t3_core::sidebar::tag_filter::Environment { environment_id, threads: &threads, hidden_tags: tags.as_deref() }],
@@ -371,18 +391,27 @@ impl AppState {
             self.clear_selection(cx);
             return;
         }
-        self.grow_settled_shelf(listed_settled, cx);
-        self.sidebar.wake_timer = next.map(|at| {
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis((at - now).max(0) as u64 + 1)).await;
-                let _ = this.update(cx, |state, cx| {
-                    state.rebuild_sidebar(cx);
-                    cx.emit(AppEvent::Shell);
-                });
-            })
-        });
-        self.track_visit(cx);
-        self.rebuild_fleet_sidebar(cx);
+        #[cfg(feature = "snapshot")]
+        let fixture_frozen = self.sidebar.snapshot_fixture;
+        #[cfg(not(feature = "snapshot"))]
+        let fixture_frozen = false;
+        if self.fleet.environments.is_empty() && !fixture_frozen {
+            self.grow_settled_shelf(listed_settled, cx);
+            self.sidebar.wake_timer = next.map(|at| {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis((at - now).max(0) as u64 + 1)).await;
+                    let _ = this.update(cx, |state, cx| {
+                        state.sidebar.last_wake_at = Some(now_ms());
+                        state.rebuild_sidebar(cx);
+                        cx.emit(AppEvent::Shell);
+                    });
+                })
+            });
+        }
+        if !fixture_frozen {
+            self.track_visit(cx);
+        }
+        self.rebuild_fleet_sidebar(now, cx);
         if connected(&self.phase) {
             self.ensure_favicons(cx);
         }
@@ -410,11 +439,12 @@ impl AppState {
         }).collect();
     }
 
-    fn rebuild_fleet_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn rebuild_fleet_sidebar(&mut self, now: Ms, cx: &mut Context<Self>) {
         if self.fleet.environments.is_empty() { return; }
         self.reveal_scoped_route(cx);
         let groups = self.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
-        let scope_keys = self.scoped_project_scope(&groups);
+        let mut scope_keys = self.scoped_project_scope(&groups);
+        scope_keys.sort();
         if self.sidebar.settled_scope_keys != scope_keys {
             self.sidebar.settled_scope_keys = scope_keys;
             self.sidebar.shelves.settled_visible = t3_core::sidebar::SETTLED_TAIL_INITIAL_COUNT;
@@ -433,20 +463,34 @@ impl AppState {
         let model = t3_core::sidebar::fleet::ScopedSidebarModel::build_presented(&t3_core::sidebar::fleet::ScopedSidebarInput {
             environments: &environments, groups: &groups, preferences: &self.project_preferences,
             settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
-            older: &older, extra_threads: &extras, now: now_ms(), folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
+            older: &older, extra_threads: &extras, now, folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
             dragging: self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section),
         }, &mut self.sidebar.fleet_state);
         self.sidebar.fleet_selection.retain(|key| model.thread(key).is_some());
         let next = model.next_change_at;
         let listed = model.listed_settled_count;
         self.sidebar.fleet = Arc::new(model);
-        self.grow_scoped_settled_shelf(listed, cx);
-        if let Some(at) = next {
-            self.sidebar.wake_timer = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis((at - now_ms()).max(0) as u64 + 1)).await;
-                let _ = this.update(cx, |state, cx| { state.rebuild_sidebar(cx); cx.emit(AppEvent::Shell); cx.emit(AppEvent::Notice); });
-            }));
+        #[cfg(feature = "snapshot")]
+        if self.sidebar.snapshot_fixture {
+            self.sidebar.wake_timer = None;
+            return;
         }
+        let was_loading = self.settled_shelf_loading();
+        self.grow_scoped_settled_shelf(listed, cx);
+        if !was_loading && self.settled_shelf_loading() {
+            cx.emit(AppEvent::Notice);
+        }
+        self.sidebar.wake_timer = next.map(|at| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis((at - now).max(0) as u64 + 1)).await;
+                let _ = this.update(cx, |state, cx| {
+                    state.sidebar.last_wake_at = Some(now_ms());
+                    state.rebuild_sidebar(cx);
+                    cx.emit(AppEvent::Shell);
+                    cx.emit(AppEvent::Notice);
+                });
+            })
+        });
     }
 
 

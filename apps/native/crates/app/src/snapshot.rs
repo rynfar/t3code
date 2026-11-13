@@ -26,7 +26,7 @@ const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--ri
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
 [--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
-[--question-request-fixture <json>] [--question-staged-fixture <json>] [--question-command-output <json>] [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] [--composer-recovery-fixture] [--workspace-availability-fixture] [--composer-audit <json>] \
+[--question-request-fixture <json>] [--question-staged-fixture <json>] [--question-command-output <json>] [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--sidebar-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] [--composer-recovery-fixture] [--workspace-availability-fixture] [--composer-audit <json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-profile-prefix <path>] [--media-select-all] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--document-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
 
@@ -147,6 +147,14 @@ pub(crate) fn register_focus(id: &'static str, focus: gpui::FocusHandle, cx: &mu
 }
 
 #[derive(Default)]
+struct SidebarPaneTarget(Option<gpui::WeakEntity<crate::sidebar::SidebarPane>>);
+impl gpui::Global for SidebarPaneTarget {}
+
+pub(crate) fn register_sidebar_pane(pane: gpui::WeakEntity<crate::sidebar::SidebarPane>, cx: &mut gpui::App) {
+    cx.set_global(SidebarPaneTarget(Some(pane)));
+}
+
+#[derive(Default)]
 struct RenderCounts(std::cell::RefCell<std::collections::HashMap<&'static str, usize>>);
 impl gpui::Global for RenderCounts {}
 
@@ -256,6 +264,7 @@ pub struct Options {
     prompt_link_repository: Option<String>,
     prompt_link_fixture: Option<PathBuf>,
     project_grouping_fixture: Option<PathBuf>,
+    sidebar_fixture: Option<PathBuf>,
     clipboard_output: Option<PathBuf>,
     pull_requests: bool,
     pull_request: Option<u64>,
@@ -324,6 +333,7 @@ impl Options {
             prompt_link_repository: flag("--prompt-link-repository"),
             prompt_link_fixture: flag("--prompt-link-fixture").map(PathBuf::from),
             project_grouping_fixture: flag("--project-grouping-fixture").map(PathBuf::from),
+            sidebar_fixture: flag("--sidebar-fixture").map(PathBuf::from),
             clipboard_output: flag("--clipboard-output").map(PathBuf::from),
             pull_requests: has("--pull-requests"),
             pull_request: flag("--pull-request").and_then(|value| value.trim_start_matches('#').parse().ok()),
@@ -617,6 +627,9 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             state.rebuild_sidebar(cx);
             cx.emit(crate::app_state::AppEvent::Shell);
         });
+    }
+    if let Some(path) = &options.sidebar_fixture {
+        apply_sidebar_fixture(path, &state, window, options.wait, &mut cx)?;
     }
     if let Some(path) = &options.prompt_link_fixture {
         let configured = state.clone();
@@ -1066,5 +1079,310 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     }
     cx.update(|cx| crate::transcript::html_render::fixture::capture(&options.out, cx))?;
     image.save(&options.out).map_err(|error| error.to_string())
+}
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SidebarFixtureShelves {
+    working_expanded: Option<bool>,
+    snoozed_expanded: Option<bool>,
+    settled_expanded: Option<bool>,
+    settled_visible: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SidebarFleetEnvFixture {
+    saved_id: String,
+    environment_id: Option<String>,
+    label: String,
+    local: Option<bool>,
+    machine: Option<String>,
+    can_pin: Option<bool>,
+    projects: Vec<t3_core::shell::ProjectShell>,
+    threads: Vec<t3_core::shell::ThreadShell>,
+    older_settled: Option<t3_core::shell::OlderSettledCut>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SidebarFixture {
+    now_ms: Option<i64>,
+    working_shelf_enabled: Option<bool>,
+    boring_sidebar_enabled: Option<bool>,
+    shelves: Option<SidebarFixtureShelves>,
+    clear_selected_thread: Option<bool>,
+    selected_thread: Option<String>,
+    draft_project: Option<String>,
+    selected_threads: Option<Vec<String>>,
+    projects: Option<Vec<t3_core::shell::ProjectShell>>,
+    threads: Option<Vec<t3_core::shell::ThreadShell>>,
+    older_settled: Option<t3_core::shell::OlderSettledCut>,
+    page_status: Option<String>,
+    fleet: Option<Vec<SidebarFleetEnvFixture>>,
+    collapsed_folders: Option<Vec<String>>,
+    scoped_project_scope: Option<Vec<String>>,
+    open_project_filter: Option<[f32; 2]>,
+    project_filter_query: Option<String>,
+    project_filter_highlighted: Option<String>,
+    search_query: Option<String>,
+}
+
+fn apply_sidebar_fixture(
+    path: &std::path::Path,
+    state: &Entity<AppState>,
+    window: AnyWindowHandle,
+    wait: f32,
+    cx: &mut VisualTestAppContext,
+) -> Result<(), String> {
+    use t3_core::client_settings::ClientSettingChange;
+    use t3_core::sidebar::grouping::{EnvironmentOwner, GroupConsumer};
+    use t3_core::sidebar::older_settled::PageStatus;
+
+    let configured = state.clone();
+    pump(cx, wait, move |cx| configured.read_with(cx, |s, _| s.server_config.config.is_some()));
+    let fixture: SidebarFixture =
+        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+
+    if let Some(enabled) = fixture.working_shelf_enabled {
+        cx.update(|cx| crate::settings::store::update_client(state, ClientSettingChange::WorkingShelf(enabled), cx));
+    }
+    if let Some(enabled) = fixture.boring_sidebar_enabled {
+        cx.update(|cx| crate::settings::store::update_client(state, ClientSettingChange::BoringSidebarEnabled(enabled), cx));
+    }
+
+    let highlighted_key = state.update(cx, |state, cx| {
+        state.stop_pump();
+        state.freeze_snapshot();
+        state.sidebar.snapshot_fixture = true;
+        state.sidebar.now_override = fixture.now_ms;
+        if fixture.clear_selected_thread == Some(true) {
+            state.selected_thread = None;
+            state.draft_project = None;
+        }
+        if let Some(selected) = &fixture.selected_thread {
+            state.selected_thread = Some(selected.clone());
+            state.draft_project = None;
+        }
+        if let Some(draft) = &fixture.draft_project {
+            state.draft_project = Some(draft.clone());
+        }
+        if let Some(ids) = &fixture.selected_threads {
+            state.sidebar.selection = Default::default();
+            for id in ids {
+                state.sidebar.selection.toggle(id);
+            }
+        }
+
+        if let Some(entries) = &fixture.fleet {
+            let mut saved_envs = Vec::with_capacity(entries.len());
+            let mut views = Vec::with_capacity(entries.len());
+            let mut active_id = None;
+            for entry in entries {
+                let env_id = entry.environment_id.clone().unwrap_or_else(|| format!("env-{}", entry.saved_id));
+                let local = entry.local.unwrap_or(false);
+                if local && active_id.is_none() {
+                    active_id = Some(entry.saved_id.clone());
+                }
+                saved_envs.push(t3_client::store::SavedEnvironment {
+                    id: entry.saved_id.clone(),
+                    environment_id: Some(env_id.clone()),
+                    label: entry.label.clone(),
+                    disabled: false,
+                    http_base: format!("http://127.0.0.1/{}", entry.saved_id),
+                    access_token: Some("fixture-token".into()),
+                    server_version: None,
+                    local,
+                    ssh: None,
+                });
+                let mut shell = t3_core::shell::ShellState::default();
+                let mut snap = serde_json::json!({
+                    "snapshotSequence": 1,
+                    "projects": entry.projects,
+                    "threads": entry.threads,
+                });
+                if let Some(cut) = &entry.older_settled {
+                    snap["olderSettled"] = serde_json::to_value(cut).unwrap_or(serde_json::Value::Null);
+                }
+                shell.apply(
+                    serde_json::from_value(serde_json::json!({ "kind": "snapshot", "snapshot": snap }))
+                        .expect("sidebar fleet shell snapshot"),
+                );
+                shell.synchronized = true;
+                let mut config = t3_core::server_config::ServerConfigState::default();
+                let machine = entry.machine.as_deref().unwrap_or(if local { "laptop" } else { "cloud" });
+                let can_pin = entry.can_pin.unwrap_or(true);
+                config.apply(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "snapshot",
+                        "config": {
+                            "environment": {
+                                "environmentId": env_id,
+                                "label": entry.label,
+                                "platform": { "os": "macos", "arch": "arm64", "machine": machine },
+                                "capabilities": { "projectOrganization": can_pin }
+                            },
+                            "cwd": "/",
+                            "settings": {}
+                        }
+                    }))
+                    .expect("sidebar fleet server config"),
+                );
+                let owner = EnvironmentOwner {
+                    saved_id: entry.saved_id.clone(),
+                    canonical_id: Some(env_id),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: shell.generation,
+                };
+                let summary = Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(owner, &shell, &config));
+                let scopes = if can_pin {
+                    vec![
+                        t3_core::auth::ORCHESTRATION_READ_SCOPE.to_owned(),
+                        t3_core::auth::ORCHESTRATION_OPERATE_SCOPE.to_owned(),
+                    ]
+                } else {
+                    vec![t3_core::auth::ORCHESTRATION_READ_SCOPE.to_owned()]
+                };
+                views.push(Arc::new(t3_client::environments::EnvironmentView {
+                    summary,
+                    status: t3_client::supervisor::ConnectionStatus::Connected,
+                    config,
+                    grants: Some(t3_core::auth::AuthSessionState {
+                        authenticated: true,
+                        auth: Default::default(),
+                        scopes: Some(scopes.clone()),
+                        permissions: Some(scopes),
+                    }),
+                    settings_revision: 1,
+                    keybindings_revision: 1,
+                }));
+            }
+            if active_id.is_none() {
+                active_id = saved_envs.first().map(|e| e.id.clone());
+            }
+            state.environments.environments = saved_envs;
+            state.environments.active = active_id;
+            state.environments_saved = state.environments.clone();
+            state.fleet = Arc::new(t3_client::environments::FleetView {
+                revision: state.fleet.revision + 1,
+                environments: views,
+            });
+            state.sidebar.grouping_projects = state
+                .fleet
+                .environments
+                .iter()
+                .flat_map(|entry| entry.summary.projects.iter().cloned())
+                .collect();
+            state.sidebar.grouping_threads = state
+                .fleet
+                .environments
+                .iter()
+                .flat_map(|entry| entry.summary.threads.iter().cloned())
+                .collect();
+            state.ensure_scoped_favicons(cx);
+            let groups = state.project_groups_for(GroupConsumer::Sidebar, cx);
+            if let Some(collapsed) = &fixture.collapsed_folders {
+                for target in collapsed {
+                    if let Some(group) = groups.iter().find(|g| &g.key == target || &g.label == target) {
+                        state.project_preferences.project_expanded.insert(group.key.clone(), false);
+                    }
+                }
+            }
+            if let Some(scoped) = &fixture.scoped_project_scope {
+                state.project_preferences.scope_keys = scoped
+                    .iter()
+                    .filter_map(|target| groups.iter().find(|g| &g.key == target || &g.label == target).map(|g| g.key.clone()))
+                    .collect();
+            }
+        } else if fixture.projects.is_some() || fixture.threads.is_some() || fixture.older_settled.is_some() {
+            state.fleet = Default::default();
+            if let Some(snapshot) = state.shell.snapshot.as_mut() {
+                if let Some(projects) = &fixture.projects {
+                    snapshot.projects = projects.clone();
+                }
+                if let Some(threads) = &fixture.threads {
+                    snapshot.threads = threads.clone();
+                }
+                snapshot.older_settled = fixture.older_settled.clone();
+            }
+            state.omitted = Default::default();
+            let _ = state.omitted.counts.sync(&state.shell);
+            let older = state.omitted.older();
+            state.omitted.pages.sync(&state.shell, older.as_ref());
+        }
+
+        state.rebuild_sidebar(cx);
+        if let Some(shelves) = &fixture.shelves {
+            if let Some(v) = shelves.working_expanded {
+                state.sidebar.shelves.working_expanded = v;
+            }
+            if let Some(v) = shelves.snoozed_expanded {
+                state.sidebar.shelves.snoozed_expanded = v;
+            }
+            if let Some(v) = shelves.settled_expanded {
+                state.sidebar.shelves.settled_expanded = v;
+            }
+            if let Some(v) = shelves.settled_visible {
+                state.sidebar.shelves.settled_visible = v;
+            }
+            state.rebuild_sidebar(cx);
+        }
+        if let Some(status) = fixture.page_status.as_deref() {
+            state.omitted.pages.status = match status {
+                "pending" => PageStatus::Pending,
+                "failed" => PageStatus::Failed,
+                _ => PageStatus::Ready,
+            };
+        }
+        let resolved_highlight = fixture.project_filter_highlighted.as_ref().map(|target| {
+            if !state.fleet.environments.is_empty() {
+                state
+                    .project_groups_for(GroupConsumer::Sidebar, cx)
+                    .into_iter()
+                    .find(|g| &g.key == target || &g.label == target)
+                    .map(|g| g.key)
+                    .unwrap_or_else(|| target.clone())
+            } else {
+                target.clone()
+            }
+        });
+        cx.emit(crate::app_state::AppEvent::Shell);
+        cx.emit(crate::app_state::AppEvent::SidebarSelection);
+        cx.emit(crate::app_state::AppEvent::Notice);
+        resolved_highlight
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        let Some(pane) = cx
+            .try_global::<SidebarPaneTarget>()
+            .and_then(|target| target.0.as_ref())
+            .and_then(gpui::WeakEntity::upgrade)
+        else {
+            return;
+        };
+        pane.update(cx, |pane, cx| {
+            if let Some(now) = fixture.now_ms {
+                pane.now_override = Some(now);
+                pane.now = now;
+                pane.clock = None;
+            }
+            if let Some([x, y]) = fixture.open_project_filter {
+                pane.project_filter = Some(point(px(x), px(y)));
+            }
+            if let Some(query) = &fixture.project_filter_query {
+                pane.project_filter_search.update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+            }
+            if let Some(highlighted) = highlighted_key {
+                pane.project_filter_highlighted = Some(highlighted);
+            }
+            if let Some(query) = &fixture.search_query {
+                pane.search_input.update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+            }
+            cx.notify();
+        });
+    })
+    .map_err(|e| e.to_string())?;
+    pump(cx, 0.2, |_| false);
+    Ok(())
 }
