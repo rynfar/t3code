@@ -25,7 +25,7 @@ pub use view::DetailsView;
 use crate::app_state::AppState;
 use crate::git::GitStore;
 use crate::theme::metrics;
-use crate::workspace::SIDEBAR_WIDTH;
+use crate::workspace::sidebar_inline_width;
 
 actions!(thread_details, [ToggleThreadPanel, OpenFavoriteEditor]);
 
@@ -213,7 +213,7 @@ pub fn project_scripts(state: &AppState) -> Option<(String, Vec<ProjectScript>)>
 
 /// How wide the chat canvas is: the window minus the sidebar and an inline right panel.
 fn canvas_width(state: &AppState, viewport_width: f32) -> f32 {
-    let sidebar = if state.sidebar.collapsed { 0. } else { SIDEBAR_WIDTH };
+    let sidebar = sidebar_inline_width(state, viewport_width);
     let row = viewport_width - sidebar;
     let panel = state.selected_thread.as_deref().map_or(0., |thread| {
         let panel = state.panels.panels.panel(thread);

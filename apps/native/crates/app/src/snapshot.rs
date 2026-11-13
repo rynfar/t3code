@@ -839,7 +839,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         // Dropped inside the composer's card: at the bottom of a thread, mid-page on a draft.
         let draft = state.read_with(&cx, |state, _| state.selected_thread.is_none() && state.draft_project.is_some());
         let y = if draft { options.height * 0.55 } else { options.height - 40. };
-        let position = gpui::point(px((crate::workspace::SIDEBAR_WIDTH + options.width) / 2.), px(y));
+        let position = gpui::point(px((t3_core::sidebar::layout::DEFAULT_WIDTH + options.width) / 2.), px(y));
         let paths = gpui::ExternalPaths(options.attach.clone().into());
         cx.simulate_event(window, gpui::FileDropEvent::Entered { position, paths });
         cx.simulate_event(window, gpui::FileDropEvent::Submit { position });

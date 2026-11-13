@@ -266,7 +266,7 @@ impl PromptLinks {
     }
 }
 impl Render for PromptLinks {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some((title, description)) = self.page.clone() else {
             return div().into_any_element();
         };
@@ -274,11 +274,7 @@ impl Render for PromptLinks {
         div()
             .absolute()
             .top(px(52.))
-            .left(px(if self.state.read(cx).sidebar.collapsed {
-                0.
-            } else {
-                crate::workspace::SIDEBAR_WIDTH
-            }))
+            .left(px(crate::workspace::sidebar_inline_width(self.state.read(cx), f32::from(window.viewport_size().width))))
             .right_0()
             .bottom_0()
             .occlude()
