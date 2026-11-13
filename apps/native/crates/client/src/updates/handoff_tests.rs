@@ -193,3 +193,90 @@ async fn malformed_desktop_preparation_never_commits_a_token() {
         script.finished();
     }
 }
+
+struct ChannelScript(Script);
+impl UpdateTransport for ChannelScript {
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+    async fn request(&self, method: &'static str, input: Value) -> Result<Value, RpcError> {
+        match self.0.next() {
+            Some(Step::Request(expected, result)) => {
+                assert_eq!(method, expected);
+                if method == "server.updateServer" {
+                    assert_eq!(input["channel"], "latest");
+                    assert_eq!(input["targetDatabaseMigration"], 69);
+                }
+                result
+            }
+            _ => panic!("unexpected RPC {method}"),
+        }
+    }
+    async fn reconnected(&self, after: u64) -> Result<(), RpcError> {
+        self.0.reconnected(after).await
+    }
+    async fn next_ready(&self, result: &Value) -> Result<Value, RpcError> {
+        self.0.next_ready(result).await
+    }
+}
+
+#[tokio::test]
+async fn channel_switch_passes_channel_migration_and_track_only_without_restarting() {
+    let script = ChannelScript(Script::new([Step::Request(
+        "server.updateServer",
+        Ok(json!({"targetVersion":"0.1.3","method":"desktop-app"})),
+    )]));
+    let mut stages = Vec::new();
+    let options = ServerRequestOptions {
+        channel: Some(t3_core::updates::UpdateTrack::Latest),
+        release_channel: Some(t3_core::updates::UpdateTrack::Latest),
+        target_database_migration: Some(69),
+        track_only: true,
+    };
+    assert_eq!(
+        update_with_options(&script, "0.1.3", "desktop-managed", &options, |stage, _| {
+            stages.push(stage)
+        })
+        .await,
+        Ok(())
+    );
+    script.0.finished();
+    assert_eq!(stages, [t3_core::updates::ServerUpdateStage::Downloading]);
+}
+
+#[tokio::test]
+async fn update_with_options_reports_server_response_version_on_handoff() {
+    let script = Script::new([
+        Step::Request(
+            "server.updateServer",
+            Ok(json!({
+                "method": "desktop-app",
+                "targetVersion": "0.2.1-feed",
+                "desktopUpdateToken": "prepared"
+            })),
+        ),
+        Step::Request("server.commitDesktopUpdate", Ok(json!({}))),
+        Step::Ready(json!({
+            "type": "ready",
+            "payload": { "environment": { "serverVersion": "0.2.1-feed" } }
+        })),
+    ]);
+    let mut handed_off = None;
+    assert_eq!(
+        update_with_options(
+            &script,
+            "0.2.0",
+            "desktop-managed",
+            &ServerRequestOptions::default(),
+            |stage, version| {
+                if stage == ServerUpdateStage::Resuming {
+                    handed_off = version.map(str::to_owned);
+                }
+            },
+        )
+        .await,
+        Ok(())
+    );
+    script.finished();
+    assert_eq!(handed_off.as_deref(), Some("0.2.1-feed"));
+}

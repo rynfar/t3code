@@ -495,6 +495,8 @@ pub struct EnvironmentCapabilities {
     pub server_self_update: Option<String>,
     #[serde(default)]
     pub desktop_app_update: Option<bool>,
+    #[serde(default)]
+    pub desktop_app_channel_switch: Option<bool>,
     /// File attachments and the largest upload the server takes; absent when it takes none.
     #[serde(default, deserialize_with = "lenient_option")]
     pub file_attachments: Option<FileAttachmentsCapability>,
@@ -553,6 +555,8 @@ pub struct EnvironmentDescriptor {
     pub server_version: String,
     #[serde(default)]
     pub orchestration_protocol_version: Option<u32>,
+    #[serde(default)]
+    pub database_migration: Option<u64>,
     #[serde(default)]
     pub capabilities: EnvironmentCapabilities,
     #[serde(default, deserialize_with = "lenient_option")]
