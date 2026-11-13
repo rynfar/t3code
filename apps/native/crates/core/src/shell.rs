@@ -116,6 +116,9 @@ pub struct ThreadShell {
     #[serde(default, deserialize_with = "stored_tags", skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     pub provider_instance_id: String,
+    /// Instances the thread ran on before, oldest first (`providerInstanceHistory`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_instance_history: Vec<String>,
     pub model_selection: ModelSelection,
     pub runtime_mode: String,
     pub interaction_mode: String,

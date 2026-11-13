@@ -124,25 +124,7 @@ pub(crate) fn shell(
                 .as_ref()
                 .filter(|c| c.environment.environment_id == field(record, "environmentId"))
             {
-                icon = match config
-                    .settings
-                    .environment_icon
-                    .as_deref()
-                    .or(config
-                        .environment
-                        .platform
-                        .as_ref()
-                        .map(|p| p.machine.as_str()))
-                    .unwrap_or("server")
-                {
-                    "laptop" => Icon::Laptop,
-                    "desktop" => Icon::Monitor,
-                    "cloud" => Icon::Cloud,
-                    "linux" => Icon::Linux,
-                    "mac-mini" => Icon::MacMini,
-                    "mac-studio" => Icon::MacStudio,
-                    _ => Icon::Server,
-                };
+                icon = Icon::machine(config);
             }
         }
     }

@@ -81,9 +81,34 @@ pub struct SidebarThread {
     pub last_visited_at: Option<Ms>,
     pub regenerating_title: bool,
     pub opens: Option<crate::search::ThreadOpenStats>,
+    /// The thread's own instance, which the runtime reports while one exists.
+    pub provider_instance_id: String,
+    pub provider_instance_history: Vec<String>,
+    pub pull_requests: Vec<crate::pull_requests::link::ThreadLink>,
 }
 
+/// `THREAD_PROVIDER_STACK_LIMIT`.
+const PROVIDER_STACK_LIMIT: usize = 3;
+
 impl SidebarThread {
+    /// `resolveThreadProviderStack`: earlier instances, oldest first, then the current one last.
+    pub fn provider_stack(&self) -> Vec<&str> {
+        let current = if self.runtime.is_some() { self.provider_instance_id.as_str() } else { self.model_selection.instance_id.as_str() };
+        let previous: Vec<&str> = self.provider_instance_history.iter().map(String::as_str).filter(|id| *id != current).collect();
+        let keep = previous.len().saturating_sub(PROVIDER_STACK_LIMIT - 1);
+        previous[keep..].iter().copied().chain(std::iter::once(current)).collect()
+    }
+
+    /// `ThreadWorktreeIndicator`'s label, when the thread runs in a worktree.
+    pub fn worktree_label(&self) -> Option<String> {
+        let path = self.worktree_path.as_deref().map(str::trim).filter(|path| !path.is_empty())?;
+        let display = worktree_display_name(path);
+        Some(match self.branch.as_deref() {
+            Some(branch) if !branch.is_empty() => format!("Worktree: {display} ({branch})"),
+            _ => format!("Worktree: {display}"),
+        })
+    }
+
     pub fn is_settled(&self) -> bool {
         self.settled_override == Some(SettledOverride::Settled)
     }
@@ -96,6 +121,13 @@ impl SidebarThread {
             _ => true,
         }
     }
+}
+
+/// `formatWorktreePathForDisplay` (`apps/web/src/worktreeCleanup.ts`): the last path segment.
+pub fn worktree_display_name(path: &str) -> &str {
+    let trimmed = path.trim();
+    let normalized = trimmed.trim_end_matches(['/', '\\']);
+    normalized.rsplit(['/', '\\']).next().map(str::trim).filter(|last| !last.is_empty()).unwrap_or(trimmed)
 }
 
 /// `backgroundWorkHoldsCompletion`: commands and monitors hold only when awaited.
@@ -184,6 +216,9 @@ pub fn present_thread(thread: &ThreadShell, pending_subagent_request: Option<Sub
         last_visited_at: parse_opt(thread.last_visited_at.as_deref()),
         regenerating_title: thread.title_regeneration.as_ref().is_some_and(|value| !value.is_null()),
         opens: thread.opens.clone().and_then(|opens| serde_json::from_value(opens).ok()),
+        provider_instance_id: thread.provider_instance_id.clone(),
+        provider_instance_history: thread.provider_instance_history.clone(),
+        pull_requests: thread.pull_requests.clone(),
     }
 }
 

@@ -13,6 +13,7 @@ use t3_core::sidebar::{Section, Shelf, SidebarRow, sort::settled_timestamp};
 use super::SidebarPane;
 use super::drag::{DraggedThread, ThreadDragPreview, ThreadHoverCard};
 use crate::icons::Icon;
+use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::theme::{Palette, hsla, palette};
 
 const CARD_CONTENT_HEIGHT: f32 = 78.;
@@ -46,6 +47,9 @@ fn tone_color(tone: StatusTone, p: Palette) -> u32 {
 
 struct RowState {
     active: bool,
+    selected: bool,
+    /// The thread holds an unsent draft (`hasUnsentDraft`).
+    draft: bool,
     status: ThreadStatus,
     top: Option<TopStatus>,
     recede: bool,
@@ -54,16 +58,18 @@ struct RowState {
     is_woke: bool,
 }
 
-fn row_state(thread: &SidebarThread, active: bool, now: i64) -> RowState {
+fn row_state(thread: &SidebarThread, active: bool, selected: bool, draft: bool, now: i64) -> RowState {
     let status = status::resolve_status(thread);
     let unread = status::has_unseen_completion(thread);
     let woke_at = settled::woke_at(thread, now);
     let is_woke = woke_at.is_some_and(|woke| thread.last_visited_at.is_none_or(|visited| visited < woke)) && !thread.is_settled();
     RowState {
         active,
+        selected,
+        draft,
         status,
         top: status::top_status(status, thread.goal_active, is_woke, unread),
-        recede: status::should_recede(status, unread, is_woke, active),
+        recede: status::should_recede(status, unread, is_woke, active, selected),
         unread,
         woke_at,
         is_woke,
@@ -84,6 +90,26 @@ fn hover_action(id: SharedString, p: Palette) -> gpui::Stateful<gpui::Div> {
         .text_color(hsla(p.muted_foreground))
         .cursor_pointer()
         .hover(|this| this.text_color(hsla(p.foreground)))
+}
+
+/// What a row shows besides its status: the unsent-draft mark, running terminals, the provider
+/// stack and, for another environment's thread, its machine.
+struct RowExtras {
+    draft: bool,
+    running: Vec<String>,
+    /// Earlier instances first; the last is the current one, which carries the badge.
+    stack: Vec<ProviderMark>,
+    remote: Option<Icon>,
+    /// A pull request badge shows.
+    pr: bool,
+}
+
+impl RowExtras {
+    /// Only the trailing icons would remain, so the card moves them to the title line instead
+    /// (`metaLineEmpty`; diff counts are not collected, as on the web).
+    fn meta_line_empty(&self, thread: &SidebarThread) -> bool {
+        thread.branch.as_deref().is_none_or(str::is_empty) && !self.pr && self.running.is_empty()
+    }
 }
 
 impl SidebarPane {
@@ -152,8 +178,9 @@ impl SidebarPane {
         let clicked_key = key.cloned();
         let menu_key = key.cloned();
         let state = self.state.read(cx);
-        let selected = !active && key.map_or_else(|| state.sidebar.selection.contains(&thread.id), |key| state.sidebar.fleet_selection.contains(key));
+        let selected = row.selected;
         let hover_bg = !active && !selected;
+        let draft_bg = hover_bg && row.draft;
         let dragging = key.map_or_else(|| state.sidebar.drag.as_ref().is_some_and(|(dragged, _)| *dragged == thread.id), |key| state.sidebar.fleet_drag.as_ref().is_some_and(|(dragged, _)| dragged == key));
         let draggable = section != Section::Working && key.map_or(state.sidebar.capabilities.can_operate, |key| crate::context_menu::ThreadMenuOwner::capture_scoped(state, key).is_some_and(|owner| owner.can_operate_owner(state))) && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != thread.id);
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
@@ -170,11 +197,12 @@ impl SidebarPane {
             .cursor_pointer()
             .when(active, |this| this.bg(hsla(p.sidebar_row_active)).when(light, |this| this.shadow(vec![ring.clone()])))
             .when(selected, |this| this.bg(hsla(p.sidebar_row_selected)).when(light, |this| this.shadow(vec![ring.clone()])))
+            .when(draft_bg, |this| this.bg(hsla(p.warning).opacity(0.04)))
             .when(recede_working, |this| this.opacity(0.7))
             // GPUI allows one hover style per element: the background and the receding row's full opacity share it.
             .when(hover_bg || recede_working, |this| {
                 this.hover(|style| {
-                    let style = if hover_bg { style.bg(hsla(p.sidebar_row_hover)) } else { style };
+                    let style = if draft_bg { style.bg(hsla(p.warning).opacity(0.08)) } else if hover_bg { style.bg(hsla(p.sidebar_row_hover)) } else { style };
                     if recede_working { style.opacity(1.) } else { style }
                 })
             })
@@ -280,10 +308,112 @@ impl SidebarPane {
         )
     }
 
+    /// Multi-selection paints over everything but the current row.
+    fn is_selected(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, active: bool, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        !active && key.map_or_else(|| state.sidebar.selection.contains(&thread.id), |key| state.sidebar.fleet_selection.contains(key))
+    }
+
+    fn row_extras(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, active: bool, cx: &App) -> RowExtras {
+        let state = self.state.read(cx);
+        let current_environment = key.is_none_or(|key| state.environments.active.as_deref() == Some(key.environment_id.as_str()));
+        // The open thread's composer is the draft itself, so its row shows no mark.
+        let draft = !active && self.composer.read(cx).sidebar_drafts().get(&t3_core::composer::drafts::thread_key(&thread.id)).is_some_and(|draft| draft.has_user_content());
+        // Terminal metadata follows the current connection only.
+        let running = current_environment.then(|| cx.try_global::<crate::terminal::RunningTerminals>().and_then(|running| running.by_thread.get(&thread.id).cloned())).flatten().unwrap_or_default();
+        let config = match key {
+            Some(key) => state.fleet.environment(&key.environment_id).and_then(|environment| environment.config.config.as_ref()),
+            None => state.server_config.config.as_ref(),
+        };
+        let stack = config.map(|config| {
+            let entries = t3_core::providers::entries(config, Some(&thread.project_id));
+            let ids = thread.provider_stack();
+            let Some((current, previous)) = ids.split_last() else { return Vec::new() };
+            let Some(current) = entries.iter().find(|entry| entry.instance_id() == *current) else { return Vec::new() };
+            previous.iter().filter_map(|id| entries.iter().find(|entry| entry.instance_id() == *id)).chain(std::iter::once(current)).map(|entry| ProviderMark::of(entry, &entries)).collect()
+        }).unwrap_or_default();
+        RowExtras { draft, running, stack, remote: (!current_environment).then(|| config.map(Icon::machine).unwrap_or(Icon::Server)), pr: false }
+    }
+
+    fn render_pr_badge(&self, _key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, _thread: &SidebarThread, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        None
+    }
+
+    /// `SidebarProviderStack` with the remote machine before it: earlier instances small, faded and
+    /// gray; the current one compact with its instance badge.
+    fn render_trailing_icons(&self, extras: &RowExtras, cx: &App) -> Option<AnyElement> {
+        if extras.stack.is_empty() && extras.remote.is_none() { return None; }
+        let p = palette(cx);
+        let last = extras.stack.len().saturating_sub(1);
+        let stack = extras.stack.iter().enumerate().map(|(index, mark)| {
+            let icon = ProviderIcon::new(mark.clone());
+            if index == last { icon.size(px(16.)).badge(BadgeSize::Compact, hsla(p.sidebar)).faded(0.6, false).into_any_element() }
+            else { icon.size(px(12.)).faded(0.35, true).into_any_element() }
+        });
+        Some(
+            div().flex_none().flex().items_center().gap(px(4.))
+                .children(extras.remote.map(|icon| icon.render(px(14.), hsla(p.sidebar_muted_foreground).opacity(0.7))))
+                .child(div().flex().items_center().gap(px(6.)).children(stack))
+                .into_any_element(),
+        )
+    }
+
+    /// `ThreadTerminalStatusButton`: opens the first running terminal in the thread's drawer.
+    fn render_terminal_button(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, running: &[String], cx: &mut Context<Self>) -> Option<AnyElement> {
+        let terminal_id = running.first()?.clone();
+        let label: SharedString = if running.len() == 1 { "1 terminal process running. Open terminal".into() } else { format!("{} terminal processes running. Open terminal", running.len()).into() };
+        let id = thread.id.clone();
+        let key = key.cloned();
+        Some(
+            div()
+                .id(SharedString::from(format!("terminal-status-{}", thread.id)))
+                .flex_none()
+                .cursor_pointer()
+                .text_color(hsla(palette(cx).terminal_running))
+                .hover(|this| this.opacity(0.8))
+                .child(Icon::Terminal.sized(px(14.)))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.state.update(cx, |state, cx| match &key {
+                        Some(key) => state.click_scoped_sidebar_thread(key, gpui::Modifiers::default(), cx),
+                        None => state.click_sidebar_thread(&id, gpui::Modifiers::default(), cx),
+                    });
+                    window.dispatch_action(Box::new(crate::worktree_setup::OpenSetupTerminal { terminal_id: terminal_id.clone() }), cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The pen that marks a thread holding an unsent draft (`draftIndicator`).
+    fn render_draft_pen(&self, thread: &SidebarThread, cx: &App) -> AnyElement {
+        div()
+            .id(SharedString::from(format!("draft-indicator-{}", thread.id)))
+            .flex_none()
+            .child(Icon::SquarePen.render(px(12.), hsla(palette(cx).warning_foreground)))
+            .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Unsent draft").build(window, cx))
+            .into_any_element()
+    }
+
+    /// `ThreadWorktreeIndicator`.
+    fn render_worktree_icon(&self, thread: &SidebarThread, cx: &App) -> Option<AnyElement> {
+        let label: SharedString = thread.worktree_label()?.into();
+        Some(
+            div()
+                .id(SharedString::from(format!("thread-worktree-{}", thread.id)))
+                .flex_none()
+                .child(Icon::FolderGit2.render(px(14.), hsla(palette(cx).icon_muted)))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                .into_any_element(),
+        )
+    }
+
     fn render_card(&mut self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let now = self.now;
-        let state = row_state(thread, active, now);
+        let extras = self.row_extras(key, thread, active, cx);
+        let state = row_state(thread, active, self.is_selected(key, thread, active, cx), extras.draft, now);
         let show_snooze = super::snooze_access(self.state.read(cx)) && settled::can_snooze(thread, now);
         let title_color = if state.recede {
             hsla(p.foreground).opacity(0.75)
@@ -367,7 +497,11 @@ impl SidebarPane {
                     });
                 },
             )));
-        let meta = thread.branch.clone().map(|branch| {
+        let meta_empty = extras.meta_line_empty(thread);
+        let trailing = self.render_trailing_icons(&extras, cx);
+        let (title_icons, meta_icons) = if meta_empty { (trailing, None) } else { (None, trailing) };
+        let meta = (!meta_empty).then(|| {
+            let branch = thread.branch.clone().filter(|branch| !branch.is_empty());
             div()
                 .mt(px(2.))
                 .flex()
@@ -376,8 +510,11 @@ impl SidebarPane {
                 .min_w_0()
                 .text_xs()
                 .text_color(hsla(p.sidebar_secondary_label))
-                .child(Icon::GitBranch.sized(px(12.)))
-                .child(div().flex_1().min_w_0().truncate().child(branch))
+                .children(branch.is_some().then(|| self.render_worktree_icon(thread, cx)).flatten())
+                .child(div().flex_1().min_w_0().truncate().children(branch))
+                .children(self.render_terminal_button(key, thread, &extras.running, cx))
+                .children(self.render_pr_badge(key, thread, cx))
+                .children(meta_icons.map(|icons| div().ml_auto().child(icons)))
         });
         let has_meta = meta.is_some();
         div()
@@ -397,6 +534,7 @@ impl SidebarPane {
                                 .items_center()
                                 .gap(px(6.))
                                 .min_w_0()
+                                .when(extras.draft, |this| this.child(self.render_draft_pen(thread, cx)))
                                 .child(self.favicon(&thread.project_id, false, cx))
                                 .children(self.pin_indicator(key, thread, cx))
                                 .child(
@@ -424,7 +562,7 @@ impl SidebarPane {
                                         }),
                                 ),
                         )
-                        .child(div().mt(px(4.)).flex().items_center().gap(px(6.)).min_w_0().child(self.render_title(key, thread, title_color, state.recede, cx)))
+                        .child(div().mt(px(4.)).flex().items_center().gap(px(6.)).min_w_0().child(self.render_title(key, thread, title_color, state.recede, cx)).children(title_icons))
                         .children(meta),
                 ),
             )
@@ -434,7 +572,8 @@ impl SidebarPane {
     fn render_slim(&mut self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, project: Option<String>, section: Section, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let now = self.now;
-        let state = row_state(thread, active, now);
+        let extras = self.row_extras(key, thread, active, cx);
+        let state = row_state(thread, active, self.is_selected(key, thread, active, cx), extras.draft, now);
         let title_color = if state.recede {
             hsla(p.secondary_label)
         } else if active || state.is_woke || matches!(state.status, ThreadStatus::Input | ThreadStatus::Request) {
@@ -502,8 +641,10 @@ impl SidebarPane {
                         .gap(px(10.))
                         .px(px(10.))
                         .child(self.scoped_favicon(key, &thread.project_id, !active && section != Section::Settled, cx))
+                        .when(extras.draft, |this| this.child(self.render_draft_pen(thread, cx)))
                         .child(self.render_title(key, thread, title_color, state.recede, cx))
                         .children(self.pin_indicator(key, thread, cx))
+                        .children(self.render_terminal_button(key, thread, &extras.running, cx))
                         .child(
                             div()
                                 .relative()

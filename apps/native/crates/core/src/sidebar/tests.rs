@@ -61,6 +61,9 @@ fn base(id: &str) -> SidebarThread {
         last_visited_at: None,
         regenerating_title: false,
         opens: None,
+        provider_instance_id: "codex".into(),
+        provider_instance_history: Vec::new(),
+        pull_requests: Vec::new(),
     }
 }
 
@@ -491,8 +494,8 @@ fn sidebar_status_follows_the_web_priority() {
     for goal_active in [false, true] {
         assert_eq!(top_status(resolve_status(&preparing), goal_active, true, true), Some(TopStatus { label: "Setting up", icon: StatusIcon::Working, tone: StatusTone::Info }));
     }
-    assert!(should_recede(resolve_status(&preparing), true, true, false));
-    assert!(!should_recede(resolve_status(&preparing), false, false, true));
+    assert!(should_recede(resolve_status(&preparing), true, true, false, false));
+    assert!(!should_recede(resolve_status(&preparing), false, false, true, false));
     assert!(is_thread_working(&preparing));
     for (approval, input, subagent, guest, expected) in [
         (false, false, None, 1, ThreadStatus::Request),
@@ -562,10 +565,39 @@ fn unseen_completion_needs_a_visit_older_than_the_completion() {
     assert!(has_unseen_failure(&failed));
     assert_eq!(top_status(ThreadStatus::Ready, false, false, true).map(|s| s.label), Some("Done"));
     assert_eq!(top_status(ThreadStatus::Working, true, false, false).map(|s| s.label), Some("Goal"));
-    assert!(should_recede(ThreadStatus::Ready, false, false, false));
-    assert!(!should_recede(ThreadStatus::Ready, true, false, false));
-    assert!(!should_recede(ThreadStatus::Input, false, false, false));
-    assert!(!should_recede(ThreadStatus::Working, false, false, true));
+    assert!(should_recede(ThreadStatus::Ready, false, false, false, false));
+    assert!(!should_recede(ThreadStatus::Ready, true, false, false, false));
+    assert!(!should_recede(ThreadStatus::Input, false, false, false, false));
+    assert!(!should_recede(ThreadStatus::Working, false, false, true, false));
+    // A multi-selected row never recedes, like the current one.
+    assert!(!should_recede(ThreadStatus::Working, false, false, false, true));
+    assert!(!should_recede(ThreadStatus::Ready, false, false, false, true));
+}
+
+#[test]
+fn provider_stack_keeps_two_earlier_instances_and_the_live_one_last() {
+    let history = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    // Without a runtime the model selection (`codex`) names the current instance.
+    let idle = SidebarThread { provider_instance_id: "stale".into(), provider_instance_history: history(&["claude", "codex"]), ..base("s") };
+    assert_eq!(idle.provider_stack(), ["claude", "codex"]);
+    let live = SidebarThread {
+        runtime: Some(runtime("running")),
+        provider_instance_id: "cursor".into(),
+        provider_instance_history: history(&["a", "cursor", "b", "c"]),
+        ..base("l")
+    };
+    assert_eq!(live.provider_stack(), ["b", "c", "cursor"]);
+    assert_eq!(SidebarThread { runtime: Some(runtime("idle")), provider_instance_id: "codex".into(), ..base("o") }.provider_stack(), ["codex"]);
+}
+
+#[test]
+fn worktree_label_names_the_last_path_segment_and_branch() {
+    assert_eq!(base("n").worktree_label(), None);
+    assert_eq!(SidebarThread { worktree_path: Some("  ".into()), ..base("b") }.worktree_label(), None);
+    let worktree = SidebarThread { worktree_path: Some("/repo/.t3/worktrees/feature-x/".into()), branch: Some("t3/feature-x".into()), ..base("w") };
+    assert_eq!(worktree.worktree_label().as_deref(), Some("Worktree: feature-x (t3/feature-x)"));
+    assert_eq!(SidebarThread { branch: None, ..worktree.clone() }.worktree_label().as_deref(), Some("Worktree: feature-x"));
+    assert_eq!(worktree_display_name("C:\\work\\tree"), "tree");
 }
 
 #[test]

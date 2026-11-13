@@ -28,6 +28,15 @@ const SAVE_DELAY: Duration = Duration::from_millis(300);
 const STATE_NAME: &str = "terminal-state";
 const AUTHORIZATION_ERROR: &str = "EnvironmentAuthorizationError";
 
+/// Each thread's terminals with a running process on the current connection, in metadata order
+/// (`useThreadRunningTerminalIds`), for the sidebar's terminal indicator.
+#[derive(Default)]
+pub struct RunningTerminals {
+    pub by_thread: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl gpui::Global for RunningTerminals {}
+
 pub struct TerminalDrawer {
     pub(super) app: Entity<AppState>,
     pub(super) layouts: TerminalLayouts,
@@ -106,6 +115,7 @@ impl TerminalDrawer {
             self.summaries = None;
             self.panes.clear();
             self.connection = current;
+            self.publish_running(cx);
             cx.notify();
         }
         if current.is_none() {
@@ -187,6 +197,7 @@ impl TerminalDrawer {
                     for event in batch {
                         terminal::apply_metadata(summaries, event);
                     }
+                    drawer.publish_running(cx);
                     drawer.sync_selection(window, cx);
                 });
                 if applied.is_err() {
@@ -231,6 +242,14 @@ impl TerminalDrawer {
     fn drop_stale_panes(&mut self, thread_id: &str) {
         let ids = self.layouts.get(thread_id).terminal_ids;
         self.panes.retain(|terminal_id, _| ids.contains(terminal_id));
+    }
+
+    /// Publishes the current connection's running terminals; observers wake only on a change.
+    fn publish_running(&self, cx: &mut App) {
+        let by_thread = self.summaries.as_deref().map(terminal::running_by_thread).unwrap_or_default();
+        if cx.try_global::<RunningTerminals>().is_none_or(|current| current.by_thread != by_thread) {
+            cx.set_global(RunningTerminals { by_thread });
+        }
     }
 
     pub(super) fn summary(&self, thread_id: &str, terminal_id: &str) -> Option<&TerminalSummary> {
