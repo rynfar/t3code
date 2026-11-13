@@ -5,7 +5,7 @@
 //! first row in view where it was (`t3_core::timeline::anchor`).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -21,7 +21,8 @@ mod status;
 pub use limit_recovery::LimitRecoveryBanner;
 
 use gpui::{Bounds, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render, Styled, Subscription, Window, actions, canvas, div, list, point, prelude::*, px, size};
-use t3_core::history::HistoryControl;
+use t3_client::history::HistoryQuery;
+use t3_core::history::{HistoryControl, HistoryStep, PageOutcome, WorkPageOutcome};
 use t3_core::timeline::anchor::{self, Anchor, ScrollTop, VisibleRows};
 use t3_core::timeline::{
     EntriesCache, GET_TURN_ITEM, RowKind, open_command_items, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
@@ -318,6 +319,248 @@ impl ThreadView {
         }
     }
 
+    /// Loads earlier history targeting `through_entry_id`, trying the lightweight `view=conversation`
+    /// slice first and filling in the full `deferWork=1` page (`threads.ts` `loadEarlier`).
+    pub(super) fn load_earlier_through(&mut self, entry_id: String, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
+        let state = self.state.clone();
+        let fixed = self.fixed.clone();
+        let Some((thread_id, client, runtime, initial_cursor)) = state.update(cx, |state, cx| {
+            let thread_id = fixed.clone().or_else(|| state.selected_thread.clone())?;
+            let client = state.client_handle()?;
+            let runtime = state.runtime().clone();
+            let thread = thread_state_for_mut(state, fixed.is_some(), &thread_id)?;
+            if thread.projection.as_ref().is_some_and(|projection| projection.has_entry(&entry_id)) {
+                return None;
+            }
+            let cursor = thread.begin_history_load()?;
+            emit_thread_updates(fixed.is_some(), false, cx);
+            Some((thread_id, client, runtime, cursor))
+        }) else {
+            return;
+        };
+
+        cx.spawn(async move |_, cx| {
+            let mut cursor = initial_cursor;
+            for _ in 0..8 {
+                let mut found = false;
+                for complete in [false, true] {
+                    let query = if complete {
+                        HistoryQuery {
+                            cursor: cursor.clone(),
+                            through_entry_id: Some(entry_id.clone()),
+                            view: None,
+                            defer_work: true,
+                        }
+                    } else {
+                        HistoryQuery::through_entry(&cursor, &entry_id)
+                    };
+                    let (fetch_client, fetch_thread) = (client.clone(), thread_id.clone());
+                    let result = runtime
+                        .spawn(async move { fetch_client.history_page_with(&fetch_thread, query).await })
+                        .await
+                        .unwrap_or_else(|_| Err("Could not load earlier activity.".into()));
+                    let merge = state.update(cx, |state, cx| {
+                        let thread = thread_state_for_mut(state, fixed.is_some(), &thread_id)?;
+                        let outcome = match result {
+                            Ok(page) => thread.begin_history_merge_with(&cursor, page, complete, false),
+                            Err(message) => PageOutcome::Step(thread.fail_history_load(&cursor, message)),
+                        };
+                        match outcome {
+                            PageOutcome::Merge(merge) => {
+                                emit_thread_updates(fixed.is_some(), false, cx);
+                                Some(merge)
+                            }
+                            PageOutcome::Step(step) => {
+                                if step != HistoryStep::Stale {
+                                    emit_thread_updates(fixed.is_some(), false, cx);
+                                }
+                                None
+                            }
+                        }
+                    });
+                    let Some(merge) = merge else { return };
+                    let merged = cx.background_executor().spawn(async move { merge.run() }).await;
+                    let keep_going = state.update(cx, |state, cx| {
+                        let Some(thread) = thread_state_for_mut(state, fixed.is_some(), &thread_id) else {
+                            return false;
+                        };
+                        let step = thread.finish_history_merge(merged);
+                        if step == HistoryStep::Stale {
+                            return false;
+                        }
+                        found = thread
+                            .projection
+                            .as_ref()
+                            .is_some_and(|projection| projection.has_entry(&entry_id));
+                        emit_thread_updates(fixed.is_some(), true, cx);
+                        !found || !complete
+                    });
+                    if !keep_going {
+                        return;
+                    }
+                    if found {
+                        // Target already visible from `view=conversation`; finish metadata pass unless complete ran.
+                        continue;
+                    }
+                }
+                let Some(next_cursor) = state.update(cx, |state, cx| {
+                    let thread = thread_state_for_mut(state, fixed.is_some(), &thread_id)?;
+                    if thread.projection.as_ref().is_some_and(|projection| projection.has_entry(&entry_id)) {
+                        return None;
+                    }
+                    let next = thread.begin_history_load()?;
+                    emit_thread_updates(fixed.is_some(), false, cx);
+                    Some(next)
+                }) else {
+                    return;
+                };
+                if next_cursor == cursor {
+                    return;
+                }
+                cursor = next_cursor;
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn load_deferred_work(&self, anchors: Vec<String>, cx: &mut Context<Self>) {
+        if anchors.is_empty() {
+            return;
+        }
+        let state = self.state.clone();
+        let fixed = self.fixed.clone();
+        let is_side = fixed.is_some();
+        let Some((thread_id, client, runtime, targets)) = state.update(cx, |state, cx| {
+            let thread_id = fixed.clone().or_else(|| state.selected_thread.clone())?;
+            let client = state.client_handle()?;
+            let runtime = state.runtime().clone();
+            let thread = thread_state_for_mut(state, is_side, &thread_id)?;
+            let mut targets = Vec::new();
+            for anchor in anchors {
+                if let Some(target) = thread.begin_work_load(&anchor) {
+                    targets.push(target);
+                }
+            }
+            if targets.is_empty() {
+                return None;
+            }
+            emit_thread_updates(is_side, false, cx);
+            Some((thread_id, client, runtime, targets))
+        }) else {
+            return;
+        };
+
+        for target in targets {
+            let (state, client, runtime, thread_id) =
+                (state.clone(), client.clone(), runtime.clone(), thread_id.clone());
+            cx.spawn(async move |_, cx| {
+                let anchor_id = target.anchor_id;
+                let mut cursor = target.cursor;
+                loop {
+                    let query = HistoryQuery::work(&cursor);
+                    let (fetch_client, fetch_thread) = (client.clone(), thread_id.clone());
+                    let result = runtime
+                        .spawn(async move { fetch_client.history_page_with(&fetch_thread, query).await })
+                        .await
+                        .unwrap_or_else(|_| Err("Could not load deferred work.".into()));
+                    let Some(merge) = state.update(cx, |state, cx| {
+                        let thread = thread_state_for_mut(state, is_side, &thread_id)?;
+                        let outcome = match result {
+                            Ok(page) => thread.begin_work_merge(&anchor_id, &cursor, page),
+                            Err(message) => {
+                                WorkPageOutcome::Step(thread.fail_work_load(&anchor_id, &cursor, message))
+                            }
+                        };
+                        match outcome {
+                            WorkPageOutcome::Ready(merge) => {
+                                emit_thread_updates(is_side, false, cx);
+                                Some(merge)
+                            }
+                            WorkPageOutcome::Step(step) => {
+                                if step != HistoryStep::Stale {
+                                    emit_thread_updates(is_side, false, cx);
+                                }
+                                None
+                            }
+                        }
+                    }) else {
+                        return;
+                    };
+                    let merged = cx.background_executor().spawn(async move { merge.run() }).await;
+                    let Some(next_cursor) = state.update(cx, |state, cx| {
+                        let thread = thread_state_for_mut(state, is_side, &thread_id)?;
+                        let step = thread.finish_work_merge(merged);
+                        if step == HistoryStep::Stale {
+                            return None;
+                        }
+                        emit_thread_updates(is_side, true, cx);
+                        let HistoryStep::Continue(_) = step else { return None };
+                        let next = thread.begin_work_load(&anchor_id)?;
+                        emit_thread_updates(is_side, false, cx);
+                        Some(next.cursor)
+                    }) else {
+                        return;
+                    };
+                    if next_cursor == cursor {
+                        return;
+                    }
+                    cursor = next_cursor;
+                }
+            })
+            .detach();
+        }
+    }
+
+    pub(super) fn load_work_for_run(&self, run_id: &str, cx: &mut Context<Self>) {
+        let (runs, _) = t3_core::timeline::fold_membership(self.entries_cache.entries(), &self.activity);
+        let entry_ids: HashSet<&str> = runs
+            .iter()
+            .filter_map(|(id, run)| (run == run_id).then_some(id.as_str()))
+            .collect();
+        let anchors = self
+            .thread_state(self.state.read(cx))
+            .projection
+            .as_ref()
+            .map(|projection| deferred_anchors_for_entries(projection, &entry_ids))
+            .unwrap_or_default();
+        self.load_deferred_work(anchors, cx);
+    }
+
+    pub(super) fn load_work_for_attempt(&self, attempt_id: &str, cx: &mut Context<Self>) {
+        let (_, attempts) = t3_core::timeline::fold_membership(self.entries_cache.entries(), &self.activity);
+        let entry_ids: HashSet<&str> = attempts
+            .iter()
+            .filter_map(|(id, attempt)| (attempt == attempt_id).then_some(id.as_str()))
+            .collect();
+        let anchors = self
+            .thread_state(self.state.read(cx))
+            .projection
+            .as_ref()
+            .map(|projection| deferred_anchors_for_entries(projection, &entry_ids))
+            .unwrap_or_default();
+        self.load_deferred_work(anchors, cx);
+    }
+
+    pub(super) fn load_work_for_group(&self, group_id: &str, cx: &mut Context<Self>) {
+        let entry_ids: HashSet<&str> = self
+            .rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                RowKind::WorkToggle { group_id: id, entries, .. } if id == group_id => Some(entries),
+                _ => None,
+            })
+            .flat_map(|entries| entries.iter().map(|entry| entry.id.as_str()))
+            .collect();
+        let anchors = self
+            .thread_state(self.state.read(cx))
+            .projection
+            .as_ref()
+            .map(|projection| deferred_anchors_for_entries(projection, &entry_ids))
+            .unwrap_or_default();
+        self.load_deferred_work(anchors, cx);
+    }
+
     fn rederive(&mut self, cx: &mut Context<Self>) {
         let visible = self.visible_rows();
         self.rederive_rows(cx);
@@ -475,23 +718,32 @@ impl ThreadView {
     pub fn toggle_run(&mut self, run_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(&format!("turn-fold:{run_id}"));
         let visible = self.visible_rows();
-        toggle(&mut self.ui.expanded_runs, run_id);
+        let expanded = toggle(&mut self.ui.expanded_runs, run_id);
         self.rederive_rows(cx);
         self.keep_place(visible);
+        if expanded {
+            self.load_work_for_run(run_id, cx);
+        }
     }
 
     pub fn toggle_attempt(&mut self, attempt_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(&format!("attempt-fold:{attempt_id}"));
         let visible = self.visible_rows();
-        toggle(&mut self.ui.expanded_attempts, attempt_id);
+        let expanded = toggle(&mut self.ui.expanded_attempts, attempt_id);
         self.rederive_rows(cx);
         self.keep_place(visible);
+        if expanded {
+            self.load_work_for_attempt(attempt_id, cx);
+        }
     }
 
     pub fn toggle_group(&mut self, group_id: &str, row_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(row_id);
         let visible = self.visible_rows();
-        toggle(&mut self.ui.expanded_groups, group_id);
+        let expanded = toggle(&mut self.ui.expanded_groups, group_id);
+        if expanded {
+            self.load_work_for_group(group_id, cx);
+        }
         self.rederive_rows(cx);
         self.keep_place(visible);
     }
@@ -502,10 +754,17 @@ impl ThreadView {
         let row = self.rows.iter().find(|row| matches!(&row.kind, RowKind::Work { entries, .. } if entries.iter().any(|e| e.id == key)))
             .or_else(|| self.rows.iter().find(|row| row.id.ends_with(key))).map(|row| row.id.clone());
         if let Some(row) = row { self.begin_disclosure(&row); }
-        if toggle(&mut self.ui.expanded_entries, key)
-            && let Some(entry) = self.find_entry(key)
-        {
-            self.fetch_detail(&entry, cx);
+        if toggle(&mut self.ui.expanded_entries, key) {
+            let anchors = self
+                .thread_state(self.state.read(cx))
+                .projection
+                .as_ref()
+                .map(|projection| deferred_anchors_for_entries(projection, &HashSet::from([key])))
+                .unwrap_or_default();
+            self.load_deferred_work(anchors, cx);
+            if let Some(entry) = self.find_entry(key) {
+                self.fetch_detail(&entry, cx);
+            }
         }
         self.sync_command_outputs(cx);
         self.remeasure_entry(key);
@@ -914,6 +1173,52 @@ fn remeasure_for_typography(key: TranscriptTypography, previous: &mut Transcript
     for group in groups.values() { group.remeasure(); }
 }
 
+fn thread_state_for_mut<'a>(
+    state: &'a mut AppState,
+    is_side: bool,
+    thread_id: &str,
+) -> Option<&'a mut t3_core::thread::ThreadState> {
+    if is_side {
+        if !state.has_side_thread(thread_id) {
+            return None;
+        }
+        state.thread_state_mut(thread_id)
+    } else if state.selected_thread.as_deref() == Some(thread_id) {
+        Some(&mut state.thread)
+    } else {
+        None
+    }
+}
+
+fn emit_thread_updates(is_side: bool, projection_changed: bool, cx: &mut Context<AppState>) {
+    if is_side {
+        cx.emit(AppEvent::SideThread);
+    } else {
+        if projection_changed {
+            cx.emit(AppEvent::Thread);
+        }
+        cx.emit(AppEvent::History);
+    }
+}
+
+fn deferred_anchors_for_entries(
+    projection: &t3_core::thread::ThreadProjection,
+    entry_ids: &HashSet<&str>,
+) -> Vec<String> {
+    if entry_ids.is_empty() {
+        return Vec::new();
+    }
+    projection
+        .visible_turn_items
+        .iter()
+        .filter(|row| {
+            row.item.deferred_work.is_some()
+                && (entry_ids.contains(row.source_item_id.as_str()) || entry_ids.contains(row.item.id.as_str()))
+        })
+        .map(|row| row.source_item_id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,5 +1352,290 @@ mod tests {
             assert!(main_list.bounds_for_item(0).is_some(), "unchanged typography keeps cached measurements");
             assert!(groups["group"].bounds_for_item(0).is_some(), "unchanged typography keeps group measurements");
         }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn thread_view_loads_through_entry_and_deferred_work_on_expand(cx: &mut gpui::TestAppContext) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_log = requests.clone();
+
+        let _server = runtime.spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let requests_log = requests_log.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_owned();
+                    requests_log.lock().unwrap().push(path.clone());
+                    let body = if path.contains("view=work") {
+                        serde_json::json!({
+                            "snapshotSequence": 1,
+                            "items": [
+                                {
+                                    "position": 0,
+                                    "visibility": "local",
+                                    "sourceThreadId": "t1",
+                                    "sourceItemId": "w-loaded",
+                                    "item": {
+                                        "id": "w-loaded",
+                                        "threadId": "t1",
+                                        "runId": "r1",
+                                        "nodeId": null,
+                                        "parentItemId": null,
+                                        "ordinal": 2,
+                                        "type": "command_execution",
+                                        "status": "completed",
+                                        "title": null,
+                                        "startedAt": null,
+                                        "completedAt": null,
+                                        "updatedAt": "2026-04-01T00:00:02.000Z",
+                                        "input": "echo hi",
+                                        "output": ""
+                                    }
+                                }
+                            ],
+                            "nextCursor": null,
+                            "hasMoreHistory": false,
+                            "hasUserTurn": false
+                        })
+                    } else if path.contains("view=conversation") {
+                        serde_json::json!({
+                            "snapshotSequence": 1,
+                            "items": [
+                                {
+                                    "position": 0,
+                                    "visibility": "local",
+                                    "sourceThreadId": "t1",
+                                    "sourceItemId": "msg-old",
+                                    "item": {
+                                        "id": "msg-old",
+                                        "threadId": "t1",
+                                        "runId": "r0",
+                                        "nodeId": null,
+                                        "parentItemId": null,
+                                        "ordinal": 0,
+                                        "type": "user_message",
+                                        "status": "completed",
+                                        "title": null,
+                                        "startedAt": null,
+                                        "completedAt": null,
+                                        "updatedAt": "2026-04-01T00:00:00.000Z",
+                                        "messageId": "msg-old",
+                                        "text": "Earlier prompt",
+                                        "inputIntent": "message"
+                                    }
+                                }
+                            ],
+                            "nextCursor": null,
+                            "hasMoreHistory": false,
+                            "hasUserTurn": true
+                        })
+                    } else {
+                        serde_json::json!({
+                            "snapshotSequence": 1,
+                            "items": [],
+                            "nextCursor": null,
+                            "hasMoreHistory": false,
+                            "hasUserTurn": false
+                        })
+                    };
+                    let json = serde_json::to_string(&body).unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        json.len(),
+                        json
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, _fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            })).unwrap(),
+            format!("http://127.0.0.1:{port}"),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell;
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 2, "visibleItemCount": 2
+            })).unwrap()];
+            state.install_active_environment(client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot",
+                "snapshotSequence": 1,
+                "hasMoreHistory": true,
+                "historyCursor": "c1",
+                "projection": {
+                    "thread": {
+                        "id": "t1", "projectId": "checkout-a", "title": "T1",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "completed",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": null,
+                        "completedAt": "2026-04-01T00:00:02.000Z"
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                    "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                    "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [
+                        {
+                            "position": 0,
+                            "visibility": "local",
+                            "sourceThreadId": "t1",
+                            "sourceItemId": "m0",
+                            "item": {
+                                "id": "m0",
+                                "threadId": "t1",
+                                "runId": null,
+                                "nodeId": null,
+                                "parentItemId": null,
+                                "ordinal": 1,
+                                "type": "user_message",
+                                "status": "completed",
+                                "title": null,
+                                "startedAt": null,
+                                "completedAt": null,
+                                "updatedAt": "2026-04-01T00:00:01.000Z",
+                                "messageId": "m0",
+                                "text": "Run check",
+                                "inputIntent": "message"
+                            }
+                        },
+                        {
+                            "position": 1,
+                            "visibility": "local",
+                            "sourceThreadId": "t1",
+                            "sourceItemId": "w-anchor",
+                            "item": {
+                                "id": "w-anchor",
+                                "threadId": "t1",
+                                "runId": "r1",
+                                "nodeId": null,
+                                "parentItemId": null,
+                                "ordinal": 2,
+                                "type": "command_execution",
+                                "status": "completed",
+                                "title": null,
+                                "startedAt": null,
+                                "completedAt": null,
+                                "updatedAt": "2026-04-01T00:00:01.000Z",
+                                "input": "ls",
+                                "output": "",
+                                "deferredWork": { "cursor": "work-c1", "itemCount": 1, "lastOrdinal": 3 }
+                            }
+                        },
+                        {
+                            "position": 2,
+                            "visibility": "local",
+                            "sourceThreadId": "t1",
+                            "sourceItemId": "a1",
+                            "item": {
+                                "id": "a1",
+                                "threadId": "t1",
+                                "runId": "r1",
+                                "nodeId": null,
+                                "parentItemId": null,
+                                "ordinal": 4,
+                                "type": "assistant_message",
+                                "status": "completed",
+                                "title": null,
+                                "startedAt": null,
+                                "completedAt": null,
+                                "updatedAt": "2026-04-01T00:00:04.000Z",
+                                "messageId": "a1",
+                                "text": "Done.",
+                                "streaming": false
+                            }
+                        }
+                    ],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+            cx.emit(AppEvent::History);
+        });
+
+        let (sent, merged) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+        let _sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if matches!(event, AppEvent::Thread | AppEvent::History)
+                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w-loaded") && p.has_entry("msg-old"))
+                {
+                    if let Some(sent) = sent.take() {
+                        let _ = sent.send(());
+                    }
+                }
+            })
+        });
+
+        let (work_sent, work_done) = tokio::sync::oneshot::channel();
+        let mut work_sent = Some(work_sent);
+        let _work_sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if matches!(event, AppEvent::Thread | AppEvent::History)
+                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w-loaded"))
+                {
+                    if let Some(sent) = work_sent.take() {
+                        let _ = sent.send(());
+                    }
+                }
+            })
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_run("r1", cx);
+            });
+        });
+        work_done.await.unwrap();
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.load_earlier_through("msg-old".into(), cx);
+            });
+        });
+
+        merged.await.unwrap();
+        state.read_with(cx, |state, _| {
+            let p = state.thread.projection.as_ref().unwrap();
+            assert!(p.has_entry("w-loaded"), "toggle_run must load deferred work anchor");
+            assert!(p.has_entry("msg-old"), "load_earlier_through must load target entry");
+        });
+        let seen = requests.lock().unwrap().clone();
+        assert!(seen.iter().any(|p| p.contains("cursor=work-c1") && p.contains("view=work")), "{seen:?}");
+        assert!(seen.iter().any(|p| p.contains("throughEntryId=msg-old") && p.contains("view=conversation")), "{seen:?}");
     }
 }

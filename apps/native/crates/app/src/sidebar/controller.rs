@@ -12,12 +12,15 @@ use t3_core::sidebar::inbox::InboxReturnTracker;
 use t3_core::settings::snooze::menu_settings;
 use t3_core::sidebar::settled::{self, DEFAULT_SNOOZE_PRESETS, SnoozePreset, SnoozePresetSetting};
 use t3_core::sidebar::sort::top_of_pinned_order_key;
-use t3_core::sidebar::time::{LocalTime, Ms, Zone};
+use t3_core::sidebar::time::{LocalTime, Ms, Zone, format_iso};
 use t3_core::families::MountedReads;
 use t3_core::shell::{ShellState, ShellStreamItem};
 use t3_core::sidebar::history::NavEntry;
 use t3_core::sidebar::thread::same_apart_from_streaming;
-use t3_core::sidebar::visits::{OpenEnvironment, OpenHistory, VisitDecision, VisitTracker, VisitedShell};
+use t3_core::sidebar::visits::{
+    LocalVisitWatermarks, OpenEnvironment, OpenHistory, VisitDecision, VisitTracker, VisitedShell,
+    server_tracks_visits,
+};
 use t3_core::sidebar::{ModelInput, OlderSettledShelf, Shelf, ShelfState, SidebarModel, SidebarSettings};
 use t3_core::thread_actions::{
     self as actions, PlanFor, RenameOutcome, ThreadAction, ThreadUndoStore, UndoAction, UndoKind, UndoStep,
@@ -172,6 +175,9 @@ pub struct SidebarController {
     visit: Option<VisitTracker>,
     visit_target: Option<VisitTarget>,
     visit_revision: u64,
+    pending_palette_visit: Option<(OpenEnvironment, String, Ms, Ms)>,
+    pub(crate) local_visits: LocalVisitWatermarks,
+    pub(crate) local_visits_loaded: bool,
     wake_timer: Option<Task<()>>,
     visit_timer: Option<Task<()>>,
     pub(crate) undo_timer: Option<Task<()>>,
@@ -262,7 +268,14 @@ impl SidebarController {
                 || current.connection != connection
         }) {
             let opened = history.claim(&environment, id, now);
-            self.visit = Some(VisitTracker::new(id, opened));
+            let mut tracker = VisitTracker::new(id, opened);
+            if let Some((p_env, p_id, p_visited_at, p_now)) = self.pending_palette_visit.take()
+                && p_env == environment
+                && p_id == id
+            {
+                tracker.mark_dispatched(p_visited_at, p_now);
+            }
+            self.visit = Some(tracker);
             self.visit_target = Some(VisitTarget {
                 environment,
                 thread: id.to_owned(),
@@ -273,6 +286,23 @@ impl SidebarController {
         shell.map_or(VisitDecision::Skip, |shell| {
             self.visit.as_mut().unwrap().on_shell(shell, now)
         })
+    }
+
+    pub(crate) fn note_palette_visit(
+        &mut self,
+        environment: OpenEnvironment,
+        thread_id: &str,
+        visited_at: Ms,
+        now: Ms,
+    ) {
+        if self.visit_target.as_ref().is_some_and(|current| {
+            current.environment == environment && current.thread == thread_id
+        }) && let Some(tracker) = self.visit.as_mut()
+        {
+            tracker.mark_dispatched(visited_at, now);
+            return;
+        }
+        self.pending_palette_visit = Some((environment, thread_id.to_owned(), visited_at, now));
     }
 
     fn pending_visit(&self, visited_at: Ms) -> Option<VisitTimer> {
@@ -333,6 +363,37 @@ impl AppState {
         #[cfg(not(feature = "snapshot"))]
         let now = now_ms();
         self.sidebar.built_at = now;
+        let tracks_visits = self.server_tracks_visits();
+        if !tracks_visits
+            || self.shell.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.threads.iter().any(|thread| thread.last_visited_at == Some(None))
+            })
+        {
+            self.ensure_local_visits_loaded();
+        }
+        if tracks_visits && self.shell.synchronized && self.shell.snapshot.is_some() {
+            let env_key = self.local_visit_environment_key();
+            let pending: Vec<(String, Ms)> = self
+                .shell
+                .snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .threads
+                        .iter()
+                        .filter_map(|thread| {
+                            self.sidebar
+                                .local_visits
+                                .take_migration(&env_key, thread)
+                                .map(|ms| (thread.id.clone(), ms))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (thread_id, visited_at) in pending {
+                self.dispatch_then(actions::visit(&uuid(), &thread_id, visited_at), None, cx, |_, _, _| {});
+            }
+        }
         let extras = self.omitted.mounts.extras(&self.shell);
         let tags = self.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
         self.sidebar.hiding_tags = tags.is_some();
@@ -368,12 +429,43 @@ impl AppState {
             self.sidebar.drag = None;
             cancelled_drag = true;
         }
+        let legacy_overlay = (!tracks_visits).then(|| {
+            let env_key = self.local_visit_environment_key();
+            let apply = |thread: &mut t3_core::shell::ThreadShell| {
+                if let Some(ms) = self.sidebar.local_visits.get(&env_key, &thread.id) {
+                    thread.last_visited_at = Some(Some(format_iso(ms)));
+                }
+            };
+            let snapshot = self.shell.snapshot.as_ref().map(|snapshot| {
+                let mut cloned = snapshot.clone();
+                for thread in &mut cloned.threads {
+                    apply(thread);
+                }
+                cloned
+            });
+            let extras: Vec<t3_core::shell::ThreadShell> = extras
+                .iter()
+                .map(|thread| {
+                    let mut cloned = (*thread).clone();
+                    apply(&mut cloned);
+                    cloned
+                })
+                .collect();
+            (snapshot, extras)
+        });
+        let overlay_extras: Vec<&t3_core::shell::ThreadShell> = legacy_overlay
+            .as_ref()
+            .map_or_else(|| extras.clone(), |(_, extras)| extras.iter().collect());
+        let snapshot_ref = legacy_overlay
+            .as_ref()
+            .and_then(|(snapshot, _)| snapshot.as_ref())
+            .or(self.shell.snapshot.as_ref());
         let build_model = |snapshot, tracker: &mut _, dragging| {
             SidebarModel::build(
                 &ModelInput {
                     snapshot,
                     config_loaded: self.server_config.config.is_some(),
-                    extra_threads: &extras,
+                    extra_threads: &overlay_extras,
                     older_settled: older.as_ref().map(|older| OlderSettledShelf { older, frontier }),
                     settings: &self.sidebar.settings,
                     shelves: &self.sidebar.shelves,
@@ -386,11 +478,11 @@ impl AppState {
                 tracker,
             )
         };
-        let mut model = match &self.shell.snapshot {
+        let mut model = match snapshot_ref {
             Some(snapshot) => build_model(snapshot, &mut self.sidebar.tracker, self.sidebar.drag.as_ref().map(|(_, from)| *from)),
             None => SidebarModel::default(),
         };
-        if let (Some(snapshot), Some((drag_id, _))) = (&self.shell.snapshot, &self.sidebar.drag)
+        if let (Some(snapshot), Some((drag_id, _))) = (snapshot_ref, &self.sidebar.drag)
             && model.section_of(drag_id).is_none_or(|section| section == t3_core::sidebar::Section::Working)
         {
             self.sidebar.drag = None;
@@ -907,31 +999,92 @@ impl AppState {
             .environment(saved.map(|saved| saved.id.as_str()), canonical)
     }
 
+    pub(crate) fn ensure_local_visits_loaded(&mut self) {
+        if self.sidebar.local_visits_loaded {
+            return;
+        }
+        self.sidebar.local_visits_loaded = true;
+        if cfg!(test) {
+            return;
+        }
+        if let Some(loaded) = t3_client::store::load_ui_state("thread-visits")
+            .and_then(|value| serde_json::from_value::<LocalVisitWatermarks>(value).ok())
+        {
+            self.sidebar.local_visits = loaded;
+        }
+    }
+
+    fn persist_local_visits(&self) {
+        if !cfg!(test) {
+            t3_client::store::save_ui_state("thread-visits", &self.sidebar.local_visits);
+        }
+    }
+
+    pub(crate) fn local_visit_environment_key(&self) -> String {
+        self.server_config
+            .config
+            .as_ref()
+            .map(|config| config.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                let active = self.environments.active.as_deref()?;
+                self.environments
+                    .environments
+                    .iter()
+                    .find(|entry| entry.id == active)
+                    .and_then(|entry| entry.environment_id.as_deref())
+                    .filter(|id| !id.is_empty())
+                    .or(Some(active).filter(|id| !id.is_empty()))
+            })
+            .unwrap_or("local")
+            .to_owned()
+    }
+
+    pub(crate) fn server_tracks_visits(&self) -> bool {
+        let capability = self
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|config| config.environment.capabilities.thread_visited_tracking);
+        let config_loaded = self.server_config.config.is_some();
+        let shell_tracks = self
+            .shell
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.threads.is_empty())
+            .map(|snapshot| snapshot.threads.iter().any(t3_core::shell::ThreadShell::tracks_visits));
+        server_tracks_visits(capability, config_loaded, shell_tracks)
+    }
+
+    pub(crate) fn effective_last_visited_at(&self, thread_id: &str) -> Option<Ms> {
+        let thread = self.thread_shell(thread_id);
+        if self.server_tracks_visits() {
+            return thread.and_then(|thread| t3_core::sidebar::time::parse_opt(thread.visited_at_iso()));
+        }
+        let env_key = self.local_visit_environment_key();
+        self.sidebar.local_visits.get(&env_key, thread_id).or_else(|| {
+            thread.and_then(|thread| t3_core::sidebar::time::parse_opt(thread.visited_at_iso()))
+        })
+    }
+
+    pub(crate) fn visited_shell_for(&self, id: &str, now: Ms) -> Option<VisitedShell> {
+        let thread = self.thread_shell(id)?;
+        let model_thread = self.sidebar.model.thread(id);
+        Some(VisitedShell {
+            updated_at: t3_core::sidebar::time::parse_iso(&thread.updated_at)?,
+            last_visited_at: self.effective_last_visited_at(id),
+            completed_at: model_thread
+                .and_then(|t| t.latest_run.as_ref())
+                .and_then(|run| run.completed_at),
+            woke_at: model_thread.and_then(|t| settled::woke_at(t, now)),
+        })
+    }
+
     pub(crate) fn track_visit(&mut self, cx: &mut Context<Self>) {
         let id = self.selected_thread.clone();
         let now = now_ms();
         let environment = self.visit_environment();
-        let shell = id.as_deref().and_then(|id| {
-            let thread = self.thread_shell(id)?;
-            Some(VisitedShell {
-                updated_at: t3_core::sidebar::time::parse_iso(&thread.updated_at)?,
-                last_visited_at: thread
-                    .last_visited_at
-                    .as_deref()
-                    .and_then(t3_core::sidebar::time::parse_iso),
-                completed_at: self
-                    .sidebar
-                    .model
-                    .thread(id)
-                    .and_then(|t| t.latest_run.as_ref())
-                    .and_then(|run| run.completed_at),
-                woke_at: self
-                    .sidebar
-                    .model
-                    .thread(id)
-                    .and_then(|t| settled::woke_at(t, now)),
-            })
-        });
+        let shell = id.as_deref().and_then(|id| self.visited_shell_for(id, now));
         let connection = self.connection_id();
         let decision = self.sidebar.visit_decision(
             &mut self.open_history,
@@ -974,10 +1127,28 @@ impl AppState {
     }
 
     fn send_visit(&mut self, thread_id: &str, visited_at: Ms, opened: bool, cx: &mut Context<Self>) {
-        let mut command = actions::visit(&uuid(), thread_id, visited_at);
-        if opened {
-            command["opened"] = Value::Bool(true);
+        self.send_visit_with(thread_id, visited_at, opened, None, cx);
+    }
+
+    pub(crate) fn send_visit_with(
+        &mut self,
+        thread_id: &str,
+        visited_at: Ms,
+        opened: bool,
+        search_query: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.server_tracks_visits() {
+            self.ensure_local_visits_loaded();
+            let env_key = self.local_visit_environment_key();
+            if self.sidebar.local_visits.record_visit(&env_key, thread_id, visited_at) {
+                self.persist_local_visits();
+                self.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+            }
+            return;
         }
+        let command = actions::visit_with(&uuid(), thread_id, visited_at, opened, search_query);
         self.dispatch_then(command, None, cx, |_, _, _| {});
     }
 
@@ -1377,6 +1548,34 @@ impl AppState {
     }
 
     pub fn mark_thread_unread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if !self.server_tracks_visits() {
+            self.ensure_local_visits_loaded();
+            let env_key = self.local_visit_environment_key();
+            let activity = self.thread_shell(thread_id).map(|thread| {
+                let updated = t3_core::sidebar::time::parse_iso(&thread.updated_at).unwrap_or(0);
+                let completed = self
+                    .sidebar
+                    .model
+                    .thread(thread_id)
+                    .and_then(|t| t.latest_run.as_ref())
+                    .and_then(|run| run.completed_at)
+                    .unwrap_or(0);
+                let woke = self
+                    .sidebar
+                    .model
+                    .thread(thread_id)
+                    .and_then(|t| settled::woke_at(t, now_ms()))
+                    .unwrap_or(0);
+                updated.max(completed).max(woke)
+            });
+            let target = activity.map_or(0, |ms| ms.saturating_sub(1));
+            if self.sidebar.local_visits.mark_unread(&env_key, thread_id, target) {
+                self.persist_local_visits();
+                self.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+            }
+            return;
+        }
         self.dispatch_then(actions::mark_unread(&uuid(), thread_id), None, cx, |_, _, _| {});
     }
 
@@ -2019,7 +2218,7 @@ mod deletion_tests {
         })).unwrap());
         let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
         let make = |id, project, at| serde_json::from_value(serde_json::json!({
-            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,"lastVisitedAt":null,
             "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
             "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
             "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
@@ -2108,7 +2307,7 @@ mod deletion_tests {
         })).unwrap());
         let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
         let make = |id, project, at| serde_json::from_value(serde_json::json!({
-            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,"lastVisitedAt":null,
             "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
             "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
             "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
@@ -2231,7 +2430,7 @@ mod deletion_tests {
         })).unwrap());
         let (mut shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
         let make = |id, project, at| serde_json::from_value(serde_json::json!({
-            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,
+            "id":id,"projectId":project,"title":id,"createdAt":at,"updatedAt":at,"lastVisitedAt":null,
             "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
             "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},
             "status":"idle","hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0
@@ -2857,5 +3056,77 @@ mod deletion_tests {
                 "completion Notice for {mode}"
             );
         }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn legacy_server_skips_visit_rpcs_and_migrates_null_watermarks_once(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let config: t3_core::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "environment": {
+                "environmentId": "legacy-env",
+                "label": "Legacy",
+                "capabilities": {}
+            },
+            "providers": [],
+            "settings": {},
+            "issues": [],
+            "keybindings": []
+        })).unwrap();
+        state.update(cx, |state, cx| {
+            state.server_config.config = Some(config);
+            let snapshot = state.shell.snapshot.as_mut().unwrap();
+            snapshot.threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "legacy-t",
+                "projectId": "checkout-a",
+                "title": "Legacy",
+                "createdAt": "2026-04-01T00:00:00.000Z",
+                "updatedAt": "2026-04-02T00:00:00.000Z",
+                "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto",
+                "interactionMode": "default",
+                "lineage": {"rootThreadId":"legacy-t"},
+                "status": "idle",
+                "hasActionableProposedPlan": false,
+                "itemCount": 0,
+                "visibleItemCount": 0
+            })).unwrap()];
+            state.rebuild_sidebar(cx);
+            assert!(!state.server_tracks_visits());
+            state.select_thread("legacy-t", cx);
+            let local_ms = state.sidebar.local_visits.get("legacy-env", "legacy-t");
+            assert!(local_ms.is_some());
+            assert_eq!(state.sidebar.model.thread("legacy-t").and_then(|t| t.last_visited_at), local_ms);
+
+            state.mark_thread_unread("legacy-t", cx);
+            let rewound = state.sidebar.local_visits.get("legacy-env", "legacy-t").unwrap();
+            assert!(rewound < local_ms.unwrap());
+            assert_eq!(state.sidebar.model.thread("legacy-t").and_then(|t| t.last_visited_at), Some(rewound));
+        });
+        assert!(
+            !fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND),
+            "legacy server must not send thread.visit or thread.markUnread RPCs"
+        );
+
+        // Upgrade server: `lastVisitedAt: null` triggers a single migration command preserving rewound watermark.
+        state.update(cx, |state, cx| {
+            state.server_config.config.as_mut().unwrap().environment.capabilities.thread_visited_tracking = Some(true);
+            state.shell.snapshot.as_mut().unwrap().threads[0].last_visited_at = Some(None);
+            state.rebuild_sidebar(cx);
+            state.rebuild_sidebar(cx);
+        });
+        let (method, command, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"], "thread.visit");
+        assert_eq!(command["threadId"], "legacy-t");
+        assert!(command.get("opened").is_none());
+        reply.send(Ok(serde_json::json!({"sequence": 1}))).unwrap();
+        assert!(
+            !fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND),
+            "migration must dispatch at most once per thread"
+        );
     }
 }

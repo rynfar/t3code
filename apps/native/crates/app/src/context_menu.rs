@@ -885,6 +885,7 @@ pub(crate) mod project_filter_tests {
             let threads = [("menu-thread", "checkout-b"), ("sibling", "checkout-a"), ("other-thread", "other")].into_iter().map(|(id, project)| {
                 serde_json::from_value(serde_json::json!({
                     "id":id,"projectId":project,"title":id,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z",
+                    "lastVisitedAt":null,
                     "providerInstanceId":"replay","modelSelection":{"instanceId":"replay","model":"replay"},
                     "runtimeMode":"auto","interactionMode":"default","lineage":{"rootThreadId":id},"status":"idle",
                     "hasActionableProposedPlan":false,"itemCount":0,"visibleItemCount":0

@@ -163,8 +163,9 @@ impl ThreadView {
         };
         match procedure.step(message, thread.history.has_more_history && thread.history.history_cursor.is_some(), thread.history.error.is_some()) {
             HistoryAction::Load => {
+                let target_entry_id = citation.message_id.clone();
                 self.citation_ui.pending = Some((citation, procedure));
-                self.load_earlier(cx);
+                self.load_earlier_through(target_entry_id, cx);
             }
             HistoryAction::Found => {
                 self.citation_ui.pending = None;

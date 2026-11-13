@@ -108,6 +108,10 @@ pub struct ClientFixture {
 #[cfg(feature = "test-support")]
 impl ClientFixture {
     pub fn handle(session: AuthSessionState) -> (ClientHandle, Self) {
+        Self::handle_with_http_base(session, "http://fixture.invalid".into())
+    }
+
+    pub fn handle_with_http_base(session: AuthSessionState, http_base: String) -> (ClientHandle, Self) {
         let (commands, received) = mpsc::unbounded_channel();
         let (grants, session_state) = watch::channel(Some(session));
         let (generation, connection_generation) = watch::channel(1);
@@ -115,7 +119,7 @@ impl ClientFixture {
             refs: Default::default(),
             commands,
             credentials: Arc::new(Credentials {
-                http_base: "http://fixture.invalid".into(),
+                http_base,
                 access_token: String::new(),
             }),
             session_state,
@@ -203,6 +207,14 @@ impl ClientHandle {
         crate::history::fetch_history_page(&self.credentials, thread_id, cursor).await
     }
 
+    pub async fn history_page_with(&self, thread_id: &str, query: crate::history::HistoryQuery) -> Result<HistoryPage, String> {
+        crate::history::fetch_history_page_with(&self.credentials, thread_id, &query).await
+    }
+
+    pub async fn bounded_snapshot(&self, thread_id: &str) -> Result<t3_core::thread::ThreadStreamItem, String> {
+        crate::history::fetch_bounded_snapshot(&self.credentials, thread_id).await
+    }
+
     /// Dispatches commands one after another, each only once the previous one committed, and
     /// stops at the first failure, returning its index. A send's prerequisites (declining
     /// approvals, persisting permissions) must land before its message, as the web awaits them.
@@ -273,7 +285,10 @@ impl ClientHandle {
 
 /// Bounded so a stalled UI pushes back through acks to the server instead of buffering forever.
 const EVENT_QUEUE: usize = 1024;
+#[cfg(not(test))]
 const THREAD_RETRY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const THREAD_RETRY: Duration = Duration::from_millis(20);
 /// `SESSION_STATE_RETRY_BASE_MS` and `SESSION_STATE_RETRY_MAX_MS`.
 const SESSION_STATE_RETRY: Duration = Duration::from_secs(2);
 const SESSION_STATE_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -733,16 +748,28 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
     ThreadForwarder(tokio::spawn(async move {
         let mut sequence = sequence;
         loop {
-            let Ok(mut stream) = session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, sequence)) else {
-                return;
+            let mut stream = match session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, sequence)) {
+                Ok(stream) => stream,
+                Err(RpcError::Closed) => return,
+                Err(error) => {
+                    if tx.send((thread_id.clone(), Some(Err(error)))).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(THREAD_RETRY).await;
+                    continue;
+                }
             };
             while let Some(value) = stream.receiver.recv().await {
                 if let Ok(item) = &value {
                     sequence = item.get("snapshotSequence").or_else(|| item.get("sequence")).and_then(Value::as_u64).or(sequence);
                 }
                 let closed = matches!(value, Err(RpcError::Closed));
+                let failed = value.is_err();
                 if tx.send((thread_id.clone(), Some(value))).await.is_err() || closed {
                     return;
+                }
+                if failed {
+                    break;
                 }
             }
             tokio::time::sleep(THREAD_RETRY).await;

@@ -179,3 +179,65 @@ fn media_mutation_id_uses_visible_items_and_last_app_checkpoint() {
     thread.visible_turn_items = visible;
     assert_eq!(crate::media::workspace_mutation_id(&thread), Some(json!(["visible-command", T]).to_string()));
 }
+
+#[test]
+fn turn_item_updated_preserves_existing_deferred_work() {
+    let mut item = assistant("i1", 1, Some("r1"), "initial");
+    item["deferredWork"] = serde_json::json!({ "cursor": "c1", "itemCount": 3, "lastOrdinal": 4 });
+    let mut proj = projection(vec![item], vec![run("r1", "running")]);
+    let updated = assistant("i1", 1, Some("r1"), "streamed");
+
+    let changed = apply_event(
+        &mut proj,
+        event("turn-item.updated", updated),
+        ApplyOptions::default(),
+    );
+    assert!(changed);
+    assert_eq!(
+        proj.visible_turn_items[0].item.deferred_work,
+        Some(crate::turn_item::DeferredWork {
+            cursor: "c1".into(),
+            item_count: 3,
+            last_ordinal: 4,
+        })
+    );
+}
+
+#[test]
+fn run_and_attempt_status_transitions_update_visibility_precisely() {
+    let mut queued = assistant("q1", 1, Some("r1"), "queued");
+    queued["type"] = serde_json::json!("user_message");
+    queued["inputIntent"] = serde_json::json!("queued_turn");
+    let kept = assistant("tool1", 2, Some("r1"), "ok");
+    let mut proj = projection(vec![queued, kept], vec![run("r1", "running")]);
+    assert_eq!(visible_ids(&proj), ["q1", "tool1"]);
+
+    // Non-hiding status update keeps everything visible.
+    apply_event(&mut proj, event("run.updated", run("r1", "completed")), ApplyOptions::default());
+    assert_eq!(visible_ids(&proj), ["q1", "tool1"]);
+
+    // Cancelled hides queued user messages while keeping non-queued items; rolled_back hides all.
+    apply_event(&mut proj, event("run.updated", run("r1", "cancelled")), ApplyOptions::default());
+    assert_eq!(visible_ids(&proj), ["tool1"]);
+    apply_event(&mut proj, event("run.updated", run("r1", "rolled_back")), ApplyOptions::default());
+    assert!(visible_ids(&proj).is_empty());
+
+    // Superseded attempt hides its run_interrupt_result unless the run has a run_interrupt_request.
+    let mut interrupt_result = base_item("ir1", 1, Some("r2"));
+    interrupt_result["nodeId"] = serde_json::json!("node-1");
+    interrupt_result["type"] = serde_json::json!("run_interrupt_result");
+    interrupt_result["message"] = serde_json::json!("stopped");
+    let mut proj2 = projection(vec![interrupt_result], vec![run("r2", "running")]);
+    apply_event(
+        &mut proj2,
+        event("run-attempt.updated", serde_json::json!({ "id": "a1", "threadId": "t1", "runId": "r2", "rootNodeId": "node-1", "status": "running", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" })),
+        ApplyOptions::default(),
+    );
+    assert_eq!(visible_ids(&proj2), ["ir1"]);
+    apply_event(
+        &mut proj2,
+        event("run-attempt.updated", serde_json::json!({ "id": "a1", "threadId": "t1", "runId": "r2", "rootNodeId": "node-1", "status": "superseded", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" })),
+        ApplyOptions::default(),
+    );
+    assert!(visible_ids(&proj2).is_empty());
+}

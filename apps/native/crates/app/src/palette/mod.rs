@@ -551,6 +551,7 @@ impl CommandPalette {
         }
         let project_action = self.scoped_project_actions.get(value).cloned();
         let thread_action = self.scoped_thread_actions.get(value).cloned();
+        let search_query = palette_search_query(self.mode, &self.search);
         self.close(window, cx);
         if let Some((group, target, draft)) = project_action {
             self.state.update(cx, |state, cx| {
@@ -566,7 +567,52 @@ impl CommandPalette {
             return;
         }
         if let Some(key) = thread_action {
-            self.state.update(cx, |state, cx| { if let Some(row) = state.scoped_thread(&key) { state.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx); } });
+            self.state.update(cx, |state, cx| {
+                if let Some(row) = state.scoped_thread(&key).cloned() {
+                    let active_matches = state.environments.active.as_deref() == Some(row.owner.saved_id.as_str())
+                        || state.server_config.config.as_ref().is_some_and(|config| {
+                            row.owner.canonical_id.as_deref() == Some(config.environment.environment_id.as_str())
+                        });
+                    let is_open = active_matches
+                        && (state.selected_thread.as_deref() == Some(key.thread_id.as_str())
+                            || state.has_side_thread(&key.thread_id));
+                    if !is_open
+                        && let Some(query) = search_query.as_deref()
+                    {
+                        let now = now_ms();
+                        let visited_at = row.thread.updated_at.unwrap_or(now);
+                        if let Some(env) = state.open_history.environment(Some(&row.owner.saved_id), row.owner.canonical_id.as_deref()) {
+                            state.open_history.claim(&env, &key.thread_id, now);
+                            if active_matches {
+                                state.sidebar.note_palette_visit(env, &key.thread_id, visited_at, now);
+                            }
+                        }
+                        if active_matches {
+                            state.send_visit_with(&key.thread_id, visited_at, true, Some(query), cx);
+                        } else if row.thread.last_visited_at.is_some()
+                            || state.scoped_environment(&row.owner.saved_id).is_some_and(|entry| {
+                                entry.summary.threads.iter().any(|t| t.thread.last_visited_at.is_some())
+                            })
+                        {
+                            let command = t3_core::thread_actions::visit_with(
+                                &crate::sidebar::controller::uuid(),
+                                &key.thread_id,
+                                visited_at,
+                                true,
+                                Some(query),
+                            );
+                            let resolve = state.connections.destination(&row.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE);
+                            cx.spawn(async move |_, _| {
+                                if let Ok(target) = resolve.await {
+                                    let _ = target.client.dispatch(command).await;
+                                }
+                            })
+                            .detach();
+                        }
+                    }
+                    state.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx);
+                }
+            });
             return;
         }
         if let Some(command) = value.strip_prefix("action:") {
@@ -602,7 +648,25 @@ impl CommandPalette {
             crate::settings::open_setting(id, cx);
         } else if let Some(rest) = value.strip_prefix("thread:") {
             let thread_id = rest.split_once(':').map_or(rest, |(_, id)| id).to_owned();
-            self.state.update(cx, |state, cx| state.select_thread(&thread_id, cx));
+            self.state.update(cx, |state, cx| {
+                let is_open = state.selected_thread.as_deref() == Some(thread_id.as_str())
+                    || state.has_side_thread(&thread_id);
+                if !is_open
+                    && let Some(query) = search_query.as_deref()
+                {
+                    let now = now_ms();
+                    let visited_at = state
+                        .thread_shell(&thread_id)
+                        .and_then(|thread| parse_iso(&thread.updated_at))
+                        .unwrap_or(now);
+                    if let Some(env) = state.visit_environment() {
+                        state.open_history.claim(&env, &thread_id, now);
+                        state.sidebar.note_palette_visit(env, &thread_id, visited_at, now);
+                    }
+                    state.send_visit_with(&thread_id, visited_at, true, Some(query), cx);
+                }
+                state.select_thread(&thread_id, cx);
+            });
         } else if let Some(rest) = value.strip_prefix("new-thread-in:") {
             let project_id = rest.split_once(':').map_or(rest, |(_, id)| id).to_owned();
             self.state.update(cx, |state, cx| state.start_draft(&project_id, cx));
@@ -731,6 +795,14 @@ impl CommandPalette {
             .child(div().flex_1())
             .child(hint("Esc", if self.mode == Mode::Command && self.search.views.is_empty() { "Close".to_owned() } else { "Back".to_owned() }))
     }
+}
+
+fn palette_search_query(mode: Mode, search: &CommandPaletteSearchState) -> Option<String> {
+    if mode != Mode::Command || !search.views.is_empty() || search.query.trim().is_empty() || search.query.starts_with('>') {
+        return None;
+    }
+    let picked = t3_core::search::picked_query(&search.query);
+    (!picked.is_empty()).then_some(picked)
 }
 
 impl Render for CommandPalette {
@@ -1065,5 +1137,122 @@ mod visit_recency_tests {
                 .iter()
                 .all(|thread| thread.local_opened_at.is_none())
         );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn query_bearing_palette_open_sends_search_query_once_unless_open_or_command_or_legacy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (palette, pcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            CommandPalette::new(state.clone(), composer, window, cx)
+        });
+
+        async fn next_dispatch(
+            fixture: &mut t3_client::supervisor::ClientFixture,
+        ) -> (
+            &'static str,
+            serde_json::Value,
+            tokio::sync::oneshot::Sender<Result<serde_json::Value, t3_client::session::RpcError>>,
+        ) {
+            loop {
+                let (method, command, reply) = fixture.next_request().await;
+                if method == t3_core::commands::method::DISPATCH_COMMAND {
+                    return (method, command, reply);
+                }
+                let _ = reply.send(Ok(serde_json::json!({})));
+            }
+        }
+
+        // 1. Search query + closed target thread sends opened=true + searchQuery once (select_thread does not duplicate).
+        pcx.update(|window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query("  Fix Race ".into()),
+                );
+                palette.activate("thread:menu-thread", window, cx);
+            });
+        });
+        let (method, command, reply) = next_dispatch(&mut fixture).await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(command["type"], "thread.visit");
+        assert_eq!(command["threadId"], "menu-thread");
+        assert_eq!(command["opened"], true);
+        assert_eq!(command["searchQuery"], "fix race");
+        reply.send(Ok(serde_json::json!({"sequence": 1}))).unwrap();
+
+        // Drain any non-query follow-up commands without allowing a duplicate query-bearing visit.
+        assert_eq!(
+            fixture
+                .take_commands()
+                .into_iter()
+                .filter(|m| *m == t3_core::commands::method::DISPATCH_COMMAND)
+                .count(),
+            0
+        );
+
+        // 2. Selecting the already-open thread or using `>action` query skips searchQuery.
+        pcx.update(|window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query("menu".into()),
+                );
+                palette.activate("thread:menu-thread", window, cx);
+            });
+        });
+        assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND), "already-open target must not record a palette visit");
+
+        pcx.update(|window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query(">sibling".into()),
+                );
+                palette.activate("thread:sibling", window, cx);
+            });
+        });
+        let (_, plain_visit, reply) = next_dispatch(&mut fixture).await;
+        assert_eq!(plain_visit["type"], "thread.visit");
+        assert!(plain_visit.get("searchQuery").is_none(), "`>` command query must not record searchQuery");
+        reply.send(Ok(serde_json::json!({"sequence": 2}))).unwrap();
+
+        // 3. Legacy server without visit tracking skips the RPC completely.
+        pcx.update(|window, cx| {
+            state.update(cx, |state, _| {
+                state.server_config.config = Some(serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "legacy", "label": "Legacy", "capabilities": {} },
+                    "providers": [], "settings": {}, "issues": [], "keybindings": []
+                })).unwrap());
+                if let Some(snapshot) = state.shell.snapshot.as_mut() {
+                    for thread in &mut snapshot.threads {
+                        thread.last_visited_at = None;
+                    }
+                }
+            });
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query("other".into()),
+                );
+                palette.activate("thread:other-thread", window, cx);
+            });
+        });
+        assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
     }
 }

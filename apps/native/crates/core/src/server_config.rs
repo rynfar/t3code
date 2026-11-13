@@ -512,6 +512,8 @@ pub struct EnvironmentCapabilities {
     pub side_chats: Option<bool>,
     #[serde(default)]
     pub thread_auto_settle_opt_out: Option<bool>,
+    #[serde(default)]
+    pub thread_visited_tracking: Option<bool>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub thread_project_from_scratch: Option<bool>,
     #[serde(default)]

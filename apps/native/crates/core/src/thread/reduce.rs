@@ -31,8 +31,12 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
         // Pull request links are not modeled natively yet; the activity bump above still applies.
         EventBody::ThreadPullRequestLinkUpdated | EventBody::CheckpointRollbackRequested => {}
         EventBody::RunUpserted(run) => {
+            let prev_status = projection.runs.iter().find(|r| r.id == run.id).map(|r| r.status.as_str());
+            let hides = matches!(run.status.as_str(), "rolled_back" | "cancelled") && prev_status != Some(run.status.as_str());
             upsert_by(&mut projection.runs, *run, |r| &r.id);
-            refresh_visible_items(projection);
+            if hides {
+                refresh_visible_items(projection);
+            }
         }
         EventBody::RunBackgroundWorkCancelled { run_id, restart_cancelled_background_work } => {
             if let Some(run) = projection.runs.iter_mut().find(|run| run.id == run_id) {
@@ -40,8 +44,17 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
             }
         }
         EventBody::AttemptUpserted(attempt) => {
+            let hides = attempt.status == "superseded"
+                && !projection.attempts.iter().any(|existing| {
+                    existing.id == attempt.id
+                        && existing.status == "superseded"
+                        && existing.run_id == attempt.run_id
+                        && existing.root_node_id == attempt.root_node_id
+                });
             upsert_by(&mut projection.attempts, attempt, |a| &a.id);
-            refresh_visible_items(projection);
+            if hides {
+                refresh_visible_items(projection);
+            }
         }
         EventBody::NodeUpserted(entity) => upsert_entity(&mut projection.nodes, entity),
         EventBody::SubagentUpserted(mut entity) => {
@@ -123,6 +136,11 @@ fn apply_turn_item(
     let previous_was_interrupt = index
         .map(|i| matches!(projection.turn_items[i].kind, TurnItemKind::RunInterruptRequest { .. }))
         .unwrap_or(false);
+    if item.deferred_work.is_none()
+        && let Some(deferred_work) = index.and_then(|i| projection.turn_items[i].deferred_work.clone())
+    {
+        Arc::make_mut(&mut item).deferred_work = Some(deferred_work);
+    }
     match index {
         Some(i) => projection.turn_items[i] = item.clone(),
         None => projection.turn_items.push(item.clone()),
@@ -205,18 +223,29 @@ fn is_superseded_interrupt(
 
 /// `activeVisibleTurnItems`: drops local rows whose run state now hides them.
 fn refresh_visible_items(projection: &mut ThreadProjection) {
-    let statuses: HashMap<&str, &str> =
-        projection.runs.iter().map(|run| (run.id.as_str(), run.status.as_str())).collect();
+    let statuses: HashMap<&str, &str> = projection
+        .runs
+        .iter()
+        .filter(|run| matches!(run.status.as_str(), "rolled_back" | "cancelled"))
+        .map(|run| (run.id.as_str(), run.status.as_str()))
+        .collect();
     let mut superseded_roots: HashMap<&str, HashSet<&str>> = HashMap::new();
     for attempt in projection.attempts.iter().filter(|a| a.status == "superseded") {
         superseded_roots.entry(attempt.run_id.as_str()).or_default().insert(attempt.root_node_id.as_str());
     }
-    let interrupt_runs: HashSet<&str> = projection
-        .turn_items
-        .iter()
-        .filter(|item| matches!(item.kind, TurnItemKind::RunInterruptRequest { .. }))
-        .filter_map(|item| item.run_id.as_deref())
-        .collect();
+    if statuses.is_empty() && superseded_roots.is_empty() {
+        return;
+    }
+    let interrupt_runs: HashSet<&str> = if superseded_roots.is_empty() {
+        HashSet::new()
+    } else {
+        projection
+            .turn_items
+            .iter()
+            .filter(|item| matches!(item.kind, TurnItemKind::RunInterruptRequest { .. }))
+            .filter_map(|item| item.run_id.as_deref())
+            .collect()
+    };
     let visible = |item: &TurnItem| {
         let status = item.run_id.as_deref().and_then(|id| statuses.get(id).copied());
         if status == Some("rolled_back") {

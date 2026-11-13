@@ -3,9 +3,12 @@
 //! thread records one open, and later shell updates advance `lastVisitedAt`, throttled while a
 //! run streams, so the sidebar's Done and Woke markers clear for what the user has seen.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 
 use super::time::Ms;
+use crate::shell::ThreadShell;
 
 /// Every visit is a command plus a broadcast to all shell subscribers.
 pub const VISIT_DISPATCH_THROTTLE_MS: Ms = 10_000;
@@ -213,10 +216,78 @@ impl VisitTracker {
         self.dispatched(visited_at, now, false)
     }
 
+    pub fn mark_dispatched(&mut self, visited_at: Ms, now: Ms) {
+        self.last_dispatched = Some(self.last_dispatched.map_or(visited_at, |old| old.max(visited_at)));
+        self.last_dispatch_at = now;
+    }
+
     fn dispatched(&mut self, visited_at: Ms, now: Ms, opened: bool) -> VisitDecision {
         self.last_dispatched = Some(visited_at);
         self.last_dispatch_at = now;
         VisitDecision::Now { visited_at, opened }
+    }
+}
+
+/// Whether this server persists `lastVisitedAt` and accepts `thread.visit`.
+pub fn server_tracks_visits(capability: Option<bool>, config_loaded: bool, shell_tracks_visits: Option<bool>) -> bool {
+    if let Some(enabled) = capability {
+        return enabled;
+    }
+    if shell_tracks_visits == Some(true) {
+        return true;
+    }
+    !config_loaded
+}
+
+/// Client-side visit watermarks for legacy servers that omit `lastVisitedAt`, plus one-time
+/// migration when a server starts reporting `lastVisitedAt: null` (`useThreadVisitedMigration.ts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalVisitWatermarks {
+    #[serde(default)]
+    pub watermarks: BTreeMap<String, BTreeMap<String, Ms>>,
+    #[serde(skip)]
+    migrated: HashSet<(String, String)>,
+}
+
+impl LocalVisitWatermarks {
+    pub fn get(&self, environment_id: &str, thread_id: &str) -> Option<Ms> {
+        self.watermarks.get(environment_id).and_then(|threads| threads.get(thread_id).copied())
+    }
+
+    /// Monotonic update used on thread open and activity while mounted.
+    pub fn record_visit(&mut self, environment_id: &str, thread_id: &str, visited_at: Ms) -> bool {
+        if self.get(environment_id, thread_id).is_some_and(|existing| existing >= visited_at) {
+            return false;
+        }
+        self.watermarks
+            .entry(environment_id.to_owned())
+            .or_default()
+            .insert(thread_id.to_owned(), visited_at);
+        true
+    }
+
+    /// Explicit Mark Unread may move the watermark backward below the latest activity.
+    pub fn mark_unread(&mut self, environment_id: &str, thread_id: &str, visited_at: Ms) -> bool {
+        if self.get(environment_id, thread_id) == Some(visited_at) {
+            return false;
+        }
+        self.watermarks
+            .entry(environment_id.to_owned())
+            .or_default()
+            .insert(thread_id.to_owned(), visited_at);
+        true
+    }
+
+    /// Returns the local watermark once per thread when a server begins tracking visits with
+    /// `lastVisitedAt: null`. Established non-null server watermarks are left untouched.
+    pub fn take_migration(&mut self, environment_id: &str, thread: &ThreadShell) -> Option<Ms> {
+        if thread.last_visited_at != Some(None) {
+            return None;
+        }
+        if !self.migrated.insert((environment_id.to_owned(), thread.id.clone())) {
+            return None;
+        }
+        self.get(environment_id, &thread.id)
     }
 }
 
@@ -399,5 +470,74 @@ mod tests {
         }
         assert!(history.environments.len() <= OPEN_HISTORY_LIMIT);
         assert!(history.opens.len() <= OPEN_HISTORY_LIMIT);
+    }
+}
+
+#[cfg(test)]
+mod legacy_and_migration_tests {
+    use super::*;
+
+    fn shell_with_last_visited(last_visited: Option<Option<&str>>) -> ThreadShell {
+        let mut value = serde_json::json!({
+            "id": "t1",
+            "projectId": "p1",
+            "title": "Thread",
+            "providerInstanceId": "codex",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "lineage": { "rootThreadId": "t1" },
+            "status": "idle",
+            "hasActionableProposedPlan": false,
+            "itemCount": 0,
+            "visibleItemCount": 0,
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z"
+        });
+        match last_visited {
+            None => {}
+            Some(None) => {
+                value.as_object_mut().unwrap().insert("lastVisitedAt".into(), serde_json::Value::Null);
+            }
+            Some(Some(iso)) => {
+                value.as_object_mut().unwrap().insert("lastVisitedAt".into(), serde_json::json!(iso));
+            }
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn capability_and_shell_presence_determine_server_visit_tracking() {
+        assert!(server_tracks_visits(Some(true), true, Some(false)));
+        assert!(!server_tracks_visits(Some(false), true, Some(true)));
+        assert!(server_tracks_visits(None, true, Some(true)));
+        assert!(!server_tracks_visits(None, true, Some(false)));
+        assert!(!server_tracks_visits(None, true, None));
+        assert!(server_tracks_visits(None, false, None));
+    }
+
+    #[test]
+    fn local_watermarks_stay_monotonic_allow_unread_rewind_and_migrate_null_shells_once() {
+        let mut store = LocalVisitWatermarks::default();
+        assert!(store.record_visit("env-1", "t1", 100));
+        assert!(!store.record_visit("env-1", "t1", 90));
+        assert_eq!(store.get("env-1", "t1"), Some(100));
+        assert!(store.mark_unread("env-1", "t1", 50));
+        assert_eq!(store.get("env-1", "t1"), Some(50));
+
+        // Legacy omitted `lastVisitedAt` (None) does not migrate.
+        let omitted = shell_with_last_visited(None);
+        assert_eq!(omitted.last_visited_at, None);
+        assert_eq!(store.take_migration("env-1", &omitted), None);
+
+        // Established server watermark (`Some(Some(...))`) is preserved (e.g. Mark unread).
+        let established = shell_with_last_visited(Some(Some("2026-01-01T00:00:00.010Z")));
+        assert_eq!(store.take_migration("env-1", &established), None);
+
+        // Explicit `null` (`Some(None)`) migrates local watermark once per thread.
+        let null_shell = shell_with_last_visited(Some(None));
+        assert_eq!(null_shell.last_visited_at, Some(None));
+        assert_eq!(store.take_migration("env-1", &null_shell), Some(50));
+        assert_eq!(store.take_migration("env-1", &null_shell), None);
     }
 }

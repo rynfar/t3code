@@ -1834,7 +1834,7 @@ mod tests {
         settled_hit.id = "settled-hit".into();
         settled_hit.title = "Settled cafe thread".into();
         settled_hit.settled_override = Some("settled".into());
-        settled_hit.last_visited_at = Some("2026-11-01T08:00:00Z".into());
+        settled_hit.last_visited_at = Some(Some("2026-11-01T08:00:00Z".into()));
         settled_hit.updated_at = "2026-10-15T08:00:00Z".into();
         settled_hit.latest_user_message_at = Some("2026-10-15T08:00:00Z".into());
         settled_hit.lineage.root_thread_id = "settled-hit".into();
@@ -1864,7 +1864,7 @@ mod tests {
         let mut agent_msg_hit = sample.clone();
         agent_msg_hit.id = "agent-msg-hit".into();
         agent_msg_hit.title = "Refactor excerpt truncation".into();
-        agent_msg_hit.last_visited_at = Some("2026-11-01T06:00:00Z".into());
+        agent_msg_hit.last_visited_at = Some(Some("2026-11-01T06:00:00Z".into()));
         agent_msg_hit.updated_at = "2026-10-30T06:00:00Z".into();
         agent_msg_hit.latest_user_message_at = Some("2026-10-30T06:00:00Z".into());
         agent_msg_hit.lineage.root_thread_id = "agent-msg-hit".into();

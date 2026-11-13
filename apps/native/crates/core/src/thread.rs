@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::history::ThreadHistoryMeta;
 use crate::model::ModelSelection;
 use crate::shell::Lineage;
-use crate::turn_item::TurnItem;
+use crate::turn_item::{TurnItem, TurnItemKind};
 use crate::wire;
 
 mod reduce;
@@ -173,6 +173,25 @@ pub struct ThreadProjection {
     #[serde(deserialize_with = "known_projected_items")]
     pub visible_turn_items: Vec<ProjectedTurnItem>,
     pub updated_at: String,
+}
+
+impl ThreadProjection {
+    /// Whether `entry_id` (a message, turn item, source item, or plan id) is already projected.
+    pub fn has_entry(&self, entry_id: &str) -> bool {
+        fn turn_item_matches(item: &TurnItem, entry_id: &str) -> bool {
+            item.id == entry_id
+                || matches!(
+                    &item.kind,
+                    TurnItemKind::UserMessage { message_id, .. }
+                        | TurnItemKind::AssistantMessage { message_id, .. }
+                        if message_id == entry_id
+                )
+        }
+        self.visible_turn_items.iter().any(|row| row.source_item_id == entry_id || turn_item_matches(&row.item, entry_id))
+            || self.turn_items.iter().any(|item| turn_item_matches(item, entry_id))
+            || self.messages.iter().any(|message| message.id == entry_id)
+            || self.plans.iter().any(|plan| plan.id == entry_id)
+    }
 }
 
 fn known_turn_items<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Arc<TurnItem>>, D::Error> {
@@ -445,12 +464,14 @@ impl ThreadState {
             _ => None,
         };
         let changed = apply_event(projection, event, options);
-        if changed
-            && options.partial_timeline
-            && let Some(ordinal) = ordinal
-            && self.history.latest_local_turn_ordinal.is_none_or(|watermark| ordinal > watermark)
-        {
-            self.history.latest_local_turn_ordinal = Some(ordinal);
+        if changed {
+            if options.partial_timeline
+                && let Some(ordinal) = ordinal
+                && self.history.latest_local_turn_ordinal.is_none_or(|watermark| ordinal > watermark)
+            {
+                self.history.latest_local_turn_ordinal = Some(ordinal);
+            }
+            self.history.reconcile_pending_work(self.projection.as_ref());
         }
         changed
     }

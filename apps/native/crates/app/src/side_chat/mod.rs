@@ -66,7 +66,11 @@ impl AppState {
         self.side_threads.threads.get(thread_id).unwrap_or(&self.side_threads.empty)
     }
 
-    fn thread_state_mut(&mut self, thread_id: &str) -> Option<&mut ThreadState> {
+    pub(crate) fn has_side_thread(&self, thread_id: &str) -> bool {
+        self.side_threads.threads.contains_key(thread_id)
+    }
+
+    pub(crate) fn thread_state_mut(&mut self, thread_id: &str) -> Option<&mut ThreadState> {
         if self.selected_thread.as_deref() == Some(thread_id) {
             return Some(&mut self.thread);
         }

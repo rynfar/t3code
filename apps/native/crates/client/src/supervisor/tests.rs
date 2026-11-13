@@ -493,3 +493,61 @@ async fn media_fallback_uses_the_local_rpc_origin_and_preserves_optional_metadat
         }
     }
 }
+
+#[tokio::test]
+async fn thread_stream_keeps_syncing_after_stream_defect_and_protocol_defect() {
+    let mut server = FakeServer::start().await;
+    let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    client.open_thread("t1");
+
+    let mut first = server.connection().await;
+    answer_config(&mut first, None).await;
+    let shell = first.request(method::SUBSCRIBE_SHELL).await;
+    let sub1 = first.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(sub1["payload"]["acceptDeferredWork"], true);
+    first.chunk(&shell, json!([{"kind": "snapshot", "snapshot": {"snapshotSequence": 1, "projects": [], "threads": []}}])).await;
+    first
+        .chunk(
+            &sub1,
+            json!([
+                {"kind": "snapshot", "snapshotSequence": 5, "projection": projection("t1"), "hasMoreHistory": false},
+                {"kind": "event", "sequence": 6, "event": {"id": "e6", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}
+            ]),
+        )
+        .await;
+    assert_eq!(next_thread_sequence(&mut events).await, Some(5));
+    assert_eq!(next_thread_sequence(&mut events).await, Some(6));
+
+    // 1. Stream-level Exit Failure (Die defect) on healthy session must resubscribe at afterSequence: 6.
+    first
+        .send(json!({
+            "_tag": "Exit",
+            "requestId": sub1["id"],
+            "exit": {"_tag": "Failure", "cause": [{"_tag": "Die", "defect": "stream boom"}]}
+        }))
+        .await;
+    let sub2 = first.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(sub2["payload"]["afterSequence"], 6);
+    first
+        .chunk(
+            &sub2,
+            json!([{"kind": "event", "sequence": 7, "event": {"id": "e7", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+        )
+        .await;
+    assert_eq!(next_thread_sequence(&mut events).await, Some(7));
+
+    // 2. Connection-wide Defect drops the socket, reconnects, and resumes at afterSequence: 7.
+    first.send(json!({"_tag": "Defect", "defect": "socket defect"})).await;
+    let mut second = server.connection().await;
+    answer_config(&mut second, None).await;
+    let _shell2 = second.request(method::SUBSCRIBE_SHELL).await;
+    let sub3 = second.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(sub3["payload"]["afterSequence"], 7);
+    second
+        .chunk(
+            &sub3,
+            json!([{"kind": "event", "sequence": 8, "event": {"id": "e8", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+        )
+        .await;
+    assert_eq!(next_thread_sequence(&mut events).await, Some(8));
+}

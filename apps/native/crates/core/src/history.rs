@@ -5,7 +5,7 @@
 //! `threadHistoryController.ts` routes. Collapsed work (`deferWork`, `view=work`) and
 //! `throughEntryId` targeting are not requested, so their branches are not ported.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -25,6 +25,8 @@ pub struct ThreadHistoryMeta {
     /// Older pages were merged in. Stays true after the last page.
     pub expanded: bool,
     pub latest_local_turn_ordinal: Option<u64>,
+    pub pending_work: BTreeSet<String>,
+    pub work_errors: BTreeMap<String, String>,
 }
 
 impl ThreadHistoryMeta {
@@ -44,6 +46,33 @@ impl ThreadHistoryMeta {
     /// `shouldShowLoadEarlierControl`.
     pub fn should_show_load_earlier_control(&self) -> bool {
         self.has_more_history || self.error.is_some()
+    }
+
+    pub fn is_loading_work(&self, anchor_id: &str) -> bool {
+        self.pending_work.contains(anchor_id)
+    }
+
+    pub fn work_error(&self, anchor_id: &str) -> Option<&str> {
+        self.work_errors.get(anchor_id).map(String::as_str)
+    }
+
+    pub fn reconcile_pending_work(&mut self, projection: Option<&ThreadProjection>) {
+        if self.pending_work.is_empty() && self.work_errors.is_empty() {
+            return;
+        }
+        let Some(projection) = projection else {
+            self.pending_work.clear();
+            self.work_errors.clear();
+            return;
+        };
+        let active: HashSet<&str> = projection
+            .visible_turn_items
+            .iter()
+            .filter(|row| row.item.deferred_work.is_some())
+            .map(|row| row.source_item_id.as_str())
+            .collect();
+        self.pending_work.retain(|id| active.contains(id.as_str()));
+        self.work_errors.retain(|id, _| active.contains(id.as_str()));
     }
 
     fn is_active_request(&self, cursor: &str) -> bool {
@@ -104,12 +133,35 @@ fn row_key(row: &ProjectedTurnItem) -> (&str, &str) {
 /// Indexes the page, not the transcript, so the transcript is scanned by borrowed key once
 /// and never cloned. Returns true when the projection changed.
 pub fn merge_older_history(projection: &mut ThreadProjection, older: Vec<ProjectedTurnItem>) -> bool {
-    if older.is_empty() {
+    merge_older_history_with_work(projection, older, None)
+}
+
+/// `mergeOlderHistoryIntoProjection` with optional deferred-work anchor state (`view=work`).
+pub fn merge_older_history_with_work(
+    projection: &mut ThreadProjection,
+    older: Vec<ProjectedTurnItem>,
+    work: Option<(&str, Option<&str>)>,
+) -> bool {
+    if older.is_empty() && work.is_none() {
+        return false;
+    }
+    let work_anchor = work.and_then(|(anchor_id, next_cursor)| {
+        let start = projection.visible_turn_items.iter().position(|row| row.source_item_id == anchor_id)?;
+        let anchor = &projection.visible_turn_items[start];
+        let deferred = anchor.item.deferred_work.clone()?;
+        Some((start, anchor.source_thread_id.clone(), anchor.item.ordinal, deferred, next_cursor))
+    });
+    if work.is_some() && work_anchor.is_none() {
         return false;
     }
     let local = |row: &ProjectedTurnItem| row.visibility == Visibility::Local || row.source_thread_id == projection.thread.id;
     let mut first: HashMap<(&str, &str), usize> = HashMap::new();
     for (index, row) in older.iter().enumerate() {
+        if let Some((_, ref anchor_thread, anchor_ordinal, ref deferred, _)) = work_anchor
+            && (row.source_thread_id != *anchor_thread || row.item.ordinal < anchor_ordinal || row.item.ordinal > deferred.last_ordinal)
+        {
+            continue;
+        }
         first.entry(row_key(row)).or_insert(index);
     }
     // Current rows that repeat a page key: the last one is its current version (`Map` semantics).
@@ -125,6 +177,7 @@ pub fn merge_older_history(projection: &mut ThreadProjection, older: Vec<Project
         known.insert(item.id.as_str(), item);
     }
     let mut page: Vec<ProjectedTurnItem> = Vec::new();
+    let mut page_keys: HashSet<(String, String)> = HashSet::new();
     let mut dropped: HashSet<usize> = HashSet::new();
     let mut appended: Vec<Arc<TurnItem>> = Vec::new();
     let mut appended_ids: HashSet<&str> = HashSet::new();
@@ -141,7 +194,11 @@ pub fn merge_older_history(projection: &mut ThreadProjection, older: Vec<Project
             && local(&row)
             && let Some(item) = known.get(row.source_item_id.as_str())
         {
-            if !matches!(item.kind, TurnItemKind::RunInterruptRequest { .. }) || !is_item_visible(projection, item) {
+            if !matches!(
+                item.kind,
+                TurnItemKind::RunInterruptRequest { .. } | TurnItemKind::ApprovalRequest { .. } | TurnItemKind::UserInputRequest { .. }
+            ) || !is_item_visible(projection, item)
+            {
                 continue;
             }
             row.item = Arc::clone(item);
@@ -150,10 +207,58 @@ pub fn merge_older_history(projection: &mut ThreadProjection, older: Vec<Project
             appended.push(row.item.clone());
         }
         dropped.extend(current.into_iter().flatten());
+        page_keys.insert((row.source_thread_id.clone(), row.source_item_id.clone()));
         page.push(row);
     }
-    if page.is_empty() {
+    if page.is_empty() && work_anchor.is_none() {
         return false;
+    }
+    if let Some((start, anchor_thread, _, mut deferred, next_cursor)) = work_anchor {
+        let anchor_id = projection.visible_turn_items[start].source_item_id.clone();
+        let mut end = start + 1;
+        while end < projection.visible_turn_items.len() {
+            let row = &projection.visible_turn_items[end];
+            if row.source_thread_id != anchor_thread || row.visibility == Visibility::Synthetic || row.item.ordinal > deferred.last_ordinal {
+                break;
+            }
+            end += 1;
+        }
+        let next_deferred = next_cursor.map(|cursor| {
+            deferred.cursor = cursor.to_owned();
+            deferred
+        });
+        let mut section = page;
+        for row in &projection.visible_turn_items[start..end] {
+            if !page_keys.contains(&(row.source_thread_id.clone(), row.source_item_id.clone())) {
+                section.push(row.clone());
+            }
+        }
+        for row in &mut section {
+            if row.source_item_id == anchor_id {
+                Arc::make_mut(&mut row.item).deferred_work = next_deferred.clone();
+            }
+        }
+        section.sort_by_key(|row| row.item.ordinal);
+        for item in &mut projection.turn_items {
+            if item.id == anchor_id {
+                Arc::make_mut(item).deferred_work = next_deferred.clone();
+            }
+        }
+        for item in &mut appended {
+            if item.id == anchor_id {
+                Arc::make_mut(item).deferred_work = next_deferred.clone();
+            }
+        }
+        let mut visible = Vec::with_capacity(projection.visible_turn_items.len() - (end - start) + section.len());
+        visible.extend(projection.visible_turn_items[..start].iter().cloned());
+        visible.extend(section);
+        visible.extend(projection.visible_turn_items[end..].iter().cloned());
+        for (position, row) in visible.iter_mut().enumerate() {
+            row.position = position;
+        }
+        projection.visible_turn_items = visible;
+        projection.turn_items.extend(appended);
+        return true;
     }
     let unchanged = dropped.len() == page.len() && (0..page.len()).all(|index| dropped.contains(&index))
         && projection.visible_turn_items.iter().zip(&page).all(|(a, b)| row_key(a) == row_key(b));
@@ -259,7 +364,17 @@ impl ThreadState {
     /// Accepts one fetched page requested with `request_cursor`. A page to merge checks the
     /// projection out; the history meta changes now, as the web's single update does.
     pub fn begin_history_merge(&mut self, request_cursor: &str, page: HistoryPage) -> PageOutcome {
-        let keep_paging = page.has_more_history && !page.has_user_turn;
+        self.begin_history_merge_with(request_cursor, page, true, true)
+    }
+
+    pub fn begin_history_merge_with(
+        &mut self,
+        request_cursor: &str,
+        page: HistoryPage,
+        complete: bool,
+        auto_page: bool,
+    ) -> PageOutcome {
+        let keep_paging = complete && auto_page && page.has_more_history && !page.has_user_turn;
         if keep_paging && page.next_cursor.as_deref().is_none_or(|next| next == request_cursor) {
             return PageOutcome::Step(self.fail_history_load(request_cursor, "History did not advance.".into()));
         }
@@ -274,13 +389,28 @@ impl ThreadState {
             Some(next) if keep_paging => HistoryStep::Continue(next.clone()),
             _ => HistoryStep::Done,
         };
-        self.history = ThreadHistoryMeta {
-            history_cursor: page.next_cursor,
-            has_more_history: page.has_more_history,
-            loading: keep_paging,
-            error: None,
-            expanded: true,
-            latest_local_turn_ordinal: self.history.latest_local_turn_ordinal,
+        self.history = if complete {
+            ThreadHistoryMeta {
+                history_cursor: page.next_cursor,
+                has_more_history: page.has_more_history,
+                loading: keep_paging,
+                error: None,
+                expanded: true,
+                latest_local_turn_ordinal: self.history.latest_local_turn_ordinal,
+                pending_work: std::mem::take(&mut self.history.pending_work),
+                work_errors: std::mem::take(&mut self.history.work_errors),
+            }
+        } else {
+            ThreadHistoryMeta {
+                history_cursor: self.history.history_cursor.clone(),
+                has_more_history: self.history.has_more_history,
+                loading: true,
+                error: None,
+                expanded: true,
+                latest_local_turn_ordinal: self.history.latest_local_turn_ordinal,
+                pending_work: std::mem::take(&mut self.history.pending_work),
+                work_errors: std::mem::take(&mut self.history.work_errors),
+            }
         };
         self.merging = Some(Vec::new());
         PageOutcome::Merge(Box::new(HistoryMerge { projection, items: page.items, generation: self.generation, next }))
@@ -295,6 +425,7 @@ impl ThreadState {
         let Some(pending) = self.merging.take() else { return HistoryStep::Stale };
         self.projection = Some(merged.projection);
         self.replay_pending(pending);
+        self.history.reconcile_pending_work(self.projection.as_ref());
         merged.next
     }
 
@@ -315,6 +446,136 @@ impl ThreadState {
         self.history.error = Some(message.clone());
         HistoryStep::Failed(message)
     }
+
+    /// Starts loading deferred work behind one anchor item.
+    pub fn begin_work_load(&mut self, anchor_id: &str) -> Option<WorkPageTarget> {
+        let projection = self.projection.as_ref()?;
+        let row = projection.visible_turn_items.iter().find(|row| row.source_item_id == anchor_id)?;
+        let deferred = row.item.deferred_work.as_ref()?;
+        if self.history.pending_work.contains(anchor_id) {
+            return None;
+        }
+        self.history.work_errors.remove(anchor_id);
+        self.history.pending_work.insert(anchor_id.to_owned());
+        Some(WorkPageTarget { anchor_id: anchor_id.to_owned(), cursor: deferred.cursor.clone() })
+    }
+
+    /// Accepts one fetched `view=work` page requested for `anchor_id` at `request_cursor`.
+    pub fn begin_work_merge(&mut self, anchor_id: &str, request_cursor: &str, page: HistoryPage) -> WorkPageOutcome {
+        if !self.history.pending_work.contains(anchor_id) {
+            return WorkPageOutcome::Step(HistoryStep::Stale);
+        }
+        let anchor_matches = self.projection.as_ref().is_some_and(|projection| {
+            projection
+                .visible_turn_items
+                .iter()
+                .find(|row| row.source_item_id == anchor_id)
+                .and_then(|row| row.item.deferred_work.as_ref())
+                .is_some_and(|deferred| deferred.cursor == request_cursor)
+        });
+        if !anchor_matches {
+            self.history.pending_work.remove(anchor_id);
+            return WorkPageOutcome::Step(HistoryStep::Stale);
+        }
+        let next = match &page.next_cursor {
+            Some(next) if next == request_cursor => {
+                return WorkPageOutcome::Step(self.fail_work_load(anchor_id, request_cursor, "History did not advance.".into()));
+            }
+            Some(next) => HistoryStep::Continue(next.clone()),
+            None => HistoryStep::Done,
+        };
+        let Some(projection) = self.projection.take() else {
+            self.history.pending_work.remove(anchor_id);
+            return WorkPageOutcome::Step(HistoryStep::Stale);
+        };
+        self.merging = Some(Vec::new());
+        WorkPageOutcome::Ready(Box::new(WorkMerge {
+            anchor_id: anchor_id.to_owned(),
+            next_cursor: page.next_cursor,
+            projection,
+            items: page.items,
+            generation: self.generation,
+            next,
+        }))
+    }
+
+    pub fn finish_work_merge(&mut self, merged: MergedWork) -> HistoryStep {
+        if merged.generation != self.generation || !self.history.pending_work.contains(&merged.anchor_id) {
+            return HistoryStep::Stale;
+        }
+        let Some(pending) = self.merging.take() else { return HistoryStep::Stale };
+        self.projection = Some(merged.projection);
+        self.replay_pending(pending);
+        self.history.pending_work.remove(&merged.anchor_id);
+        self.history.work_errors.remove(&merged.anchor_id);
+        self.history.reconcile_pending_work(self.projection.as_ref());
+        merged.next
+    }
+
+    pub fn apply_work_page(&mut self, anchor_id: &str, request_cursor: &str, page: HistoryPage) -> HistoryStep {
+        match self.begin_work_merge(anchor_id, request_cursor, page) {
+            WorkPageOutcome::Ready(merge) => self.finish_work_merge(merge.run()),
+            WorkPageOutcome::Step(step) => step,
+        }
+    }
+
+    pub fn fail_work_load(&mut self, anchor_id: &str, request_cursor: &str, message: String) -> HistoryStep {
+        if !self.history.pending_work.contains(anchor_id) {
+            return HistoryStep::Stale;
+        }
+        let active = self.projection.as_ref().is_some_and(|projection| {
+            projection
+                .visible_turn_items
+                .iter()
+                .find(|row| row.source_item_id == anchor_id)
+                .and_then(|row| row.item.deferred_work.as_ref())
+                .is_some_and(|deferred| deferred.cursor == request_cursor)
+        });
+        self.history.pending_work.remove(anchor_id);
+        if !active {
+            return HistoryStep::Stale;
+        }
+        self.history.work_errors.insert(anchor_id.to_owned(), message.clone());
+        HistoryStep::Failed(message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPageTarget {
+    pub anchor_id: String,
+    pub cursor: String,
+}
+
+#[derive(Debug)]
+pub struct WorkMerge {
+    anchor_id: String,
+    next_cursor: Option<String>,
+    projection: ThreadProjection,
+    items: Vec<ProjectedTurnItem>,
+    generation: u64,
+    next: HistoryStep,
+}
+
+impl WorkMerge {
+    pub fn run(self) -> MergedWork {
+        let WorkMerge { anchor_id, next_cursor, mut projection, items, generation, next } = self;
+        merge_older_history_with_work(&mut projection, items, Some((&anchor_id, next_cursor.as_deref())));
+        MergedWork { anchor_id, projection, generation, next }
+    }
+}
+
+#[derive(Debug)]
+pub struct MergedWork {
+    anchor_id: String,
+    projection: ThreadProjection,
+    generation: u64,
+    next: HistoryStep,
+}
+
+#[derive(Debug)]
+pub enum WorkPageOutcome {
+    Ready(Box<WorkMerge>),
+    Step(HistoryStep),
 }
 
 #[cfg(test)]
