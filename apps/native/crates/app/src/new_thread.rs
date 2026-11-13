@@ -73,44 +73,6 @@ pub fn start_new_thread(state: &mut AppState, cx: &mut Context<AppState>) {
     }
 }
 
-/// The header's breadcrumb: the project (a button that starts a new thread in it, as on the web),
-/// a separator, and the thread's title.
-pub fn breadcrumb(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
-    let p = palette(cx);
-    let app = state.read(cx);
-    let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
-    let project_id = thread.map(|thread| thread.project_id.clone()).or_else(|| app.draft_project.clone());
-    let project = project_id.as_deref().and_then(|id| app.shell.project(id)).map(|project| (project.id.clone(), project.title.clone()));
-    let title: Option<SharedString> = match thread {
-        Some(thread) => Some(thread.title.clone().into()),
-        None if app.draft_project.is_some() => Some("New thread".into()),
-        None => None,
-    };
-    let state = state.clone();
-    h_flex()
-        .flex_1()
-        .min_w_0()
-        .gap(px(12.))
-        .text_sm()
-        .children(project.map(|(project_id, name)| {
-            let tooltip: SharedString = format!("New thread in {name}").into();
-            h_flex()
-                .id("breadcrumb-project")
-                .flex_shrink(1.)
-                .min_w_0()
-                .gap(px(6.))
-                .cursor_pointer()
-                .text_color(hsla(p.muted_foreground))
-                .hover(|this| this.text_color(hsla(p.foreground)))
-                .child(Icon::Folder.render(px(14.), hsla(p.icon_muted)))
-                .child(div().max_w(px(160.)).truncate().child(name))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_draft(&project_id, cx)))
-        }))
-        .when(title.is_some(), |this| this.child(div().flex_none().text_color(hsla(p.icon_muted)).child("/")))
-        .children(title.map(|title| div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title)))
-}
-
 /// The header's New thread button: a ghost 28px toggle with the square-pen icon.
 pub fn new_thread_button(cx: &App) -> impl IntoElement {
     let p = palette(cx);

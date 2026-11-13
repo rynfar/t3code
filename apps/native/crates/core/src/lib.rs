@@ -49,6 +49,7 @@ pub mod terminal_output;
 pub mod text_selection;
 pub mod thread;
 pub mod thread_actions;
+pub mod thread_details;
 pub mod timeline;
 pub mod traits;
 pub mod turn_item;

@@ -117,7 +117,7 @@ pub fn previews(cx: &App) -> Option<Entity<Previews>> {
 
 /// The launcher's "Browser" entry (`addBrowserSurface`): a new session in a new tab.
 pub fn add_browser_surface(state: &mut AppState, cx: &mut Context<AppState>) {
-    let Some(thread_id) = state.selected_thread.clone() else { return };
+    let Some(thread_id) = state.panel_thread() else { return };
     cx.defer(move |cx| {
         if let Some(previews) = previews(cx) {
             previews.update(cx, |previews, cx| previews.open_session(thread_id, None, cx));
@@ -128,7 +128,7 @@ pub fn add_browser_surface(state: &mut AppState, cx: &mut Context<AppState>) {
 /// `preview.toggle` (`togglePreviewPanel`): hides a showing browser, else shows the active
 /// session's tab or starts one.
 pub fn toggle_preview(state: &mut AppState, cx: &mut Context<AppState>) {
-    let Some(thread_id) = state.selected_thread.clone() else { return };
+    let Some(thread_id) = state.panel_thread() else { return };
     let showing = state.panels.panels.active_surface(&thread_id).is_some_and(|surface| surface.preview_tab().is_some() || surface.id == "browser:new");
     if showing {
         state.mutate_panels(cx, |panels, thread| {
@@ -162,7 +162,7 @@ impl Previews {
             AppEvent::ServerConfig => this.sync_server_browser(cx),
             AppEvent::Selection => {
                 this.panel_changed(cx);
-                let selected = this.state.read(cx).selected_thread.clone();
+                let selected = this.state.read(cx).panel_thread();
                 let edit = this.threads.show(selected.as_deref());
                 this.apply_edit(selected.as_deref(), edit, cx);
                 this.list_selected(cx);
@@ -211,7 +211,7 @@ impl Previews {
         }
         self.connection = current;
         self.threads.clear();
-        self.threads.show(state.selected_thread.as_deref());
+        self.threads.show(state.panel_thread().as_deref());
         self.panel_tabs.clear();
         self.events = None;
         self.grants = None;
@@ -251,7 +251,7 @@ impl Previews {
     }
 
     fn emit_all(&self, cx: &mut Context<Self>) {
-        if let Some(thread) = self.state.read(cx).selected_thread.clone() {
+        if let Some(thread) = self.state.read(cx).panel_thread() {
             cx.emit(PreviewsEvent::Thread(thread));
         }
     }
@@ -343,7 +343,7 @@ impl Previews {
         for thread in &applied.changed {
             self.changed(thread, cx);
         }
-        let shown = self.state.read(cx).selected_thread.clone();
+        let shown = self.state.read(cx).panel_thread();
         self.apply_edit(shown.as_deref(), applied.edit, cx);
         if resubscribed || applied.relist {
             self.list_selected(cx);
@@ -354,7 +354,7 @@ impl Previews {
         if self.server_browser != Some(true) {
             return;
         }
-        let Some(thread_id) = self.state.read(cx).selected_thread.clone() else { return };
+        let Some(thread_id) = self.state.read(cx).panel_thread() else { return };
         self.threads.thread_mut(&thread_id);
         let Some(task) = self.state.read(cx).request(method::LIST, json!({ "threadId": thread_id }), ListResult::decode) else { return };
         self.listing = Some(cx.spawn(async move |this, cx| {
@@ -395,7 +395,7 @@ impl Previews {
     /// Applies the shown thread's tab edit to its panel.
     fn apply_edit(&mut self, thread_id: Option<&str>, edit: Option<TabsEdit>, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(edit)) = (thread_id, edit) else { return };
-        if self.state.read(cx).selected_thread.as_deref() != Some(thread_id) {
+        if self.state.read(cx).panel_thread().as_deref() != Some(thread_id) {
             return;
         }
         self.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| edit.apply(&mut panels.panels, thread)));
@@ -404,7 +404,7 @@ impl Previews {
     /// A browser tab the user closed (a tab whose session still lives) closes its session.
     fn panel_changed(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let Some(thread_id) = state.selected_thread.clone() else { return };
+        let Some(thread_id) = state.panel_thread() else { return };
         let now: Vec<String> = state.panels.panels.panel(&thread_id).surfaces.iter().filter_map(|surface| surface.preview_tab().map(str::to_owned)).collect();
         let before = self.panel_tabs.insert(thread_id.clone(), now.clone()).unwrap_or_default();
         if self.availability() != Availability::Available {
@@ -519,7 +519,11 @@ impl Previews {
     }
 
     fn project_of(&self, thread_id: &str, cx: &App) -> Option<String> {
-        self.state.read(cx).thread_shell(thread_id).map(|thread| thread.project_id.clone())
+        self.state
+            .read(cx)
+            .thread_shell(thread_id)
+            .map(|thread| thread.project_id.clone())
+            .or_else(|| thread_id.strip_prefix("draft:").map(str::to_owned))
     }
 
     /// The thread's project's recently used addresses, newest first.

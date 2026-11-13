@@ -107,6 +107,23 @@ pub struct LimitRecovery {
     pub snooze: Option<bool>,
 }
 
+/// `OrchestrationV2LinkOrigin`: when a delegated thread was started over a paired link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkOrigin {
+    pub session_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub access: Option<String>,
+}
+
+impl LinkOrigin {
+    /// `linkOriginIsFenced`: only explicit `"full-access"` links are unfenced.
+    pub fn is_fenced(&self) -> bool {
+        self.access.as_deref() != Some("full-access")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadShell {
@@ -132,6 +149,8 @@ pub struct ThreadShell {
     pub creation_source: Option<String>,
     #[serde(default)]
     pub delegated_from: Option<serde_json::Value>,
+    #[serde(default)]
+    pub link_origin: Option<LinkOrigin>,
     #[serde(default)]
     pub active_provider_thread_id: Option<String>,
     pub latest_run_id: Option<String>,

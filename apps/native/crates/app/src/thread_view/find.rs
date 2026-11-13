@@ -70,6 +70,10 @@ fn row_entry(row: &TimelineRow) -> Option<&str> {
 }
 
 impl ThreadView {
+    pub(crate) fn is_find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn find_query_for_test(&self) -> Option<&str> {
         self.find.as_ref().map(|find| find.query.as_str())

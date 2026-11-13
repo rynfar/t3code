@@ -18,11 +18,20 @@ pub struct FileWorkspace {
 
 impl AppState {
     pub fn file_workspace(&self) -> Option<FileWorkspace> {
-        let thread_id = self.selected_thread.clone()?;
-        let thread = self.thread_shell(&thread_id)?;
-        let project = self.shell.project(&thread.project_id)?;
-        let cwd = thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone());
-        (!cwd.is_empty()).then(|| FileWorkspace { thread_id, cwd, project_name: project.title.clone() })
+        if let Some(thread_id) = self.selected_thread.clone() {
+            let thread = self.thread_shell(&thread_id)?;
+            let project = self.shell.project(&thread.project_id)?;
+            let cwd = thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone());
+            return (!cwd.is_empty()).then(|| FileWorkspace { thread_id, cwd, project_name: project.title.clone() });
+        }
+        let project_id = self.draft_project.as_deref()?;
+        let project = self.shell.project(project_id)?;
+        let cwd = project.workspace_root.clone();
+        (!self.is_scratch_project(project_id) && !cwd.is_empty()).then(|| FileWorkspace {
+            thread_id: t3_core::composer::drafts::new_thread_key(project_id),
+            cwd,
+            project_name: project.title.clone(),
+        })
     }
 
     /// `openFile`: shows `path` (workspace-relative, or absolute) in a file tab, scrolling to

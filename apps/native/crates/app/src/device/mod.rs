@@ -72,7 +72,7 @@ pub fn devices(cx: &App) -> Option<Entity<Devices>> {
 /// The launcher's "Device" entry (`addDeviceSurface`): setup first while devices are off or not
 /// set up, else the device list in a tab.
 pub fn add_device_surface(state: &mut AppState, cx: &mut Context<AppState>) {
-    let Some(thread_id) = state.selected_thread.clone() else { return };
+    let Some(thread_id) = state.panel_thread() else { return };
     let needs_setup = devices(cx).and_then(|devices| devices.read(cx).service().map(ServiceState::needs_setup)) == Some(true);
     if needs_setup {
         cx.defer(move |cx| {
@@ -87,7 +87,7 @@ pub fn add_device_surface(state: &mut AppState, cx: &mut Context<AppState>) {
 
 /// Applies a panel change to `thread_id`, which may no longer be the one showing.
 fn edit_panels(state: &mut AppState, thread_id: &str, cx: &mut Context<AppState>, change: impl FnOnce(&mut RightPanels, &str) -> bool) {
-    if state.selected_thread.as_deref() == Some(thread_id) {
+    if state.panel_thread().as_deref() == Some(thread_id) {
         state.mutate_panels(cx, |panels, thread| change(&mut panels.panels, thread));
     } else if change(&mut state.panels.panels, thread_id) {
         state.save_panels(cx);

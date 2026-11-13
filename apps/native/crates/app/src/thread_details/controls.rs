@@ -258,29 +258,40 @@ pub fn menu_icon(icon: Icon) -> gpui_component::Icon {
     gpui_component::Icon::default().path(icon.path())
 }
 
-/// `ThreadDetailsSection`: 8px sides, 8 above and 10 below, an optional 11px heading, and a
-/// hairline above when it follows another section.
-pub fn section(separated: bool, heading: Option<SharedString>, cx: &App) -> gpui::Div {
+/// `ThreadDetailsSection`: 8px sides, 8 above and 10 below (tightened when `compact`), an optional
+/// 11px heading with an optional trailing action, and a hairline above when it follows another section.
+pub fn section_with_action(separated: bool, heading: Option<SharedString>, action: Option<AnyElement>, compact: bool, cx: &App) -> gpui::Div {
     let p = palette(cx);
     div()
         .flex()
         .flex_col()
         .px(px(8.))
-        .pt(px(8.))
-        .pb(px(10.))
-        .when(separated, |this| this.border_t_1().border_color(hsla(p.border).opacity(0.65)))
-        .children(heading.map(|title| {
-            div()
-                .flex()
-                .items_center()
-                .min_h(px(32.))
-                .mb(px(4.))
-                .px(px(10.))
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(hsla(p.muted_foreground))
-                .child(div().truncate().child(title))
-        }))
+        .pt(px(if compact { 4. } else { 8. }))
+        .pb(px(if compact { 4. } else { 10. }))
+        .when(separated && !compact, |this| this.border_t_1().border_color(hsla(p.border).opacity(0.65)))
+        .when(!compact, |this| {
+            this.children(heading.map(|title| {
+                h_flex()
+                    .justify_between()
+                    .gap(px(8.))
+                    .min_h(px(32.))
+                    .mb(px(4.))
+                    .px(px(10.))
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hsla(p.muted_foreground))
+                    .child(div().min_w_0().truncate().child(title))
+                    .children(action)
+            }))
+        })
+}
+
+pub fn section_with_options(separated: bool, heading: Option<SharedString>, compact: bool, cx: &App) -> gpui::Div {
+    section_with_action(separated, heading, None, compact, cx)
+}
+
+pub fn section(separated: bool, heading: Option<SharedString>, cx: &App) -> gpui::Div {
+    section_with_options(separated, heading, false, cx)
 }
 
 /// A row in the branch picker (`menu.tsx` item): 28 min, 8 / 4 padding, highlighted `accent`.
