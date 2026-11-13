@@ -846,3 +846,116 @@ async fn channel_switch_run_sets_track_switch_and_dispatches_boot_service(cx: &m
         );
     });
 }
+
+#[gpui::test]
+async fn circular_update_button_mutes_during_run_and_capsule_popover_escapes(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+    let control = cx.new(|cx| UpdateControl::new(state, cx));
+    let (root, vcx) = cx.add_window_view(|_, cx| Harness {
+        outer: cx.focus_handle().tab_stop(true),
+        control: control.clone(),
+    });
+    control.update(vcx, |ctrl, cx| {
+        ctrl.plan = updates::Plan {
+            servers: vec![updates::ServerTarget {
+                environment_id: "local".into(),
+                label: "Local".into(),
+                target_version: "0.2.0".into(),
+                self_update: "npm".into(),
+            }],
+            providers: Vec::new(),
+            restarts: Vec::new(),
+            rows: Vec::new(),
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear();
+    });
+    let button_bounds = vcx
+        .debug_bounds("update-everything")
+        .expect("32x32 circular update button renders when updates are available");
+    assert_eq!(button_bounds.size.width, gpui::px(32.));
+    assert_eq!(button_bounds.size.height, gpui::px(32.));
+
+    control.update(vcx, |ctrl, cx| {
+        ctrl.run = Some(updates::UpdateEverythingRun {
+            track_switch: false,
+            phase: updates::UpdateRunPhase::Servers,
+            machines: vec![updates::UpdateRunMachine {
+                environment_id: "local".into(),
+                label: "Local".into(),
+                updates_providers: false,
+                server: None,
+                handed_off_version: None,
+                started_at_ms: now_ms(),
+                result: None,
+                failure: None,
+                provider_failure: None,
+            }],
+        });
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear();
+    });
+    assert!(
+        vcx.debug_bounds("update-everything").is_none(),
+        "active update run must hide #update-everything"
+    );
+    let trigger_center = vcx
+        .debug_bounds("update-capsule-trigger")
+        .expect("#update-capsule-trigger renders during active run")
+        .center();
+    vcx.simulate_mouse_move(trigger_center, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: trigger_center,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: trigger_center,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear();
+    });
+    assert!(
+        vcx.debug_bounds("update-capsule-popover").is_some(),
+        "clicking capsule trigger opens upward popover"
+    );
+
+    vcx.update(|window, cx| {
+        let outer = root.read(cx).outer.clone();
+        window.focus(&outer, cx);
+        window.focus_next(cx);
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear();
+    });
+    assert!(
+        vcx.debug_bounds("update-capsule-popover").is_none(),
+        "Escape closes #update-capsule-popover"
+    );
+}
