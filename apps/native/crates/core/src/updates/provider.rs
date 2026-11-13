@@ -78,6 +78,19 @@ pub fn one_click_candidates(providers: &[ServerProvider]) -> Vec<&ServerProvider
         })
         .collect()
 }
+pub fn same_one_click_representatives(a: &[ServerProvider], b: &[ServerProvider]) -> bool {
+    let mut left: Vec<_> = one_click_candidates(a)
+        .into_iter()
+        .map(|p| (p.driver.as_str(), p.instance_id.as_str()))
+        .collect();
+    let mut right: Vec<_> = one_click_candidates(b)
+        .into_iter()
+        .map(|p| (p.driver.as_str(), p.instance_id.as_str()))
+        .collect();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
 fn version(value: &str) -> String {
     if value.starts_with('v') {
         value.into()

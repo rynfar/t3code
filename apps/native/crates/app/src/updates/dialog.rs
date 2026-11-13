@@ -1,4 +1,5 @@
-use super::{Host, connected, plan};
+use super::{Host, plan};
+use t3_client::updates::{CapturedUpdateOwner, UpdateDestination};
 use crate::{
     app_state::{AppEvent, AppState},
     icons::Icon,
@@ -14,7 +15,7 @@ use t3_core::updates::{Plan, thread_warning};
 pub struct UpdateDialog {
     state: Entity<AppState>,
     pub(super) plan: Option<Plan>,
-    connection: Option<u64>,
+    captures: Result<Vec<CapturedUpdateOwner>, String>,
     pub(super) fixture: bool,
     pub(super) counts: Vec<(String, usize)>,
     expanded: bool,
@@ -47,7 +48,7 @@ impl UpdateDialog {
         Self {
             state,
             plan: None,
-            connection: None,
+            captures: Ok(Vec::new()),
             fixture: false,
             counts: Vec::new(),
             expanded: false,
@@ -63,7 +64,7 @@ impl UpdateDialog {
         self.plan = Some(plan);
         self.fixture = fixture;
         self.expanded = false;
-        self.connection = self.state.read(cx).connection_id();
+        self.captures = t3_client::updates::capture(self.plan.as_ref().unwrap(), &self.state.read(cx).fleet);
         self.counts = self.running_counts(cx);
         self.previous_focus = window.focused(cx);
         window.focus(&self.cancel_focus, cx);
@@ -74,31 +75,20 @@ impl UpdateDialog {
             return Vec::new();
         };
         let state = self.state.read(cx);
-        let environment = state
-            .server_config
-            .config
-            .as_ref()
-            .map(|c| c.environment.environment_id.as_str())
-            .unwrap_or_default();
-        t3_core::updates::running_counts(
-            &plan.restarts,
-            state.shell.snapshot.as_ref().into_iter().flat_map(|shell| {
-                shell
-                    .threads
-                    .iter()
-                    .map(|thread| (environment, thread.status.as_str()))
-            }),
-        )
+        plan.restarts.iter().map(|restart| {
+            let count = self.captures.as_ref().ok().and_then(|captures| captures.iter().find(|c| c.owner.saved_id == restart.environment_id))
+                .and_then(|capture| state.fleet.environment(&restart.environment_id).filter(|entry| entry.summary.owner == capture.owner))
+                .map_or(0, |entry| entry.summary.running_thread_count);
+            (restart.environment_id.clone(), count)
+        }).collect()
     }
     fn disabled_reason(&self, cx: &App) -> Option<&'static str> {
-        if self.fixture {
-            return None;
-        }
+        if self.fixture { return None; }
         let state = self.state.read(cx);
-        if self.connection != state.connection_id() || !connected(state) {
-            return Some("The environment is not connected.");
-        }
-        if self.plan.as_ref() != Some(&plan(state, false)) {
+        let Some(opening) = &self.plan else { return Some("No updates are selected."); };
+        if opening != &plan(state, false)
+            || self.captures.as_ref().ok() != t3_client::updates::capture(opening, &state.fleet).as_ref().ok()
+            || self.captures.is_err() {
             return Some("Updates changed. Close this dialog and review them again.");
         }
         None
@@ -129,6 +119,7 @@ impl UpdateDialog {
     }
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.plan = None;
+        self.captures = Ok(Vec::new());
         if let Some(focus) = self.previous_focus.take() {
             window.focus(&focus, cx);
         } else {
@@ -148,10 +139,20 @@ impl UpdateDialog {
             return;
         };
         let state = self.state.read(cx);
-        let Some(client) = state.client_handle() else {
-            return;
-        };
-        let connection = state.connection_id();
+        let Ok(captures) = self.captures.clone() else { return; };
+        let mut lookups = Vec::new();
+        for capture in captures {
+            for (scope, needed) in [
+                ("providers:manage", plan.providers.iter().any(|p| p.environment_id == capture.owner.saved_id)),
+                ("environment:maintain", plan.servers.iter().any(|s| s.environment_id == capture.owner.saved_id)),
+            ] {
+                if needed {
+                    let receipt = state.connections.destination(&capture.owner, scope);
+                    lookups.push((capture.clone(), scope, receipt));
+                }
+            }
+        }
+        let view = state.connections.view();
         let runtime = state.runtime().clone();
         let state = self.state.clone();
         let control = cx.global::<Host>().control.clone();
@@ -159,16 +160,19 @@ impl UpdateDialog {
         if let Some(control) = control.upgrade() {
             control.update(cx, |control, cx| control.busy(Some("Updating…".into()), cx));
         }
-        let task = runtime.spawn(async move { t3_client::updates::run(&client, plan).await });
+        let task = runtime.spawn(async move {
+            let mut destinations = Vec::new();
+            for (capture, scope, receipt) in lookups {
+                destinations.push(UpdateDestination { capture, scope, receipt: receipt.await });
+            }
+            t3_client::updates::run(plan, destinations, view).await
+        });
         cx.spawn(async move |_, cx| {
             let failures = task.await.unwrap_or_else(|e| vec![e.to_string()]);
             if let Some(control) = control.upgrade() {
                 control.update(cx, |control, cx| control.busy(None, cx));
             }
             state.update(cx, |state, cx| {
-                if state.connection_id() != connection {
-                    return;
-                }
                 let (kind, title) = if failures.is_empty() {
                     (ToastKind::Success, "Updates complete")
                 } else {

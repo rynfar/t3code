@@ -282,7 +282,22 @@ fn publish(entries: &HashMap<String, Entry>, changed: &str, material: bool, outp
             Some(prior) => prior.summary.clone(),
             None => { relink = true; Arc::new(EnvironmentSummary::from_shell(owner, &entry.shell, &entry.config)) },
         };
-        let same = prior.is_some_and(|prior| prior.summary == summary && prior.status == entry.status && prior.config.config == entry.config.config && prior.grants == grants && prior.settings_revision == entry.config.settings_revision() && prior.keybindings_revision == entry.config.keybindings_revision());
+        let same = prior.is_some_and(|prior| {
+            prior.summary == summary
+                && prior.status == entry.status
+                && prior.config.config == entry.config.config
+                && prior
+                    .config
+                    .config
+                    .as_ref()
+                    .zip(entry.config.config.as_ref())
+                    .is_none_or(|(a, b)| {
+                        t3_core::updates::same_one_click_representatives(&a.providers, &b.providers)
+                    })
+                && prior.grants == grants
+                && prior.settings_revision == entry.config.settings_revision()
+                && prior.keybindings_revision == entry.config.keybindings_revision()
+        });
         if !same {
             let view = Arc::new(EnvironmentView { summary, status: entry.status.clone(), config: entry.config.clone(), grants, settings_revision: entry.config.settings_revision(), keybindings_revision: entry.config.keybindings_revision() });
             match index { Some(index) => environments[index] = view, None => environments.push(view) }

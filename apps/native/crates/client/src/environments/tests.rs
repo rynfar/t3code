@@ -284,6 +284,154 @@ async fn removing_environment_cancels_its_in_flight_session_state_fetch() {
 }
 
 
+
+fn socket_update_config() -> Value {
+    json!({"environment":{"environmentId":"update-host","label":"Update host","serverVersion":"1.0.0","capabilities":{"serverSelfUpdate":"boot-service"}},"providers":[{"instanceId":"codex","driver":"codex","enabled":true,"installed":false,"status":"missing"}]})
+}
+async fn socket_update_shell(connection: &mut Connection, config: Value) -> Value {
+    let (config_request, shell) = shell_streams(connection, config).await;
+    connection.chunk(&shell,json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[]}},{"kind":"synchronized"}])).await;
+    config_request
+}
+fn socket_update_ready(view: &FleetView) -> bool {
+    view.environment("update").is_some_and(|e| e.status == ConnectionStatus::Connected
+        && e.summary.synchronized && e.summary.config_loaded
+        && e.grants.as_ref().is_some_and(|s| s.grants("environment:maintain")))
+}
+async fn socket_update_request(connection: &mut Connection, tag: &str, task: &mut tokio::task::JoinHandle<Vec<String>>) -> Value {
+    loop {
+        tokio::select! {
+            frame = connection.recv() => {
+                if frame["_tag"] == "Request" {
+                    assert_eq!(frame["tag"],tag,"unexpected update request: {frame}");
+                    return frame;
+                }
+            },
+            joined = &mut *task => panic!("runner completed before {tag}: {joined:?}"),
+        }
+    }
+}
+async fn socket_update_fence(connection: &mut Connection, client: &ClientHandle) {
+    let response = client.request("fixture.read",json!({}));
+    loop {
+        let frame = connection.recv().await;
+        if frame["_tag"] == "Request" {
+            assert_eq!(frame["tag"],"fixture.read","unsafe write before ordered fence: {frame}");
+            connection.send(json!({"_tag":"Exit","requestId":frame["id"],"exit":{"_tag":"Success","value":{}}})).await;
+            break;
+        }
+    }
+    response.await.unwrap();
+}
+
+#[tokio::test]
+async fn unresolved_provider_revocation_withholds_restart_through_owned_join_and_fence() {
+    let mut server = FakeServer::start().await;
+    server.set_session(json!({"authenticated":true,"permissions":["providers:manage","environment:maintain"]}));
+    let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(),false);
+    let mut view = owner.view(); owner.watch("update",server.credentials(),None);
+    let mut connection = server.connection().await;
+    socket_update_shell(&mut connection,socket_update_config()).await;
+    view.wait_for(|view| socket_update_ready(view) && view.environment("update").unwrap().grants.as_ref().unwrap().grants("providers:manage")).await.unwrap();
+    let client = owner.client("update").await.unwrap();
+    let plan = t3_core::updates::Plan {
+        providers: vec![t3_core::updates::ProviderTarget { environment_id:"update".into(),driver:"codex".into(),instance_id:"codex".into() }],
+        servers: vec![t3_core::updates::ServerTarget { environment_id:"update".into(),label:"Update host".into(),target_version:"2.0.0".into(),self_update:"boot-service".into() }], ..Default::default()
+    };
+    let capture = crate::updates::capture(&plan,&view.borrow()).unwrap().remove(0);
+    let mut destinations = Vec::new();
+    for scope in ["providers:manage","environment:maintain"] {
+        destinations.push(crate::updates::UpdateDestination { receipt:owner.destination(&capture.owner,scope).await,capture:capture.clone(),scope });
+    }
+    let mut task = tokio::spawn(crate::updates::run(plan,destinations,view.clone()));
+    let held = socket_update_request(&mut connection,"server.updateProvider",&mut task).await;
+    assert_eq!(held["payload"],json!({"provider":"codex","instanceId":"codex"}));
+    server.set_session(json!({"authenticated":true,"permissions":["environment:maintain"]}));
+    let mut live = client.session_state(); client.refresh_session_state();
+    live.wait_for(|s| s.as_ref().is_some_and(|s| s.grants("environment:maintain") && !s.grants("providers:manage"))).await.unwrap();
+    view.wait_for(|v| socket_update_ready(v) && !v.environment("update").unwrap().grants.as_ref().unwrap().grants("providers:manage")).await.unwrap();
+    let failures = loop {
+        tokio::select! {
+            joined = &mut task => break joined.unwrap(),
+            frame = connection.recv() => assert_ne!(frame["_tag"],"Request","unsafe request while provider unresolved: {frame}"),
+        }
+    };
+    assert!(failures.iter().any(|s| s.contains("unresolved")));
+    assert!(failures.iter().any(|s| s.contains("restart withheld")));
+    socket_update_fence(&mut connection,&client).await;
+    drop((held,connection,client,owner));
+}
+
+#[tokio::test]
+async fn own_server_reconnect_accepts_ready_but_rejects_live_maintain_or_policy_loss() {
+    for denial in ["none","grant","policy"] {
+        let mut server = FakeServer::start().await;
+        server.set_session(json!({"authenticated":true,"permissions":["environment:maintain","providers:manage"]}));
+        let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(),false);
+        let mut view = owner.view(); owner.watch("update",server.credentials(),None);
+        let mut connection = server.connection().await;
+        socket_update_shell(&mut connection,socket_update_config()).await;
+        view.wait_for(|view| socket_update_ready(view)).await.unwrap();
+        let client = owner.client("update").await.unwrap();
+        let plan = t3_core::updates::Plan { providers:vec![t3_core::updates::ProviderTarget { environment_id:"update".into(),driver:"codex".into(),instance_id:"codex".into() }], servers:vec![t3_core::updates::ServerTarget { environment_id:"update".into(),label:"Update host".into(),target_version:"2.0.0".into(),self_update:"boot-service".into() }],..Default::default() };
+        let capture = crate::updates::capture(&plan,&view.borrow()).unwrap().remove(0);
+        let original = capture.owner.clone();
+        let provider_receipt = owner.destination(&original,"providers:manage").await;
+        let receipt = owner.destination(&original,"environment:maintain").await;
+        let mut task = tokio::spawn(crate::updates::run(plan,vec![
+            crate::updates::UpdateDestination { capture:capture.clone(),scope:"providers:manage",receipt:provider_receipt },
+            crate::updates::UpdateDestination { capture,scope:"environment:maintain",receipt },
+        ],view.clone()));
+        let provider = socket_update_request(&mut connection,"server.updateProvider",&mut task).await;
+        let status = match denial { "none" => "succeeded", "grant" => "failed", _ => "unchanged" };
+        connection.send(json!({"_tag":"Exit","requestId":provider["id"],"exit":{"_tag":"Success","value":{"providers":[{"instanceId":"codex","updateState":{"status":status}}]}}})).await;
+        let prepare = socket_update_request(&mut connection,"server.updateServer",&mut task).await;
+        assert_eq!(prepare["payload"],json!({"targetVersion":"2.0.0"}));
+        connection.send(json!({"_tag":"Exit","requestId":prepare["id"],"exit":{"_tag":"Success","value":{"method":"service","targetVersion":"2.1.0","updateId":"trial"}}})).await;
+        let _old_subscription = socket_update_request(&mut connection,"subscribeServerLifecycle",&mut task).await;
+        drop(connection);
+        let mut connection = server.connection().await;
+        let mut config = socket_update_config(); config["environment"]["serverVersion"] = json!("2.1.0");
+        let config_request = socket_update_shell(&mut connection,config.clone()).await;
+        view.wait_for(|v| socket_update_ready(v) && v.environment("update").unwrap().summary.owner.connection_generation > original.connection_generation).await.unwrap();
+        {
+            let view = view.borrow(); let owner = &view.environment("update").unwrap().summary.owner;
+            assert_eq!(owner.generation,original.generation); assert_eq!(owner.canonical_id,original.canonical_id);
+            assert_eq!(owner.saved_id,original.saved_id); assert!(owner.shell_generation >= original.shell_generation);
+            assert_eq!(owner.connection_generation,*client.connection_generation().borrow());
+        }
+        let lifecycle = socket_update_request(&mut connection,"subscribeServerLifecycle",&mut task).await;
+        if denial == "grant" {
+            server.set_session(json!({"authenticated":true,"permissions":[]}));
+            let mut live = client.session_state(); client.refresh_session_state();
+            live.wait_for(|s| s.as_ref().is_some_and(|s| !s.grants("environment:maintain"))).await.unwrap();
+            view.wait_for(|v| v.environment("update").unwrap().grants.as_ref().is_some_and(|s| !s.grants("environment:maintain"))).await.unwrap();
+        } else if denial == "policy" {
+            config["managedPolicy"] = json!({"limits":{"updates":{"mode":"off"}}});
+            connection.chunk(&config_request,json!([{"type":"snapshot","config":config}])).await;
+            view.wait_for(|v| v.environment("update").unwrap().config.config.as_ref().unwrap().managed_policy.is_some()).await.unwrap();
+        }
+        let failures = if denial == "none" {
+            connection.chunk(&lifecycle,json!([{"type":"ready","payload":{"environment":{"serverVersion":"2.1.0"},"updateOutcome":{"id":"trial","status":"committed","targetVersion":"2.1.0"}}}])).await;
+            task.await.unwrap()
+        } else {
+            loop {
+                tokio::select! {
+                    joined = &mut task => break joined.unwrap(),
+                    frame = connection.recv() => assert_ne!(frame["_tag"],"Request","unsafe request after authorization loss: {frame}"),
+                }
+            }
+        };
+        assert_eq!(failures.is_empty(),denial == "none","{denial}: {failures:?}");
+        if denial != "none" {
+            let expected = if denial == "grant" { "no permission to maintain server" } else { "server capability or policy changed" };
+            assert!(failures.iter().any(|error| error.contains(expected)),"{denial}: {failures:?}");
+        }
+        socket_update_fence(&mut connection,&client).await;
+        drop((connection,client,owner));
+    }
+}
+
 #[cfg(feature = "test-support")]
 mod quiet_fleet {
     use super::*;
@@ -421,12 +569,141 @@ mod quiet_fleet {
         view.changed().await.unwrap();
         assert!(view.borrow().environments.is_empty());
         assert!(matches!(owner.destination(&token, ORCHESTRATION_OPERATE_SCOPE).await, Err(DestinationError::Missing)));
+
+        let [(mut active_entry, mut active_fixture), (mut a_entry, mut a_fixture), (mut b_entry, mut b_fixture)] = ["active", "a", "b"].map(self::entry);
+        for (entry, fixture) in [(&mut active_entry, &mut active_fixture), (&mut a_entry, &mut a_fixture), (&mut b_entry, &mut b_fixture)] {
+            fixture.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":["providers:manage"]})).unwrap()));
+            entry.config.apply(serde_json::from_value(json!({"type":"snapshot","config":{"environment":{"environmentId":"shared-update-host","label":"Update host"},"scratchWorkspaceRoot":"/scratch","providers":[{"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"ready"}]}})).unwrap());
+        }
+        let (mut updates_owner, mut updates_events) = Environments::start(&tokio::runtime::Handle::current(), false);
+        let updates_view = updates_owner.view();
+        let mut updates_inputs = Vec::new();
+        for (id, entry) in [("active", &active_entry), ("a", &a_entry), ("b", &b_entry)] {
+            updates_inputs.push(updates_owner.install_fixture(id, entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await);
+        }
+        drop((active_entry, a_entry, b_entry));
+        let update_tokens = {
+            let view = updates_view.borrow();
+            assert_eq!(view.environments.len(), 3);
+            ["active", "a", "b"].map(|id| {
+                let entry = view.environment(id).unwrap();
+                assert_eq!(entry.summary.owner.saved_id, id);
+                assert_eq!(entry.summary.owner.canonical_id.as_deref(), Some("shared-update-host"));
+                assert_eq!(entry.status, ConnectionStatus::Connected);
+                assert!(entry.summary.synchronized && entry.summary.config_loaded);
+                assert!(entry.grants.as_ref().unwrap().grants("providers:manage"));
+                let providers = &entry.config.config.as_ref().unwrap().providers;
+                assert_eq!(providers.len(), 1);
+                assert_eq!((providers[0].driver.as_str(), providers[0].instance_id.as_str()), ("codex", "codex"));
+                entry.summary.owner.clone()
+            })
+        };
+        assert_ne!(update_tokens[0], update_tokens[1]);
+        assert_ne!(update_tokens[0], update_tokens[2]);
+        assert_ne!(update_tokens[1], update_tokens[2]);
+        for token in &update_tokens {
+            let destination = updates_owner.destination(token, "providers:manage").await.unwrap();
+            assert_eq!(&destination.owner, token);
+            assert!(destination.is_current(&updates_view.borrow()));
+        }
+        updates_owner.activate(Some("active"));
+        let (active_client, active_generation) = activated(&mut updates_events, "active").await;
+        assert_eq!(active_generation, update_tokens[0].generation);
+        let plan = t3_core::updates::Plan {
+            providers: vec![t3_core::updates::ProviderTarget { environment_id: update_tokens[1].saved_id.clone(), driver: "codex".into(), instance_id: "codex".into() }],
+            ..Default::default()
+        };
+        let captures = crate::updates::capture(&plan, &updates_view.borrow()).unwrap();
+        assert_eq!(captures[0].owner, update_tokens[1]);
+        let capture = captures.into_iter().next().unwrap();
+        let receipt = updates_owner.destination(&capture.owner, "providers:manage");
+        let runner_view = updates_view.clone();
+        let mut update_task = tokio::spawn(async move {
+            let destinations = vec![crate::updates::UpdateDestination { capture, scope: "providers:manage", receipt: receipt.await }];
+            crate::updates::run(plan, destinations, runner_view).await
+        });
+        drop(active_client);
+        let observed = tokio::select! {
+            request = active_fixture.next_request() => Ok(("active", request)),
+            request = a_fixture.next_request() => Ok(("a", request)),
+            request = b_fixture.next_request() => Ok(("b", request)),
+            completed = &mut update_task => Err(completed),
+        };
+        let (observed_destination, request, reply_sent, completed) = match observed {
+            Ok((destination, (method, payload, reply))) => {
+                let reply_sent = reply.send(Ok(json!({"providers":[{"instanceId":"codex","updateState":{"status":"succeeded"}}]}))).is_ok();
+                (destination, Some((method, payload)), reply_sent, update_task.await)
+            }
+            Err(completed) => ("completed", None, false, completed),
+        };
+        drop((updates_inputs, updates_owner, updates_events, updates_view, active_fixture, a_fixture, b_fixture));
+        let failures = completed.expect("the owned update runner task must join");
+        assert!(reply_sent, "the update runner must await the acquired unary reply");
+        assert!(failures.is_empty(), "the acquired provider update must finish: {failures:?}");
+        let (method, payload) = request.expect("the update runner must send the planned provider request");
+        assert_eq!(method, "server.updateProvider");
+        assert_eq!(payload, json!({"provider":"codex","instanceId":"codex"}));
+        assert_eq!(observed_destination, "a", "a saved provider target must not use the unrelated active or colliding saved client");
+    }
+
+
+    #[tokio::test]
+    async fn captured_update_drivers_tolerate_own_stream_and_refuse_command_drift() {
+        let (mut entry, mut fixture) = entry("updates");
+        fixture.grants.send_replace(Some(serde_json::from_value(json!({"authenticated":true,"permissions":["providers:manage"]})).unwrap()));
+        let provider = |driver: &str, command: &str, stamp: &str| json!({"instanceId":driver,"driver":driver,"enabled":true,"installed":false,"status":"missing","checkedAt":stamp,"versionAdvisory":{"status":"behind_latest","latestVersion":"2.0.0","canUpdate":true,"updateCommand":command}});
+        let providers = vec![provider("codex","codex update","2026-11-01"),provider("claudeCode","claude update","2026-11-01")];
+        entry.config.apply(serde_json::from_value(json!({"type":"providerStatuses","payload":{"providers":providers}})).unwrap());
+        let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(), false);
+        let mut view = owner.view();
+        let input = owner.install_fixture("updates", entry.client.clone(), entry.shell.clone(), entry.config.clone(), ConnectionStatus::Connected).await;
+        let plan = t3_core::updates::Plan { providers: ["codex","claudeCode"].map(|driver| t3_core::updates::ProviderTarget { environment_id:"updates".into(), driver:driver.into(), instance_id:driver.into() }).to_vec(), ..Default::default() };
+        let capture = crate::updates::capture(&plan, &view.borrow()).unwrap().remove(0);
+        let receipt = owner.destination(&capture.owner,"providers:manage").await;
+        let runner_view = view.clone();
+        let mut task = tokio::spawn(crate::updates::run(plan.clone(), vec![crate::updates::UpdateDestination { capture: capture.clone(), scope:"providers:manage", receipt }], runner_view));
+        let (method,payload,reply) = tokio::select! { request = fixture.next_request() => request, done = &mut task => panic!("runner ended before first request: {done:?}") };
+        assert_eq!(method,"server.updateProvider"); assert_eq!(payload["provider"],"codex");
+        let mut streamed = vec![provider("codex","codex update","2026-11-02"),provider("claudeCode","claude update","2026-11-02")];
+        streamed[0]["updateState"] = json!({"status":"running"});
+        input.send(ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({"type":"providerStatuses","payload":{"providers":streamed}})).unwrap()))).await.unwrap();
+        view.wait_for(|view| view.environment("updates").unwrap().config.config.as_ref().unwrap().providers[0].update_state.as_ref().is_some_and(|s| s.status == "running")).await.unwrap();
+        streamed[0]["updateState"] = json!({"status":"succeeded"});
+        input.send(ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({"type":"providerStatuses","payload":{"providers":streamed}})).unwrap()))).await.unwrap();
+        view.wait_for(|view| view.environment("updates").unwrap().config.config.as_ref().unwrap().providers[0].update_state.as_ref().is_some_and(|s| s.status == "succeeded")).await.unwrap();
+        reply.send(Ok(json!({"providers":[{"instanceId":"codex","updateState":{"status":"succeeded"}}]}))).unwrap();
+        let (method,payload,reply) = tokio::select! { request = fixture.next_request() => request, done = &mut task => panic!("runner ended before second request: {done:?}") };
+        assert_eq!(method,"server.updateProvider"); assert_eq!(payload["provider"],"claudeCode");
+        reply.send(Ok(json!({"providers":[{"instanceId":"claudeCode","updateState":{"status":"succeeded"}}]}))).unwrap();
+        assert!(task.await.unwrap().is_empty());
+        let plan = t3_core::updates::Plan { providers: vec![plan.providers[1].clone()], ..Default::default() };
+        let capture = crate::updates::capture(&plan,&view.borrow()).unwrap().remove(0);
+        let receipt = owner.destination(&capture.owner,"providers:manage").await;
+        streamed[1]["versionAdvisory"]["updateCommand"] = json!("changed command");
+        input.send(ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({"type":"providerStatuses","payload":{"providers":streamed}})).unwrap()))).await.unwrap();
+        view.wait_for(|view| view.environment("updates").unwrap().config.config.as_ref().unwrap().providers[1].version_advisory.as_ref().unwrap().update_command.as_deref() == Some("changed command")).await.unwrap();
+        let mut refused = tokio::spawn(crate::updates::run(plan,vec![crate::updates::UpdateDestination { capture, scope:"providers:manage", receipt }],view.clone()));
+        let failures = tokio::select! {
+            result = &mut refused => result.unwrap(),
+            request = fixture.next_request() => panic!("command drift was dispatched: {} {}",request.0,request.1),
+        };
+        assert!(failures.iter().any(|e| e.contains("facts changed")));
+        let probe = entry.client.request("fixture.read",json!({}));
+        let (method,_,reply) = fixture.next_request().await;
+        assert_eq!(method,"fixture.read"); reply.send(Ok(json!({}))).unwrap(); probe.await.unwrap();
+        drop((input,owner,fixture));
     }
 
     #[tokio::test]
     async fn quiet_fleet_config_updates_publish_revisions_and_reuse_quiet_summary() {
         let (mut entry, _fixture) = entry("config");
-        let loaded_config = entry.config.config.clone().unwrap();
+        let mut loaded_config = entry.config.config.clone().unwrap();
+        let providers = |work: &str, office: &str| serde_json::from_value::<Vec<t3_core::server_config::ServerProvider>>(json!([
+            {"instanceId":"work","driver":"codex","enabled":true,"installed":true,"status":"ready","checkedAt":work,"versionAdvisory":{"status":"behind_latest","latestVersion":"2.0.0","canUpdate":true,"updateCommand":"npm update codex"}},
+            {"instanceId":"office","driver":"codex","enabled":true,"installed":true,"status":"ready","checkedAt":office,"versionAdvisory":{"status":"behind_latest","latestVersion":"2.0.0","canUpdate":true,"updateCommand":"npm update codex"}}
+        ])).unwrap();
+        loaded_config.providers = providers("2026-01-02","2026-01-01");
+        assert_eq!(t3_core::updates::one_click_candidates(&loaded_config.providers)[0].instance_id,"work");
         entry.config = ServerConfigState::default();
         let (mut owner, mut output) = Environments::start(&tokio::runtime::Handle::current(), false);
         let mut view = owner.view();
@@ -459,9 +736,186 @@ mod quiet_fleet {
         events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(changed) }))).await.unwrap();
         loop { if matches!(output.recv().await, Some(EnvironmentEvent::Active { .. })) { break; } }
         assert!(Arc::ptr_eq(&view.borrow().environment("config").unwrap().summary, &summary));
+        let before = view.borrow_and_update().clone();
+        let original_owner = before.environment("config").unwrap().summary.owner.clone();
+        assert!(!view.has_changed().unwrap());
+        let flipped = providers("2026-01-03","2026-01-04");
+        assert_eq!(t3_core::updates::one_click_candidates(&flipped)[0].instance_id,"office");
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::ProviderStatuses {
+            payload: t3_core::server_config::ProvidersPayload { providers: flipped },
+        }))).await.unwrap();
+        loop {
+            if let EnvironmentEvent::Active { id, events, .. } = output.recv().await.expect("active actor remains alive")
+                && id == "config"
+                && events.iter().any(|event| matches!(event, ClientEvent::ServerConfig(event)
+                    if matches!(&**event, t3_core::server_config::ServerConfigStreamEvent::ProviderStatuses { payload }
+                        if payload.providers.iter().any(|p| p.instance_id == "office" && p.checked_at.0.as_deref() == Some("2026-01-04"))))) {
+                break;
+            }
+        }
+        assert!(view.has_changed().unwrap(), "a stamp-only representative flip must publish after actor processing");
+        let published = view.borrow_and_update().clone();
+        let current = published.environment("config").unwrap();
+        assert!(published.revision > before.revision);
+        assert_eq!(current.summary.owner,original_owner);
+        assert!(Arc::ptr_eq(&current.summary,&summary));
+        assert_eq!(t3_core::updates::one_click_candidates(&current.config.config.as_ref().unwrap().providers)[0].instance_id,"office");
+        let published_entry = published.environments.iter().find(|e| e.summary.owner.saved_id == "config").unwrap().clone();
+        let same_winner = providers("2026-01-05","2026-01-06");
+        assert_eq!(t3_core::updates::one_click_candidates(&same_winner)[0].instance_id,"office");
+        events.send(ClientEvent::ServerConfig(Box::new(t3_core::server_config::ServerConfigStreamEvent::ProviderStatuses {
+            payload: t3_core::server_config::ProvidersPayload { providers: same_winner },
+        }))).await.unwrap();
+        loop {
+            if let EnvironmentEvent::Active { id, events, .. } = output.recv().await.expect("active actor remains alive")
+                && id == "config"
+                && events.iter().any(|event| matches!(event, ClientEvent::ServerConfig(event)
+                    if matches!(&**event, t3_core::server_config::ServerConfigStreamEvent::ProviderStatuses { payload }
+                        if payload.providers.iter().any(|p| p.instance_id == "office" && p.checked_at.0.as_deref() == Some("2026-01-06"))))) {
+                break;
+            }
+        }
+        assert!(!view.has_changed().unwrap(), "a same-winner stamp refresh must stay quiet");
+        let quiet = view.borrow();
+        assert_eq!(quiet.revision,published.revision);
+        assert!(Arc::ptr_eq(&*quiet,&published));
+        assert!(Arc::ptr_eq(quiet.environments.iter().find(|e| e.summary.owner.saved_id == "config").unwrap(),&published_entry));
+        assert!(Arc::ptr_eq(&quiet.environment("config").unwrap().summary,&summary));
+        assert_eq!(quiet.environment("config").unwrap().summary.owner,original_owner);
     }
 
     fn b_owner(view: &watch::Receiver<Arc<FleetView>>) -> EnvironmentOwner {
         view.borrow().environment("b").unwrap().summary.owner.clone()
+    }
+}
+
+#[tokio::test]
+async fn desktop_guard_retries_same_prepared_token_across_own_old_version_reconnect() {
+    let mut server = FakeServer::start().await;
+    server.set_session(json!({"authenticated":true,"permissions":["environment:maintain"]}));
+    let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(),false);
+    let mut view = owner.view(); owner.watch("update",server.credentials(),None);
+    let mut connection = server.connection().await;
+    let mut config = socket_update_config();
+    config["environment"]["capabilities"] = json!({"serverSelfUpdate":"desktop-managed","desktopAppUpdate":true});
+    socket_update_shell(&mut connection,config.clone()).await;
+    view.wait_for(|v| socket_update_ready(v)).await.unwrap();
+    let client = owner.client("update").await.unwrap();
+    let plan = t3_core::updates::Plan { servers:vec![t3_core::updates::ServerTarget { environment_id:"update".into(),label:"Update host".into(),target_version:"2.0.0".into(),self_update:"desktop-managed".into() }],..Default::default() };
+    let capture = crate::updates::capture(&plan,&view.borrow()).unwrap().remove(0);
+    let original = capture.owner.clone();
+    let receipt = owner.destination(&original,"environment:maintain").await;
+    let mut task = tokio::spawn(crate::updates::run(plan,vec![crate::updates::UpdateDestination { capture,scope:"environment:maintain",receipt }],view.clone()));
+    let prepare = socket_update_request(&mut connection,"server.updateServer",&mut task).await;
+    assert_eq!(prepare["payload"],json!({"targetVersion":"2.0.0"}));
+    connection.send(json!({"_tag":"Exit","requestId":prepare["id"],"exit":{"_tag":"Success","value":{"method":"desktop-app","targetVersion":"2.1.0","desktopUpdateToken":"host-prepared"}}})).await;
+    let first_commit = socket_update_request(&mut connection,"server.commitDesktopUpdate",&mut task).await;
+    assert_eq!(first_commit["payload"],json!({"requestId":"host-prepared"}));
+    drop(connection);
+    let mut previous = original.clone();
+    for (version, retry) in [("1.0.0",true),("2.1.0",false)] {
+        let mut connection = server.connection().await;
+        config["environment"]["serverVersion"] = json!(version);
+        socket_update_shell(&mut connection,config.clone()).await;
+        view.wait_for(|v| socket_update_ready(v) && v.environment("update").unwrap().summary.owner.connection_generation > previous.connection_generation).await.unwrap();
+        let current = view.borrow().environment("update").unwrap().summary.owner.clone();
+        assert_eq!(current.saved_id,original.saved_id);
+        assert_eq!(current.canonical_id,original.canonical_id);
+        assert_eq!(current.generation,original.generation);
+        assert!(current.shell_generation > previous.shell_generation);
+        assert_eq!(current.connection_generation,*client.connection_generation().borrow());
+        let lifecycle = socket_update_request(&mut connection,"subscribeServerLifecycle",&mut task).await;
+        connection.chunk(&lifecycle,json!([{"type":"ready","payload":{"environment":{"serverVersion":version}}}])).await;
+        if retry {
+            let commit = socket_update_request(&mut connection,"server.commitDesktopUpdate",&mut task).await;
+            assert_eq!(commit["payload"],first_commit["payload"]);
+            previous = current;
+            drop(connection);
+        } else {
+            assert!(task.await.unwrap().is_empty());
+            socket_update_fence(&mut connection,&client).await;
+            drop((connection,client,owner));
+            return;
+        }
+    }
+    unreachable!("the committed host-returned version must join the runner");
+}
+
+#[tokio::test]
+async fn handed_off_server_guard_rejects_same_saved_replacement_and_removal() {
+    for replacement in [true,false] {
+        let mut server = FakeServer::start().await;
+        server.set_session(json!({"authenticated":true,"permissions":["environment:maintain"]}));
+        let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(),false);
+        let mut view = owner.view(); owner.watch("update",server.credentials(),None);
+        let mut connection = server.connection().await;
+        socket_update_shell(&mut connection,socket_update_config()).await;
+        view.wait_for(|v| socket_update_ready(v)).await.unwrap();
+        let client = owner.client("update").await.unwrap();
+        let plan = t3_core::updates::Plan { servers:vec![t3_core::updates::ServerTarget { environment_id:"update".into(),label:"Update host".into(),target_version:"2.0.0".into(),self_update:"boot-service".into() }],..Default::default() };
+        let capture = crate::updates::capture(&plan,&view.borrow()).unwrap().remove(0);
+        let original = capture.owner.clone();
+        let receipt = owner.destination(&original,"environment:maintain").await;
+        let mut task = tokio::spawn(crate::updates::run(plan,vec![crate::updates::UpdateDestination { capture,scope:"environment:maintain",receipt }],view.clone()));
+        let prepare = socket_update_request(&mut connection,"server.updateServer",&mut task).await;
+        assert_eq!(prepare["payload"],json!({"targetVersion":"2.0.0"}));
+        connection.send(json!({"_tag":"Exit","requestId":prepare["id"],"exit":{"_tag":"Success","value":{"method":"service","targetVersion":"2.0.0","updateId":"owned-trial"}}})).await;
+        let held_lifecycle = socket_update_request(&mut connection,"subscribeServerLifecycle",&mut task).await;
+        let mut other = FakeServer::start().await;
+        other.set_session(json!({"authenticated":true,"permissions":["environment:maintain"]}));
+        if replacement {
+            owner.watch("update",other.credentials(),None);
+            view.wait_for(|v| v.environment("update").is_some_and(|e| e.summary.owner.generation > original.generation)).await.unwrap();
+        } else {
+            owner.remove("update");
+            view.wait_for(|v| v.environment("update").is_none()).await.unwrap();
+        }
+        let mut closed = false;
+        let failures = loop {
+            tokio::select! {
+                joined = &mut task => break joined.unwrap(),
+                frame = connection.try_recv(), if !closed => match frame {
+                    Some(frame) => assert_ne!(frame["_tag"], "Request", "unsafe write after owner loss: {frame}"),
+                    None => closed = true,
+                }
+            }
+        };
+        let expected = if replacement { "server owner changed" } else { "environment removed" };
+        assert!(failures.iter().any(|e| e.contains(expected)),"{expected}: {failures:?}");
+        if !closed {
+            while let Some(frame) = connection.try_recv().await {
+                assert_ne!(frame["_tag"], "Request", "unsafe write after owner loss: {frame}");
+            }
+        }
+        assert!(client.request("fixture.read", json!({})).await.is_err());
+        if replacement {
+            let mut other_connection = other.connection().await;
+            let config_request = loop {
+                let frame = other_connection.recv().await;
+                if frame["_tag"] == "Request" {
+                    assert_eq!(frame["tag"],method::SUBSCRIBE_SERVER_CONFIG,"replacement must not receive old update work: {frame}");
+                    break frame;
+                }
+            };
+            other_connection.chunk(&config_request,json!([{"type":"snapshot","config":socket_update_config()}])).await;
+            let shell_request = loop {
+                let frame = other_connection.recv().await;
+                if frame["_tag"] == "Request" {
+                    assert_eq!(frame["tag"],method::SUBSCRIBE_SHELL,"replacement must not receive old update work: {frame}");
+                    break frame;
+                }
+            };
+            other_connection.chunk(&shell_request,json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[]}},{"kind":"synchronized"}])).await;
+            view.wait_for(|v| socket_update_ready(v) && v.environment("update").unwrap().summary.owner.generation > original.generation).await.unwrap();
+            let current = view.borrow().environment("update").unwrap().summary.owner.clone();
+            assert_eq!(current.saved_id,original.saved_id);
+            assert_eq!(current.canonical_id,original.canonical_id);
+            assert_ne!(current.generation,original.generation);
+            let new_client = owner.client("update").await.unwrap();
+            assert_ne!(new_client.environment(),client.environment());
+            socket_update_fence(&mut other_connection,&new_client).await;
+            drop((other_connection,new_client));
+        }
+        drop((held_lifecycle,connection,client,owner,other));
     }
 }

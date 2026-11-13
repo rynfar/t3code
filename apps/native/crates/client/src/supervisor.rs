@@ -6,7 +6,7 @@
 //! before every attempt, as the web's connection resolver authorizes each one.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -346,7 +346,7 @@ async fn supervise(
                 generations.send_modify(|generation| *generation += 1);
                 attempt = 0;
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
-                let mut fetch = SessionStateFetch { credentials: &credentials, grants: &grants, task: None };
+                let mut fetch = SessionStateFetch::new(&credentials, &grants);
                 fetch.start();
                 let end = run_session(&session, &mut resume, &mut commands, &events, &mut fetch).await;
                 fetch.stop();
@@ -632,24 +632,40 @@ async fn initial_shell_options(stream: &mut Option<StreamHandle>, events: &Event
     tokio::time::timeout(CONFIG_WAIT, wait).await.unwrap_or_default()
 }
 
+#[derive(Clone, Copy)]
+enum FetchGate {
+    Idle,
+    Running { dirty: bool },
+}
+
 /// The grants fetch of one connection. Failures retry with backoff while the connection lasts,
 /// so a fetch that failed mid-reconnect cannot outlive the socket that recovered.
 struct SessionStateFetch<'a> {
     credentials: &'a Credentials,
     grants: &'a watch::Sender<Option<AuthSessionState>>,
     task: Option<JoinHandle<()>>,
+    gate: Arc<Mutex<FetchGate>>,
 }
 
 impl Drop for SessionStateFetch<'_> {
     fn drop(&mut self) { self.stop(); }
 }
 
-impl SessionStateFetch<'_> {
+impl<'a> SessionStateFetch<'a> {
+    fn new(credentials: &'a Credentials, grants: &'a watch::Sender<Option<AuthSessionState>>) -> Self {
+        Self { credentials, grants, task: None, gate: Arc::new(Mutex::new(FetchGate::Idle)) }
+    }
+
     fn start(&mut self) {
-        if self.task.as_ref().is_some_and(|task| !task.is_finished()) {
-            return;
+        {
+            let mut gate = self.gate.lock().expect("fetch gate");
+            if let FetchGate::Running { dirty } = &mut *gate {
+                *dirty = true;
+                return;
+            }
+            *gate = FetchGate::Running { dirty: false };
         }
-        let (credentials, grants) = (self.credentials.clone(), self.grants.clone());
+        let (credentials, grants, gate) = (self.credentials.clone(), self.grants.clone(), self.gate.clone());
         self.task = Some(tokio::spawn(async move {
             let mut delay = SESSION_STATE_RETRY;
             loop {
@@ -660,9 +676,29 @@ impl SessionStateFetch<'_> {
                             *current = Some(state);
                             changed
                         });
+                        let mut guard = gate.lock().expect("fetch gate");
+                        if matches!(*guard, FetchGate::Running { dirty: true }) {
+                            *guard = FetchGate::Running { dirty: false };
+                            delay = SESSION_STATE_RETRY;
+                            continue;
+                        }
+                        *guard = FetchGate::Idle;
                         return;
                     }
                     Err(error) => tracing::warn!(%error, "session state fetch failed"),
+                }
+                let dirty = {
+                    let mut guard = gate.lock().expect("fetch gate");
+                    if matches!(*guard, FetchGate::Running { dirty: true }) {
+                        *guard = FetchGate::Running { dirty: false };
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if dirty {
+                    delay = SESSION_STATE_RETRY;
+                    continue;
                 }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(SESSION_STATE_RETRY_MAX);
@@ -674,6 +710,7 @@ impl SessionStateFetch<'_> {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.gate = Arc::new(Mutex::new(FetchGate::Idle));
     }
 }
 

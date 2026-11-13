@@ -903,7 +903,13 @@ impl ServerConfigState {
                     config.usage_limit_sources = current.usage_limit_sources.clone();
                 }
                 if let Some(current) = self.config.as_ref() { config.environment_themes = current.environment_themes.clone();config.environment_theme_definitions=current.environment_theme_definitions.clone(); }
-                if self.config.as_ref() == Some(&*config) {
+                if self.config.as_ref().is_some_and(|current| {
+                    *current == *config
+                        && crate::updates::same_one_click_representatives(
+                            &current.providers,
+                            &config.providers,
+                        )
+                }) {
                     return false;
                 }
                 self.config = Some(*config);
@@ -938,7 +944,8 @@ impl ServerConfigState {
     /// `checkedAt` stamps are kept even when nothing else changed, which reports no change.
     pub fn apply_providers(&mut self, providers: Vec<ServerProvider>) -> bool {
         self.update(|config| {
-            let changed = config.providers != providers;
+            let changed = config.providers != providers
+                || !crate::updates::same_one_click_representatives(&config.providers, &providers);
             config.providers = providers;
             changed
         })

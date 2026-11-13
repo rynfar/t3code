@@ -203,6 +203,26 @@ async fn serve(mut stream: TcpStream, session: Arc<Mutex<Value>>, descriptor: Ar
 }
 
 impl Connection {
+    /// The next client message other than `Ping`, or `None` once the client closes.
+    pub async fn try_recv(&mut self) -> Option<Value> {
+        loop {
+            let frame = tokio::time::timeout(WAIT, self.socket.next())
+                .await
+                .expect("the client sends a message or closes")?;
+            let Ok(frame) = frame else { return None };
+            match frame {
+                Message::Close(_) => return None,
+                Message::Text(text) => {
+                    let message: Value = serde_json::from_str(&text).expect("client frames are JSON");
+                    if message["_tag"] != "Ping" {
+                        return Some(message);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// The next client message other than `Ping`.
     pub async fn recv(&mut self) -> Value {
         loop {
@@ -257,6 +277,10 @@ impl SessionRequests {
 }
 
 impl SessionRequest {
+    pub async fn respond(self, body: Value) {
+        respond_json(self.0, body).await;
+    }
+
     pub async fn closed(mut self) {
         let mut byte = [0];
         let count = tokio::time::timeout(WAIT, self.0.read(&mut byte)).await.expect("removal cancels the in-flight session fetch").expect("read HTTP connection");

@@ -183,6 +183,16 @@ async fn each_connection_fetches_the_grants_and_a_refresh_picks_up_changes() {
     client.refresh_session_state();
     let state = next_grants(&mut grants).await;
     assert!(state.grants("terminal:read") && !state.grants("terminal:operate"));
+
+    let mut sessions = server.hold_session_requests();
+    client.refresh_session_state();
+    let held = sessions.request().await;
+    client.refresh_session_state();
+    held.respond(json!({"authenticated": true, "auth": {}, "permissions": ["terminal:read"]})).await;
+    let next = sessions.request().await;
+    next.respond(json!({"authenticated": true, "auth": {}, "permissions": ["terminal:write"]})).await;
+    let state = next_grants(&mut grants).await;
+    assert!(state.grants("terminal:write") && !state.grants("terminal:read"));
 }
 
 #[tokio::test]

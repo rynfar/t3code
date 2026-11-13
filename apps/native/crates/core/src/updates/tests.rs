@@ -68,6 +68,45 @@ fn one_click_requires_compatible_consistent_commands_and_deduplicates() {
     broken.compatibility_advisory =
         Some(serde_json::from_value(json!({"latestVersionStatus":"broken"})).unwrap());
     assert!(!candidate(&broken));
+
+    let mut work = provider("work", "idle", "");
+    work.checked_at.0 = Some("2026-01-02".into());
+    let office = provider("office", "idle", "");
+    let original = vec![work, office];
+    assert_eq!(one_click_candidates(&original)[0].instance_id, "work");
+    let mut same_winner = original.clone();
+    same_winner[0].checked_at.0 = Some("2026-01-04".into());
+    same_winner[1].checked_at.0 = Some("2026-01-03".into());
+    assert_eq!(one_click_candidates(&same_winner)[0].instance_id, "work");
+    let mut flipped = same_winner.clone();
+    flipped[0].checked_at.0 = Some("2026-01-05".into());
+    flipped[1].checked_at.0 = Some("2026-01-06".into());
+    assert_eq!(one_click_candidates(&flipped)[0].instance_id, "office");
+    assert_eq!(original, flipped, "ordinary provider equality intentionally ignores checkedAt");
+    let mut with_default = flipped.clone();
+    with_default.push(provider("codex", "idle", ""));
+    assert_eq!(one_click_candidates(&with_default)[0].instance_id, "codex");
+    let mut provider_state = crate::server_config::ServerConfigState::default();
+    provider_state.config = Some(ServerConfig { providers: original.clone(), ..Default::default() });
+    assert!(!provider_state.apply_providers(same_winner.clone()), "same-winner stamp refresh stays quiet");
+    assert_eq!(provider_state.config.as_ref().unwrap().providers.iter().map(|p| p.checked_at.0.as_deref()).collect::<Vec<_>>(), [Some("2026-01-04"), Some("2026-01-03")]);
+    let mut snapshot_state = crate::server_config::ServerConfigState::default();
+    let original_config = ServerConfig { providers: original, ..Default::default() };
+    assert!(snapshot_state.apply(crate::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(original_config.clone()) }));
+    let mut same_config = original_config.clone();
+    same_config.providers = same_winner;
+    assert!(!snapshot_state.apply(crate::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(same_config) }), "same-winner Snapshot keeps its existing unchanged outcome");
+    assert_eq!(snapshot_state.settings_revision(), 2);
+    assert_eq!(snapshot_state.keybindings_revision(), 2);
+    let provider_changed = provider_state.apply_providers(flipped.clone());
+    let mut flipped_config = original_config;
+    flipped_config.providers = flipped;
+    let snapshot_changed = snapshot_state.apply(crate::server_config::ServerConfigStreamEvent::Snapshot { config: Box::new(flipped_config) });
+    assert_eq!((provider_changed, snapshot_changed), (true, true), "a relative representative flip must be material for providerStatuses and Snapshot");
+    assert_eq!(one_click_candidates(&provider_state.config.as_ref().unwrap().providers)[0].instance_id, "office");
+    assert_eq!(one_click_candidates(&snapshot_state.config.as_ref().unwrap().providers)[0].instance_id, "office");
+    assert_eq!(snapshot_state.settings_revision(), 3);
+    assert_eq!(snapshot_state.keybindings_revision(), 3);
 }
 #[test]
 fn planner_orders_merges_and_skips_web_restrictions() {

@@ -37,6 +37,7 @@ pub struct EnvironmentSummary {
     pub owner: EnvironmentOwner,
     pub projects: Vec<ScopedProject>,
     pub threads: Vec<ScopedThread>,
+    pub running_thread_count: usize,
     pub synchronized: bool,
     pub config_loaded: bool,
     pub snapshot_sequence: Option<u64>,
@@ -64,7 +65,8 @@ impl EnvironmentSummary {
         let older_settled = shell.snapshot.as_ref().and_then(|snapshot| snapshot.older_settled.clone());
         let older_count_key = shell.snapshot.as_ref().zip(older_settled.as_ref().and_then(OlderSettled::from_cut)).map(|(snapshot, older)| older_settled::count_key(&snapshot.threads, older.before_ms, &shell.removed_at));
         let request_ancestry_len = shell.snapshot.as_ref().map_or(0, |snapshot| snapshot.threads.len());
-        Self { owner, projects, threads, synchronized: shell.synchronized, config_loaded: config.is_some(), snapshot_sequence: shell.sequence(), older_settled, removed_at: shell.removed_at.clone(), older_count_key, request_contributions, request_ancestry_len }
+        let running_thread_count = shell.snapshot.as_ref().map_or(0, |snapshot| snapshot.threads.iter().filter(|thread| crate::updates::running(&thread.status)).count());
+        Self { owner, projects, threads, running_thread_count, synchronized: shell.synchronized, config_loaded: config.is_some(), snapshot_sequence: shell.sequence(), older_settled, removed_at: shell.removed_at.clone(), older_count_key, request_contributions, request_ancestry_len }
     }
 
     /// Reads have already passed MountedReads owner/generation/cut/tombstone/shell-id admission.

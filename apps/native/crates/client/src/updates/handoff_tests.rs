@@ -181,3 +181,15 @@ async fn completed_desktop_commit_and_terminal_errors_do_not_retry_forever() {
     );
     script.finished();
 }
+
+#[tokio::test]
+async fn malformed_desktop_preparation_never_commits_a_token() {
+    for result in [
+        json!({"method":"desktop-app","targetVersion":"2.0.0","desktopUpdateToken":""}),
+        json!({"method":"desktop-app","targetVersion":" ","desktopUpdateToken":"prepared"}),
+    ] {
+        let script = Script::new([Step::Request("server.updateServer",Ok(result))]);
+        assert!(update_with(&script,"2.0.0","desktop-managed").await.is_err());
+        script.finished();
+    }
+}

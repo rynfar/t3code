@@ -1343,8 +1343,8 @@ fn scoped_sidebar_collisions_folder_selected_route_and_per_owner_frontier() {
     let mut preferences = ProjectPreferences::default();
     let groups = build_scoped_project_groups(&GroupInput { projects: &projects, threads: &threads, settings: &settings, preferences: &preferences, preferred_environment: None, consumer: GroupConsumer::Sidebar, sort: ProjectSortOrder::UpdatedAt });
     preferences.set_expanded(&groups[0], false);
-    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None, request_contributions: Vec::new(), request_ancestry_len: 0 };
-    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None, request_contributions: Vec::new(), request_ancestry_len: 0 };
+    let ea = EnvironmentSummary { owner: a.owner.clone(), projects: vec![a], threads: vec![ta], running_thread_count: 0, synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None, request_contributions: Vec::new(), request_ancestry_len: 0 };
+    let eb = EnvironmentSummary { owner: b.owner.clone(), projects: vec![b], threads: vec![tb], running_thread_count: 0, synchronized: true, config_loaded: true, snapshot_sequence: Some(1), older_settled: None, removed_at: HashMap::new(), older_count_key: None, request_contributions: Vec::new(), request_ancestry_len: 0 };
     let selected = ThreadKey::new("b", "same");
     let sidebar = SidebarSettings::default(); let shelves = ShelfState::default(); let hidden = HashSet::new();
     let mut state = ScopedSidebarState::default();
@@ -1725,6 +1725,25 @@ fn scoped_sections_follow_loaded_config_per_owner_and_keep_cached_disconnects() 
     let expired_scope = scope_model(&scope_completed,&scoped_preferences,&mut scoped_history,scope_deadline);
     assert_eq!(expired_scope.section_of(&key),Some(Section::Active));
     assert_eq!(expired_scope.next_change_at,None);
+
+    let mut count_shell = ShellState::default();
+    assert_eq!(EnvironmentSummary::from_shell(owner("ready"), &count_shell, &loaded).running_thread_count, 0);
+    count_shell.snapshot = Some(snapshot(vec![
+        wire_thread("preparing", json!({"status":"preparing"})),
+        wire_thread("starting", json!({"status":"starting"})),
+        wire_thread("running", json!({"status":"running"})),
+        wire_thread("queued", json!({"status":"queued"})),
+        wire_thread("waiting", json!({"status":"waiting"})),
+        wire_thread("idle", json!({"status":"idle","latestRunId":"run","activityRunStatus":"running"})),
+    ]));
+    count_shell.snapshot.as_mut().unwrap().archived_threads.push(serde_json::from_value(wire_thread(
+        "archived-running", json!({"status":"running","archivedAt":NOW}),
+    )).unwrap());
+    let counted = EnvironmentSummary::from_shell(owner("ready"), &count_shell, &loaded);
+    assert_eq!(counted.running_thread_count, 3, "only raw active preparing/starting/running rows count");
+    assert!(counted.threads.iter().find(|row| row.thread.id == "running").unwrap().thread.runtime.is_none());
+    assert_eq!(counted.threads.iter().find(|row| row.thread.id == "idle").unwrap().thread.runtime.as_ref().unwrap().status, "running");
+    assert!(counted.threads.iter().any(|row| row.thread.id == "archived-running" && row.thread.archived));
 }
 
 #[test]
