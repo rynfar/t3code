@@ -6,14 +6,29 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px};
+use gpui::{AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px};
+use gpui_component::input::{Input, InputState};
 use gpui_component::{h_flex, v_flex};
-use t3_core::timeline::{CompactionTokens, format_duration, parse_iso_ms};
+use serde_json::Value;
+use t3_core::providers::entries as provider_entries;
+use t3_core::timeline::{
+    CompactionTokens, ExistingPeerLink, HandoffEndpoint, LinkTone, MachineCandidate, SecretTone,
+    can_manage_peer_links, format_duration, link_access_description, link_access_label,
+    link_request_default_access, link_request_display, linkable_machines, mcp_client_scopes,
+    parse_iso_ms, rank_machines_by_hint, resolve_handoff_endpoints, secret_request_display,
+    secret_request_privacy_note,
+};
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
-use super::parts::{ROW_GROUP, DividerTone, focusable, icon_slot, system_divider, timestamp, work_line, work_row_frame};
+use super::parts::{
+    ROW_GROUP, DividerTone, focusable, ghost_button, icon_slot, outline_button, system_divider,
+    system_divider_button, timestamp, work_line, work_row_frame,
+};
+use super::timer::{TimerKind, WorkingTimer};
 use super::RowEnv;
+use crate::app_state::AppState;
 use crate::icons::Icon;
+use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 
@@ -201,10 +216,40 @@ fn elapsed_label(item: &TurnItem, now_ms: i64) -> Option<String> {
     Some(format_duration(((end - start).max(0) / 1_000 * 1_000).max(1_000) as f64))
 }
 
-/// `SubagentTimelineLink`: avatar, title, latest progress or result, status and elapsed time.
-fn subagent_row(item: &Arc<TurnItem>, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+#[derive(IntoElement)]
+struct SubagentLiveElapsed {
+    item_id: SharedString,
+    started_at: String,
+}
+
+impl RenderOnce for SubagentLiveElapsed {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let timer = window
+            .use_keyed_state(SharedString::from(format!("subagent-timer:{}", self.item_id)), cx, |_, cx| {
+                cx.new(|cx| WorkingTimer::new(self.started_at, TimerKind::Elapsed, cx))
+            })
+            .read(cx)
+            .clone();
+        div().flex_none().text_xs().text_color(hsla(palette(cx).muted_foreground)).child(timer)
+    }
+}
+
+fn subagent_avatar(provider_instance_id: Option<&str>, marks: &[(String, ProviderMark)], size: f32, cx: &App) -> AnyElement {
     let p = palette(cx);
-    let TurnItemKind::Subagent { child_thread_id, progress, result, .. } = &item.kind else { return div().into_any_element() };
+    if let Some(id) = provider_instance_id
+        && let Some((_, mark)) = marks.iter().find(|(instance_id, _)| instance_id == id)
+    {
+        return ProviderIcon::new(mark.clone()).size(px(size)).into_any_element();
+    }
+    Icon::WorkBot.render(px(size - 2.), hsla(p.secondary_label)).into_any_element()
+}
+
+/// `SubagentTimelineLink`: avatar, title, latest progress or result, status and elapsed time.
+fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+    let p = palette(cx);
+    let TurnItemKind::Subagent { child_thread_id, provider_instance_id, remote_child, progress, result, .. } = &item.kind else {
+        return div().into_any_element();
+    };
     let settled = matches!(item.status.as_str(), "completed" | "failed" | "cancelled" | "interrupted");
     let raw = if settled { result.as_deref().or(progress.as_deref()) } else { progress.as_deref().or(result.as_deref()) };
     let detail = raw
@@ -212,6 +257,12 @@ fn subagent_row(item: &Arc<TurnItem>, env: &RowEnv, cx: &mut Context<ThreadView>
         .filter(|d| !d.is_empty() && !d.starts_with("Child task ended with status"))
         .map(plain_detail)
         .filter(|d| !d.is_empty());
+    let remote_label = remote_child
+        .as_ref()
+        .and_then(|v| v.get("environmentLabel").or_else(|| v.get("label")).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|label| format!("on {label}"));
     let failed = item.status == "failed";
     let status = status_label(&item.status);
     let dot = match item.status.as_str() {
@@ -221,6 +272,13 @@ fn subagent_row(item: &Arc<TurnItem>, env: &RowEnv, cx: &mut Context<ThreadView>
         _ => hsla(p.muted_foreground).opacity(0.6),
     };
     let detail_color = hsla(if failed { p.destructive } else { p.muted_foreground });
+    let elapsed_view = if item.is_running()
+        && let Some(started_at) = item.started_at.clone()
+    {
+        Some(SubagentLiveElapsed { item_id: SharedString::from(item.id.clone()), started_at }.into_any_element())
+    } else {
+        elapsed_label(item, env.clock.now_ms).map(|elapsed| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(elapsed).into_any_element())
+    };
     let mut row = h_flex()
         .id(SharedString::from(format!("subagent:{}", item.id)))
         .w_full()
@@ -239,20 +297,28 @@ fn subagent_row(item: &Arc<TurnItem>, env: &RowEnv, cx: &mut Context<ThreadView>
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(Icon::WorkBot.render(px(14.), hsla(p.secondary_label)))
+                .child(subagent_avatar(provider_instance_id.as_deref(), marks, 16., cx))
                 .child(div().absolute().right_0().bottom_0().size(px(7.)).rounded_full().bg(dot)),
         )
         .child(
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(subagent_title(item)))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(subagent_title(item)))
+                        .when_some(remote_label, |this, remote| {
+                            this.child(div().flex_none().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(remote))
+                        }),
+                )
                 .child(div().min_w_0().truncate().text_size(px(11.)).text_color(detail_color).child(detail.clone().unwrap_or_else(|| status.to_owned()))),
         )
         .when(detail.is_some() && item.status != "completed", |this| {
             this.child(div().flex_none().text_xs().text_color(detail_color).child(status))
         })
-        .children(elapsed_label(item, env.clock.now_ms).map(|elapsed| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(elapsed)));
+        .children(elapsed_view);
     if let Some(child) = child_thread_id.clone() {
         row = focusable(row, cx)
             .cursor_pointer()
@@ -264,7 +330,7 @@ fn subagent_row(item: &Arc<TurnItem>, env: &RowEnv, cx: &mut Context<ThreadView>
 }
 
 /// `V2SubagentGroup`: adjacent subagents of one turn behind an "N subagents" disclosure.
-fn subagent_group(id: &str, members: &[Arc<TurnItem>], env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+fn subagent_group(id: &str, members: &[Arc<TurnItem>], marks: &[(String, ProviderMark)], env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
     let expanded = env.ui.expanded_entries.contains(&format!("subagent-group:{id}"));
     let running = members.iter().filter(|m| m.is_running()).count();
@@ -283,6 +349,46 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], env: &RowEnv, cx: &mut Co
     let label = format!("{} {}", members.len(), if members.len() == 1 { "subagent" } else { "subagents" });
     let key = format!("subagent-group:{id}");
     let ring = hsla(p.ring);
+    let visible_avatars: Vec<_> = members.iter().take(3).collect();
+    let overflow = members.len().saturating_sub(3);
+    let avatar_stack = h_flex()
+        .items_center()
+        .children(visible_avatars.into_iter().enumerate().map(|(index, member)| {
+            let instance_id = match &member.kind {
+                TurnItemKind::Subagent { provider_instance_id, .. } => provider_instance_id.as_deref(),
+                _ => None,
+            };
+            div()
+                .when(index > 0, |this| this.ml(px(-6.)))
+                .size(px(20.))
+                .rounded_full()
+                .border_1()
+                .border_color(hsla(p.background))
+                .bg(hsla(p.muted))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(subagent_avatar(instance_id, marks, 13., cx))
+        }))
+        .when(overflow > 0, |this| {
+            this.child(
+                div()
+                    .ml(px(-6.))
+                    .px(px(4.))
+                    .h(px(20.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(hsla(p.background))
+                    .bg(hsla(p.secondary))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hsla(p.secondary_foreground))
+                    .child(format!("+{overflow}")),
+            )
+        });
     let header = h_flex()
         .id(SharedString::from(format!("subagents:{id}")))
         .tab_index(0)
@@ -294,7 +400,7 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], env: &RowEnv, cx: &mut Co
         .cursor_pointer()
         .text_color(if expanded || running > 0 { hsla(p.foreground) } else { hsla(p.muted_foreground) })
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_entry(&key, cx)))
-        .child(Icon::WorkBot.render(px(16.), hsla(p.icon_muted)))
+        .child(avatar_stack)
         .child(
             v_flex()
                 .flex_1()
@@ -318,33 +424,783 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], env: &RowEnv, cx: &mut Co
             .border_1()
             .border_color(hsla(p.border).opacity(0.6))
             .bg(hsla(p.card).opacity(0.3))
-            .children(members.iter().map(|member| subagent_row(member, env, cx)).collect::<Vec<_>>())
+            .children(members.iter().map(|member| subagent_row(member, marks, env, cx)).collect::<Vec<_>>())
     });
     v_flex().w_full().child(header).children(list).into_any_element()
 }
 
-fn request_card(title: String, body: Option<String>, note: Option<String>, cx: &App) -> AnyElement {
-    let p = palette(cx);
-    v_flex()
-        .w_full()
-        .gap(px(4.))
-        .p(px(16.))
-        .rounded(px(12.))
-        .border_1()
-        .border_color(hsla(p.border).opacity(0.6))
-        .bg(hsla(p.card))
-        .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title))
-        .children(body.filter(|b| !b.trim().is_empty()).map(|body| div().text_size(px(14.)).text_color(hsla(p.muted_foreground)).child(body)))
-        .children(note.map(|note| {
+struct SecretCardState {
+    input: Entity<InputState>,
+    submitting: bool,
+    error: Option<String>,
+}
+
+#[derive(IntoElement)]
+struct SecretRequestCard {
+    id: SharedString,
+    thread_id: String,
+    turn_item_id: String,
+    label: String,
+    reason: String,
+    placeholder: Option<String>,
+    delivery: Option<String>,
+    state: Entity<AppState>,
+}
+
+impl RenderOnce for SecretRequestCard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let placeholder = self.placeholder.clone().unwrap_or_else(|| "Paste secret".to_owned());
+        let card_state = window.use_keyed_state(SharedString::from(format!("secret-ui:{}", self.id)), cx, |window, cx| SecretCardState {
+            input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder)),
+            submitting: false,
+            error: None,
+        });
+        let (input, submitting, error) = {
+            let s = card_state.read(cx);
+            (s.input.clone(), s.submitting, s.error.clone())
+        };
+        let privacy_note = secret_request_privacy_note(self.delivery.as_deref());
+        let save_state = card_state.clone();
+        let save_input = input.clone();
+        let save_app = self.state.clone();
+        let save_thread = self.thread_id.clone();
+        let save_item = self.turn_item_id.clone();
+
+        let decline_state = card_state.clone();
+        let decline_app = self.state.clone();
+        let decline_thread = self.thread_id.clone();
+        let decline_item = self.turn_item_id.clone();
+
+        v_flex()
+            .w_full()
+            .gap(px(8.))
+            .p(px(16.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(hsla(p.border).opacity(0.6))
+            .bg(hsla(p.card))
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child(Icon::KeyRound.render(px(15.), hsla(p.muted_foreground)))
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.label)),
+            )
+            .when(!self.reason.trim().is_empty(), |this| {
+                this.child(div().text_size(px(13.)).text_color(hsla(p.muted_foreground)).child(self.reason))
+            })
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().child(Input::new(&input).disabled(submitting)))
+                    .child(outline_button(
+                        SharedString::from(format!("secret-save:{}", self.id)),
+                        if submitting { "Saving..." } else { "Save securely" },
+                        move |_, _, cx| {
+                            if submitting {
+                                return;
+                            }
+                            let secret = save_input.read(cx).value().to_string();
+                            if secret.trim().is_empty() {
+                                save_state.update(cx, |s, cx| {
+                                    s.error = Some("Enter a secret value first.".to_owned());
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            save_state.update(cx, |s, cx| {
+                                s.submitting = true;
+                                s.error = None;
+                                cx.notify();
+                            });
+                            let task = save_app.update(cx, |app, _| {
+                                app.rpc(
+                                    t3_core::commands::method::SECRETS_ANSWER_REQUEST,
+                                    t3_core::commands::secret_request_answer_save(&save_thread, &save_item, &secret),
+                                )
+                            });
+                            let weak = save_state.downgrade();
+                            cx.spawn(async move |cx| {
+                                let res = task.await;
+                                let _ = weak.update(cx, |s, cx| {
+                                    s.submitting = false;
+                                    if let Err(err) = res {
+                                        s.error = Some(err.to_string());
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        },
+                        cx,
+                    ))
+                    .child(ghost_button(
+                        SharedString::from(format!("secret-decline:{}", self.id)),
+                        "Decline",
+                        submitting,
+                        move |_, _, cx| {
+                            if submitting {
+                                return;
+                            }
+                            decline_state.update(cx, |s, cx| {
+                                s.submitting = true;
+                                s.error = None;
+                                cx.notify();
+                            });
+                            let task = decline_app.update(cx, |app, _| {
+                                app.rpc(
+                                    t3_core::commands::method::SECRETS_ANSWER_REQUEST,
+                                    t3_core::commands::secret_request_answer_decline(&decline_thread, &decline_item),
+                                )
+                            });
+                            let weak = decline_state.downgrade();
+                            cx.spawn(async move |cx| {
+                                let res = task.await;
+                                let _ = weak.update(cx, |s, cx| {
+                                    s.submitting = false;
+                                    if let Err(err) = res {
+                                        s.error = Some(err.to_string());
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        },
+                        cx,
+                    )),
+            )
+            .when_some(error, |this, err| this.child(div().text_xs().text_color(hsla(p.destructive)).child(err)))
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .text_xs()
+                    .text_color(hsla(p.muted_foreground))
+                    .child(Icon::Shield.render(px(14.), hsla(p.muted_foreground)))
+                    .child(privacy_note),
+            )
+    }
+}
+
+struct LinkCardState {
+    dialog_open: bool,
+    manual_mode: bool,
+    access: String,
+    loading_links: bool,
+    links: Vec<ExistingPeerLink>,
+    submitting: bool,
+    error: Option<String>,
+    url_input: Entity<InputState>,
+    label_input: Entity<InputState>,
+    code_input: Entity<InputState>,
+}
+
+#[derive(IntoElement)]
+struct LinkRequestCard {
+    id: SharedString,
+    thread_id: String,
+    turn_item_id: String,
+    reason: String,
+    default_url: Option<String>,
+    default_environment_id: Option<String>,
+    default_label: Option<String>,
+    hint: Option<String>,
+    requested_access: Option<String>,
+    state: Entity<AppState>,
+}
+
+impl RenderOnce for LinkRequestCard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let default_access = link_request_default_access(self.requested_access.as_deref()).to_owned();
+        let default_url = self.default_url.clone().unwrap_or_default();
+        let default_label = self.default_label.clone().unwrap_or_default();
+        let card_state = window.use_keyed_state(SharedString::from(format!("link-ui:{}", self.id)), cx, |window, cx| LinkCardState {
+            dialog_open: false,
+            manual_mode: false,
+            access: default_access,
+            loading_links: false,
+            links: Vec::new(),
+            submitting: false,
+            error: None,
+            url_input: cx.new(|cx| InputState::new(window, cx).default_value(default_url).placeholder("https://machine:3773")),
+            label_input: cx.new(|cx| InputState::new(window, cx).default_value(default_label).placeholder("Machine label (optional)")),
+            code_input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Paste pairing code")),
+        });
+        let (dialog_open, manual_mode, access, loading_links, links, submitting, error, url_input, label_input, code_input) = {
+            let s = card_state.read(cx);
+            (
+                s.dialog_open,
+                s.manual_mode,
+                s.access.clone(),
+                s.loading_links,
+                s.links.clone(),
+                s.submitting,
+                s.error.clone(),
+                s.url_input.clone(),
+                s.label_input.clone(),
+                s.code_input.clone(),
+            )
+        };
+        let app_read = self.state.read(cx);
+        let current_env_id = app_read
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.clone());
+        let session = app_read.client_handle().and_then(|h| h.session_state().borrow().clone());
+        let can_manage = can_manage_peer_links(session.as_ref());
+        let candidates: Vec<MachineCandidate> = app_read
+            .environments
+            .environments
+            .iter()
+            .map(|env| MachineCandidate {
+                id: env.environment_id.clone().unwrap_or_else(|| env.id.clone()),
+                label: env.label.clone(),
+                urls: vec![env.http_base.clone()],
+                reachable: !env.disabled && env.credentials().is_some(),
+            })
+            .collect();
+        let saved_envs = app_read.environments.environments.clone();
+        let _ = app_read;
+
+        let machines = rank_machines_by_hint(
+            linkable_machines(&candidates, &links, current_env_id.as_deref()),
+            self.hint.as_deref(),
+            self.default_label.as_deref(),
+            self.default_environment_id.as_deref(),
+        );
+
+        let has_machines = !machines.is_empty();
+        let title = self.default_label.clone().unwrap_or_else(|| "Link a machine to this environment".to_owned());
+        let open_state = card_state.clone();
+        let open_app = self.state.clone();
+        let decline_state = card_state.clone();
+        let decline_app = self.state.clone();
+        let decline_thread = self.thread_id.clone();
+        let decline_item = self.turn_item_id.clone();
+        let manual_toggle_state = card_state.clone();
+        let manual_submit_state = card_state.clone();
+        let manual_submit_app = self.state.clone();
+        let manual_thread = self.thread_id.clone();
+        let manual_item = self.turn_item_id.clone();
+        let manual_url_input = url_input.clone();
+        let manual_label_input = label_input.clone();
+        let manual_code_input = code_input.clone();
+        let manual_access = access.clone();
+
+        v_flex()
+            .w_full()
+            .gap(px(8.))
+            .p(px(16.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(hsla(p.border).opacity(0.6))
+            .bg(hsla(p.card))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .child(Icon::Link2.render(px(15.), hsla(p.muted_foreground)))
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title)),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .when(can_manage, |this| {
+                                this.child(outline_button(
+                                    SharedString::from(format!("link-open:{}", self.id)),
+                                    if dialog_open { "Hide options" } else { "Link machine" },
+                                    move |_, _, cx| {
+                                        let next_open = !open_state.read(cx).dialog_open;
+                                        open_state.update(cx, |s, cx| {
+                                            s.dialog_open = next_open;
+                                            s.error = None;
+                                            if next_open {
+                                                s.loading_links = true;
+                                            }
+                                            cx.notify();
+                                        });
+                                        if next_open {
+                                            let task = open_app.update(cx, |app, _| {
+                                                app.rpc(t3_core::commands::method::PEER_LINKS_LIST, serde_json::json!({}))
+                                            });
+                                            let weak = open_state.downgrade();
+                                            cx.spawn(async move |cx| {
+                                                let res = task.await;
+                                                let _ = weak.update(cx, |s, cx| {
+                                                    s.loading_links = false;
+                                                    if let Ok(val) = res
+                                                        && let Some(arr) = val.get("links").and_then(Value::as_array)
+                                                    {
+                                                        s.links = arr
+                                                            .iter()
+                                                            .filter_map(|item| {
+                                                                Some(ExistingPeerLink {
+                                                                    environment_id: item.get("environmentId")?.as_str()?.to_owned(),
+                                                                    label: item.get("label").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                                                })
+                                                            })
+                                                            .collect();
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            })
+                                            .detach();
+                                        }
+                                    },
+                                    cx,
+                                ))
+                            })
+                            .child(ghost_button(
+                                SharedString::from(format!("link-decline:{}", self.id)),
+                                "Decline",
+                                submitting || !can_manage,
+                                move |_, _, cx| {
+                                    if submitting || !can_manage {
+                                        return;
+                                    }
+                                    decline_state.update(cx, |s, cx| {
+                                        s.submitting = true;
+                                        s.error = None;
+                                        cx.notify();
+                                    });
+                                    let task = decline_app.update(cx, |app, _| {
+                                        app.rpc(
+                                            t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                            t3_core::commands::link_request_answer_decline(&decline_thread, &decline_item),
+                                        )
+                                    });
+                                    let weak = decline_state.downgrade();
+                                    cx.spawn(async move |cx| {
+                                        let res = task.await;
+                                        let _ = weak.update(cx, |s, cx| {
+                                            s.submitting = false;
+                                            if let Err(err) = res {
+                                                s.error = Some(err.to_string());
+                                            }
+                                            cx.notify();
+                                        });
+                                    })
+                                    .detach();
+                                },
+                                cx,
+                            )),
+                    ),
+            )
+            .when(!self.reason.trim().is_empty(), |this| {
+                this.child(div().text_size(px(13.)).text_color(hsla(p.muted_foreground)).child(self.reason))
+            })
+            .when(!can_manage, |this| {
+                this.child(
+                    h_flex()
+                        .gap(px(6.))
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(Icon::Lock.render(px(13.), hsla(p.muted_foreground)))
+                        .child("You need access:write permission on this connection to link machines."),
+                )
+            })
+            .when(dialog_open && can_manage, |this| {
+                let id_str = self.id.clone();
+                let access_picker = h_flex().flex_wrap().gap(px(6.)).children(
+                    ["read-only", "approval-required", "full-access"].into_iter().map(|opt| {
+                        let active = access == opt;
+                        let st = card_state.clone();
+                        let val = opt.to_owned();
+                        focusable(
+                            div()
+                                .id(SharedString::from(format!("link-access:{id_str}:{opt}")))
+                                .px(px(8.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(if active { hsla(p.primary) } else { hsla(p.border).opacity(0.6) })
+                                .bg(if active { hsla(p.primary).opacity(0.14) } else { hsla(p.secondary).opacity(0.3) })
+                                .text_xs()
+                                .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                                .text_color(if active { hsla(p.foreground) } else { hsla(p.muted_foreground) })
+                                .cursor_pointer()
+                                .child(link_access_label(opt))
+                                .on_click(move |_, _, cx| {
+                                    st.update(cx, |s, cx| {
+                                        s.access = val.clone();
+                                        cx.notify();
+                                    });
+                                }),
+                            cx,
+                        )
+                    }),
+                );
+
+                this.child(
+                    v_flex()
+                        .gap(px(10.))
+                        .mt(px(4.))
+                        .p(px(12.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(hsla(p.border).opacity(0.7))
+                        .bg(hsla(p.secondary).opacity(0.25))
+                        .child(
+                            v_flex()
+                                .gap(px(4.))
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Access level"))
+                                .child(access_picker)
+                                .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(link_access_description(&access))),
+                        )
+                        .when(loading_links, |panel| {
+                            panel.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Loading existing links..."))
+                        })
+                        .when(!manual_mode && has_machines, |panel| {
+                            panel.child(
+                                v_flex().gap(px(6.)).children(machines.into_iter().map(|machine| {
+                                    let existing = machine.existing_link_environment_id.clone();
+                                    let machine_id = machine.id.clone();
+                                    let machine_label = machine.label.clone();
+                                    let machine_urls = machine.urls.clone();
+                                    let creds = saved_envs
+                                        .iter()
+                                        .find(|e| e.environment_id.as_deref() == Some(machine_id.as_str()) || e.id == machine_id)
+                                        .and_then(|e| e.credentials());
+                                    let st = card_state.clone();
+                                    let app = self.state.clone();
+                                    let thread_id = self.thread_id.clone();
+                                    let turn_item_id = self.turn_item_id.clone();
+                                    let cur_access = access.clone();
+                                    let button_label = if existing.is_some() { "Use existing link" } else { "Link" };
+                                    h_flex()
+                                        .justify_between()
+                                        .gap(px(8.))
+                                        .px(px(10.))
+                                        .py(px(8.))
+                                        .rounded(px(8.))
+                                        .border_1()
+                                        .border_color(hsla(p.border).opacity(0.5))
+                                        .bg(hsla(p.card).opacity(0.7))
+                                        .child(
+                                            v_flex()
+                                                .min_w_0()
+                                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(machine.label))
+                                                .when_some(machine_urls.first().cloned(), |row, url| {
+                                                    row.child(div().truncate().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(url))
+                                                }),
+                                        )
+                                        .child(outline_button(
+                                            SharedString::from(format!("link-machine:{id_str}:{machine_id}")),
+                                            button_label,
+                                            move |_, _, cx| {
+                                                if submitting {
+                                                    return;
+                                                }
+                                                st.update(cx, |s, cx| {
+                                                    s.submitting = true;
+                                                    s.error = None;
+                                                    cx.notify();
+                                                });
+                                                let weak = st.downgrade();
+                                                if let Some(existing_id) = existing.clone() {
+                                                    let task = app.update(cx, |app, _| {
+                                                        app.rpc(
+                                                            t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                                            t3_core::commands::link_request_answer_use_existing(&thread_id, &turn_item_id, &existing_id),
+                                                        )
+                                                    });
+                                                    cx.spawn(async move |cx| {
+                                                        let res = task.await;
+                                                        let _ = weak.update(cx, |s, cx| {
+                                                            s.submitting = false;
+                                                            if let Err(err) = res {
+                                                                s.error = Some(err.to_string());
+                                                            }
+                                                            cx.notify();
+                                                        });
+                                                    })
+                                                    .detach();
+                                                } else if let Some(creds) = creds.clone() {
+                                                    let body = t3_core::settings::access::pairing_token_body(
+                                                        "T3 Code peer link",
+                                                        &mcp_client_scopes(&cur_access),
+                                                    );
+                                                    let app_handle = app.clone();
+                                                    let thread_id = thread_id.clone();
+                                                    let turn_item_id = turn_item_id.clone();
+                                                    let machine_id = machine_id.clone();
+                                                    let machine_label = machine_label.clone();
+                                                    let machine_urls = machine_urls.clone();
+                                                    let cur_access = cur_access.clone();
+                                                    cx.spawn(async move |cx| {
+                                                        let minted = cx
+                                                            .background_executor()
+                                                            .spawn(async move {
+                                                                tokio::runtime::Handle::current().block_on(t3_client::auth::post_access(
+                                                                    &creds,
+                                                                    "/api/auth/pairing-token",
+                                                                    Some(body),
+                                                                ))
+                                                            })
+                                                            .await;
+                                                        let code = match minted {
+                                                            Ok(val) => val
+                                                                .get("credential")
+                                                                .or_else(|| val.get("pairingCode"))
+                                                                .or_else(|| val.get("token"))
+                                                                .and_then(Value::as_str)
+                                                                .map(str::to_owned),
+                                                            Err(err) => {
+                                                                let _ = weak.update(cx, |s, cx| {
+                                                                    s.submitting = false;
+                                                                    s.error = Some(err);
+                                                                    cx.notify();
+                                                                });
+                                                                return;
+                                                            }
+                                                        };
+                                                        let Some(code) = code.filter(|c| !c.is_empty()) else {
+                                                            let _ = weak.update(cx, |s, cx| {
+                                                                s.submitting = false;
+                                                                s.manual_mode = true;
+                                                                s.error = Some("Could not mint a pairing code automatically; paste one below.".to_owned());
+                                                                cx.notify();
+                                                            });
+                                                            return;
+                                                        };
+                                                        let task = app_handle.update(cx, |app, _| {
+                                                            app.rpc(
+                                                                t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                                                t3_core::commands::link_request_answer_link(
+                                                                    &thread_id,
+                                                                    &turn_item_id,
+                                                                    Some(&machine_id),
+                                                                    Some(&machine_label),
+                                                                    &machine_urls,
+                                                                    &cur_access,
+                                                                    &code,
+                                                                ),
+                                                            )
+                                                        });
+                                                        let res = task.await;
+                                                        let _ = weak.update(cx, |s, cx| {
+                                                            s.submitting = false;
+                                                            if let Err(err) = res {
+                                                                s.error = Some(err.to_string());
+                                                            }
+                                                            cx.notify();
+                                                        });
+                                                    })
+                                                    .detach();
+                                                } else {
+                                                    st.update(cx, |s, cx| {
+                                                        s.submitting = false;
+                                                        s.manual_mode = true;
+                                                        s.error = Some("No active credentials for that machine; enter a pairing code manually.".to_owned());
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            },
+                                            cx,
+                                        ))
+                                }))
+                            )
+                        })
+                        .when(!manual_mode && !has_machines && !loading_links, |panel| {
+                            panel.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("No other saved machines found. Enter connection details manually."))
+                        })
+                        .when(manual_mode || !has_machines, |panel| {
+                            panel.child(
+                                v_flex()
+                                    .gap(px(6.))
+                                    .child(Input::new(&url_input).disabled(submitting))
+                                    .child(Input::new(&label_input).disabled(submitting))
+                                    .child(Input::new(&code_input).disabled(submitting))
+                                    .child(h_flex().justify_end().child(outline_button(
+                                        SharedString::from(format!("link-manual-submit:{id_str}")),
+                                        if submitting { "Linking..." } else { "Link machine" },
+                                        move |_, _, cx| {
+                                            if submitting {
+                                                return;
+                                            }
+                                            let url = manual_url_input.read(cx).value().trim().to_owned();
+                                            let lbl = manual_label_input.read(cx).value().trim().to_owned();
+                                            let code = manual_code_input.read(cx).value().trim().to_owned();
+                                            if url.is_empty() || code.is_empty() {
+                                                manual_submit_state.update(cx, |s, cx| {
+                                                    s.error = Some("URL and pairing code are required.".to_owned());
+                                                    cx.notify();
+                                                });
+                                                return;
+                                            }
+                                            manual_submit_state.update(cx, |s, cx| {
+                                                s.submitting = true;
+                                                s.error = None;
+                                                cx.notify();
+                                            });
+                                            let lbl_opt = (!lbl.is_empty()).then_some(lbl.as_str());
+                                            let task = manual_submit_app.update(cx, |app, _| {
+                                                app.rpc(
+                                                    t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                                    t3_core::commands::link_request_answer_link(
+                                                        &manual_thread,
+                                                        &manual_item,
+                                                        None,
+                                                        lbl_opt,
+                                                        &[url],
+                                                        &manual_access,
+                                                        &code,
+                                                    ),
+                                                )
+                                            });
+                                            let weak = manual_submit_state.downgrade();
+                                            cx.spawn(async move |cx| {
+                                                let res = task.await;
+                                                let _ = weak.update(cx, |s, cx| {
+                                                    s.submitting = false;
+                                                    if let Err(err) = res {
+                                                        s.error = Some(err.to_string());
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            })
+                                            .detach();
+                                        },
+                                        cx,
+                                    ))),
+                            )
+                        })
+                        .when(has_machines, |panel| {
+                            panel.child(h_flex().justify_start().child(ghost_button(
+                                SharedString::from(format!("link-toggle-manual:{id_str}")),
+                                if manual_mode { "Choose saved machine" } else { "Connect manually" },
+                                submitting,
+                                move |_, _, cx| {
+                                    manual_toggle_state.update(cx, |s, cx| {
+                                        s.manual_mode = !s.manual_mode;
+                                        s.error = None;
+                                        cx.notify();
+                                    });
+                                },
+                                cx,
+                            )))
+                        })
+                        .when_some(error, |panel, err| panel.child(div().text_xs().text_color(hsla(p.destructive)).child(err))),
+                )
+            })
+    }
+}
+
+#[derive(IntoElement)]
+struct HandoffCard {
+    id: SharedString,
+    from: Vec<HandoffEndpoint>,
+    to: HandoffEndpoint,
+    pending: bool,
+    failed: bool,
+    summary: Option<String>,
+}
+
+impl RenderOnce for HandoffCard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let expanded_state = window.use_keyed_state(SharedString::from(format!("handoff-open:{}", self.id)), cx, |_, _| false);
+        let expanded = *expanded_state.read(cx);
+        let color = hsla(if self.failed { p.destructive } else { p.muted_foreground });
+        let line = || div().h(px(1.)).flex_1().bg(if self.failed { hsla(p.destructive).opacity(0.3) } else { hsla(p.border).opacity(0.7) });
+        let render_endpoint = |ep: HandoffEndpoint| {
+            let label = ep.label.clone();
             h_flex()
-                .mt(px(8.))
-                .gap(px(6.))
-                .text_xs()
-                .text_color(hsla(p.muted_foreground))
-                .child(Icon::Shield.render(px(14.), hsla(p.muted_foreground)))
-                .child(note)
-        }))
-        .into_any_element()
+                .gap(px(4.))
+                .when_some(ep.driver, |row, driver| {
+                    let accent = ep.is_custom.then_some(p.primary);
+                    row.child(ProviderIcon::new(ProviderMark::configured(&driver, &label, accent)).size(px(12.)))
+                })
+                .child(ep.label)
+        };
+        let mut from_views: Vec<AnyElement> = Vec::new();
+        let from_count = self.from.len();
+        for (idx, ep) in self.from.into_iter().enumerate() {
+            from_views.push(render_endpoint(ep).into_any_element());
+            if idx + 1 < from_count {
+                from_views.push(div().child(", ").into_any_element());
+            }
+        }
+        let has_endpoints = from_count > 0 || !self.to.label.is_empty();
+        let title = if self.pending { "Context handoff pending" } else { "Context handoff" };
+        let toggle = self.summary.as_ref().map(|_| {
+            let st = expanded_state.clone();
+            focusable(
+                div()
+                    .id(SharedString::from(format!("handoff-toggle:{}", self.id)))
+                    .px(px(4.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hsla(p.accent).opacity(0.5)))
+                    .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).render(px(12.), color))
+                    .on_click(move |_, _, cx| {
+                        st.update(cx, |open, cx| {
+                            *open = !*open;
+                            cx.notify();
+                        });
+                    }),
+                cx,
+            )
+        });
+
+        v_flex()
+            .w_full()
+            .gap(px(4.))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(8.))
+                    .py(px(8.))
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(color)
+                    .child(line())
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap(px(6.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .child(Icon::ArrowRightLeft.render(px(12.), color))
+                            .child(div().font_weight(FontWeight::MEDIUM).child(title))
+                            .when(has_endpoints, |row| {
+                                row.child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap(px(4.))
+                                        .opacity(0.8)
+                                        .children(from_views)
+                                        .when(from_count > 0 && !self.to.label.is_empty(), |r| r.child(Icon::ArrowRight.render(px(11.), color)))
+                                        .when(!self.to.label.is_empty(), |r| r.child(render_endpoint(self.to))),
+                                )
+                            })
+                            .children(toggle),
+                    )
+                    .child(line()),
+            )
+            .when(expanded, |this| {
+                this.when_some(self.summary, |this, summary| {
+                    this.child(
+                        div()
+                            .mx(px(16.))
+                            .p(px(10.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(hsla(p.border).opacity(0.5))
+                            .bg(hsla(p.card).opacity(0.5))
+                            .text_xs()
+                            .text_color(hsla(p.muted_foreground))
+                            .child(summary),
+                    )
+                })
+            })
+    }
 }
 
 fn answered_line(id: &str, icon: Icon, text: String, cx: &App) -> AnyElement {
@@ -356,53 +1212,148 @@ fn answered_line(id: &str, icon: Icon, text: String, cx: &App) -> AnyElement {
 /// `V2EventTimelineRow`.
 pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], resource_summary: bool, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
+    let marks: Vec<(String, ProviderMark)> = env
+        .state
+        .read(cx)
+        .server_config
+        .config
+        .as_ref()
+        .map(|config| {
+            let entries = provider_entries(config, None);
+            entries
+                .iter()
+                .map(|entry| (entry.instance_id().to_owned(), ProviderMark::of(entry, &entries)))
+                .collect()
+        })
+        .unwrap_or_default();
     match &item.kind {
-        TurnItemKind::Subagent { .. } if subagents.len() > 1 => subagent_group(id, subagents, env, cx),
-        TurnItemKind::Subagent { .. } => subagent_row(item, env, cx),
-        TurnItemKind::SecretRequest { label, reason, secret_status } => match secret_status.as_str() {
-            "pending" => request_card(label.clone(), Some(reason.clone()), Some("Stored securely, never shown to the agent".into()), cx),
-            "saved" => answered_line(id, Icon::Check, format!("{label} · Saved securely and kept private"), cx),
-            "declined" => answered_line(id, Icon::X, format!("{label} · Declined"), cx),
-            _ => answered_line(id, Icon::X, format!("{label} · Request ended"), cx),
-        },
-        TurnItemKind::LinkRequest { reason, link_status, label, failure, linked_label } => {
-            let name = label.clone().unwrap_or_else(|| "Link a machine to this environment".into());
-            match link_status.as_str() {
-                "pending" => request_card(name, Some(reason.clone()), None, cx),
-                "linked" => answered_line(id, Icon::Link, format!("Linked {}", linked_label.clone().or(label.clone()).unwrap_or_default()).trim().to_owned(), cx),
-                "declined" => answered_line(id, Icon::X, format!("{name} · Declined"), cx),
-                "failed" => answered_line(id, Icon::CircleAlert, format!("{name} · {}", failure.clone().unwrap_or_else(|| "Failed".into())), cx),
-                _ => answered_line(id, Icon::X, format!("{name} · Request ended"), cx),
+        TurnItemKind::Subagent { .. } if subagents.len() > 1 => subagent_group(id, subagents, &marks, env, cx),
+        TurnItemKind::Subagent { .. } => subagent_row(item, &marks, env, cx),
+        TurnItemKind::SecretRequest { label, reason, placeholder, delivery, secret_status } => {
+            if secret_status == "pending"
+                && let Some(thread_id) = env.thread_id
+            {
+                return SecretRequestCard {
+                    id: SharedString::from(id.to_owned()),
+                    thread_id: thread_id.to_owned(),
+                    turn_item_id: item.id.clone(),
+                    label: label.clone(),
+                    reason: reason.clone(),
+                    placeholder: placeholder.clone(),
+                    delivery: delivery.clone(),
+                    state: env.state.clone(),
+                }
+                .into_any_element();
             }
+            let display = secret_request_display(secret_status, label, true);
+            let icon = match display.tone {
+                SecretTone::Saved => Icon::Check,
+                SecretTone::Declined | SecretTone::TimedOut => Icon::X,
+                SecretTone::Pending | SecretTone::PendingElsewhere => Icon::KeyRound,
+            };
+            let summary = if display.detail.is_empty() { display.label } else { format!("{} · {}", display.label, display.detail) };
+            answered_line(id, icon, summary, cx)
+        }
+        TurnItemKind::LinkRequest {
+            reason,
+            link_status,
+            url,
+            environment_id,
+            label,
+            hint,
+            requested_access,
+            failure,
+            linked_label,
+            linked_access,
+            ..
+        } => {
+            if link_status == "pending"
+                && let Some(thread_id) = env.thread_id
+            {
+                return LinkRequestCard {
+                    id: SharedString::from(id.to_owned()),
+                    thread_id: thread_id.to_owned(),
+                    turn_item_id: item.id.clone(),
+                    reason: reason.clone(),
+                    default_url: url.clone(),
+                    default_environment_id: environment_id.clone(),
+                    default_label: label.clone(),
+                    hint: hint.clone(),
+                    requested_access: requested_access.clone(),
+                    state: env.state.clone(),
+                }
+                .into_any_element();
+            }
+            let session = env.state.read(cx).client_handle().and_then(|h| h.session_state().borrow().clone());
+            let can_manage = can_manage_peer_links(session.as_ref());
+            let display = link_request_display(
+                link_status,
+                label.as_deref(),
+                failure.as_deref(),
+                linked_label.as_deref(),
+                linked_access.as_deref(),
+                can_manage,
+            );
+            let icon = match display.tone {
+                LinkTone::Linked => Icon::Link,
+                LinkTone::Failed => Icon::CircleAlert,
+                LinkTone::Declined | LinkTone::TimedOut => Icon::X,
+                LinkTone::Pending | LinkTone::PendingElsewhere => Icon::Link2,
+            };
+            let summary = if display.detail.is_empty() { display.label } else { format!("{} · {}", display.label, display.detail) };
+            answered_line(id, icon, summary, cx)
         }
         TurnItemKind::RunInterruptResult { message } => {
             system_divider("Run interrupted".into(), Some(message.clone().into()).filter(|m: &SharedString| !m.is_empty()), Some(Icon::CircleStop), DividerTone::Neutral, cx)
         }
-        TurnItemKind::Handoff { to_model, .. } => system_divider(
-            "Context handoff".into(),
-            to_model.clone().map(SharedString::from),
-            Some(Icon::ArrowRightLeft),
-            if item.status == "failed" { DividerTone::Danger } else { DividerTone::Neutral },
-            cx,
-        ),
-        TurnItemKind::Fork { target_thread_id, source } => {
+        TurnItemKind::Handoff {
+            from_provider_instance_ids,
+            to_provider_instance_id,
+            from_model_selections,
+            to_model,
+            summary,
+            ..
+        } => {
+            let providers = env
+                .state
+                .read(cx)
+                .server_config
+                .config
+                .as_ref()
+                .map(|config| provider_entries(config, None))
+                .unwrap_or_default();
+            let (from, to) = resolve_handoff_endpoints(
+                from_model_selections,
+                from_provider_instance_ids,
+                to_provider_instance_id.as_deref(),
+                to_model.as_deref(),
+                &providers,
+            );
+            HandoffCard {
+                id: SharedString::from(id.to_owned()),
+                from,
+                to,
+                pending: matches!(item.status.as_str(), "pending" | "waiting" | "running"),
+                failed: item.status == "failed",
+                summary: summary.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_owned),
+            }
+            .into_any_element()
+        }
+        TurnItemKind::Fork { target_thread_id, source, .. } => {
             let from_run = source.as_ref().and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("run");
             let target = if from_run {
                 source.as_ref().and_then(|s| s.get("threadId")).and_then(|t| t.as_str()).map(str::to_owned).unwrap_or_else(|| target_thread_id.clone())
             } else {
                 target_thread_id.clone()
             };
-            focusable(div().id(SharedString::from(format!("fork:{id}"))), cx)
-                .cursor_pointer()
-                .on_click(cx.listener(move |view, _, _, cx| view.open_thread(&target, cx)))
-                .child(system_divider(
-                    if from_run { "Forked from conversation".into() } else { "Conversation fork".into() },
-                    None,
-                    Some(Icon::GitFork),
-                    DividerTone::Neutral,
-                    cx,
-                ))
-                .into_any_element()
+            system_divider_button(
+                SharedString::from(format!("fork:{id}")),
+                if from_run { "Forked from conversation".into() } else { "Conversation fork".into() },
+                Some(Icon::GitFork),
+                if from_run { "Open source conversation" } else { "Open forked thread" },
+                cx.listener(move |view, _, _, cx| view.open_thread(&target, cx)),
+                cx,
+            )
         }
         TurnItemKind::ThreadCreated { target_thread_id, .. } => {
             let title = item.title.clone().unwrap_or_else(|| "Created thread".into());
@@ -443,5 +1394,36 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
             }
         }
         _ => div().into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subagent_item(status: &str, started_at: &str, completed_at: Option<&str>) -> TurnItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "item-1",
+            "type": "subagent",
+            "subagentId": "subagent-1",
+            "status": status,
+            "title": "  Worker  task\n  here ",
+            "startedAt": started_at,
+            "completedAt": completed_at,
+            "childThreadId": "thread-child",
+        }))
+        .expect("valid subagent item")
+    }
+
+    #[test]
+    fn subagent_helpers_normalize_title_detail_and_elapsed() {
+        let running = subagent_item("running", "2026-01-01T00:00:00Z", None);
+        assert_eq!(subagent_title(&running), "Worker task here");
+        let start_ms = parse_iso_ms("2026-01-01T00:00:00Z").expect("valid iso");
+        assert_eq!(elapsed_label(&running, start_ms + 300).as_deref(), Some("1s"));
+
+        let settled = subagent_item("completed", "2026-01-01T00:00:00Z", Some("2026-01-01T00:01:05Z"));
+        assert_eq!(elapsed_label(&settled, start_ms + 300).as_deref(), Some("1m 5s"));
+        assert_eq!(plain_detail("- Running `cargo test`\n* Done"), "Running cargo test Done");
     }
 }

@@ -412,7 +412,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                     continue;
                 }
                 let (status, before, after, summary) = match work.item.as_ref().map(|i| (&i.status, &i.kind)) {
-                    Some((status, TurnItemKind::Compaction { before_token_count, after_token_count, summary })) => {
+                    Some((status, TurnItemKind::Compaction { before_token_count, after_token_count, summary, .. })) => {
                         (status.as_str(), *before_token_count, *after_token_count, summary.as_deref())
                     }
                     _ => ("completed", None, None, None),

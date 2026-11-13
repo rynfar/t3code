@@ -114,6 +114,8 @@ struct Snapshot {
     setup_blocks_send: bool,
     /// The run is being prepared, so a send queues behind it (`sendQueuesBehindSetup`).
     setup_queues: bool,
+    /// Latest actionable proposed plan on a settled run (`findLatestProposedPlan`).
+    active_proposed_plan: Option<t3_core::timeline::plan::ActiveProposedPlan>,
 }
 
 /// The corresponding transcript follows this composer's effective selection (`ChatView.tsx`).
@@ -165,6 +167,7 @@ pub struct Composer {
     picker_open: bool,
     permissions_open: bool,
     approval_menu_open: bool,
+    plan_menu_open: bool,
     choices: HashMap<Target, Choices>,
     /// The model and mode a new draft starts from: what the thread before it ran.
     carry: (Option<ModelSelection>, Option<InteractionMode>),
@@ -325,6 +328,7 @@ impl Composer {
             picker_open: false,
             permissions_open: false,
             approval_menu_open: false,
+            plan_menu_open: false,
             choices: HashMap::new(),
             carry: (None, None),
             snapshot: Snapshot::default(),
@@ -413,8 +417,25 @@ impl Composer {
             pending_key,
             pending,
             queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
+            active_proposed_plan: projection.and_then(t3_core::timeline::plan::find_active_proposed_plan),
             target,
         }
+    }
+
+    pub(super) fn active_plan_follow_up(&self, cx: &App) -> Option<&t3_core::timeline::plan::ActiveProposedPlan> {
+        let resolved = self.resolve(cx);
+        let target = self.snapshot.target.as_ref();
+        let has_attachments = target.is_some_and(|t| !self.staged_for(t).is_empty());
+        let plan = self.snapshot.active_proposed_plan.as_ref();
+        t3_core::timeline::plan::should_show_plan_follow_up_prompt(
+            self.snapshot.pending.user_inputs.len(),
+            resolved.interaction_mode,
+            self.snapshot.running,
+            plan,
+            has_attachments,
+        )
+        .then_some(plan)
+        .flatten()
     }
 
     /// Re-reads app state. Notifies only when something the composer shows changed.

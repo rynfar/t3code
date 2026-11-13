@@ -16,7 +16,7 @@ use t3_core::turn_item::{TurnItem, TurnItemKind};
 use super::command_output;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
-use super::parts::{chevron, focusable, icon_slot, outline_button, timestamp, work_line, work_row_frame};
+use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
@@ -205,6 +205,28 @@ fn entry_row(
     let mut trailing = Vec::new();
     if failed && !severe {
         trailing.push(Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
+    }
+    if let Some(TurnItemKind::Notification { source, .. }) = entry.item.as_ref().map(|item| &item.kind)
+        && matches!(source.get("kind").and_then(serde_json::Value::as_str), Some("subagent" | "delegated_task"))
+        && let Some(child_thread_id) = source
+            .get("childThreadId")
+            .or_else(|| source.get("threadId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    {
+        trailing.push(inline_button(
+            SharedString::from(format!("notif-open:{}", entry.id)),
+            "Open chat",
+            InlineTone::Default,
+            false,
+            cx.listener(move |view, _, _, cx| {
+                cx.stop_propagation();
+                view.open_thread(&child_thread_id, cx);
+            }),
+            cx,
+        ));
     }
     trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     trailing.push(chevron(expanded, can_expand, cx));

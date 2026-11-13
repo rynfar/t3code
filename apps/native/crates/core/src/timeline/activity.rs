@@ -116,7 +116,7 @@ pub fn user_message_attribution(message: &ChatMessage) -> Option<Attribution> {
     if message.meta.guest_name.is_some() || message.meta.guest_text.is_some() {
         return Some(Attribution::Guest);
     }
-    if message.meta.scheduled_task_id.is_some() || message.text.starts_with("[Triggered by schedule task: ") {
+    if scheduled_task_id_from_message(message).is_some() || has_legacy_automation_prefix(&message.text) {
         return Some(Attribution::Automation);
     }
     match (message.meta.created_by.as_deref(), message.meta.creation_source.as_deref()) {
@@ -192,3 +192,307 @@ pub fn strip_displayed_plan_markdown(markdown: &str) -> String {
     }
     lines.get(start..).map(|rest| rest.join("\n")).unwrap_or_default()
 }
+
+/// Resolved presentation of a user message (`resolveUserMessagePresentation` in `userMessage.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMessagePresentation {
+    pub text: String,
+    pub attribution: Option<Attribution>,
+    pub scheduled_task_id: Option<String>,
+}
+
+/// Parse `scheduled-task-message:<id>:<ts>:(scheduled|manual)` when `meta.scheduled_task_id` is absent.
+pub fn scheduled_task_id_from_message(message: &ChatMessage) -> Option<String> {
+    if let Some(id) = message.meta.scheduled_task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(id.to_owned());
+    }
+    let rest = message.id.strip_prefix("scheduled-task-message:")?;
+    let suffix_start = rest.rfind(':')?;
+    let trigger = &rest[suffix_start + 1..];
+    if !matches!(trigger, "scheduled" | "manual") {
+        return None;
+    }
+    let before_trigger = &rest[..suffix_start];
+    let ts_start = before_trigger.rfind(':')?;
+    let ts = &before_trigger[ts_start + 1..];
+    if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let id = &before_trigger[..ts_start];
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+fn has_legacy_automation_prefix(text: &str) -> bool {
+    strip_legacy_automation_prefix(text).is_some()
+}
+
+fn strip_legacy_automation_prefix(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("[Triggered by schedule task: ")?;
+    let close = rest.find(']')?;
+    if rest[..close].contains(['\r', '\n']) {
+        return None;
+    }
+    let after_bracket = &rest[close + 1..];
+    if let Some(after) = after_bracket.strip_prefix("\r\n\r\n") {
+        Some(after)
+    } else if let Some(after) = after_bracket.strip_prefix("\n\n") {
+        Some(after)
+    } else {
+        None
+    }
+}
+
+/// Strip automation trigger prefix and attachment-only bootstrap prompt (`resolveUserMessagePresentation`).
+pub fn resolve_user_message_presentation(message: &ChatMessage) -> UserMessagePresentation {
+    let scheduled_task_id = scheduled_task_id_from_message(message);
+    let attribution = user_message_attribution(message);
+    let mut text = message.text.as_ref();
+    if attribution == Some(Attribution::Automation)
+        && let Some(stripped) = strip_legacy_automation_prefix(text)
+    {
+        text = stripped;
+    }
+    let display = if crate::composer::attachments::is_attachment_only_prompt(text) {
+        String::new()
+    } else {
+        text.to_owned()
+    };
+    UserMessagePresentation { text: display, attribution, scheduled_task_id }
+}
+
+/// Partitioned attachments and file-card flags for a user message (`resolveUserMessageFileCards`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserFileCard {
+    pub attachment: serde_json::Value,
+    pub label: String,
+    pub size_bytes: Option<u64>,
+    pub downloadable: bool,
+    pub pasted_text: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserAttachmentPartition {
+    pub images: Vec<serde_json::Value>,
+    pub audios: Vec<serde_json::Value>,
+    pub files: Vec<UserFileCard>,
+    pub file_cards_only: bool,
+    pub audio_only: bool,
+}
+
+pub fn is_audio_attachment(attachment: &serde_json::Value) -> bool {
+    attachment.get("kind").and_then(serde_json::Value::as_str) == Some("audio")
+        || attachment
+            .get("mimeType")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("audio/"))
+}
+
+pub fn user_message_file_label(attachment: &serde_json::Value) -> String {
+    if attachment.get("pastedText").and_then(serde_json::Value::as_bool) == Some(true) {
+        return "Pasted text".to_owned();
+    }
+    attachment
+        .get("name")
+        .or_else(|| attachment.get("filename"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("File")
+        .to_owned()
+}
+
+pub fn partition_user_attachments(attachments: &[serde_json::Value], display_text: &str) -> UserAttachmentPartition {
+    let mut out = UserAttachmentPartition::default();
+    for att in attachments {
+        let kind = att.get("kind").and_then(serde_json::Value::as_str);
+        let ty = att.get("type").and_then(serde_json::Value::as_str);
+        let mime = att.get("mimeType").and_then(serde_json::Value::as_str).unwrap_or("");
+        if is_audio_attachment(att) {
+            out.audios.push(att.clone());
+        } else if ty == Some("image") || kind == Some("image") || mime.to_ascii_lowercase().starts_with("image/") {
+            out.images.push(att.clone());
+        } else {
+            let pasted_text = att.get("pastedText").and_then(serde_json::Value::as_bool) == Some(true);
+            let downloadable = att.get("downloadable").and_then(serde_json::Value::as_bool) != Some(false)
+                && att.get("id").and_then(serde_json::Value::as_str).is_some_and(|id| !id.is_empty());
+            let size_bytes = att.get("sizeBytes").and_then(serde_json::Value::as_u64);
+            out.files.push(UserFileCard {
+                attachment: att.clone(),
+                label: user_message_file_label(att),
+                size_bytes,
+                downloadable,
+                pasted_text,
+            });
+        }
+    }
+    let text_empty = display_text.trim().is_empty();
+    out.file_cards_only = text_empty && out.images.is_empty() && out.audios.is_empty() && !out.files.is_empty();
+    out.audio_only = text_empty && out.images.is_empty() && out.files.is_empty() && !out.audios.is_empty();
+    out
+}
+
+/// Resolved same-harness model/effort switch (`resolveModelSwitchChange` in `handoff.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSwitchDisplay {
+    pub from_summary: String,
+    pub to_summary: String,
+    pub model_changed: bool,
+    pub effort_changed: bool,
+}
+
+fn selection_effort(selection: &serde_json::Value) -> Option<String> {
+    let opts = selection.get("options")?;
+    opts.get("reasoningEffort")
+        .or_else(|| opts.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn describe_switch_side(
+    selection: &serde_json::Value,
+    providers: &[crate::providers::ProviderEntry<'_>],
+    model_changed: bool,
+    effort: Option<&str>,
+) -> String {
+    let instance_id = selection.get("instanceId").and_then(serde_json::Value::as_str).unwrap_or("");
+    let slug = selection.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
+    let model_name = providers
+        .iter()
+        .find(|p| p.instance_id() == instance_id)
+        .and_then(|p| p.provider.models.iter().find(|m| m.slug == slug))
+        .map(|m| crate::providers::trigger_model_name(m).to_owned())
+        .unwrap_or_else(|| slug.to_owned());
+    match (model_changed.then_some(model_name).filter(|s| !s.is_empty()), effort) {
+        (Some(m), Some(e)) => format!("{m} {e}"),
+        (Some(m), None) => m,
+        (None, Some(e)) => e.to_owned(),
+        (None, None) => String::new(),
+    }
+}
+
+pub fn resolve_model_switch_change(
+    model_switch: &serde_json::Value,
+    providers: &[crate::providers::ProviderEntry],
+) -> Option<ModelSwitchDisplay> {
+    let from = model_switch.get("from")?;
+    let to = model_switch.get("to")?;
+    let from_slug = from.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
+    let to_slug = to.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
+    let from_inst = from.get("instanceId").and_then(serde_json::Value::as_str).unwrap_or("");
+    let to_inst = to.get("instanceId").and_then(serde_json::Value::as_str).unwrap_or("");
+    let from_effort = selection_effort(from);
+    let to_effort = selection_effort(to);
+    let model_changed = from_slug != to_slug || from_inst != to_inst;
+    let effort_changed = from_effort != to_effort;
+    if !model_changed && !effort_changed {
+        return None;
+    }
+    Some(ModelSwitchDisplay {
+        from_summary: describe_switch_side(from, providers, model_changed, from_effort.as_deref()),
+        to_summary: describe_switch_side(to, providers, model_changed, to_effort.as_deref()),
+        model_changed,
+        effort_changed,
+    })
+}
+
+/// Whether a user message is a provider-native workflow opening script (`isWorkflowScriptMessage`).
+pub fn is_workflow_script_message(role: super::Role, text: &str, workflow_script: Option<bool>) -> bool {
+    if role != super::Role::User {
+        return false;
+    }
+    workflow_script.unwrap_or_else(|| starts_with_workflow_script(text))
+}
+
+fn starts_with_workflow_script(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("//") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            break;
+        }
+    }
+    let Some(after_export) = rest.strip_prefix("export") else { return false };
+    let after_ws1 = after_export.trim_start();
+    if after_ws1.len() == after_export.len() {
+        return false;
+    }
+    let Some(after_const) = after_ws1.strip_prefix("const") else { return false };
+    let after_ws2 = after_const.trim_start();
+    if after_ws2.len() == after_const.len() {
+        return false;
+    }
+    let Some(after_meta) = after_ws2.strip_prefix("meta") else { return false };
+    after_meta.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use serde_json::json;
+
+    use super::*;
+    use crate::composer::attachments::ATTACHMENT_ONLY_PROMPT;
+    use crate::timeline::{MessageMeta, Role};
+
+    fn user_msg(id: &str, text: &str, meta: MessageMeta) -> ChatMessage {
+        ChatMessage {
+            id: id.to_owned(),
+            role: Role::User,
+            text: Arc::from(text),
+            run_id: None,
+            streaming: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            meta,
+            item: None,
+        }
+    }
+
+    #[test]
+    fn user_message_presentation_strips_automation_and_bootstrap_prompts() {
+        let auto = user_msg(
+            "scheduled-task-message:task-42:1700000000000:scheduled",
+            "[Triggered by schedule task: Daily check]\n\nRun checks",
+            MessageMeta::default(),
+        );
+        let pres = resolve_user_message_presentation(&auto);
+        assert_eq!(pres.attribution, Some(Attribution::Automation));
+        assert_eq!(pres.scheduled_task_id.as_deref(), Some("task-42"));
+        assert_eq!(pres.text, "Run checks");
+
+        let boot = user_msg("m1", &format!("Ultrathink:\n{ATTACHMENT_ONLY_PROMPT}"), MessageMeta::default());
+        assert_eq!(resolve_user_message_presentation(&boot).text, "");
+    }
+
+    #[test]
+    fn partitions_user_attachments_for_pasted_text_audio_and_files() {
+        let atts = vec![
+            json!({ "id": "a1", "kind": "file", "name": "notes.txt", "pastedText": true, "sizeBytes": 42 }),
+            json!({ "id": "a2", "kind": "audio", "name": "voice.webm", "mimeType": "audio/webm" }),
+        ];
+        let part = partition_user_attachments(&atts, "");
+        assert_eq!(part.files.len(), 1);
+        assert_eq!(part.files[0].label, "Pasted text");
+        assert!(part.files[0].pasted_text);
+        assert_eq!(part.audios.len(), 1);
+        assert!(!part.file_cards_only);
+
+        let files_only = partition_user_attachments(&atts[..1], "");
+        assert!(files_only.file_cards_only);
+    }
+
+    #[test]
+    fn detects_workflow_script_messages() {
+        assert!(is_workflow_script_message(Role::User, "// comment\nexport const meta = {};", None));
+        assert!(!is_workflow_script_message(Role::User, "Explain `export const meta`.", None));
+        assert!(!is_workflow_script_message(Role::Assistant, "export const meta = {};", None));
+    }
+}
+
+

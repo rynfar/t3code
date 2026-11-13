@@ -7,6 +7,7 @@ mod activity;
 pub mod anchor;
 mod compaction;
 mod detail;
+pub mod directives;
 mod entries;
 mod changed_files;
 mod find;
@@ -15,7 +16,9 @@ mod fork;
 mod inspector;
 pub mod minimap;
 mod now;
+pub mod plan;
 mod presentation;
+pub mod requests;
 mod rewind;
 mod rows;
 mod status;
@@ -39,8 +42,23 @@ use crate::thread::Visibility;
 use crate::turn_item::TurnItem;
 
 pub use activity::{
-    Attribution, LatestRun, ThreadActivity, derive_activity, plan_title, should_collapse_user_message, strip_displayed_plan_markdown,
-    user_message_attribution,
+    Attribution, LatestRun, ModelSwitchDisplay, ThreadActivity, UserAttachmentPartition, UserFileCard, UserMessagePresentation,
+    derive_activity, is_audio_attachment, is_workflow_script_message, partition_user_attachments, plan_title,
+    resolve_model_switch_change, resolve_user_message_presentation, scheduled_task_id_from_message,
+    should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution, user_message_file_label,
+};
+pub use directives::render_codex_directives_for_copy;
+pub use plan::{
+    ActiveProposedPlan, PlanFollowUpSubmission, build_collapsed_proposed_plan_preview_markdown,
+    build_plan_implementation_prompt, build_plan_implementation_thread_title, build_proposed_plan_markdown_filename,
+    find_active_proposed_plan, normalize_plan_markdown_for_export, proposed_plan_title,
+    resolve_plan_follow_up_submission, should_show_plan_follow_up_prompt,
+};
+pub use requests::{
+    ExistingPeerLink, HandoffEndpoint, LinkRequestDisplay, LinkTone, MachineCandidate, SecretRequestDisplay,
+    SecretTone, can_manage_peer_links, link_access_description, link_access_label, link_request_default_access,
+    link_request_display, linkable_machines, mcp_client_scopes, rank_machines_by_hint, resolve_handoff_endpoints,
+    secret_request_display, secret_request_privacy_note,
 };
 pub use detail::{
     GET_TURN_ITEM, MAX_TOOL_OUTPUT_IMAGES, ToolCallLines, command_output_text, decode_detail, detail_request, detail_revision, format_tool_value, needs_detail_fetch,
@@ -166,6 +184,8 @@ pub struct MessageMeta {
     pub guest_name: Option<String>,
     pub guest_text: Option<String>,
     pub model_switch: Option<Value>,
+    pub workflow_script: Option<bool>,
+    pub fresh_context: Option<bool>,
 }
 
 /// `ChatMessage`, built from a user or assistant turn item.
@@ -194,6 +214,7 @@ pub struct ProposedPlan {
     pub run_id: Option<String>,
     pub markdown: Arc<str>,
     pub status: String,
+    pub streaming: bool,
     pub updated_at: String,
 }
 

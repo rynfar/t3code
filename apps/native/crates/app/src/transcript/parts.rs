@@ -2,7 +2,10 @@
 //! (`TimelineRowParts.tsx`), the system divider (`TimelineSystemDivider.tsx`) and the small
 //! ghost buttons rows use. Each owns its look; callers only place them.
 
-use gpui::{AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px};
+use std::rc::Rc;
+use std::time::Duration;
+
+use gpui::{AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px};
 use gpui_component::h_flex;
 
 use crate::icons::Icon;
@@ -110,7 +113,6 @@ pub fn chevron(open: bool, visible: bool, cx: &App) -> AnyElement {
 
 pub enum DividerTone {
     Neutral,
-    Danger,
 }
 
 /// `TimelineSystemDivider`: a centered 11px label between two hairlines.
@@ -118,7 +120,6 @@ pub fn system_divider(label: SharedString, detail: Option<SharedString>, icon: O
     let p = palette(cx);
     let color = match tone {
         DividerTone::Neutral => hsla(p.muted_foreground),
-        DividerTone::Danger => hsla(p.destructive),
     };
     let line = || div().h(px(1.)).flex_1().bg(hsla(p.border).opacity(0.7));
     h_flex()
@@ -142,6 +143,109 @@ pub fn system_divider(label: SharedString, detail: Option<SharedString>, icon: O
         )
         .child(line())
         .into_any_element()
+}
+
+/// Interactive system divider where only the centered pill is focusable, clickable, and shows
+/// the tooltip (`TimelineSystemDivider` interactive variant).
+pub fn system_divider_button(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    icon: Option<Icon>,
+    tooltip: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let line = || div().h(px(1.)).flex_1().bg(hsla(p.border).opacity(0.7));
+    let pill = h_flex()
+        .id(id)
+        .min_w_0()
+        .gap(px(6.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .text_color(hsla(p.muted_foreground))
+        .cursor_pointer()
+        .hover(|style| style.bg(hsla(p.accent).opacity(0.6)).text_color(hsla(p.foreground)))
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx))
+        .children(icon.map(|icon| icon.render(px(12.), hsla(p.muted_foreground))))
+        .child(div().font_weight(FontWeight::MEDIUM).child(label))
+        .on_click(on_click);
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap(px(8.))
+        .py(px(8.))
+        .text_size(px(11.))
+        .line_height(px(16.))
+        .child(line())
+        .child(focusable(pill, cx))
+        .child(line())
+        .into_any_element()
+}
+
+#[derive(Default)]
+struct CopyButtonState {
+    seq: u64,
+    _reset: Option<Task<()>>,
+}
+
+type CopyHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// An `icon-xs` copy button with 2-second check confirmation (`MessageCopyButton`).
+#[derive(IntoElement)]
+pub struct CopyButton {
+    id: SharedString,
+    tooltip: &'static str,
+    on_copy: CopyHandler,
+}
+
+impl CopyButton {
+    pub fn new(id: impl Into<SharedString>, tooltip: &'static str, on_copy: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        Self { id: id.into(), tooltip, on_copy: Rc::new(on_copy) }
+    }
+}
+
+impl RenderOnce for CopyButton {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| CopyButtonState::default());
+        let copied = state.read(cx).seq > 0;
+        let icon = if copied { Icon::Check } else { Icon::Copy };
+        let color = if copied { hsla(p.primary) } else { hsla(p.muted_foreground) };
+        let tip = if copied { "Copied" } else { self.tooltip };
+        let on_copy = self.on_copy;
+        let button = div()
+            .id(self.id)
+            .size(px(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|style| style.bg(hsla(p.accent)))
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip).build(window, cx))
+            .child(icon.render(px(12.), color))
+            .on_click(move |_, window, cx| {
+                on_copy(window, cx);
+                state.update(cx, |s, cx| {
+                    s.seq = s.seq.wrapping_add(1).max(1);
+                    let current = s.seq;
+                    s._reset = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        let _ = this.update(cx, |s, cx| {
+                            if s.seq == current {
+                                s.seq = 0;
+                                cx.notify();
+                            }
+                        });
+                    }));
+                    cx.notify();
+                });
+            });
+        focusable(button, cx)
+    }
 }
 
 /// An `xs` ghost-muted text button (24 tall, pad-x 7, 12px text).

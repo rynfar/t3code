@@ -140,6 +140,10 @@ pub enum TurnItemKind {
         #[serde(default)]
         idle_compaction: Option<String>,
         #[serde(default)]
+        workflow_script: Option<bool>,
+        #[serde(default)]
+        fresh_context: Option<bool>,
+        #[serde(default)]
         context: Option<Value>,
     },
     AssistantMessage {
@@ -248,6 +252,8 @@ pub enum TurnItemKind {
     },
     Compaction {
         #[serde(default)]
+        driver: Option<String>,
+        #[serde(default)]
         summary: Option<String>,
         #[serde(default)]
         before_token_count: Option<u64>,
@@ -255,6 +261,12 @@ pub enum TurnItemKind {
         after_token_count: Option<u64>,
     },
     Handoff {
+        #[serde(default)]
+        from_provider_instance_ids: Vec<String>,
+        #[serde(default)]
+        to_provider_instance_id: Option<String>,
+        #[serde(default)]
+        from_model_selections: Vec<Value>,
         #[serde(default)]
         to_model: Option<String>,
         strategy: String,
@@ -265,29 +277,53 @@ pub enum TurnItemKind {
         target_thread_id: String,
         #[serde(default)]
         source: Option<Value>,
+        #[serde(default)]
+        provider_thread_id: Option<String>,
     },
     ThreadCreated {
         target_thread_id: String,
+        #[serde(default)]
+        target_provider_instance_id: Option<String>,
         target_model: String,
     },
     SecretRequest {
         label: String,
         reason: String,
         secret_status: String,
+        #[serde(default)]
+        placeholder: Option<String>,
+        #[serde(default)]
+        delivery: Option<String>,
     },
     LinkRequest {
         reason: String,
         link_status: String,
         #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        environment_id: Option<String>,
+        #[serde(default)]
         label: Option<String>,
+        #[serde(default)]
+        hint: Option<String>,
+        #[serde(default)]
+        requested_access: Option<String>,
         #[serde(default)]
         failure: Option<String>,
         #[serde(default)]
+        linked_environment_id: Option<String>,
+        #[serde(default)]
         linked_label: Option<String>,
+        #[serde(default)]
+        linked_access: Option<String>,
     },
     Subagent {
         subagent_id: String,
         child_thread_id: Option<String>,
+        #[serde(default)]
+        provider_instance_id: Option<String>,
+        #[serde(default)]
+        remote_child: Option<Value>,
         #[serde(default)]
         prompt: String,
         #[serde(default)]

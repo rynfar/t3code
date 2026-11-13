@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, ExternalPaths, Focusable, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
+    AnyElement, App, Context, ExternalPaths, Focusable, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
 use gpui_component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Copy, Paste, Textarea};
@@ -31,7 +31,7 @@ const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
 impl Composer {
     /// `ChatComposer` placeholders, most specific first.
-    fn placeholder(&self) -> &'static str {
+    fn placeholder(&self, cx: &App) -> &'static str {
         if let Some(approval) = self.snapshot.pending.approvals.first() {
             return if approval.supports_feedback {
                 "Send feedback to decline this request"
@@ -46,12 +46,15 @@ impl Composer {
                 "Choose an option above"
             };
         }
+        if self.active_plan_follow_up(cx).is_some() {
+            return "Add feedback to refine the plan, or leave this blank to implement it";
+        }
         DEFAULT_PLACEHOLDER
     }
 
     /// Placeholder and disabled state follow what the agent waits on; written only on change.
     pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let placeholder = self.placeholder();
+        let placeholder = self.placeholder(cx);
         let disabled = self.active_question().is_some_and(|(request_id, question)| {
             !question.allows_custom_answer() || self.question_responding(&request_id, cx)
         });
@@ -207,6 +210,10 @@ impl Composer {
         if running && !has_text && !editing_queued {
             return stop().into_any_element();
         }
+        if !running && !editing_queued && self.active_plan_follow_up(cx).is_some() {
+            let disabled = self.sending || resolved.model.is_none() || self.snapshot.setup_blocks_send;
+            return self.render_plan_primary(self.has_text, disabled, cx);
+        }
         let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
         let settings = self.state.read(cx).client_settings;
         let follow_up = if self.snapshot.pending.approvals.is_empty() { settings.follow_up_behavior } else { rules::FollowUpBehavior::Steer };
@@ -346,6 +353,9 @@ impl Render for Composer {
                 .children(question.as_ref().map(|input| self.render_question(input, cx)))
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))
+                })
+                .when(question.is_none() && approval.is_none(), |this| {
+                    this.children(self.active_plan_follow_up(cx).map(|plan| self.render_plan_follow_up_banner(plan, cx)))
                 })
                 .children(self.render_stash_badge(cx))
                 .children(self.render_stash_menu(cx))

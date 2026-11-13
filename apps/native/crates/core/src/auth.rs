@@ -8,6 +8,7 @@ pub const ACCESS_WRITE_SCOPE: &str = "access:write";
 pub const TERMINAL_READ_SCOPE: &str = "terminal:read";
 pub const TERMINAL_OPERATE_SCOPE: &str = "terminal:operate";
 pub const SOURCE_CONTROL_WRITE_SCOPE: &str = "source-control:write";
+pub const FILESYSTEM_WRITE_SCOPE: &str = "filesystem:write";
 pub const ORCHESTRATION_READ_SCOPE: &str = "orchestration:read";
 pub const ORCHESTRATION_OPERATE_SCOPE: &str = "orchestration:operate";
 

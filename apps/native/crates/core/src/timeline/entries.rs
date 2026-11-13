@@ -177,7 +177,7 @@ pub(super) fn projected_work_entry(row: &ProjectedTurnItem) -> WorkLogEntry {
     };
     match &item.kind {
         TurnItemKind::ThreadCreated { .. } => entry.label = "Created thread".into(),
-        TurnItemKind::Compaction { summary, before_token_count, after_token_count } => {
+        TurnItemKind::Compaction { summary, before_token_count, after_token_count, .. } => {
             entry.label = context_compaction_label(&item.status, *before_token_count, *after_token_count);
             entry.source_activity = Some(SourceActivity::Compaction);
             entry.detail = summary.as_deref().and_then(non_empty);
@@ -285,7 +285,7 @@ fn is_standalone(kind: &TurnItemKind) -> bool {
 fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
     let (id, role, text, streaming, meta) = match &item.kind {
         TurnItemKind::UserMessage {
-            message_id, text, input_intent, model_switch, scheduled_task_id, sender_thread_id, created_by, creation_source, idle_compaction, context, ..
+            message_id, text, input_intent, model_switch, scheduled_task_id, sender_thread_id, created_by, creation_source, idle_compaction, workflow_script, fresh_context, context, ..
         } => {
             let guest = context.as_ref().and_then(|c| c.get("guest"));
             let meta = MessageMeta {
@@ -298,6 +298,8 @@ fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
                 guest_name: guest.and_then(|g| g.get("name")).and_then(Value::as_str).map(str::to_owned),
                 guest_text: guest.and_then(|g| g.get("text")).and_then(Value::as_str).map(str::to_owned),
                 model_switch: model_switch.clone(),
+                workflow_script: *workflow_script,
+                fresh_context: *fresh_context,
             };
             (message_id, Role::User, text, false, meta)
         }
@@ -400,12 +402,13 @@ fn build_entry(row: &ProjectedTurnItem, lookups: &Lookups, plans: &[Entity]) -> 
     let item = &row.item;
     let kind = if let Some(message) = chat_message(item) {
         EntryKind::Message(Arc::new(message))
-    } else if let TurnItemKind::ProposedPlan { plan_id, markdown, .. } = &item.kind {
+    } else if let TurnItemKind::ProposedPlan { plan_id, markdown, streaming } = &item.kind {
         EntryKind::ProposedPlan(Arc::new(ProposedPlan {
             id: plan_id.clone(),
             run_id: item.run_id.clone(),
             markdown: Arc::from(markdown.as_str()),
             status: plan_status(plans, plan_id).to_owned(),
+            streaming: *streaming,
             updated_at: item.updated_at.clone(),
         }))
     } else if let Some(reference) = html_render_reference(item) {

@@ -18,6 +18,10 @@ pub mod method {
     pub const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
     pub const LAUNCH_THREAD: &str = "orchestration.launchThread";
     pub const PROJECTS_READ_FILE: &str = "projects.readFile";
+    pub const PROJECTS_WRITE_FILE: &str = "projects.writeFile";
+    pub const PEER_LINKS_LIST: &str = "peerLinks.list";
+    pub const PEER_LINKS_ANSWER_REQUEST: &str = "peerLinks.answerRequest";
+    pub const SECRETS_ANSWER_REQUEST: &str = "secrets.answerRequest";
     pub const VCS_LIST_REFS: &str = "vcs.listRefs";
 }
 
@@ -317,6 +321,115 @@ pub fn launch_thread(launch: &LaunchThread) -> Value {
 /// `server.updateSettings` with `setModelFavorites`, as `useToggleEnvironmentModelFavorite` saves.
 pub fn set_model_favorite(provider: &str, model: &str, favorite: bool) -> Value {
     json!({ "patch": { "setModelFavorites": [{ "provider": provider, "model": model, "favorite": favorite }] } })
+}
+
+/// `thread.create` for implementing a plan in a new thread, before dispatching the prompt.
+#[allow(clippy::too_many_arguments)]
+pub fn create_thread(
+    command_id: &str,
+    thread_id: &str,
+    project_id: &str,
+    title: &str,
+    model_selection: &ModelSelection,
+    runtime_mode: RuntimeMode,
+    interaction_mode: InteractionMode,
+    branch: Option<&str>,
+    worktree_path: Option<&str>,
+) -> Value {
+    json!({
+        "type": "thread.create",
+        "commandId": command_id,
+        "createdBy": "user",
+        "creationSource": CREATION_SOURCE,
+        "threadId": thread_id,
+        "projectId": project_id,
+        "title": title,
+        "modelSelection": model_selection,
+        "runtimeMode": runtime_mode,
+        "interactionMode": interaction_mode,
+        "branch": branch,
+        "worktreePath": worktree_path,
+    })
+}
+
+/// Attach `sourcePlanRef` to a `message.dispatch` command payload.
+pub fn with_source_plan_ref(mut command: Value, thread_id: &str, plan_id: &str) -> Value {
+    command["sourcePlanRef"] = json!({ "threadId": thread_id, "planId": plan_id });
+    command
+}
+
+/// `projects.writeFile` payload for saving a proposed plan markdown file to the workspace.
+pub fn project_write_file(workspace_cwd: &str, relative_path: &str, contents: &str) -> Value {
+    json!({
+        "workspaceCwd": workspace_cwd,
+        "relativePath": relative_path,
+        "contents": contents,
+    })
+}
+
+/// `secrets.answerRequest` payload.
+pub fn secret_request_answer_save(thread_id: &str, turn_item_id: &str, secret: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": { "type": "save", "secret": secret },
+    })
+}
+
+/// `secrets.answerRequest` decline payload.
+pub fn secret_request_answer_decline(thread_id: &str, turn_item_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": { "type": "decline" },
+    })
+}
+
+/// `peerLinks.answerRequest` payload.
+pub fn link_request_answer_link(
+    thread_id: &str,
+    turn_item_id: &str,
+    environment_id: Option<&str>,
+    label: Option<&str>,
+    urls: &[String],
+    access: &str,
+    pairing_code: &str,
+) -> Value {
+    let mut answer = json!({
+        "type": "link",
+        "urls": urls,
+        "access": access,
+        "pairingCode": pairing_code,
+    });
+    if let Some(env_id) = environment_id.filter(|s| !s.is_empty()) {
+        answer["environmentId"] = json!(env_id);
+    }
+    if let Some(lbl) = label.map(str::trim).filter(|s| !s.is_empty()) {
+        answer["label"] = json!(lbl);
+    }
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": answer,
+    })
+}
+
+/// `peerLinks.answerRequest` payload for reusing an existing link.
+pub fn link_request_answer_use_existing(thread_id: &str, turn_item_id: &str, environment_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": { "type": "use-existing", "environmentId": environment_id },
+    })
+}
+
+/// `peerLinks.answerRequest` decline payload.
+pub fn link_request_answer_decline(thread_id: &str, turn_item_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": { "type": "decline" },
+    })
 }
 
 #[cfg(test)]
