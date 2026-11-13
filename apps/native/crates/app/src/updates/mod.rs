@@ -114,29 +114,21 @@ fn connected(state: &AppState) -> bool {
     )
 }
 pub(super) fn plan(state: &AppState, updating: bool) -> Plan {
-    let Some(config) = state.server_config.config.as_ref() else {
-        return Plan::default();
-    };
-    let grants = state
-        .client_handle()
-        .and_then(|c| c.session_state().borrow().clone());
-    updates::collect(
-        &[Machine {
-            id: &config.environment.environment_id,
-            label: &config.environment.label,
-            config: Some(config),
-            connected: connected(state),
+    let machines: Vec<_> = state.fleet.environments.iter().map(|entry| {
+        let owner = &entry.summary.owner;
+        Machine {
+            id: &owner.saved_id,
+            label: entry.config.config.as_ref().map_or(owner.saved_id.as_str(), |c| c.environment.label.as_str()),
+            config: entry.config.config.as_ref(),
+            connected: entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                && entry.summary.synchronized && entry.summary.config_loaded,
             hosted_by_this_app: false,
-            can_maintain: grants
-                .as_ref()
-                .is_some_and(|s| s.grants("environment:maintain")),
-            can_manage_providers: grants
-                .as_ref()
-                .is_some_and(|s| s.grants("providers:manage")),
+            can_maintain: entry.grants.as_ref().is_some_and(|s| s.grants("environment:maintain")),
+            can_manage_providers: entry.grants.as_ref().is_some_and(|s| s.grants("providers:manage")),
             updating,
-        }],
-        target_version(),
-    )
+        }
+    }).collect();
+    updates::collect(&machines, target_version())
 }
 impl UpdateControl {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {

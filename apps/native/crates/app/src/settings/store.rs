@@ -709,8 +709,22 @@ mod tests {
             let before = state.read_with(cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
             let (ready, loaded) = tokio::sync::oneshot::channel();
             let mut ready = Some(ready);
+            let plan_view = (scenario == "saved").then(|| state.read_with(cx, |state, _| state.connections.view()));
             let _subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
                 if *event == AppEvent::Shell && state.fleet.environments.len() == 2 {
+                    if let Some(view) = &plan_view {
+                        let view = view.borrow();
+                        if !["a", "b"].iter().all(|saved| {
+                            state.scoped_environment(saved).zip(view.environment(saved)).is_some_and(|(applied, current)| {
+                                applied.summary.owner == current.summary.owner
+                                    && applied.summary.owner.canonical_id.as_deref() == Some("shared-update-host")
+                                    && applied.status == ConnectionStatus::Connected && applied.summary.synchronized
+                                    && applied.config.config.as_ref().is_some_and(|config| config.environment.label == *saved
+                                        && t3_core::updates::one_click_candidates(&config.providers).len() == 1)
+                                    && applied.grants.as_ref().is_some_and(|session| session.grants("providers:manage") && session.grants("settings:write"))
+                            })
+                        }) { return; }
+                    }
                     if let Some(ready) = ready.take() { let _ = ready.send(()); }
                 }
             }));
@@ -718,6 +732,9 @@ mod tests {
             let mut events = Vec::new();
             for saved in ["a", "b"] {
                 let session = serde_json::from_value(json!({"authenticated":true,"permissions":if scenario == "denied" && saved == "b" { Vec::<&str>::new() } else { vec!["settings:write"] }})).unwrap();
+                let session = if scenario == "saved" {
+                    serde_json::from_value(json!({"authenticated":true,"permissions":["settings:write","providers:manage"]})).unwrap()
+                } else { session };
                 let (client, fixture) = ClientFixture::handle(session);
                 let mut shell = ShellState::default();
                 shell.apply(serde_json::from_value(json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[{
@@ -732,11 +749,47 @@ mod tests {
                         "settings":{"projectSettingsOverrides":{"same":{"defaultThreadEnvMode":"local","retained":saved}}}
                     }})).unwrap());
                 }
+                if scenario == "saved" {
+                    let config = config.config.as_mut().unwrap();
+                    config.environment.environment_id = "shared-update-host".into();
+                    config.providers = vec![serde_json::from_value(json!({
+                        "instanceId":"codex", "driver":"codex", "enabled":true, "installed":true, "status":"ready",
+                        "versionAdvisory":{"status":"behind_latest","latestVersion":"2","canUpdate":true,"updateCommand":"update"}
+                    })).unwrap()];
+                }
                 let install = state.update(cx, |state, _| state.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected));
                 events.push(runtime.spawn(install).await.unwrap());
                 fixtures.push(fixture);
             }
             loaded.await.unwrap();
+            if scenario == "saved" {
+                state.read_with(cx, |state, _| {
+                    let current = state.connections.view();
+                    let current = current.borrow();
+                    for saved in ["a", "b"] {
+                        let entry = state.scoped_environment(saved).unwrap();
+                        assert_eq!(entry.summary.owner, current.environment(saved).unwrap().summary.owner);
+                        assert_eq!(entry.summary.owner.saved_id, saved);
+                        assert_eq!(entry.summary.owner.canonical_id.as_deref(), Some("shared-update-host"));
+                        assert_eq!(entry.status, ConnectionStatus::Connected);
+                        assert!(entry.summary.synchronized && entry.summary.config_loaded);
+                        let config = entry.config.config.as_ref().unwrap();
+                        assert_eq!(config.environment.label, saved);
+                        let candidates = t3_core::updates::one_click_candidates(&config.providers);
+                        assert_eq!(candidates.len(), 1);
+                        assert_eq!((&*candidates[0].driver, &*candidates[0].instance_id), ("codex", "codex"));
+                        let grants = entry.grants.as_ref().unwrap();
+                        assert!(grants.grants("settings:write") && grants.grants("providers:manage"));
+                    }
+                    assert_ne!(state.scoped_environment("a").unwrap().summary.owner, state.scoped_environment("b").unwrap().summary.owner);
+                    let plan = crate::updates::plan(state, false);
+                    let mut targets = plan.providers.iter().map(|provider| provider.environment_id.as_str()).collect::<Vec<_>>();
+                    targets.sort_unstable();
+                    assert_eq!(targets, ["a", "b"], "ordinary provider updates must include both watched saved aliases, not only the selected canonical host");
+                    assert!(plan.providers.iter().all(|provider| provider.driver == "codex" && provider.instance_id == "codex"));
+                    assert_eq!((state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()), before);
+                });
+            }
             let members = state.read_with(cx, |state, _| state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect::<Vec<_>>());
             let (finished, done) = tokio::sync::oneshot::channel();
             let edit = if matches!(scenario, "action-partial" | "shortcut-stream") {
