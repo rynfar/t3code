@@ -12,21 +12,23 @@ use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
 use t3_core::providers::entries as provider_entries;
 use t3_core::timeline::{
-    CompactionTokens, ExistingPeerLink, HandoffEndpoint, LinkTone, MachineCandidate, SecretTone,
-    can_manage_peer_links, format_duration, link_access_description, link_access_label,
-    link_request_default_access, link_request_display, linkable_machines, mcp_client_scopes,
-    parse_iso_ms, rank_machines_by_hint, resolve_handoff_endpoints, secret_request_display,
+    CompactionTokens, ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS, LinkTone,
+    MachineCandidate, SecretTone, can_manage_peer_links, format_duration, link_access_description,
+    link_access_label, link_request_default_access, link_request_display, linkable_machines,
+    mcp_client_scopes, parse_iso_ms, rank_machines_by_hint, resolve_handoff_endpoints,
+    sanitize_link_request_error, sanitize_secret_request_error, secret_request_display,
     secret_request_privacy_note,
 };
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
 use super::parts::{
-    ROW_GROUP, DividerTone, focusable, ghost_button, icon_slot, outline_button, system_divider,
+    ROW_GROUP, DividerTone, focusable, ghost_button, icon_slot, system_divider,
     system_divider_button, timestamp, work_line, work_row_frame,
 };
 use super::timer::{TimerKind, WorkingTimer};
 use super::RowEnv;
 use crate::app_state::AppState;
+use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette, rem};
@@ -429,6 +431,67 @@ fn subagent_group(id: &str, members: &[Arc<TurnItem>], marks: &[(String, Provide
     v_flex().w_full().child(header).children(list).into_any_element()
 }
 
+fn rpc_error_tag_and_message(err: &t3_client::session::RpcError) -> (Option<&str>, &str) {
+    match err {
+        t3_client::session::RpcError::Failure(failure) => (failure.tag.as_deref(), failure.message.as_str()),
+        t3_client::session::RpcError::Closed => (None, ""),
+    }
+}
+
+fn merge_link_candidates(saved: &[t3_client::store::SavedEnvironment], relay: &[t3_core::relay::Environment]) -> Vec<MachineCandidate> {
+    let mut candidates: Vec<MachineCandidate> = saved
+        .iter()
+        .map(|env| MachineCandidate {
+            id: env.environment_id.clone().unwrap_or_else(|| env.id.clone()),
+            label: env.label.clone(),
+            urls: vec![env.http_base.clone()],
+            reachable: !env.disabled && env.credentials().is_some(),
+        })
+        .collect();
+    for env in relay {
+        if let Some(existing) = candidates.iter_mut().find(|candidate| candidate.id == env.environment_id) {
+            if !env.endpoint.http_base_url.trim().is_empty() && !existing.urls.iter().any(|u| u == &env.endpoint.http_base_url) {
+                existing.urls.push(env.endpoint.http_base_url.clone());
+            }
+        } else {
+            let urls = if env.endpoint.http_base_url.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![env.endpoint.http_base_url.clone()]
+            };
+            candidates.push(MachineCandidate {
+                id: env.environment_id.clone(),
+                label: env.label.clone(),
+                urls,
+                reachable: false,
+            });
+        }
+    }
+    candidates
+}
+
+fn link_card_headline(default_label: Option<&str>, default_url: Option<&str>, default_environment_id: Option<&str>) -> (String, Option<String>) {
+    fn clean(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let lbl = clean(default_label);
+    let url = clean(default_url);
+    let env_id = clean(default_environment_id);
+    let title = match lbl.or(url).or(env_id) {
+        Some(target) => format!("Link {target} to this environment"),
+        None => "Link a machine to this environment".to_owned(),
+    };
+    let subtitle = if lbl.is_some() { url.map(str::to_owned) } else { None };
+    (title, subtitle)
+}
+
+fn link_access_full_description(access: &str) -> String {
+    format!(
+        "{} An agent never gets more access there than its own mode here. Below full access, it can change only threads this link started, not that machine's own threads.",
+        link_access_description(access)
+    )
+}
+
 struct SecretCardState {
     input: Entity<InputState>,
     submitting: bool,
@@ -493,47 +556,48 @@ impl RenderOnce for SecretRequestCard {
                 h_flex()
                     .gap(px(8.))
                     .child(div().flex_1().min_w_0().child(Input::new(&input).disabled(submitting)))
-                    .child(outline_button(
-                        SharedString::from(format!("secret-save:{}", self.id)),
-                        if submitting { "Saving..." } else { "Save securely" },
-                        move |_, _, cx| {
-                            if submitting {
-                                return;
-                            }
-                            let secret = save_input.read(cx).value().to_string();
-                            if secret.trim().is_empty() {
+                    .child(
+                        Button::new(SharedString::from(format!("secret-save:{}", self.id)), ButtonVariant::Outline, ButtonSize::Xs)
+                            .label(if submitting { "Saving..." } else { "Save securely" })
+                            .disabled(submitting)
+                            .on_click(move |_, _, cx| {
+                                if submitting {
+                                    return;
+                                }
+                                let secret = save_input.read(cx).value().to_string();
+                                if secret.trim().is_empty() {
+                                    save_state.update(cx, |s, cx| {
+                                        s.error = Some("Enter a secret value first.".to_owned());
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
                                 save_state.update(cx, |s, cx| {
-                                    s.error = Some("Enter a secret value first.".to_owned());
+                                    s.submitting = true;
+                                    s.error = None;
                                     cx.notify();
                                 });
-                                return;
-                            }
-                            save_state.update(cx, |s, cx| {
-                                s.submitting = true;
-                                s.error = None;
-                                cx.notify();
-                            });
-                            let task = save_app.update(cx, |app, _| {
-                                app.rpc(
-                                    t3_core::commands::method::SECRETS_ANSWER_REQUEST,
-                                    t3_core::commands::secret_request_answer_save(&save_thread, &save_item, &secret),
-                                )
-                            });
-                            let weak = save_state.downgrade();
-                            cx.spawn(async move |cx| {
-                                let res = task.await;
-                                let _ = weak.update(cx, |s, cx| {
-                                    s.submitting = false;
-                                    if let Err(err) = res {
-                                        s.error = Some(err.to_string());
-                                    }
-                                    cx.notify();
+                                let task = save_app.update(cx, |app, _| {
+                                    app.rpc(
+                                        t3_core::commands::method::SECRETS_ANSWER_REQUEST,
+                                        t3_core::commands::secret_request_answer_save(&save_thread, &save_item, &secret),
+                                    )
                                 });
-                            })
-                            .detach();
-                        },
-                        cx,
-                    ))
+                                let weak = save_state.downgrade();
+                                cx.spawn(async move |cx| {
+                                    let res = task.await;
+                                    let _ = weak.update(cx, |s, cx| {
+                                        s.submitting = false;
+                                        if let Err(err) = res {
+                                            let (tag, msg) = rpc_error_tag_and_message(&err);
+                                            s.error = Some(sanitize_secret_request_error(tag, msg));
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                                .detach();
+                            }),
+                    )
                     .child(ghost_button(
                         SharedString::from(format!("secret-decline:{}", self.id)),
                         "Decline",
@@ -559,7 +623,8 @@ impl RenderOnce for SecretRequestCard {
                                 let _ = weak.update(cx, |s, cx| {
                                     s.submitting = false;
                                     if let Err(err) = res {
-                                        s.error = Some(err.to_string());
+                                        let (tag, msg) = rpc_error_tag_and_message(&err);
+                                        s.error = Some(sanitize_secret_request_error(tag, msg));
                                     }
                                     cx.notify();
                                 });
@@ -594,6 +659,19 @@ struct LinkCardState {
     code_input: Entity<InputState>,
 }
 
+impl LinkCardState {
+    fn reset(&mut self, default_access: String, default_url: &str, default_label: &str, window: &mut Window, cx: &mut App) {
+        self.dialog_open = false;
+        self.manual_mode = false;
+        self.access = default_access;
+        self.submitting = false;
+        self.error = None;
+        self.url_input.update(cx, |input, cx| input.set_value(default_url.to_owned(), window, cx));
+        self.label_input.update(cx, |input, cx| input.set_value(default_label.to_owned(), window, cx));
+        self.code_input.update(cx, |input, cx| input.set_value("", window, cx));
+    }
+}
+
 #[derive(IntoElement)]
 struct LinkRequestCard {
     id: SharedString,
@@ -614,16 +692,20 @@ impl RenderOnce for LinkRequestCard {
         let default_access = link_request_default_access(self.requested_access.as_deref()).to_owned();
         let default_url = self.default_url.clone().unwrap_or_default();
         let default_label = self.default_label.clone().unwrap_or_default();
+        let wh = window.window_handle();
+        let init_access = default_access.clone();
+        let init_url = default_url.clone();
+        let init_label = default_label.clone();
         let card_state = window.use_keyed_state(SharedString::from(format!("link-ui:{}", self.id)), cx, |window, cx| LinkCardState {
             dialog_open: false,
             manual_mode: false,
-            access: default_access,
+            access: init_access,
             loading_links: false,
             links: Vec::new(),
             submitting: false,
             error: None,
-            url_input: cx.new(|cx| InputState::new(window, cx).default_value(default_url).placeholder("https://machine:3773")),
-            label_input: cx.new(|cx| InputState::new(window, cx).default_value(default_label).placeholder("Machine label (optional)")),
+            url_input: cx.new(|cx| InputState::new(window, cx).default_value(init_url).placeholder("https://machine:3773")),
+            label_input: cx.new(|cx| InputState::new(window, cx).default_value(init_label).placeholder("Machine label (optional)")),
             code_input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Paste pairing code")),
         });
         let (dialog_open, manual_mode, access, loading_links, links, submitting, error, url_input, label_input, code_input) = {
@@ -649,17 +731,7 @@ impl RenderOnce for LinkRequestCard {
             .map(|c| c.environment.environment_id.clone());
         let session = app_read.client_handle().and_then(|h| h.session_state().borrow().clone());
         let can_manage = can_manage_peer_links(session.as_ref());
-        let candidates: Vec<MachineCandidate> = app_read
-            .environments
-            .environments
-            .iter()
-            .map(|env| MachineCandidate {
-                id: env.environment_id.clone().unwrap_or_else(|| env.id.clone()),
-                label: env.label.clone(),
-                urls: vec![env.http_base.clone()],
-                reachable: !env.disabled && env.credentials().is_some(),
-            })
-            .collect();
+        let candidates = merge_link_candidates(&app_read.environments.environments, &app_read.cloud.discovery.environments);
         let saved_envs = app_read.environments.environments.clone();
         let _ = app_read;
 
@@ -671,13 +743,20 @@ impl RenderOnce for LinkRequestCard {
         );
 
         let has_machines = !machines.is_empty();
-        let title = self.default_label.clone().unwrap_or_else(|| "Link a machine to this environment".to_owned());
+        let (title, url_subtitle) = link_card_headline(self.default_label.as_deref(), self.default_url.as_deref(), self.default_environment_id.as_deref());
         let open_state = card_state.clone();
         let open_app = self.state.clone();
+        let open_default_access = default_access.clone();
+        let open_default_url = default_url.clone();
+        let open_default_label = default_label.clone();
         let decline_state = card_state.clone();
         let decline_app = self.state.clone();
         let decline_thread = self.thread_id.clone();
         let decline_item = self.turn_item_id.clone();
+        let decline_default_access = default_access.clone();
+        let decline_default_url = default_url.clone();
+        let decline_default_label = default_label.clone();
+        let decline_wh = wh;
         let manual_toggle_state = card_state.clone();
         let manual_submit_state = card_state.clone();
         let manual_submit_app = self.state.clone();
@@ -687,6 +766,10 @@ impl RenderOnce for LinkRequestCard {
         let manual_label_input = label_input.clone();
         let manual_code_input = code_input.clone();
         let manual_access = access.clone();
+        let manual_default_access = default_access.clone();
+        let manual_default_url = default_url.clone();
+        let manual_default_label = default_label.clone();
+        let manual_wh = wh;
 
         v_flex()
             .w_full()
@@ -699,60 +782,82 @@ impl RenderOnce for LinkRequestCard {
             .child(
                 h_flex()
                     .justify_between()
+                    .items_start()
                     .gap(px(8.))
                     .child(
                         h_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .items_start()
                             .gap(px(8.))
-                            .child(Icon::Link2.render(px(15.), hsla(p.muted_foreground)))
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title)),
+                            .child(div().pt(px(2.)).child(Icon::Link2.render(px(15.), hsla(p.muted_foreground))))
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap(px(2.))
+                                    .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title))
+                                    .when_some(url_subtitle, |col, subtitle| {
+                                        col.child(div().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(subtitle))
+                                    }),
+                            ),
                     )
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap(px(6.))
                             .when(can_manage, |this| {
-                                this.child(outline_button(
-                                    SharedString::from(format!("link-open:{}", self.id)),
-                                    if dialog_open { "Hide options" } else { "Link machine" },
-                                    move |_, _, cx| {
-                                        let next_open = !open_state.read(cx).dialog_open;
-                                        open_state.update(cx, |s, cx| {
-                                            s.dialog_open = next_open;
-                                            s.error = None;
-                                            if next_open {
-                                                s.loading_links = true;
-                                            }
-                                            cx.notify();
-                                        });
-                                        if next_open {
-                                            let task = open_app.update(cx, |app, _| {
-                                                app.rpc(t3_core::commands::method::PEER_LINKS_LIST, serde_json::json!({}))
+                                this.child(
+                                    Button::new(SharedString::from(format!("link-open:{}", self.id)), ButtonVariant::Outline, ButtonSize::Xs)
+                                        .label(if dialog_open { "Hide options" } else { "Link machine" })
+                                        .disabled(submitting)
+                                        .on_click(move |_, window, cx| {
+                                            let next_open = !open_state.read(cx).dialog_open;
+                                            let reset_access = open_default_access.clone();
+                                            let reset_url = open_default_url.clone();
+                                            let reset_label = open_default_label.clone();
+                                            open_state.update(cx, |s, cx| {
+                                                if next_open {
+                                                    s.dialog_open = true;
+                                                    s.error = None;
+                                                    s.loading_links = true;
+                                                } else {
+                                                    s.reset(reset_access, &reset_url, &reset_label, window, cx);
+                                                }
+                                                cx.notify();
                                             });
-                                            let weak = open_state.downgrade();
-                                            cx.spawn(async move |cx| {
-                                                let res = task.await;
-                                                let _ = weak.update(cx, |s, cx| {
-                                                    s.loading_links = false;
-                                                    if let Ok(val) = res
-                                                        && let Some(arr) = val.get("links").and_then(Value::as_array)
-                                                    {
-                                                        s.links = arr
-                                                            .iter()
-                                                            .filter_map(|item| {
-                                                                Some(ExistingPeerLink {
-                                                                    environment_id: item.get("environmentId")?.as_str()?.to_owned(),
-                                                                    label: item.get("label").and_then(Value::as_str).unwrap_or("").to_owned(),
-                                                                })
-                                                            })
-                                                            .collect();
+                                            if next_open {
+                                                let task = open_app.update(cx, |app, cx| {
+                                                    if app.cloud.discovery.environments.is_empty() && !app.cloud.discovery.refreshing {
+                                                        app.refresh_cloud(cx);
                                                     }
-                                                    cx.notify();
+                                                    app.rpc(t3_core::commands::method::PEER_LINKS_LIST, serde_json::json!({}))
                                                 });
-                                            })
-                                            .detach();
-                                        }
-                                    },
-                                    cx,
-                                ))
+                                                let weak = open_state.downgrade();
+                                                cx.spawn(async move |cx| {
+                                                    let res = task.await;
+                                                    let _ = weak.update(cx, |s, cx| {
+                                                        s.loading_links = false;
+                                                        if let Ok(val) = res
+                                                            && let Some(arr) = val.get("links").and_then(Value::as_array)
+                                                        {
+                                                            s.links = arr
+                                                                .iter()
+                                                                .filter_map(|item| {
+                                                                    Some(ExistingPeerLink {
+                                                                        environment_id: item.get("environmentId")?.as_str()?.to_owned(),
+                                                                        label: item.get("label").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                                                    })
+                                                                })
+                                                                .collect();
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .detach();
+                                            }
+                                        }),
+                                )
                             })
                             .child(ghost_button(
                                 SharedString::from(format!("link-decline:{}", self.id)),
@@ -774,14 +879,23 @@ impl RenderOnce for LinkRequestCard {
                                         )
                                     });
                                     let weak = decline_state.downgrade();
+                                    let reset_access = decline_default_access.clone();
+                                    let reset_url = decline_default_url.clone();
+                                    let reset_label = decline_default_label.clone();
                                     cx.spawn(async move |cx| {
                                         let res = task.await;
-                                        let _ = weak.update(cx, |s, cx| {
-                                            s.submitting = false;
-                                            if let Err(err) = res {
-                                                s.error = Some(err.to_string());
-                                            }
-                                            cx.notify();
+                                        let _ = decline_wh.update(cx, |_, window, cx| {
+                                            let _ = weak.update(cx, |s, cx| {
+                                                s.submitting = false;
+                                                match &res {
+                                                    Ok(_) => s.reset(reset_access.clone(), &reset_url, &reset_label, window, cx),
+                                                    Err(err) => {
+                                                        let (tag, msg) = rpc_error_tag_and_message(err);
+                                                        s.error = Some(sanitize_link_request_error(tag, msg));
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
                                         });
                                     })
                                     .detach();
@@ -806,7 +920,7 @@ impl RenderOnce for LinkRequestCard {
             .when(dialog_open && can_manage, |this| {
                 let id_str = self.id.clone();
                 let access_picker = h_flex().flex_wrap().gap(px(6.)).children(
-                    ["read-only", "approval-required", "full-access"].into_iter().map(|opt| {
+                    LINK_ACCESS_LEVELS.into_iter().map(|opt| {
                         let active = access == opt;
                         let st = card_state.clone();
                         let val = opt.to_owned();
@@ -822,9 +936,12 @@ impl RenderOnce for LinkRequestCard {
                                 .text_xs()
                                 .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                                 .text_color(if active { hsla(p.foreground) } else { hsla(p.muted_foreground) })
-                                .cursor_pointer()
+                                .when(!submitting, |d| d.cursor_pointer())
                                 .child(link_access_label(opt))
                                 .on_click(move |_, _, cx| {
+                                    if submitting {
+                                        return;
+                                    }
                                     st.update(cx, |s, cx| {
                                         s.access = val.clone();
                                         cx.notify();
@@ -849,7 +966,7 @@ impl RenderOnce for LinkRequestCard {
                                 .gap(px(4.))
                                 .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Access level"))
                                 .child(access_picker)
-                                .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(link_access_description(&access))),
+                                .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(link_access_full_description(&access))),
                         )
                         .when(loading_links, |panel| {
                             panel.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Loading existing links..."))
@@ -870,6 +987,9 @@ impl RenderOnce for LinkRequestCard {
                                     let thread_id = self.thread_id.clone();
                                     let turn_item_id = self.turn_item_id.clone();
                                     let cur_access = access.clone();
+                                    let reset_access = default_access.clone();
+                                    let reset_url = default_url.clone();
+                                    let reset_label = default_label.clone();
                                     let button_label = if existing.is_some() { "Use existing link" } else { "Link" };
                                     h_flex()
                                         .justify_between()
@@ -888,120 +1008,139 @@ impl RenderOnce for LinkRequestCard {
                                                     row.child(div().truncate().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(url))
                                                 }),
                                         )
-                                        .child(outline_button(
-                                            SharedString::from(format!("link-machine:{id_str}:{machine_id}")),
-                                            button_label,
-                                            move |_, _, cx| {
-                                                if submitting {
-                                                    return;
-                                                }
-                                                st.update(cx, |s, cx| {
-                                                    s.submitting = true;
-                                                    s.error = None;
-                                                    cx.notify();
-                                                });
-                                                let weak = st.downgrade();
-                                                if let Some(existing_id) = existing.clone() {
-                                                    let task = app.update(cx, |app, _| {
-                                                        app.rpc(
-                                                            t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
-                                                            t3_core::commands::link_request_answer_use_existing(&thread_id, &turn_item_id, &existing_id),
-                                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("link-machine:{id_str}:{machine_id}")), ButtonVariant::Outline, ButtonSize::Xs)
+                                                .label(button_label)
+                                                .disabled(submitting || loading_links)
+                                                .on_click(move |_, _, cx| {
+                                                    if submitting || loading_links {
+                                                        return;
+                                                    }
+                                                    st.update(cx, |s, cx| {
+                                                        s.submitting = true;
+                                                        s.error = None;
+                                                        cx.notify();
                                                     });
-                                                    cx.spawn(async move |cx| {
-                                                        let res = task.await;
-                                                        let _ = weak.update(cx, |s, cx| {
-                                                            s.submitting = false;
-                                                            if let Err(err) = res {
-                                                                s.error = Some(err.to_string());
-                                                            }
-                                                            cx.notify();
+                                                    let weak = st.downgrade();
+                                                    if let Some(existing_id) = existing.clone() {
+                                                        let task = app.update(cx, |app, _| {
+                                                            app.rpc(
+                                                                t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                                                t3_core::commands::link_request_answer_use_existing(&thread_id, &turn_item_id, &existing_id),
+                                                            )
                                                         });
-                                                    })
-                                                    .detach();
-                                                } else if let Some(creds) = creds.clone() {
-                                                    let body = t3_core::settings::access::pairing_token_body(
-                                                        "T3 Code peer link",
-                                                        &mcp_client_scopes(&cur_access),
-                                                    );
-                                                    let app_handle = app.clone();
-                                                    let thread_id = thread_id.clone();
-                                                    let turn_item_id = turn_item_id.clone();
-                                                    let machine_id = machine_id.clone();
-                                                    let machine_label = machine_label.clone();
-                                                    let machine_urls = machine_urls.clone();
-                                                    let cur_access = cur_access.clone();
-                                                    cx.spawn(async move |cx| {
-                                                        let minted = cx
-                                                            .background_executor()
-                                                            .spawn(async move {
-                                                                tokio::runtime::Handle::current().block_on(t3_client::auth::post_access(
-                                                                    &creds,
-                                                                    "/api/auth/pairing-token",
-                                                                    Some(body),
-                                                                ))
-                                                            })
-                                                            .await;
-                                                        let code = match minted {
-                                                            Ok(val) => val
-                                                                .get("credential")
-                                                                .or_else(|| val.get("pairingCode"))
-                                                                .or_else(|| val.get("token"))
-                                                                .and_then(Value::as_str)
-                                                                .map(str::to_owned),
-                                                            Err(err) => {
+                                                        let reset_access = reset_access.clone();
+                                                        let reset_url = reset_url.clone();
+                                                        let reset_label = reset_label.clone();
+                                                        cx.spawn(async move |cx| {
+                                                            let res = task.await;
+                                                            let _ = wh.update(cx, |_, window, cx| {
                                                                 let _ = weak.update(cx, |s, cx| {
                                                                     s.submitting = false;
-                                                                    s.error = Some(err);
+                                                                    match &res {
+                                                                        Ok(_) => s.reset(reset_access.clone(), &reset_url, &reset_label, window, cx),
+                                                                        Err(err) => {
+                                                                            let (tag, msg) = rpc_error_tag_and_message(err);
+                                                                            s.error = Some(sanitize_link_request_error(tag, msg));
+                                                                        }
+                                                                    }
+                                                                    cx.notify();
+                                                                });
+                                                            });
+                                                        })
+                                                        .detach();
+                                                    } else if let Some(creds) = creds.clone() {
+                                                        let body = t3_core::settings::access::pairing_token_body(
+                                                            "T3 Code peer link",
+                                                            &mcp_client_scopes(&cur_access),
+                                                        );
+                                                        let app_handle = app.clone();
+                                                        let thread_id = thread_id.clone();
+                                                        let turn_item_id = turn_item_id.clone();
+                                                        let machine_id = machine_id.clone();
+                                                        let machine_label = machine_label.clone();
+                                                        let machine_urls = machine_urls.clone();
+                                                        let cur_access = cur_access.clone();
+                                                        let reset_access = reset_access.clone();
+                                                        let reset_url = reset_url.clone();
+                                                        let reset_label = reset_label.clone();
+                                                        cx.spawn(async move |cx| {
+                                                            let minted = cx
+                                                                .background_executor()
+                                                                .spawn(async move {
+                                                                    tokio::runtime::Handle::current().block_on(t3_client::auth::post_access(
+                                                                        &creds,
+                                                                        "/api/auth/pairing-token",
+                                                                        Some(body),
+                                                                    ))
+                                                                })
+                                                                .await;
+                                                            let code = match minted {
+                                                                Ok(val) => val
+                                                                    .get("credential")
+                                                                    .or_else(|| val.get("pairingCode"))
+                                                                    .or_else(|| val.get("token"))
+                                                                    .and_then(Value::as_str)
+                                                                    .map(str::to_owned),
+                                                                Err(_) => {
+                                                                    let _ = weak.update(cx, |s, cx| {
+                                                                        s.submitting = false;
+                                                                        s.manual_mode = true;
+                                                                        s.error = Some("Could not reach that machine automatically. Enter a pairing code manually.".to_owned());
+                                                                        cx.notify();
+                                                                    });
+                                                                    return;
+                                                                }
+                                                            };
+                                                            let Some(code) = code.filter(|c| !c.is_empty()) else {
+                                                                let _ = weak.update(cx, |s, cx| {
+                                                                    s.submitting = false;
+                                                                    s.manual_mode = true;
+                                                                    s.error = Some("Could not mint a pairing code automatically; paste one below.".to_owned());
                                                                     cx.notify();
                                                                 });
                                                                 return;
-                                                            }
-                                                        };
-                                                        let Some(code) = code.filter(|c| !c.is_empty()) else {
-                                                            let _ = weak.update(cx, |s, cx| {
-                                                                s.submitting = false;
-                                                                s.manual_mode = true;
-                                                                s.error = Some("Could not mint a pairing code automatically; paste one below.".to_owned());
-                                                                cx.notify();
+                                                            };
+                                                            let task = app_handle.update(cx, |app, _| {
+                                                                app.rpc(
+                                                                    t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                                                    t3_core::commands::link_request_answer_link(
+                                                                        &thread_id,
+                                                                        &turn_item_id,
+                                                                        Some(&machine_id),
+                                                                        Some(&machine_label),
+                                                                        &machine_urls,
+                                                                        &cur_access,
+                                                                        &code,
+                                                                    ),
+                                                                )
                                                             });
-                                                            return;
-                                                        };
-                                                        let task = app_handle.update(cx, |app, _| {
-                                                            app.rpc(
-                                                                t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
-                                                                t3_core::commands::link_request_answer_link(
-                                                                    &thread_id,
-                                                                    &turn_item_id,
-                                                                    Some(&machine_id),
-                                                                    Some(&machine_label),
-                                                                    &machine_urls,
-                                                                    &cur_access,
-                                                                    &code,
-                                                                ),
-                                                            )
-                                                        });
-                                                        let res = task.await;
-                                                        let _ = weak.update(cx, |s, cx| {
+                                                            let res = task.await;
+                                                            let _ = wh.update(cx, |_, window, cx| {
+                                                                let _ = weak.update(cx, |s, cx| {
+                                                                    s.submitting = false;
+                                                                    match &res {
+                                                                        Ok(_) => s.reset(reset_access.clone(), &reset_url, &reset_label, window, cx),
+                                                                        Err(err) => {
+                                                                            let (tag, msg) = rpc_error_tag_and_message(err);
+                                                                            s.error = Some(sanitize_link_request_error(tag, msg));
+                                                                        }
+                                                                    }
+                                                                    cx.notify();
+                                                                });
+                                                            });
+                                                        })
+                                                        .detach();
+                                                    } else {
+                                                        st.update(cx, |s, cx| {
                                                             s.submitting = false;
-                                                            if let Err(err) = res {
-                                                                s.error = Some(err.to_string());
-                                                            }
+                                                            s.manual_mode = true;
+                                                            s.error = Some("No active credentials for that machine; enter a pairing code manually.".to_owned());
                                                             cx.notify();
                                                         });
-                                                    })
-                                                    .detach();
-                                                } else {
-                                                    st.update(cx, |s, cx| {
-                                                        s.submitting = false;
-                                                        s.manual_mode = true;
-                                                        s.error = Some("No active credentials for that machine; enter a pairing code manually.".to_owned());
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            },
-                                            cx,
-                                        ))
+                                                    }
+                                                }),
+                                        )
                                 }))
                             )
                         })
@@ -1015,58 +1154,69 @@ impl RenderOnce for LinkRequestCard {
                                     .child(Input::new(&url_input).disabled(submitting))
                                     .child(Input::new(&label_input).disabled(submitting))
                                     .child(Input::new(&code_input).disabled(submitting))
-                                    .child(h_flex().justify_end().child(outline_button(
-                                        SharedString::from(format!("link-manual-submit:{id_str}")),
-                                        if submitting { "Linking..." } else { "Link machine" },
-                                        move |_, _, cx| {
-                                            if submitting {
-                                                return;
-                                            }
-                                            let url = manual_url_input.read(cx).value().trim().to_owned();
-                                            let lbl = manual_label_input.read(cx).value().trim().to_owned();
-                                            let code = manual_code_input.read(cx).value().trim().to_owned();
-                                            if url.is_empty() || code.is_empty() {
-                                                manual_submit_state.update(cx, |s, cx| {
-                                                    s.error = Some("URL and pairing code are required.".to_owned());
-                                                    cx.notify();
-                                                });
-                                                return;
-                                            }
-                                            manual_submit_state.update(cx, |s, cx| {
-                                                s.submitting = true;
-                                                s.error = None;
-                                                cx.notify();
-                                            });
-                                            let lbl_opt = (!lbl.is_empty()).then_some(lbl.as_str());
-                                            let task = manual_submit_app.update(cx, |app, _| {
-                                                app.rpc(
-                                                    t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
-                                                    t3_core::commands::link_request_answer_link(
-                                                        &manual_thread,
-                                                        &manual_item,
-                                                        None,
-                                                        lbl_opt,
-                                                        &[url],
-                                                        &manual_access,
-                                                        &code,
-                                                    ),
-                                                )
-                                            });
-                                            let weak = manual_submit_state.downgrade();
-                                            cx.spawn(async move |cx| {
-                                                let res = task.await;
-                                                let _ = weak.update(cx, |s, cx| {
-                                                    s.submitting = false;
-                                                    if let Err(err) = res {
-                                                        s.error = Some(err.to_string());
+                                    .child(
+                                        h_flex().justify_end().child(
+                                            Button::new(SharedString::from(format!("link-manual-submit:{id_str}")), ButtonVariant::Outline, ButtonSize::Xs)
+                                                .label(if submitting { "Linking..." } else { "Link machine" })
+                                                .disabled(submitting)
+                                                .on_click(move |_, _, cx| {
+                                                    if submitting {
+                                                        return;
                                                     }
-                                                    cx.notify();
-                                                });
-                                            })
-                                            .detach();
-                                        },
-                                        cx,
-                                    ))),
+                                                    let url = manual_url_input.read(cx).value().trim().to_owned();
+                                                    let lbl = manual_label_input.read(cx).value().trim().to_owned();
+                                                    let code = manual_code_input.read(cx).value().trim().to_owned();
+                                                    if url.is_empty() || code.is_empty() {
+                                                        manual_submit_state.update(cx, |s, cx| {
+                                                            s.error = Some("URL and pairing code are required.".to_owned());
+                                                            cx.notify();
+                                                        });
+                                                        return;
+                                                    }
+                                                    manual_submit_state.update(cx, |s, cx| {
+                                                        s.submitting = true;
+                                                        s.error = None;
+                                                        cx.notify();
+                                                    });
+                                                    let lbl_opt = (!lbl.is_empty()).then_some(lbl.as_str());
+                                                    let task = manual_submit_app.update(cx, |app, _| {
+                                                        app.rpc(
+                                                            t3_core::commands::method::PEER_LINKS_ANSWER_REQUEST,
+                                                            t3_core::commands::link_request_answer_link(
+                                                                &manual_thread,
+                                                                &manual_item,
+                                                                None,
+                                                                lbl_opt,
+                                                                &[url],
+                                                                &manual_access,
+                                                                &code,
+                                                            ),
+                                                        )
+                                                    });
+                                                    let weak = manual_submit_state.downgrade();
+                                                    let reset_access = manual_default_access.clone();
+                                                    let reset_url = manual_default_url.clone();
+                                                    let reset_label = manual_default_label.clone();
+                                                    cx.spawn(async move |cx| {
+                                                        let res = task.await;
+                                                        let _ = manual_wh.update(cx, |_, window, cx| {
+                                                            let _ = weak.update(cx, |s, cx| {
+                                                                s.submitting = false;
+                                                                match &res {
+                                                                    Ok(_) => s.reset(reset_access.clone(), &reset_url, &reset_label, window, cx),
+                                                                    Err(err) => {
+                                                                        let (tag, msg) = rpc_error_tag_and_message(err);
+                                                                        s.error = Some(sanitize_link_request_error(tag, msg));
+                                                                    }
+                                                                }
+                                                                cx.notify();
+                                                            });
+                                                        });
+                                                    })
+                                                    .detach();
+                                                }),
+                                        ),
+                                    ),
                             )
                         })
                         .when(has_machines, |panel| {
@@ -1210,8 +1360,17 @@ fn answered_line(id: &str, icon: Icon, text: String, cx: &App) -> AnyElement {
 }
 
 /// `V2EventTimelineRow`.
-pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], resource_summary: bool, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn event_row(
+    id: &str,
+    item: &Arc<TurnItem>,
+    visibility: t3_core::thread::Visibility,
+    subagents: &[Arc<TurnItem>],
+    resource_summary: bool,
+    env: &RowEnv,
+    cx: &mut Context<ThreadView>,
+) -> AnyElement {
     let p = palette(cx);
+    let can_answer_here = visibility == t3_core::thread::Visibility::Local && env.thread_id.is_some();
     let marks: Vec<(String, ProviderMark)> = env
         .state
         .read(cx)
@@ -1231,6 +1390,7 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
         TurnItemKind::Subagent { .. } => subagent_row(item, &marks, env, cx),
         TurnItemKind::SecretRequest { label, reason, placeholder, delivery, secret_status } => {
             if secret_status == "pending"
+                && can_answer_here
                 && let Some(thread_id) = env.thread_id
             {
                 return SecretRequestCard {
@@ -1245,7 +1405,7 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
                 }
                 .into_any_element();
             }
-            let display = secret_request_display(secret_status, label, true);
+            let display = secret_request_display(secret_status, label, can_answer_here);
             let icon = match display.tone {
                 SecretTone::Saved => Icon::Check,
                 SecretTone::Declined | SecretTone::TimedOut => Icon::X,
@@ -1268,6 +1428,7 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
             ..
         } => {
             if link_status == "pending"
+                && can_answer_here
                 && let Some(thread_id) = env.thread_id
             {
                 return LinkRequestCard {
@@ -1284,15 +1445,14 @@ pub fn event_row(id: &str, item: &Arc<TurnItem>, subagents: &[Arc<TurnItem>], re
                 }
                 .into_any_element();
             }
-            let session = env.state.read(cx).client_handle().and_then(|h| h.session_state().borrow().clone());
-            let can_manage = can_manage_peer_links(session.as_ref());
             let display = link_request_display(
                 link_status,
                 label.as_deref(),
-                failure.as_deref(),
+                url.as_deref(),
                 linked_label.as_deref(),
                 linked_access.as_deref(),
-                can_manage,
+                failure.as_deref(),
+                can_answer_here,
             );
             let icon = match display.tone {
                 LinkTone::Linked => Icon::Link,
@@ -1425,5 +1585,58 @@ mod tests {
         let settled = subagent_item("completed", "2026-01-01T00:00:00Z", Some("2026-01-01T00:01:05Z"));
         assert_eq!(elapsed_label(&settled, start_ms + 300).as_deref(), Some("1m 5s"));
         assert_eq!(plain_detail("- Running `cargo test`\n* Done"), "Running cargo test Done");
+    }
+
+    #[test]
+    fn link_card_headline_and_candidate_merge_cover_url_label_and_relay() {
+        assert_eq!(
+            link_card_headline(None, None, None),
+            ("Link a machine to this environment".to_owned(), None)
+        );
+        assert_eq!(
+            link_card_headline(Some("Studio Mac"), Some("https://studio.ts.net"), None),
+            ("Link Studio Mac to this environment".to_owned(), Some("https://studio.ts.net".to_owned()))
+        );
+        assert_eq!(
+            link_card_headline(None, Some("https://studio.ts.net"), None),
+            ("Link https://studio.ts.net to this environment".to_owned(), None)
+        );
+
+        let relay = vec![
+            t3_core::relay::Environment {
+                environment_id: "env-relay-1".to_owned(),
+                label: "Relay Box".to_owned(),
+                endpoint: t3_core::relay::Endpoint {
+                    http_base_url: "https://relay.example/env-1".to_owned(),
+                    ws_base_url: "wss://relay.example/env-1".to_owned(),
+                    provider_kind: "relay".to_owned(),
+                },
+            },
+        ];
+        let merged = merge_link_candidates(&[], &relay);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "env-relay-1");
+        assert_eq!(merged[0].label, "Relay Box");
+        assert_eq!(merged[0].urls, vec!["https://relay.example/env-1".to_owned()]);
+        assert!(!merged[0].reachable);
+    }
+
+    #[test]
+    fn rpc_errors_sanitize_untagged_and_preserve_domain_tags() {
+        let domain_err = t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure {
+            tag: Some("PeerPairingCodeError".to_owned()),
+            message: "Pairing code expired.".to_owned(),
+            error: Value::Null,
+        });
+        let (tag, msg) = rpc_error_tag_and_message(&domain_err);
+        assert_eq!(sanitize_link_request_error(tag, msg), "Pairing code expired.");
+
+        let raw_err = t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure {
+            tag: Some("ParseError".to_owned()),
+            message: "secret_value=hunter2 leaked".to_owned(),
+            error: Value::Null,
+        });
+        let (tag, msg) = rpc_error_tag_and_message(&raw_err);
+        assert_eq!(sanitize_secret_request_error(tag, msg), t3_core::timeline::RPC_REQUEST_FALLBACK_ERROR);
     }
 }

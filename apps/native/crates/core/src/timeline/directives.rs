@@ -159,28 +159,137 @@ fn try_render_follow_up(input: &str) -> Option<(String, usize)> {
     Some((label.to_owned(), consumed))
 }
 
-fn try_render_artifact(input: &str) -> Option<(String, usize)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexArtifactTemplate {
+    pub artifact_kind: String,
+    pub display_name: String,
+    pub skill_directory: String,
+    pub skill_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAssistantSegment {
+    Markdown(String),
+    ArtifactTemplate(CodexArtifactTemplate),
+}
+
+pub fn codex_artifact_template_presentation_label(artifact_kind: &str) -> Option<&'static str> {
+    match artifact_kind {
+        "document" => Some("Document template"),
+        "presentation" => Some("Presentation template"),
+        "spreadsheet" => Some("Spreadsheet template"),
+        "site" => Some("Site template"),
+        "google-docs" => Some("Google Doc template"),
+        "google-slides" => Some("Google Slides template"),
+        "google-sheets" => Some("Google Sheet template"),
+        "image" => Some("Image template"),
+        "email" => Some("Email template"),
+        "slack" => Some("Slack template"),
+        _ => None,
+    }
+}
+
+fn try_parse_artifact(input: &str) -> Option<(CodexArtifactTemplate, usize)> {
     let (_label, attrs, consumed) = parse_directive(input, ARTIFACT_PREFIX)?;
-    let kind_label = match attrs.get("artifact_kind").map(String::as_str)? {
-        "document" => "Document template",
-        "presentation" => "Presentation template",
-        "spreadsheet" => "Spreadsheet template",
-        "site" => "Site template",
-        "google-docs" => "Google Doc template",
-        "google-slides" => "Google Slides template",
-        "google-sheets" => "Google Sheet template",
-        "image" => "Image template",
-        "email" => "Email template",
-        "slack" => "Slack template",
-        _ => return None,
-    };
-    let display = attrs.get("display_name")?.trim();
-    let skill_dir = attrs.get("skill_directory")?;
-    let skill_name = attrs.get("skill_name")?;
-    if display.is_empty() || !(skill_dir.starts_with('/') && !skill_dir.starts_with("//")) || !skill_name.starts_with("artifact-template-") {
+    let artifact_kind = attrs.get("artifact_kind")?.trim().to_owned();
+    codex_artifact_template_presentation_label(&artifact_kind)?;
+    let display_name = attrs.get("display_name")?.trim().to_owned();
+    let skill_directory = attrs.get("skill_directory")?.clone();
+    let skill_name = attrs.get("skill_name")?.clone();
+    if display_name.is_empty()
+        || !(skill_directory.starts_with('/') && !skill_directory.starts_with("//"))
+        || !skill_name.starts_with("artifact-template-")
+    {
         return None;
     }
-    Some((format!("{display} ({kind_label})"), consumed))
+    Some((CodexArtifactTemplate { artifact_kind, display_name, skill_directory, skill_name }, consumed))
+}
+
+fn try_render_artifact(input: &str) -> Option<(String, usize)> {
+    let (template, consumed) = try_parse_artifact(input)?;
+    let kind_label = codex_artifact_template_presentation_label(&template.artifact_kind)?;
+    Some((format!("{} ({kind_label})", template.display_name), consumed))
+}
+
+fn rewrite_inline_for_display(line: &str) -> String {
+    if !line.contains(CITATION_PREFIX) && !line.contains(FOLLOW_UP_PREFIX) && !line.contains(ARTIFACT_PREFIX) {
+        return line.to_owned();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = find_next_directive(rest) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some((replacement, consumed)) = try_render_artifact(after)
+            .or_else(|| try_render_citation(after))
+            .or_else(|| {
+                let (label, consumed) = try_render_follow_up(after)?;
+                Some((format!("**{}**", escape_md_label(&label)), consumed))
+            })
+        {
+            out.push_str(&replacement);
+            rest = &after[consumed..];
+        } else {
+            out.push(':');
+            rest = &after[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rewrite `:codex-file-citation` and `:codex-followup` directives into display markdown and split
+/// standalone `::artifact-template` lines into structured segments (`ChatMarkdown.tsx`).
+pub fn split_codex_assistant_segments(markdown: &str) -> Vec<CodexAssistantSegment> {
+    if !markdown.contains(CITATION_PREFIX) && !markdown.contains(FOLLOW_UP_PREFIX) && !markdown.contains(ARTIFACT_PREFIX) {
+        return vec![CodexAssistantSegment::Markdown(markdown.to_owned())];
+    }
+    let mut segments = Vec::new();
+    let mut current_md = String::new();
+    let mut fence: Option<(u8, usize)> = None;
+
+    for raw_line in markdown.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let has_nl = raw_line.ends_with('\n');
+        let trimmed = line.trim_start();
+        if let Some((ch, min_len)) = fence {
+            let count = trimmed.bytes().take_while(|b| *b == ch).count();
+            if count >= min_len && trimmed[count..].trim().is_empty() {
+                fence = None;
+            }
+            current_md.push_str(raw_line);
+            continue;
+        }
+        let fence_byte = trimmed.as_bytes().first().copied().filter(|b| *b == b'`' || *b == b'~');
+        if let Some(ch) = fence_byte {
+            let count = trimmed.bytes().take_while(|b| *b == ch).count();
+            if count >= 3 && (ch == b'~' || !trimmed[count..].contains('`')) {
+                fence = Some((ch, count));
+                current_md.push_str(raw_line);
+                continue;
+            }
+        }
+        let trimmed_all = line.trim();
+        if let Some((template, consumed)) = try_parse_artifact(trimmed_all)
+            && consumed == trimmed_all.len()
+        {
+            if !current_md.trim().is_empty() {
+                segments.push(CodexAssistantSegment::Markdown(std::mem::take(&mut current_md).trim_end().to_owned()));
+            } else {
+                current_md.clear();
+            }
+            segments.push(CodexAssistantSegment::ArtifactTemplate(template));
+            continue;
+        }
+        current_md.push_str(&rewrite_inline_for_display(line));
+        if has_nl {
+            current_md.push('\n');
+        }
+    }
+    if !current_md.trim().is_empty() || segments.is_empty() {
+        segments.push(CodexAssistantSegment::Markdown(current_md));
+    }
+    segments
 }
 
 fn escape_md_label(value: &str) -> String {
@@ -208,5 +317,20 @@ mod tests {
     fn renders_artifact_template_for_copy() {
         let md = "::artifact-template{artifact_kind=\"document\" display_name=\"RFC\" skill_directory=\"/skills/doc\" skill_name=\"artifact-template-rfc\"}";
         assert_eq!(render_codex_directives_for_copy(md), "RFC (Document template)");
+    }
+
+    #[test]
+    fn splits_assistant_segments_and_ignores_code_fences() {
+        let md = "Intro :codex-file-citation[app.rs]{path=\"src/app.rs\" line_range_start=\"42\"}\n\n\
+            ::artifact-template{artifact_kind=\"presentation\" display_name=\"Deck\" skill_directory=\"/skills/deck\" skill_name=\"artifact-template-deck\"}\n\n\
+            ```md\n:codex-followup[Raw]{prompt=\"keep\"}\n```\n\n\
+            Next :codex-followup[Ship it]{prompt=\"go\"}";
+        let segs = super::split_codex_assistant_segments(md);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0], super::CodexAssistantSegment::Markdown("Intro [app.rs](<src/app.rs#L42>)".into()));
+        assert!(matches!(&segs[1], super::CodexAssistantSegment::ArtifactTemplate(t) if t.display_name == "Deck" && t.artifact_kind == "presentation"));
+        let super::CodexAssistantSegment::Markdown(tail) = &segs[2] else { panic!("expected markdown tail") };
+        assert!(tail.contains(":codex-followup[Raw]{prompt=\"keep\"}"));
+        assert!(tail.contains("Next **Ship it**"));
     }
 }

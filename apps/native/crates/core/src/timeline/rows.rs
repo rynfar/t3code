@@ -475,9 +475,10 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             EntryKind::ProposedPlan(plan) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::ProposedPlan(plan.clone()))),
             EntryKind::McpApp(app) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::McpApp(app.clone()))),
             EntryKind::HtmlRender(render) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::HtmlRender(render.clone()))),
-            EntryKind::Event(item) => {
+            EntryKind::Event { item, visibility } => {
                 if let Some(previous) = rows.last_mut()
-                    && let RowKind::Event { item: previous_item, subagents, .. } = &mut previous.kind
+                    && let RowKind::Event { item: previous_item, visibility: previous_visibility, subagents, .. } = &mut previous.kind
+                    && *previous_visibility == *visibility
                     && is_subagent(item)
                     && is_subagent(previous_item)
                     && previous_item.run_id == item.run_id
@@ -488,7 +489,11 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                     }
                     subagents.push(item.clone());
                 } else {
-                    rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::Event { item: item.clone(), subagents: Vec::new(), resource_summary: false }));
+                    rows.push(row(
+                        entry.id.clone(),
+                        Some(entry.created_at.clone()),
+                        RowKind::Event { item: item.clone(), visibility: *visibility, subagents: Vec::new(), resource_summary: false },
+                    ));
                 }
             }
             EntryKind::Message(message) => {
@@ -661,17 +666,18 @@ fn attach_created_thread_summaries(rows: Vec<TimelineRow>, entries: &[Arc<Timeli
             terminal_index.insert(run.clone(), index);
         }
     }
-    let mut created: HashMap<String, Vec<(String, String, Arc<TurnItem>)>> = HashMap::new();
+    type CreatedEntry = (String, String, crate::thread::Visibility, Arc<TurnItem>);
+    let mut created: HashMap<String, Vec<CreatedEntry>> = HashMap::new();
     for entry in entries {
-        let item = match &entry.kind {
-            EntryKind::Work(w) => w.item.clone(),
-            EntryKind::Event(item) => Some(item.clone()),
-            _ => None,
+        let (item, visibility) = match &entry.kind {
+            EntryKind::Work(w) => (w.item.clone(), crate::thread::Visibility::Local),
+            EntryKind::Event { item, visibility } => (Some(item.clone()), *visibility),
+            _ => (None, crate::thread::Visibility::Local),
         };
         if let Some(item) = item.filter(|i| matches!(i.kind, TurnItemKind::ThreadCreated { .. }))
             && let Some(run) = item.run_id.clone()
         {
-            created.entry(run).or_default().push((entry.id.clone(), entry.created_at.clone(), item));
+            created.entry(run).or_default().push((entry.id.clone(), entry.created_at.clone(), visibility, item));
         }
     }
     if created.is_empty() {
@@ -693,8 +699,12 @@ fn attach_created_thread_summaries(rows: Vec<TimelineRow>, entries: &[Arc<Timeli
             _ => None,
         };
         out.push(row_value);
-        for (id, created_at, item) in summaries.unwrap_or_default() {
-            out.push(row(format!("summary:{id}"), Some(created_at), RowKind::Event { item, subagents: Vec::new(), resource_summary: true }));
+        for (id, created_at, visibility, item) in summaries.unwrap_or_default() {
+            out.push(row(
+                format!("summary:{id}"),
+                Some(created_at),
+                RowKind::Event { item, visibility, subagents: Vec::new(), resource_summary: true },
+            ));
         }
     }
     out

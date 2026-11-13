@@ -116,6 +116,8 @@ struct Snapshot {
     setup_queues: bool,
     /// Latest actionable proposed plan on a settled run (`findLatestProposedPlan`).
     active_proposed_plan: Option<t3_core::timeline::plan::ActiveProposedPlan>,
+    /// Whether the thread currently offers a resume primary action (`resumableRunId !== null || hasHeldQueuedRuns`).
+    can_resume: bool,
 }
 
 /// The corresponding transcript follows this composer's effective selection (`ChatView.tsx`).
@@ -418,6 +420,7 @@ impl Composer {
             pending,
             queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
             active_proposed_plan: projection.and_then(t3_core::timeline::plan::find_active_proposed_plan),
+            can_resume: projection.is_some_and(t3_core::timeline::plan::can_resume_thread),
             target,
         }
     }

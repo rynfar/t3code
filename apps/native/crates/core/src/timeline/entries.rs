@@ -418,7 +418,7 @@ fn build_entry(row: &ProjectedTurnItem, lookups: &Lookups, plans: &[Entity]) -> 
     {
         EntryKind::McpApp(Arc::new(super::McpAppEntry { run_id: item.run_id.clone(), reference, source_thread_id: row.source_thread_id.clone(), source_item_id: row.source_item_id.clone(), item: item.clone() }))
     } else if is_standalone(&item.kind) {
-        EntryKind::Event(item.clone())
+        EntryKind::Event { item: item.clone(), visibility: row.visibility }
     } else {
         EntryKind::Work(Arc::new(projected_work_entry(row)))
     };
@@ -433,7 +433,7 @@ fn entry_item(entry: &TimelineEntry) -> Option<&Arc<TurnItem>> {
     match &entry.kind {
         EntryKind::Message(message) => message.item.as_ref(),
         EntryKind::Work(work) => work.item.as_ref(),
-        EntryKind::Event(item) => Some(item),
+        EntryKind::Event { item, .. } => Some(item),
         EntryKind::HtmlRender(render) => Some(&render.item),
         EntryKind::McpApp(app) => Some(&app.item),
         EntryKind::ProposedPlan(_) => None,

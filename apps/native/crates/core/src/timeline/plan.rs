@@ -35,26 +35,49 @@ pub fn strip_displayed_plan_markdown(plan_markdown: &str) -> String {
     strip_plan_markdown_body(plan_markdown)
 }
 
+pub const DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES: usize = 8;
+
 /// Collapsed preview markdown for `ProposedPlanCard` (`buildCollapsedProposedPlanPreviewMarkdown`).
+/// Counts only non-whitespace lines toward `max_lines`, trims trailing blank lines, and
+/// appends a blank line followed by `...` when remaining non-whitespace content was truncated.
 pub fn build_collapsed_proposed_plan_preview_markdown(plan_markdown: &str, max_lines: usize) -> (String, bool) {
     let display = strip_displayed_plan_markdown(plan_markdown);
-    let mut lines: Vec<&str> = display.lines().collect();
-    while lines.first().is_some_and(|line| line.trim().is_empty()) {
-        lines.remove(0);
+    let raw_lines: Vec<&str> = display.lines().collect();
+    let mut preview_lines: Vec<&str> = Vec::new();
+    let mut visible_line_count = 0usize;
+    let mut stopped_at = raw_lines.len();
+
+    for (index, line) in raw_lines.iter().enumerate() {
+        if preview_lines.is_empty() && line.trim().is_empty() {
+            continue;
+        }
+        preview_lines.push(line);
+        if !line.trim().is_empty() {
+            visible_line_count += 1;
+            if visible_line_count >= max_lines {
+                stopped_at = index + 1;
+                break;
+            }
+        }
     }
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
+
+    while preview_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        preview_lines.pop();
     }
-    if lines.is_empty() {
+
+    if preview_lines.is_empty() {
         let fallback = proposed_plan_title(plan_markdown).unwrap_or_else(|| "Plan preview unavailable.".to_owned());
         return (fallback, false);
     }
-    if lines.len() <= max_lines {
-        return (lines.join("\n"), false);
+
+    let was_truncated = raw_lines[stopped_at..].iter().any(|line| !line.trim().is_empty());
+    if !was_truncated {
+        return (preview_lines.join("\n"), false);
     }
-    let mut preview = lines[..max_lines].join("\n");
-    preview.push_str("\n...");
-    (preview, true)
+
+    preview_lines.push("");
+    preview_lines.push("...");
+    (preview_lines.join("\n"), true)
 }
 
 fn sanitize_plan_file_segment(input: &str) -> String {
@@ -158,6 +181,32 @@ pub fn should_show_plan_follow_up_prompt(
         && !has_composer_attachments
 }
 
+/// Whether the thread currently has a held queued run or resumable interrupted/usage-limited run
+/// (`deriveResumableRunId !== null || hasHeldQueuedRuns`).
+pub fn can_resume_thread(projection: &ThreadProjection) -> bool {
+    if projection.runs.iter().any(|run| run.status == "queued" && run.queue_held == Some(true)) {
+        return true;
+    }
+    let latest_executed = projection
+        .runs
+        .iter()
+        .filter(|run| run.status != "queued" && !(run.status == "cancelled" && run.started_at.is_none()))
+        .max_by(|a, b| {
+            let end_a = a.completed_at.as_deref().and_then(super::parse_iso_ms).unwrap_or(i64::MAX);
+            let end_b = b.completed_at.as_deref().and_then(super::parse_iso_ms).unwrap_or(i64::MAX);
+            end_a.cmp(&end_b).then_with(|| a.ordinal.cmp(&b.ordinal))
+        });
+    let Some(run) = latest_executed else { return false };
+    if run.status == "interrupted" {
+        return true;
+    }
+    if run.status != "failed" {
+        return false;
+    }
+    super::status::thread_error(projection)
+        .is_some_and(|err| err.class.as_deref() == Some("usage_limit"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,11 +223,12 @@ mod tests {
         let md = "# Empty Body";
         assert_eq!(build_collapsed_proposed_plan_preview_markdown(md, 8), ("Empty Body".to_owned(), false));
 
-        let many: String = (1..=12).map(|i| format!("line {i}\n")).collect();
-        let (preview, truncated) = build_collapsed_proposed_plan_preview_markdown(&many, 8);
+        // Blank lines do not count toward the 8 non-whitespace preview lines.
+        let with_blanks = (1..=10).map(|i| format!("line {i}\n\n")).collect::<String>();
+        let (preview, truncated) = build_collapsed_proposed_plan_preview_markdown(&with_blanks, 8);
         assert!(truncated);
-        assert!(preview.ends_with("\n..."));
-        assert_eq!(preview.lines().count(), 9);
+        assert!(preview.ends_with("\n\n..."));
+        assert_eq!(preview.lines().filter(|l| !l.trim().is_empty()).count(), 9);
     }
 
     #[test]

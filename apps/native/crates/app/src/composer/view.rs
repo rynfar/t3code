@@ -210,7 +210,7 @@ impl Composer {
         if running && !has_text && !editing_queued {
             return stop().into_any_element();
         }
-        if !running && !editing_queued && self.active_plan_follow_up(cx).is_some() {
+        if !running && !editing_queued && self.active_plan_follow_up(cx).is_some() && (self.has_text || !self.snapshot.can_resume) {
             let disabled = self.sending || resolved.model.is_none() || self.snapshot.setup_blocks_send;
             return self.render_plan_primary(self.has_text, disabled, cx);
         }

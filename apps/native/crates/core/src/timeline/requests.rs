@@ -80,15 +80,45 @@ pub enum LinkTone {
     TimedOut,
 }
 
+pub const RPC_REQUEST_FALLBACK_ERROR: &str = "Could not answer the request. Try again.";
+
+/// `secretRequestFailureMessage`: only surface explicit tagged domain errors so transport/encoding
+/// errors never echo entered secret text.
+pub fn sanitize_secret_request_error(tag: Option<&str>, message: &str) -> String {
+    let trimmed = message.trim();
+    if !trimmed.is_empty() && matches!(tag, Some("SecretRequestError" | "EnvironmentAuthorizationError")) {
+        trimmed.to_owned()
+    } else {
+        RPC_REQUEST_FALLBACK_ERROR.to_owned()
+    }
+}
+
+/// `linkRequestFailureMessage`: only surface explicit tagged domain errors so raw errors never
+/// leak entered pairing codes.
+pub fn sanitize_link_request_error(tag: Option<&str>, message: &str) -> String {
+    let trimmed = message.trim();
+    if !trimmed.is_empty()
+        && matches!(tag, Some("PeerLinkRequestError" | "EnvironmentAuthorizationError" | "PeerPairingCodeError"))
+    {
+        trimmed.to_owned()
+    } else {
+        RPC_REQUEST_FALLBACK_ERROR.to_owned()
+    }
+}
+
+pub const LINK_ACCESS_LEVELS: [&str; 5] =
+    ["read-only", "approval-required", "auto-accept-edits", "auto", "full-access"];
+
 pub fn link_request_display(
     link_status: &str,
     label: Option<&str>,
+    url: Option<&str>,
     linked_label: Option<&str>,
     linked_access: Option<&str>,
     failure: Option<&str>,
     can_answer_here: bool,
 ) -> LinkRequestDisplay {
-    let target = linked_label.or(label).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("machine");
+    let target = linked_label.or(label).or(url).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("machine");
     match link_status {
         "linked" => {
             let access_note = linked_access.map(link_access_label).map(|a| format!(" ({a})")).unwrap_or_default();
@@ -126,20 +156,28 @@ pub fn link_request_display(
     }
 }
 
-/// Access level options shown in `LinkAccessPicker`.
+/// Access level options shown in `LinkAccessPicker` (`accessConfig` in `ConnectAgentSurface.tsx`).
 pub fn link_access_label(access: &str) -> &'static str {
+    use crate::composer::runtime_mode_label;
+    use crate::server_config::RuntimeMode;
     match access {
         "read-only" => "Read only",
-        "full-access" => "Full access",
-        _ => "Approval required",
+        "auto-accept-edits" => runtime_mode_label(RuntimeMode::AutoAcceptEdits),
+        "auto" => runtime_mode_label(RuntimeMode::Auto),
+        "full-access" => runtime_mode_label(RuntimeMode::FullAccess),
+        _ => runtime_mode_label(RuntimeMode::ApprovalRequired),
     }
 }
 
 pub fn link_access_description(access: &str) -> &'static str {
+    use crate::composer::runtime_mode_description;
+    use crate::server_config::RuntimeMode;
     match access {
-        "read-only" => "Read threads and files. Cannot send turns or change settings.",
-        "full-access" => "Send turns, approve tools, change settings, and edit git.",
-        _ => "Read and send turns. Settings and git stay off limits.",
+        "read-only" => "Read projects and threads. Cannot start, message or change anything.",
+        "auto-accept-edits" => runtime_mode_description(RuntimeMode::AutoAcceptEdits),
+        "auto" => runtime_mode_description(RuntimeMode::Auto),
+        "full-access" => runtime_mode_description(RuntimeMode::FullAccess),
+        _ => runtime_mode_description(RuntimeMode::ApprovalRequired),
     }
 }
 
@@ -160,6 +198,8 @@ pub fn mcp_client_scopes(access: &str) -> Vec<String> {
 pub fn link_request_default_access(requested_access: Option<&str>) -> &'static str {
     match requested_access {
         Some("read-only") => "read-only",
+        Some("auto-accept-edits") => "auto-accept-edits",
+        Some("auto") => "auto",
         Some("full-access") => "full-access",
         _ => "approval-required",
     }
@@ -300,13 +340,25 @@ mod tests {
         assert_eq!(secret_request_display("saved", "OPENAI_API_KEY", true).label, "Saved OPENAI_API_KEY");
         assert_eq!(secret_request_display("pending", "TOKEN", false).tone, SecretTone::PendingElsewhere);
         assert_eq!(
-            link_request_display("linked", Some("Mac"), Some("Build Box"), Some("full-access"), None, true).label,
+            link_request_display("linked", Some("Mac"), None, Some("Build Box"), Some("full-access"), None, true).label,
             "Linked Build Box (Full access)"
         );
         assert_eq!(
-            link_request_display("failed", Some("Box"), None, None, Some("bad code"), true).detail,
+            link_request_display("pending", None, Some("https://box.local"), None, None, None, true).label,
+            "Link https://box.local"
+        );
+        assert_eq!(
+            link_request_display("failed", Some("Box"), None, None, None, Some("bad code"), true).detail,
             "bad code"
         );
+        assert_eq!(link_access_label("approval-required"), "Supervised");
+        assert_eq!(link_access_label("auto-accept-edits"), "Auto-accept edits");
+        assert_eq!(link_access_label("auto"), "Auto");
+        assert_eq!(link_request_default_access(Some("auto-accept-edits")), "auto-accept-edits");
+        assert_eq!(sanitize_secret_request_error(Some("SecretRequestError"), "Bad secret"), "Bad secret");
+        assert_eq!(sanitize_secret_request_error(None, "raw error echoing sk-secret"), RPC_REQUEST_FALLBACK_ERROR);
+        assert_eq!(sanitize_link_request_error(Some("PeerPairingCodeError"), "Invalid code"), "Invalid code");
+        assert_eq!(sanitize_link_request_error(Some("UnknownError"), "raw error echoing code"), RPC_REQUEST_FALLBACK_ERROR);
     }
 
     #[test]

@@ -340,14 +340,55 @@ pub struct ModelSwitchDisplay {
     pub effort_changed: bool,
 }
 
-fn selection_effort(selection: &serde_json::Value) -> Option<String> {
-    let opts = selection.get("options")?;
-    opts.get("reasoningEffort")
-        .or_else(|| opts.get("effort"))
+const FALLBACK_EFFORT_KEYS: [&str; 7] =
+    ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level", "thinking"];
+
+fn resolve_effort(
+    selection: &serde_json::Value,
+    providers: &[crate::providers::ProviderEntry<'_>],
+) -> Option<(String, String)> {
+    let instance_id = selection.get("instanceId").and_then(serde_json::Value::as_str).unwrap_or("");
+    let slug = selection.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
+    let opts = selection.get("options");
+    let model = providers
+        .iter()
+        .find(|p| p.instance_id() == instance_id)
+        .and_then(|p| p.provider.models.iter().find(|m| m.slug == slug));
+    let Some(model) = model else {
+        let value = FALLBACK_EFFORT_KEYS.iter().find_map(|key| {
+            opts.and_then(|o| o.get(*key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })?;
+        return Some((value.to_owned(), value.to_owned()));
+    };
+    let capabilities = model.capabilities.as_ref()?;
+    let crate::server_config::OptionDescriptor::Select(select) =
+        capabilities.option_descriptors.iter().find(|d| crate::traits::is_reasoning_control(d))?
+    else {
+        return None;
+    };
+    let raw = opts
+        .and_then(|o| o.get(&select.id))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+        .or_else(|| {
+            crate::traits::current_value(&crate::server_config::OptionDescriptor::Select(select.clone()))
+                .and_then(|v| match v {
+                    crate::traits::OptionValue::Str(s) => Some(s),
+                    crate::traits::OptionValue::Bool(_) => None,
+                })
+        })?;
+    let label = select
+        .options
+        .iter()
+        .find(|opt| opt.id == raw)
+        .map(|opt| opt.label.clone())
+        .unwrap_or_else(|| raw.clone());
+    Some((raw, label))
 }
 
 fn describe_switch_side(
@@ -380,18 +421,21 @@ pub fn resolve_model_switch_change(
     let to = model_switch.get("to")?;
     let from_slug = from.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
     let to_slug = to.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
-    let from_inst = from.get("instanceId").and_then(serde_json::Value::as_str).unwrap_or("");
-    let to_inst = to.get("instanceId").and_then(serde_json::Value::as_str).unwrap_or("");
-    let from_effort = selection_effort(from);
-    let to_effort = selection_effort(to);
-    let model_changed = from_slug != to_slug || from_inst != to_inst;
-    let effort_changed = from_effort != to_effort;
+    let from_effort = resolve_effort(from, providers);
+    let to_effort = resolve_effort(to, providers);
+    let model_changed = from_slug != to_slug;
+    let effort_labels = from_effort
+        .as_ref()
+        .zip(to_effort.as_ref())
+        .filter(|((fv, _), (tv, _))| fv != tv)
+        .map(|((_, fl), (_, tl))| (fl.as_str(), tl.as_str()));
+    let effort_changed = effort_labels.is_some();
     if !model_changed && !effort_changed {
         return None;
     }
     Some(ModelSwitchDisplay {
-        from_summary: describe_switch_side(from, providers, model_changed, from_effort.as_deref()),
-        to_summary: describe_switch_side(to, providers, model_changed, to_effort.as_deref()),
+        from_summary: describe_switch_side(from, providers, model_changed, effort_labels.map(|(f, _)| f)),
+        to_summary: describe_switch_side(to, providers, model_changed, effort_labels.map(|(_, t)| t)),
         model_changed,
         effort_changed,
     })
@@ -492,6 +536,32 @@ mod tests {
         assert!(is_workflow_script_message(Role::User, "// comment\nexport const meta = {};", None));
         assert!(!is_workflow_script_message(Role::User, "Explain `export const meta`.", None));
         assert!(!is_workflow_script_message(Role::Assistant, "export const meta = {};", None));
+    }
+
+    #[test]
+    fn resolves_model_switch_thinking_and_omits_half_effort_without_default() {
+        let same_model_thinking = json!({
+            "from": { "instanceId": "pi", "model": "claude-sonnet", "options": { "thinking": "low" } },
+            "to": { "instanceId": "pi", "model": "claude-sonnet", "options": { "thinking": "high" } },
+        });
+        let display = resolve_model_switch_change(&same_model_thinking, &[]).expect("effort switch");
+        assert!(!display.model_changed);
+        assert!(display.effort_changed);
+        assert_eq!((display.from_summary.as_str(), display.to_summary.as_str()), ("low", "high"));
+
+        // Without a catalog default, an omitted effort on one side must not produce " → high".
+        let missing_left = json!({
+            "from": { "instanceId": "codex", "model": "gpt-5" },
+            "to": { "instanceId": "codex", "model": "gpt-5", "options": { "reasoningEffort": "high" } },
+        });
+        assert!(resolve_model_switch_change(&missing_left, &[]).is_none());
+
+        // Same model across instances does not count as a model change.
+        let cross_inst = json!({
+            "from": { "instanceId": "a", "model": "gpt-5" },
+            "to": { "instanceId": "b", "model": "gpt-5" },
+        });
+        assert!(resolve_model_switch_change(&cross_inst, &[]).is_none());
     }
 }
 

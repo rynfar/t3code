@@ -76,11 +76,11 @@ impl Composer {
             self.save_queued_edit(window, cx);
             return;
         }
-        if self.active_plan_follow_up(cx).is_some() {
-            self.submit_plan_follow_up(window, cx);
+        if self.snapshot.setup_blocks_send {
             return;
         }
-        if self.snapshot.setup_blocks_send {
+        if self.active_plan_follow_up(cx).is_some() && (self.has_text || !self.snapshot.can_resume) {
+            self.submit_plan_follow_up(window, cx);
             return;
         }
         let prompt = self.prompt(cx);
@@ -208,12 +208,20 @@ impl Composer {
     }
 
     pub(super) fn submit_plan_follow_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot.setup_blocks_send {
+            return;
+        }
         let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
         let raw_prompt = self.prompt(cx);
-        let follow_up = t3_core::timeline::plan::resolve_plan_follow_up_submission(&raw_prompt, &plan.markdown);
+        let terminals = TerminalSend::of(&raw_prompt, self.current_terminals());
+        if terminals.expired > 0 {
+            self.expired_toast(terminals.expired, ExpiredNotice::Omitted, cx);
+        }
+        let stripped_prompt = terminals.text;
+        let follow_up = t3_core::timeline::plan::resolve_plan_follow_up_submission(&stripped_prompt, &plan.markdown);
         let staged = self.staged_attachments();
-        let prompt_for_outgoing = if raw_prompt.trim().is_empty() { follow_up.text.clone() } else { raw_prompt };
+        let prompt_for_outgoing = if stripped_prompt.trim().is_empty() { follow_up.text.clone() } else { stripped_prompt };
         let mut outgoing = self.outgoing(prompt_for_outgoing, &staged);
         outgoing.text = follow_up.text;
 
@@ -223,6 +231,7 @@ impl Composer {
             cx.notify();
             return;
         };
+        let previous_interaction_mode = self.choices().and_then(|choices| choices.interaction_mode);
         if let Some(choices) = self.choices_mut() {
             choices.interaction_mode = Some(follow_up.interaction_mode);
         }
@@ -261,6 +270,9 @@ impl Composer {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 if let Some(error) = failure {
+                    if let Some(choices) = this.choices.get_mut(&taken.target) {
+                        choices.interaction_mode = previous_interaction_mode;
+                    }
                     this.restore(taken, error, window, cx);
                 } else {
                     this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
@@ -272,6 +284,9 @@ impl Composer {
     }
 
     pub(super) fn submit_plan_in_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot.setup_blocks_send {
+            return;
+        }
         let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
         let Some(Target::Thread(source_thread_id)) = self.snapshot.target.clone() else { return };
         let Some(project_id) = self.snapshot.project_id.clone() else { return };
@@ -286,7 +301,7 @@ impl Composer {
         let branch = shell.and_then(|t| t.branch.clone());
         let worktree_path = shell.and_then(|t| t.worktree_path.clone());
         let star_origin = state.star_prompt_origin();
-        let title = t3_core::timeline::plan::build_plan_implementation_thread_title(&plan.markdown);
+        let title = rules::title_seed(&t3_core::timeline::plan::build_plan_implementation_thread_title(&plan.markdown));
         let text = t3_core::timeline::plan::build_plan_implementation_prompt(&plan.markdown);
         let new_thread_id = uuid_v4();
         let message_id = uuid_v4();
@@ -296,7 +311,7 @@ impl Composer {
             &project_id,
             &title,
             &selection,
-            resolved.runtime_mode,
+            resolved.default_runtime_mode,
             InteractionMode::Default,
             branch.as_deref(),
             worktree_path.as_deref(),
@@ -331,7 +346,17 @@ impl Composer {
                             state.select_when_listed(&new_thread_id, cx);
                         });
                     }
-                    Err((_, error)) => {
+                    Err((index, error)) => {
+                        if index > 0 {
+                            let cleanup = this.state.read(cx).rpc(
+                                method::DISPATCH_COMMAND,
+                                t3_core::thread_actions::delete(&uuid_v4(), &new_thread_id),
+                            );
+                            cx.background_executor().spawn(async move {
+                                let _ = cleanup.await;
+                            })
+                            .detach();
+                        }
                         this.error = Some(format!("Failed to implement plan in new thread. {error}"));
                     }
                 }

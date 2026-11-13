@@ -12,11 +12,19 @@ pub(super) fn chips(
     presentation: &records::SentPresentation,
     all: &[Value],
     source: Option<&std::sync::Arc<t3_core::turn_item::TurnItem>>,
-    state: &gpui::Entity<crate::app_state::AppState>,
-    ui: &super::TranscriptUi,
+    excluded_attachment_ids: &[&str],
+    env: &super::RowEnv,
     cx: &mut Context<ThreadView>,
 ) -> Option<AnyElement> {
-    let linked = presentation.records(all);
+    let (state, ui) = (env.state, env.ui);
+    let linked: Vec<_> = presentation
+        .records(all)
+        .into_iter()
+        .filter(|record| {
+            let att_id = records::field(record, "attachmentId");
+            att_id.is_empty() || !excluded_attachment_ids.contains(&att_id)
+        })
+        .collect();
     if linked.is_empty() {
         return None;
     }
