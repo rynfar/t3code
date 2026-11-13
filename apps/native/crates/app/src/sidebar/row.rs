@@ -13,7 +13,7 @@ use t3_core::sidebar::{Section, Shelf, SidebarRow, sort::settled_timestamp};
 
 use super::SidebarPane;
 use super::drag::{DraggedSweep, DraggedThread, ThreadDragPreview, drop_verb_badge};
-use super::hover::ThreadHoverCard;
+use super::hover::{HoverTarget, pr_icon, pr_tone};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::theme::{Palette, hsla, palette};
@@ -284,7 +284,7 @@ impl SidebarPane {
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
         let focus_ring = BoxShadow { color: hsla(p.ring), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: true };
         let visual = key.map_or_else(|| crate::project_icon::ProjectVisual::for_project(state, &thread.project_id), |key| crate::project_icon::ProjectVisual::for_scoped_project(state, &t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: thread.project_id.clone() }));
-        let card = ThreadHoverCard { title: thread.title.clone().into(), project: project.clone().map(Into::into), favicon: visual.clone(), branch: thread.branch.clone().map(Into::into), model: (!thread.model_selection.model.is_empty()).then(|| thread.model_selection.model.clone().into()), error: thread.runtime.as_ref().filter(|runtime| runtime.last_error.is_some()).map(|runtime| runtime.last_error_class.as_deref() == Some("usage_limit")) };
+        let hover = HoverTarget { state: self.state.clone(), key: key.cloned(), thread_id: thread.id.clone(), project: project.clone(), favicon: visual.clone() };
         let preview = (thread.title.clone(), project, visual);
         let pane = cx.entity().downgrade();
         div()
@@ -309,9 +309,7 @@ impl SidebarPane {
                 })
             })
             .when(dragging, |this| this.opacity(0.5))
-            .when(self.drag.is_none() && self.sweep.is_none() && !self.menu_open, |this| this.tooltip(move |_, cx| {
-                cx.new(|_| ThreadHoverCard { title: card.title.clone(), project: card.project.clone(), favicon: card.favicon.clone(), branch: card.branch.clone(), model: card.model.clone(), error: card.error }).into()
-            }))
+            .when(self.drag.is_none() && self.sweep.is_none() && !self.menu_open, |this| this.tooltip(super::hover::tooltip(hover)))
             .when(draggable, |this| {
                 this.on_drag(DraggedThread { id: thread.id.clone(), key: key.cloned() }, move |dragged, _, _, cx| {
                     let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone(), preview.2.clone()));
@@ -519,19 +517,8 @@ impl SidebarPane {
     fn render_pr_badge(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, pr: Option<&PrBadge>, active: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         let pr = pr?;
         let p = palette(cx);
-        let icon = match pr.glyph {
-            t3_core::pull_requests::thread_badge::PrGlyph::PullRequest => Icon::GitPullRequestArrow,
-            t3_core::pull_requests::thread_badge::PrGlyph::Draft => Icon::GitPullRequestDraft,
-            t3_core::pull_requests::thread_badge::PrGlyph::Closed => Icon::GitPullRequestClosed,
-            t3_core::pull_requests::thread_badge::PrGlyph::Merged => Icon::GitMerge,
-            t3_core::pull_requests::thread_badge::PrGlyph::Stack => Icon::Layers,
-        };
-        let tone = match pr.tone {
-            t3_core::pull_requests::thread_badge::PrTone::Open => p.pill_completed,
-            t3_core::pull_requests::thread_badge::PrTone::Draft | t3_core::pull_requests::thread_badge::PrTone::Muted => p.muted_foreground,
-            t3_core::pull_requests::thread_badge::PrTone::Closed => p.pill_failed,
-            t3_core::pull_requests::thread_badge::PrTone::Merged => p.pill_plan,
-        };
+        let icon = pr_icon(pr.glyph);
+        let tone = pr_tone(pr.tone, p);
         let label = pr.label.clone();
         let opens_list = pr.opens_list;
         let url = pr.url.clone();
