@@ -73,6 +73,8 @@ pub struct SidebarPane {
     pub(crate) project_filter: Option<gpui::Point<gpui::Pixels>>,
     pub(crate) project_filter_search: Entity<InputState>,
     pub(crate) project_filter_focus: gpui::FocusHandle,
+    pub(crate) project_filter_return_focus: Option<gpui::FocusHandle>,
+    pub(crate) project_filter_scroll: gpui::ScrollHandle,
     pub(crate) project_filter_order: std::cell::RefCell<Vec<String>>,
     pub(crate) project_filter_highlighted: Option<String>,
     jump_hints: bool,
@@ -187,7 +189,7 @@ impl SidebarPane {
             }),
             cx.subscribe_in(&project_filter_search, window, |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
-                    this.project_filter_highlighted = None;
+                    this.sync_project_filter_highlight(cx);
                     cx.notify();
                 }
                 InputEvent::PressEnter { shift, .. } if this.project_filter.is_some() => {
@@ -289,6 +291,8 @@ impl SidebarPane {
             project_filter: None,
             project_filter_search,
             project_filter_focus,
+            project_filter_return_focus: None,
+            project_filter_scroll: gpui::ScrollHandle::new(),
             project_filter_order: Default::default(),
             project_filter_highlighted: None,
             jump_hints: false,
@@ -587,6 +591,7 @@ impl SidebarPane {
         let p = palette(cx);
         div()
             .id(id)
+            .debug_selector(move || id.to_owned())
             .group(id)
             .size(px(28.))
             .flex()
@@ -1762,6 +1767,7 @@ mod sb_sections_pane_tests {
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (state, _orig) = cx.update(|cx| {
+            gpui_component::init(cx);
             let installed = install_state(cx, runtime.handle().clone());
             crate::composer::init(cx);
             crate::keymap::init(cx);
@@ -1859,33 +1865,197 @@ mod sb_sections_pane_tests {
             "schedule_clock_at must stay active for fleet rows even when single-env model.rows is empty"
         );
 
-        // Open project filter and verify plain click selects single project + closes, while Shift-click toggles + stays open.
-        pane.update(vcx, |p, cx| {
-            p.project_filter = Some(point(px(20.), px(20.)));
-            cx.notify();
-        });
-        vcx.run_until_parked();
         let groups = state.read_with(vcx, |s, cx| s.project_groups_for(GroupConsumer::Sidebar, cx));
         let alpha_key = groups.iter().find(|g| g.label == "Local Alpha").unwrap().key.clone();
         let beta_key = groups.iter().find(|g| g.label == "Cloud Beta").unwrap().key.clone();
         let alpha_id: &'static str = Box::leak(format!("scoped-project-filter-{alpha_key}").into_boxed_str());
         let beta_id: &'static str = Box::leak(format!("scoped-project-filter-{beta_key}").into_boxed_str());
 
-        vcx.update(|window, cx| { window.draw(cx).clear(); });
-        let beta_pos = vcx.debug_bounds(beta_id).map(|b| b.center()).unwrap_or_else(|| point(px(100.), px(120.)));
+        let click_in = |window: &mut gpui::Window, cx: &mut gpui::App, button: MouseButton, pos: gpui::Point<Pixels>, modifiers: Modifiers| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: pos,
+                    pressed_button: None,
+                    modifiers,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    button,
+                    position: pos,
+                    modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    button,
+                    position: pos,
+                    modifiers,
+                    click_count: 1,
+                }),
+                cx,
+            );
+        };
+        let key_in = |window: &mut gpui::Window, cx: &mut gpui::App, key: &str| {
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        };
+        let draw_bounds = |vcx: &mut gpui::VisualTestContext| {
+            pane.update(vcx, |_, cx| cx.notify());
+            vcx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+        };
+
+        draw_bounds(vcx);
+        let trigger_pos = vcx.debug_bounds("project-filter").expect("#project-filter button rendered").center();
+
+        // 1) Clicking `#project-filter` focuses `#project-filter-search` and auto-highlights `"all"`.
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, trigger_pos, Default::default());
+            let pane_ref = pane.read(cx);
+            assert!(pane_ref.project_filter.is_some(), "clicking #project-filter must open popover");
+            assert!(
+                pane_ref.project_filter_search.read(cx).focus_handle(cx).is_focused(window),
+                "opening project filter must focus #project-filter-search input"
+            );
+            assert_eq!(pane_ref.project_filter_highlighted.as_deref(), Some("all"), "autoHighlight starts on first visible item");
+            // Park focus onto `popup_focus` before TestWindow::draw renders `<Input>` (macOS `window_handle` is unimplemented on TestWindow).
+            let popup_focus = pane_ref.project_filter_focus.clone();
+            window.focus(&popup_focus, cx);
+        });
+        draw_bounds(vcx);
+
+        // With popup in the dispatch tree: focused-Input capture actions (`MoveDown`, `MoveUp`, `Escape`) route through `popup_id`.
+        let dispatch_focused_action = |vcx: &mut gpui::VisualTestContext, action: Box<dyn gpui::Action>| {
+            vcx.update(|window, cx| {
+                let search = pane.read(cx).project_filter_search.clone();
+                let popup_focus = pane.read(cx).project_filter_focus.clone();
+                search.update(cx, |input, cx| input.focus(window, cx));
+                assert!(search.read(cx).focus_handle(cx).is_focused(window));
+                window.dispatch_action(action, cx);
+                // After GPUI's deferred action runs (FIFO), move focus off Input before TestWindow::draw runs.
+                let win = window.window_handle();
+                cx.defer(move |cx| {
+                    let _ = cx.update_window(win, |_, window, cx| window.focus(&popup_focus, cx));
+                });
+            });
+            vcx.run_until_parked();
+        };
+        dispatch_focused_action(vcx, Box::new(gpui_component::input::MoveDown));
+        assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.clone()).as_deref(), Some(beta_key.as_str()));
+        dispatch_focused_action(vcx, Box::new(gpui_component::input::MoveUp));
+        assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.clone()).as_deref(), Some("all"));
+        dispatch_focused_action(vcx, Box::new(gpui_component::input::Escape));
+        assert!(pane.read_with(vcx, |p, _| p.project_filter.is_none()), "Escape capture action must close project filter from focused Input");
+
+        // 2) Re-open, type query (`autoHighlight` picks first match), clear query (`autoHighlight` returns to `"all"`), fallback keys + Shift+F10 on `popup_id`.
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, trigger_pos, Default::default());
+            let search = pane.read(cx).project_filter_search.clone();
+            assert!(search.read(cx).focus_handle(cx).is_focused(window));
+            search.update(cx, |input, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(input, Some(0..0), "cloud", window, cx);
+            });
+            let popup_focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&popup_focus, cx);
+        });
+        vcx.run_until_parked();
+        pane.read_with(vcx, |p, cx| {
+            assert_eq!(p.project_filter_search.read(cx).value(), "cloud");
+            assert_eq!(p.project_filter_highlighted.as_deref(), Some(beta_key.as_str()));
+        });
+
+        vcx.update(|window, cx| {
+            let search = pane.read(cx).project_filter_search.clone();
+            search.update(cx, |input, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(input, Some(0..5), "", window, cx);
+            });
+            let popup_focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&popup_focus, cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.as_deref().map(str::to_owned)).as_deref(), Some("all"));
+
+        draw_bounds(vcx);
+        vcx.update(|window, cx| {
+            key_in(window, cx, "down");
+            assert_eq!(pane.read(cx).project_filter_highlighted.as_deref(), Some(beta_key.as_str()));
+            key_in(window, cx, "down");
+            assert_eq!(pane.read(cx).project_filter_highlighted.as_deref(), Some(alpha_key.as_str()));
+            key_in(window, cx, "up");
+            assert_eq!(pane.read(cx).project_filter_highlighted.as_deref(), Some(beta_key.as_str()));
+            key_in(window, cx, "down");
+            assert_eq!(pane.read(cx).project_filter_highlighted.as_deref(), Some(alpha_key.as_str()));
+            key_in(window, cx, "shift-f10");
+            assert!(pane.read(cx).project_filter.is_none(), "Shift+F10 must close project filter after opening project settings");
+        });
+        vcx.run_until_parked();
+
+        // 3) Fallback `Escape` on `popup_id` when focus is on popup instead of Input.
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, trigger_pos, Default::default());
+            let popup_focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&popup_focus, cx);
+        });
+        draw_bounds(vcx);
+        vcx.update(|window, cx| {
+            key_in(window, cx, "escape");
+            assert!(pane.read(cx).project_filter.is_none(), "Escape fallback on popup_id must close when focus leaves Input");
+        });
+        vcx.run_until_parked();
+
+        // 4) Right-clicking a project row closes project filter before opening ContextMenu.
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, trigger_pos, Default::default());
+            let focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&focus, cx);
+        });
+        draw_bounds(vcx);
+        let alpha_pos = vcx.debug_bounds(alpha_id).expect("alpha filter row rendered").center();
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Right, alpha_pos, Default::default());
+        });
+        vcx.run_until_parked();
+        assert!(pane.read_with(vcx, |p, _| p.project_filter.is_none()), "right-click must close project filter before opening ContextMenu");
+        assert!(root.read_with(vcx, |host, cx| host.menu.read(cx).is_open()), "right-click must open project ContextMenu");
+        root.update(vcx, |host, cx| host.menu.update(cx, |m, cx| m.close(cx)));
+        vcx.run_until_parked();
+
+        // 5) Shift-click toggles + keeps filter open; plain click selects single project + closes.
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, trigger_pos, Default::default());
+            let focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&focus, cx);
+        });
+        draw_bounds(vcx);
+        let beta_pos = vcx.debug_bounds(beta_id).expect("beta filter row rendered").center();
         let shift = Modifiers { shift: true, ..Default::default() };
-        vcx.simulate_mouse_move(beta_pos, None::<MouseButton>, shift);
-        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: beta_pos, modifiers: shift, click_count: 1, first_mouse: false });
-        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: beta_pos, modifiers: shift, click_count: 1 });
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, beta_pos, shift);
+            let focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&focus, cx);
+        });
         vcx.run_until_parked();
         assert!(pane.read_with(vcx, |p, _| p.project_filter.is_some()), "Shift-click must keep project filter open");
         assert_eq!(state.read_with(vcx, |s, cx| s.scoped_project_scope(&s.project_groups_for(GroupConsumer::Sidebar, cx))), vec![beta_key.clone()]);
 
-        vcx.update(|window, cx| { window.draw(cx).clear(); });
-        let alpha_pos = vcx.debug_bounds(alpha_id).map(|b| b.center()).unwrap_or_else(|| point(px(100.), px(88.)));
-        vcx.simulate_mouse_move(alpha_pos, None::<MouseButton>, Default::default());
-        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: alpha_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
-        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: alpha_pos, modifiers: Default::default(), click_count: 1 });
+        draw_bounds(vcx);
+        let alpha_pos = vcx.debug_bounds(alpha_id).expect("alpha filter row rendered").center();
+        vcx.update(|window, cx| {
+            click_in(window, cx, MouseButton::Left, alpha_pos, Default::default());
+        });
         vcx.run_until_parked();
         assert!(
             pane.read_with(vcx, |p, _| p.project_filter.is_none()),

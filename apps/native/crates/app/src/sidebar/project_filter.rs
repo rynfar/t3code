@@ -9,9 +9,9 @@ use gpui::{
     ParentElement, Pixels, Point, SharedString, Styled, Window, anchored, deferred, div, point,
     prelude::*, px,
 };
-use gpui_component::Sizable;
 use gpui_component::input::{Escape, Input, MoveDown, MoveUp};
 use gpui_component::tooltip::Tooltip;
+use gpui_component::{ActiveTheme, Sizable};
 use t3_core::sidebar::ENVIRONMENT_ID;
 use t3_core::sidebar::grouping::{
     GroupConsumer, ProjectEnvironmentBadge, ProjectGroup, ProjectScope, ScopedProjectGroup,
@@ -166,15 +166,37 @@ impl SidebarPane {
     }
 
     pub(crate) fn close_project_filter(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.close_project_filter_with_focus(window, false, cx);
+    }
+
+    pub(crate) fn close_project_filter_with_focus(
+        &mut self,
+        window: Option<&mut Window>,
+        restore_focus: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.project_filter = None;
         self.project_filter_order.borrow_mut().clear();
         self.project_filter_highlighted = None;
-        if let Some(window) = window
-            && !self.project_filter_search.read(cx).value().is_empty()
-        {
-            self.project_filter_search.update(cx, |input, cx| input.set_value("", window, cx));
+        let return_focus = self.project_filter_return_focus.take();
+        if let Some(window) = window {
+            if !self.project_filter_search.read(cx).value().is_empty() {
+                self.project_filter_search.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            if restore_focus && let Some(focus) = return_focus {
+                window.focus(&focus, cx);
+            }
         }
         cx.notify();
+    }
+
+    pub(super) fn sync_project_filter_highlight(&mut self, cx: &App) {
+        if self.project_filter.is_none() {
+            self.project_filter_highlighted = None;
+            return;
+        }
+        self.project_filter_highlighted = self.visible_filter_values(cx).into_iter().next();
+        self.project_filter_scroll.scroll_to_item(0);
     }
 
     pub(super) fn toggle_project_filter(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -183,12 +205,15 @@ impl SidebarPane {
             return;
         }
         self.project_filter_order.borrow_mut().clear();
-        self.project_filter_highlighted = None;
-        if !self.project_filter_search.read(cx).value().is_empty() {
-            self.project_filter_search.update(cx, |input, cx| input.set_value("", window, cx));
-        }
+        self.project_filter_return_focus = window.focused(cx);
         self.project_filter = Some(position);
-        window.focus(&self.project_filter_focus, cx);
+        self.project_filter_search.update(cx, |input, cx| {
+            if !input.value().is_empty() {
+                input.set_value("", window, cx);
+            }
+            input.focus(window, cx);
+        });
+        self.sync_project_filter_highlight(cx);
         cx.notify();
     }
 
@@ -272,6 +297,7 @@ impl SidebarPane {
             None => values.len() - 1,
         };
         self.project_filter_highlighted = Some(values[next].clone());
+        self.project_filter_scroll.scroll_to_item(next);
         cx.notify();
     }
 
@@ -339,6 +365,33 @@ impl SidebarPane {
                 }
             });
             cx.notify();
+            true
+        }
+    }
+
+    fn open_highlighted_project_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.project_filter_highlighted.clone().filter(|cur| cur != "all") else {
+            return false;
+        };
+        let fleet = !self.state.read(cx).fleet.environments.is_empty();
+        if fleet {
+            let group = {
+                let state = self.state.read(cx);
+                let groups = pickable_scoped_project_groups(&state.project_groups_for(GroupConsumer::Sidebar, cx));
+                groups.into_iter().find(|g| g.key == target)
+            };
+            let Some(group) = group else { return false };
+            self.close_project_filter(Some(window), cx);
+            self.state.update(cx, |state, cx| {
+                state.run_scoped_project_action(&group, t3_core::thread_actions::ProjectAction::Settings, cx);
+            });
+            true
+        } else {
+            let Some(group) = self.project_groups(cx).into_iter().find(|g| g.key == target) else {
+                return false;
+            };
+            self.close_project_filter(Some(window), cx);
+            crate::settings::open_project(&group.representative_id, cx);
             true
         }
     }
@@ -438,6 +491,7 @@ impl SidebarPane {
                 .id("project-filter-list")
                 .max_h(px(320.))
                 .overflow_y_scroll()
+                .track_scroll(&self.project_filter_scroll)
                 .p(px(4.))
                 .flex()
                 .flex_col()
@@ -455,6 +509,10 @@ impl SidebarPane {
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.close_project_filter(Some(window), cx)),
                 )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, window, cx| this.close_project_filter(Some(window), cx)),
+                )
                 .child(
                     anchored()
                         .position(position + point(px(-8.), px(16.)))
@@ -465,6 +523,7 @@ impl SidebarPane {
                                 .track_focus(&self.project_filter_focus)
                                 .occlude()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                                 .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
                                     if !super::is_composing(&this.project_filter_search, window, cx) {
                                         this.move_project_filter_highlight(1, cx);
@@ -479,21 +538,65 @@ impl SidebarPane {
                                 }))
                                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                                     if !super::is_composing(&this.project_filter_search, window, cx) {
-                                        this.close_project_filter(Some(window), cx);
+                                        this.close_project_filter_with_focus(Some(window), true, cx);
                                         cx.stop_propagation();
                                     }
                                 }))
                                 .on_action(cx.listener(|this, _: &crate::keymap::PinThread, _, cx| {
-                                    if this.toggle_highlighted_project_pin(cx) {
+                                    if this.project_filter.is_some() {
+                                        this.toggle_highlighted_project_pin(cx);
                                         cx.stop_propagation();
                                     }
                                 }))
                                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                    if super::is_composing(&this.project_filter_search, window, cx) {
+                                        return;
+                                    }
+                                    let key = &event.keystroke;
+                                    let context_key = (key.key == "menu" && !key.modifiers.modified())
+                                        || (key.key == "f10"
+                                            && key.modifiers.shift
+                                            && !key.modifiers.control
+                                            && !key.modifiers.alt
+                                            && !key.modifiers.platform
+                                            && !key.modifiers.function);
+                                    if context_key {
+                                        if this.open_highlighted_project_settings(window, cx) {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        }
+                                        return;
+                                    }
                                     let search_focused = this.project_filter_search.read(cx).focus_handle(cx).is_focused(window);
-                                    if !search_focused && event.keystroke.key == "enter" {
-                                        window.prevent_default();
-                                        cx.stop_propagation();
-                                        this.activate_highlighted_project_filter(event.keystroke.modifiers.shift, window, cx);
+                                    if !search_focused
+                                        && !key.modifiers.control
+                                        && !key.modifiers.alt
+                                        && !key.modifiers.platform
+                                        && !key.modifiers.function
+                                    {
+                                        match key.key.as_str() {
+                                            "down" => {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                                this.move_project_filter_highlight(1, cx);
+                                            }
+                                            "up" => {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                                this.move_project_filter_highlight(-1, cx);
+                                            }
+                                            "escape" => {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                                this.close_project_filter_with_focus(Some(window), true, cx);
+                                            }
+                                            "enter" => {
+                                                window.prevent_default();
+                                                cx.stop_propagation();
+                                                this.activate_highlighted_project_filter(key.modifiers.shift, window, cx);
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }))
                                 .relative()
@@ -505,6 +608,7 @@ impl SidebarPane {
                                 .flex_col()
                                 .text_sm()
                                 .text_color(hsla(p.popover_foreground))
+                                .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
                                 .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
                                 .child(
                                     div()
@@ -713,6 +817,7 @@ impl SidebarPane {
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
+                                    this.close_project_filter(Some(window), cx);
                                     this.menu.update(cx, |menu, cx| menu.open_for_project(&menu_project, event.position, window, cx));
                                 }),
                             )
@@ -922,6 +1027,7 @@ impl SidebarPane {
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
+                                    this.close_project_filter(Some(window), cx);
                                     this.menu.update(cx, |context, cx| {
                                         context.open_scoped_project(menu_group.clone(), event.position, window, cx)
                                     });

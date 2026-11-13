@@ -612,18 +612,19 @@ impl SidebarPane {
             .child(
                 div()
                     .id("settled-show-more")
-                    .h(px(36.))
+                    .min_h(px(36.))
                     .flex()
                     .items_center()
                     .gap(px(10.))
                     .px(px(10.))
+                    .py(px(6.))
                     .rounded(px(6.))
                     .cursor_pointer()
                     .text_sm()
                     .text_color(hsla(p.sidebar_muted_foreground))
                     .hover(|this| this.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
-                    .child(Icon::ChevronDown.sized(px(16.)))
-                    .child(self.state.read(cx).settled_show_more_label(count))
+                    .child(div().flex_none().child(Icon::ChevronDown.sized(px(16.))))
+                    .child(div().flex_1().min_w_0().child(self.state.read(cx).settled_show_more_label(count)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.update(cx, |state, cx| if !state.settled_shelf_loading() { state.show_more_settled(cx) })
                     })),
