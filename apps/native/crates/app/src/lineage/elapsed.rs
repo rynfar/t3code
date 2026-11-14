@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AnyElement, App, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Task, Window, div};
+use gpui::{AnyElement, App, AppContext as _, Context, IntoElement, ParentElement, Render, SharedString, Styled, Task, Window, div};
 use t3_core::lineage::AgentTiming;
 
 /// Live ticking elapsed view for an active subagent, phase, or workflow member.
@@ -31,12 +31,13 @@ impl LiveAgentElapsed {
         Self { timing, compact, painted, _tick: tick }
     }
 
-    pub fn sync(&mut self, timing: AgentTiming, compact: bool, cx: &mut Context<Self>) {
-        if self.timing != timing || self.compact != compact {
-            self.timing = timing;
-            self.compact = compact;
-            cx.notify();
+    pub fn set(&mut self, timing: AgentTiming, compact: bool) -> bool {
+        if self.timing == timing && self.compact == compact {
+            return false;
         }
+        self.timing = timing;
+        self.compact = compact;
+        true
     }
 }
 
@@ -52,7 +53,13 @@ pub fn agent_elapsed_element(key: SharedString, timing: AgentTiming, compact: bo
     if !timing.active {
         return div().whitespace_nowrap().child(timing.format(0, compact)).into_any_element();
     }
-    let entity: Entity<LiveAgentElapsed> = window.use_keyed_state(key, cx, |_, cx| LiveAgentElapsed::new(timing, compact, cx));
-    entity.update(cx, |view, cx| view.sync(timing, compact, cx));
-    entity.into_any_element()
+    let timer = window
+        .use_keyed_state(key, cx, |_, cx| cx.new(|cx| LiveAgentElapsed::new(timing, compact, cx)))
+        .read(cx)
+        .clone();
+    if timer.update(cx, |view, _| view.set(timing, compact)) {
+        let timer = timer.clone();
+        window.defer(cx, move |_, cx| timer.update(cx, |_, cx| cx.notify()));
+    }
+    timer.into_any_element()
 }

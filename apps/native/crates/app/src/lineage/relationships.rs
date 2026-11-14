@@ -197,7 +197,13 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
                 })
             })
             .flatten();
-        let timing = agent.and_then(AgentTiming::from_subagent);
+        let timing = agent.and_then(|agent| {
+            if workflow.is_some() {
+                AgentTiming::from_subagent(agent)
+            } else {
+                AgentTiming::from_subagent(&agent.current(node))
+            }
+        });
         LineageRow {
             thread_id: row.thread_id.clone(),
             title: if subagent { subagent_display_title(&title) } else { title },
@@ -719,6 +725,58 @@ mod tests {
             assert_eq!(rel.remote_subagents.len(), 1);
             assert_eq!(rel.remote_subagents[0].title, "Remote Check");
             assert_eq!(rel.remote_subagents[0].env_label, "Remote Mac");
+
+            // A completed non-workflow subagent whose child thread resumes uses `agent.current(node)` for timing.
+            let mut resumed_child_json = serde_json::to_value(state.thread_shell("menu-thread").unwrap()).unwrap();
+            resumed_child_json["id"] = serde_json::json!("child-resumed");
+            resumed_child_json["title"] = serde_json::json!("Resumed Child");
+            resumed_child_json["status"] = serde_json::json!("running");
+            resumed_child_json["activityRunStatus"] = serde_json::json!("running");
+            resumed_child_json["activityRunStartedAt"] = serde_json::json!("2026-04-01T00:04:00.000Z");
+            resumed_child_json["latestRunRequestedAt"] = serde_json::json!("2026-04-01T00:04:00.000Z");
+            resumed_child_json["delegatedFrom"] = serde_json::Value::Null;
+            resumed_child_json["lineage"] = serde_json::json!({
+                "parentThreadId": "menu-thread",
+                "relationshipToParent": "subagent",
+                "rootThreadId": "menu-thread"
+            });
+            let resumed_child: ThreadShell = serde_json::from_value(resumed_child_json).unwrap();
+            state.shell.snapshot.as_mut().unwrap().threads.push(resumed_child);
+            let mut resumed_proj = serde_json::to_value(state.thread.projection.as_ref().unwrap()).unwrap();
+            resumed_proj["subagents"] = serde_json::json!([
+                {
+                    "id": "sub-resumed",
+                    "threadId": "menu-thread",
+                    "childThreadId": "child-resumed",
+                    "origin": "app_owned",
+                    "prompt": "resumed",
+                    "title": "Subagent: Resumed Child",
+                    "status": "completed",
+                    "startedAt": "2026-04-01T00:00:01.000Z",
+                    "completedAt": "2026-04-01T00:00:10.000Z",
+                    "updatedAt": "2026-04-01T00:00:10.000Z"
+                }
+            ]);
+            let resumed_snapshot: ThreadStreamItem = serde_json::from_value(serde_json::json!({
+                "kind": "snapshot",
+                "snapshotSequence": 3,
+                "hasMoreHistory": false,
+                "historyCursor": null,
+                "projection": resumed_proj
+            }))
+            .unwrap();
+            state.thread.apply(resumed_snapshot);
+            let thread = state.thread_shell("menu-thread").unwrap().clone();
+            let rel = relationships_with_titles(state, &thread, None);
+            assert_eq!(rel.active.len(), 1);
+            assert_eq!(
+                rel.active[0].timing,
+                Some(AgentTiming {
+                    active: true,
+                    started_ms: t3_core::timeline::parse_iso_ms("2026-04-01T00:04:00.000Z"),
+                    completed_ms: None,
+                })
+            );
         });
     }
 }
