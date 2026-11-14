@@ -5,17 +5,18 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, ClickEvent, ClipboardItem, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, ClipboardItem, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
+use t3_core::lineage::{AgentTiming, PhaseState, WorkflowMember, relationship_status_label, subagent_display_title};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script, menu_label};
 use t3_core::thread_details::{CardDensity, item_visible_at_density};
 use t3_core::vcs::{self, editor_label, editor_options};
 
-use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, section_with_options, split_row};
+use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, section_with_action, section_with_options, split_row};
 use super::{Details, project_scripts, run_button_script};
 use crate::app_state::AppState;
-use crate::lineage::{LineageRow, MergeBack, Relationships, StopAction};
+use crate::lineage::{DelegatedFromRow, LineageRow, MergeBack, Relationships, RemoteSubagentRow, StopAction, elapsed::agent_elapsed_element};
 use crate::git::{self, BranchPicker, GitDialogs, GitStore};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -264,14 +265,122 @@ pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &Ap
 
 /// One related thread: opens it (a side chat in its tab), with Merge back on the fork's source
 /// and Stop on a subagent or workflow that can still be stopped.
-fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, cx: &App) -> AnyElement {
+fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     let (state, id) = (ctx.state.clone(), row.thread_id.clone());
+    let status_color = if row.failed { hsla(p.destructive) } else { hsla(p.muted_foreground) };
+    let trailing_label: AnyElement = if !row.failed && (row.timing.is_some() || row.workflow.is_some()) {
+        match row.timing {
+            Some(timing) => div()
+                .flex_none()
+                .text_size(px(11.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(hsla(p.muted_foreground))
+                .child(agent_elapsed_element(SharedString::from(format!("lineage-elapsed:{}", row.thread_id)), timing, true, window, cx))
+                .into_any_element(),
+            None => div().flex_none().into_any_element(),
+        }
+    } else if !row.merge_target && row.workflow.is_none() {
+        div().flex_none().text_size(px(11.)).font_weight(gpui::FontWeight::MEDIUM).text_color(status_color).child(row.status).into_any_element()
+    } else {
+        div().flex_none().into_any_element()
+    };
     let primary = Row::new(SharedString::from(format!("lineage-{}", row.thread_id)), row.title.clone())
         .icon(row.icon)
-        .trailing(div().flex_none().text_size(px(11.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(row.status))
+        .trailing(trailing_label)
         .tooltip(format!("{}\n{} · Open thread", row.title, row.relationship))
         .on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_related_thread(&id, cx)));
+    if let Some(workflow) = &row.workflow {
+        let expanded = window.use_keyed_state(SharedString::from(format!("details-wf-open:{}", row.thread_id)), cx, |_, _| false);
+        let is_expanded = *expanded.read(cx);
+        let stop_btn = row.stop.clone().map(|action| {
+            let state = ctx.state.clone();
+            crate::right_panel::Button::new(SharedString::from(format!("lineage-stop-{}", row.thread_id)))
+                .icon(Icon::Square)
+                .icon_size(12.)
+                .tooltip("Stop entire workflow")
+                .on_click(move |_, _, cx| state.update(cx, |state, cx| state.run_stop_action(&action, cx)))
+        });
+        let toggle = crate::right_panel::Button::new(SharedString::from(format!("lineage-wf-toggle-{}", row.thread_id)))
+            .icon(if is_expanded { Icon::ChevronDown } else { Icon::ChevronRight })
+            .icon_size(12.)
+            .tooltip(if is_expanded { format!("Collapse {}", row.title) } else { format!("Expand {}", row.title) })
+            .on_click({
+                let expanded = expanded.clone();
+                move |_, _, cx| expanded.update(cx, |open, cx| { *open = !*open; cx.notify(); })
+            });
+        let trailing = h_flex().flex_none().items_center().gap(px(2.)).children(stop_btn).child(toggle);
+        let header = split_row(format!("lineage-split-{}", row.thread_id), primary, trailing, cx).into_any_element();
+        if !is_expanded {
+            return header.into_any_element();
+        }
+        let mut children: Vec<AnyElement> = Vec::new();
+        let phases: Vec<_> = workflow.phases.iter().filter(|phase| !phase.members.is_empty()).collect();
+        for phase in &phases {
+            let phase_open: Entity<Option<bool>> = window.use_keyed_state(
+                SharedString::from(format!("details-wf-phase:{}:{}", row.thread_id, phase.index)),
+                cx,
+                |_, _| None,
+            );
+            let is_phase_open = phase_open.read(cx).unwrap_or(phase.state == PhaseState::Running);
+            let phase_failed = phase.state != PhaseState::Running && phase.members.iter().any(|m| m.status == "failed");
+            let count_text = format!(
+                "{}/{} {}",
+                phase.settled_count,
+                phase.members.len(),
+                if phase.members.len() == 1 { "agent" } else { "agents" }
+            );
+            let count_color = if phase.state == PhaseState::Running { hsla(p.foreground) } else { hsla(p.muted_foreground) };
+            let phase_elapsed = AgentTiming::from_phase(phase).map(|timing| {
+                div().text_color(hsla(p.muted_foreground)).child(agent_elapsed_element(
+                    SharedString::from(format!("wf-phase-elapsed:{}:{}", row.thread_id, phase.index)),
+                    timing,
+                    false,
+                    window,
+                    cx,
+                ))
+            });
+            let accessory = h_flex()
+                .flex_none()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(11.))
+                .when(phase_failed, |this| {
+                    this.child(div().font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.destructive)).child("Failed"))
+                })
+                .child(div().text_color(count_color).child(count_text))
+                .children(phase_elapsed);
+            let phase_row = Row::new(SharedString::from(format!("wf-phase-{}-{}", row.thread_id, phase.index)), phase.title.clone())
+                .icon(if is_phase_open { Icon::ChevronDown } else { Icon::ChevronRight })
+                .trailing(accessory)
+                .on_click({
+                    let phase_open = phase_open.clone();
+                    move |_, _, cx| phase_open.update(cx, |open, cx| { *open = Some(!is_phase_open); cx.notify(); })
+                })
+                .into_any_element();
+            children.push(phase_row);
+            if is_phase_open {
+                for member in &phase.members {
+                    children.push(workflow_member_row(&ctx.state, &row.thread_id, &format!("p{}", phase.index), member, window, cx));
+                }
+            }
+        }
+        for member in &workflow.unphased {
+            children.push(workflow_member_row(&ctx.state, &row.thread_id, "u", member, window, cx));
+        }
+        if phases.is_empty() && workflow.unphased.is_empty() {
+            children.push(
+                div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_size(px(11.))
+                    .text_color(hsla(p.muted_foreground).opacity(0.7))
+                    .child("No agents yet")
+                    .into_any_element(),
+            );
+        }
+        return v_flex().w_full().child(header).child(v_flex().pl(px(16.)).children(children)).into_any_element();
+    }
     if let (true, Some(merge)) = (row.merge_target, merge) {
         let state = ctx.state.clone();
         let tooltip = match (&merge.target_title, merge.ready) {
@@ -300,23 +409,197 @@ fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, cx: 
     primary.into_any_element()
 }
 
-pub fn lineage(ctx: &Ctx, rows: &Relationships, shown: usize, separated: bool, density: CardDensity, on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> Option<AnyElement> {
-    if !ctx.details.read(cx).shows("lineage") || !item_visible_at_density("lineage", density) || rows.lineage.is_empty() {
+fn workflow_member_row(
+    state: &Entity<AppState>,
+    coordinator_id: &str,
+    scope: &str,
+    member: &WorkflowMember,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let p = palette(cx);
+    let failed = member.status == "failed";
+    let trailing: AnyElement = match AgentTiming::from_member(member) {
+        Some(timing) => div()
+            .flex_none()
+            .text_size(px(11.))
+            .text_color(hsla(p.muted_foreground))
+            .child(agent_elapsed_element(
+                SharedString::from(format!("wf-member-elapsed:{coordinator_id}:{scope}:{}", member.index)),
+                timing,
+                false,
+                window,
+                cx,
+            ))
+            .into_any_element(),
+        None if failed => div()
+            .flex_none()
+            .text_size(px(11.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(hsla(p.destructive))
+            .child(relationship_status_label(Some(&member.status)))
+            .into_any_element(),
+        None => div().flex_none().into_any_element(),
+    };
+    let mut row = Row::new(
+        SharedString::from(format!("wf-member-{coordinator_id}-{scope}-{}", member.index)),
+        subagent_display_title(&member.label),
+    )
+    .icon(Icon::Bot)
+    .disabled(member.child_thread_id.is_none())
+    .trailing(trailing);
+    if let Some(child_id) = member.child_thread_id.clone() {
+        let state = state.clone();
+        row = row.on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_related_thread(&child_id, cx)));
+    }
+    row.into_any_element()
+}
+
+fn delegated_from_row(ctx: &Ctx, item: &DelegatedFromRow, cx: &App) -> AnyElement {
+    let p = palette(cx);
+    let mut row = Row::new("lineage-delegated-from", item.title.clone()).icon(Icon::CornerLeftUp).disabled(!item.connected);
+    if let Some(label) = &item.env_label {
+        row = row.trailing(div().flex_none().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(format!("on {label}")));
+    }
+    let hint = if item.connected {
+        "Open parent agent".to_owned()
+    } else {
+        format!("Delegated from {}. Connect to it to open the parent thread.", item.env_label.as_deref().unwrap_or("a linked environment"))
+    };
+    row = row.tooltip(format!("{}\n{hint}", item.title));
+    if item.connected {
+        let (state, env_id, thread_id) = (ctx.state.clone(), item.environment_id.clone(), item.thread_id.clone());
+        row = row.on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_linked_thread(&env_id, &thread_id, cx)));
+    }
+    row.into_any_element()
+}
+
+fn remote_subagent_row(ctx: &Ctx, item: &RemoteSubagentRow, cx: &App) -> AnyElement {
+    let p = palette(cx);
+    let color = if item.failed { hsla(p.destructive) } else { hsla(p.muted_foreground) };
+    let hint = if item.connected {
+        format!("Open on {}", item.env_label)
+    } else {
+        format!("Runs on {}. Connect to it to open the thread there.", item.env_label)
+    };
+    let mut row = Row::new(SharedString::from(format!("lineage-remote-{}", item.id)), item.title.clone())
+        .icon(Icon::Bot)
+        .disabled(!item.connected)
+        .trailing(div().flex_none().text_size(px(11.)).text_color(color).child(format!("on {} · {}", item.env_label, item.status)))
+        .tooltip(format!("{}\n{hint}", item.title));
+    if item.connected {
+        let (state, env_id, thread_id) = (ctx.state.clone(), item.environment_id.clone(), item.thread_id.clone());
+        row = row.on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_linked_thread(&env_id, &thread_id, cx)));
+    }
+    row.into_any_element()
+}
+
+pub fn lineage(
+    ctx: &Ctx,
+    rows: &Relationships,
+    thread_id: Option<&str>,
+    separated: bool,
+    density: CardDensity,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    if !ctx.details.read(cx).shows("lineage") || !item_visible_at_density("lineage", density) || !rows.has_lineage() {
         return None;
     }
-    let hidden = rows.lineage.len().saturating_sub(shown);
-    let rendered: Vec<AnyElement> = rows.lineage.iter().take(shown).map(|row| relationship_row(ctx, row, rows.merge.as_ref(), cx)).collect();
-    let list = v_flex().id("details-lineage").max_h(px(216.)).overflow_y_scroll().children(rendered);
-    let more = (hidden > 0).then(|| Row::new("lineage-more", format!("Show {} more", hidden.min(LINEAGE_PAGE))).icon(Icon::Plus).on_click(on_more));
-    Some(section(separated, Some("Lineage".into()), cx).child(list).children(more).into_any_element())
+    let key_thread = thread_id.unwrap_or("none");
+    let shown_state = window.use_keyed_state(SharedString::from(format!("details-lineage-shown:{key_thread}")), cx, |_, _| LINEAGE_INITIAL);
+    let shown = *shown_state.read(cx);
+    let expanded_rows: Vec<&LineageRow> = rows.related.iter().chain(&rows.active).collect();
+    let hidden = expanded_rows.len().saturating_sub(shown);
+    let mut rendered: Vec<AnyElement> = rows.delegated_from.iter().map(|item| delegated_from_row(ctx, item, cx)).collect();
+    rendered.extend(expanded_rows.iter().take(shown).map(|row| relationship_row(ctx, row, rows.merge.as_ref(), window, cx)));
+    let more = (hidden > 0).then(|| {
+        Row::new("lineage-more", format!("Show {} more", hidden.min(LINEAGE_PAGE))).icon(Icon::Plus).on_click({
+            let shown_state = shown_state.clone();
+            move |_, _, cx| shown_state.update(cx, |count, cx| { *count += LINEAGE_PAGE; cx.notify(); })
+        })
+    });
+    let previous_block = (!rows.previous.is_empty()).then(|| {
+        let prev_open = window.use_keyed_state(SharedString::from(format!("details-prev-open:{key_thread}")), cx, |_, _| false);
+        let prev_shown = window.use_keyed_state(SharedString::from(format!("details-prev-shown:{key_thread}")), cx, |_, _| LINEAGE_INITIAL);
+        let is_open = *prev_open.read(cx);
+        let shown_prev = *prev_shown.read(cx);
+        let failed_count = rows.previous.iter().filter(|row| row.failed).count();
+        let p = palette(cx);
+        let trailing = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .when(failed_count > 0, |this| {
+                this.child(div().text_size(px(11.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.destructive)).child(format!("{failed_count} failed")))
+            })
+            .when(!is_open, |this| {
+                this.child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(rows.previous.len().to_string()))
+            })
+            .child((if is_open { Icon::ChevronDown } else { Icon::ChevronRight }).sized(px(14.)).text_color(hsla(p.muted_foreground)));
+        let toggle = Row::new("lineage-previous-toggle", "Previous agents")
+            .icon(Icon::Bot)
+            .trailing(trailing)
+            .on_click({
+                let prev_open = prev_open.clone();
+                move |_, _, cx| prev_open.update(cx, |open, cx| { *open = !*open; cx.notify(); })
+            });
+        let mut group = v_flex().w_full().child(toggle);
+        if is_open {
+            let prev_hidden = rows.previous.len().saturating_sub(shown_prev);
+            let prev_items: Vec<AnyElement> =
+                rows.previous.iter().take(shown_prev).map(|row| relationship_row(ctx, row, rows.merge.as_ref(), window, cx)).collect();
+            let prev_more = (prev_hidden > 0).then(|| {
+                Row::new("lineage-previous-more", format!("Show {} more", prev_hidden.min(LINEAGE_PAGE))).icon(Icon::Plus).on_click({
+                    let prev_shown = prev_shown.clone();
+                    move |_, _, cx| prev_shown.update(cx, |count, cx| { *count += LINEAGE_PAGE; cx.notify(); })
+                })
+            });
+            group = group.child(v_flex().w_full().children(prev_items).children(prev_more));
+        }
+        group.into_any_element()
+    });
+    if let Some(more_row) = more {
+        rendered.push(more_row.into_any_element());
+    }
+    if let Some(prev) = previous_block {
+        rendered.push(prev);
+    }
+    rendered.extend(rows.remote_subagents.iter().map(|item| remote_subagent_row(ctx, item, cx)));
+    let heading = rows.show_heading.then(|| {
+        if rows.running_count > 0 { format!("Lineage · {} running", rows.running_count) } else { "Lineage".to_owned() }.into()
+    });
+    let action = rows.can_detach.then(|| {
+        let state = ctx.state.clone();
+        crate::right_panel::Button::new("lineage-more-actions")
+            .icon(Icon::Ellipsis)
+            .icon_size(12.)
+            .tooltip("More thread actions")
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+                let state = state.clone();
+                menu.min_w(px(ROW_WIDTH)).item(
+                    PopupMenuItem::new("Disconnect agent session")
+                        .icon(menu_icon(Icon::Power))
+                        .on_click(move |_, _, cx| state.update(cx, |state, cx| state.detach_provider_session(cx))),
+                )
+            })
+            .into_any_element()
+    });
+    let list = (!rendered.is_empty()).then(|| v_flex().id("details-lineage").max_h(px(216.)).overflow_y_scroll().children(rendered));
+    Some(section_with_action(separated, heading, action, false, cx).children(list).into_any_element())
 }
 
 /// The thread's side chats, which open in their right panel tab.
-pub fn side_chats(ctx: &Ctx, rows: &Relationships, separated: bool, density: CardDensity, cx: &App) -> Option<AnyElement> {
+pub fn side_chats(ctx: &Ctx, rows: &Relationships, separated: bool, density: CardDensity, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     if !ctx.details.read(cx).shows("sideChats") || !item_visible_at_density("sideChats", density) || rows.side_chats.is_empty() {
         return None;
     }
-    let rendered: Vec<AnyElement> = rows.side_chats.iter().map(|row| relationship_row(ctx, row, None, cx)).collect();
+    let heading = if rows.running_side_chats > 0 {
+        format!("Side chats · {} running", rows.running_side_chats)
+    } else {
+        "Side chats".to_owned()
+    };
+    let rendered: Vec<AnyElement> = rows.side_chats.iter().map(|row| relationship_row(ctx, row, None, window, cx)).collect();
     let list = v_flex().id("details-side-chats").max_h(px(216.)).overflow_y_scroll().children(rendered);
-    Some(section(separated, Some("Side chats".into()), cx).child(list).into_any_element())
+    Some(section(separated, Some(heading.into()), cx).child(list).into_any_element())
 }

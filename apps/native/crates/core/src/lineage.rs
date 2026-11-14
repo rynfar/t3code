@@ -325,5 +325,37 @@ pub fn stop_workflow_request(thread_id: &str, subagent_id: &str) -> Value {
     json!({ "threadId": thread_id, "subagentId": subagent_id })
 }
 
+pub const GET_THREAD_TITLES: &str = "orchestration.getThreadTitles";
+
+pub fn thread_titles_request(thread_ids: &[String]) -> Value {
+    json!({ "threadIds": thread_ids })
+}
+
+pub fn decode_thread_titles(value: Value) -> Result<HashMap<String, String>, String> {
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+/// Related thread IDs missing from live shells (excluding subagents that already carry a title).
+pub fn unlisted_title_ids(rows: &[RelationshipRow], listed_ids: &HashSet<&str>, subagents_with_titles: &HashSet<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = rows
+        .iter()
+        .filter(|row| {
+            !listed_ids.contains(row.thread_id.as_str())
+                && (row.edge.kind != RelationshipKind::Subagent || !subagents_with_titles.contains(row.thread_id.as_str()))
+        })
+        .map(|row| row.thread_id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Omitted and archived threads stay reachable; only a settled `getThreadTitles` lookup proves a fork/transfer is deleted.
+pub fn keep_relationship_row(row: &RelationshipRow, unlisted_ids: &HashSet<&str>, resolved_titles: Option<&HashMap<String, String>>) -> bool {
+    row.edge.kind == RelationshipKind::Subagent
+        || !unlisted_ids.contains(row.thread_id.as_str())
+        || resolved_titles.is_none_or(|titles| titles.contains_key(&row.thread_id))
+}
+
 #[cfg(test)]
 mod tests;

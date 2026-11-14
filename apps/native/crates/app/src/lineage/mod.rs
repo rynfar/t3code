@@ -3,7 +3,9 @@
 //! which cannot take messages, `ProviderSubagentBar.tsx` with `NativeChildWorkDialog.tsx`.
 
 mod child_work;
+pub(crate) mod elapsed;
 mod relationships;
+mod titles;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -14,8 +16,8 @@ use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, 
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{ApprovalDecision, respond_to_approval};
 use t3_core::lineage::{
-    ProviderSubagentStatus, effort_label, format_provider_subagent_status, is_active_status,
-    is_provider_native_subagent, provider_subagent_status, reported_model_selection,
+    ProviderSubagentStatus, effort_label, format_model_slug_name, format_provider_subagent_status, is_active_status,
+    is_provider_native_subagent, provider_subagent_status, reported_model_selection, resolve_selectable_model,
 };
 use t3_core::providers;
 use t3_core::timeline::child_inputs;
@@ -28,7 +30,8 @@ use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
 
-pub use relationships::{LineageRow, MergeBack, Relationships, StopAction, relationships};
+pub use relationships::{DelegatedFromRow, LineageRow, MergeBack, Relationships, RemoteSubagentRow, StopAction, relationships_with_titles};
+pub use titles::ThreadTitlesFeed;
 
 /// One child approval: the child thread, its title, and what it asks.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +57,7 @@ struct SubagentBar {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Snapshot {
     approvals: Vec<ChildApproval>,
+    can_respond: bool,
     bar: Option<SubagentBar>,
 }
 
@@ -125,7 +129,7 @@ impl ComposerLineage {
                 }
             }
         }
-        Snapshot { approvals, bar: Self::read_bar(thread_id, state) }
+        Snapshot { approvals, can_respond: state.can_operate_threads(), bar: Self::read_bar(thread_id, state) }
     }
 
     fn read_bar(thread_id: &str, state: &AppState) -> Option<SubagentBar> {
@@ -137,7 +141,7 @@ impl ComposerLineage {
         let selection = &shell.model_selection;
         let config = state.server_config.config.as_ref();
         let provider = config.and_then(|config| config.provider(&selection.instance_id));
-        let model = provider.and_then(|provider| provider.models.iter().find(|model| model.slug == selection.model));
+        let model = provider.and_then(|provider| resolve_selectable_model(&provider.driver, &selection.model, &provider.models));
         let entries = config.map(|config| providers::entries(config, Some(&shell.project_id))).unwrap_or_default();
         let mark = entries.iter().find(|entry| entry.instance_id() == selection.instance_id).map(|entry| ProviderMark::of(entry, &entries));
         let reported = projection.and_then(reported_model_selection);
@@ -145,7 +149,9 @@ impl ComposerLineage {
             thread_id: thread_id.to_owned(),
             parent_id: shell.lineage.parent_thread_id.clone(),
             mark,
-            model_label: model.map_or_else(|| selection.model.clone(), |model| providers::trigger_model_name(model).to_owned()),
+            model_label: model
+                .map(|model| providers::trigger_model_name(model).to_owned())
+                .unwrap_or_else(|| format_model_slug_name(&selection.model)),
             effort_label: effort_label(selection, model, reported.as_ref()),
             status: projection.and_then(provider_subagent_status),
             child_work: provider.is_some_and(|provider| provider.driver == "antigravity"),
@@ -188,7 +194,7 @@ impl ComposerLineage {
     }
 
     fn respond(&mut self, thread_id: String, request_id: String, decision: ApprovalDecision, cx: &mut Context<Self>) {
-        if !self.responding.insert(request_id.clone()) {
+        if !self.snapshot.can_respond || !self.responding.insert(request_id.clone()) {
             return;
         }
         self.errors.remove(&request_id);
@@ -221,7 +227,7 @@ impl ComposerLineage {
                 let variant = if decision == ApprovalDecision::Accept { ButtonVariant::Default } else { ButtonVariant::Outline };
                 ActionButton::new(SharedString::from(format!("child-approval-{}-{}", approval.request_id, decision.as_str())), variant, ButtonSize::Xs)
                     .label(option.label.clone())
-                    .disabled(responding || !approval.live)
+                    .disabled(!self.snapshot.can_respond || responding || !approval.live)
                     .on_click(cx.listener(move |this, _, _, cx| this.respond(thread_id.clone(), request_id.clone(), decision, cx)))
                     .into_any_element()
             })
@@ -374,5 +380,86 @@ impl Render for ComposerLineage {
             )
             .children(self.child_work.clone())
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn subagent_bar_resolves_alias_and_ultracode_effort_plus_readonly_child_approvals(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (ro_client, mut ro_fixture) = t3_client::supervisor::ClientFixture::handle(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": [t3_core::auth::ORCHESTRATION_READ_SCOPE]
+            }))
+            .unwrap(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell;
+            shell.snapshot.as_mut().unwrap().threads.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sub-native", "projectId": "checkout-a", "title": "Worker",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "lastVisitedAt": null,
+                    "providerInstanceId": "claude",
+                    "modelSelection": {"instanceId":"claude","model":"opus-latest","options":[{"id":"effort","value":"ultracode"}]},
+                    "runtimeMode": "auto", "interactionMode": "default",
+                    "lineage": {"rootThreadId":"menu-thread","parentThreadId":"menu-thread","relationshipToParent":"subagent"},
+                    "creationSource": "provider",
+                    "status": "idle", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+                }))
+                .unwrap(),
+            );
+            let mut config = state.server_config.config.clone().unwrap_or_default();
+            let claude: t3_core::server_config::ServerProvider = serde_json::from_value(serde_json::json!({
+                "instanceId": "claude",
+                "driver": "claudeAgent",
+                "displayName": "Claude",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "models": [{
+                    "slug": "claude-opus-4-7",
+                    "name": "Claude Opus 4.7",
+                    "isCustom": false,
+                    "aliases": ["opus-latest"],
+                    "capabilities": {"optionDescriptors": [
+                        {"id": "ultracode", "label": "Ultracode", "type": "boolean"},
+                        {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "xhigh", "label": "Extra High"}]}
+                    ]}
+                }]
+            }))
+            .unwrap();
+            config.providers.push(claude);
+            let mut server_config = state.server_config.clone();
+            server_config.config = Some(config);
+            state.install_active_environment(
+                ro_client,
+                shell,
+                server_config,
+                t3_client::supervisor::ConnectionStatus::Connected,
+                cx,
+            );
+            state.select_thread("sub-native", cx);
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| ComposerLineage::new(state.clone(), cx));
+        let _ = ro_fixture.take_commands();
+        vcx.update(|_, cx| {
+            view.read_with(cx, |lineage, _| {
+                assert!(!lineage.snapshot.can_respond);
+                let bar = lineage.snapshot.bar.as_ref().expect("subagent bar shown");
+                assert_eq!(bar.model_label, "Claude Opus 4.7");
+                assert_eq!(bar.effort_label.as_deref(), Some("Extra High"));
+            });
+            view.update(cx, |lineage, cx| lineage.respond("sub-native".into(), "req-1".into(), ApprovalDecision::Accept, cx));
+        });
+        assert!(ro_fixture.take_commands().is_empty(), "read-only connection must not dispatch approval response");
     }
 }
