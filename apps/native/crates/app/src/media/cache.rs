@@ -63,6 +63,13 @@ pub enum ImageState {
     Failed(SharedString),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoUrlState {
+    Loading,
+    Ready(String),
+    Unavailable(SharedString),
+}
+
 struct Encoded {
     bytes: Arc<[u8]>,
     used: u64,
@@ -129,9 +136,19 @@ impl MediaCache {
         }
     }
 
+    fn environment_key(&self, source: &MediaSource, cx: &App) -> Option<Arc<str>> {
+        if let Some(environment) = self.state.read(cx).environment() {
+            Some(Arc::from(environment))
+        } else if matches!(source, MediaSource::Direct(_)) {
+            Some(Arc::from("direct"))
+        } else {
+            None
+        }
+    }
+
     fn key(&self, source: &MediaSource, cx: &App) -> Option<Key> {
-        let environment = self.state.read(cx).environment()?;
-        let mut key = Key { environment: Arc::from(environment), source: source.clone(), content: None };
+        let environment = self.environment_key(source, cx)?;
+        let mut key = Key { environment, source: source.clone(), content: None };
         if matches!(source, MediaSource::Asset(_)) {
             key.content = Some(self.revisions.shown_asset(&key)?.ok()?.content_key());
         }
@@ -150,7 +167,7 @@ impl MediaCache {
     }
 
     pub(super) fn resource_key(&self, source: &MediaSource, cx: &App) -> Option<Key> {
-        Some(Key { environment: self.state.read(cx).environment()?.into(), source: source.clone(), content: None })
+        Some(Key { environment: self.environment_key(source, cx)?, source: source.clone(), content: None })
     }
 
     pub(super) fn source_visible(&self, key: &Key) -> bool {
@@ -170,6 +187,97 @@ impl MediaCache {
         if remount { self.refresh_remount(&resource, scope.owner, cx); }
         if changed { self.schedule_refresh(window, cx); }
         image
+    }
+
+    /// Resolves a video URL for `source`, tracking visibility so expiring minted URLs refresh
+    /// while the player stays mounted and notifying `owner` when ready.
+    pub fn visible_video(
+        &mut self,
+        source: &MediaSource,
+        scope: Option<&super::MediaScope>,
+        owner: EntityId,
+        consumer: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> VideoUrlState {
+        let revision = scope.and_then(|scope| super::revision_for(source, scope));
+        let Some(resource) = self.resource_key(source, cx) else {
+            return match source {
+                MediaSource::Direct(url) => VideoUrlState::Ready(url.clone()),
+                MediaSource::Asset(resource) => match resource.fallback_url() {
+                    Some(url) => VideoUrlState::Ready(url.to_owned()),
+                    None => VideoUrlState::Loading,
+                },
+            };
+        };
+        let remount = !self.source_visible(&resource);
+        self.refresh_window = Some(window.window_handle());
+        let state = self.video_url(source, revision, owner, cx);
+        let key = self.key(source, cx).unwrap_or_else(|| resource.clone());
+        let previous = self.visibility.get(consumer).cloned();
+        let changed = self.visibility.set(consumer, Some((key, Variant::Full)));
+        self.release_unused(previous);
+        self.consumer_owners.insert(consumer, owner);
+        if remount {
+            self.refresh_remount(&resource, owner, cx);
+        }
+        if changed {
+            self.schedule_refresh(window, cx);
+        }
+        state
+    }
+
+    /// Resolves a playable URL for `source` without decoding image pixels.
+    pub fn video_url(
+        &mut self,
+        source: &MediaSource,
+        revision: Option<&str>,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+    ) -> VideoUrlState {
+        match source {
+            MediaSource::Direct(url) => VideoUrlState::Ready(url.clone()),
+            MediaSource::Asset(resource) => {
+                let Some(environment) = self.state.read(cx).environment().map(str::to_owned) else {
+                    return match resource.fallback_url() {
+                        Some(url) => VideoUrlState::Ready(url.to_owned()),
+                        None => VideoUrlState::Loading,
+                    };
+                };
+                let resource_key = Key {
+                    environment: Arc::from(environment.as_str()),
+                    source: source.clone(),
+                    content: None,
+                };
+                self.refresh_asset(&resource_key, revision, owner, cx);
+                match self.revisions.shown_url(&resource_key) {
+                    Some(Ok(relative_url)) => {
+                        match t3_core::media::resolve_asset_url(&environment, relative_url) {
+                            Some(url) => VideoUrlState::Ready(url),
+                            None => VideoUrlState::Unavailable("Video unavailable.".into()),
+                        }
+                    }
+                    Some(Err(message)) => VideoUrlState::Unavailable(message.to_owned().into()),
+                    None => VideoUrlState::Loading,
+                }
+            }
+        }
+    }
+
+    /// Clears a failed or expired minted video record so the next read re-mints immediately.
+    pub fn retry_video(
+        &mut self,
+        source: &MediaSource,
+        revision: Option<&str>,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(resource_key) = self.resource_key(source, cx) {
+            self.revisions.reset(&resource_key);
+            self.refresh_asset(&resource_key, revision, owner, cx);
+            let app: &mut App = cx;
+            app.notify(owner);
+        }
     }
 
     fn release_unused(&mut self, previous: Option<(Key, Variant)>) {
@@ -193,8 +301,8 @@ impl MediaCache {
     /// when it arrives.
     pub fn image(&mut self, source: &MediaSource, variant: Variant, owner: EntityId, revision: Option<&str>, cx: &mut Context<Self>) -> ImageState {
         self.frame += 1;
-        let Some(environment) = self.state.read(cx).environment() else { return ImageState::Loading };
-        let resource_key = Key { environment: Arc::from(environment), source: source.clone(), content: None };
+        let Some(environment) = self.environment_key(source, cx) else { return ImageState::Loading };
+        let resource_key = Key { environment, source: source.clone(), content: None };
         self.refresh_asset(&resource_key, revision, owner, cx);
         if let Some(Err(message)) = self.revisions.shown_url(&resource_key) { return ImageState::Failed(message.to_owned().into()); }
         let Some(key) = self.key(source, cx) else { return ImageState::Loading };
@@ -270,8 +378,9 @@ impl MediaCache {
         let asset_url = if cached.is_none() && matches!(key.source, MediaSource::Asset(_)) {
             Some(self.asset_for_fetch(&resource_key, owner, cx)?.relative_url)
         } else { None };
+        let is_data_uri = matches!(&key.source, MediaSource::Direct(uri) if uri.len() > 5 && uri[..5].eq_ignore_ascii_case("data:"));
         let state = self.state.read(cx);
-        let client = state.client_handle()?;
+        let client = if is_data_uri { state.client_handle() } else { Some(state.client_handle()?) };
         let runtime = state.runtime().clone();
         let (permits, svg, source, max_edge) = (self.permits.clone(), cx.svg_renderer(), key.source.clone(), variant.max_edge());
         let job = runtime.spawn(async move {
@@ -281,8 +390,19 @@ impl MediaCache {
                 Some(bytes) => (bytes, None),
                 None => {
                     let fetched = match asset_url {
-                        Some(url) => t3_client::assets::fetch_signed_media(&client, &url).await.map_err(|message| (message, Some(url)))?,
-                        None => t3_client::assets::fetch_media(&client, &source).await.map_err(|message| (message, None))?,
+                        Some(url) => {
+                            let client = client.as_ref().ok_or_else(|| ("Image unavailable.".to_owned(), None))?;
+                            t3_client::assets::fetch_signed_media(client, &url).await.map_err(|message| (message, Some(url)))?
+                        }
+                        None => match &source {
+                            MediaSource::Direct(uri) if uri.len() > 5 && uri[..5].eq_ignore_ascii_case("data:") => {
+                                t3_client::assets::fetch_data_media(uri).map_err(|message| (message, None))?
+                            }
+                            _ => {
+                                let client = client.as_ref().ok_or_else(|| ("Image unavailable.".to_owned(), None))?;
+                                t3_client::assets::fetch_media(client, &source).await.map_err(|message| (message, None))?
+                            }
+                        },
                     };
                     (Arc::<[u8]>::from(fetched.bytes), fetched.dimensions)
                 }
@@ -381,5 +501,50 @@ impl MediaCache {
     pub fn begin_frame(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.images.retain(|_, slot| !matches!(slot, Slot::Failed { at, .. } if at.elapsed() >= RETRY_AFTER));
         self.trim(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::AppContext;
+
+    use super::*;
+
+    #[gpui::test]
+    fn video_url_resolves_direct_and_source_control_fallback(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let cache = cx.update(|cx| {
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            super::super::cache(&state, cx)
+        });
+        cache.update(cx, |cache, cx| {
+            let owner = cx.entity_id();
+            assert_eq!(
+                cache.video_url(&MediaSource::Direct("https://example.com/demo.mp4".into()), None, owner, cx),
+                VideoUrlState::Ready("https://example.com/demo.mp4".into())
+            );
+            assert_eq!(
+                cache.video_url(
+                    &MediaSource::Asset(AssetResource::SourceControlMedia {
+                        cwd: "/repo".into(),
+                        url: "https://github.com/org/repo/assets/1/2".into(),
+                        repository: Some("org/repo".into()),
+                    }),
+                    None,
+                    owner,
+                    cx,
+                ),
+                VideoUrlState::Ready("https://github.com/org/repo/assets/1/2".into())
+            );
+            assert_eq!(
+                cache.video_url(
+                    &MediaSource::Asset(AssetResource::MediaFile { thread_id: "t1".into(), path: "a.mp4".into() }),
+                    None,
+                    owner,
+                    cx,
+                ),
+                VideoUrlState::Loading
+            );
+        });
     }
 }

@@ -895,9 +895,21 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         Some(markdown_view(&state, cx))
     };
     let images = t3_core::media::image_attachments(attachments);
+    let videos = t3_core::media::video_attachments(&partitioned.videos);
     let inline_media = matches!(attribution, Some(Attribution::Guest | Attribution::Agent));
-    let placement = t3_core::media::media_placement(images.len(), body.is_none(), partitioned.files.len() + partitioned.audios.len(), inline_media);
-    let media = placement.map(|placement| super::media::user_media(id, &images, placement, grouped_with_previous, grouped_with_next, cx));
+    let placement = t3_core::media::media_placement(images.len() + videos.len(), body.is_none(), partitioned.files.len() + partitioned.audios.len(), inline_media);
+    let image_block = (!images.is_empty())
+        .then(|| placement.map(|placement| super::media::user_media(id, &images, placement, grouped_with_previous, grouped_with_next, cx)))
+        .flatten();
+    let video_block = (!videos.is_empty())
+        .then(|| placement.map(|placement| super::media::user_videos(id, &videos, placement, grouped_with_previous, grouped_with_next, cx)))
+        .flatten();
+    let media = match (image_block, video_block) {
+        (Some(image_el), Some(video_el)) => Some(v_flex().gap(px(8.)).child(image_el).child(video_el).into_any_element()),
+        (Some(image_el), None) => Some(image_el),
+        (None, Some(video_el)) => Some(video_el),
+        (None, None) => None,
+    };
     let (media_above, media_in_bubble) = match placement {
         Some(MediaPlacement::InBubble) => (None, media),
         _ => (media, None),

@@ -20,18 +20,33 @@ pub struct MediaBytes {
     pub dimensions: Option<(u32, u32)>,
 }
 
+/// Decodes an inline `data:` media URI without requiring an active server client.
+pub fn fetch_data_media(uri: &str) -> Result<MediaBytes, String> {
+    decode_data_url(uri).map(|bytes| MediaBytes { bytes, dimensions: None }).ok_or_else(|| UNAVAILABLE.to_owned())
+}
+
 pub async fn fetch_media(client: &ClientHandle, source: &MediaSource) -> Result<MediaBytes, String> {
     match source {
-        MediaSource::Direct(uri) if uri.len() > 5 && uri[..5].eq_ignore_ascii_case("data:") => {
-            decode_data_url(uri).map(|bytes| MediaBytes { bytes, dimensions: None }).ok_or_else(|| UNAVAILABLE.to_owned())
-        }
+        MediaSource::Direct(uri) if uri.len() > 5 && uri[..5].eq_ignore_ascii_case("data:") => fetch_data_media(uri),
         MediaSource::Direct(uri) => Ok(MediaBytes { bytes: get(uri).await?, dimensions: None }),
-        MediaSource::Asset(resource) => {
-            let minted = mint_media_url(client, resource).await?;
-            let mut media = fetch_signed_media(client, &minted.relative_url).await?;
-            media.dimensions = minted.dimensions;
-            Ok(media)
-        }
+        MediaSource::Asset(resource) => match mint_media_url(client, resource).await {
+            Ok(minted) => {
+                match fetch_signed_media(client, &minted.relative_url).await {
+                    Ok(mut media) => {
+                        media.dimensions = minted.dimensions;
+                        Ok(media)
+                    }
+                    Err(error) => match resource.fallback_url() {
+                        Some(fallback) => Ok(MediaBytes { bytes: get(fallback).await?, dimensions: None }),
+                        None => Err(error),
+                    },
+                }
+            }
+            Err(error) => match resource.fallback_url() {
+                Some(fallback) => Ok(MediaBytes { bytes: get(fallback).await?, dimensions: None }),
+                None => Err(error),
+            },
+        },
     }
 }
 
@@ -44,7 +59,8 @@ pub async fn mint_media_url(client: &ClientHandle, resource: &AssetResource) -> 
     decode_asset_url(&minted)
 }
 
-/// Uses an already connected local environment only for web's three missing-host errors.
+/// Uses an already connected local environment only for web's three missing-host errors, or the
+/// direct host URL for `SourceControlMedia` (`fallbackSrc={hostMediaUrl}`).
 /// Unknown error tags and failed fallbacks use the same unavailable presentation.
 pub async fn mint_media_url_with_fallback(
     client: &ClientHandle,
@@ -57,13 +73,21 @@ pub async fn mint_media_url_with_fallback(
         Err(error) => error,
     };
     let tag = match &error { crate::session::RpcError::Failure(error) => error.tag.as_deref(), _ => None };
-    if !t3_core::media::allows_local_media_fallback(resource, tag, true) { return Err(UNAVAILABLE.into()); }
-    if let Some(local) = local.await.filter(|local| local.environment() != client.environment())
+    if t3_core::media::allows_local_media_fallback(resource, tag, true)
+        && let Some(local) = local.await.filter(|local| local.environment() != client.environment())
         && let Ok(mut asset) = mint_media_url(&local, resource).await
         && let Some(url) = t3_core::media::resolve_asset_url(local.environment(), &asset.relative_url)
     {
         asset.relative_url = url;
         return Ok(asset);
+    }
+    if let Some(fallback) = resource.fallback_url() {
+        return Ok(AssetUrl {
+            relative_url: fallback.to_owned(),
+            dimensions: None,
+            expires_at: 0.,
+            file_revision: None,
+        });
     }
     Err(UNAVAILABLE.into())
 }
@@ -130,5 +154,52 @@ mod tests {
         release.send(()).unwrap();
         assert!(held, "cancelled async callers must not admit another blocking decode");
         let _finished = permits.acquire_owned().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_control_media_sends_repository_and_falls_back_to_host_url_when_mint_fails() {
+        use crate::supervisor;
+        use crate::test_server::FakeServer;
+        use serde_json::json;
+        use t3_core::media::AssetResource;
+
+        let mut server = FakeServer::start().await;
+        let (handle, _events) = supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut socket = server.connection().await;
+        let config = socket.request(t3_core::commands::method::SUBSCRIBE_SERVER_CONFIG).await;
+        socket.chunk(&config, json!([{"type":"snapshot","config":{}}])).await;
+
+        let fallback = "https://raw.githubusercontent.com/owner/repo/main/shot.png";
+        let resource = AssetResource::SourceControlMedia {
+            cwd: "/repo".into(),
+            url: fallback.into(),
+            repository: Some("upstream/repo".into()),
+        };
+
+        let mint_ok = tokio::spawn({
+            let handle = handle.clone();
+            let resource = resource.clone();
+            async move { super::mint_media_url_with_fallback(&handle, &resource, async { None }).await }
+        });
+        let req = socket.request(t3_core::media::CREATE_ASSET_URL).await;
+        assert_eq!(req["payload"], resource.create_url_request());
+        assert_eq!(req["payload"]["resource"]["repository"], "upstream/repo");
+        socket
+            .send(json!({"_tag":"Exit","requestId":req["id"],"exit":{"_tag":"Success","value":{"relativeUrl":"/api/assets/signed","expiresAt":9999999999.0}}}))
+            .await;
+        let ok = mint_ok.await.unwrap().unwrap();
+        assert_eq!(ok.relative_url, "/api/assets/signed");
+
+        let mint_fail = tokio::spawn({
+            let handle = handle.clone();
+            let resource = resource.clone();
+            async move { super::mint_media_url_with_fallback(&handle, &resource, async { None }).await }
+        });
+        let req2 = socket.request(t3_core::media::CREATE_ASSET_URL).await;
+        socket
+            .send(json!({"_tag":"Exit","requestId":req2["id"],"exit":{"_tag":"Failure","cause":{"_tag":"Fail","error":{"_tag":"NotFound","message":"missing"}}}}))
+            .await;
+        let fallen_back = mint_fail.await.unwrap().unwrap();
+        assert_eq!(fallen_back.relative_url, fallback);
     }
 }

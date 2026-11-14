@@ -76,6 +76,10 @@ enum Content {
     Folder,
     Failed(ReadFailure),
     Image(ImageState),
+    Video {
+        source: t3_core::media::MediaSource,
+        player: Entity<crate::media::video::VideoPlayer>,
+    },
 }
 
 pub struct Preview {
@@ -136,6 +140,8 @@ impl Preview {
             self.key = key.clone();
             self.generation += 1;
             self._fetch = None;
+            crate::media::video::retire_owner(cx.entity_id(), cx);
+            self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
             let cached = key.as_ref().and_then(|key| self.cache.iter().position(|file| file.key == *key));
             match (key, cached) {
                 (None, _) => self.replace_content(Content::Empty, cx),
@@ -208,6 +214,50 @@ impl Preview {
         }
         self.generation += 1;
         let generation = self.generation;
+        if t3_core::media::is_workspace_video_preview_path(&key.path) {
+            self._fetch = None;
+            let source = t3_core::media::MediaSource::Asset(t3_core::media::AssetResource::MediaFile {
+                thread_id: target.root.workspace.thread_id.clone(),
+                path: key.path.clone(),
+            });
+            let scope = crate::media::MediaScope {
+                owner: cx.entity_id(),
+                thread_id: Some(target.root.workspace.thread_id.clone()),
+                workspace_root: Some(target.root.workspace.cwd.clone()),
+                workspace_mutation_id: self.mutation.clone(),
+                source_control_media: false,
+                source_control_media_repository: None,
+                viewer: self.viewer.downgrade(),
+            };
+            let viewer_handle = self.viewer.downgrade();
+            let viewer_item = crate::media::ViewerItem::video(source.clone(), key.path.clone());
+            let expand_scope = scope.clone();
+            let options = crate::media::video::VideoPlayerOptions {
+                source: source.clone(),
+                name: key.path.clone().into(),
+                revision: self.mutation.clone(),
+                hints: t3_core::media::MediaHints { width: None, height: None, explicit_video: true },
+                modal: false,
+                max_width: 820.,
+                max_height: 540.,
+                on_expand: Some(std::sync::Arc::new(move |window, cx| {
+                    let _ = viewer_handle.update(cx, |viewer, cx| viewer.open_with_scope(vec![viewer_item.clone()], 0, Some(expand_scope.clone()), window, cx));
+                })),
+                on_open_external: None,
+                on_close_modal: None,
+            };
+            if let Content::Video { source: existing, player } = &mut self.content
+                && *existing == source
+            {
+                player.update(cx, |player, cx| player.update_options(options, Some(scope), cx));
+                cx.notify();
+                return;
+            }
+            let player = cx.new(|cx| crate::media::video::VideoPlayer::new(options, Some(scope), cx));
+            self.replace_content(Content::Video { source, player }, cx);
+            cx.notify();
+            return;
+        }
         match image_kind(&key.path) {
             Some(kind) => {
                 if !matches!(self.content, Content::Image(_)) {
@@ -343,10 +393,20 @@ impl Preview {
     }
 
     fn render_markdown(&mut self, file: &Rc<TextFile>, cx: &mut Context<Self>) -> AnyElement {
+        let target = self.target.as_ref().unwrap();
         let state = match &self.markdown {
             Some((key, state)) if *key == file.key => state.clone(),
             _ => {
-                let text = mask_frontmatter(&file.contents).into_owned();
+                let raw = mask_frontmatter(&file.contents);
+                let text = t3_core::markdown::prepare_display_markdown_with_raw_html(
+                    &raw,
+                    t3_core::markdown::DisplayMarkdownOptions {
+                        is_dark: cx.theme().is_dark(),
+                        cwd: Some(&target.root.workspace.cwd),
+                        math_enabled: crate::settings::client_settings(cx).math_rendering_enabled(),
+                    },
+                    true,
+                );
                 if let Some(document) = &self.media_document { *document.write().unwrap() = std::sync::Arc::new(t3_core::media::MarkdownMediaDocument::new(std::sync::Arc::from(text.as_str()))); }
                 else { self.media_document = Some(crate::transcript::media_document(std::sync::Arc::from(text.as_str()))); }
                 let state = cx.new(|cx| {
@@ -358,12 +418,13 @@ impl Preview {
                 state
             }
         };
-        let target = self.target.as_ref().unwrap();
         let scope = crate::media::MediaScope {
             owner: cx.entity_id(),
             thread_id: Some(target.root.workspace.thread_id.clone()),
             workspace_root: Some(t3_core::media::markdown_image_base_dir(&target.root.workspace.cwd, &target.path)),
             workspace_mutation_id: self.mutation.clone(),
+            source_control_media: false,
+            source_control_media_repository: None,
             viewer: self.viewer.downgrade(),
         };
         if let Some(current) = &self.media_scope { *current.lock().unwrap() = scope; }
@@ -475,6 +536,14 @@ impl Render for Preview {
             Content::Loading => loading(cx),
             Content::Failed(failure) => self.render_failure(&failure.clone(), cx),
             Content::Image(image) => image.render(cx),
+            Content::Video { player, .. } => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(24.))
+                .child(player.clone())
+                .into_any_element(),
             Content::Text(file) => {
                 let file = file.clone();
                 if self.renders_markdown() { self.render_markdown(&file, cx) } else { self.render_code(window, cx) }
@@ -489,3 +558,46 @@ impl Render for Preview {
 pub(crate) struct MarkdownFixture { pub path: String, pub text: String }
 #[cfg(feature = "snapshot")]
 impl gpui::Global for MarkdownFixture {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn video_file_opens_workspace_video_player(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let preview = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            cx.new(|cx| Preview::new(state, cx))
+        });
+        let target = Target {
+            root: Root {
+                environment: "env-1".into(),
+                workspace: super::super::FileWorkspace {
+                    thread_id: "t-1".into(),
+                    cwd: "/repo".into(),
+                    project_name: "repo".into(),
+                },
+            },
+            path: "demo/clip.mp4".into(),
+            reveal_line: None,
+            reveal_request_id: 0,
+        };
+        preview.update(cx, |preview, cx| {
+            preview.set_target(Some(target), cx);
+            match &preview.content {
+                Content::Video { source, .. } => assert_eq!(
+                    *source,
+                    t3_core::media::MediaSource::Asset(t3_core::media::AssetResource::MediaFile {
+                        thread_id: "t-1".into(),
+                        path: "demo/clip.mp4".into(),
+                    })
+                ),
+                _ => panic!("expected Content::Video for demo/clip.mp4"),
+            }
+        });
+    }
+}
