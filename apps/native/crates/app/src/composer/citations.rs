@@ -7,7 +7,6 @@ use super::{
     controls::{Button, ButtonSize, ButtonVariant, Float, floating, menu_surface},
 };
 use crate::{
-    app_state::AppEvent,
     icons::Icon,
     theme::{hsla, palette},
 };
@@ -24,7 +23,7 @@ pub(super) struct CommentEditor {
 
 impl Composer {
     pub(super) fn add_citation(&mut self, citation: Citation, window: &mut Window, cx: &mut Context<Self>) {
-        if self.answering.is_some() || self.editing_queued().is_some() || !citation.valid() {
+        if self.is_rewinding(cx) || self.answering.is_some() || !citation.valid() {
             return;
         }
         if !self.close_citation_comment("outside-press", window, cx) {
@@ -100,7 +99,7 @@ impl Composer {
     }
 
     pub(super) fn render_citation_chips(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.answering.is_some() || self.editing_queued().is_some() {
+        if self.answering.is_some() {
             return None;
         }
         let prompt = self.prompt(cx);
@@ -130,15 +129,7 @@ impl Composer {
                                 .gap(px(2.))
                                 .child(chip_shell(&format!("citation-{i}"), Icon::Quote, citation.label(), Ink::Accent(p.context_chip_citation), !rewinding, cx).when(!rewinding, |this| {
                                     this.on_click(cx.listener(move |this, _, _, cx| {
-                                        let environment = this.environment_id(cx);
-                                        if go.environment_id != environment {
-                                            return;
-                                        }
-                                        this.state.update(cx, |state, cx| {
-                                            state.select_thread(&go.thread_id, cx);
-                                            state.citation_source = Some(go.clone());
-                                            cx.emit(AppEvent::CitationSource);
-                                        });
+                                        crate::transcript::markdown::links::navigate_to_citation_source(go.clone(), &this.state, cx);
                                     }))
                                 }))
                                 .child(

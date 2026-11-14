@@ -20,6 +20,7 @@ pub mod keybindings;
 pub mod lineage;
 pub mod lists;
 pub mod local_server;
+pub mod markdown;
 pub mod media;
 pub mod mcp_apps;
 pub mod model;

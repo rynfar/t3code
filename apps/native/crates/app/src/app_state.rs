@@ -366,7 +366,16 @@ impl AppState {
         self.composer_review_comment = None;
         self.review_comments.clear();
         self.remove_review_comment = None;
-        self.citation_source = None;
+        let keeping_scoped_citation = matches!(
+            (&self.pending_scoped_route, &self.citation_source),
+            (Some(ScopedRoute { owner, action: ScopedRouteAction::Thread(route_thread) }), Some(citation))
+                if (citation.environment_id == owner.saved_id
+                    || owner.canonical_id.as_deref() == Some(citation.environment_id.as_str()))
+                    && citation.thread_id == *route_thread
+        );
+        if !keeping_scoped_citation {
+            self.citation_source = None;
+        }
         let keeping_scoped_drop = matches!(
             (&self.pending_scoped_route, &self.pending_composer_file_drop),
             (Some(ScopedRoute { owner, action: ScopedRouteAction::Thread(route_thread) }), Some((drop_key, _)))
@@ -493,6 +502,10 @@ impl AppState {
         })
     }
 
+    pub(crate) fn has_pending_scoped_route(&self) -> bool {
+        self.pending_scoped_route.is_some()
+    }
+
     pub(crate) fn navigate_scoped(&mut self, owner: t3_core::sidebar::grouping::EnvironmentOwner, action: ScopedRouteAction, cx: &mut Context<Self>) {
         if !self.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) { return; }
         if let ScopedRouteAction::Thread(id)=&action && self.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(&owner.saved_id,id)).is_some_and(|_| self.scoped_environment(&owner.saved_id).is_some_and(|entry| !entry.summary.threads.iter().any(|row| row.thread.id==*id))) {
@@ -517,6 +530,7 @@ impl AppState {
         if !self.scoped_ready(&route.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
             self.pending_scoped_route = None;
             self.pending_composer_file_drop = None;
+            self.citation_source = None;
             if let ScopedRouteAction::Project { group, action } = route.action {
                 self.finish_scoped_project_action(&group, action, cx);
             }
@@ -654,6 +668,7 @@ impl AppState {
 
     pub(crate) fn close_selected_thread(&mut self, cx: &mut Context<Self>) {
         self.pending_composer_file_drop = None;
+        self.citation_source = None;
         if let (Some(client), Some(thread_id)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&thread_id);
         }
@@ -691,6 +706,14 @@ impl AppState {
             !pending_drop_matches(key, self.environments.active.as_deref(), thread_id)
         }) {
             self.pending_composer_file_drop = None;
+        }
+        if self.citation_source.as_ref().is_some_and(|citation| {
+            citation.thread_id != thread_id
+                || (!citation.environment_id.is_empty()
+                    && self.environment() != Some(citation.environment_id.as_str())
+                    && self.environments.active.as_deref() != Some(citation.environment_id.as_str()))
+        }) {
+            self.citation_source = None;
         }
         if !self.thread_route_visible(thread_id) {
             self.pending_composer_file_drop = None;
@@ -794,6 +817,7 @@ impl AppState {
         self.notification_route = None;
         self.pending_thread_find = None;
         self.pending_composer_file_drop = None;
+        self.citation_source = None;
         if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
             return self.set_pull_requests_open(false, cx);
         }
@@ -815,6 +839,7 @@ impl AppState {
         self.notification_route = None;
         self.pending_thread_find = None;
         self.pending_composer_file_drop = None;
+        self.citation_source = None;
         if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&previous);
         }

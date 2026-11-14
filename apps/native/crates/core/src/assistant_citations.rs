@@ -596,6 +596,216 @@ pub fn unique_quote_range(source: &str, quote: &str) -> Option<Range<usize>> {
     Some(raw_start?..raw_end)
 }
 
+/// Contextual hints collected from GPUI text views so repeated quotes in the same assistant
+/// message can be disambiguated deterministically rather than rejected.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionHint<'a> {
+    pub byte_range: Option<Range<usize>>,
+    pub source_quote: Option<&'a str>,
+    pub vertical_fraction: Option<f32>,
+    pub horizontal_fraction: Option<f32>,
+}
+
+/// Result of locating a saved citation inside rendered/normalized assistant text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitationRangeMatch {
+    pub range: Range<usize>,
+    pub exact_offset: bool,
+}
+
+/// User-message presentation with `t3-citation://v1/...` citations extracted into chips while
+/// keeping inline sentence citations readable and clickable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedCitations {
+    pub display_text: String,
+    pub citations: Vec<Citation>,
+}
+
+impl Citation {
+    /// Like [`Self::from_rendered_selection`], but uses UI selection hints (`byte_range`, pointer
+    /// `vertical_fraction`/`horizontal_fraction`, or markdown `source_quote`) to pick the right
+    /// occurrence when `quote` appears multiple times in `source`.
+    pub fn from_rendered_selection_with_hint(
+        environment: String,
+        thread: String,
+        message: String,
+        source: &str,
+        quote: &str,
+        hint: &SelectionHint<'_>,
+    ) -> Option<Self> {
+        let quote = quote.trim_end();
+        let range = disambiguate_quote_range(source, quote, hint)?;
+        let mut citation = Self::from_selection(environment, thread, message, source, range)?;
+        citation.text = quote.chars().take(MAX_TEXT + 1).collect();
+        Some(citation)
+    }
+}
+
+/// Resolves `quote` inside `source`, disambiguating multiple occurrences with `hint`.
+pub fn disambiguate_quote_range(source: &str, quote: &str, hint: &SelectionHint<'_>) -> Option<Range<usize>> {
+    let candidates = quote_ranges(source, quote);
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+
+    if let Some(exact) = &hint.byte_range {
+        return candidates
+            .into_iter()
+            .min_by_key(|r| r.start.abs_diff(exact.start) + r.end.abs_diff(exact.end));
+    }
+
+    if let Some(v_frac) = hint.vertical_fraction {
+        let clamped_v = v_frac.clamp(0.0, 1.0);
+        let total_len = source.len().max(1) as f32;
+        let h_target = hint.horizontal_fraction.map(|h| h.clamp(0.0, 1.0));
+        return candidates.into_iter().min_by(|a, b| {
+            let a_mid = ((a.start + a.end) as f32 * 0.5) / total_len;
+            let b_mid = ((b.start + b.end) as f32 * 0.5) / total_len;
+            let da = (a_mid - clamped_v).abs();
+            let db = (b_mid - clamped_v).abs();
+            if let Some(h) = h_target
+                && (da - db).abs() < 0.06
+            {
+                let ha = horizontal_line_fraction(source, a);
+                let hb = horizontal_line_fraction(source, b);
+                return (ha - h).abs().total_cmp(&(hb - h).abs());
+            }
+            da.total_cmp(&db)
+        });
+    }
+
+    if hint.source_quote.is_some() {
+        // Without positional hints, pick the first match only when no better disambiguator exists.
+        return Some(candidates[0].clone());
+    }
+
+    None
+}
+
+fn horizontal_line_fraction(source: &str, range: &Range<usize>) -> f32 {
+    let before = &source[..range.start.min(source.len())];
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let after = &source[range.start.min(source.len())..];
+    let line_end = after.find('\n').map(|i| range.start + i).unwrap_or(source.len());
+    let line_len = line_end.saturating_sub(line_start).max(1) as f32;
+    let mid = ((range.start + range.end) as f32 * 0.5) - line_start as f32;
+    (mid / line_len).clamp(0.0, 1.0)
+}
+
+/// Finds `citation`'s quoted excerpt in `rendered_text`, returning byte offsets into `rendered_text`
+/// and preferring its saved UTF-16 `start..end` span when unchanged, else falling back to
+/// prefix/suffix + nearest distance (`findAssistantCitationText`).
+pub fn find_citation_range(rendered_text: &str, citation: &Citation) -> Option<CitationRangeMatch> {
+    let source = normalize(rendered_text);
+    let from_byte = utf16_to_utf8_offset(&source, citation.start);
+    let to_byte = utf16_to_utf8_offset(&source, citation.end);
+    let expected = normalize(&citation.text);
+    if from_byte < to_byte
+        && to_byte <= source.len()
+        && let Some(slice) = source.get(from_byte..to_byte)
+        && normalize(slice) == expected
+        && let Some(mut mapped) = raw_ranges(rendered_text, std::slice::from_ref(&(from_byte..to_byte)))
+        && let Some(raw_range) = mapped.pop()
+    {
+        return Some(CitationRangeMatch { range: raw_range, exact_offset: true });
+    }
+
+    let prefix = normalize(&citation.prefix);
+    let suffix = normalize(&citation.suffix);
+    let approx_cursor = from_byte.min(source.len());
+    let approx_raw = raw_ranges(rendered_text, std::slice::from_ref(&(approx_cursor..approx_cursor)))
+        .and_then(|mut v| v.pop())
+        .map(|r| r.start)
+        .unwrap_or(from_byte);
+    let candidates = quote_ranges(rendered_text, &citation.text);
+    let best = candidates.into_iter().min_by_key(|r| {
+        let before = normalize(&rendered_text[..r.start]);
+        let after = normalize(&rendered_text[r.end..]);
+        let prefix_ok = prefix.is_empty() || before.ends_with(&prefix);
+        let suffix_ok = suffix.is_empty() || after.starts_with(&suffix);
+        let penalty = usize::from(!prefix_ok) + usize::from(!suffix_ok);
+        (penalty, r.start.abs_diff(approx_raw))
+    })?;
+    Some(CitationRangeMatch { range: best, exact_offset: false })
+}
+
+fn utf16_to_utf8_offset(text: &str, target_units: usize) -> usize {
+    let mut units = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if units >= target_units {
+            return byte_idx;
+        }
+        units += ch.len_utf16();
+    }
+    text.len()
+}
+
+/// Extracts `t3-citation://v1/...` references from a sent user message and cleans standalone tokens
+/// out of `display_text` (replacing inline mid-sentence citations with readable clickable labels).
+pub fn present_user_citations(display_text: &str, raw_text: &str) -> PresentedCitations {
+    let citations: Vec<Citation> = collect(raw_text).into_iter().map(|(_, c)| c).collect();
+    let display_matches = collect(display_text);
+    if display_matches.is_empty() {
+        return PresentedCitations {
+            display_text: display_text.to_owned(),
+            citations,
+        };
+    }
+
+    let mut out = String::with_capacity(display_text.len());
+    let mut cursor = 0usize;
+    for (range, citation) in display_matches {
+        out.push_str(&display_text[cursor..range.start]);
+        let before_line = display_text[..range.start].rsplit('\n').next().unwrap_or("");
+        let after_line = display_text[range.end..].split('\n').next().unwrap_or("");
+        let standalone_on_line = before_line.trim().is_empty() && after_line.trim().is_empty();
+        if standalone_on_line {
+            // Collapse the extra newline/spaces left by a chip-only line.
+            if out.ends_with('\n') && display_text[range.end..].starts_with('\n') {
+                // Keep at most a single line separator cleanly via post-trim.
+            }
+        } else {
+            let clean_label = citation.label().replace(['[', ']', '\n'], " ");
+            out.push('[');
+            out.push_str(&clean_label);
+            out.push_str("](");
+            out.push_str(&citation.href());
+            out.push(')');
+        }
+        cursor = range.end;
+    }
+    out.push_str(&display_text[cursor..]);
+    let collapsed = collapse_blank_citation_lines(&out);
+    PresentedCitations {
+        display_text: collapsed,
+        citations,
+    }
+}
+
+fn collapse_blank_citation_lines(input: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut prev_blank = false;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !lines.is_empty() && !prev_blank {
+                lines.push("");
+                prev_blank = true;
+            }
+        } else {
+            lines.push(line.trim_end());
+            prev_blank = false;
+        }
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +945,50 @@ mod tests {
         assert_eq!(collect(&saved)[0].1.comment.as_deref(), Some("shortened"));
         assert!(!anchor.relocate("the link was removed"));
         assert!(!anchor.relocate(&format!("prefix {source} {source}")));
+    }
+
+    #[test]
+    fn disambiguates_repeated_quotes_by_hint_and_locates_citation_ranges() {
+        let source = "alpha token beta\n\nmiddle text here\n\ngamma token delta";
+        let top = Citation::from_rendered_selection_with_hint(
+            "e".into(),
+            "t".into(),
+            "m".into(),
+            source,
+            "token",
+            &SelectionHint { vertical_fraction: Some(0.1), ..Default::default() },
+        )
+        .expect("top occurrence");
+        let bottom = Citation::from_rendered_selection_with_hint(
+            "e".into(),
+            "t".into(),
+            "m".into(),
+            source,
+            "token",
+            &SelectionHint { vertical_fraction: Some(0.9), ..Default::default() },
+        )
+        .expect("bottom occurrence");
+        assert!(top.start < bottom.start);
+        assert_eq!(find_citation_range(source, &bottom), Some(CitationRangeMatch { range: 42..47, exact_offset: true }));
+
+        let shifted = format!("leading shift\n{source}");
+        let relocated = find_citation_range(&shifted, &bottom).expect("nearest relocated match");
+        assert!(!relocated.exact_offset);
+        assert_eq!(&shifted[relocated.range], "token");
+    }
+
+    #[test]
+    fn presents_user_citations_into_chips_while_keeping_inline_sentence_links() {
+        let c1 = citation();
+        let raw = format!("{}\n\nPlease inspect this.", c1.serialize());
+        let presented = present_user_citations(&raw, &raw);
+        assert_eq!(presented.citations.len(), 1);
+        assert_eq!(presented.display_text, "Please inspect this.");
+
+        let inline_raw = format!("Compare {} with details.", c1.serialize());
+        let inline_presented = present_user_citations(&inline_raw, &inline_raw);
+        assert_eq!(inline_presented.citations.len(), 1);
+        assert!(inline_presented.display_text.contains(&format!("[{}]({})", c1.label(), c1.href())));
     }
 
 }

@@ -6,11 +6,11 @@ use crate::app_state::AppEvent;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
-use gpui::{AnyElement, Context, FocusHandle, IntoElement, ParentElement, Pixels, Point, Styled, Window, div, prelude::*, px};
+use crate::transcript::markdown::{MarkdownState, links::{CitationPopoverGlobal, close_sent_citation_popover, navigate_to_citation_source}};
+use gpui::{AnyElement, Bounds, ClipboardItem, Context, FocusHandle, IntoElement, ParentElement, Pixels, Point, Styled, Window, div, prelude::*, px};
 use gpui_base::TextSelection;
-use crate::transcript::markdown::MarkdownState;
 use std::sync::Arc;
-use t3_core::assistant_citations::{self as rules, Citation, CitedMessage, HistoryAction};
+use t3_core::assistant_citations::{self as rules, Citation, CitedMessage, HistoryAction, SelectionHint};
 use t3_core::timeline::Role;
 
 pub(super) struct CitationUi {
@@ -28,9 +28,22 @@ impl CitationUi {
 }
 
 impl ThreadView {
+    #[cfg(test)]
     pub(crate) fn citation_from_markdown_selection(selected: &MarkdownState, source: &str, quote: &str, identity: (String, String, String), cx: &gpui::App) -> Option<Citation> {
         let quote = selected.selection_text(source, quote, cx)?;
         Citation::from_rendered_selection(identity.0, identity.1, identity.2, &rules::markdown_text(source), &quote)
+    }
+
+    pub(crate) fn citation_from_markdown_selection_with_hint(
+        selected: &MarkdownState,
+        source: &str,
+        quote: &str,
+        identity: (String, String, String),
+        hint: &SelectionHint<'_>,
+        cx: &gpui::App,
+    ) -> Option<Citation> {
+        let quote = selected.selection_text(source, quote, cx)?;
+        Citation::from_rendered_selection_with_hint(identity.0, identity.1, identity.2, &rules::markdown_text(source), &quote, hint)
     }
 
     pub(crate) fn capture_citation_selection(
@@ -38,7 +51,7 @@ impl ThreadView {
         selected: MarkdownState,
         message: String,
         source: Arc<str>,
-        pointer: Point<Pixels>,
+        (pointer, hint_bounds): (Point<Pixels>, Option<Bounds<Pixels>>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -53,10 +66,23 @@ impl ThreadView {
                     return;
                 }
                 let current = this.entries_cache.entries().iter().any(|entry| matches!(&entry.kind,
-                    t3_core::timeline::EntryKind::Message(current) if current.id == message && *current.text == *source));
+                    t3_core::timeline::EntryKind::Message(current) if current.id == message && (*current.text == *source || current.text.contains(&*source))));
                 if !current { return; }
                 let quote = TextSelection::selected_text(window, cx);
-                let Some(citation) = Self::citation_from_markdown_selection(&selected, &source, &quote, (environment, thread.unwrap_or_default(), message), cx) else { return };
+                let (vertical_fraction, horizontal_fraction) = match hint_bounds {
+                    Some(bounds) if f32::from(bounds.size.height) > 1.0 => (
+                        Some(((f32::from(pointer.y) - f32::from(bounds.origin.y)) / f32::from(bounds.size.height)).clamp(0.0, 1.0)),
+                        Some(((f32::from(pointer.x) - f32::from(bounds.origin.x)) / f32::from(bounds.size.width).max(1.0)).clamp(0.0, 1.0)),
+                    ),
+                    _ => (None, None),
+                };
+                let hint = SelectionHint {
+                    byte_range: None,
+                    source_quote: Some(&quote),
+                    vertical_fraction,
+                    horizontal_fraction,
+                };
+                let Some(citation) = Self::citation_from_markdown_selection_with_hint(&selected, &source, &quote, (environment, thread.unwrap_or_default(), message), &hint, cx) else { return };
                 this.citation_ui.selection = Some((citation, pointer));
                 this.citation_ui.selection_connection = connection;
                 window.focus(&this.citation_ui.selection_focus, cx);
@@ -66,6 +92,7 @@ impl ThreadView {
     }
 
     pub(super) fn dismiss_citation_selection(&mut self, cx: &mut Context<Self>) {
+        close_sent_citation_popover(cx);
         if self.citation_ui.selection.take().is_some() || self.citation_ui.highlighted.take().is_some() {
             cx.notify();
         }
@@ -73,6 +100,145 @@ impl ThreadView {
     }
 
     pub(super) fn render_citation_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let popover = self.render_sent_citation_popover(window, cx);
+        let toolbar = self.render_selection_toolbar(window, cx);
+        match (toolbar, popover) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(div().child(a).child(b).into_any_element()),
+        }
+    }
+
+    fn render_sent_citation_popover(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active = cx
+            .try_global::<CitationPopoverGlobal>()
+            .and_then(|g| g.active.as_ref())
+            .filter(|a| a.owner == cx.entity().entity_id())?
+            .clone();
+        let p = palette(cx);
+        let bounds = window.viewport_size();
+        let x = f32::from(active.position.x).clamp(8., (f32::from(bounds.width) - 368.).max(8.));
+        let y = (f32::from(active.position.y) + 12.).clamp(8., (f32::from(bounds.height) - 220.).max(8.));
+        let copy_text = active.citation.text.clone();
+        let copy_state = active.state.clone();
+        let go_citation = active.citation.clone();
+        let go_state = active.state.clone();
+        let comment = active.citation.comment.clone().filter(|c| !c.trim().is_empty());
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position_mode(gpui::AnchoredPositionMode::Window)
+                    .position(gpui::point(px(x), px(y)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        gpui_component::v_flex()
+                            .id("sent-citation-popover")
+                            .w(px(340.))
+                            .max_w(px(360.))
+                            .p(px(12.))
+                            .gap(px(8.))
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(hsla(p.border))
+                            .bg(hsla(p.popover))
+                            .shadow_sm()
+                            .occlude()
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down_out(|_, _, cx| close_sent_citation_popover(cx))
+                            .on_key_down(|event: &gpui::KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "escape" {
+                                    close_sent_citation_popover(cx);
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(
+                                gpui_component::h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        gpui_component::h_flex()
+                                            .gap(px(6.))
+                                            .items_center()
+                                            .text_size(px(11.))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(hsla(p.muted_foreground))
+                                            .child(Icon::Quote.render(px(12.), hsla(p.context_chip_citation)))
+                                            .child("Cited excerpt"),
+                                    )
+                                    .child(crate::transcript::ghost_icon_button(
+                                        "close-sent-citation",
+                                        Icon::X,
+                                        |_, _, cx| close_sent_citation_popover(cx),
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("sent-citation-quote-body")
+                                    .max_h(px(180.))
+                                    .overflow_y_scroll()
+                                    .pl(px(10.))
+                                    .border_l_2()
+                                    .border_color(hsla(p.context_chip_citation).opacity(0.65))
+                                    .text_size(px(12.))
+                                    .line_height(px(18.))
+                                    .text_color(hsla(p.foreground).opacity(0.9))
+                                    .child(active.citation.text),
+                            )
+                            .when_some(comment, |this, comment| {
+                                this.child(
+                                    gpui_component::v_flex()
+                                        .gap(px(2.))
+                                        .pt(px(6.))
+                                        .border_t_1()
+                                        .border_color(hsla(p.border).opacity(0.6))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(hsla(p.muted_foreground))
+                                                .child("Comment"),
+                                        )
+                                        .child(div().text_size(px(12.)).text_color(hsla(p.foreground)).child(comment)),
+                                )
+                            })
+                            .child(
+                                gpui_component::h_flex()
+                                    .justify_end()
+                                    .gap(px(6.))
+                                    .pt(px(2.))
+                                    .child(crate::transcript::ghost_text_button(
+                                        "copy-sent-citation",
+                                        "Copy quote",
+                                        Some(Icon::Copy),
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                            copy_state.update(cx, |app, cx| {
+                                                app.show_toast(Toast::new(ToastKind::Success, "Copied quote"), cx);
+                                            });
+                                            close_sent_citation_popover(cx);
+                                        },
+                                        cx,
+                                    ))
+                                    .child(crate::transcript::ghost_text_button(
+                                        "goto-sent-citation",
+                                        "Go to source",
+                                        Some(Icon::ArrowUpRight),
+                                        move |_, _, cx| {
+                                            navigate_to_citation_source(go_citation.clone(), &go_state, cx);
+                                        },
+                                        cx,
+                                    )),
+                            ),
+                    ),
+            )
+            .with_priority(3)
+            .into_any_element(),
+        )
+    }
+
+    fn render_selection_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (citation, pointer) = self.citation_ui.selection.as_ref()?;
         if self.thread_id.as_deref() != Some(&citation.thread_id) || self.citation_ui.selection_connection != self.state.read(cx).connection_id() {
             return None;
@@ -141,6 +307,12 @@ impl ThreadView {
     }
 
     pub(super) fn advance_citation_source(&mut self, cx: &mut Context<Self>) {
+        if self.citation_ui.pending.is_none() {
+            if self.state.read(cx).citation_source.as_ref().is_some_and(|c| self.thread_id.as_deref() == Some(&c.thread_id)) {
+                self.open_citation_source(cx);
+            }
+            return;
+        }
         let Some((citation, mut procedure)) = self.citation_ui.pending.clone() else {
             return;
         };
@@ -170,6 +342,22 @@ impl ThreadView {
             HistoryAction::Found => {
                 self.citation_ui.pending = None;
                 self.citation_ui.highlighted = Some(citation.message_id.clone());
+                let matched_excerpt = self.entries_cache.entries().iter().find_map(|entry| match &entry.kind {
+                    t3_core::timeline::EntryKind::Message(msg) if msg.id == citation.message_id => {
+                        let rendered = rules::markdown_text(&msg.text);
+                        Some(rules::find_citation_range(&rendered, &citation).is_some())
+                    }
+                    _ => None,
+                });
+                if matched_excerpt == Some(false) {
+                    self.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            Toast::new(ToastKind::Info, "The quoted text has changed")
+                                .description("Showing the source response. The saved quote is unchanged."),
+                            cx,
+                        );
+                    });
+                }
                 self.reveal_entry(&citation.message_id, cx);
             }
             HistoryAction::Failed(failure) => {
@@ -214,5 +402,44 @@ impl ThreadView {
             TextSelection::clear(window, cx);
             cx.stop_propagation();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AppContext;
+    use gpui_component::text::TextViewState;
+
+    #[gpui::test]
+    fn repeated_quotes_disambiguate_using_hint_fraction(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let source = "alpha token beta\n\nmiddle body prose here\n\ngamma token delta";
+        let tv = cx.update(|cx| cx.new(|cx| TextViewState::markdown(source, cx)));
+        let nested = cx.update(|cx| cx.new(|cx| TextViewState::markdown("token", cx)));
+        cx.run_until_parked();
+        let nested_views = crate::transcript::markdown::blocks::NestedViews::default();
+        nested_views.lock().unwrap().insert("repeat:0".into(), nested.clone());
+        let state = MarkdownState::from(&tv).with_nested_views_for_test(nested_views);
+        nested.update(cx, |s, cx| s.select_all(cx));
+        cx.update(|cx| {
+            let quote = nested.read(cx).selected_text();
+            let bottom_hint = SelectionHint {
+                byte_range: None,
+                source_quote: Some(&quote),
+                vertical_fraction: Some(0.9),
+                horizontal_fraction: Some(0.4),
+            };
+            let cited = ThreadView::citation_from_markdown_selection_with_hint(
+                &state,
+                source,
+                &quote,
+                ("env".into(), "t1".into(), "m1".into()),
+                &bottom_hint,
+                cx,
+            )
+            .expect("hint must disambiguate repeated quote");
+            assert!(cited.start > 30);
+        });
     }
 }
