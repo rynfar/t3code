@@ -55,8 +55,16 @@ struct SmoothScroll {
     target: SmoothTarget,
     started_at: Instant,
     last_progress: f32,
-    source: anchor::ScrollSource,
+    source: Option<anchor::ScrollSource>,
     _task: gpui::Task<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDisclosureReveal {
+    row_id: String,
+    entry_id: Option<String>,
+    content_row_id: Option<String>,
+    ready: bool,
 }
 
 pub struct ThreadView {
@@ -82,6 +90,8 @@ pub struct ThreadView {
     /// list to scroll up into the rows above it, which only then have heights.
     anchor_gap: Rc<RefCell<Option<(String, f32)>>>,
     disclosure: anchor::DisclosureFollow,
+    pending_disclosure_reveal: Option<PendingDisclosureReveal>,
+    pending_disclosure_reveal_frame: bool,
     follow: anchor::TimelineFollow,
     remembered_positions: anchor::RememberedPositions,
     pending_restore: Option<anchor::SavedThreadPosition>,
@@ -225,6 +235,8 @@ impl ThreadView {
             group_lists: Rc::default(),
             anchor_gap: Rc::default(),
             disclosure: anchor::DisclosureFollow::default(),
+            pending_disclosure_reveal: None,
+            pending_disclosure_reveal_frame: false,
             follow: anchor::TimelineFollow::default(),
             remembered_positions: anchor::RememberedPositions::default(),
             pending_restore: None,
@@ -313,6 +325,8 @@ impl ThreadView {
                 );
             }
             self.disclosure.cancel();
+            self.pending_disclosure_reveal = None;
+            self.pending_disclosure_reveal_frame = false;
             self.smooth_scroll = None;
             self.scroll_to_end_task = None;
             self.pending_scroll_source = None;
@@ -769,7 +783,7 @@ impl ThreadView {
         pending
     }
 
-    pub(super) fn load_work_for_group(&self, group_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn load_work_for_group(&self, group_id: &str, cx: &mut Context<Self>) -> bool {
         let entry_ids: HashSet<&str> = self
             .rows
             .iter()
@@ -785,7 +799,9 @@ impl ThreadView {
             .as_ref()
             .map(|projection| deferred_anchors_for_entries(projection, &entry_ids))
             .unwrap_or_default();
+        let has_deferred = !anchors.is_empty();
         self.load_deferred_work(anchors, cx);
+        has_deferred
     }
 
     fn rederive(&mut self, cx: &mut Context<Self>) {
@@ -930,6 +946,7 @@ impl ThreadView {
                 };
                 view.details.insert(id, detail);
                 view.remeasure_entry(&entry_id, cx);
+                view.mark_disclosure_content_ready(&entry_id, cx);
                 cx.notify();
             });
         })
@@ -954,7 +971,114 @@ impl ThreadView {
         self.disclosure.follow_change(distance, viewport)
     }
 
+    fn begin_disclosure_reveal(
+        &mut self,
+        row_id: &str,
+        entry_id: Option<&str>,
+        content_row_id: Option<&str>,
+        ready: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_follow_paused(cx) || (self.activity.is_working && self.follow.is_following()) {
+            self.pending_disclosure_reveal = None;
+            return;
+        }
+        self.pending_disclosure_reveal = Some(PendingDisclosureReveal {
+            row_id: row_id.to_owned(),
+            entry_id: entry_id.map(str::to_owned),
+            content_row_id: content_row_id.map(str::to_owned),
+            ready,
+        });
+        cx.notify();
+    }
+
+    /// Public hook for disclosure panels (`command_output`, `inspector`) to request scrolling an
+    /// expanded row out from behind the bottom edge once its content is ready (used by #384).
+    #[allow(dead_code)]
+    pub fn reveal_disclosure_for_entry(&mut self, row_id: &str, entry_id: &str, ready: bool, cx: &mut Context<Self>) {
+        self.begin_disclosure_reveal(row_id, Some(entry_id), None, ready, cx);
+    }
+
+    /// Marks an entry's pending disclosure reveal ready after initial async output/detail loads.
+    pub fn mark_disclosure_content_ready(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_disclosure_reveal.as_mut() else { return };
+        if pending.entry_id.as_deref() != Some(entry_id) {
+            return;
+        }
+        pending.ready = true;
+        cx.notify();
+    }
+
+    fn try_reveal_disclosure(&mut self, cx: &mut Context<Self>) {
+        let Some(mut pending) = self.pending_disclosure_reveal.clone() else { return };
+        if self.is_follow_paused(cx) || (self.activity.is_working && self.follow.is_following()) {
+            self.pending_disclosure_reveal = None;
+            return;
+        }
+        let Some(row_index) = self.rows.iter().position(|row| row.id == pending.row_id) else {
+            self.pending_disclosure_reveal = None;
+            return;
+        };
+        let outer_bounds = self.list.viewport_bounds();
+        let viewport_h = f32::from(outer_bounds.size.height);
+        if viewport_h <= 0. {
+            return;
+        }
+        let header = self.header_count();
+        let scroll = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        let mut row_top = f32::from(self.list.offset_for_item(header + row_index)) - scroll;
+        let mut row_bottom = f32::from(self.list.offset_for_item(header + row_index + 1)) - scroll;
+
+        if let Some(content_row_id) = pending.content_row_id.as_deref()
+            && let Some(content_ix) = self.rows.iter().position(|row| row.id == content_row_id)
+        {
+            row_bottom = f32::from(self.list.offset_for_item(header + content_ix + 1)) - scroll;
+            if !pending.ready
+                && let RowKind::Work { entries, .. } = &self.rows[content_ix].kind
+                && let Some(projection) = self.thread_state(self.state.read(cx)).projection.as_ref()
+            {
+                let entry_ids: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+                if deferred_anchors_for_entries(projection, &entry_ids).is_empty() {
+                    pending.ready = true;
+                }
+            }
+        } else if let Some(entry_id) = pending.entry_id.as_deref()
+            && let RowKind::Work { entries, expanded_group: true, .. } = &self.rows[row_index].kind
+            && let Some(member) = entries.iter().position(|entry| entry.id == entry_id)
+            && let Some(group_list) = self.group_lists.borrow().get(&pending.row_id).cloned()
+        {
+            let inner_bounds = group_list.viewport_bounds();
+            let inner_h = f32::from(inner_bounds.size.height);
+            if inner_h > 0. {
+                let inner_scroll = -f32::from(group_list.scroll_px_offset_for_scrollbar().y);
+                let inner_top = f32::from(group_list.offset_for_item(member)) - inner_scroll;
+                let inner_bottom = f32::from(group_list.offset_for_item(member + 1)) - inner_scroll;
+                let inner_delta = anchor::resolve_disclosure_reveal_scroll_delta(inner_top, inner_bottom, 0., inner_h, 0., 0.);
+                if inner_delta > 0.5 {
+                    let cur_y = group_list.scroll_px_offset_for_scrollbar().y;
+                    group_list.set_offset_from_scrollbar(point(px(0.), cur_y - px(inner_delta)));
+                }
+                let origin_y = f32::from(inner_bounds.top() - outer_bounds.top());
+                row_top = (origin_y + inner_top - inner_delta).max(row_top);
+                row_bottom = (origin_y + inner_bottom - inner_delta).min(row_bottom);
+            }
+        }
+
+        let delta = anchor::resolve_disclosure_reveal_scroll_delta(row_top, row_bottom, 0., viewport_h, 0., anchor::ANCHOR_TOP_OFFSET_PX);
+        let max_scroll = f32::from(self.list.max_offset_for_scrollbar().y).max(0.);
+        if pending.ready && scroll + delta <= max_scroll + 0.5 {
+            self.pending_disclosure_reveal = None;
+        } else {
+            self.pending_disclosure_reveal = Some(pending);
+        }
+        if delta > 0.5 {
+            self.disclosure.cancel();
+            self.smooth_scroll_by_source(-delta, None, cx);
+        }
+    }
+
     pub fn toggle_run(&mut self, run_id: &str, cx: &mut Context<Self>) {
+        self.pending_disclosure_reveal = None;
         self.begin_disclosure(&format!("turn-fold:{run_id}"));
         let visible = self.visible_rows(cx);
         if self.ui.expanded_runs.contains(run_id) && self.ui.work_fold_for_run(run_id).error {
@@ -972,6 +1096,7 @@ impl ThreadView {
     }
 
     pub fn toggle_attempt(&mut self, attempt_id: &str, cx: &mut Context<Self>) {
+        self.pending_disclosure_reveal = None;
         self.begin_disclosure(&format!("attempt-fold:{attempt_id}"));
         let visible = self.visible_rows(cx);
         if self.ui.expanded_attempts.contains(attempt_id) && self.ui.work_fold_for_attempt(attempt_id).error {
@@ -989,36 +1114,52 @@ impl ThreadView {
     }
 
     pub fn toggle_group(&mut self, group_id: &str, row_id: &str, cx: &mut Context<Self>) {
+        self.pending_disclosure_reveal = None;
         self.begin_disclosure(row_id);
         let visible = self.visible_rows(cx);
         let expanded = toggle(&mut self.ui.expanded_groups, group_id);
-        if expanded {
-            self.load_work_for_group(group_id, cx);
-        }
+        let deferred = if expanded { self.load_work_for_group(group_id, cx) } else { false };
         self.rederive_rows(cx);
         self.keep_place(visible);
+        if expanded {
+            self.begin_disclosure_reveal(row_id, None, Some(&format!("{group_id}:details")), !deferred, cx);
+        }
     }
 
     /// Opening one entry changes only its own row's height, and fetches withheld output or
     /// subscribes to a command's; closing it lets the subscription go.
     pub fn toggle_entry(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.pending_disclosure_reveal = None;
         let row = self.rows.iter().find(|row| matches!(&row.kind, RowKind::Work { entries, .. } if entries.iter().any(|e| e.id == key)))
             .or_else(|| self.rows.iter().find(|row| row.id.ends_with(key))).map(|row| row.id.clone());
-        if let Some(row) = row { self.begin_disclosure(&row); }
-        if toggle(&mut self.ui.expanded_entries, key) {
+        if let Some(row) = row.as_deref() { self.begin_disclosure(row); }
+        let mut pending_async = false;
+        let expanded = toggle(&mut self.ui.expanded_entries, key);
+        if expanded {
             let anchors = self
                 .thread_state(self.state.read(cx))
                 .projection
                 .as_ref()
                 .map(|projection| deferred_anchors_for_entries(projection, &HashSet::from([key])))
                 .unwrap_or_default();
+            pending_async |= !anchors.is_empty();
             self.load_deferred_work(anchors, cx);
             if let Some(entry) = self.find_entry(key) {
                 self.fetch_detail(&entry, cx);
+                if entry.item.as_ref().is_some_and(|item| matches!(self.details.get(&item.id), Some(Detail::Loading { .. }))) {
+                    pending_async = true;
+                }
             }
         }
+        let had_output = self.command_outputs.contains_key(key);
         self.sync_command_outputs(cx);
+        if expanded && !had_output && self.command_outputs.contains_key(key) {
+            pending_async = true;
+        }
         self.remeasure_entry(key, cx);
+        if expanded && let Some(row_id) = row.as_deref() {
+            self.begin_disclosure_reveal(row_id, Some(key), None, !pending_async, cx);
+        }
         cx.notify();
     }
 
@@ -1057,10 +1198,14 @@ impl ThreadView {
             let pump = cx.spawn(async move |this, cx| {
                 while status.changed().await.is_ok() {
                     let next = status.borrow_and_update().clone();
+                    let ready = next.output.is_some() || next.error.is_some();
                     let updated = this.update(cx, |view, cx| {
                         let Some(slot) = view.command_outputs.get_mut(&key) else { return };
                         if slot.update(next) {
                             view.remeasure_entry(&key, cx);
+                        }
+                        if ready {
+                            view.mark_disclosure_content_ready(&key, cx);
                         }
                         cx.notify();
                     });
@@ -1099,14 +1244,22 @@ impl ThreadView {
     }
 
     pub fn toggle_message(&mut self, row_id: &str, cx: &mut Context<Self>) {
-        toggle(&mut self.ui.expanded_messages, row_id);
+        self.pending_disclosure_reveal = None;
+        let expanded = toggle(&mut self.ui.expanded_messages, row_id);
         self.remeasure_where(|row| row.id == row_id);
+        if expanded {
+            self.begin_disclosure_reveal(row_id, None, None, true, cx);
+        }
         cx.notify();
     }
 
     pub fn toggle_plan(&mut self, row_id: &str, cx: &mut Context<Self>) {
-        toggle(&mut self.ui.expanded_plans, row_id);
+        self.pending_disclosure_reveal = None;
+        let expanded = toggle(&mut self.ui.expanded_plans, row_id);
         self.remeasure_where(|row| row.id == row_id);
+        if expanded {
+            self.begin_disclosure_reveal(row_id, None, None, true, cx);
+        }
         cx.notify();
     }
 
@@ -1607,9 +1760,11 @@ impl ThreadView {
         let was_visible = self.follow.pill_state(self.find.is_some(), !self.rows.is_empty(), now).0;
 
         if let Some(source) = source {
+            self.pending_disclosure_reveal = None;
             self.list.set_tail_reservation(None);
             self.follow.on_user_navigation(source, at_end, now);
         } else if self.list.is_scrollbar_dragging() {
+            self.pending_disclosure_reveal = None;
             self.smooth_scroll = None;
             self.pending_restore = None;
             self.pending_scroll_top = None;
@@ -1655,7 +1810,7 @@ impl ThreadView {
         cx.notify();
     }
 
-    fn start_smooth_scroll(&mut self, target: SmoothTarget, source: anchor::ScrollSource, cx: &mut Context<Self>) {
+    fn start_smooth_scroll(&mut self, target: SmoothTarget, source: Option<anchor::ScrollSource>, cx: &mut Context<Self>) {
         let started_at = cx.background_executor().now();
         let task = cx.spawn(async move |this, cx| {
             loop {
@@ -1697,10 +1852,11 @@ impl ThreadView {
                 cx.notify();
             }
             SmoothTarget::Item { item_ix, view_offset } => {
+                let source = anim.source.unwrap_or(anchor::ScrollSource::Keyboard);
                 if next_t >= 1. {
-                    self.snap_to_item(item_ix, view_offset, anim.source, None, cx);
+                    self.snap_to_item(item_ix, view_offset, source, None, cx);
                 } else {
-                    self.pending_scroll_source = Some(anim.source);
+                    self.pending_scroll_source = Some(source);
                     let cur_y = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
                     let max_scroll = f32::from(self.list.max_offset_for_scrollbar().y);
                     let target_y = -(f32::from(self.list.offset_for_item(item_ix)) - view_offset).clamp(0., max_scroll);
@@ -1712,7 +1868,7 @@ impl ThreadView {
             SmoothTarget::Delta { ref mut remaining } => {
                 let step = if next_t >= 1. { *remaining } else { *remaining * frac };
                 *remaining -= step;
-                self.pending_scroll_source = Some(anim.source);
+                self.pending_scroll_source = anim.source;
                 let top = self.list.scroll_px_offset_for_scrollbar();
                 self.list.set_offset_from_scrollbar(point(px(0.), top.y + px(step)));
                 self.on_observed_list_scroll(cx);
@@ -1729,6 +1885,7 @@ impl ThreadView {
 
     pub(super) fn smooth_jump_to_item(&mut self, target: usize, view_offset: f32, source: anchor::ScrollSource, window: &mut Window, cx: &mut Context<Self>) {
         self.disclosure.cancel();
+        self.pending_disclosure_reveal = None;
         self.pending_restore = None;
         self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
@@ -1736,19 +1893,25 @@ impl ThreadView {
             self.snap_to_item(target, view_offset, source, Some(window), cx);
             return;
         }
-        self.start_smooth_scroll(SmoothTarget::Item { item_ix: target, view_offset }, source, cx);
+        self.start_smooth_scroll(SmoothTarget::Item { item_ix: target, view_offset }, Some(source), cx);
     }
 
     fn smooth_scroll_by(&mut self, delta: f32, source: anchor::ScrollSource, cx: &mut Context<Self>) {
+        self.pending_disclosure_reveal = None;
+        self.smooth_scroll_by_source(delta, Some(source), cx);
+    }
+
+    fn smooth_scroll_by_source(&mut self, delta: f32, source: Option<anchor::ScrollSource>, cx: &mut Context<Self>) {
         if delta == 0. {
             return;
         }
         self.disclosure.cancel();
+        self.pending_disclosure_reveal = None;
         self.pending_restore = None;
         self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
         if cx.reduce_motion() {
-            self.pending_scroll_source = Some(source);
+            self.pending_scroll_source = source;
             let top = self.list.scroll_px_offset_for_scrollbar();
             self.list.set_offset_from_scrollbar(point(px(0.), top.y + px(delta)));
             self.on_observed_list_scroll(cx);
@@ -1811,6 +1974,7 @@ impl ThreadView {
             return false;
         }
         self.disclosure.cancel();
+        self.pending_disclosure_reveal = None;
         self.pending_restore = None;
         self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
@@ -1828,6 +1992,7 @@ impl ThreadView {
 
     pub fn scroll_to_end_from_pill(&mut self, cx: &mut Context<Self>) {
         self.disclosure.cancel();
+        self.pending_disclosure_reveal = None;
         self.pending_restore = None;
         self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
@@ -1841,7 +2006,7 @@ impl ThreadView {
             cx.notify();
             return;
         }
-        self.start_smooth_scroll(SmoothTarget::Bottom, anchor::ScrollSource::EndKey, cx);
+        self.start_smooth_scroll(SmoothTarget::Bottom, Some(anchor::ScrollSource::EndKey), cx);
     }
 
     fn handle_scroll_key_down(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1996,6 +2161,13 @@ impl Render for ThreadView {
                 });
             });
         }
+        if self.pending_disclosure_reveal.is_some() && !self.pending_disclosure_reveal_frame {
+            self.pending_disclosure_reveal_frame = true;
+            cx.on_next_frame(window, move |view, _, cx| {
+                view.pending_disclosure_reveal_frame = false;
+                view.try_reveal_disclosure(cx);
+            });
+        }
         // TextView selection registrations must paint each drawn frame; scene reuse makes them stale.
         let transcript = self.timeline_rows.clone();
         div().id("citation-viewport")
@@ -2014,6 +2186,7 @@ impl Render for ThreadView {
             }))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
                 this.smooth_scroll = None;
+                this.pending_disclosure_reveal = None;
                 this.pending_restore = None;
                 this.pending_scroll_top = None;
                 this.dismiss_citation_selection(cx);
@@ -2027,6 +2200,7 @@ impl Render for ThreadView {
                     return;
                 }
                 this.smooth_scroll = None;
+                this.pending_disclosure_reveal = None;
                 this.pending_restore = None;
                 this.pending_scroll_top = None;
                 this.disclosure.cancel();

@@ -11,8 +11,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use gpui::AppContext;
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, HighlightStyle,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, HighlightStyle,
     Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Styled, StyledText, Subscription, TextLayout,
     TextStyleRefinement, WeakEntity, Window, WrappedLineLayout, div, fill, point, px,
@@ -130,6 +132,7 @@ impl GroupState {
         self.sync_members(cx);
     }
 
+    #[cfg(test)]
     fn reset(&mut self, cx: &mut App) {
         self.clear_selection(cx);
         self.parts.clear();
@@ -137,6 +140,7 @@ impl GroupState {
 }
 
 impl SelectionGroup {
+    #[cfg(test)]
     pub fn new(cx: &mut App) -> Self {
         Self(cx.new(|_| GroupState::default()))
     }
@@ -150,6 +154,7 @@ impl SelectionGroup {
         clear_active_selection_if_group(&self.0, cx);
     }
 
+    #[cfg(test)]
     pub fn reset(&self, cx: &mut App) {
         self.0.update(cx, |group, cx| group.reset(cx));
         clear_active_selection_if_group(&self.0, cx);
@@ -278,8 +283,6 @@ pub struct SelectableText {
     origin: usize,
     scroll: Option<ScrollHandle>,
     group: Option<(SelectionGroup, usize)>,
-    tab_stop: bool,
-    tail_ellipsis: bool,
     on_state: Option<StateCallback>,
 }
 
@@ -293,12 +296,11 @@ impl SelectableText {
             origin: 0,
             scroll: None,
             group: None,
-            tab_stop: true,
-            tail_ellipsis: false,
             on_state: None,
         }
     }
 
+    #[cfg(test)]
     pub fn selection_group(mut self, group: SelectionGroup, part: usize) -> Self {
         self.group = Some((group, part));
         self
@@ -306,17 +308,6 @@ impl SelectableText {
 
     pub fn on_state(mut self, f: impl Fn(&SelectableTextHandle, &mut App) + 'static) -> Self {
         self.on_state = Some(Arc::new(f));
-        self
-    }
-
-    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
-        self.tab_stop = tab_stop;
-        self
-    }
-
-    /// Selection offsets still index the source when only its tail is replaced by an ellipsis.
-    pub fn tail_ellipsis(mut self) -> Self {
-        self.tail_ellipsis = true;
         self
     }
 
@@ -545,7 +536,7 @@ impl RenderOnce for SelectableText {
             .id(self.id)
             .key_context(CONTEXT)
             .track_focus(&focus)
-            .tab_index(if self.tab_stop { 0 } else { -1 })
+            .tab_index(0)
             .font_family(cx.theme().font_family.clone())
             .on_action(move |_: &Copy, _, cx| copy(&copy_state, cx))
             .on_action(move |_: &SelectAll, _, cx| {
@@ -560,7 +551,7 @@ impl RenderOnce for SelectableText {
                     set_active_selection(&all_state, cx);
                 }
             })
-            .child(TextElement::new(state, self.text, self.highlights, selected, font_family, self.tail_ellipsis))
+            .child(TextElement::new(state, self.text, self.highlights, selected, font_family))
             .context_menu(move |menu, _, cx| {
                 let popup = cx.entity();
                 let selected = menu_state.update(cx, |state, cx| {
@@ -581,18 +572,17 @@ struct TextElement {
     state: Entity<State>,
     text: StyledText,
     font_family: SharedString,
-    tail_ellipsis: bool,
 }
 
 impl TextElement {
-    fn new(state: Entity<State>, text: SharedString, highlights: Option<Highlights>, selected: Option<Range<usize>>, font_family: SharedString, tail_ellipsis: bool) -> Self {
+    fn new(state: Entity<State>, text: SharedString, highlights: Option<Highlights>, selected: Option<Range<usize>>, font_family: SharedString) -> Self {
         let text = StyledText::new(text);
         let text = match (highlights, selected) {
             (Some(highlights), Some(selected)) => text.with_highlights(lift_fills(&highlights, selected)),
             (Some(highlights), None) => text.with_highlights(highlights.iter().cloned()),
             (None, _) => text,
         };
-        TextElement { state, text, font_family, tail_ellipsis }
+        TextElement { state, text, font_family }
     }
 }
 
@@ -646,8 +636,7 @@ impl Element for TextElement {
     ) {
         let text_layout = self.text.layout().clone();
         let (range, dragging, selected, group_info) = self.state.update(cx, |state, _| {
-            let visible_end = if self.tail_ellipsis { t3_core::text_selection::visible_prefix_end(&state.text, &text_layout.text()) }
-                else if text_layout.len() == state.text.len() { Some(state.text.len()) } else { None };
+            let visible_end = (text_layout.len() == state.text.len()).then_some(state.text.len());
             state.visible_end = visible_end;
             state.layout = Some(text_layout.clone());
             state.painted_scroll = state.scroll.as_ref().map_or(px(0.), |scroll| scroll.offset().y);

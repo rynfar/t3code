@@ -68,7 +68,14 @@ fn ids(rows: &[TimelineRow]) -> Vec<&str> {
 
 fn running(run: &str) -> ThreadActivity {
     ThreadActivity {
-        latest_run: Some(LatestRun { run_id: run.into(), status: "running".into(), started_at: Some("2026-01-01T00:00:00Z".into()), completed_at: None, turn_ended: false }),
+        latest_run: Some(LatestRun {
+            run_id: run.into(),
+            status: "running".into(),
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            completed_at: None,
+            turn_ended: false,
+            provider_starting_label: None,
+        }),
         running_run_id: Some(run.into()),
         is_working: true,
         runless_work_active: false,
@@ -185,6 +192,7 @@ fn folds_completed_activity_after_the_terminal_response_unless_failed_or_live() 
             started_at: Some("2026-01-01T00:00:00Z".into()),
             completed_at: Some("2026-01-01T00:00:10Z".into()),
             turn_ended: false,
+            provider_starting_label: None,
         });
         assert_eq!(ids(&input.rows(&entries)), vec!["turn-fold:turn-1", "assistant-final-entry"]);
 
@@ -748,6 +756,7 @@ fn a_reply_finished_before_the_steer_stays_visible() {
             started_at: Some(at(0)),
             completed_at: (run_status == "completed").then(|| at(14)),
             turn_ended: false,
+            provider_starting_label: None,
         });
         input.rows(&entries)
     };
@@ -1204,7 +1213,11 @@ fn turn_starting_messages_rewind_to_the_previous_runs_checkpoint() {
         message("a2", Role::Assistant, "ok", Some("r2"), "2026-01-01T00:00:04Z", "2026-01-01T00:00:04Z"),
         message("u3", Role::User, "three", Some("r3"), "2026-01-01T00:00:05Z", "2026-01-01T00:00:05Z"),
     ];
-    let checkpoints = vec![checkpoint("c0", None, None, 0, "ready"), checkpoint("c1", Some("r1"), Some(1), 1, "ready"), checkpoint("c2", Some("r2"), Some(2), 2, "missing")];
+    let checkpoints = vec![
+        checkpoint("c0", None, None, 0, "ready"),
+        checkpoint("c1", Some("r1"), Some(1), 1, "ready"),
+        checkpoint("c2", Some("r2"), Some(2), 2, "missing"),
+    ];
     let all: HashSet<u64> = [0, 1, 2].into();
     let none = HashSet::new();
     let input = RevertInput { entries: &entries, checkpoints: &checkpoints, thread_start_ready: true, available: &all, unsettled_run_id: Some("r3"), inherited: &none };
@@ -1213,7 +1226,14 @@ fn turn_starting_messages_rewind_to_the_previous_runs_checkpoint() {
     assert_eq!(counts.get("u2"), Some(&1));
     assert_eq!(counts.get("u3"), None, "the unsettled run cannot rewind");
     let settled = revert_turn_counts(&RevertInput { unsettled_run_id: None, ..input });
-    assert_eq!(settled.get("u3"), None, "the run before it has no ready checkpoint");
+    assert_eq!(settled.get("u3"), Some(&2), "missing checkpoints allow conversation-only rewind");
+    let errored = vec![
+        checkpoint("c0", None, None, 0, "ready"),
+        checkpoint("c1", Some("r1"), Some(1), 1, "ready"),
+        checkpoint("c2", Some("r2"), Some(2), 2, "error"),
+    ];
+    let settled_err = revert_turn_counts(&RevertInput { checkpoints: &errored, unsettled_run_id: None, ..input });
+    assert_eq!(settled_err.get("u3"), None, "errored checkpoints are not rewindable");
     let paged = revert_turn_counts(&RevertInput { thread_start_ready: false, unsettled_run_id: None, ..input });
     assert_eq!(paged.get("u1"), None);
     let only_start: HashSet<u64> = [0].into();
@@ -1229,10 +1249,18 @@ fn finds_the_ready_checkpoint_for_a_turn_count() {
         checkpoint("one-old", Some("r1"), Some(1), 1, "ready"),
         checkpoint("one", Some("r1"), Some(1), 2, "ready"),
         checkpoint("two", Some("r2"), Some(2), 4, "error"),
+        checkpoint("three", Some("r3"), Some(3), 5, "missing"),
     ];
     assert_eq!(find_revert_checkpoint(&checkpoints, 0).map(|c| c.id), Some("start".into()));
-    assert_eq!(find_revert_checkpoint(&checkpoints, 1), Some(RevertCheckpoint { id: "one".into(), scope_id: "scope".into() }));
+    assert_eq!(
+        find_revert_checkpoint(&checkpoints, 1),
+        Some(RevertCheckpoint { id: "one".into(), scope_id: "scope".into(), status: "ready".into() })
+    );
     assert_eq!(find_revert_checkpoint(&checkpoints, 2), None);
+    assert_eq!(
+        find_revert_checkpoint(&checkpoints, 3),
+        Some(RevertCheckpoint { id: "three".into(), scope_id: "scope".into(), status: "missing".into() })
+    );
     let command = rollback_command("cmd", "t", &find_revert_checkpoint(&checkpoints, 1).unwrap(), false);
     assert_eq!(command["type"], "checkpoint.rollback");
     assert_eq!((command["checkpointId"].as_str(), command["scopeId"].as_str(), command["restoreFiles"].as_bool()), (Some("one"), Some("scope"), Some(false)));
@@ -2044,4 +2072,79 @@ fn thread_read_helpers_extract_target_and_strip_deleted_or_archived_titles() {
     assert_eq!(thread_read_target_title("Investigate bug", Some("2026-11-01T00:00:00Z"), None), None);
     assert_eq!(thread_read_target_title("Investigate bug", None, Some("2026-11-01T00:00:00Z")), None);
     assert_eq!(thread_read_target_title("   ", None, None), None);
+}
+
+#[test]
+fn activity_and_thinking_label_provider_starting_and_foreground_subagents() {
+    let mut projection = projection_json(
+        serde_json::json!({}),
+        serde_json::json!([{
+            "id": "run-starting",
+            "ordinal": 1,
+            "providerInstanceId": "claude-1",
+            "modelSelection": { "instanceId": "claude-1", "model": "sonnet" },
+            "userMessageId": "u",
+            "rootNodeId": null,
+            "status": "running",
+            "requestedAt": "2026-01-01T00:00:00Z",
+            "startedAt": "2026-01-01T00:00:00Z",
+            "completedAt": null,
+            "activeAttemptId": "attempt-1"
+        }]),
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    projection.provider_sessions.push(crate::thread::Entity {
+        id: "sess-1".into(),
+        value: serde_json::json!({ "id": "sess-1", "providerInstanceId": "claude-1", "driver": "claudeAgent" }),
+    });
+    let activity = derive_activity(&projection);
+    assert_eq!(activity.latest_run.as_ref().and_then(|r| r.provider_starting_label.as_deref()), Some("Starting Claude"));
+
+    let child = |id: &str| -> Arc<TimelineEntry> {
+        let item: crate::turn_item::TurnItem = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "threadId": "th",
+            "runId": "turn-1",
+            "ordinal": 1,
+            "status": "running",
+            "type": "subagent",
+            "subagentId": id,
+            "prompt": "Explore",
+            "updatedAt": "2026-01-01T00:00:01Z"
+        }))
+        .expect("subagent item");
+        Arc::new(TimelineEntry {
+            id: id.into(),
+            created_at: "2026-01-01T00:00:01Z".into(),
+            attempt: None,
+            kind: EntryKind::Event { item: Arc::new(item), visibility: crate::thread::Visibility::Local },
+        })
+    };
+    let entries = vec![
+        message("user", Role::User, "Research", Some("turn-1"), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        child("sub-1"),
+        child("sub-2"),
+    ];
+    let mut input = Input::idle();
+    input.activity = running("turn-1");
+    assert!(matches!(
+        input.rows(&entries).last().map(|r| &r.kind),
+        Some(RowKind::Thinking { label: Some(label), .. }) if label == "Waiting on 2 subagents"
+    ));
+
+    let entries_with_later_work = vec![
+        entries[0].clone(),
+        entries[1].clone(),
+        entries[2].clone(),
+        work("reason-1", "turn-1", "2026-01-01T00:00:02Z", |w| {
+            w.item_type = Some("reasoning");
+            w.detail = None;
+            w.status = Some(ToolStatus::Completed);
+        }),
+    ];
+    assert!(matches!(
+        input.rows(&entries_with_later_work).last().map(|r| &r.kind),
+        Some(RowKind::Thinking { label: None, .. })
+    ));
 }

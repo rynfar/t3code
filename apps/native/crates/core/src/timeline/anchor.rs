@@ -473,6 +473,24 @@ pub fn ease_out_cubic(t: f32) -> f32 {
     1. - (1. - t).powi(3)
 }
 
+/// Scroll delta (`>= 0`) needed to bring an expanded disclosure's bottom edge into view above
+/// `composer_overlay_height`, without pushing the row's top above `viewport_top + anchor_offset`.
+pub fn resolve_disclosure_reveal_scroll_delta(
+    row_top: f32,
+    row_bottom: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    composer_overlay_height: f32,
+    anchor_offset: f32,
+) -> f32 {
+    let hidden_below = row_bottom - (viewport_bottom - composer_overlay_height);
+    if hidden_below <= 0. || hidden_below.is_nan() {
+        return 0.;
+    }
+    let room_above = row_top - (viewport_top + anchor_offset);
+    hidden_below.min(room_above).max(0.)
+}
+
 /// Fraction of the remaining distance to travel between normalized times `prev_t` and `next_t`.
 /// Advancing incrementally by remaining distance preserves smooth ease-out even when unmeasured
 /// rows dynamically resize mid-flight.

@@ -198,3 +198,43 @@ fn title_seeds_fall_back_to_attachments() {
     assert_eq!(thread_title_seed("Look at this", &[attached(AttachmentKind::File, "x")]), "Look at this");
     assert_eq!(thread_title_seed("", &[]), "New thread");
 }
+
+#[test]
+fn triage_prompt_rewrites_only_the_playbook_link() {
+    let link = |path: &str| {
+        let encoded = path.replace(' ', "%20").replace('(', "%28").replace(')', "%29").replace('#', "%23").replace('?', "%3F");
+        format!("[triage-playbook.md](file://{encoded})")
+    };
+    let app_prompt = |path: &str| format!("Read {} and follow it. ", link(path));
+    let machine_a = "/Users/a/.t3/triage/1/triage-playbook.md";
+    let machine_b = "/home/b/.t3/triage/2/triage-playbook.md";
+    let other = "[log.md](file:///Users/a/notes%20%28old%29/log.md)";
+    let prompt = format!("Before. {}The app crashes, see {other} (twice).", app_prompt(machine_a));
+    assert_eq!(
+        replace_triage_playbook_link(&prompt, &app_prompt(machine_b)),
+        format!("Before. {}The app crashes, see {other} (twice).", app_prompt(machine_b))
+    );
+    for path in [
+        "/Users/a b/My Data/triage-playbook.md",
+        "/Users/a/t3 (dev)/triage-playbook.md",
+        "/Users/a/#1/what?/triage-playbook.md",
+        "C:\\Users\\a b\\t3 (dev)\\triage-playbook.md",
+    ] {
+        assert_eq!(
+            replace_triage_playbook_link(&format!("{}It is slow.", app_prompt(path)), &app_prompt(machine_b)),
+            format!("{}It is slow.", app_prompt(machine_b))
+        );
+        assert_eq!(
+            replace_triage_playbook_link(&format!("{}It is slow.", app_prompt(machine_a)), &app_prompt(path)),
+            format!("{}It is slow.", app_prompt(path))
+        );
+    }
+    assert_eq!(
+        replace_triage_playbook_link(&format!("Follow {}", link(machine_a)), &app_prompt(machine_b)),
+        format!("Follow {}", link(machine_b))
+    );
+    let plain = "The app crashes, see [log.md](file:///Users/a/log.md) please.";
+    assert!(!is_triage_prompt(plain));
+    assert_eq!(replace_triage_playbook_link(plain, &app_prompt(machine_b)), plain);
+    assert_eq!(replace_triage_playbook_link(&app_prompt(machine_a), "Read the playbook."), app_prompt(machine_a));
+}

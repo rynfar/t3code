@@ -16,12 +16,15 @@ use crate::composer::attachments::is_attachment_only_prompt;
 pub const MIN_ITEMS: usize = 2;
 /// px between neighbouring strips until the rail reaches its cap.
 pub const ITEM_SPACING: f32 = 8.;
-/// rem: the rail's cap is the window height less this (`calc(100vh - 18rem)`).
-pub const MAX_HEIGHT_INSET: f32 = 288.;
-/// rem: the hit strip's width while a preview is open (`22rem`).
-pub const EXPANDED_HIT_STRIP_WIDTH: f32 = 352.;
+/// rem: the rail's cap is the timeline height less this (`max(4rem, calc(100% - 14.75rem))`).
+pub const MAX_HEIGHT_INSET: f32 = 236.;
+/// rem: minimum rail cap (`4rem`).
+pub const MIN_MAX_HEIGHT: f32 = 64.;
 /// px a jumped-to message sits below the top (`scrollToIndex`'s `viewOffset`).
 pub const JUMP_VIEW_OFFSET: f32 = 24.;
+/// px inset below the scroll top used when computing the current turn so `Next turn` doesn't
+/// stick on adjacent user messages (`TIMELINE_MINIMAP_TARGET_OFFSET + 1`).
+pub const CURRENT_RANGE_INSET: f32 = JUMP_VIEW_OFFSET + 1.;
 pub const MOTION_DURATION: Duration = Duration::from_millis(150);
 const TOOLTIP_WARMUP: Duration = Duration::from_millis(600);
 pub const PREVIOUS_TURN: &str = "Previous turn";
@@ -216,6 +219,10 @@ fn html_tag(text: &str) -> Option<(&str, usize)> {
 }
 
 /// `resolveTimelineMinimapHeightStyle`: 8px per gap, capped at `max_height`.
+pub fn max_rail_height(container_height: f32, rem_px: f32) -> f32 {
+    (container_height - MAX_HEIGHT_INSET * rem_px).max(MIN_MAX_HEIGHT * rem_px)
+}
+
 pub fn rail_height(item_count: usize, max_height: f32) -> f32 {
     let natural = (item_count.saturating_sub(1) as f32 * ITEM_SPACING).max(1.);
     natural.min(max_height).max(0.)
@@ -556,8 +563,8 @@ pub fn keyboard_action(active: Option<usize>, count: usize, key: &str) -> Keyboa
     }
 }
 
-pub fn preview_offset(index: usize, count: usize, height: f32) -> f32 {
-    if index == 0 { 0. } else if index + 1 == count { -height } else { -height / 2. }
+pub fn preview_offset(height: f32) -> f32 {
+    -height / 2.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -314,3 +314,14 @@ fn smooth_step_fraction_recovers_exact_ease_out_cubic_curve() {
     }
     assert_eq!(pos, target);
 }
+
+#[test]
+fn resolve_disclosure_reveal_scroll_delta_matches_web_cases() {
+    let reveal = |row_top: f32, row_bottom: f32| {
+        resolve_disclosure_reveal_scroll_delta(row_top, row_bottom, 0., 800., 150., 24.)
+    };
+    assert_eq!(reveal(300., 650.), 0.);
+    assert_eq!(reveal(560., 900.), 250.);
+    assert_eq!(reveal(600., 2000.), 576.);
+    assert_eq!(reveal(-40., 1200.), 0.);
+}

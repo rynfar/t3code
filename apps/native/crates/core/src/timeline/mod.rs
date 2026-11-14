@@ -311,6 +311,7 @@ pub enum RowKind {
     Thinking {
         group_id: Option<String>,
         expanded: bool,
+        label: Option<String>,
     },
     WorkToggle {
         run_id: Option<String>,

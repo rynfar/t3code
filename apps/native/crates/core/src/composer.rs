@@ -287,5 +287,61 @@ pub fn effective_selection(entries: &[ProviderEntry], chosen: Option<&ModelSelec
     })
 }
 
+pub const TRIAGE_PROMPT_FILE_NAME: &str = "triage-playbook.md";
+pub const SERVER_PREPARE_TRIAGE: &str = "server.prepareTriage";
+
+pub fn prepare_triage_request(os: Option<&str>, app_version: Option<&str>) -> serde_json::Value {
+    let mut client = serde_json::Map::new();
+    client.insert("deviceType".into(), serde_json::json!("desktop"));
+    client.insert("surface".into(), serde_json::json!("desktop"));
+    if let Some(os) = os.filter(|os| !os.trim().is_empty()) {
+        client.insert("os".into(), serde_json::json!(os));
+    }
+    if let Some(version) = app_version.filter(|version| !version.trim().is_empty()) {
+        client.insert("appVersion".into(), serde_json::json!(version));
+    }
+    serde_json::json!({ "client": client })
+}
+
+/// `isTriagePrompt` (`packages/shared/src/triagePrompt.ts`): a draft is a triage draft while its
+/// message still links the playbook file.
+pub fn is_triage_prompt(prompt: &str) -> bool {
+    prompt.contains(&format!("[{TRIAGE_PROMPT_FILE_NAME}]("))
+}
+
+fn playbook_link_end(text: &str, start: usize) -> Option<usize> {
+    let prefix_len = 1 + TRIAGE_PROMPT_FILE_NAME.len() + 2;
+    let rest = text.get(start + prefix_len..)?;
+    let close = rest.find(')')?;
+    Some(start + prefix_len + close + 1)
+}
+
+/// `replaceTriagePlaybookLink` (`packages/shared/src/triagePrompt.ts`): moves a triage draft to
+/// the session another machine prepared, replacing each playbook link in `prompt` with the link in
+/// `prepared_prompt` while keeping all other text unchanged.
+pub fn replace_triage_playbook_link(prompt: &str, prepared_prompt: &str) -> String {
+    let needle = format!("[{TRIAGE_PROMPT_FILE_NAME}](");
+    let Some(prepared_start) = prepared_prompt.find(&needle) else {
+        return prompt.to_owned();
+    };
+    let Some(prepared_end) = playbook_link_end(prepared_prompt, prepared_start) else {
+        return prompt.to_owned();
+    };
+    let link = &prepared_prompt[prepared_start..prepared_end];
+    let mut next = String::with_capacity(prompt.len());
+    let mut cursor = 0;
+    while let Some(offset) = prompt[cursor..].find(&needle) {
+        let start = cursor + offset;
+        let Some(end) = playbook_link_end(prompt, start) else {
+            break;
+        };
+        next.push_str(&prompt[cursor..start]);
+        next.push_str(link);
+        cursor = end;
+    }
+    next.push_str(&prompt[cursor..]);
+    next
+}
+
 #[cfg(test)]
 mod tests;

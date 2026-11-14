@@ -226,12 +226,10 @@ pub fn should_show_plan_follow_up_prompt(
         && !has_composer_attachments
 }
 
-/// Whether the thread currently has a held queued run or resumable interrupted/usage-limited run
-/// (`deriveResumableRunId !== null || hasHeldQueuedRuns`).
+/// Whether the thread currently has a resumable interrupted/usage-limited run (without a
+/// pending runtime request blocking continuation), else a held queued run
+/// (`canResumeThread`).
 pub fn can_resume_thread(projection: &ThreadProjection) -> bool {
-    if projection.runs.iter().any(|run| run.status == "queued" && run.queue_held == Some(true)) {
-        return true;
-    }
     let latest_executed = projection
         .runs
         .iter()
@@ -241,15 +239,19 @@ pub fn can_resume_thread(projection: &ThreadProjection) -> bool {
             let end_b = b.completed_at.as_deref().and_then(super::parse_iso_ms).unwrap_or(i64::MAX);
             end_a.cmp(&end_b).then_with(|| a.ordinal.cmp(&b.ordinal))
         });
-    let Some(run) = latest_executed else { return false };
-    if run.status == "interrupted" {
-        return true;
+    let has_resumable_run = latest_executed.is_some_and(|run| {
+        run.status == "interrupted"
+            || (run.status == "failed"
+                && super::status::thread_error(projection)
+                    .is_some_and(|err| err.class.as_deref() == Some("usage_limit")))
+    });
+    if !has_resumable_run {
+        return projection.runs.iter().any(|run| run.status == "queued" && run.queue_held == Some(true));
     }
-    if run.status != "failed" {
-        return false;
-    }
-    super::status::thread_error(projection)
-        .is_some_and(|err| err.class.as_deref() == Some("usage_limit"))
+    !projection
+        .runtime_requests
+        .iter()
+        .any(|request| request.value.get("status").and_then(serde_json::Value::as_str) == Some("pending"))
 }
 
 #[cfg(test)]
@@ -384,5 +386,79 @@ mod tests {
 
         projection.plans[0].value["status"] = serde_json::json!("implemented");
         assert!(find_active_proposed_plan(&projection).is_none());
+    }
+
+    #[test]
+    fn can_resume_thread_blocks_when_runtime_request_is_pending() {
+        let mut projection: ThreadProjection = serde_json::from_value(serde_json::json!({
+            "thread": {
+                "id": "th-1",
+                "projectId": "pr-1",
+                "title": "Resume thread",
+                "providerInstanceId": "codex-1",
+                "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": null,
+                "worktreePath": null,
+                "lineage": {
+                    "parentThreadId": null,
+                    "relationshipToParent": null,
+                    "rootThreadId": "th-1"
+                },
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:03:00Z",
+                "archivedAt": null
+            },
+            "runs": [
+                {
+                    "id": "run-1",
+                    "ordinal": 1,
+                    "providerInstanceId": "codex-1",
+                    "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                    "userMessageId": "msg-1",
+                    "rootNodeId": null,
+                    "status": "interrupted",
+                    "requestedAt": "2026-01-01T00:00:00Z",
+                    "startedAt": "2026-01-01T00:00:01Z",
+                    "completedAt": "2026-01-01T00:01:00Z"
+                },
+                {
+                    "id": "run-2",
+                    "ordinal": 2,
+                    "providerInstanceId": "codex-1",
+                    "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
+                    "userMessageId": "msg-2",
+                    "rootNodeId": null,
+                    "status": "queued",
+                    "queueHeld": true,
+                    "requestedAt": "2026-01-01T00:02:00Z",
+                    "startedAt": null,
+                    "completedAt": null
+                }
+            ],
+            "attempts": [],
+            "nodes": [],
+            "subagents": [],
+            "providerSessions": [],
+            "providerThreads": [],
+            "providerTurns": [],
+            "runtimeRequests": [{ "id": "req-1", "status": "pending", "kind": "command_approval" }],
+            "messages": [],
+            "plans": [],
+            "turnItems": [],
+            "checkpointScopes": [],
+            "checkpoints": [],
+            "contextHandoffs": [],
+            "contextTransfers": [],
+            "visibleTurnItems": [],
+            "updatedAt": "2026-01-01T00:03:00Z"
+        }))
+        .expect("valid projection");
+
+        // A pending runtime request blocks continuing the interrupted run even if the queue is held.
+        assert!(!can_resume_thread(&projection));
+        projection.runtime_requests[0].value["status"] = serde_json::json!("resolved");
+        assert!(can_resume_thread(&projection));
     }
 }

@@ -19,6 +19,7 @@ use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, Mov
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
+use t3_core::composer::{SERVER_PREPARE_TRIAGE, is_triage_prompt, prepare_triage_request, replace_triage_playbook_link};
 use t3_core::sidebar::ENVIRONMENT_ID;
 use t3_core::sidebar::grouping::{
     EnvironmentOwner, GroupConsumer, ProjectEnvironmentBadge, ScopedProjectGroup, build_project_groups, filter_project_scope_items, order_while_open,
@@ -200,12 +201,7 @@ fn inline_heading_width(project_title: &str, window: &mut Window, cx: &App) -> f
     f32::from(shaped.width) + 16.
 }
 
-const TRIAGE_PROMPT_FILE_NAME: &str = "triage-playbook.md";
 const TRIAGE_CLI_COMMAND: &str = "npx t3 triage";
-
-fn is_triage_prompt(prompt: &str) -> bool {
-    prompt.contains(&format!("[{TRIAGE_PROMPT_FILE_NAME}]("))
-}
 
 /// The draft's page: "What should we build in <project>?" over the composer, centered.
 pub struct DraftHero {
@@ -441,11 +437,17 @@ impl DraftHero {
             let app = self.state.read(cx);
             (app.draft_project.clone(), app.environments.active.clone())
         };
-        let same_target = current.as_deref() == Some(entry.project_id.as_str())
-            && entry.owner.as_ref().is_none_or(|owner| active_env.as_deref() == Some(&owner.saved_id));
+        let same_env = entry.owner.as_ref().is_none_or(|owner| active_env.as_deref() == Some(&owner.saved_id));
+        let same_target = current.as_deref() == Some(entry.project_id.as_str()) && same_env;
         if !same_target {
+            if !same_env
+                && let Some(owner) = entry.owner.clone()
+                && is_triage_prompt(&self.composer.read(cx).prompt_text(cx))
+            {
+                self.switch_triage_machine(owner, Some(entry.project_id), window, cx);
+                return;
+            }
             if let Some(from) = current {
-                let same_env = entry.owner.as_ref().is_none_or(|owner| active_env.as_deref() == Some(&owner.saved_id));
                 self.composer.update(cx, |composer, cx| {
                     composer.retarget_draft(&from, &entry.project_id, same_env, window, cx);
                 });
@@ -456,6 +458,92 @@ impl DraftHero {
             });
         }
         self.composer.update(cx, |composer, cx| composer.focus(window, cx));
+    }
+
+    /// `useDraftEnvironmentRouting`: switching machines on a triage draft prepares a triage
+    /// session on the destination machine, ensures a project there if needed, and rewrites the
+    /// playbook link while preserving any edits typed in the meantime.
+    fn switch_triage_machine(&mut self, owner: EnvironmentOwner, known_project_id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (from_project, active_env, destination) = {
+            let app = self.state.read(cx);
+            if !app.scoped_ready(&owner, ORCHESTRATION_OPERATE_SCOPE) {
+                return;
+            }
+            (
+                app.draft_project.clone(),
+                app.environments.active.clone(),
+                app.connections.destination(&owner, ORCHESTRATION_OPERATE_SCOPE),
+            )
+        };
+        let request_id = self.scratch_request;
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome: Result<(String, String), String> = async {
+                let target = destination.await.map_err(|_| "Not connected to the target machine.".to_owned())?;
+                let prepared = target
+                    .client
+                    .request(
+                        SERVER_PREPARE_TRIAGE,
+                        prepare_triage_request(Some(std::env::consts::OS), Some(env!("CARGO_PKG_VERSION"))),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let prepared_prompt = prepared
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "Could not prepare triage on the target machine.".to_owned())?;
+                let project_id = match known_project_id {
+                    Some(id) => id,
+                    None => {
+                        let scratch = target
+                            .client
+                            .request(t3_core::home::PROJECTS_ENSURE_SCRATCH, serde_json::json!({}))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        t3_core::home::ensure_scratch_project_id(&scratch)
+                            .ok_or_else(|| "Could not open scratch project on target machine.".to_owned())?
+                    }
+                };
+                Ok((prepared_prompt, project_id))
+            }
+            .await;
+            let _ = this.update_in(cx, |hero, window, cx| {
+                if hero.scratch_request != request_id {
+                    return;
+                }
+                let same_draft = {
+                    let app = hero.state.read(cx);
+                    app.selected_thread.is_none() && app.draft_project == from_project && app.environments.active == active_env
+                };
+                if !same_draft {
+                    return;
+                }
+                match outcome {
+                    Ok((prepared_prompt, target_project_id)) => {
+                        hero.composer.update(cx, |composer, cx| {
+                            let current = composer.prompt_text(cx);
+                            let next = replace_triage_playbook_link(&current, &prepared_prompt);
+                            if next != current {
+                                composer.replace_prompt_text(&next, window, cx);
+                            }
+                            if let Some(from) = &from_project {
+                                composer.retarget_draft(from, &target_project_id, false, window, cx);
+                            }
+                        });
+                        hero.state.update(cx, |state, cx| {
+                            state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Draft(target_project_id), cx);
+                        });
+                        hero.composer.update(cx, |composer, cx| composer.focus(window, cx));
+                    }
+                    Err(description) => {
+                        hero.state.update(cx, |state, cx| {
+                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Could not switch machine").description(description), cx);
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn activate_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1414,13 +1502,120 @@ mod tests {
             );
         });
 
-        drop(vcx);
+        let _ = vcx;
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();
             cx.clear_globals();
         });
         drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn triage_draft_machine_switch_calls_prepare_triage_and_rewrites_playbook_link(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (connections, _output) = t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+        let mut view = state.read_with(cx, |state, _| state.connections.view());
+        let (remote_client, mut remote_fixture) = t3_client::supervisor::ClientFixture::handle(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            }))
+            .unwrap(),
+        );
+        let mut shell = t3_core::shell::ShellState::default();
+        shell.synchronized = true;
+        shell.snapshot = Some(t3_core::shell::ShellSnapshot::default());
+        let mut cfg = t3_core::server_config::ServerConfigState::default();
+        cfg.config = Some(serde_json::from_value(serde_json::json!({
+            "environment": { "environmentId": "remote-env", "label": "Remote Box", "platform": "linux", "homeDir": "/home/me", "capabilities": {}, "serverVersion": "1.2.3" },
+            "providers": [],
+            "auth": {},
+            "scratchWorkspaceRoot": "/home/me/.t3/scratch"
+        })).unwrap());
+        let install = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "remote-1",
+                remote_client,
+                shell,
+                cfg,
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _events = runtime.spawn(install).await.unwrap();
+        let installed = view.borrow_and_update().clone();
+        let remote_owner = installed.environment("remote-1").unwrap().summary.owner.clone();
+
+        let (harness, vcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let hero = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
+            let unfocus = cx.focus_handle();
+            window.focus(&unfocus, cx);
+            HeroHarness { hero, composer, render_hero: false, unfocus }
+        });
+        let (hero, composer) = harness.read_with(vcx, |h, _| (h.hero.clone(), h.composer.clone()));
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.apply_fleet_view(installed, cx);
+                state.start_draft("scratch-local", cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_test_prompt(
+                    "My notes\nSee [triage-playbook.md](file:///local/triage-playbook.md)",
+                    window,
+                    cx,
+                );
+            });
+            hero.update(cx, |hero, cx| {
+                hero.switch_triage_machine(remote_owner.clone(), None, window, cx);
+            });
+        });
+
+        let (method, params, reply) = remote_fixture.next_request().await;
+        assert_eq!(method, SERVER_PREPARE_TRIAGE);
+        assert!(params["client"]["os"].is_string());
+        reply
+            .send(Ok(serde_json::json!({
+                "prompt": "Read [triage-playbook.md](file:///home/me/.t3/triage-playbook.md)"
+            })))
+            .unwrap();
+
+        let (method, _, reply) = remote_fixture.next_request().await;
+        assert_eq!(method, t3_core::home::PROJECTS_ENSURE_SCRATCH);
+        reply.send(Ok(serde_json::json!({ "projectId": "remote-scratch" }))).unwrap();
+
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(
+                composer.read(cx).stored_draft_prompt("remote-scratch"),
+                Some("My notes\nSee [triage-playbook.md](file:///home/me/.t3/triage-playbook.md)")
+            );
+            assert_eq!(state.read(cx).environments.active.as_deref(), Some("remote-1"));
+        });
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
         drop(runtime);
         cx.run_until_parked();
     }
