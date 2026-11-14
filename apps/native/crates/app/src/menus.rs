@@ -1,7 +1,7 @@
 //! The app menu bar (`apps/desktop/src/window/DesktopApplicationMenu.ts`) for what the native
 //! client has: app, File, Edit (routed to the focused text field), View, and Window.
 
-use gpui::{App, Entity, KeyBinding, Menu, MenuItem, SystemMenuType, actions};
+use gpui::{App, Entity, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, actions};
 use gpui_component::input::{Copy, Cut, Delete, Paste, Redo, SelectAll, Undo};
 
 use crate::app_state::AppState;
@@ -14,6 +14,20 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&mut gpui::Window)) {
     if let Some(window) = cx.active_window() {
         let _ = window.update(cx, |_, window, _| f(window));
     }
+}
+
+fn edit_menu() -> Menu {
+    Menu::new("Edit").items([
+        MenuItem::action("Undo", Undo),
+        MenuItem::action("Redo", Redo),
+        MenuItem::separator(),
+        MenuItem::os_action("Cut", Cut, OsAction::Cut),
+        MenuItem::os_action("Copy", Copy, OsAction::Copy),
+        MenuItem::os_action("Paste", Paste, OsAction::Paste),
+        MenuItem::action("Delete", Delete),
+        MenuItem::separator(),
+        MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+    ])
 }
 
 pub fn init(state: Entity<AppState>, cx: &mut App) {
@@ -54,17 +68,7 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
             MenuItem::action("Quit T3 Code", Quit),
         ]),
         Menu::new("File").items([MenuItem::action("Close Window", CloseWindow)]),
-        Menu::new("Edit").items([
-            MenuItem::action("Undo", Undo),
-            MenuItem::action("Redo", Redo),
-            MenuItem::separator(),
-            MenuItem::action("Cut", Cut),
-            MenuItem::action("Copy", Copy),
-            MenuItem::action("Paste", Paste),
-            MenuItem::action("Delete", Delete),
-            MenuItem::separator(),
-            MenuItem::action("Select All", SelectAll),
-        ]),
+        edit_menu(),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Command Palette", ToggleCommandPalette),
@@ -73,4 +77,47 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
         ]),
         Menu::new("Window").items([MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)]),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::TypeId;
+
+    use super::*;
+
+    fn os_action_tag(action: Option<OsAction>) -> Option<&'static str> {
+        match action? {
+            OsAction::Cut => Some("cut"),
+            OsAction::Copy => Some("copy"),
+            OsAction::Paste => Some("paste"),
+            OsAction::SelectAll => Some("select_all"),
+            OsAction::Undo => Some("undo"),
+            OsAction::Redo => Some("redo"),
+        }
+    }
+
+    #[test]
+    fn edit_menu_routes_clipboard_and_select_all_through_os_actions() {
+        let menu = edit_menu();
+        let actions: Vec<_> = menu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, action, os_action, .. } => Some((name.as_ref(), action.as_ref().type_id(), os_action_tag(*os_action))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                ("Undo", TypeId::of::<Undo>(), None),
+                ("Redo", TypeId::of::<Redo>(), None),
+                ("Cut", TypeId::of::<Cut>(), Some("cut")),
+                ("Copy", TypeId::of::<Copy>(), Some("copy")),
+                ("Paste", TypeId::of::<Paste>(), Some("paste")),
+                ("Delete", TypeId::of::<Delete>(), None),
+                ("Select All", TypeId::of::<SelectAll>(), Some("select_all")),
+            ]
+        );
+    }
 }

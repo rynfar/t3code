@@ -34,8 +34,31 @@ pub enum Anchor {
 /// The rows in view, measured with `item_top` (an item's top in the list's content). `None` while
 /// the list follows its tail or has not laid out, unless a disclosure anchors its own row.
 pub fn capture<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top: ScrollTop, viewport: f32, item_top: impl Fn(usize) -> f32, disclosure: Option<&str>) -> Option<VisibleRows> {
+    let mode = disclosure.map_or(TailCapture::Follow, TailCapture::Disclosure);
+    capture_inner(rows, id, header, scroll_top, viewport, item_top, mode)
+}
+
+/// Like [`capture`], but still captures visible rows at the tail when live follow is paused
+/// (e.g. while a full-screen modal overlay is open).
+pub fn capture_pinned<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top: ScrollTop, viewport: f32, item_top: impl Fn(usize) -> f32, disclosure: Option<&str>) -> Option<VisibleRows> {
+    capture_inner(rows, id, header, scroll_top, viewport, item_top, TailCapture::Pinned(disclosure))
+}
+
+#[derive(Clone, Copy)]
+enum TailCapture<'a> {
+    Follow,
+    Disclosure(&'a str),
+    Pinned(Option<&'a str>),
+}
+
+fn capture_inner<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top: ScrollTop, viewport: f32, item_top: impl Fn(usize) -> f32, mode: TailCapture<'_>) -> Option<VisibleRows> {
+    let (disclosure, pin_at_tail) = match mode {
+        TailCapture::Follow => (None, false),
+        TailCapture::Disclosure(key) => (Some(key), false),
+        TailCapture::Pinned(key) => (key, true),
+    };
     let at_tail = scroll_top.item >= header + rows.len();
-    if viewport <= 0. || (at_tail && disclosure.is_none()) {
+    if viewport <= 0. || (at_tail && !pin_at_tail && disclosure.is_none()) {
         return None;
     }
     // At the tail GPUI reports the end of all items (including the footer), not the viewport top.
@@ -45,7 +68,12 @@ pub fn capture<T>(rows: &[T], id: impl Fn(&T) -> &str, header: usize, scroll_top
         let top = item_top(header + index) - scrolled;
         return (top < viewport).then(|| VisibleRows { scroll_top, header, rows: vec![(key.to_owned(), index, top)], disclosure: true });
     }
-    let first = scroll_top.item.max(header) - header;
+    let mut first = if at_tail && pin_at_tail { rows.len() } else { scroll_top.item.max(header) - header };
+    if at_tail && pin_at_tail {
+        while first > 0 && item_top(header + first) > scrolled {
+            first -= 1;
+        }
+    }
     let rows: Vec<(String, usize, f32)> = (first..rows.len())
         .map(|index| (index, item_top(header + index) - scrolled))
         .take_while(|(_, top)| *top < viewport)
