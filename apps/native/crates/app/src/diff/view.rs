@@ -148,6 +148,10 @@ impl View {
         self.keys.get(file).map(String::as_str)
     }
 
+    pub fn file_rows_slice(&self, file: usize) -> Option<&[DiffRow]> {
+        self.rows.get(file).map(|rows| rows.as_slice())
+    }
+
     pub fn is_folded(&self, file: usize) -> bool {
         self.folded.get(file).copied().unwrap_or(false)
     }

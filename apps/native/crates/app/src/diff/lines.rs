@@ -60,7 +60,14 @@ pub(crate) fn gutter_width(digits: usize, char_width: Pixels) -> Pixels {
 impl DiffPanel {
     pub(super) fn render_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity().downgrade();
-        cx.defer(move |cx| { if let Some(entity) = entity.upgrade() { entity.update(cx, |panel, cx| panel.load_nearby(cx)); } });
+        cx.defer(move |cx| {
+            if let Some(entity) = entity.upgrade() {
+                entity.update(cx, |panel, cx| {
+                    panel.load_nearby(cx);
+                    panel.apply_pending_scroll_restore(cx);
+                });
+            }
+        });
         let p = palette(cx);
         let font = (cx.theme().mono_font_family.clone(), cx.theme().mono_font_size);
         if self.measured_font.as_ref() != Some(&font) {
@@ -85,14 +92,20 @@ impl DiffPanel {
             .min_w_0()
             .h_full()
             .bg(hsla(p.background))
-            .on_scroll_wheel(cx.listener(Self::scroll_horizontally))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                this.cancel_reveal_on_interaction();
+                this.scroll_horizontally(event, window, cx);
+            }))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| {
+                this.cancel_reveal_on_interaction();
+            }))
             .on_mouse_move(cx.listener(Self::drag_comment_selection))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
                 this.track_comment_pointer(event.position, cx);
                 this.finish_selection(window, cx);
             }))
             .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| this.finish_selection(window, cx)))
-            .child(list(self.list.clone(), cx.processor(|this, ix: usize, _, cx| this.render_row(ix, cx))).size_full())
+            .child(list(self.list.clone(), cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx))).size_full())
             .children(sticky.map(|file| div().absolute().top_0().left_0().right_0().child(self.render_file_header(file, cx))))
             .vertical_scrollbar(&self.list)
             .into_any_element()
@@ -121,10 +134,10 @@ impl DiffPanel {
         }
     }
 
-    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let row = self.view.as_ref().and_then(|view| view.row(ix));
         let code = self.render_code_row(ix, cx);
-        self.with_comment_editor(row, code, cx)
+        self.with_comment_editor(row, code, window, cx)
     }
 
     fn render_code_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -137,14 +150,19 @@ impl DiffPanel {
             DiffRow::Line { file, hunk, line } => {
                 let Some((line, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
                 let p = palette(cx);
-                self.code_row(line_colors(line.kind, p).row, cx).child(self.half(file, Some(&line), digits, true, cx)).into_any_element()
+                let highlighted = self.is_revealed_line(file, &line, None);
+                let bg = if highlighted { hsla(p.primary).opacity(0.08) } else { line_colors(line.kind, p).row };
+                self.code_row(bg, cx).child(self.half(file, Some(&line), digits, true, cx)).into_any_element()
             }
             DiffRow::Split { file, hunk, left, right } => {
                 let left = left.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
                 let right = right.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
                 let digits = left.as_ref().or(right.as_ref()).map_or(3, |(_, digits)| *digits);
                 let p = palette(cx);
-                self.code_row(hsla(p.background), cx)
+                let left_hi = left.as_ref().is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(t3_core::composer::review::Side::Deletions)));
+                let right_hi = right.as_ref().is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(t3_core::composer::review::Side::Additions)));
+                let bg = if left_hi || right_hi { hsla(p.primary).opacity(0.08) } else { hsla(p.background) };
+                self.code_row(bg, cx)
                     .child(self.half(file, left.as_ref().map(|(line, _)| line), digits, false, cx))
                     .child(self.half(file, right.as_ref().map(|(line, _)| line), digits, true, cx))
                     .into_any_element()

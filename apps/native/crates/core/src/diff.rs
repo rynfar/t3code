@@ -6,11 +6,14 @@
 //! `apps/web/src/state/queries.ts` (`useCheckpointDiff`), and one tool call's recorded patch
 //! (`apps/web/src/lib/toolCallDiff.ts`).
 
+mod completion;
 mod parse;
 mod hunks;
+mod reveal;
 mod review;
 mod rows;
 mod scope;
+mod scroll;
 mod session;
 mod tool_call;
 mod tree;
@@ -18,9 +21,24 @@ mod whitespace;
 
 use std::sync::Arc;
 
+pub use completion::{
+    COMPLETION_DEBOUNCE_MS, CompletionItem, CompletionOptions, CompletionScope,
+    CompletionSearchDecision, CompletionSupport, FilterOptionsKind, MAX_COMPLETION_ITEMS,
+    MentionCandidate, PrCompletionState, PullRequestComposerTrigger, ReferenceCandidate,
+    ReferenceKind, ReferenceSigil, ReferenceState, TriggerKind, completion_query_cache_key,
+    debounced_pull_request_completion_search, detect_pull_request_composer_trigger,
+    filter_options_params, insert_pull_request_completion, narrow_pull_request_mentions,
+    narrow_pull_request_references, nudge_completion, pull_request_completion_key,
+    pull_request_completions,
+};
 pub use parse::parse_patch;
 pub use hunks::FileHunks;
+pub use reveal::{
+    FileReveal, FileRevealTarget, RevealAction, addition_line, expand_partial_diff_to_line,
+    file_matches_path, find_nearest_row_for_line, find_selection_row, line_number_for_side,
+};
 pub use review::{review_boundary_near, ReviewScope, ReviewFile, ReviewModel, PatchTicket, FilePatchState};
+pub use scroll::{ScrollRestore, ScrollRestoreAction};
 pub use session::DiffSession;
 pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{
