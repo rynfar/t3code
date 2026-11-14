@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::Context;
 use t3_core::lineage::{
-    RelationshipGraph, RelationshipKind, RelationshipRow, STOP_WORKFLOW, Subagent, group_relationships, immediate_relationships,
+    RelationshipGraph, RelationshipKind, RelationshipRow, STOP_WORKFLOW, Subagent, WorkflowGroup, group_relationships, immediate_relationships,
     is_parent_relationship, keep_relationship_row, latest_merge_back_run, merge_back_command, merge_back_target, order_rows,
     relationship_graph, relationship_label, relationship_status_label, row_status, stop_subagent_command, stop_workflow_request,
     subagent_display_title, subagents_of, unlisted_title_ids, workflow_group,
@@ -25,15 +25,18 @@ pub enum StopAction {
     Workflow { thread_id: String, subagent_id: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LineageRow {
     pub thread_id: String,
     pub title: String,
     pub icon: Icon,
     pub relationship: &'static str,
     pub status: &'static str,
+    pub failed: bool,
+    pub is_running: bool,
     pub merge_target: bool,
     pub stop: Option<StopAction>,
+    pub workflow: Option<WorkflowGroup>,
 }
 
 /// Merging the open fork back: into which thread, and whether a finished turn allows it.
@@ -43,11 +46,22 @@ pub struct MergeBack {
     pub ready: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Relationships {
-    pub lineage: Vec<LineageRow>,
+    pub related: Vec<LineageRow>,
+    pub active: Vec<LineageRow>,
+    pub previous: Vec<LineageRow>,
     pub side_chats: Vec<LineageRow>,
     pub merge: Option<MergeBack>,
+    pub running_count: usize,
+    pub running_side_chats: usize,
+    pub show_heading: bool,
+}
+
+impl Relationships {
+    pub fn lineage_len(&self) -> usize {
+        self.related.len() + self.active.len() + self.previous.len()
+    }
 }
 
 struct Prepared<'a> {
@@ -62,13 +76,23 @@ struct Prepared<'a> {
 fn prepare<'a>(state: &'a AppState, thread: &ThreadShell) -> Option<Prepared<'a>> {
     let snapshot = state.shell.snapshot.as_ref()?;
     let projection = state.thread.projection.as_ref().filter(|projection| projection.thread.id == thread.id);
-    // Live shells first, then the idle family rows the shell omits, then archived snapshots.
+    // Only live shells count as listed (`relationshipShells`); omitted/archived shells still feed
+    // graph structure and fallback metadata, while `getThreadTitles` fetches fresh titles/existence.
+    let listed_set: HashSet<&str> = snapshot.threads.iter().map(|shell| shell.id.as_str()).collect();
     let family = state.omitted.mounts.extras(&state.shell);
     let listed: Vec<&'a ThreadShell> = snapshot.threads.iter().chain(family).chain(snapshot.archived_threads.iter()).collect();
-    let listed_set: HashSet<&str> = listed.iter().map(|shell| shell.id.as_str()).collect();
     let graph = relationship_graph(listed, projection);
     let merge_target = projection.and_then(|projection| merge_back_target(&projection.thread));
-    let rows = order_rows(&graph, immediate_relationships(&graph, &thread.id), &thread.id, merge_target.as_deref());
+    let hiding_anywhere = state.hiding_thread_tags() || !state.sidebar.hidden_thread_ids.is_empty();
+    let rows: Vec<RelationshipRow> = order_rows(&graph, immediate_relationships(&graph, &thread.id), &thread.id, merge_target.as_deref())
+        .into_iter()
+        .filter(|row| {
+            !state.sidebar.hidden_thread_ids.contains(&row.thread_id)
+                && !(hiding_anywhere
+                    && graph.nodes.get(&row.thread_id).is_some_and(|node| node.missing)
+                    && (row.edge.kind != RelationshipKind::Subagent || is_parent_relationship(&row.edge, &thread.id)))
+        })
+        .collect();
     let agents: Vec<Subagent> = projection.map(subagents_of).unwrap_or_default();
     let subagents_with_titles: HashSet<&str> =
         agents.iter().filter(|agent| agent.title.is_some()).filter_map(|agent| agent.child_thread_id.as_deref()).collect();
@@ -84,13 +108,25 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
     let Some(prepared) = prepare(state, thread) else { return Relationships::default() };
     let unlisted_set: HashSet<&str> = prepared.unlisted_ids.iter().map(String::as_str).collect();
     let resolved = titles.and_then(|feed| feed.resolved_for(state, &prepared.unlisted_ids));
-    let visible_rows: Vec<RelationshipRow> =
-        prepared.rows.into_iter().filter(|row| keep_relationship_row(row, &unlisted_set, resolved)).collect();
     let by_child: HashMap<&str, &Subagent> = prepared.agents.iter().filter_map(|agent| Some((agent.child_thread_id.as_deref()?, agent))).collect();
+    let visible_rows: Vec<RelationshipRow> = prepared
+        .rows
+        .into_iter()
+        .filter(|row| keep_relationship_row(row, &unlisted_set, resolved))
+        .map(|mut row| {
+            if row.edge.kind == RelationshipKind::Subagent
+                && !is_parent_relationship(&row.edge, &thread.id)
+                && let Some(group) = by_child.get(row.thread_id.as_str()).copied().and_then(workflow_group)
+            {
+                row.edge.status = Some(group.status);
+            }
+            row
+        })
+        .collect();
     let can_operate = state.can_operate_threads();
     let graph = &prepared.graph;
     let merge_target = prepared.merge_target.as_deref().filter(|target| visible_rows.iter().any(|row| row.thread_id == *target));
-    let groups = group_relationships(graph, visible_rows.clone(), &thread.id);
+    let groups = group_relationships(graph, visible_rows, &thread.id);
     let row = |row: &RelationshipRow| {
         let node = graph.nodes.get(&row.thread_id).and_then(|node| node.thread);
         let parent = is_parent_relationship(&row.edge, &thread.id);
@@ -99,11 +135,13 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
         let agent = (subagent && !parent).then(|| by_child.get(row.thread_id.as_str()).copied()).flatten();
         let workflow = agent.and_then(workflow_group);
         let status = workflow.as_ref().map(|group| group.status.clone()).or_else(|| row_status(graph, row));
+        let failed = matches!(status.as_deref(), Some("failed" | "error"));
+        let is_running = status.as_deref() == Some("running");
         let title = workflow
             .as_ref()
             .and_then(|group| group.name.clone())
-            .or_else(|| node.map(|node| node.title.clone()))
             .or_else(|| resolved.and_then(|map| map.get(&row.thread_id).cloned()))
+            .or_else(|| node.map(|node| node.title.clone()))
             .or_else(|| agent.map(runtime_title))
             .unwrap_or_else(|| row.thread_id.clone());
         let stop = can_operate
@@ -129,24 +167,28 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
             },
             relationship: relationship_label(&row.edge, &thread.id, side_chat),
             status: relationship_status_label(status.as_deref()),
+            failed,
+            is_running,
             merge_target: merge_target == Some(row.thread_id.as_str()),
             stop,
+            workflow,
         }
     };
     let merge = merge_target.map(|target| MergeBack {
-        target_title: graph
-            .nodes
-            .get(target)
-            .and_then(|node| node.thread)
-            .map(|thread| thread.title.clone())
-            .or_else(|| resolved.and_then(|map| map.get(target).cloned())),
+        target_title: resolved
+            .and_then(|map| map.get(target).cloned())
+            .or_else(|| graph.nodes.get(target).and_then(|node| node.thread).map(|thread| thread.title.clone())),
         ready: can_operate && prepared.projection.is_some_and(|projection| latest_merge_back_run(&projection.runs).is_some()),
     });
-    Relationships {
-        lineage: groups.related.iter().chain(&groups.active).chain(&groups.previous).map(row).collect(),
-        side_chats: groups.side_chats.iter().map(row).collect(),
-        merge,
-    }
+    let related: Vec<LineageRow> = groups.related.iter().map(row).collect();
+    let active: Vec<LineageRow> = groups.active.iter().map(row).collect();
+    let previous: Vec<LineageRow> = groups.previous.iter().map(row).collect();
+    let side_chats: Vec<LineageRow> = groups.side_chats.iter().map(row).collect();
+    let running_count = prepared.agents.iter().filter(|agent| agent.child_thread_id.is_none() && agent.status == "running").count()
+        + active.iter().filter(|row| row.is_running).count();
+    let running_side_chats = side_chats.iter().filter(|row| row.is_running).count();
+    let show_heading = running_count > 0 || !related.is_empty() || !active.is_empty();
+    Relationships { related, active, previous, side_chats, merge, running_count, running_side_chats, show_heading }
 }
 
 /// The runtime title `projectedSubagentsToRuntime` gives a subagent: its title, else its prompt.
@@ -276,6 +318,15 @@ mod tests {
             let thread = shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|t| t.id == "menu-thread").unwrap();
             thread.lineage.parent_thread_id = Some("fork-deleted".into());
             thread.lineage.relationship_to_parent = Some("fork".into());
+            // Archived thread with stale title in snapshot.archived_threads must STILL be fetched
+            // via getThreadTitles, and the resolved live title must win over the archived copy.
+            let mut archived: ThreadShell = thread.clone();
+            archived.id = "fork-archived".into();
+            archived.title = "Archived Stale Title".into();
+            archived.lineage.parent_thread_id = None;
+            archived.lineage.relationship_to_parent = None;
+            archived.archived_at = Some("2026-04-01T00:00:00.000Z".into());
+            shell.snapshot.as_mut().unwrap().archived_threads.push(archived);
             state.install_active_environment(rw_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
             state.select_thread("menu-thread", cx);
             let snapshot: ThreadStreamItem = serde_json::from_value(serde_json::json!({
@@ -300,8 +351,20 @@ mod tests {
                         "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": null,
                         "completedAt": "2026-04-01T00:00:02.000Z"
                     }],
-                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
-                    "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                    "attempts": [], "nodes": [],
+                    "subagents": [
+                        {
+                            "id": "sub-done", "threadId": "menu-thread", "childThreadId": "child-done",
+                            "origin": "app_owned", "prompt": "done agent", "title": "Done Agent",
+                            "status": "completed", "updatedAt": "2026-04-01T00:00:02.000Z"
+                        },
+                        {
+                            "id": "sub-live", "threadId": "menu-thread", "childThreadId": "child-live",
+                            "origin": "app_owned", "prompt": "live agent", "title": "Live Agent",
+                            "status": "running", "updatedAt": "2026-04-01T00:00:03.000Z"
+                        }
+                    ],
+                    "providerSessions": [], "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
                     "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
                     "checkpoints": [], "contextHandoffs": [],
                     "contextTransfers": [{
@@ -323,12 +386,36 @@ mod tests {
             h
         });
 
-        // Unsettled lookup preserves both unlisted IDs.
+        // Unsettled lookup preserves unlisted IDs and separates active vs previous groups.
         vcx.update(|_, cx| {
             view.read_with(cx, |h, _| {
-                let ids: Vec<&str> = h.latest.lineage.iter().map(|r| r.thread_id.as_str()).collect();
+                let ids: Vec<&str> = h.latest.related.iter().map(|r| r.thread_id.as_str()).collect();
                 assert_eq!(ids, vec!["fork-deleted", "fork-archived"]);
+                assert_eq!(h.latest.active.iter().map(|r| r.thread_id.as_str()).collect::<Vec<_>>(), vec!["child-live"]);
+                assert_eq!(h.latest.previous.iter().map(|r| r.thread_id.as_str()).collect::<Vec<_>>(), vec!["child-done"]);
+                assert_eq!(h.latest.running_count, 1);
+                assert!(h.latest.show_heading);
                 assert!(h.latest.merge.as_ref().is_some_and(|m| m.ready));
+            });
+        });
+
+        // First getThreadTitles fails -> feed must recover (not stay locked on active_key).
+        let (method_err, payload_err, reply_err) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == t3_core::lineage::GET_THREAD_TITLES {
+                break req;
+            }
+            let _ = req.2.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(method_err, t3_core::lineage::GET_THREAD_TITLES);
+        assert_eq!(payload_err["threadIds"], serde_json::json!(["fork-archived", "fork-deleted"]));
+        reply_err.send(Err(t3_client::session::RpcError::Closed)).unwrap();
+
+        // Advancing event/retry clears failed_key and fires retry.
+        vcx.update(|_, cx| {
+            view.update(cx, |h, cx| {
+                h.titles.allow_retry();
+                h.refresh(cx);
             });
         });
 
@@ -346,14 +433,22 @@ mod tests {
         settled_rx.recv().await.unwrap();
         vcx.update(|_, cx| {
             view.read_with(cx, |h, _| {
-                assert_eq!(h.latest.lineage.len(), 1);
-                assert_eq!(h.latest.lineage[0].thread_id, "fork-archived");
-                assert_eq!(h.latest.lineage[0].title, "Archived Fork Fresh Title");
+                assert_eq!(h.latest.related.len(), 1);
+                assert_eq!(h.latest.related[0].thread_id, "fork-archived");
+                assert_eq!(h.latest.related[0].title, "Archived Fork Fresh Title");
                 assert!(h.latest.merge.is_none(), "deleted merge target clears merge button");
             });
 
-            // Removing archived fork in shell updates removed_at and triggers a fresh lookup.
+            // Hidden thread IDs filter related rows.
             state.update(cx, |state, _| {
+                state.sidebar.hidden_thread_ids.insert("fork-archived".into());
+            });
+            view.update(cx, |h, cx| h.refresh(cx));
+            view.read_with(cx, |h, _| {
+                assert!(h.latest.related.is_empty(), "hidden thread id must be filtered from lineage");
+            });
+            state.update(cx, |state, _| {
+                state.sidebar.hidden_thread_ids.remove("fork-archived");
                 state.shell.removed_at.insert("fork-archived".into(), 2);
             });
             view.update(cx, |h, cx| h.refresh(cx));
@@ -371,7 +466,7 @@ mod tests {
 
         settled_rx.recv().await.unwrap();
         view.read_with(cx, |h, _| {
-            assert!(h.latest.lineage.is_empty(), "removed archived fork disappears after re-lookup");
+            assert!(h.latest.related.is_empty(), "removed archived fork disappears after re-lookup");
         });
 
         // Read-only permissions block workflow stop / merge mutations.

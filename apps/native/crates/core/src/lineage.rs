@@ -335,7 +335,7 @@ pub fn decode_thread_titles(value: Value) -> Result<HashMap<String, String>, Str
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
 
-/// Related thread IDs missing from live+family shells (excluding subagents that already carry a title).
+/// Related thread IDs missing from live shells (excluding subagents that already carry a title).
 pub fn unlisted_title_ids(rows: &[RelationshipRow], listed_ids: &HashSet<&str>, subagents_with_titles: &HashSet<&str>) -> Vec<String> {
     let mut ids: Vec<String> = rows
         .iter()

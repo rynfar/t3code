@@ -372,6 +372,9 @@ mod tests {
                 .unwrap(),
             );
             state.install_active_environment(client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            let mut config = state.server_config.config.clone().unwrap_or_default();
+            config.environment.capabilities.side_chats = Some(true);
+            state.server_config.config = Some(config);
             state.select_thread("menu-thread", cx);
         });
         let _ = fixture.take_commands();
@@ -385,11 +388,16 @@ mod tests {
             }))
             .unwrap();
             assert!(!state.can_operate_threads());
+            assert!(!state.side_chats_offered());
+            assert_eq!(state.side_chat_disabled_reason(), Some("This connection cannot change threads."));
+            assert!(!state.open_side_chat(Some("hi".into()), cx));
             assert_eq!(bring_back_blocked_reason(state.can_operate_threads(), false, Some(&run)), Some("This connection cannot change threads."));
             state.bring_back_side_chat("side-ro", cx);
             state.delete_side_chat("side-ro", cx);
+            state.fail_side_chat_start("side-ro", "start failed", cx);
+            state.discard_closed_side_chats(&[Surface::side_chat("side-ro")], cx);
         });
-        assert!(fixture.take_commands().is_empty(), "read-only connection must not dispatch bring-back or delete");
+        assert!(fixture.take_commands().is_empty(), "read-only connection must not dispatch side-chat mutations");
     }
 }
 

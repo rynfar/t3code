@@ -184,7 +184,7 @@ impl AppState {
         let thread = self.thread_shell(self.selected_thread.as_deref()?)?;
         let runs = self.thread.projection.as_ref().filter(|projection| projection.thread.id == thread.id).map_or(&[][..], |projection| &projection.runs);
         let capability = self.server_config.config.as_ref().map(|config| config.environment.capabilities.side_chats == Some(true));
-        Some(Parent::of(thread, runs, capability))
+        Some(Parent::of(thread, runs, capability, self.can_operate_threads()))
     }
 
     /// `sideChatsOffered`: whether the open thread shows side chat entry points at all.
@@ -206,7 +206,7 @@ impl AppState {
     /// Returns whether the start began.
     pub fn open_side_chat(&mut self, prompt: Option<String>, cx: &mut Context<Self>) -> bool {
         let Some(parent) = self.selected_thread.clone() else { return false };
-        if self.side_threads.starting.is_some() {
+        if self.side_threads.starting.is_some() || !self.can_operate_threads() {
             return false;
         }
         if let Some(reason) = self.side_chat_disabled_reason() {
@@ -274,7 +274,9 @@ impl AppState {
     /// Drops the empty side chat a failed start leaves behind; one that got its message stays.
     fn fail_side_chat_start(&mut self, target: &str, message: &str, cx: &mut Context<Self>) {
         self.report_side_chat_error(message, cx);
-        self.dispatch_then(side_chat::delete_command(&uuid_v4(), target, true), None, cx, |_, _, _| {});
+        if self.can_operate_threads() {
+            self.dispatch_then(side_chat::delete_command(&uuid_v4(), target, true), None, cx, |_, _, _| {});
+        }
     }
 
     fn report_side_chat_error(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -353,6 +355,9 @@ impl AppState {
     /// Closing side chat tabs drops the empty ones: the server keeps a side chat with a run or
     /// message. One the shell no longer has is already deleted.
     pub(crate) fn discard_closed_side_chats(&mut self, closed: &[Surface], cx: &mut Context<Self>) {
+        if !self.can_operate_threads() {
+            return;
+        }
         for surface in closed {
             let Some(id) = surface.side_chat_thread() else { continue };
             if self.shell.synchronized && self.shell.thread(id).is_none() {

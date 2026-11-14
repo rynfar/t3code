@@ -60,6 +60,7 @@ pub struct Parent<'a> {
     pub is_subagent: bool,
     /// `None` until the server config arrives.
     pub capability: Option<bool>,
+    pub can_operate: bool,
     /// The thread exists on the server (not a draft).
     pub is_server_thread: bool,
     pub worktree_path: Option<&'a str>,
@@ -67,11 +68,12 @@ pub struct Parent<'a> {
 }
 
 impl<'a> Parent<'a> {
-    pub fn of(thread: &'a ThreadShell, runs: &'a [Run], capability: Option<bool>) -> Parent<'a> {
+    pub fn of(thread: &'a ThreadShell, runs: &'a [Run], capability: Option<bool>, can_operate: bool) -> Parent<'a> {
         Parent {
             is_side_chat: thread.lineage.side_chat == Some(true),
             is_subagent: thread.lineage.relationship_to_parent.as_deref() == Some("subagent") || thread.delegated_from.is_some(),
             capability,
+            can_operate,
             is_server_thread: true,
             worktree_path: thread.worktree_path.as_deref(),
             runs,
@@ -82,7 +84,7 @@ impl<'a> Parent<'a> {
 /// `sideChatsOffered`: side chats do not nest or start from subagents, and older servers would
 /// fork a listed thread.
 pub fn offered(parent: &Parent) -> bool {
-    !parent.is_side_chat && !parent.is_subagent && parent.capability == Some(true)
+    parent.can_operate && !parent.is_side_chat && !parent.is_subagent && parent.capability == Some(true)
 }
 
 /// `orchestrationV2WorktreePending`: the thread waits on a worktree that is not set up yet.
@@ -106,6 +108,9 @@ pub fn disabled_reason(parent: &Parent) -> Option<&'static str> {
         None => return Some("Side chats are not ready yet. Try again in a moment."),
         Some(false) => return Some("Update this environment's T3 Code server to use side chats."),
         Some(true) => {}
+    }
+    if !parent.can_operate {
+        return Some("This connection cannot change threads.");
     }
     if !parent.is_server_thread {
         return Some("Side chats start after the first message.");

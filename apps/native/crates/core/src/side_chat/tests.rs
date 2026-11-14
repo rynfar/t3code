@@ -31,7 +31,7 @@ fn run(status: &str, preparation: Option<&str>) -> Run {
 }
 
 fn main_thread<'a>(capability: Option<bool>, runs: &'a [Run]) -> Parent<'a> {
-    Parent { is_side_chat: false, is_subagent: false, capability, is_server_thread: true, worktree_path: None, runs }
+    Parent { is_side_chat: false, is_subagent: false, capability, can_operate: true, is_server_thread: true, worktree_path: None, runs }
 }
 
 #[test]
@@ -40,6 +40,8 @@ fn the_disabled_reason_follows_the_web_order() {
     let parent = main_thread(Some(true), &none);
     assert_eq!(disabled_reason(&parent), None);
     assert!(offered(&parent));
+    assert!(!offered(&Parent { can_operate: false, ..parent }));
+    assert_eq!(disabled_reason(&Parent { can_operate: false, ..parent }), Some("This connection cannot change threads."));
     assert_eq!(disabled_reason(&Parent { is_side_chat: true, ..parent }), Some("Side chats cannot start side chats."));
     assert_eq!(disabled_reason(&Parent { is_subagent: true, ..parent }), Some("Subagent threads cannot start side chats."));
     assert!(!offered(&Parent { is_subagent: true, ..parent }));
@@ -57,9 +59,9 @@ fn the_disabled_reason_follows_the_web_order() {
 fn parent_of_reads_the_shell() {
     let none: [Run; 0] = [];
     let subagent = shell(json!({"lineage": {"parentThreadId": "t1", "relationshipToParent": "subagent", "rootThreadId": "t1"}}));
-    assert!(Parent::of(&subagent, &none, Some(true)).is_subagent);
+    assert!(Parent::of(&subagent, &none, Some(true), true).is_subagent);
     let side = shell(json!({}));
-    assert!(Parent::of(&side, &none, Some(true)).is_side_chat);
+    assert!(Parent::of(&side, &none, Some(true), true).is_side_chat);
     assert!(is_side_chat_of(&side, "t1"));
     assert!(!is_side_chat_of(&side, "t2"));
 }

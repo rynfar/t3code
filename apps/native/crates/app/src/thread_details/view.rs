@@ -81,7 +81,7 @@ pub struct DetailsView {
     pub(super) servers: ServersFeed,
     pub(super) automations: AutomationsFeed,
     lineage_titles: crate::lineage::ThreadTitlesFeed,
-    lineage_shown: usize,
+    card_open: bool,
     inputs: Option<Inputs>,
     find_open: bool,
     draft_provider: Option<String>,
@@ -115,17 +115,18 @@ impl DetailsView {
         let subscriptions = vec![
             cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {
                 AppEvent::Selection => {
-                    this.lineage_shown = sections::LINEAGE_INITIAL;
                     this.servers.reset_pagination();
                     this.picker.update(cx, |picker, cx| picker.close(cx));
-                    this.sync_lineage_titles(true, cx);
+                    this.lineage_titles.allow_retry();
+                    this.sync_lineage_titles(this.card_open, cx);
                     this.inputs = inputs(state.read(cx), &this.lineage_titles);
                     this.find_open = state.read(cx).selected_thread.is_some() && this.thread.read(cx).is_find_open();
                     cx.notify();
                 }
                 // Lineage reads the open thread's subagents and runs as well as the shell.
                 AppEvent::Shell | AppEvent::Thread | AppEvent::Phase => {
-                    this.sync_lineage_titles(true, cx);
+                    this.lineage_titles.allow_retry();
+                    this.sync_lineage_titles(this.card_open, cx);
                     let next = inputs(state.read(cx), &this.lineage_titles);
                     if next != this.inputs {
                         this.inputs = next;
@@ -191,7 +192,7 @@ impl DetailsView {
             servers: ServersFeed::new(),
             automations: AutomationsFeed::new(),
             lineage_titles,
-            lineage_shown: sections::LINEAGE_INITIAL,
+            card_open: false,
             inputs: initial,
             find_open,
             draft_provider,
@@ -268,6 +269,7 @@ impl Render for DetailsView {
             (details.shows("servers"), details.shows("automations"), details.shows("usage"), details.shows("context"))
         };
         let feed_active = layout.card_open && active_thread.is_some();
+        self.card_open = feed_active;
         self.servers.sync(&self.state, feed_active && show_servers, cx);
         self.automations.sync(&self.state, feed_active && show_automations, cx);
         self.sync_lineage_titles(feed_active, cx);
@@ -309,7 +311,7 @@ impl Render for DetailsView {
                 changes: details.shows("changes") && is_repo,
                 servers_rows: if show_servers { thread_id.map_or(0, |id| self.servers.count_for(id)) } else { 0 },
                 automations_rows: if show_automations { thread_id.map_or(0, |id| self.automations.count_for(id)) } else { 0 },
-                lineage_rows: if details.shows("lineage") { rel.map_or(0, |r| r.lineage.len()) } else { 0 },
+                lineage_rows: if details.shows("lineage") { rel.map_or(0, crate::lineage::Relationships::lineage_len) } else { 0 },
                 side_chats_rows: if details.shows("sideChats") { rel.map_or(0, |r| r.side_chats.len()) } else { 0 },
                 usage_rows: if show_usage { limit_row_count(app, draft_provider.as_deref()) } else { 0 },
                 context: show_context && context_available(app),
@@ -319,7 +321,6 @@ impl Render for DetailsView {
 
         let p = palette(cx);
         let ctx = self.ctx();
-        let lineage_shown = self.lineage_shown;
         let workspace = sections::workspace(&ctx, density, cx);
         let mut any_above = workspace.is_some();
         let version_control = sections::version_control(&ctx, any_above, density, cx);
@@ -332,14 +333,10 @@ impl Render for DetailsView {
             .then(|| thread_id.and_then(|id| self.automations.render(&self.state, id, any_above && density.is_full(), cx)))
             .flatten();
         any_above |= automations.is_some();
-        let more = cx.listener(|this, _, _, cx| {
-            this.lineage_shown += sections::LINEAGE_PAGE;
-            cx.notify();
-        });
         let relationships = self.inputs.as_ref().map(|inputs| inputs.lineage.clone()).unwrap_or_default();
-        let lineage = sections::lineage(&ctx, &relationships, lineage_shown, any_above && density.is_full(), density, more, cx);
+        let lineage = sections::lineage(&ctx, &relationships, thread_id, any_above && density.is_full(), density, window, cx);
         any_above |= lineage.is_some();
-        let side_chats = sections::side_chats(&ctx, &relationships, any_above && density.is_full(), density, cx);
+        let side_chats = sections::side_chats(&ctx, &relationships, any_above && density.is_full(), density, window, cx);
         any_above |= side_chats.is_some();
         let usage_limits = (show_usage && item_visible_at_density("usage", density))
             .then(|| usage_limits_section(self.state.read(cx), draft_provider.as_deref(), any_above && density.is_full(), density.is_essential(), cx))
