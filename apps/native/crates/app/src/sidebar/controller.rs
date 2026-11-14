@@ -948,7 +948,7 @@ impl AppState {
         cx.emit(AppEvent::Shell);
     }
 
-    fn hiding_thread_tags(&self) -> bool {
+    pub(crate) fn hiding_thread_tags(&self) -> bool {
         self.sidebar.hiding_tags
     }
 

@@ -158,5 +158,29 @@ pub fn stop_target(projection: Option<&ThreadProjection>, active_run_id: Option<
     }
 }
 
+/// `canDetachThreadProviderSession`: active/attached session that is neither stopped nor errored.
+pub fn can_detach_provider_session(projection: &ThreadProjection) -> bool {
+    provider_session(projection)
+        .and_then(|session| text(session, "status"))
+        .is_some_and(|status| !matches!(status, "stopped" | "error"))
+}
+
+/// `stopThreadSession`: detaches every tracked provider session on the thread.
+pub fn detach_session_commands(command_id: &str, projection: &ThreadProjection) -> Vec<Value> {
+    projection
+        .provider_sessions
+        .iter()
+        .map(|session| {
+            serde_json::json!({
+                "type": "provider-session.detach",
+                "commandId": format!("{command_id}:detach:{}", session.id),
+                "threadId": projection.thread.id,
+                "providerSessionId": session.id,
+                "reason": "client-requested",
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

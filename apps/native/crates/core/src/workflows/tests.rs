@@ -130,3 +130,40 @@ fn stop_targets_the_live_run_or_background_work_when_thread_stop_is_missing() {
     assert_eq!(stop_target(None, Some("r7"), false), StopTarget::Run("r7".into()));
     assert_eq!(stop_target(None, Some("r7"), true), StopTarget::Thread);
 }
+
+#[test]
+fn detach_requires_live_provider_session_and_builds_commands() {
+    let active = projection(
+        vec![],
+        vec![],
+        json!({
+            "thread": {"activeProviderThreadId": "pt1"},
+            "providerThreads": [{"id": "pt1", "appThreadId": "t1", "providerSessionId": "s1"}],
+            "providerSessions": [{"id": "s1", "status": "ready"}]
+        }),
+    );
+    assert!(can_detach_provider_session(&active));
+    assert_eq!(
+        detach_session_commands("c1", &active),
+        vec![json!({
+            "type": "provider-session.detach",
+            "commandId": "c1:detach:s1",
+            "threadId": "t1",
+            "providerSessionId": "s1",
+            "reason": "client-requested"
+        })]
+    );
+
+    for dead in ["stopped", "error"] {
+        let proj = projection(
+            vec![],
+            vec![],
+            json!({
+                "thread": {"activeProviderThreadId": "pt1"},
+                "providerThreads": [{"id": "pt1", "appThreadId": "t1", "providerSessionId": "s1"}],
+                "providerSessions": [{"id": "s1", "status": dead}]
+            }),
+        );
+        assert!(!can_detach_provider_session(&proj), "{dead} cannot detach");
+    }
+}

@@ -63,6 +63,12 @@ impl AppState {
         self.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_none_or(|session| session.grants("orchestration:read")))
     }
 
+    pub(crate) fn can_operate_threads(&self) -> bool {
+        self.client_handle().is_some_and(|client| {
+            client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+        })
+    }
+
     /// The detail of the open thread or of a side subscription; empty while it loads.
     pub fn thread_state(&self, thread_id: &str) -> &ThreadState {
         if self.selected_thread.as_deref() == Some(thread_id) {
@@ -187,7 +193,7 @@ impl AppState {
         let thread = self.thread_shell(self.selected_thread.as_deref()?)?;
         let runs = self.thread.projection.as_ref().filter(|projection| projection.thread.id == thread.id).map_or(&[][..], |projection| &projection.runs);
         let capability = self.server_config.config.as_ref().map(|config| config.environment.capabilities.side_chats == Some(true));
-        Some(Parent::of(thread, runs, capability))
+        Some(Parent::of(thread, runs, capability, self.can_operate_threads()))
     }
 
     /// `sideChatsOffered`: whether the open thread shows side chat entry points at all.
@@ -209,7 +215,7 @@ impl AppState {
     /// Returns whether the start began.
     pub fn open_side_chat(&mut self, prompt: Option<String>, cx: &mut Context<Self>) -> bool {
         let Some(parent) = self.selected_thread.clone() else { return false };
-        if self.side_threads.starting.is_some() {
+        if self.side_threads.starting.is_some() || !self.can_operate_threads() {
             return false;
         }
         if let Some(reason) = self.side_chat_disabled_reason() {
@@ -242,8 +248,15 @@ impl AppState {
     }
 
     fn continue_side_chat_start(&mut self, cx: &mut Context<Self>) {
-        let listed = self.side_threads.starting.as_ref().is_some_and(|starting| self.shell.thread(&starting.target).is_some());
-        if !listed {
+        let Some(target) = self.side_threads.starting.as_ref().map(|starting| starting.target.clone()) else {
+            return;
+        };
+        if self.shell.removed_at.contains_key(&target) {
+            self.side_threads.starting = None;
+            self.fail_side_chat_start(&target, "The side chat is no longer available.", cx);
+            return;
+        }
+        if self.shell.thread(&target).is_none() {
             return;
         }
         let Some(Starting { parent, target, prompt, .. }) = self.side_threads.starting.take() else { return };
@@ -270,7 +283,9 @@ impl AppState {
     /// Drops the empty side chat a failed start leaves behind; one that got its message stays.
     fn fail_side_chat_start(&mut self, target: &str, message: &str, cx: &mut Context<Self>) {
         self.report_side_chat_error(message, cx);
-        self.dispatch_then(side_chat::delete_command(&uuid_v4(), target, true), None, cx, |_, _, _| {});
+        if self.can_operate_threads() {
+            self.dispatch_then(side_chat::delete_command(&uuid_v4(), target, true), None, cx, |_, _, _| {});
+        }
     }
 
     fn report_side_chat_error(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -298,6 +313,9 @@ impl AppState {
 
     /// Bring back: merges the side chat's latest finished reply into the open thread's next turn.
     pub fn bring_back_side_chat(&mut self, side_chat: &str, cx: &mut Context<Self>) {
+        if !self.can_operate_threads() {
+            return;
+        }
         let Some(parent) = self.selected_thread.clone() else { return };
         let parent_active = self.is_thread_running(&parent);
         let Some(run_id) = self.thread_state(side_chat).projection.as_ref().and_then(|projection| latest_merge_back_run(&projection.runs)).map(|run| run.id.clone()) else {
@@ -324,6 +342,9 @@ impl AppState {
 
     /// Deletes the side chat (after the caller confirmed) and closes its tab.
     pub fn delete_side_chat(&mut self, side_chat: &str, cx: &mut Context<Self>) {
+        if !self.can_operate_threads() {
+            return;
+        }
         let Some(parent) = self.selected_thread.clone() else { return };
         if self.side_threads.busy.iter().any(|id| id == side_chat) {
             return;
@@ -343,6 +364,9 @@ impl AppState {
     /// Closing side chat tabs drops the empty ones: the server keeps a side chat with a run or
     /// message. One the shell no longer has is already deleted.
     pub(crate) fn discard_closed_side_chats(&mut self, closed: &[Surface], cx: &mut Context<Self>) {
+        if !self.can_operate_threads() {
+            return;
+        }
         for surface in closed {
             let Some(id) = surface.side_chat_thread() else { continue };
             if self.shell.synchronized && self.shell.thread(id).is_none() {
@@ -578,5 +602,44 @@ mod history_tests {
             assert!(!thread.history.loading);
             assert!(!thread.history.is_loading_work("w-anchor-1"));
         });
+    }
+
+    #[gpui::test]
+    async fn side_chat_start_fails_and_discards_when_target_disappears_after_fork(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            let mut config = state.server_config.config.clone().unwrap_or_default();
+            config.environment.capabilities.side_chats = Some(true);
+            state.server_config.config = Some(config);
+            state.select_thread("menu-thread", cx);
+            assert!(state.open_side_chat(Some("Quick check".into()), cx));
+        });
+
+        let target = loop {
+            let (method, command, reply) = fixture.next_request().await;
+            reply.send(Ok(serde_json::json!({"sequence": 1}))).unwrap();
+            if method == t3_core::commands::method::DISPATCH_COMMAND && command["type"] == "thread.fork" {
+                break command["targetThreadId"].as_str().unwrap().to_owned();
+            }
+        };
+
+        state.update(cx, |state, cx| {
+            state.shell.removed_at.insert(target.clone(), 2);
+            state.sync_side_threads(cx);
+        });
+
+        state.read_with(cx, |state, _| {
+            assert!(!state.side_threads.is_starting());
+            assert_eq!(state.last_error.as_deref(), Some("The side chat is no longer available."));
+        });
+
+        let (method, cleanup, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(cleanup["type"], "thread.delete");
+        assert_eq!(cleanup["threadId"], target);
+        assert_eq!(cleanup["onlyIfUnused"], true);
+        reply.send(Ok(serde_json::json!({"sequence": 2}))).unwrap();
     }
 }
