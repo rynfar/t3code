@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Bounds, BoxShadow, Context, Entity, FocusHandle, FontWeight, ListOffset, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollWheelEvent, Subscription, WeakEntity, Window,
+    AnyElement, Bounds, BoxShadow, Context, Entity, FocusHandle, FontWeight, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollWheelEvent, Subscription, WeakEntity, Window,
     canvas, div, fill, point, prelude::*, px, size,
 };
 use t3_core::timeline::anchor::ScrollSource;
@@ -161,6 +161,7 @@ impl ListLayout {
         }
     }
 
+    #[cfg(test)]
     fn observe(self, content: AnyElement, measured: Rc<Cell<Measured>>, repaint: gpui::EntityId, scroll: Rc<Cell<Option<Pixels>>>, on_scroll: impl Fn(&mut gpui::App) + Clone + 'static) -> AnyElement {
         self.observe_with_groups(content, measured, repaint, scroll, None, Rc::default(), on_scroll, |_| {})
     }
@@ -504,10 +505,10 @@ impl ThreadView {
         let preview = active.map(|index| (index, self.minimap.preview(index)));
         let preview_open = preview.is_some();
         if let Some((index, ref data)) = preview {
-            if self.minimap.last_preview.as_ref().is_some_and(|(prev_ix, _)| *prev_ix != index) {
-                if let Some(group) = &self.minimap.preview_selection {
-                    group.clear(cx);
-                }
+            if self.minimap.last_preview.as_ref().is_some_and(|(prev_ix, _)| *prev_ix != index)
+                && let Some(group) = &self.minimap.preview_selection
+            {
+                group.clear(cx);
             }
             self.minimap.last_preview = Some((index, data.clone()));
             if self.minimap.preview_selection.is_none() {
@@ -1137,7 +1138,7 @@ mod tests {
             }
         }
         let list = gpui::ListState::new(6, gpui::ListAlignment::Top, px(600.));
-        list.scroll_to(ListOffset { item_ix: 1, offset_in_item: px(20.) });
+        list.scroll_to(gpui::ListOffset { item_ix: 1, offset_in_item: px(20.) });
         let layout = ListLayout { list: list.clone(), header: 0, row_count: 6, rows: Rc::new(vec![0, 2, 4]), lane_padding: 0., lane_max: None };
         let displayed = Rc::new(Cell::new(Measured::default()));
         let scroll_changes = Rc::new(Cell::new(0));
@@ -1180,7 +1181,7 @@ mod tests {
         draw(cx);
         assert_eq!(scroll_changes.get(), 1, "actual list scrolling invokes dismissal once");
         assert_eq!(next_frame(cx), 0, "settled scroll offsets schedule no work");
-        list.scroll_to(ListOffset { item_ix: 1, offset_in_item: px(20.) });
+        list.scroll_to(gpui::ListOffset { item_ix: 1, offset_in_item: px(20.) });
         rows.update(cx, |_, cx| cx.notify());
         draw(cx);
         next_frame(cx);

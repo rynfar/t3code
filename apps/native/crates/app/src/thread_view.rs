@@ -3263,6 +3263,7 @@ mod tests {
         vcx.run_until_parked();
     }
 
+    #[cfg(feature = "snapshot")]
     fn test_snapshot_json(thread_id: &str, runs: serde_json::Value, visible_items: Vec<serde_json::Value>) -> String {
         serde_json::json!({
             "kind": "snapshot",
@@ -3289,6 +3290,7 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(feature = "snapshot")]
     fn test_user_item(thread_id: &str, pos: usize, msg_id: &str, text: &str) -> serde_json::Value {
         serde_json::json!({
             "position": pos, "visibility": "local", "sourceThreadId": thread_id, "sourceItemId": msg_id,
@@ -3301,6 +3303,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "snapshot")]
     fn test_assistant_item(thread_id: &str, pos: usize, msg_id: &str, run_id: &str, text: &str) -> serde_json::Value {
         serde_json::json!({
             "position": pos, "visibility": "local", "sourceThreadId": thread_id, "sourceItemId": msg_id,
@@ -3313,6 +3316,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "snapshot")]
     #[gpui::test]
     fn follow_release_150ms_pill_position_restore_and_keyboard_scroll(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -3452,6 +3456,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "snapshot")]
     #[gpui::test]
     fn new_turn_anchors_first_user_message_with_tail_reservation_and_releases_on_tool(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
