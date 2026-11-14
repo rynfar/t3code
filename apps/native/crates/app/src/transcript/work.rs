@@ -6,18 +6,24 @@ use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListSizingBehavior, ListState, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, list, prelude::FluentBuilder, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use serde_json::Value;
 use t3_core::commands::ApprovalDecision;
+use t3_core::lineage::{Subagent, subagents_of};
 use t3_core::requests::{self, PendingApproval};
 use t3_core::timeline::{
-    EntryBody, RowKind, TimelineRow, WorkIcon, WorkLogEntry, answered_questions, detail_revision, entry_body, entry_can_expand, entry_fetches_detail,
-    has_question_answer, live_thought_line, live_work_entry_label, question_answer_preview, question_text_preview, summary_icon, work_entry_display_indicates_tool_failure,
-    work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group, work_log_entry_is_tool_like, ToolStatus,
+    EntryBody, RowKind, TimelineRow, ToolStatus, WorkIcon, WorkLogEntry, answered_questions, detail_revision, entry_body, entry_can_expand, entry_fetches_detail,
+    format_duration, format_subagent_display_title, has_question_answer, live_thought_line, live_work_entry_label, parse_iso_ms, question_answer_preview,
+    question_text_preview, summary_icon, thread_read_label_prefix, thread_read_target_id, thread_read_target_title, tool_surface_icon,
+    work_entry_display_indicates_tool_failure, work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group, work_entry_viewed_image,
+    work_log_entry_is_tool_like,
 };
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
 use super::command_output;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
+use super::media::tool_output_image;
+use super::notices::{SubagentLiveElapsed, plain_detail, provider_marks, subagent_avatar};
 use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, inline_button_with, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
 use crate::composer::controls::{Float, MenuItem, floating, menu_surface};
@@ -42,7 +48,9 @@ pub fn work_icon(icon: WorkIcon) -> Icon {
         WorkIcon::MessageCircle => Icon::WorkMessageCircle,
         WorkIcon::ListTodo => Icon::WorkListTodo,
         WorkIcon::Code => Icon::WorkCode,
-        WorkIcon::Computer => Icon::WorkMonitor,
+        WorkIcon::Computer | WorkIcon::Browser => Icon::WorkMonitor,
+        WorkIcon::Device => Icon::Smartphone,
+        WorkIcon::PullRequest => Icon::GitPullRequest,
         WorkIcon::T3 => Icon::WorkMessageSquare,
     }
 }
@@ -68,8 +76,181 @@ pub fn work_section(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut Markdow
     if *expanded_group {
         return group_list(&row.id, visible, env, cx);
     }
-    let rows: Vec<AnyElement> = visible.iter().map(|entry| entry_row(entry, display_label.as_deref(), false, env, markdown, cx)).collect();
+    let rows: Vec<AnyElement> = visible
+        .iter()
+        .map(|entry| {
+            subagent_notification_link(entry, env, cx)
+                .unwrap_or_else(|| entry_row(entry, display_label.as_deref(), false, env, markdown, cx))
+        })
+        .collect();
     v_flex().w_full().min_w_0().children(rows).into_any_element()
+}
+
+fn subagent_status_label(status: &str) -> &'static str {
+    match status {
+        "pending" => "Queued",
+        "running" => "Running",
+        "waiting" => "Waiting",
+        "idle" => "Idle · resumable",
+        "completed" => "Completed",
+        "failed" => "Failed",
+        _ => "Stopped",
+    }
+}
+
+fn notification_child_thread_id(source: &Value) -> Option<&str> {
+    matches!(source.get("kind").and_then(Value::as_str), Some("subagent" | "delegated_task"))
+        .then(|| source.get("childThreadId").or_else(|| source.get("threadId")).and_then(Value::as_str))
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// `SubagentNotificationLink` (`SimpleWorkEntryRow` + `V2LifecycleRow.tsx`).
+fn subagent_notification_link(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<AnyElement> {
+    if pending_approval(entry, env).is_some() {
+        return None;
+    }
+    let item = entry.item.as_ref()?;
+    let TurnItemKind::Notification { source, outcome, .. } = &item.kind else { return None };
+    let child_thread_id = notification_child_thread_id(source)?;
+    let task_ids: Option<Vec<&str>> = (source.get("kind").and_then(Value::as_str) == Some("delegated_task"))
+        .then(|| source.get("taskIds").and_then(Value::as_array).map(|arr| arr.iter().filter_map(Value::as_str).collect::<Vec<_>>()))
+        .flatten();
+    let app = env.state.read(cx);
+    let projection = env.thread_id.and_then(|tid| app.thread_state(tid).projection.as_ref())?;
+    let agent: Subagent = subagents_of(projection).into_iter().find(|agent| match &task_ids {
+        Some(ids) => ids.contains(&agent.id.as_str()),
+        None => agent.child_thread_id.as_deref() == Some(child_thread_id),
+    })?;
+    let provider_instance_id = projection.visible_turn_items.iter().find_map(|projected| match &projected.item.kind {
+        TurnItemKind::Subagent { provider_instance_id, .. } if projected.item.id == agent.id => provider_instance_id.as_deref(),
+        _ => None,
+    });
+    let marks = provider_marks(app);
+    let event_status = match outcome.as_str() {
+        "completed" => Some("completed"),
+        "failed" => Some("failed"),
+        "cancelled" => Some("cancelled"),
+        _ => None,
+    };
+    let outcome_label = match outcome.as_str() {
+        "failed" => "Failed",
+        "cancelled" => "Stopped",
+        "updated" => "Updated",
+        _ => "Finished",
+    };
+    let active = matches!(agent.status.as_str(), "pending" | "running" | "waiting");
+    let started_after = parse_iso_ms(&entry.created_at)
+        .zip(agent.started_at.as_deref().and_then(parse_iso_ms))
+        .is_some_and(|(notified, started)| started > notified);
+    let resumed = event_status.is_some() && (active || started_after);
+    let live_status = agent.status.as_str();
+    let status = if resumed { Some(live_status) } else { event_status };
+    let status_text = if resumed { subagent_status_label(live_status) } else { outcome_label };
+    let effective = status.unwrap_or(live_status);
+    let settled = matches!(effective, "completed" | "failed" | "cancelled" | "interrupted");
+    let raw = if settled {
+        agent.result.as_deref().or(agent.progress.as_deref())
+    } else {
+        agent.progress.as_deref().or(agent.result.as_deref())
+    };
+    let detail = raw
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.starts_with("Child task ended with status"))
+        .map(plain_detail)
+        .filter(|d| !d.is_empty());
+    let remote_label = agent
+        .remote_child
+        .as_ref()
+        .and_then(|v| v.get("environmentLabel").or_else(|| v.get("label")).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|label| format!("on {label}"));
+    let failed = status == Some("failed");
+    let p = palette(cx);
+    let dot = match effective {
+        "pending" | "running" | "waiting" => hsla(p.info),
+        "completed" => hsla(p.success),
+        "failed" => hsla(p.destructive),
+        _ => hsla(p.muted_foreground).opacity(0.6),
+    };
+    let detail_color = hsla(if failed { p.destructive } else { p.muted_foreground });
+    let title = format_subagent_display_title(agent.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Subagent"));
+    let right_time = if !resumed {
+        Some(timestamp(&env.clock, &entry.created_at, false, cx))
+    } else if active {
+        agent.started_at.clone().map(|started_at| {
+            SubagentLiveElapsed { item_id: SharedString::from(format!("notif:{}", entry.id)), started_at }.into_any_element()
+        })
+    } else {
+        agent
+            .started_at
+            .as_deref()
+            .and_then(parse_iso_ms)
+            .zip(agent.completed_at.as_deref().and_then(parse_iso_ms))
+            .map(|(start, end)| {
+                let text = format_duration(((end - start).max(0) / 1_000 * 1_000).max(1_000) as f64);
+                div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(text).into_any_element()
+            })
+    };
+    let child = child_thread_id.to_owned();
+    let row = h_flex()
+        .id(SharedString::from(format!("subagent-notif:{}", entry.id)))
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .child(
+            div()
+                .relative()
+                .size(px(24.))
+                .flex_none()
+                .rounded_full()
+                .bg(hsla(p.muted))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(subagent_avatar(provider_instance_id, &marks, 16., cx))
+                .child(div().absolute().right_0().bottom_0().size(px(7.)).rounded_full().bg(dot)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title))
+                        .when_some(remote_label, |this, remote| {
+                            this.child(div().flex_none().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(remote))
+                        }),
+                )
+                .child(div().min_w_0().truncate().text_size(px(11.)).text_color(detail_color).child(detail.clone().unwrap_or_else(|| status_text.to_owned()))),
+        )
+        .when(detail.is_some() && (!resumed || status != Some("completed")), |this| {
+            this.child(div().flex_none().text_xs().text_color(detail_color).child(status_text))
+        })
+        .children(right_time);
+    Some(
+        focusable(row, cx)
+            .cursor_pointer()
+            .hover(|style| style.bg(hsla(p.accent).opacity(0.2)))
+            .child(Icon::ChevronRight.render(px(14.), hsla(p.muted_foreground).opacity(0.6)))
+            .on_click(cx.listener(move |view, _, _, cx| view.open_thread(&child, cx)))
+            .into_any_element(),
+    )
+}
+
+fn thread_read_target(entry: &WorkLogEntry, preview: &str, env: &RowEnv, cx: &App) -> Option<(String, String, String)> {
+    let target_id = thread_read_target_id(entry)?;
+    let prefix = thread_read_label_prefix(preview)?;
+    let shell = env.state.read(cx).thread_shell(&target_id)?;
+    let title = thread_read_target_title(&shell.title, shell.archived_at.as_deref(), shell.deleted_at.as_deref())?;
+    Some((prefix, target_id, title))
 }
 
 /// The open group's members in their own virtualized list (`ExpandedWorkGroupEntries`, a
@@ -117,7 +298,7 @@ pub fn group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut Mark
         let state = markdown.state(&format!("reasoning:{}", entry.id), &text, cx);
         return div().pb(rem(12.)).child(prose(&state, cx)).into_any_element();
     }
-    entry_row(entry, None, true, env, markdown, cx)
+    subagent_notification_link(entry, env, cx).unwrap_or_else(|| entry_row(entry, None, true, env, markdown, cx))
 }
 
 /// `WorkEntryLogRow`.
@@ -204,24 +385,30 @@ fn entry_row(
     } else {
         hsla(p.foreground).opacity(0.8)
     };
-    let can_expand = entry_can_expand(entry, env.workspace_root);
+    let viewed_image = (!reasoning).then(|| work_entry_viewed_image(entry, env.thread_id, env.workspace_root)).flatten();
+    let thread_read = (!reasoning).then(|| thread_read_target(entry, &preview, env, cx)).flatten();
+    let can_expand = viewed_image.is_some() || entry_can_expand(entry, env.workspace_root);
     let mut trailing = Vec::new();
-    if failed && !severe {
-        trailing.push(Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
+    if let Some(TurnItemKind::ThreadCreated { target_thread_id, .. }) = entry.item.as_ref().map(|item| &item.kind) {
+        let target_thread_id = target_thread_id.clone();
+        trailing.push(inline_button(
+            SharedString::from(format!("thread-created-open:{}", entry.id)),
+            "Open chat",
+            InlineTone::Default,
+            false,
+            cx.listener(move |view, _, _, cx| {
+                cx.stop_propagation();
+                view.open_thread(&target_thread_id, cx);
+            }),
+            cx,
+        ));
     }
     if let Some(TurnItemKind::Notification { source, .. }) = entry.item.as_ref().map(|item| &item.kind)
-        && matches!(source.get("kind").and_then(serde_json::Value::as_str), Some("subagent" | "delegated_task"))
-        && let Some(child_thread_id) = source
-            .get("childThreadId")
-            .or_else(|| source.get("threadId"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
+        && let Some(child_thread_id) = notification_child_thread_id(source).map(str::to_owned)
     {
         trailing.push(inline_button(
             SharedString::from(format!("notif-open:{}", entry.id)),
-            "Open chat",
+            "Open subagent",
             InlineTone::Default,
             false,
             cx.listener(move |view, _, _, cx| {
@@ -231,19 +418,49 @@ fn entry_row(
             cx,
         ));
     }
+    if failed && !severe {
+        trailing.push(Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
+    }
     trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     trailing.push(chevron(expanded, can_expand, cx));
+    let heading = if let Some((prefix, target_id, title)) = thread_read {
+        h_flex()
+            .min_w_0()
+            .text_color(label_color)
+            .when(warning || severe, |this| this.font_weight(FontWeight::MEDIUM))
+            .child(div().flex_none().child(format!("{prefix} “")))
+            .child(
+                focusable(
+                    div()
+                        .id(SharedString::from(format!("thread-read:{}:{}", entry.id, target_id)))
+                        .min_w_0()
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(hsla(p.foreground))
+                        .hover(|style| style.underline())
+                        .child(title),
+                    cx,
+                )
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.open_thread(&target_id, cx);
+                })),
+            )
+            .child(div().flex_none().child("”"))
+            .into_any_element()
+    } else {
+        div()
+            .min_w_0()
+            .truncate()
+            .text_color(label_color)
+            .when(warning || severe, |this| this.font_weight(FontWeight::MEDIUM))
+            .child(preview)
+            .into_any_element()
+    };
     let label = h_flex()
         .min_w_0()
         .gap(rem(6.))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(label_color)
-                .when(warning || severe, |this| this.font_weight(FontWeight::MEDIUM))
-                .child(preview),
-        )
+        .child(heading)
         .children(answer.map(|answer| {
             let color = if expanded { hsla(p.muted_foreground) } else { hsla(p.foreground) };
             div().min_w_0().truncate().text_color(color).child(answer)
@@ -269,8 +486,21 @@ fn entry_row(
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(prose(&state, cx)),
         );
-    } else if expanded && let Some(body) = entry_body(entry, env.workspace_root) {
-        frame = frame.child(expanded_body(entry, body, env, cx));
+    } else if expanded {
+        if let Some(viewed) = viewed_image {
+            frame = frame.child(
+                div()
+                    .id(SharedString::from(format!("work-media:{}", entry.id)))
+                    .ml(rem(28.))
+                    .mt(rem(4.))
+                    .mb(rem(6.))
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(tool_output_image(SharedString::from(format!("work-viewed:{}", entry.id)), viewed.source, &viewed.alt, cx)),
+            );
+        }
+        if let Some(body) = entry_body(entry, env.workspace_root) {
+            frame = frame.child(expanded_body(entry, body, env, cx));
+        }
     }
     frame.into_any_element()
 }
@@ -555,7 +785,12 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
     let label = if thought_is_status {
         if active { "Thinking".to_owned() } else { "Thought".to_owned() }
     } else {
-        live_work_entry_label(entry, env.workspace_root, active)
+        let base = live_work_entry_label(entry, env.workspace_root, active);
+        if let Some((prefix, _id, title)) = thread_read_target(entry, &base, env, cx) {
+            format!("{prefix} “{title}”")
+        } else {
+            base
+        }
     };
     let group_id = group_id.to_owned();
     let row_id = id.to_owned();
@@ -599,7 +834,7 @@ pub fn group_header(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView
     let RowKind::WorkToggle { group_id, summary, summary_kind, tool_surface, .. } = &row.kind else { return div().into_any_element() };
     let id = row.id.as_str();
     let p = palette(cx);
-    let icon = if tool_surface.is_some() { Icon::WorkMonitor } else { work_icon(summary_icon(*summary_kind)) };
+    let icon = work_icon(tool_surface.as_deref().map(tool_surface_icon).unwrap_or_else(|| summary_icon(*summary_kind)));
     let trailing = row.created_at.as_deref().map(|at| vec![timestamp(&env.clock, at, false, cx)]).unwrap_or_default();
     let (group_id, row_id) = (group_id.to_owned(), id.to_owned());
     focusable(work_row_frame(SharedString::from(format!("toggle:{id}")), false), cx)
