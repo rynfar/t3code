@@ -1895,3 +1895,21 @@ fn inherited_event_visibility_survives_entries_to_rows_projection() {
         .collect();
     assert_eq!(visibilities, vec![("item-secret", Visibility::Inherited), ("item-link", Visibility::Local)]);
 }
+
+#[test]
+fn branch_mismatch_rules_gate_on_worktree_content_and_dismissal() {
+    assert_eq!(local_checkout_branch_mismatch("t1", Some("feat/a"), Some("/tmp/wt"), Some("main")), None);
+    assert_eq!(local_checkout_branch_mismatch("t1", Some("main"), None, Some("main")), None);
+    assert_eq!(local_checkout_branch_mismatch("t1", None, None, Some("main")), None);
+    assert_eq!(local_checkout_branch_mismatch("t1", Some("feat/a"), None, Some("  ")), None);
+
+    let mismatch = local_checkout_branch_mismatch("t1", Some("feat/a"), None, Some("main")).expect("mismatch");
+    let key = mismatch.key();
+    assert_eq!(key, "t1:feat/a:main");
+    assert!(!should_show_branch_mismatch_banner(Some(&key), false, false, None));
+    assert!(should_show_branch_mismatch_banner(Some(&key), false, true, None));
+    assert!(should_show_branch_mismatch_banner(Some(&key), false, false, Some(&key)));
+    assert!(!should_show_branch_mismatch_banner(Some(&key), false, false, Some("t1:feat/b:main")));
+    assert!(!should_show_branch_mismatch_banner(Some(&key), true, true, Some(&key)));
+    assert!(!should_show_branch_mismatch_banner(None, false, true, Some(&key)));
+}

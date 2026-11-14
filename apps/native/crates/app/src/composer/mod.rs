@@ -6,6 +6,9 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+mod branch_mismatch;
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) use branch_mismatch::CheckoutStatusOverride;
 mod question_attachments;
 #[cfg(feature = "snapshot")]
 pub(crate) use question_attachments::QuestionCommandSpy;
@@ -24,7 +27,7 @@ pub(crate) mod prompt_links;
 mod queue;
 mod send;
 mod stash;
-pub(crate) use pending::banner_surface;
+pub(crate) use pending::{banner_surface, banner_surface_card};
 mod view;
 mod workspace;
 
@@ -203,6 +206,9 @@ pub struct Composer {
     question_focus: FocusHandle,
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
     usage_limits: Option<UsageLimitsPanel>,
+    checkout_vcs: Option<branch_mismatch::CheckoutWatcher>,
+    revealed_branch_mismatch_key: Option<String>,
+    restoring_branch_threads: HashSet<String>,
     /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
     pub(super) fixed: Option<String>,
     /// The `@`, `/` and `$` menus.
@@ -397,6 +403,9 @@ impl Composer {
         let mut composer = Composer {
             limit_recovery,
             usage_limits: None,
+            checkout_vcs: None,
+            revealed_branch_mismatch_key: None,
+            restoring_branch_threads: HashSet::new(),
             state,
             input,
             picker,
@@ -532,6 +541,8 @@ impl Composer {
         }
         if next == self.snapshot && !config_changed {
             if self.provider_target.connection != self.state.read(cx).connection_id() { self.sync_provider_target(cx); }
+            self.sync_checkout_vcs(cx);
+            self.sync_branch_mismatch(cx);
             if self.finish_prepared_reads(cx) || pruned { cx.notify(); }
             return;
         }
@@ -570,6 +581,8 @@ impl Composer {
         self.snapshot = next;
         self.sync_provider_target(cx);
         self.sync_usage_limits(cx);
+        self.sync_checkout_vcs(cx);
+        self.sync_branch_mismatch(cx);
         self.finish_prepared_reads(cx);
         #[cfg(feature = "snapshot")]
         self.attachment_fixture(cx);
@@ -877,6 +890,7 @@ impl Composer {
         let text = self.prompt(cx);
         self.sync_citation_comment(&text, cx);
         self.sync_context_chips(&text, cx);
+        self.sync_branch_mismatch(cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();
         if let Some((request_id, question)) = &answering {
@@ -1086,9 +1100,9 @@ impl Composer {
             .into_any_element()
     }
 
-    pub(super) fn render_usage_limits_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(super) fn render_usage_limits_banner(&self, detached: bool, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use gpui::{FontWeight, div, px, relative};
-        use gpui_component::{h_flex, v_flex};
+        use gpui_component::{ActiveTheme, h_flex, v_flex};
         let panel = self.usage_limits.as_ref()?;
         let key = self.usage_limits_key(cx)?;
         if panel.key != key {
@@ -1101,6 +1115,9 @@ impl Composer {
             usage_limits::collect_provider_usage_limits(&instance_id, &config.providers, &config.usage_limit_sources, panel.now_ms)?
         };
         let p = palette(cx);
+        let card_bg = hsla(if cx.theme().is_dark() { p.surface_raised } else { p.card });
+        let clock = crate::transcript::Clock::now();
+        let ts_format = crate::settings::store::client(cx).timestamp_format();
         let now = t3_core::timeline::parse_iso_ms(&report.created_at).unwrap_or(panel.now_ms);
         let can_manage = self
             .state
@@ -1145,11 +1162,33 @@ impl Composer {
                     .map(gpui::rgba)
                     .map(gpui::Hsla::from)
                     .unwrap_or_else(|| usage_bar_color(&account.driver, p));
+                let mut label_col = v_flex().w(px(144.)).flex_none().gap(px(2.));
+                let mut bar_col = v_flex().flex_1().min_w(px(48.)).gap(px(2.));
+                let mut meta_col = v_flex().flex_none().gap(px(2.));
                 for (win_ix, window) in account.limits.windows.iter().enumerate() {
                     let remaining = usage_limits::remaining_percent(window);
                     let pace = usage_limits::pace_of(window, now);
                     let pace_left = usage_limits::pace_remaining_percent(window, now);
                     let resets = usage_limits::format_resets_in(window, now);
+                    let reset_at = window
+                        .resets_at
+                        .as_deref()
+                        .map(|iso| t3_core::timeline::format_upcoming(iso, clock.now_ms, &clock.zone, ts_format, &crate::timestamp::SystemTimestampLocale))
+                        .filter(|s| !s.is_empty());
+                    let mut tip_lines = vec![match pace_left {
+                        Some(left) => format!("{remaining}% left · {left}% of the window left"),
+                        None => format!("{remaining}% left"),
+                    }];
+                    if pace_left.is_some() {
+                        tip_lines.push("The line is where even spending would be.".to_owned());
+                    }
+                    if let (Some(at), Some(resets_in)) = (reset_at.as_deref(), resets.as_deref()) {
+                        let suffix = resets_in.strip_prefix("resets ").or_else(|| resets_in.strip_prefix("Resets ")).unwrap_or(resets_in);
+                        tip_lines.push(format!("Resets {at} · {suffix}"));
+                    } else if let Some(resets_in) = resets.as_deref() {
+                        tip_lines.push(resets_in.to_owned());
+                    }
+                    let bar_tip: gpui::SharedString = tip_lines.join("\n").into();
                     let pace_icon = pace.map(|pace| {
                         let glyph = match pace {
                             usage_limits::LimitPace::Ahead => Icon::TrendingUp,
@@ -1163,26 +1202,26 @@ impl Composer {
                             .child(glyph.render(px(12.), hsla(p.muted_foreground)))
                             .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
                     });
-                    block = block.child(
+                    label_col = label_col.child(
                         h_flex()
+                            .h(px(24.))
+                            .items_center()
                             .min_w_0()
-                            .gap(px(10.))
-                            .text_xs()
-                            .child(
-                                h_flex()
-                                    .w(px(144.))
-                                    .flex_none()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(window.label.clone()))
-                                    .child(div().ml_auto().flex_none().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(format!("{remaining}% left"))),
-                            )
+                            .gap(px(6.))
+                            .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(window.label.clone()))
+                            .child(div().ml_auto().flex_none().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(format!("{remaining}% left"))),
+                    );
+                    bar_col = bar_col.child(
+                        h_flex()
+                            .id(("usage-limits-bar", account_ix * 16 + win_ix))
+                            .h(px(24.))
+                            .items_center()
+                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(bar_tip.clone()).build(window, cx))
                             .child(
                                 div()
                                     .relative()
-                                    .flex_1()
-                                    .min_w(px(48.))
-                                    .h(px(16.))
+                                    .w_full()
+                                    .h(px(14.))
                                     .flex()
                                     .items_center()
                                     .child(
@@ -1196,19 +1235,37 @@ impl Composer {
                                             .when(remaining > 0, |this| this.child(div().h_full().rounded_full().bg(bar_color).w(relative(remaining as f32 / 100.0)))),
                                     )
                                     .when_some(pace_left, |this, pace_left| {
-                                        this.child(div().absolute().top(px(3.)).bottom(px(3.)).w(px(2.)).rounded_full().bg(hsla(p.foreground)).left(relative(pace_left as f32 / 100.0)))
+                                        this.child(
+                                            div().absolute().top_0().bottom_0().left(px(3.)).right(px(3.)).child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left(relative(pace_left as f32 / 100.0))
+                                                    .ml(px(-3.))
+                                                    .w(px(6.))
+                                                    .flex()
+                                                    .justify_center()
+                                                    .bg(card_bg)
+                                                    .child(div().w(px(2.)).h_full().rounded_full().bg(hsla(p.foreground))),
+                                            ),
+                                        )
                                     }),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .gap(px(6.))
-                                    .text_color(hsla(p.muted_foreground))
-                                    .whitespace_nowrap()
-                                    .children(pace_icon)
-                                    .children(resets.map(|text| div().child(text))),
                             ),
                     );
+                    meta_col = meta_col.child(
+                        h_flex()
+                            .h(px(24.))
+                            .items_center()
+                            .gap(px(6.))
+                            .text_color(hsla(p.muted_foreground))
+                            .whitespace_nowrap()
+                            .children(pace_icon)
+                            .children(resets.map(|text| div().child(text))),
+                    );
+                }
+                if !account.limits.windows.is_empty() {
+                    block = block.child(h_flex().w_full().min_w_0().items_start().gap(px(12.)).text_xs().child(label_col).child(bar_col).child(meta_col));
                 }
             }
             if let Some(external) = &account.limits.external_usage {
@@ -1286,7 +1343,7 @@ impl Composer {
             body = body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(notice.clone()));
         }
         Some(
-            banner_surface(false, v_flex().child(header).child(div().id("usage-limits-scroll").max_h(px(240.)).overflow_y_scroll().child(body)), cx)
+            banner_surface_card(false, detached, v_flex().child(header).child(div().id("usage-limits-scroll").max_h(px(240.)).overflow_y_scroll().child(body)), cx)
                 .id("usage-limits-banner")
                 .debug_selector(|| "usage-limits-banner".to_owned())
                 .into_any_element(),
@@ -1488,7 +1545,7 @@ mod stream_error_tests {
         struct Host(Entity<Composer>);
         impl gpui::Render for Host {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-                let banner = self.0.update(cx, |composer, cx| composer.render_usage_limits_banner(cx));
+                let banner = self.0.update(cx, |composer, cx| composer.render_usage_limits_banner(false, cx));
                 gpui::div().w(gpui::px(720.)).children(banner)
             }
         }
@@ -1543,5 +1600,189 @@ mod stream_error_tests {
             window.draw(cx).clear();
         });
         assert!(vcx.debug_bounds("usage-limits-banner").is_some());
+    }
+
+    #[gpui::test]
+    fn usage_limits_runs_when_setup_blocks_send_and_draft_banner_is_out_of_flow(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            state.server_config.config = serde_json::from_value(serde_json::json!({
+                "environment": { "environmentId": "env-1", "label": "Local" },
+                "cwd": "/tmp",
+                "providers": [{
+                    "instanceId": "codex", "driver": "codex", "status": "ready", "enabled": true, "installed": true,
+                    "auth": { "status": "authenticated" },
+                    "usageLimits": {
+                        "checkedAt": "2026-11-02T09:00:00Z",
+                        "windows": [
+                            { "id": "five_hour", "kind": "session", "label": "5h", "usedPercent": 20, "windowDurationMins": 300, "resetsAt": "2026-11-02T14:00:00Z" },
+                            { "id": "weekly", "kind": "weekly", "label": "Weekly", "usedPercent": 80, "windowDurationMins": 10080, "resetsAt": "2026-11-09T09:00:00Z" }
+                        ]
+                    },
+                    "models": [{ "slug": "m", "name": "GPT-5" }]
+                }]
+            }))
+            .unwrap();
+            state.start_draft("checkout-a", cx);
+            cx.emit(AppEvent::ServerConfig);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let draft_banner = self.0.update(cx, |composer, cx| composer.render_usage_limits_banner(true, cx));
+                gpui_component::v_flex()
+                    .w(gpui::px(720.))
+                    .h(gpui::px(600.))
+                    .justify_center()
+                    .child(
+                        gpui_component::v_flex()
+                            .relative()
+                            .w_full()
+                            .child(gpui::div().id("composer-card").debug_selector(|| "composer-card".to_owned()).h(gpui::px(96.)))
+                            .children(draft_banner.map(view::render_draft_usage_limits_overlay)),
+                    )
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        vcx.update(|window, cx| window.draw(cx).clear());
+        let before_card = vcx.debug_bounds("composer-card").expect("draft composer card");
+
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.snapshot.setup_blocks_send = true;
+                composer.set_prompt("/usage-limits", window, cx);
+                composer.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
+                assert_eq!(composer.prompt(cx), "");
+                assert!(composer.usage_limits.is_some());
+            });
+            window.draw(cx).clear();
+        });
+        let after_card = vcx.debug_bounds("composer-card").expect("draft composer card after banner");
+        assert_eq!(before_card.origin.y, after_card.origin.y);
+        let overlay = vcx.debug_bounds("draft-usage-limits-overlay").expect("draft overlay");
+        assert!(overlay.origin.y >= after_card.bottom());
+        assert!(vcx.debug_bounds("usage-limits-banner").is_some());
+    }
+
+    #[gpui::test]
+    fn branch_mismatch_banner_reveals_with_content_stays_sticky_and_dismisses(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| {
+            let mut overrides = std::collections::HashMap::new();
+            overrides.insert(
+                "/repo".to_owned(),
+                t3_core::vcs::VcsStatus {
+                    local: t3_core::vcs::VcsLocalStatus { ref_name: Some("main".to_owned()), ..Default::default() },
+                    ..Default::default()
+                },
+            );
+            cx.set_global(CheckoutStatusOverride(overrides));
+        });
+        state.update(cx, |state, cx| {
+            state.shell.snapshot = serde_json::from_value(serde_json::json!({
+                "snapshotSequence": 1,
+                "projects": [{
+                    "id": "p1", "title": "P1", "workspaceRoot": "/repo", "scripts": [],
+                    "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                }],
+                "threads": [
+                    {
+                        "id": "t1", "projectId": "p1", "title": "T1",
+                        "providerInstanceId": "codex",
+                        "modelSelection": { "instanceId": "codex", "model": "m" },
+                        "runtimeMode": "full-access", "interactionMode": "default",
+                        "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                        "lineage": { "rootThreadId": "t1" },
+                        "branch": "feat/a"
+                    },
+                    {
+                        "id": "t2", "projectId": "p1", "title": "T2",
+                        "providerInstanceId": "codex",
+                        "modelSelection": { "instanceId": "codex", "model": "m" },
+                        "runtimeMode": "full-access", "interactionMode": "default",
+                        "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                        "lineage": { "rootThreadId": "t2" },
+                        "branch": "main"
+                    }
+                ]
+            }))
+            .unwrap();
+            state.selected_thread = Some("t1".into());
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::Selection);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let banner = self.0.update(cx, |composer, cx| composer.render_branch_mismatch_banner(cx));
+                gpui::div().w(gpui::px(720.)).children(banner)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+
+        // Typing reveals the banner and clearing keeps it sticky on the same thread/mismatch key.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("hello", window, cx);
+                composer.on_prompt_change(cx);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_some());
+
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("", window, cx);
+                composer.on_prompt_change(cx);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_some());
+
+        // Switching to another thread and back with empty prompt clears the sticky reveal.
+        state.update(vcx, |state, cx| {
+            state.selected_thread = Some("t2".into());
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+        state.update(vcx, |state, cx| {
+            state.selected_thread = Some("t1".into());
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+
+        // Dismissing keeps the banner hidden even when typing again.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("again", window, cx);
+                composer.on_prompt_change(cx);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_some());
+        vcx.update(|_, cx| {
+            cx.update_default_global::<branch_mismatch::DismissedBranchMismatches, _>(|set, _| {
+                set.0.insert("t1:feat/a:main".into());
+            });
+            composer.update(cx, |composer, cx| composer.sync_branch_mismatch(cx));
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
     }
 }

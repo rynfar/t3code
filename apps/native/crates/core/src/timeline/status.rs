@@ -502,3 +502,51 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
         warning: incompatible.map_or(provider.status == "warning", |advisory| advisory.status != "broken"),
     })
 }
+
+/// `localCheckoutBranchMismatch` (`ChatView.tsx`): mismatch between a non-worktree thread's
+/// recorded branch and the local project checkout's current branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchMismatch {
+    pub thread_id: String,
+    pub thread_branch: String,
+    pub current_branch: String,
+}
+
+impl BranchMismatch {
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}", self.thread_id, self.thread_branch, self.current_branch)
+    }
+}
+
+pub fn local_checkout_branch_mismatch(
+    thread_id: &str,
+    thread_branch: Option<&str>,
+    worktree_path: Option<&str>,
+    current_branch: Option<&str>,
+) -> Option<BranchMismatch> {
+    if worktree_path.is_some() {
+        return None;
+    }
+    let thread_branch = thread_branch.map(str::trim).filter(|branch| !branch.is_empty())?;
+    let current_branch = current_branch.map(str::trim).filter(|branch| !branch.is_empty())?;
+    if thread_branch == current_branch {
+        return None;
+    }
+    Some(BranchMismatch { thread_id: thread_id.to_owned(), thread_branch: thread_branch.to_owned(), current_branch: current_branch.to_owned() })
+}
+
+/// `shouldShowBranchMismatchBanner` (`ChatView.logic.ts`).
+pub fn should_show_branch_mismatch_banner(
+    mismatch_key: Option<&str>,
+    dismissed: bool,
+    composer_has_content: bool,
+    revealed_mismatch_key: Option<&str>,
+) -> bool {
+    let Some(key) = mismatch_key else {
+        return false;
+    };
+    if dismissed {
+        return false;
+    }
+    composer_has_content || revealed_mismatch_key == Some(key)
+}

@@ -22,7 +22,7 @@ use crate::glass;
 use crate::icons::{Icon, ProviderLogo, provider_logo};
 use crate::theme::{hsla, metrics, palette, rem};
 use crate::toast::{Toast, ToastKind};
-use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, ghost_text_button, inline_button};
+use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, inline_button};
 
 /// The lines after the last row, in the web's order.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,15 +32,15 @@ struct FooterLines {
     children: Option<ChildInputs>,
     /// Background commands and subagents left running after the turn.
     background: Option<BackgroundWork>,
-    /// The thread is resubscribing ("Syncing messages...").
-    syncing: bool,
+    /// Loading or resubscribing detail ("Loading messages..." / "Syncing messages...").
+    syncing: Option<&'static str>,
     goal: Option<GoalLine>,
     status: Option<StatusLine>,
 }
 
 impl FooterLines {
     fn is_shown(&self) -> bool {
-        self.stop.is_some() || self.children.is_some() || self.background.is_some() || self.syncing || self.goal.is_some() || self.status.is_some()
+        self.stop.is_some() || self.children.is_some() || self.background.is_some() || self.syncing.is_some() || self.goal.is_some() || self.status.is_some()
     }
 }
 
@@ -62,6 +62,8 @@ pub struct ThreadFooter {
     background_stop: Option<(Vec<String>, std::time::Instant)>,
     /// When the thread was first seen unsynchronized, for the sync line's delay.
     unsynced_since: Option<std::time::Instant>,
+    /// Expanded notice row id when the user clicked a truncated footer description.
+    expanded_notice: Option<&'static str>,
     /// Re-reads the relative labels ("Settled 5m ago", "Snoozed, 2h left") once a minute.
     minute: Option<Task<()>>,
 }
@@ -213,21 +215,26 @@ impl ThreadView {
             _ => None,
         };
         let thread = self.thread_state(state);
-        let unsynced = thread.projection.is_some() && !thread.synchronized;
-        let syncing = match (unsynced, self.footer.unsynced_since) {
-            (false, _) => {
+        let sync_label = match (self.thread_id.is_some() && shell.is_some(), thread.projection.is_some(), thread.synchronized) {
+            (true, false, false) => Some("Loading messages..."),
+            (_, true, false) => Some("Syncing messages..."),
+            _ => None,
+        };
+        let syncing = match (sync_label, self.footer.unsynced_since) {
+            (None, _) => {
                 self.footer.unsynced_since = None;
-                false
+                None
             }
-            (true, Some(since)) => since.elapsed() >= SYNC_LINE_DELAY,
-            (true, None) => {
+            (Some(label), Some(since)) if since.elapsed() >= SYNC_LINE_DELAY => Some(label),
+            (Some(_), Some(_)) => None,
+            (Some(_), None) => {
                 self.footer.unsynced_since = Some(std::time::Instant::now());
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(SYNC_LINE_DELAY).await;
                     let _ = this.update(cx, |view, cx| view.sync_footer(cx));
                 })
                 .detach();
-                false
+                None
             }
         };
         let thread = self.thread_state(state);
@@ -376,20 +383,31 @@ impl ThreadView {
         });
     }
 
+    fn render_notice_detail(&self, id: &'static str, description: String, detail: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = self.footer.expanded_notice == Some(id);
+        let tip = SharedString::from(description.clone());
+        div()
+            .id(id)
+            .min_w_0()
+            .ml(px(6.))
+            .text_color(detail)
+            .cursor_pointer()
+            .when(!expanded, |this| this.truncate())
+            .when(expanded, |this| this.whitespace_normal())
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.footer.expanded_notice = if view.footer.expanded_notice == Some(id) { None } else { Some(id) };
+                cx.notify();
+            }))
+            .child(description)
+            .into_any_element()
+    }
+
     pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let muted = hsla(p.muted_foreground);
         let detail = if cx.theme().is_dark() { muted.opacity(0.6) } else { muted.opacity(0.8) };
         let line = || h_flex().w_full().min_w_0().gap(px(6.)).px(px(4.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(muted);
-        let text = |title: String, description: Option<String>| {
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(div().flex_none().child(title))
-                .children(description.map(|description| div().min_w_0().truncate().ml(px(6.)).text_color(detail).child(description)))
-        };
         let actions = || h_flex().flex_none().ml(px(6.)).gap(px(10.));
         let mut lines: Vec<AnyElement> = Vec::new();
         let stop_line = self.footer.lines.stop.as_ref().map(|stop| {
@@ -407,9 +425,18 @@ impl ThreadView {
                     cx,
                 )
             });
+            let stop_expanded = self.footer.expanded_notice == Some("notice-stop-detail");
+            let detail_el = stop.description().map(|desc| self.render_notice_detail("notice-stop-detail", desc.to_owned(), detail, cx));
             line()
                 .child(div().flex_none().child(icon))
-                .child(text(stop.title().to_owned(), stop.description().map(str::to_owned)))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .when(!stop_expanded, |this| this.overflow_hidden().whitespace_nowrap())
+                        .child(div().flex_none().child(stop.title()))
+                        .children(detail_el),
+                )
                 .child(actions().children(self.footer.stop_timer.clone()).children(force))
                 .into_any_element()
         });
@@ -480,9 +507,10 @@ impl ThreadView {
                 }
                 Some(h_flex().min_w_0().overflow_hidden().ml(px(6.)).text_color(detail).children(parts).into_any_element())
             } else {
-                background.description().map(|description| div().min_w_0().truncate().ml(px(6.)).text_color(detail).child(description).into_any_element())
+                background.description().map(|description| self.render_notice_detail("notice-background-detail", description, detail, cx))
             };
-            let body = h_flex().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(title_el).children(description_el);
+            let bg_expanded = self.footer.expanded_notice == Some("notice-background-detail");
+            let body = h_flex().flex_1().min_w_0().when(!bg_expanded, |this| this.overflow_hidden().whitespace_nowrap()).child(title_el).children(description_el);
             Some(
                 line()
                     .child(div().flex_none().child(icon.render(px(14.), muted)))
@@ -493,8 +521,8 @@ impl ThreadView {
         });
         lines.extend(attention);
         lines.extend(work);
-        if self.footer.lines.syncing {
-            lines.push(line().child(div().flex_none().child(Icon::RefreshCw.render(px(14.), muted))).child(div().min_w_0().truncate().child("Syncing messages...")).into_any_element());
+        if let Some(sync_label) = self.footer.lines.syncing {
+            lines.push(line().child(div().flex_none().child(Icon::RefreshCw.render(px(14.), muted))).child(div().min_w_0().truncate().child(sync_label)).into_any_element());
         }
         if let Some(goal) = &self.footer.lines.goal {
             let pending = self.footer.goal_pending;
@@ -518,10 +546,19 @@ impl ThreadView {
                 cx.listener(|view, _, _, cx| view.send_goal_command("/goal clear", "Failed to clear goal.", cx)),
                 cx,
             ));
+            let goal_expanded = self.footer.expanded_notice == Some("notice-goal-detail");
+            let detail_el = self.render_notice_detail("notice-goal-detail", goal.objective.clone(), detail, cx);
             lines.push(
                 line()
                     .child(div().flex_none().child(Icon::Target.render(px(14.), muted)))
-                    .child(text(goal.title.clone(), Some(goal.objective.clone())))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .when(!goal_expanded, |this| this.overflow_hidden().whitespace_nowrap())
+                            .child(div().flex_none().child(goal.title.clone()))
+                            .child(detail_el),
+                    )
                     .child(actions().children(buttons))
                     .into_any_element(),
             );
@@ -631,7 +668,11 @@ impl ThreadView {
             ));
             actions.push(copy.into_any_element());
         } else if error.chatgpt_limit() {
-            actions.push(ghost_text_button("manage-usage", "Manage usage", Some(Icon::ExternalLink), |_, _, cx| cx.open_url(CHATGPT_USAGE_URL), cx));
+            let manage = Button::new("manage-usage", ButtonVariant::Default, ButtonSize::Sm)
+                .icon(Icon::ExternalLink)
+                .label("Manage usage")
+                .on_click(|_, _, cx| cx.open_url(CHATGPT_USAGE_URL));
+            actions.push(manage.into_any_element());
         }
         actions.push(ghost_icon_button("dismiss-error", Icon::X, cx.listener(move |view, _, _, cx| view.dismiss_error(key.clone(), cx)), cx));
         actions

@@ -76,14 +76,6 @@ impl Composer {
             self.save_queued_edit(window, cx);
             return;
         }
-        if self.snapshot.setup_blocks_send {
-            return;
-        }
-        let plan_follow_up = self.active_plan_follow_up(cx).is_some();
-        if plan_follow_up && !self.has_text && !self.snapshot.can_resume {
-            self.submit_plan_follow_up(window, cx);
-            return;
-        }
         let prompt = self.prompt(cx);
         let staged = self.staged_attachments();
         if t3_core::usage::limits::UsageLimitsReport::is_command(&prompt)
@@ -95,6 +87,14 @@ impl Composer {
                 self.set_prompt("", window, cx);
                 self.draft_changed(cx);
             }
+            return;
+        }
+        if self.snapshot.setup_blocks_send {
+            return;
+        }
+        let plan_follow_up = self.active_plan_follow_up(cx).is_some();
+        if plan_follow_up && !self.has_text && !self.snapshot.can_resume {
+            self.submit_plan_follow_up(window, cx);
             return;
         }
         // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
