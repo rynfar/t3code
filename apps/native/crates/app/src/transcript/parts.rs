@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px};
-use gpui_component::h_flex;
+use gpui_component::{ActiveTheme, h_flex};
 
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
@@ -293,11 +293,27 @@ pub fn inline_button(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    inline_button_with(id, label, None, None, tone, disabled, on_click, cx)
+}
+
+/// `InlineButton` with optional leading 12px icon and hover tooltip.
+#[allow(clippy::too_many_arguments)]
+pub fn inline_button_with(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    icon: Option<Icon>,
+    tooltip: Option<SharedString>,
+    tone: InlineTone,
+    disabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
     let p = palette(cx);
     let (text, hover) = match tone {
         InlineTone::Default => (hsla(p.foreground), hsla(p.foreground)),
         InlineTone::Muted => (hsla(p.muted_foreground), hsla(p.foreground)),
     };
+    let icon_size = rem(12.).to_pixels(cx.theme().font_size);
     let button = div()
         .id(id)
         .flex()
@@ -307,7 +323,11 @@ pub fn inline_button(
         .whitespace_nowrap()
         .font_weight(FontWeight::MEDIUM)
         .text_color(text)
-        .child(label.into());
+        .children(icon.map(|icon| icon.render(icon_size, text)))
+        .child(label.into())
+        .when_some(tooltip, |this, tip| {
+            this.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+        });
     if disabled {
         return button.opacity(0.64).into_any_element();
     }

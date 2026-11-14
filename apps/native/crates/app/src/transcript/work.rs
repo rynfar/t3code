@@ -18,9 +18,9 @@ use t3_core::turn_item::{TurnItem, TurnItemKind};
 use super::command_output;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
-use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, outline_button, timestamp, work_line, work_row_frame};
+use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, inline_button_with, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
-use crate::composer::controls::{Button, ButtonSize, ButtonVariant, Float, MenuItem, floating, menu_surface};
+use crate::composer::controls::{Float, MenuItem, floating, menu_surface};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
@@ -336,13 +336,13 @@ fn fetch_state(entry: &WorkLogEntry, item: &TurnItem, env: &RowEnv) -> Fetch {
     }
 }
 
-fn approval_icon(kind: &str) -> (Icon, &'static str) {
+fn approval_icon(kind: &str) -> Icon {
     match kind {
-        "command" => (Icon::WorkTerminal, "Command approval"),
-        "file-change" => (Icon::WorkSquarePen, "File change approval"),
-        "file-read" => (Icon::WorkEye, "File read approval"),
-        "permission" => (Icon::WorkWrench, "App permission approval"),
-        _ => (Icon::WorkHammer, "App access approval"),
+        "command" => Icon::WorkTerminal,
+        "file-change" => Icon::WorkSquarePen,
+        "file-read" => Icon::WorkEye,
+        "permission" => Icon::WorkWrench,
+        _ => Icon::WorkHammer,
     }
 }
 
@@ -357,9 +357,9 @@ pub fn approval_card(
 ) -> AnyElement {
     let p = palette(cx);
     let dark = cx.theme().is_dark();
-    let (icon, _) = approval_icon(&approval.request_kind);
-    let (_, detail_label) = approval.presentation();
-    let detail = approval.detail.as_deref().filter(|text| !text.is_empty()).unwrap_or(detail_label).to_owned();
+    let icon = approval_icon(&approval.request_kind);
+    let (label, _) = approval.presentation();
+    let detail = approval.detail.as_deref().filter(|text| !text.is_empty()).unwrap_or(label).to_owned();
     let request_id = approval.request_id.clone();
     let disabled = !env.can_operate_thread || env.rewinding || env.responding_approvals.contains(&request_id);
     let menu_open = env.open_approval_menu == Some(request_id.as_str()) && !disabled;
@@ -368,61 +368,66 @@ pub fn approval_card(
     let more: Vec<(ApprovalDecision, String, bool)> =
         more.into_iter().map(|option| (option.decision, option.label.clone(), option.warning.is_some())).collect();
 
-    let actions = h_flex().flex_wrap().gap(px(8.)).children(primary.into_iter().map(|option| {
-        let (request_id, decision) = (request_id.clone(), option.decision);
-        let variant = if decision == ApprovalDecision::Accept { ButtonVariant::Default } else { ButtonVariant::Outline };
-        let mut button = Button::new(SharedString::from(format!("approval-{}:{}", decision.as_str(), request_id)), variant, ButtonSize::Xs)
-            .label(option.label.clone())
-            .disabled(disabled)
-            .on_click(cx.listener(move |view, _, _, cx| {
-                cx.stop_propagation();
-                view.respond_to_approval(request_id.clone(), decision, cx);
-            }));
-        if option.warning.is_some() {
-            button = button.icon(Icon::TriangleAlert);
-        }
-        if let Some(warning) = &option.warning {
-            button = button.tooltip(warning.clone());
-        }
-        button
-    }));
-    let actions = actions.when(!more.is_empty(), |this| {
-        let menu_request_id = request_id.clone();
-        this.child(
-            div()
-                .relative()
-                .child(
-                    Button::new(SharedString::from(format!("approval-more:{request_id}")), ButtonVariant::Outline, ButtonSize::IconXs)
-                        .icon(Icon::Ellipsis)
-                        .tooltip("More approval options")
-                        .disabled(disabled)
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            cx.stop_propagation();
-                            if !disabled {
-                                view.toggle_approval_menu(menu_request_id.clone(), cx);
-                            }
-                        })),
-                )
-                .when(menu_open, |this| {
-                    let item_request_id = request_id.clone();
-                    this.child(floating(
-                        Float::AboveEnd,
-                        menu_surface(cx)
-                            .occlude()
-                            .mb(px(4.))
-                            .on_mouse_down_out(cx.listener(|view, _, _, cx| view.close_approval_menu(cx)))
-                            .children(more.iter().map(|(decision, label, warning)| {
-                                let (request_id, decision) = (item_request_id.clone(), *decision);
-                                let item = MenuItem::new(SharedString::from(format!("more-{}:{request_id}", decision.as_str())), label.clone())
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        cx.stop_propagation();
-                                        view.respond_to_approval(request_id.clone(), decision, cx);
-                                    }));
-                                if *warning { item.icon(Icon::TriangleAlert, hsla(p.warning)) } else { item }
-                            })),
-                    ))
+    let primary_actions: Vec<AnyElement> = primary
+        .into_iter()
+        .map(|option| {
+            let (request_id, decision) = (request_id.clone(), option.decision);
+            let tone = if decision == ApprovalDecision::Accept { InlineTone::Default } else { InlineTone::Muted };
+            let icon = option.warning.as_ref().map(|_| Icon::TriangleAlert);
+            let warning = option.warning.clone().map(SharedString::from);
+            inline_button_with(
+                SharedString::from(format!("approval-{}:{}", decision.as_str(), request_id)),
+                option.label.clone(),
+                icon,
+                warning,
+                tone,
+                disabled,
+                cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.respond_to_approval(request_id.clone(), decision, cx);
                 }),
-        )
+                cx,
+            )
+        })
+        .collect();
+    let more_control = (!more.is_empty()).then(|| {
+        let menu_request_id = request_id.clone();
+        let item_request_id = request_id.clone();
+        div()
+            .relative()
+            .child(inline_button(
+                SharedString::from(format!("approval-more:{request_id}")),
+                "More",
+                InlineTone::Muted,
+                disabled,
+                cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    if !disabled {
+                        view.toggle_approval_menu(menu_request_id.clone(), cx);
+                    }
+                }),
+                cx,
+            ))
+            .when(menu_open, |this| {
+                this.child(floating(
+                    Float::AboveEnd,
+                    menu_surface(cx)
+                        .occlude()
+                        .mb(px(4.))
+                        .on_mouse_down_out(cx.listener(|view, _, _, cx| view.close_approval_menu(cx)))
+                        .children(more.iter().map(|(decision, label, warning)| {
+                            let (request_id, decision) = (item_request_id.clone(), *decision);
+                            let item = MenuItem::new(SharedString::from(format!("more-{}:{request_id}", decision.as_str())), label.clone())
+                                .disabled(disabled)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    view.respond_to_approval(request_id.clone(), decision, cx);
+                                }));
+                            if *warning { item.icon(Icon::TriangleAlert, hsla(p.warning)) } else { item }
+                        })),
+                ))
+            })
+            .into_any_element()
     });
 
     let override_control = approval.full_access_override.as_deref().map(|kind| {
@@ -430,19 +435,19 @@ pub fn approval_card(
         let override_request_id = request_id.clone();
         div()
             .relative()
-            .child(
-                div()
-                    .id(SharedString::from(format!("approval-override:{request_id}")))
-                    .cursor_pointer()
-                    .text_color(hsla(p.muted_foreground))
-                    .hover(|this| this.underline())
-                    .child(requests::FULL_ACCESS_OVERRIDE_QUESTION)
-                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(explanation).build(window, cx))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        cx.stop_propagation();
-                        view.toggle_approval_override(override_request_id.clone(), cx);
-                    })),
-            )
+            .child(inline_button_with(
+                SharedString::from(format!("approval-override:{request_id}")),
+                requests::FULL_ACCESS_OVERRIDE_QUESTION,
+                None,
+                Some(SharedString::from(explanation)),
+                InlineTone::Muted,
+                false,
+                cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.toggle_approval_override(override_request_id.clone(), cx);
+                }),
+                cx,
+            ))
             .when(override_open, |this| {
                 this.child(floating(
                     Float::AboveStart,
@@ -493,26 +498,34 @@ pub fn approval_card(
                 .text_xs()
                 .children(approval.app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
                 .children(approval.reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
-                .child(match approval.live {
-                    true => h_flex()
+                .child(
+                    h_flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(8.))
-                        .child(
-                            h_flex()
-                                .gap(px(4.))
-                                .text_color(hsla(p.warning_foreground))
-                                .child(Icon::Shield.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.warning_foreground)))
-                                .child("Waiting for approval"),
-                        )
-                        .child(actions)
-                        .children(override_control)
-                        .into_any_element(),
-                    false => div()
-                        .text_color(hsla(p.warning_foreground))
-                        .child("Provider process is gone. Interrupt or restart the run to respond.")
-                        .into_any_element(),
-                })
+                        .gap_x(px(8.))
+                        .gap_y(px(4.))
+                        .when(approval.live, |this| {
+                            this.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_color(hsla(p.warning_foreground))
+                                    .child(Icon::Shield.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.warning_foreground)))
+                                    .child("Waiting for approval"),
+                            )
+                            .child(div().text_color(hsla(p.muted_foreground)).child("·"))
+                            .children(primary_actions)
+                            .children(more_control)
+                        })
+                        .when(!approval.live, |this| {
+                            this.child(
+                                div()
+                                    .text_color(hsla(p.warning_foreground))
+                                    .child("Provider process is gone. Interrupt or restart the run to respond."),
+                            )
+                        })
+                        .children(override_control),
+                )
                 .children(env.approval_errors.get(&approval.request_id).map(|err| {
                     div().text_color(hsla(p.destructive)).child(err.clone())
                 })),

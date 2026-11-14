@@ -1254,6 +1254,16 @@ impl ThreadView {
         }
     }
 
+    pub(crate) fn dismiss_approval_popovers(&mut self, cx: &mut Context<Self>) -> bool {
+        let menu = self.open_approval_menu.take().is_some();
+        let override_open = self.open_approval_override.take().is_some();
+        if menu || override_open {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     fn remeasure_approvals(&self) {
         self.remeasure_where(|row| match &row.kind {
             RowKind::Work { entries, .. } | RowKind::WorkLive { entries, .. } => entries
@@ -1401,6 +1411,16 @@ impl Render for ThreadView {
         let transcript = self.timeline_rows.clone();
         div().id("citation-viewport")
             .track_focus(&self.citation_ui.selection_focus)
+            .on_action(cx.listener(|this, _: &gpui_component::input::Escape, _, cx| {
+                if !this.dismiss_approval_popovers(cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.dismiss_approval_popovers(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 this.disclosure.cancel();
@@ -2650,10 +2670,35 @@ mod tests {
             .unwrap(),
             "http://127.0.0.1:1".into(),
         );
-        vcx.update(|_, cx| {
+        vcx.update(|window, cx| {
             state.update(cx, |state, cx| {
                 state.install_active_environment(op_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
             });
+            let focus = view.read(cx).citation_ui.selection_focus.clone();
+            window.focus(&focus, cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_approval_override("req-matched".into(), cx);
+                assert_eq!(view.open_approval_override.as_deref(), Some("req-matched"));
+            });
+        });
+        vcx.simulate_keystrokes("escape");
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.open_approval_override, None, "Escape keystroke must dismiss approval override popover");
+        });
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_approval_menu("req-matched".into(), cx);
+                assert_eq!(view.open_approval_menu.as_deref(), Some("req-matched"));
+            });
+        });
+        vcx.update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Escape), cx));
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.open_approval_menu, None, "Escape action must dismiss approval More menu");
+        });
+        vcx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.toggle_approval_override("req-matched".into(), cx);
                 assert_eq!(view.open_approval_override.as_deref(), Some("req-matched"));
