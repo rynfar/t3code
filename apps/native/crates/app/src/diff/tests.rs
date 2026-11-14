@@ -123,6 +123,13 @@ fn per_scope_scroll_restores_across_switches_and_waits_for_settled_patch(
         f32::from(-panel.list.scroll_px_offset_for_scrollbar().y)
     });
     assert!((restored - recorded.unwrap()).abs() < 2.0, "expected ~{recorded:?}, got {restored}");
+
+    // First manual scroll after programmatic restore must not be swallowed.
+    panel.update(&mut cx, |panel, _| {
+        panel.list.set_offset_from_scrollbar(point(px(0.), px(-95.)));
+        panel.on_list_scrolled();
+        assert_eq!(panel.scroll_restore.saved_offset("scope:a"), Some(95.0));
+    });
 }
 
 #[gpui::test]
@@ -140,6 +147,7 @@ fn line_reveal_unfolds_target_scrolls_and_user_interaction_cancels_pending_revea
         panel.set_folded(1, true, cx);
     });
     assert!(panel.read_with(&cx, |panel, _| panel.is_collapsed(1)));
+    cx.draw(point(px(0.), px(0.)), size(px(800.), px(240.)), |_, _| panel.clone().into_any_element());
 
     panel.update(&mut cx, |panel, cx| {
         panel.reveal_file_path(1, FileRevealTarget::line("file_1.rs", 25), cx);
@@ -154,8 +162,32 @@ fn line_reveal_unfolds_target_scrolls_and_user_interaction_cancels_pending_revea
         panel.read_with(&cx, |panel, _| panel.file_reveal.highlight_for("file_1.rs")),
         Some((25, 25, None))
     );
+    panel.read_with(&cx, |panel, _| {
+        let view = panel.view.as_ref().expect("view");
+        let base = view.header_row(1).expect("header row");
+        let local_row = t3_core::diff::find_selection_row(
+            view.file_rows_slice(1).expect("file rows"),
+            0,
+            &view.parsed.files()[1],
+            25,
+            None,
+        )
+        .expect("target row");
+        let target_row = base + local_row;
+        // Centered below the sticky header, never scrolled with target_row pinned to row 0.
+        assert!(panel.list.logical_scroll_top().item_ix < target_row);
+        let deletion_line = t3_core::diff::DiffLine {
+            kind: t3_core::diff::LineKind::Deletion,
+            old_line: Some(25),
+            new_line: None,
+            text: Arc::from("old"),
+            source_text: Arc::from("old"),
+            no_newline_at_eof: false,
+        };
+        assert!(panel.is_revealed_line(1, &deletion_line, None));
+    });
 
-    // Pending reveal for an unloaded file cancels when user interacts.
+    // Pending reveal and pending scroll restore both cancel when user interacts.
     panel.update(&mut cx, |panel, cx| {
         panel.external = Some(External {
             key: "scope:reveal".into(),
@@ -165,8 +197,9 @@ fn line_reveal_unfolds_target_scrolls_and_user_interaction_cancels_pending_revea
         });
         panel.reveal_file_path(2, FileRevealTarget::line("file_missing.rs", 10), cx);
         assert!(panel.file_reveal.has_pending());
-        panel.cancel_reveal_on_interaction();
+        panel.cancel_navigation_on_interaction();
         assert!(!panel.file_reveal.has_pending());
+        assert!(!panel.scroll_restore.has_pending());
     });
 }
 
@@ -247,6 +280,9 @@ fn comment_completion_and_dictation_hooks_work_end_to_end(cx: &mut gpui::TestApp
             panel.set_comment_dictation_state(CommentDictationState::Active, cx);
             assert!(panel.insert_comment_text("about #42", window, cx));
             assert_eq!(panel.read_comment_draft(cx).as_deref(), Some("Ask @alice about #42"));
+            let ref_items = panel.active_completion_items();
+            assert_eq!(ref_items.len(), 1);
+            assert_eq!(ref_items[0].insert_text(), "#42");
             panel.submit_comment(cx);
             assert!(submitted.lock().unwrap().is_empty());
 

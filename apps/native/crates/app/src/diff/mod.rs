@@ -88,7 +88,6 @@ pub struct DiffPanel {
     selected_file: Option<String>,
     file_reveal: FileReveal,
     scroll_restore: ScrollRestore,
-    programmatic_scroll: bool,
     external_scroll_handler: Rc<RefCell<Option<ScrollHandler>>>,
     /// A patch from outside the thread (a pull request's Code tab) replaces the scopes.
     external: Option<External>,
@@ -181,7 +180,6 @@ impl DiffPanel {
             selected_file: None,
             file_reveal: FileReveal::default(),
             scroll_restore: ScrollRestore::default(),
-            programmatic_scroll: false,
             external_scroll_handler: external_scroll_handler.clone(),
             external: None,
             comments: comments::Comments::default(),
@@ -600,6 +598,9 @@ impl DiffPanel {
             self.comments = comments::Comments::default();
             self.comments.scope = scope_key.clone();
         }
+        if self.scroll_restore.current_scope() != Some(scope_key.as_str()) {
+            self.file_reveal.reset();
+        }
         if let DiffSelection::Turn { file_path: Some(path), reveal_request_id, .. } = &self.selection {
             self.file_reveal.request(&scope_key, *reveal_request_id, FileRevealTarget::file(path));
         }
@@ -663,10 +664,7 @@ impl DiffPanel {
             Some(ListOffset { item_ix: start + within.min(end.saturating_sub(start + 1)), offset_in_item })
         });
         match keep {
-            Some(top) => {
-                self.programmatic_scroll = true;
-                self.list.scroll_to(top);
-            }
+            Some(top) => self.list.scroll_to(top),
             None => self.h_offset = px(0.),
         }
         self.top_file = view.row(0).map(|row| row.file());
@@ -739,7 +737,6 @@ impl DiffPanel {
         self.scroll_restore.discard(&scope_key);
         self.set_folded(file, false, cx);
         if let Some(index) = self.view.as_ref().and_then(|view| view.header_row(file)) {
-            self.programmatic_scroll = true;
             self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
             self.top_file = Some(file);
         }
@@ -805,7 +802,6 @@ impl DiffPanel {
             RevealAction::ScrollToFile { file, path } => {
                 self.set_folded(file, false, cx);
                 if let Some(index) = self.view.as_ref().and_then(|view| view.header_row(file)) {
-                    self.programmatic_scroll = true;
                     self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
                     self.top_file = Some(file);
                 }
@@ -814,8 +810,17 @@ impl DiffPanel {
                 cx.notify();
             }
             RevealAction::ScrollToRow { file, path, row, .. } => {
-                self.programmatic_scroll = true;
-                self.list.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+                let viewport_h = f32::from(self.list.viewport_bounds().size.height);
+                if viewport_h > 0.0 {
+                    let row_top = f32::from(self.list.offset_for_item(row));
+                    let center_lead = ((viewport_h - lines::LINE_HEIGHT) * 0.5).max(32.0);
+                    let target_top = (row_top - center_lead).max(0.0);
+                    self.list.set_offset_from_scrollbar(point(px(0.), px(-target_top)));
+                } else {
+                    let header = self.view.as_ref().and_then(|view| view.header_row(file)).unwrap_or(0);
+                    let item_ix = row.saturating_sub(2).max(header);
+                    self.list.scroll_to(ListOffset { item_ix, offset_in_item: px(0.) });
+                }
                 self.top_file = Some(file);
                 self.selected_file = Some(path);
                 cx.notify();
@@ -823,9 +828,9 @@ impl DiffPanel {
         }
     }
 
-    pub(super) fn cancel_reveal_on_interaction(&mut self) {
-        self.programmatic_scroll = false;
+    pub(super) fn cancel_navigation_on_interaction(&mut self) {
         self.file_reveal.cancel_on_user_interaction();
+        self.scroll_restore.cancel_pending();
     }
 
     pub(super) fn is_revealed_line(&self, file: usize, line: &DiffLine, side: Option<Side>) -> bool {
@@ -834,12 +839,18 @@ impl DiffPanel {
         let Some((start, end, target_side)) = self.file_reveal.highlight_for(diff.path()) else {
             return false;
         };
-        if let (Some(req_side), Some(row_side)) = (target_side, side)
+        let row_side = match (side, line.kind) {
+            (Some(s), _) => Some(s),
+            (None, t3_core::diff::LineKind::Deletion) => Some(Side::Deletions),
+            (None, t3_core::diff::LineKind::Addition) => Some(Side::Additions),
+            (None, t3_core::diff::LineKind::Context) => None,
+        };
+        if let (Some(req_side), Some(row_side)) = (target_side, row_side)
             && req_side != row_side
         {
             return false;
         }
-        let Some(num) = line_number_for_side(line, target_side.or(side)) else {
+        let Some(num) = line_number_for_side(line, target_side.or(row_side)) else {
             return false;
         };
         (start..=end).contains(&num)
@@ -853,7 +864,10 @@ impl DiffPanel {
             return false;
         }
         if let Some(review) = self.review().filter(|review| review.lazy()) {
-            return !review.files().iter().any(|file| review.state(file).is_some_and(|state| state.pending));
+            return !review
+                .files()
+                .iter()
+                .any(|file| review.state(file).is_none_or(|state| state.pending));
         }
         true
     }
@@ -867,10 +881,6 @@ impl DiffPanel {
     }
 
     fn on_list_scrolled(&mut self) {
-        if self.programmatic_scroll {
-            self.programmatic_scroll = false;
-            return;
-        }
         if self.view.is_none() {
             return;
         }
@@ -883,18 +893,25 @@ impl DiffPanel {
         if self.file_reveal.has_pending() || !self.scroll_restore.has_pending() {
             return;
         }
+        let settled = self.is_settled();
         let Some(max_top) = self.max_scroll_top_px() else {
+            if !settled && self.review().is_some_and(|review| review.lazy()) {
+                self.patch_command(source::Command::Next);
+            }
             return;
         };
         let scope_key = self.scope_key();
-        let settled = self.is_settled();
-        match self.scroll_restore.apply(&scope_key, max_top, settled) {
-            ScrollRestoreAction::None => {}
-            ScrollRestoreAction::ScrollTo { offset_px, .. } => {
-                self.programmatic_scroll = true;
+        let need_more = match self.scroll_restore.apply(&scope_key, max_top, settled) {
+            ScrollRestoreAction::None => false,
+            ScrollRestoreAction::ScrollTo { offset_px, done } => {
                 self.list.set_offset_from_scrollbar(point(px(0.), px(-offset_px)));
                 cx.notify();
+                !done
             }
+            ScrollRestoreAction::WaitMore => true,
+        };
+        if need_more && !settled && self.review().is_some_and(|review| review.lazy()) {
+            self.patch_command(source::Command::Next);
         }
     }
 

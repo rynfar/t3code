@@ -22,6 +22,8 @@ pub enum ScrollRestoreAction {
     /// Scroll vertically to `offset_px` (clamped to `[0, max_scroll_top]`).
     /// When `done` is false, lazy patches are still loading and `target > max_scroll_top`.
     ScrollTo { offset_px: f32, done: bool },
+    /// Waiting for more lazy patches before `target` is reachable (current list cannot advance yet).
+    WaitMore,
 }
 
 impl ScrollRestore {
@@ -108,12 +110,8 @@ impl ScrollRestore {
 
         let max_top = max_scroll_top_px.max(0.0);
         let reached_target = max_top >= pending.target;
-        if !settled && !reached_target && max_top <= 0.0 {
-            return ScrollRestoreAction::None;
-        }
-
-        let next = pending.target.min(max_top).max(0.0);
         let done = settled || reached_target;
+        let next = pending.target.min(max_top).max(0.0);
         let unchanged = pending
             .last_applied
             .is_some_and(|prev| (prev - next).abs() < 0.5);
@@ -126,8 +124,8 @@ impl ScrollRestore {
             return ScrollRestoreAction::ScrollTo { offset_px: next, done: true };
         }
 
-        if unchanged || next <= 0.0 {
-            return ScrollRestoreAction::None;
+        if max_top <= 0.0 || unchanged || next <= 0.0 {
+            return ScrollRestoreAction::WaitMore;
         }
         pending.last_applied = Some(next);
         ScrollRestoreAction::ScrollTo { offset_px: next, done: false }
@@ -172,8 +170,8 @@ mod tests {
         restore.sync_scope("thread:b", false);
         restore.sync_scope("thread:a", false);
 
-        // Empty list while patches are still loading -> waits without consuming pending.
-        assert_eq!(restore.apply("thread:a", 0.0, false), ScrollRestoreAction::None);
+        // Empty list while patches are still loading -> asks caller to fetch more without consuming pending.
+        assert_eq!(restore.apply("thread:a", 0.0, false), ScrollRestoreAction::WaitMore);
         assert!(restore.has_pending());
 
         // Partial load shorter than 600px -> scrolls partway, keeps pending.
@@ -181,6 +179,7 @@ mod tests {
             restore.apply("thread:a", 300.0, false),
             ScrollRestoreAction::ScrollTo { offset_px: 300.0, done: false }
         );
+        assert_eq!(restore.apply("thread:a", 300.0, false), ScrollRestoreAction::WaitMore);
         assert!(restore.has_pending());
 
         // Settled at 450px -> clamps to 450px and finishes.

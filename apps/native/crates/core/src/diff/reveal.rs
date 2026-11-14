@@ -360,22 +360,36 @@ pub fn expand_partial_diff_to_line(
     let expand_start = start.saturating_sub(context_lines).max(1);
     let expand_end = end.saturating_add(context_lines).min(total_lines);
 
-    let old_delta = cumulative_line_delta_before(&file.hunks, expand_start);
-    let mut new_hunks: Vec<Hunk> = Vec::with_capacity(file.hunks.len() + 1);
-    let mut inserted = false;
+    let mut cursor = expand_start;
+    let mut old_delta = 0i64;
+    let mut pieces: Vec<Hunk> = Vec::with_capacity(file.hunks.len() * 2 + 1);
 
     for hunk in &file.hunks {
-        if !inserted && hunk.new_start >= expand_start {
-            new_hunks.push(build_context_hunk(file_lines, expand_start, expand_end, old_delta));
-            inserted = true;
+        let before_end = if hunk.new_count == 0 {
+            hunk.new_start
+        } else {
+            hunk.new_start.saturating_sub(1)
+        };
+        if cursor <= expand_end && cursor <= before_end {
+            let gap_end = before_end.min(expand_end);
+            pieces.push(build_context_hunk(file_lines, cursor, gap_end, old_delta));
+            cursor = gap_end.saturating_add(1);
         }
-        new_hunks.push(hunk.clone());
-    }
-    if !inserted {
-        new_hunks.push(build_context_hunk(file_lines, expand_start, expand_end, old_delta));
+        pieces.push(hunk.clone());
+        old_delta += i64::from(hunk.new_count) - i64::from(hunk.old_count);
+        let hunk_after = if hunk.new_count == 0 {
+            hunk.new_start.saturating_add(1)
+        } else {
+            hunk.new_start.saturating_add(hunk.new_count)
+        };
+        cursor = cursor.max(hunk_after);
     }
 
-    let merged = merge_overlapping_hunks(new_hunks);
+    if cursor <= expand_end {
+        pieces.push(build_context_hunk(file_lines, cursor, expand_end, old_delta));
+    }
+
+    let merged = merge_adjacent_hunks(pieces);
     let mut expanded = file.clone();
     expanded.hunks = super::FileHunks::from(merged);
     Some(expanded)
@@ -385,17 +399,6 @@ fn range_covered_on_new_side(hunks: &[Hunk], start: u32, end: u32) -> bool {
     (start..=end).all(|target| {
         hunks.iter().any(|hunk| hunk.lines.iter().any(|line| line.new_line == Some(target)))
     })
-}
-
-fn cumulative_line_delta_before(hunks: &[Hunk], before_new_line: u32) -> i64 {
-    let mut delta = 0i64;
-    for hunk in hunks {
-        if hunk.new_start >= before_new_line {
-            break;
-        }
-        delta += i64::from(hunk.new_count) - i64::from(hunk.old_count);
-    }
-    delta
 }
 
 fn build_context_hunk(file_lines: &[&str], new_start: u32, new_end: u32, old_delta: i64) -> Hunk {
@@ -424,25 +427,20 @@ fn build_context_hunk(file_lines: &[&str], new_start: u32, new_end: u32, old_del
     }
 }
 
-fn merge_overlapping_hunks(hunks: Vec<Hunk>) -> Vec<Hunk> {
+fn hunks_touch(prev: &Hunk, next: &Hunk) -> bool {
+    match (prev.new_count, next.new_count) {
+        (0, 0) => prev.new_start == next.new_start,
+        (0, _) => next.new_start <= prev.new_start.saturating_add(1),
+        (n, 0) => prev.new_start.saturating_add(n).saturating_sub(1) >= next.new_start,
+        (n, _) => next.new_start <= prev.new_start.saturating_add(n),
+    }
+}
+
+fn merge_adjacent_hunks(hunks: Vec<Hunk>) -> Vec<Hunk> {
     let mut out: Vec<Hunk> = Vec::with_capacity(hunks.len());
     for hunk in hunks {
-        let Some(prev) = out.last_mut() else {
-            out.push(hunk);
-            continue;
-        };
-        let prev_new_end = prev.new_start.saturating_add(prev.new_count);
-        if hunk.new_start <= prev_new_end {
-            // Append only lines not already covered by `prev`.
-            for line in hunk.lines {
-                let already_present = match line.new_line {
-                    Some(n) => prev.lines.iter().any(|existing| existing.new_line == Some(n)),
-                    None => false,
-                };
-                if !already_present {
-                    prev.lines.push(line);
-                }
-            }
+        if let Some(prev) = out.last_mut().filter(|prev| hunks_touch(prev, &hunk)) {
+            prev.lines.extend(hunk.lines);
             recompute_hunk_bounds(prev);
         } else {
             out.push(hunk);
@@ -573,5 +571,50 @@ index 1111111..2222222 100644
         let rows = build_rows(std::slice::from_ref(&expanded), &HashSet::new(), Layout::Stacked);
         assert!(find_selection_row(&rows, 0, &expanded, 12, Some(Side::Additions)).is_some());
         assert!(find_selection_row(&rows, 0, &expanded, 13, Some(Side::Additions)).is_some());
+    }
+
+    #[test]
+    fn expands_across_hunk_with_additions_and_deletions_without_dropping_lines() {
+        let patch = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -5,3 +5,4 @@
+ line 5
+-line 6
++line 6 new
++line 7 new
+ line 8
+";
+        let files = match parse_patch(patch) {
+            ParsedPatch::Files(files) => files,
+            other => panic!("expected parsed files, got {other:?}"),
+        };
+        let full_lines: Vec<String> = (1..=14).map(|i| format!("new {i}")).collect();
+        let line_refs: Vec<&str> = full_lines.iter().map(String::as_str).collect();
+
+        // Range 3..=11 spans before, through, and after hunk 0 (new lines 5..=8, delta +1).
+        let expanded = expand_partial_diff_to_line(&files[0], &line_refs, 3, Some(11), 0)
+            .expect("should expand across existing hunk");
+        assert_eq!(expanded.hunks.len(), 1);
+        let hunk = &expanded.hunks[0];
+        let kinds_and_lines: Vec<(LineKind, Option<u32>, Option<u32>)> =
+            hunk.lines.iter().map(|l| (l.kind, l.old_line, l.new_line)).collect();
+        assert_eq!(
+            kinds_and_lines,
+            vec![
+                (LineKind::Context, Some(3), Some(3)),
+                (LineKind::Context, Some(4), Some(4)),
+                (LineKind::Context, Some(5), Some(5)),
+                (LineKind::Deletion, Some(6), None),
+                (LineKind::Addition, None, Some(6)),
+                (LineKind::Addition, None, Some(7)),
+                (LineKind::Context, Some(7), Some(8)),
+                (LineKind::Context, Some(8), Some(9)),
+                (LineKind::Context, Some(9), Some(10)),
+                (LineKind::Context, Some(10), Some(11)),
+            ]
+        );
+        assert_eq!((hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count), (3, 8, 3, 9));
     }
 }

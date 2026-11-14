@@ -39,6 +39,7 @@ use crate::{
 pub type ExternalCommentHandler = Rc<dyn Fn(ReviewComment, &mut App)>;
 pub type CommentDictationControlsBuilder =
     Rc<dyn Fn(CommentDictationState, &mut Window, &mut Context<DiffPanel>) -> AnyElement>;
+pub type CommentDictationCancelHandler = Rc<dyn Fn(&mut App) -> bool>;
 
 /// Host-level hooks for inline diff comments that survive thread/scope switches (`DF-COMMENTS`).
 #[derive(Default)]
@@ -46,9 +47,11 @@ pub(super) struct CommentsConfig {
     pub completion_scope: Option<CompletionScope>,
     pub completion_options: CompletionOptions,
     pub completion_cache: HashMap<String, CompletionOptions>,
+    pub completion_last_options: HashMap<(String, char), CompletionOptions>,
     pub external_comment_handler: Option<ExternalCommentHandler>,
     pub dictation_state: CommentDictationState,
     pub dictation_controls: Option<CommentDictationControlsBuilder>,
+    pub dictation_cancel_handler: Option<CommentDictationCancelHandler>,
 }
 
 impl CommentsConfig {
@@ -70,6 +73,7 @@ pub(super) struct Comments {
     completion_loading: bool,
     completion_error: Option<String>,
     completion_query_key: Option<String>,
+    last_caret_snapshot: Option<(usize, usize)>,
     _completion_task: Option<Task<()>>,
 }
 
@@ -263,11 +267,20 @@ impl DiffPanel {
         let Some(comment) = review::build_diff_comment(uuid_v4(), section, title, diff, selection, "") else { return };
         let Some(file_key) = self.view.as_ref().and_then(|view| view.key(file)).map(str::to_owned) else { return };
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Add a comment…"));
-        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
+        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change | InputEvent::Focus => {
                 this.sync_comment_completion(cx);
                 cx.notify();
             }
+            InputEvent::Blur => {
+                if this.comments.completion.dismiss() {
+                    this.comments.completion_loading = false;
+                    this.comments._completion_task = None;
+                    this.invalidate_comment_row();
+                    cx.notify();
+                }
+            }
+            InputEvent::PressEnter { .. } => {}
         });
         input.update(cx, |input, cx| input.focus(window, cx));
         self.comments.editor = Some(Editor { file_key, comment, input, _subscription: subscription });
@@ -275,6 +288,7 @@ impl DiffPanel {
         self.comments.completion_loading = false;
         self.comments.completion_error = None;
         self.comments.completion_query_key = None;
+        self.comments.last_caret_snapshot = None;
         self.comments._completion_task = None;
         self.invalidate_comment_row();
         cx.notify();
@@ -357,6 +371,7 @@ impl DiffPanel {
         }
         self.comments_config.completion_scope = scope;
         self.comments_config.completion_cache.clear();
+        self.comments_config.completion_last_options.clear();
         self.reset_comment_completion();
         self.sync_comment_completion(cx);
         cx.notify();
@@ -407,6 +422,17 @@ impl DiffPanel {
         cx.notify();
     }
 
+    /// Registers an Escape-time hook to cancel active comment dictation before dismissing UI (`#376`).
+    #[allow(dead_code)]
+    pub fn set_comment_dictation_cancel_handler(
+        &mut self,
+        handler: Option<CommentDictationCancelHandler>,
+        cx: &mut Context<Self>,
+    ) {
+        self.comments_config.dictation_cancel_handler = handler;
+        cx.notify();
+    }
+
     /// Reads the current inline diff comment draft (`readDraft` in `useTextFieldSpeech.tsx`; `#376`).
     #[allow(dead_code)]
     pub fn read_comment_draft(&self, cx: &App) -> Option<String> {
@@ -452,6 +478,18 @@ impl DiffPanel {
         true
     }
 
+    fn sync_comment_completion_if_caret_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &self.comments.editor else { return };
+        let snapshot = {
+            let input = editor.input.read(cx);
+            (input.value().len(), input.cursor())
+        };
+        if self.comments.last_caret_snapshot != Some(snapshot) {
+            self.sync_comment_completion(cx);
+            cx.notify();
+        }
+    }
+
     fn sync_comment_completion(&mut self, cx: &mut Context<Self>) {
         let Some(scope) = self.comments_config.completion_scope.clone() else {
             self.reset_comment_completion();
@@ -464,6 +502,7 @@ impl DiffPanel {
             let input = editor.input.read(cx);
             (input.value().to_string(), input.cursor())
         };
+        self.comments.last_caret_snapshot = Some((value.len(), caret));
         self.comments.completion.sync_input(&value, caret, &scope.support);
 
         let Some(trigger) = self.comments.completion.trigger.clone() else {
@@ -475,6 +514,8 @@ impl DiffPanel {
             return;
         };
 
+        let sigil = trigger_sigil(&trigger);
+        let scope_key = scope.scope_key.clone();
         let key = completion_query_cache_key(&scope.scope_key, &trigger);
         if self.comments.completion_query_key.as_ref() == Some(&key) {
             self.invalidate_comment_row();
@@ -521,6 +562,9 @@ impl DiffPanel {
                 match result {
                     Ok(Ok(value)) => {
                         let parsed = CompletionOptions::from_filter_options_value(&value);
+                        this.comments_config
+                            .completion_last_options
+                            .insert((scope_key, sigil), parsed.clone());
                         this.comments_config.completion_cache.insert(key, parsed);
                         this.comments.completion_error = None;
                     }
@@ -541,9 +585,15 @@ impl DiffPanel {
         let scope = self.comments_config.completion_scope.as_ref()?;
         let trigger = self.comments.completion.trigger.as_ref()?;
         let key = completion_query_cache_key(&scope.scope_key, trigger);
+        let sigil = trigger_sigil(trigger);
         self.comments_config
             .completion_cache
             .get(&key)
+            .or_else(|| {
+                self.comments_config
+                    .completion_last_options
+                    .get(&(scope.scope_key.clone(), sigil))
+            })
             .or_else(|| {
                 (!self.comments_config.completion_options.authors.is_empty()
                     || !self.comments_config.completion_options.references.is_empty())
@@ -641,6 +691,15 @@ impl DiffPanel {
                     .bg(hsla(p.background))
                     .text_color(hsla(p.foreground))
                     .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                        if this
+                            .comments_config
+                            .dictation_cancel_handler
+                            .as_ref()
+                            .is_some_and(|cancel| cancel(cx))
+                        {
+                            cx.stop_propagation();
+                            return;
+                        }
                         if this.comments.completion.dismiss() {
                             this.comments.completion_loading = false;
                             this.comments._completion_task = None;
@@ -677,7 +736,7 @@ impl DiffPanel {
                         if action.secondary {
                             this.submit_comment(cx);
                             cx.stop_propagation();
-                        } else if this.accept_completion(None, window, cx) {
+                        } else if !action.shift && this.accept_completion(None, window, cx) {
                             cx.stop_propagation();
                         } else {
                             cx.propagate();
@@ -695,8 +754,30 @@ impl DiffPanel {
                         ) {
                             this.submit_comment(cx);
                             cx.stop_propagation();
+                            return;
                         }
+                        let entity = cx.entity().downgrade();
+                        cx.defer(move |cx| {
+                            if let Some(entity) = entity.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.sync_comment_completion_if_caret_changed(cx);
+                                });
+                            }
+                        });
                     }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| {
+                            let entity = cx.entity().downgrade();
+                            cx.defer(move |cx| {
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(cx, |this, cx| {
+                                        this.sync_comment_completion_if_caret_changed(cx);
+                                    });
+                                }
+                            });
+                        }),
+                    )
                     .children(trigger.map(|trigger| {
                         render_completion_popover(
                             trigger,
@@ -825,6 +906,13 @@ impl DiffPanel {
     }
 }
 
+fn trigger_sigil(trigger: &t3_core::diff::PullRequestComposerTrigger) -> char {
+    match trigger.kind {
+        t3_core::diff::TriggerKind::Mention => '@',
+        t3_core::diff::TriggerKind::Reference(sigil) => sigil.as_char(),
+    }
+}
+
 fn completion_item_icon(item: &CompletionItem, p: &crate::theme::Palette) -> (Icon, gpui::Hsla) {
     match item {
         CompletionItem::Mention(author) => (
@@ -879,7 +967,7 @@ fn render_completion_popover(
             div()
                 .px(px(8.))
                 .py(px(2.))
-                .text_size(px(11.))
+                .text_xs()
                 .text_color(hsla(p.muted_foreground))
                 .child(heading),
         )
@@ -888,7 +976,7 @@ fn render_completion_popover(
                 div()
                     .px(px(8.))
                     .py(px(6.))
-                    .text_size(px(12.))
+                    .text_sm()
                     .text_color(hsla(p.muted_foreground))
                     .child("Searching…"),
             )
@@ -898,7 +986,7 @@ fn render_completion_popover(
                 div()
                     .px(px(8.))
                     .py(px(6.))
-                    .text_size(px(12.))
+                    .text_sm()
                     .text_color(hsla(p.error_foreground))
                     .child(gpui::SharedString::from(err.to_owned())),
             )
@@ -908,7 +996,7 @@ fn render_completion_popover(
                 div()
                     .px(px(8.))
                     .py(px(6.))
-                    .text_size(px(12.))
+                    .text_sm()
                     .text_color(hsla(p.muted_foreground))
                     .child(match trigger.kind {
                         t3_core::diff::TriggerKind::Mention => "No matching people",
@@ -921,12 +1009,21 @@ fn render_completion_popover(
             let (icon, icon_color) = completion_item_icon(item, p);
             let (primary_label, secondary_label) = match item {
                 CompletionItem::Mention(author) => (
-                    format!("@{}", author.login),
-                    author.name.clone().unwrap_or_default(),
+                    author.login.clone(),
+                    author
+                        .name
+                        .clone()
+                        .filter(|name| name != &author.login)
+                        .unwrap_or_default(),
                 ),
                 CompletionItem::Reference { candidate, .. } => {
                     (item.insert_text(), candidate.title.clone())
                 }
+            };
+            let secondary_color = if active {
+                hsla(p.accent_foreground).opacity(0.75)
+            } else {
+                hsla(p.muted_foreground)
             };
             h_flex()
                 .id(("diff-comment-completion-item", ix))
@@ -949,7 +1046,7 @@ fn render_completion_popover(
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(12.))
+                        .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .child(gpui::SharedString::from(primary_label)),
                 )
@@ -959,8 +1056,8 @@ fn render_completion_popover(
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.))
-                            .text_color(hsla(p.muted_foreground))
+                            .text_sm()
+                            .text_color(secondary_color)
                             .child(gpui::SharedString::from(secondary_label)),
                     )
                 })

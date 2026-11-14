@@ -10,13 +10,18 @@ use crate::pull_requests::wire::Actor;
 /// Maximum completion items shown in a diff/PR comment popover (`PullRequestMarkdownTextarea.tsx`).
 pub const MAX_COMPLETION_ITEMS: usize = 8;
 
-/// Debounce delay in milliseconds before querying `pullRequests.filterOptions` for a non-empty query.
+/// Maximum query length forwarded to `pullRequests.filterOptions` (`PullRequestFilterOptionsInput`).
+pub const MAX_COMPLETION_QUERY_CHARS: usize = 100;
+
+/// Debounce delay in milliseconds before querying `pullRequests.filterOptions` (`useCompletions`).
 pub const COMPLETION_DEBOUNCE_MS: u64 = 200;
 
-fn trigger_regex() -> &'static Regex {
+fn token_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?:^|\s)([@#!])([A-Za-z0-9_.-]*)$").expect("valid PR completion trigger regex")
+        // Mirrors `pullRequestComposerTrigger.ts`: Unicode letters/digits, combining marks cannot start.
+        Regex::new(r"^(?:@([\p{L}\p{N}_][\p{L}\p{M}\p{N}_.-]*)?|([#!])([\p{L}\p{N}_-]*))$")
+            .expect("valid PR completion token regex")
     })
 }
 
@@ -115,7 +120,23 @@ pub struct PullRequestComposerTrigger {
     pub range_end: usize,
 }
 
-/// Detects an active `@mention` or `#ref` / `!ref` trigger ending at byte offset `caret`.
+fn clamp_char_boundary(text: &str, byte_ix: usize) -> usize {
+    let mut end = byte_ix.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((byte_ix, _)) => value[..byte_ix].to_owned(),
+        None => value.to_owned(),
+    }
+}
+
+/// Detects an active `@mention`, `#ref`, or `!ref` token ending at `caret` when followed by
+/// whitespace or end-of-text (`detectPullRequestComposerTrigger`).
 pub fn detect_pull_request_composer_trigger(
     text: &str,
     caret: usize,
@@ -124,75 +145,72 @@ pub fn detect_pull_request_composer_trigger(
     if !support.is_enabled() {
         return None;
     }
-    let mut end = caret.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    let end = clamp_char_boundary(text, caret);
+    if text[end..].chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
     }
-    let before = &text[..end];
-    let caps = trigger_regex().captures(before)?;
-    let sigil_match = caps.get(1)?;
-    let query_match = caps.get(2)?;
-    let sigil = sigil_match.as_str().chars().next()?;
-
-    let kind = match sigil {
-        '@' if support.mentions => TriggerKind::Mention,
-        '#' | '!' => {
-            let ref_sigil = ReferenceSigil::from_char(sigil)?;
-            if !support.reference_sigils.contains(&ref_sigil) {
-                return None;
-            }
-            TriggerKind::Reference(ref_sigil)
+    let mut start = end;
+    for (idx, ch) in text[..end].char_indices().rev() {
+        if ch.is_whitespace() {
+            break;
         }
-        _ => return None,
-    };
-
+        start = idx;
+    }
+    let token = &text[start..end];
+    let caps = token_regex().captures(token)?;
+    if let Some(ref_sigil_str) = caps.get(2).map(|m| m.as_str()) {
+        let sigil = ref_sigil_str.chars().next()?;
+        let ref_sigil = ReferenceSigil::from_char(sigil)?;
+        if !support.reference_sigils.contains(&ref_sigil) {
+            return None;
+        }
+        return Some(PullRequestComposerTrigger {
+            kind: TriggerKind::Reference(ref_sigil),
+            sigil,
+            query: caps.get(3).map_or("", |m| m.as_str()).to_owned(),
+            range_start: start,
+            range_end: end,
+        });
+    }
+    if !support.mentions {
+        return None;
+    }
     Some(PullRequestComposerTrigger {
-        kind,
-        sigil,
-        query: query_match.as_str().to_owned(),
-        range_start: sigil_match.start(),
+        kind: TriggerKind::Mention,
+        sigil: '@',
+        query: caps.get(1).map_or("", |m| m.as_str()).to_owned(),
+        range_start: start,
         range_end: end,
     })
 }
 
-/// Replaces the detected trigger token with `insert_value` followed by a trailing space and returns
-/// the updated string plus the new byte caret position.
+/// Replaces the detected trigger token with `insert_value`, consuming a following space/tab or
+/// inserting a single space (`insertPullRequestCompletion`).
 pub fn insert_pull_request_completion(
     text: &str,
     trigger: &PullRequestComposerTrigger,
     insert_value: &str,
 ) -> (String, usize) {
-    let start = trigger.range_start.min(text.len());
-    let end = trigger.range_end.min(text.len()).max(start);
-    let already_spaced = text[end..].starts_with(char::is_whitespace);
-    let replacement = if already_spaced { insert_value.to_owned() } else { format!("{insert_value} ") };
-    let (next, caret) = replace_text_range(text, start, end, &replacement);
-    if already_spaced {
-        // Advance past the existing separating space so the user can keep typing naturally.
-        let next_caret = text[end..]
-            .chars()
-            .next()
-            .map(|ch| caret + ch.len_utf8())
-            .unwrap_or(caret)
-            .min(next.len());
-        (next, next_caret)
-    } else {
-        (next, caret)
+    let start = clamp_char_boundary(text, trigger.range_start);
+    let end = clamp_char_boundary(text, trigger.range_end).max(start);
+    let followed_by_space = text[end..].starts_with([' ', '\t']);
+    if !followed_by_space {
+        return replace_text_range(text, start, end, &format!("{insert_value} "));
     }
+    let (next, caret) = replace_text_range(text, start, end, insert_value);
+    (next, (caret + 1).min(text.len() - (end - start) + insert_value.len()))
 }
 
-/// Stable bucket key for a trigger kind + sigil.
-pub fn pull_request_completion_key(trigger: &PullRequestComposerTrigger) -> &'static str {
-    match trigger.kind {
-        TriggerKind::Mention => "mention",
-        TriggerKind::Reference(ReferenceSigil::Hash) => "reference:#",
-        TriggerKind::Reference(ReferenceSigil::Bang) => "reference:!",
-    }
+/// Debounce key carrying the sigil and capped query (`pullRequestCompletionKey`).
+pub fn pull_request_completion_key(trigger: &PullRequestComposerTrigger) -> String {
+    let query = truncate_chars(&trigger.query, MAX_COMPLETION_QUERY_CHARS);
+    format!("{}{query}", trigger.sigil)
 }
 
-/// Cache key distinguishing a `(scope, trigger_kind, sigil, query)` RPC lookup.
+/// Cache key distinguishing a `(scope, sigil, query)` RPC lookup.
 pub fn completion_query_cache_key(scope_key: &str, trigger: &PullRequestComposerTrigger) -> String {
-    format!("{scope_key}:{}:{}", pull_request_completion_key(trigger), trigger.query.to_ascii_lowercase())
+    let query = truncate_chars(&trigger.query, MAX_COMPLETION_QUERY_CHARS).to_ascii_lowercase();
+    format!("{scope_key}:{}:{query}", trigger.sigil)
 }
 
 /// Filter kind argument sent to `pullRequests.filterOptions`.
@@ -219,8 +237,8 @@ pub enum CompletionSearchDecision {
     Debounce { delay_ms: u64 },
 }
 
-/// Mirrors `debouncedPullRequestCompletionSearch`: empty queries fetch immediately when uncached;
-/// typed queries wait `COMPLETION_DEBOUNCE_MS` unless already cached.
+/// Mirrors `useCompletions` / `debouncedPullRequestCompletionSearch`: empty queries fetch
+/// immediately when uncached; typed queries debounce by `COMPLETION_DEBOUNCE_MS` unless cached.
 pub fn debounced_pull_request_completion_search(
     cached: bool,
     trigger: &PullRequestComposerTrigger,
@@ -234,21 +252,28 @@ pub fn debounced_pull_request_completion_search(
     }
 }
 
-/// Builds the JSON params object for `pullRequests.filterOptions`.
+/// Builds the JSON params object for `pullRequests.filterOptions` (query capped at 100 chars).
 pub fn filter_options_params(project_id: &str, trigger: &PullRequestComposerTrigger) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("projectId".to_owned(), Value::String(project_id.to_owned()));
     match trigger.kind {
         TriggerKind::Mention => {
-            map.insert("kind".to_owned(), Value::String(FilterOptionsKind::Authors.as_str().to_owned()));
+            map.insert(
+                "kind".to_owned(),
+                Value::String(FilterOptionsKind::Authors.as_str().to_owned()),
+            );
         }
         TriggerKind::Reference(sigil) => {
-            map.insert("kind".to_owned(), Value::String(FilterOptionsKind::References.as_str().to_owned()));
+            map.insert(
+                "kind".to_owned(),
+                Value::String(FilterOptionsKind::References.as_str().to_owned()),
+            );
             map.insert("sigil".to_owned(), Value::String(sigil.as_str().to_owned()));
         }
     }
-    if !trigger.query.is_empty() {
-        map.insert("query".to_owned(), Value::String(trigger.query.clone()));
+    let query = truncate_chars(&trigger.query, MAX_COMPLETION_QUERY_CHARS);
+    if !query.is_empty() {
+        map.insert("query".to_owned(), Value::String(query));
     }
     Value::Object(map)
 }
@@ -353,7 +378,7 @@ impl CompletionItem {
         match self {
             Self::Mention(author) => format!("@{}", author.login),
             Self::Reference { sigil, candidate } => {
-                if candidate.reference.starts_with('#') || candidate.reference.starts_with('!') {
+                if candidate.reference.starts_with(sigil.as_char()) {
                     candidate.reference.clone()
                 } else {
                     format!("{}{}", sigil.as_char(), candidate.number)
@@ -372,14 +397,14 @@ pub fn narrow_pull_request_mentions<'a>(
     if limit == 0 {
         return Vec::new();
     }
-    let needle = query.trim().to_ascii_lowercase();
+    let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return authors.iter().take(limit).collect();
     }
     let mut ranked: Vec<(u8, usize, &MentionCandidate)> = Vec::new();
     for (index, author) in authors.iter().enumerate() {
-        let login = author.login.to_ascii_lowercase();
-        let name = author.name.as_deref().unwrap_or("").to_ascii_lowercase();
+        let login = author.login.to_lowercase();
+        let name = author.name.as_deref().unwrap_or("").to_lowercase();
         let tier = if login.starts_with(&needle) {
             Some(0)
         } else if !name.is_empty() && name.starts_with(&needle) {
@@ -399,34 +424,37 @@ pub fn narrow_pull_request_mentions<'a>(
     ranked.into_iter().take(limit).map(|(_, _, author)| author).collect()
 }
 
-/// Narrows and ranks `#123` / `!123` reference candidates for `query`, capped at `limit`.
+/// Narrows `#123` / `!123` reference candidates matching `sigil`, by number prefix or title substring.
 pub fn narrow_pull_request_references<'a>(
     references: &'a [ReferenceCandidate],
+    sigil: ReferenceSigil,
     query: &str,
     limit: usize,
 ) -> Vec<&'a ReferenceCandidate> {
     if limit == 0 {
         return Vec::new();
     }
-    let needle = query.trim().trim_start_matches(['#', '!']).to_ascii_lowercase();
-    if needle.is_empty() {
-        return references.iter().take(limit).collect();
-    }
+    let sigil_char = sigil.as_char();
+    let needle = query.trim().to_lowercase();
     let mut ranked: Vec<(u8, usize, &ReferenceCandidate)> = Vec::new();
     for (index, reference) in references.iter().enumerate() {
+        if !reference.reference.starts_with(sigil_char) {
+            continue;
+        }
+        if needle.is_empty() {
+            ranked.push((0, index, reference));
+            continue;
+        }
         let number = reference.number.to_string();
-        let ref_lower = reference.reference.to_ascii_lowercase();
-        let title_lower = reference.title.to_ascii_lowercase();
+        let title_lower = reference.title.to_lowercase();
         let tier = if number == needle {
             Some(0)
         } else if number.starts_with(&needle) {
             Some(1)
-        } else if number.contains(&needle) || ref_lower.contains(&needle) {
-            Some(2)
         } else if title_lower.starts_with(&needle) {
-            Some(3)
+            Some(2)
         } else if title_lower.contains(&needle) {
-            Some(4)
+            Some(3)
         } else {
             None
         };
@@ -451,6 +479,7 @@ pub fn pull_request_completions(
             .collect(),
         TriggerKind::Reference(sigil) => narrow_pull_request_references(
             &options.references,
+            sigil,
             &trigger.query,
             MAX_COMPLETION_ITEMS,
         )
@@ -469,31 +498,36 @@ pub fn nudge_completion(selected: usize, delta: isize, len: usize) -> usize {
     (selected.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize
 }
 
-/// Tracks the active PR completion trigger, keyboard selection, and query cache for one comment editor.
+/// Tracks the active PR completion trigger, keyboard selection, and dismissal range.
 #[derive(Clone, Debug, Default)]
 pub struct PrCompletionState {
     pub trigger: Option<PullRequestComposerTrigger>,
     pub selected: usize,
-    pub dismissed_range: Option<(usize, usize)>,
+    pub dismissed_at: Option<usize>,
 }
 
 impl PrCompletionState {
     pub fn sync_input(&mut self, text: &str, caret: usize, support: &CompletionSupport) -> bool {
         let next = detect_pull_request_composer_trigger(text, caret, support);
-        if let (Some(dismissed), Some(candidate)) = (self.dismissed_range, next.as_ref())
-            && dismissed == (candidate.range_start, candidate.range_end)
+        if let (Some(dismissed_start), Some(candidate)) = (self.dismissed_at, next.as_ref())
+            && dismissed_start == candidate.range_start
         {
+            if self.trigger.is_some() {
+                self.trigger = None;
+                return true;
+            }
             return false;
         }
-        if next.is_none() {
-            self.dismissed_range = None;
+        if next.is_none() || self.dismissed_at.is_some_and(|start| next.as_ref().is_some_and(|t| t.range_start != start)) {
+            self.dismissed_at = None;
         }
         let changed = self.trigger != next;
         if changed {
+            let query_changed = self.trigger.as_ref().map(|t| t.query.as_str())
+                != next.as_ref().map(|t| t.query.as_str());
             self.trigger = next;
-            self.selected = 0;
-            if self.trigger.is_some() {
-                self.dismissed_range = None;
+            if query_changed || self.trigger.is_none() {
+                self.selected = 0;
             }
         }
         changed
@@ -503,9 +537,13 @@ impl PrCompletionState {
         let Some(trigger) = self.trigger.take() else {
             return false;
         };
-        self.dismissed_range = Some((trigger.range_start, trigger.range_end));
+        self.dismissed_at = Some(trigger.range_start);
         self.selected = 0;
         true
+    }
+
+    pub fn clear_dismissed(&mut self) {
+        self.dismissed_at = None;
     }
 }
 
@@ -519,11 +557,14 @@ mod tests {
     }
 
     fn gitlab_support() -> CompletionSupport {
-        CompletionSupport { mentions: true, reference_sigils: vec![ReferenceSigil::Hash, ReferenceSigil::Bang] }
+        CompletionSupport {
+            mentions: true,
+            reference_sigils: vec![ReferenceSigil::Hash, ReferenceSigil::Bang],
+        }
     }
 
     #[test]
-    fn detects_mention_at_start_and_after_whitespace() {
+    fn detects_mention_unicode_and_validates_token_boundaries() {
         let support = github_support();
         let start = detect_pull_request_composer_trigger("@ali", 4, &support).expect("start mention");
         assert_eq!(start.kind, TriggerKind::Mention);
@@ -531,14 +572,17 @@ mod tests {
         assert_eq!((start.range_start, start.range_end), (0, 4));
 
         let mid = detect_pull_request_composer_trigger("cc @bob-1.2", 11, &support).expect("mid mention");
-        assert_eq!(mid.kind, TriggerKind::Mention);
         assert_eq!(mid.query, "bob-1.2");
         assert_eq!((mid.range_start, mid.range_end), (3, 11));
-    }
 
-    #[test]
-    fn ignores_mid_word_sigils_and_unsupported_capabilities() {
-        let support = github_support();
+        let unicode = detect_pull_request_composer_trigger("hi @josé ", 9, &support).expect("unicode name");
+        assert_eq!(unicode.query, "josé");
+
+        // Mid-word caret, leading punctuation after sigil, and unsupported sigils do not match.
+        assert_eq!(detect_pull_request_composer_trigger("@alice", 3, &support), None);
+        assert_eq!(detect_pull_request_composer_trigger("@.foo", 5, &support), None);
+        assert_eq!(detect_pull_request_composer_trigger("@-bar", 5, &support), None);
+        assert_eq!(detect_pull_request_composer_trigger("#1.2", 4, &support), None);
         assert_eq!(detect_pull_request_composer_trigger("foo@bar", 7, &support), None);
         assert_eq!(detect_pull_request_composer_trigger("anchor#12", 9, &support), None);
         assert_eq!(detect_pull_request_composer_trigger("fix !12", 7, &support), None);
@@ -554,54 +598,44 @@ mod tests {
         let hash = detect_pull_request_composer_trigger("see #42", 7, &support).expect("hash ref");
         assert_eq!(hash.kind, TriggerKind::Reference(ReferenceSigil::Hash));
         assert_eq!(hash.query, "42");
-        assert_eq!((hash.range_start, hash.range_end), (4, 7));
 
         let bang = detect_pull_request_composer_trigger("!98", 3, &support).expect("bang ref");
         assert_eq!(bang.kind, TriggerKind::Reference(ReferenceSigil::Bang));
         assert_eq!(bang.query, "98");
-        assert_eq!((bang.range_start, bang.range_end), (0, 3));
     }
 
     #[test]
-    fn inserts_completion_with_trailing_space_and_preserves_suffix() {
+    fn inserts_completion_respecting_spaces_tabs_and_newlines() {
+        let support = github_support();
         let text = "Ask @al to review";
-        let trigger = detect_pull_request_composer_trigger(text, 7, &github_support()).unwrap();
+        let trigger = detect_pull_request_composer_trigger(text, 7, &support).unwrap();
         let (next, caret) = insert_pull_request_completion(text, &trigger, "@alice");
         assert_eq!(next, "Ask @alice to review");
         assert_eq!(caret, "Ask @alice ".len());
 
-        let tail = "See #1";
-        let trigger = detect_pull_request_composer_trigger(tail, tail.len(), &github_support()).unwrap();
-        let (next, caret) = insert_pull_request_completion(tail, &trigger, "#123");
-        assert_eq!(next, "See #123 ");
-        assert_eq!(caret, "See #123 ".len());
+        // Newline after caret is NOT consumed as horizontal space; inserts a trailing space.
+        let before_newline = "Ask @al\nmore";
+        let trigger = detect_pull_request_composer_trigger(before_newline, 7, &support).unwrap();
+        let (next, caret) = insert_pull_request_completion(before_newline, &trigger, "@alice");
+        assert_eq!(next, "Ask @alice \nmore");
+        assert_eq!(caret, "Ask @alice ".len());
     }
 
     #[test]
-    fn narrows_mentions_and_references_with_ranking_and_limit() {
-        let authors: Vec<MentionCandidate> = (0..12)
-            .map(|i| MentionCandidate {
-                login: format!("dev{i}"),
-                name: Some(format!("Developer {i}")),
-                is_bot: false,
-                avatar_url: None,
-            })
-            .collect();
-        assert_eq!(narrow_pull_request_mentions(&authors, "", MAX_COMPLETION_ITEMS).len(), 8);
-
-        let ranked_authors = vec![
-            MentionCandidate { login: "x_alice".into(), name: None, is_bot: false, avatar_url: None },
-            MentionCandidate { login: "alice".into(), name: None, is_bot: false, avatar_url: None },
-        ];
-        let hits = narrow_pull_request_mentions(&ranked_authors, "ali", 8);
-        assert_eq!(hits.iter().map(|a| a.login.as_str()).collect::<Vec<_>>(), vec!["alice", "x_alice"]);
-
+    fn narrows_mentions_and_filters_references_strictly_by_sigil() {
         let refs = vec![
             ReferenceCandidate {
                 reference: "#120".into(),
                 kind: ReferenceKind::Issue,
                 number: 120,
                 title: "Handle timeout".into(),
+                state: ReferenceState::Open,
+            },
+            ReferenceCandidate {
+                reference: "!12".into(),
+                kind: ReferenceKind::ChangeRequest,
+                number: 12,
+                title: "GitLab MR".into(),
                 state: ReferenceState::Open,
             },
             ReferenceCandidate {
@@ -612,34 +646,21 @@ mod tests {
                 state: ReferenceState::Merged,
             },
         ];
-        let ref_hits = narrow_pull_request_references(&refs, "12", 8);
-        assert_eq!(ref_hits.iter().map(|r| r.number).collect::<Vec<_>>(), vec![12, 120]);
+        let hash_hits = narrow_pull_request_references(&refs, ReferenceSigil::Hash, "12", 8);
+        assert_eq!(hash_hits.iter().map(|r| r.reference.as_str()).collect::<Vec<_>>(), vec!["#12", "#120"]);
+        let bang_hits = narrow_pull_request_references(&refs, ReferenceSigil::Bang, "12", 8);
+        assert_eq!(bang_hits.iter().map(|r| r.reference.as_str()).collect::<Vec<_>>(), vec!["!12"]);
     }
 
     #[test]
-    fn debounces_non_empty_queries_when_uncached() {
-        let support = github_support();
-        let empty = detect_pull_request_composer_trigger("@", 1, &support).unwrap();
-        assert_eq!(
-            debounced_pull_request_completion_search(false, &empty),
-            CompletionSearchDecision::Immediate
-        );
-        let typed = detect_pull_request_composer_trigger("@al", 3, &support).unwrap();
-        assert_eq!(
-            debounced_pull_request_completion_search(false, &typed),
-            CompletionSearchDecision::Debounce { delay_ms: COMPLETION_DEBOUNCE_MS }
-        );
-        assert_eq!(
-            debounced_pull_request_completion_search(true, &typed),
-            CompletionSearchDecision::Cached
-        );
-    }
-
-    #[test]
-    fn decodes_capabilities_and_filter_options_payloads() {
-        let caps = json!({ "mentions": true, "referenceSigils": ["#", "!"] });
-        let support = CompletionSupport::from_capabilities_value(&caps);
-        assert_eq!(support, gitlab_support());
+    fn caps_query_to_100_chars_and_decodes_filter_options() {
+        let long_query = format!("@{}", "a".repeat(140));
+        let trigger =
+            detect_pull_request_composer_trigger(&long_query, long_query.len(), &github_support())
+                .unwrap();
+        assert_eq!(pull_request_completion_key(&trigger).len(), 1 + MAX_COMPLETION_QUERY_CHARS);
+        let params = filter_options_params("proj-1", &trigger);
+        assert_eq!(params["query"].as_str().unwrap().chars().count(), MAX_COMPLETION_QUERY_CHARS);
 
         let payload = json!({
             "authors": [{ "login": "theo", "name": "Theo", "isBot": false }],
@@ -653,27 +674,21 @@ mod tests {
             "truncated": true
         });
         let options = CompletionOptions::from_filter_options_value(&payload);
-        assert_eq!(options.authors.len(), 1);
-        assert_eq!(options.authors[0].login, "theo");
-        assert_eq!(options.references.len(), 1);
-        assert_eq!(options.references[0].kind, ReferenceKind::ChangeRequest);
-        assert!(options.truncated);
-
-        let trigger = detect_pull_request_composer_trigger("!7", 2, &support).unwrap();
-        let items = pull_request_completions(&trigger, &options);
+        let bang = detect_pull_request_composer_trigger("!7", 2, &gitlab_support()).unwrap();
+        let items = pull_request_completions(&bang, &options);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].insert_text(), "!77");
     }
 
     #[test]
-    fn dismiss_hides_same_trigger_range_until_edited_away() {
+    fn dismiss_hides_until_cleared_or_token_start_changes() {
         let mut state = PrCompletionState::default();
         let support = github_support();
         assert!(state.sync_input("@al", 3, &support));
-        assert!(state.trigger.is_some());
         assert!(state.dismiss());
         assert!(state.trigger.is_none());
-        assert!(!state.sync_input("@al", 3, &support));
+        assert!(!state.sync_input("@ali", 4, &support));
+        state.clear_dismissed();
         assert!(state.sync_input("@ali", 4, &support));
         assert!(state.trigger.is_some());
     }

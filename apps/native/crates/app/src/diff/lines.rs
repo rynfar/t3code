@@ -93,11 +93,11 @@ impl DiffPanel {
             .h_full()
             .bg(hsla(p.background))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                this.cancel_reveal_on_interaction();
+                this.cancel_navigation_on_interaction();
                 this.scroll_horizontally(event, window, cx);
             }))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| {
-                this.cancel_reveal_on_interaction();
+                this.cancel_navigation_on_interaction();
             }))
             .on_mouse_move(cx.listener(Self::drag_comment_selection))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
@@ -151,8 +151,9 @@ impl DiffPanel {
                 let Some((line, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
                 let p = palette(cx);
                 let highlighted = self.is_revealed_line(file, &line, None);
-                let bg = if highlighted { hsla(p.primary).opacity(0.08) } else { line_colors(line.kind, p).row };
-                self.code_row(bg, cx).child(self.half(file, Some(&line), digits, true, cx)).into_any_element()
+                self.code_row(line_colors(line.kind, p).row, cx)
+                    .child(self.half(file, Some(&line), digits, true, highlighted, cx))
+                    .into_any_element()
             }
             DiffRow::Split { file, hunk, left, right } => {
                 let left = left.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
@@ -161,10 +162,9 @@ impl DiffPanel {
                 let p = palette(cx);
                 let left_hi = left.as_ref().is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(t3_core::composer::review::Side::Deletions)));
                 let right_hi = right.as_ref().is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(t3_core::composer::review::Side::Additions)));
-                let bg = if left_hi || right_hi { hsla(p.primary).opacity(0.08) } else { hsla(p.background) };
-                self.code_row(bg, cx)
-                    .child(self.half(file, left.as_ref().map(|(line, _)| line), digits, false, cx))
-                    .child(self.half(file, right.as_ref().map(|(line, _)| line), digits, true, cx))
+                self.code_row(hsla(p.background), cx)
+                    .child(self.half(file, left.as_ref().map(|(line, _)| line), digits, false, left_hi, cx))
+                    .child(self.half(file, right.as_ref().map(|(line, _)| line), digits, true, right_hi, cx))
                     .into_any_element()
             }
             DiffRow::NoNewline { file, hunk, line } => {
@@ -209,10 +209,13 @@ impl DiffPanel {
 
     /// One side of a row: a gutter with the line number and change bar, then the code. In the
     /// stacked layout deletions show their old number and everything else its new one.
-    fn half(&self, file: usize, line: Option<&DiffLine>, digits: usize, new_side: bool, cx: &mut Context<Self>) -> Div {
+    fn half(&self, file: usize, line: Option<&DiffLine>, digits: usize, new_side: bool, highlighted: bool, cx: &mut Context<Self>) -> Div {
         let p = palette(cx);
         let char_width = self.char_width.unwrap_or(px(7.8));
         let colors = line.map_or_else(|| line_colors(LineKind::Context, p), |line| line_colors(line.kind, p));
+        let highlight = hsla(p.primary).opacity(0.14);
+        let row_bg = if highlighted { colors.row.blend(highlight) } else { colors.row };
+        let gutter_bg = if highlighted { colors.gutter.blend(highlight) } else { colors.gutter };
         let number = line.and_then(|line| match (line.kind, new_side) {
             (LineKind::Deletion, _) | (LineKind::Context, false) => line.old_line,
             _ => line.new_line,
@@ -222,7 +225,7 @@ impl DiffPanel {
             .flex()
             .flex_1()
             .min_w_0()
-            .bg(colors.row)
+            .bg(row_bg)
             .child(
                 div()
                     .relative()
@@ -230,7 +233,7 @@ impl DiffPanel {
                     .w(gutter_width(digits, char_width))
                     .pl(char_width * 2.)
                     .pr(char_width)
-                    .bg(colors.gutter)
+                    .bg(gutter_bg)
                     .text_color(colors.number)
                     .text_right()
                     .children(colors.bar.filter(|_| line.is_some()).map(|bar| div().absolute().top_0().bottom_0().left_0().w(px(4.)).bg(bar)))
