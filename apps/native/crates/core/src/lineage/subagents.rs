@@ -417,6 +417,75 @@ pub fn format_provider_subagent_status(status: Option<&ProviderSubagentStatus>, 
     if live { format!("{label} {elapsed}") } else { format!("{label} in {elapsed}") }
 }
 
+/// Elapsed timing for subagents, workflow phases, and workflow members (`AgentElapsed.tsx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentTiming {
+    pub active: bool,
+    pub started_ms: Option<i64>,
+    pub completed_ms: Option<i64>,
+}
+
+impl AgentTiming {
+    pub fn from_subagent(agent: &Subagent) -> Option<Self> {
+        let timing = Self {
+            active: is_active_status(&agent.status),
+            started_ms: agent.started_at.as_deref().and_then(parse_iso_ms),
+            completed_ms: agent.completed_at.as_deref().and_then(parse_iso_ms),
+        };
+        timing.elapsed_ms(0).map(|_| timing)
+    }
+
+    pub fn from_member(member: &WorkflowMember) -> Option<Self> {
+        let timing = Self { active: is_active_status(&member.status), started_ms: member.started_at, completed_ms: member.completed_at };
+        timing.elapsed_ms(0).map(|_| timing)
+    }
+
+    pub fn from_phase(phase: &WorkflowPhaseGroup) -> Option<Self> {
+        let active = phase.state == PhaseState::Running;
+        let started_ms = phase.members.iter().filter_map(|member| member.started_at).min();
+        let completed_ms = if active { None } else { phase.members.iter().filter_map(|member| member.completed_at).max() };
+        let timing = Self { active, started_ms: if active || completed_ms.is_some() { started_ms } else { None }, completed_ms };
+        timing.elapsed_ms(0).map(|_| timing)
+    }
+
+    /// Mirrors `deriveSubagentElapsedMs`: `None` without a start or a running/completed end.
+    pub fn elapsed_ms(self, now_ms: i64) -> Option<i64> {
+        let start = self.started_ms?;
+        let end = if self.active { now_ms } else { self.completed_ms? };
+        Some((end - start).max(0))
+    }
+
+    /// Mirrors `AgentElapsed.tsx`: full (`1m 05s`) vs compact (`1m`, `1.5h`, `12h`).
+    pub fn format(self, now_ms: i64, compact: bool) -> String {
+        let Some(ms) = self.elapsed_ms(now_ms) else { return String::new() };
+        let total_seconds = (ms / 1_000).max(0);
+        if compact {
+            if total_seconds < 60 {
+                return format!("{total_seconds}s");
+            }
+            let minutes = total_seconds / 60;
+            if minutes < 60 {
+                return format!("{minutes}m");
+            }
+            if minutes >= 600 {
+                return format!("{}h", minutes / 60);
+            }
+            let tenths = minutes / 6;
+            if tenths % 10 == 0 { format!("{}h", tenths / 10) } else { format!("{}.{}h", tenths / 10, tenths % 10) }
+        } else {
+            let minutes = total_seconds / 60;
+            if minutes == 0 {
+                return format!("{total_seconds}s");
+            }
+            let hours = minutes / 60;
+            if hours == 0 {
+                return format!("{minutes}m {:02}s", total_seconds % 60);
+            }
+            format!("{hours}h {:02}m", minutes % 60)
+        }
+    }
+}
+
 pub const GET_NATIVE_CHILD_WORK: &str = "orchestration.getNativeChildWork";
 
 pub fn native_child_work_request(thread_id: &str) -> Value {

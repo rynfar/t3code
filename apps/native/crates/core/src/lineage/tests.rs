@@ -445,3 +445,32 @@ fn relationship_title_lookup_filters_deleted_forks_after_settling_and_keeps_suba
     let kept: Vec<&str> = rows.iter().filter(|r| keep_relationship_row(r, &unlisted, Some(&resolved))).map(|r| r.thread_id.as_str()).collect();
     assert_eq!(kept, vec!["fork-live", "fork-archived", "sub-untitled", "sub-titled"]);
 }
+
+#[test]
+fn agent_timing_derives_phase_and_formats_full_and_compact_elapsed() {
+    let start = parse_iso_ms(T).expect("start");
+    let running = decode_agents(vec![subagent("r1", None, "running", T, json!({"startedAt": T}))]).remove(0);
+    let timing = AgentTiming::from_subagent(&running).expect("running timing");
+    assert_eq!(timing.format(start + 65_000, false), "1m 05s");
+    assert_eq!(timing.format(start + 65_000, true), "1m");
+    assert_eq!(timing.format(start + 5_400_000, true), "1.5h");
+    assert_eq!(timing.format(start + 43_200_000, true), "12h");
+
+    let unstarted = decode_agents(vec![subagent("p1", None, "running", T, json!({"startedAt": null}))]).remove(0);
+    assert_eq!(AgentTiming::from_subagent(&unstarted), None);
+
+    let coordinator = decode_agents(vec![subagent(
+        "w",
+        None,
+        "completed",
+        T,
+        json!({"workflow": {"phases": [{"index": 0, "title": "Build"}], "agents": [
+            {"index": 0, "label": "A", "state": "completed", "phaseIndex": 0, "startedAt": 1_000, "completedAt": 4_000},
+            {"index": 1, "label": "B", "state": "completed", "phaseIndex": 0, "startedAt": 2_000, "completedAt": 66_000}
+        ]}}),
+    )])
+    .remove(0);
+    let group = workflow_group(&coordinator).expect("group");
+    let phase_timing = AgentTiming::from_phase(&group.phases[0]).expect("phase timing");
+    assert_eq!(phase_timing.format(0, false), "1m 05s");
+}

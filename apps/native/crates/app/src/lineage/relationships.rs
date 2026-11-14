@@ -5,17 +5,19 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::Context;
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::lineage::{
-    RelationshipGraph, RelationshipKind, RelationshipRow, STOP_WORKFLOW, Subagent, WorkflowGroup, group_relationships, immediate_relationships,
-    is_parent_relationship, keep_relationship_row, latest_merge_back_run, merge_back_command, merge_back_target, order_rows,
-    relationship_graph, relationship_label, relationship_status_label, row_status, stop_subagent_command, stop_workflow_request,
+    AgentTiming, RelationshipGraph, RelationshipKind, RelationshipRow, STOP_WORKFLOW, Subagent, WorkflowGroup, group_relationships,
+    immediate_relationships, is_parent_relationship, keep_relationship_row, latest_merge_back_run, merge_back_command, merge_back_target,
+    order_rows, relationship_graph, relationship_label, relationship_status_label, row_status, stop_subagent_command, stop_workflow_request,
     subagent_display_title, subagents_of, unlisted_title_ids, workflow_group,
 };
 use t3_core::shell::ThreadShell;
 use t3_core::thread::ThreadProjection;
+use t3_core::workflows::{can_detach_provider_session, detach_session_commands};
 
 use super::titles::ThreadTitlesFeed;
-use crate::app_state::{AppState, uuid_v4};
+use crate::app_state::{AppState, ScopedRouteAction, uuid_v4};
 use crate::icons::Icon;
 use crate::toast::{Toast, ToastKind};
 
@@ -37,6 +39,30 @@ pub struct LineageRow {
     pub merge_target: bool,
     pub stop: Option<StopAction>,
     pub workflow: Option<WorkflowGroup>,
+    pub timing: Option<AgentTiming>,
+}
+
+/// A parent thread on a linked environment that delegated this thread (`DelegatedFromRow`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedFromRow {
+    pub environment_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub env_label: Option<String>,
+    pub connected: bool,
+}
+
+/// A subagent task delegated to a linked environment (`RemoteSubagentRow`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSubagentRow {
+    pub id: String,
+    pub environment_id: String,
+    pub thread_id: String,
+    pub env_label: String,
+    pub title: String,
+    pub status: &'static str,
+    pub failed: bool,
+    pub connected: bool,
 }
 
 /// Merging the open fork back: into which thread, and whether a finished turn allows it.
@@ -52,15 +78,33 @@ pub struct Relationships {
     pub active: Vec<LineageRow>,
     pub previous: Vec<LineageRow>,
     pub side_chats: Vec<LineageRow>,
+    pub delegated_from: Option<DelegatedFromRow>,
+    pub remote_subagents: Vec<RemoteSubagentRow>,
     pub merge: Option<MergeBack>,
     pub running_count: usize,
     pub running_side_chats: usize,
+    pub can_detach: bool,
     pub show_heading: bool,
 }
 
 impl Relationships {
+    pub fn has_lineage(&self) -> bool {
+        !self.related.is_empty()
+            || !self.active.is_empty()
+            || !self.previous.is_empty()
+            || self.running_count > 0
+            || !self.remote_subagents.is_empty()
+            || self.delegated_from.is_some()
+            || (self.can_detach && !self.side_chats.is_empty())
+    }
+
     pub fn lineage_len(&self) -> usize {
-        self.related.len() + self.active.len() + self.previous.len()
+        let rows = self.related.len()
+            + self.active.len()
+            + self.previous.len()
+            + usize::from(self.delegated_from.is_some())
+            + self.remote_subagents.len();
+        if rows > 0 { rows } else { usize::from(self.has_lineage()) }
     }
 }
 
@@ -153,6 +197,7 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
                 })
             })
             .flatten();
+        let timing = agent.and_then(AgentTiming::from_subagent);
         LineageRow {
             thread_id: row.thread_id.clone(),
             title: if subagent { subagent_display_title(&title) } else { title },
@@ -172,6 +217,7 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
             merge_target: merge_target == Some(row.thread_id.as_str()),
             stop,
             workflow,
+            timing,
         }
     };
     let merge = merge_target.map(|target| MergeBack {
@@ -187,8 +233,83 @@ pub fn relationships_with_titles(state: &AppState, thread: &ThreadShell, titles:
     let running_count = prepared.agents.iter().filter(|agent| agent.child_thread_id.is_none() && agent.status == "running").count()
         + active.iter().filter(|row| row.is_running).count();
     let running_side_chats = side_chats.iter().filter(|row| row.is_running).count();
-    let show_heading = running_count > 0 || !related.is_empty() || !active.is_empty();
-    Relationships { related, active, previous, side_chats, merge, running_count, running_side_chats, show_heading }
+    let can_detach = can_operate && prepared.projection.is_some_and(can_detach_provider_session);
+    let delegated_from = thread.delegated_from.as_ref().and_then(|value| {
+        let environment_id = value.get("environmentId")?.as_str()?.to_owned();
+        let parent_id = value.get("threadId")?.as_str()?.to_owned();
+        let fallback_title = value.get("title")?.as_str()?.to_owned();
+        let (connected, env_label, parent_title) = resolve_linked_target(state, &environment_id, &parent_id);
+        Some(DelegatedFromRow {
+            environment_id,
+            thread_id: parent_id,
+            title: parent_title.unwrap_or(fallback_title),
+            env_label: env_label.or_else(|| thread.link_origin.as_ref().map(|origin| origin.label.clone())),
+            connected,
+        })
+    });
+    let remote_subagents = prepared
+        .agents
+        .iter()
+        .filter_map(|agent| {
+            let remote = agent.remote_child.as_ref()?;
+            let environment_id = remote.get("environmentId")?.as_str()?.to_owned();
+            let remote_thread_id = remote.get("threadId")?.as_str()?.to_owned();
+            let env_label = remote.get("label")?.as_str()?.to_owned();
+            let (connected, _, _) = resolve_linked_target(state, &environment_id, &remote_thread_id);
+            let title = subagent_display_title(agent.title.as_deref().unwrap_or("Subagent"));
+            let failed = agent.status == "failed";
+            Some(RemoteSubagentRow {
+                id: agent.id.clone(),
+                environment_id,
+                thread_id: remote_thread_id,
+                env_label,
+                title,
+                status: relationship_status_label(Some(&agent.status)),
+                failed,
+                connected,
+            })
+        })
+        .collect();
+    let show_heading = running_count > 0 || can_detach || !related.is_empty() || !active.is_empty() || delegated_from.is_some();
+    Relationships {
+        related,
+        active,
+        previous,
+        side_chats,
+        delegated_from,
+        remote_subagents,
+        merge,
+        running_count,
+        running_side_chats,
+        can_detach,
+        show_heading,
+    }
+}
+
+fn resolve_linked_target(state: &AppState, canonical_env_id: &str, thread_id: &str) -> (bool, Option<String>, Option<String>) {
+    if !state.fleet.environments.is_empty() {
+        let entry = state.fleet.environments.iter().find(|entry| entry.summary.owner.canonical_id.as_deref() == Some(canonical_env_id));
+        let connected = entry.is_some_and(|entry| state.scoped_ready(&entry.summary.owner, ORCHESTRATION_READ_SCOPE));
+        let label = entry.and_then(|entry| {
+            entry
+                .config
+                .config
+                .as_ref()
+                .map(|config| config.environment.label.clone())
+                .or_else(|| state.environments.get(&entry.summary.owner.saved_id).map(|saved| saved.label.clone()))
+        });
+        let title = entry
+            .and_then(|entry| entry.summary.threads.iter().find(|t| t.thread.id == thread_id))
+            .map(|t| t.thread.title.clone());
+        return (connected, label, title);
+    }
+    let self_matches = state.server_config.config.as_ref().is_some_and(|config| config.environment.environment_id == canonical_env_id);
+    if !self_matches {
+        return (false, None, None);
+    }
+    let label = state.server_config.config.as_ref().map(|config| config.environment.label.clone());
+    let title = state.shell.snapshot.as_ref().and_then(|s| s.threads.iter().find(|t| t.id == thread_id)).map(|t| t.title.clone());
+    (state.client_handle().is_some(), label, title)
 }
 
 /// The runtime title `projectedSubagentsToRuntime` gives a subagent: its title, else its prompt.
@@ -213,6 +334,39 @@ impl AppState {
                 state.open_related_thread(&target, cx);
             }
         });
+    }
+
+    pub fn detach_provider_session(&mut self, cx: &mut Context<Self>) {
+        if !self.can_operate_threads() {
+            return;
+        }
+        let Some(source) = self.selected_thread.clone() else { return };
+        let Some(projection) = self.thread.projection.as_ref().filter(|projection| projection.thread.id == source) else { return };
+        if !can_detach_provider_session(projection) {
+            return;
+        }
+        for command in detach_session_commands(&uuid_v4(), projection) {
+            self.dispatch_then(command, Some("Could not disconnect agent session"), cx, |_, _, _| {});
+        }
+    }
+
+    pub fn open_linked_thread(&mut self, environment_id: &str, thread_id: &str, cx: &mut Context<Self>) {
+        if let Some(owner) = self
+            .fleet
+            .environments
+            .iter()
+            .find(|entry| entry.summary.owner.canonical_id.as_deref() == Some(environment_id))
+            .map(|entry| entry.summary.owner.clone())
+            .filter(|owner| self.scoped_ready(owner, ORCHESTRATION_READ_SCOPE))
+        {
+            self.navigate_scoped(owner, ScopedRouteAction::Thread(thread_id.to_owned()), cx);
+            return;
+        }
+        if self.fleet.environments.is_empty()
+            && self.server_config.config.as_ref().is_some_and(|config| config.environment.environment_id == environment_id)
+        {
+            self.open_related_thread(thread_id, cx);
+        }
     }
 
     pub fn run_stop_action(&mut self, action: &StopAction, cx: &mut Context<Self>) {
@@ -485,7 +639,86 @@ mod tests {
         state.update(cx, |state, cx| {
             state.merge_back_selected(cx);
             state.run_stop_action(&StopAction::Workflow { thread_id: "menu-thread".into(), subagent_id: "sub-1".into() }, cx);
+            state.detach_provider_session(cx);
         });
-        assert!(ro_fixture.take_commands().is_empty(), "read-only connection must not dispatch merge or stop");
+        assert!(ro_fixture.take_commands().is_empty(), "read-only connection must not dispatch merge, stop, or detach");
+
+        // Unlinked running subagents, remote subagents, delegatedFrom, and live session detach keep lineage visible.
+        state.update(cx, |state, cx| {
+            state.install_active_environment(
+                t3_client::supervisor::ClientFixture::handle(
+                    serde_json::from_value(serde_json::json!({
+                        "authenticated": true,
+                        "permissions": [t3_core::auth::ORCHESTRATION_READ_SCOPE, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE]
+                    }))
+                    .unwrap(),
+                )
+                .0,
+                state.shell.clone(),
+                state.server_config.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+                cx,
+            );
+            let snap = state.shell.snapshot.as_mut().unwrap();
+            snap.archived_threads.clear();
+            snap.threads.retain(|t| t.id == "menu-thread");
+            for t in &mut snap.threads {
+                t.lineage = t3_core::shell::Lineage { parent_thread_id: None, relationship_to_parent: None, root_thread_id: "menu-thread".into(), side_chat: None };
+                t.forked_from = None;
+                t.delegated_from = Some(serde_json::json!({"environmentId": "remote-env", "threadId": "remote-parent", "title": "Remote Parent"}));
+            }
+            let snapshot: ThreadStreamItem = serde_json::from_value(serde_json::json!({
+                "kind": "snapshot",
+                "snapshotSequence": 2,
+                "hasMoreHistory": false,
+                "historyCursor": null,
+                "projection": {
+                    "thread": {
+                        "id": "menu-thread", "projectId": "checkout-a", "title": "Main",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "runtimeMode": "auto", "interactionMode": "default",
+                        "activeProviderThreadId": "pt-1",
+                        "lineage": {"parentThreadId": null, "relationshipToParent": null, "rootThreadId": "menu-thread"},
+                        "forkedFrom": null
+                    },
+                    "runs": [], "attempts": [], "nodes": [],
+                    "subagents": [
+                        {
+                            "id": "sub-unlinked", "threadId": "menu-thread", "childThreadId": null,
+                            "origin": "provider_native", "prompt": "unlinked", "title": "Unlinked",
+                            "status": "running", "updatedAt": "2026-04-01T00:00:03.000Z"
+                        },
+                        {
+                            "id": "sub-remote", "threadId": "menu-thread", "childThreadId": null,
+                            "remoteChild": {"environmentId": "remote-env", "threadId": "rc-1", "label": "Remote Mac"},
+                            "origin": "app_owned", "prompt": "remote", "title": "Subagent: Remote Check",
+                            "status": "running", "updatedAt": "2026-04-01T00:00:03.000Z"
+                        }
+                    ],
+                    "providerSessions": [{"id": "ps-1", "status": "ready"}],
+                    "providerThreads": [{"id": "pt-1", "appThreadId": "menu-thread", "providerSessionId": "ps-1"}],
+                    "providerTurns": [], "runtimeRequests": [], "messages": [], "plans": [],
+                    "turnItems": [], "checkpointScopes": [], "checkpoints": [],
+                    "contextHandoffs": [], "contextTransfers": [], "visibleTurnItems": [],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }))
+            .unwrap();
+            state.thread.apply(snapshot);
+            let thread = state.thread_shell("menu-thread").unwrap().clone();
+            let rel = relationships_with_titles(state, &thread, None);
+            assert!(rel.related.is_empty() && rel.active.is_empty() && rel.previous.is_empty());
+            assert_eq!(rel.running_count, 2);
+            assert!(rel.can_detach);
+            assert!(rel.show_heading);
+            assert!(rel.has_lineage());
+            assert!(rel.lineage_len() >= 2);
+            assert_eq!(rel.delegated_from.as_ref().map(|d| (d.title.as_str(), d.connected)), Some(("Remote Parent", false)));
+            assert_eq!(rel.remote_subagents.len(), 1);
+            assert_eq!(rel.remote_subagents[0].title, "Remote Check");
+            assert_eq!(rel.remote_subagents[0].env_label, "Remote Mac");
+        });
     }
 }

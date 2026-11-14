@@ -3,6 +3,7 @@
 //! which cannot take messages, `ProviderSubagentBar.tsx` with `NativeChildWorkDialog.tsx`.
 
 mod child_work;
+pub(crate) mod elapsed;
 mod relationships;
 mod titles;
 
@@ -29,7 +30,7 @@ use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
 
-pub use relationships::{LineageRow, MergeBack, Relationships, StopAction, relationships_with_titles};
+pub use relationships::{DelegatedFromRow, LineageRow, MergeBack, Relationships, RemoteSubagentRow, StopAction, relationships_with_titles};
 pub use titles::ThreadTitlesFeed;
 
 /// One child approval: the child thread, its title, and what it asks.
