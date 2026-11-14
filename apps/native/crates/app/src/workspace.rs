@@ -445,6 +445,7 @@ impl Render for Workspace {
             .when_some(sheet, |this, width| this.child(self.render_sidebar_sheet(width, cx)))
             .child(self.render_sidebar_toggle(cx))
             .children(crate::transcript::html_render::fullscreen(window, cx))
+            .children(crate::transcript::mcp_app::fullscreen(window, cx))
             .child(self.prompt_links.clone())
             .child(self.menu.clone())
             .child(self.dialog.clone())

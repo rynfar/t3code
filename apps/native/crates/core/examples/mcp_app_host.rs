@@ -25,12 +25,17 @@ fn main() {
             match action {
                 Action::Post(value) => println!("host -> {value}"),
                 Action::Height(height) => println!("frame height -> {height}"),
+                Action::ExitFullscreen => println!("exit fullscreen"),
                 Action::Request { token, operation } => {
                     println!("network boundary -> {operation:?}");
                     let result = match operation {
                         Operation::CallTool { .. } => json!({"content":[],"structuredContent":{"weather":"Sunny"},"_meta":null}),
                         Operation::ReadResource { .. } => json!({"contents":[{"uri":"ui://weather/dashboard","text":"fixture"}]}),
-                        Operation::OpenLink { .. } => json!({}),
+                        Operation::OpenLink { .. }
+                        | Operation::SendMessage { .. }
+                        | Operation::UpdateModelContext { .. }
+                        | Operation::DownloadFile { .. } => json!({}),
+                        Operation::RequestDisplayMode { mode } => json!({ "mode": mode }),
                     };
                     for action in host.complete(token, Ok(result)) {
                         if let Action::Post(value) = action {
