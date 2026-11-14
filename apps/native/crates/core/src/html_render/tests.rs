@@ -235,3 +235,53 @@ fn page_keys_reject_mutations_conflicts_and_forged_codes() {
     bad["params"]["code"] = json!(42);
     assert!(host::read_key(&bad).is_none());
 }
+
+#[test]
+fn page_images_validate_sources_and_trim_names() {
+    use super::host;
+    let valid_png = "DATA:IMAGE/png;base64,iVBORw0KGgo=";
+    let img = host::read_image(&json!({
+        "jsonrpc": "2.0",
+        "method": "t3/notifications/open-image",
+        "params": { "src": valid_png, "name": "   architecture diagram \n  " }
+    }))
+    .unwrap();
+    assert_eq!(img.src, valid_png);
+    assert_eq!(img.name, "architecture diagram");
+
+    let https_img = host::read_image(&json!({
+        "jsonrpc": "2.0",
+        "method": "t3/notifications/open-image",
+        "params": { "src": "https://cdn.example.com/chart.png", "name": "   " }
+    }))
+    .unwrap();
+    assert_eq!(https_img.name, "Image");
+
+    let long_name = "a".repeat(250);
+    let capped = host::read_image(&json!({
+        "jsonrpc": "2.0",
+        "method": "t3/notifications/open-image",
+        "params": { "src": "http://localhost:8080/a.jpg", "name": long_name }
+    }))
+    .unwrap();
+    assert_eq!(capped.name.len(), 200);
+
+    for bad in [
+        "javascript:alert(1)",
+        "file:///tmp/x.png",
+        "data:text/html,<script>alert(1)</script>",
+        "data:image/png;base64,",
+        "data:image/png;base64,***",
+        "",
+    ] {
+        assert!(
+            host::read_image(&json!({
+                "jsonrpc": "2.0",
+                "method": "t3/notifications/open-image",
+                "params": { "src": bad }
+            }))
+            .is_none(),
+            "expected rejection for {bad}"
+        );
+    }
+}

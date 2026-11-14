@@ -169,3 +169,16 @@ fn disclosure_settling_cannot_override_navigation_or_a_newer_layout() {
     assert!(!follow.settle(current, 0., 200.));
     assert!(!follow.follow_change(0., 200.));
 }
+
+#[test]
+fn pinned_tail_captures_visible_rows_and_holds_position_on_append() {
+    let old = ids(&["r0", "r1", "r2", "r3", "r4"]);
+    // 1 header (60) + 5 rows (200) = 260; viewport 100 at tail => scrolled = 160 (20px into r2).
+    let tail = ScrollTop { item: 6, offset: 0. };
+    let visible = capture_pinned(&old, id, 1, tail, 100., tops(1), None).expect("pinned capture holds the visible rows at tail");
+    let new = ids(&["r0", "r1", "r2", "r3", "r4", "r5"]);
+    assert_eq!(
+        restore(&visible, &new, id, 1, ScrollTop { item: 7, offset: 0. }),
+        Some(Anchor::At(ScrollTop { item: 3, offset: 20. })),
+    );
+}

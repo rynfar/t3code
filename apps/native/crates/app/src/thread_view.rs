@@ -280,11 +280,12 @@ impl ThreadView {
                 self.activity = ThreadActivity::default();
             }
         }
-        let follow = self.disclosure.needs_follow_check().then(|| disclosure_end_distance(&self.list));
-        let visible = self.visible_rows();
+        let paused = self.is_follow_paused(cx);
+        let follow = (!paused && self.disclosure.needs_follow_check()).then(|| disclosure_end_distance(&self.list));
+        let visible = self.visible_rows(cx);
         self.sync_history(cx);
         let changed = self.rederive_rows(cx);
-        let follow = changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
+        let follow = !paused && changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
         if follow { self.list.scroll_to_end(); } else { self.keep_place(visible); }
         if changed { self.disclosure.changed(); }
         let pending_work = self.sync_work_folds(cx);
@@ -640,24 +641,32 @@ impl ThreadView {
     }
 
     fn rederive(&mut self, cx: &mut Context<Self>) {
-        let visible = self.visible_rows();
+        let visible = self.visible_rows(cx);
         self.rederive_rows(cx);
         self.keep_place(visible);
     }
 
-    /// The rows in view and where they sit, before a change. A gap not yet scrolled into still
-    /// counts: that row sits below the viewport's top.
-    fn visible_rows(&self) -> Option<VisibleRows> {
-        self.visible_rows_for(self.disclosure.anchor())
+    fn is_follow_paused(&self, cx: &gpui::App) -> bool {
+        crate::transcript::html_render::is_fullscreen_open(cx) || self.viewer.read(cx).is_open()
     }
 
-    fn visible_rows_for(&self, disclosure: Option<&str>) -> Option<VisibleRows> {
+    /// The rows in view and where they sit, before a change. A gap not yet scrolled into still
+    /// counts: that row sits below the viewport's top.
+    fn visible_rows(&self, cx: &gpui::App) -> Option<VisibleRows> {
+        self.visible_rows_for(self.disclosure.anchor(), self.is_follow_paused(cx))
+    }
+
+    fn visible_rows_for(&self, disclosure: Option<&str>, pin_at_tail: bool) -> Option<VisibleRows> {
         let top = self.list.logical_scroll_top();
         let row = top.item_ix.checked_sub(self.header_count()).and_then(|index| self.rows.get(index));
         let pending = self.anchor_gap.borrow().as_ref().filter(|(id, _)| row.is_some_and(|row| row.id == *id)).map_or(0., |(_, gap)| *gap);
         let top = ScrollTop { item: top.item_ix, offset: f32::from(top.offset_in_item) - pending };
         let viewport = f32::from(self.list.viewport_bounds().size.height);
-        anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)), disclosure)
+        if pin_at_tail {
+            anchor::capture_pinned(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)), disclosure)
+        } else {
+            anchor::capture(&self.rows, |row| row.id.as_str(), self.header_count(), top, viewport, |ix| f32::from(self.list.offset_for_item(ix)), disclosure)
+        }
     }
 
     /// Puts the first row that was in view back where it was, as the web list's
@@ -768,7 +777,7 @@ impl ThreadView {
                     Err(error) => Detail::Failed { revision, message: error.to_string() },
                 };
                 view.details.insert(id, detail);
-                view.remeasure_entry(&entry_id);
+                view.remeasure_entry(&entry_id, cx);
                 cx.notify();
             });
         })
@@ -795,7 +804,7 @@ impl ThreadView {
 
     pub fn toggle_run(&mut self, run_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(&format!("turn-fold:{run_id}"));
-        let visible = self.visible_rows();
+        let visible = self.visible_rows(cx);
         if self.ui.expanded_runs.contains(run_id) && self.ui.work_fold_for_run(run_id).error {
             self.load_work_for_run(run_id, cx);
             self.sync_work_folds(cx);
@@ -812,7 +821,7 @@ impl ThreadView {
 
     pub fn toggle_attempt(&mut self, attempt_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(&format!("attempt-fold:{attempt_id}"));
-        let visible = self.visible_rows();
+        let visible = self.visible_rows(cx);
         if self.ui.expanded_attempts.contains(attempt_id) && self.ui.work_fold_for_attempt(attempt_id).error {
             self.load_work_for_attempt(attempt_id, cx);
             self.sync_work_folds(cx);
@@ -829,7 +838,7 @@ impl ThreadView {
 
     pub fn toggle_group(&mut self, group_id: &str, row_id: &str, cx: &mut Context<Self>) {
         self.begin_disclosure(row_id);
-        let visible = self.visible_rows();
+        let visible = self.visible_rows(cx);
         let expanded = toggle(&mut self.ui.expanded_groups, group_id);
         if expanded {
             self.load_work_for_group(group_id, cx);
@@ -857,7 +866,7 @@ impl ThreadView {
             }
         }
         self.sync_command_outputs(cx);
-        self.remeasure_entry(key);
+        self.remeasure_entry(key, cx);
         cx.notify();
     }
 
@@ -899,7 +908,7 @@ impl ThreadView {
                     let updated = this.update(cx, |view, cx| {
                         let Some(slot) = view.command_outputs.get_mut(&key) else { return };
                         if slot.update(next) {
-                            view.remeasure_entry(&key);
+                            view.remeasure_entry(&key, cx);
                         }
                         cx.notify();
                     });
@@ -913,9 +922,10 @@ impl ThreadView {
     }
 
     /// Remeasures the row that draws `key`, and only the open group list holding it.
-    fn remeasure_entry(&mut self, key: &str) {
-        let follow = self.follow_disclosure_change();
-        let visible = self.disclosure.anchor().and_then(|_| self.visible_rows());
+    fn remeasure_entry(&mut self, key: &str, cx: &gpui::App) {
+        let paused = self.is_follow_paused(cx);
+        let follow = !paused && self.follow_disclosure_change();
+        let visible = if paused || self.disclosure.anchor().is_some() { self.visible_rows(cx) } else { None };
         let offset = self.header_count();
         let lists = self.group_lists.borrow();
         for (index, row) in self.rows.iter().enumerate() {
@@ -969,7 +979,9 @@ impl ThreadView {
             .collect();
         self.turn_diffs = next;
         if !changed.is_empty() {
+            let visible = self.is_follow_paused(cx).then(|| self.visible_rows(cx)).flatten();
             self.remeasure_where(|row| matches!(&row.kind, RowKind::Message { message, .. } if changed.contains(&message.id)));
+            self.keep_place(visible);
             cx.notify();
         }
     }
@@ -1201,7 +1213,7 @@ impl Render for ThreadView {
             // Match the web's two-frame disclosure settle; newer layouts invalidate this ticket.
             cx.on_next_frame(window, move |_, window, cx| {
                 cx.on_next_frame(window, move |view, _, cx| {
-                    if settle_disclosure(&view.list, &mut view.disclosure, generation) { cx.notify(); }
+                    if !view.is_follow_paused(cx) && settle_disclosure(&view.list, &mut view.disclosure, generation) { cx.notify(); }
                 });
             });
         }
@@ -1386,6 +1398,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[gpui::test]
+    fn paused_follow_pins_tail_while_media_viewer_is_open(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        struct TestList { list: ListState, rows: Vec<(String, f32)>, anchor_row: usize, top: Rc<std::cell::Cell<gpui::Pixels>> }
+        impl Render for TestList {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rows = self.rows.clone();
+                let anchor_row = self.anchor_row;
+                let top_cell = self.top.clone();
+                list(self.list.clone(), move |ix, _, _| {
+                    let top_cell = top_cell.clone();
+                    div().h(px(rows[ix].1)).relative().when(ix == anchor_row, |row| {
+                        row.child(canvas(move |bounds, _, _| top_cell.set(bounds.top()), |_, _, _, _| {}).absolute().size_full())
+                    }).into_any_element()
+                }).size_full()
+            }
+        }
+        let rows: Vec<(String, f32)> = (0..5).map(|i| (format!("r{i}"), 40.)).collect();
+        let list = ListState::new(rows.len(), ListAlignment::Bottom, px(600.));
+        let top_cell = Rc::new(std::cell::Cell::new(px(0.)));
+        let view = cx.update(|_, cx| cx.new(|_| TestList { list: list.clone(), rows, anchor_row: 3, top: top_cell.clone() }));
+        let viewer = cx.update(|_, cx| cx.new(crate::media::MediaViewer::new));
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(200.), px(120.)), |_, _| view.clone().into_any_element());
+        };
+        draw(cx);
+        // Before opening the viewer, appends at tail naturally follow to the new end.
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.rows.push(("r5".into(), 40.)); cx.notify(); }));
+        list.splice(5..5, 1);
+        draw(cx);
+        assert_eq!(list.logical_scroll_top().item_ix, 6);
+        // Opening MediaViewer pauses live follow and captures/restores the tail viewport instead.
+        cx.update(|window, cx| {
+            assert!(!crate::transcript::html_render::is_fullscreen_open(cx));
+            viewer.update(cx, |v, cx| {
+                v.open(vec![crate::media::ViewerItem { source: t3_core::media::MediaSource::Direct("data:image/png;base64,iVBORw0KGgo=".into()), name: "img".into() }], 0, window, cx);
+            });
+            assert!(viewer.read(cx).is_open());
+        });
+        let before_pause_y = top_cell.get();
+        let captured = cx.update(|_, cx| {
+            let paused = crate::transcript::html_render::is_fullscreen_open(cx) || viewer.read(cx).is_open();
+            assert!(paused);
+            let st = list.logical_scroll_top();
+            let st = ScrollTop { item: st.item_ix, offset: f32::from(st.offset_in_item) };
+            let viewport = f32::from(list.viewport_bounds().size.height);
+            view.read(cx).rows.split_last().and(Some(())).and_then(|_| {
+                anchor::capture_pinned(&view.read(cx).rows, |(id, _)| id.as_str(), 0, st, viewport, |ix| f32::from(list.offset_for_item(ix)), None)
+            })
+        }).expect("pinned tail captures visible rows");
+        let mut follow = anchor::DisclosureFollow::default();
+        follow.toggle("r3", true);
+        let generation = follow.generation().unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.rows.push(("r6".into(), 40.)); cx.notify(); }));
+        list.splice(6..6, 1);
+        let paused = cx.update(|_, cx| crate::transcript::html_render::is_fullscreen_open(cx) || viewer.read(cx).is_open());
+        assert!(!(!paused && settle_disclosure(&list, &mut follow, generation)), "disclosure settle must defer while paused");
+        assert_eq!(follow.generation(), Some(generation));
+        let st = list.logical_scroll_top();
+        let current = ScrollTop { item: st.item_ix, offset: f32::from(st.offset_in_item) };
+        if let Some(anchor::Anchor::At(target)) = cx.update(|_, cx| anchor::restore(&captured, &view.read(cx).rows, |(id, _)| id.as_str(), 0, current)) {
+            list.scroll_to(ListOffset { item_ix: target.item, offset_in_item: px(target.offset) });
+        }
+        draw(cx);
+        assert_eq!(top_cell.get(), before_pause_y, "visible rows stay pinned while MediaViewer is open");
+        assert!(list.logical_scroll_top().item_ix < 7, "new tail row stays below the fold while paused");
+        // Closing MediaViewer clears the pause so tail appends follow again once back at end.
+        cx.update(|window, cx| {
+            viewer.update(cx, |v, cx| v.close(window, cx));
+            assert!(!viewer.read(cx).is_open());
+        });
+        list.scroll_to_end();
+        draw(cx);
+        assert!(settle_disclosure(&list, &mut follow, generation));
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.rows.push(("r7".into(), 40.)); cx.notify(); }));
+        list.splice(7..7, 1);
+        draw(cx);
+        assert_eq!(list.logical_scroll_top().item_ix, 8, "live follow resumes after MediaViewer closes");
     }
 
     #[gpui::test]

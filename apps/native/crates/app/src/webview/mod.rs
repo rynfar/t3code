@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use futures::channel::mpsc::UnboundedSender;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui::{
     App, Bounds, DispatchPhase, Element, ElementId, Global, GlobalElementId, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, Pixels, Style,
     Window, WindowId, point, px, relative, size,
@@ -107,7 +107,7 @@ impl NativeView {
     fn new(_: &mut Window, _: &Page, _: UnboundedSender<WebEvent>) -> Option<Self> {
         None
     }
-    fn place(&self, _: Bounds<Pixels>, _: Bounds<Pixels>) {}
+    fn place(&self, _: Bounds<Pixels>, _: Bounds<Pixels>, _: &[Bounds<Pixels>]) {}
     fn hide(&self) {}
     fn set_dark(&self, _: bool) {}
     fn set_zoom(&self, _: f64) {}
@@ -115,6 +115,16 @@ impl NativeView {
     fn release_focus(&self) {}
     fn take_activation(&self) -> bool { false }
     fn is_focused(&self) -> bool { false }
+    fn watch_hover(&self) -> UnboundedReceiver<bool> {
+        futures::channel::mpsc::unbounded().1
+    }
+}
+
+#[derive(PartialEq)]
+struct AppliedPlacement {
+    bounds: Bounds<Pixels>,
+    visible: Bounds<Pixels>,
+    cutouts: Vec<Bounds<Pixels>>,
 }
 
 pub struct WebView {
@@ -122,8 +132,8 @@ pub struct WebView {
     layer: Layer,
     occluders: Rc<Occluders>,
     leases: Cell<usize>,
-    /// The frame and visible part last applied; `None` while hidden.
-    applied: Cell<Option<(Bounds<Pixels>, Bounds<Pixels>)>>,
+    /// The frame, visible part, and cutouts last applied; `None` while hidden.
+    applied: RefCell<Option<AppliedPlacement>>,
     dark: Cell<bool>,
 }
 
@@ -159,7 +169,14 @@ impl WebView {
             return None;
         }
         let native = NativeView::new(window, &page, events)?;
-        Some(Rc::new(WebView { native, layer, occluders: occluders(window, cx), leases: Cell::new(0), applied: Cell::new(None), dark: Cell::new(page.dark) }))
+        Some(Rc::new(WebView {
+            native,
+            layer,
+            occluders: occluders(window, cx),
+            leases: Cell::new(0),
+            applied: RefCell::new(None),
+            dark: Cell::new(page.dark),
+        }))
     }
 
     pub fn set_zoom(&self, zoom: f64) {
@@ -168,6 +185,14 @@ impl WebView {
 
     pub fn evaluate(&self, script: &str) {
         self.native.evaluate(script);
+    }
+
+    pub fn release_focus(&self) {
+        self.native.release_focus();
+    }
+
+    pub fn watch_hover(&self) -> UnboundedReceiver<bool> {
+        self.native.watch_hover()
     }
 
     pub fn take_activation(&self) -> bool { self.native.take_activation() }
@@ -181,22 +206,24 @@ impl WebView {
     }
 
     fn hide(&self) {
-        if self.applied.take().is_some() {
+        if self.applied.borrow_mut().take().is_some() {
             self.native.release_focus();
             self.native.hide();
         }
     }
 
     /// Places the view for the frame being presented: `bounds` clipped to `clip`, minus what
-    /// higher layers cover.
+    /// higher layers cover, with higher-layer cutouts masked out.
     fn present(&self, bounds: Bounds<Pixels>, clip: Bounds<Pixels>) {
         let visible = self.occluders.visible(bounds.intersect(&clip), self.layer);
         if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
             return self.hide();
         }
-        if self.applied.get() != Some((bounds, visible)) {
-            self.applied.set(Some((bounds, visible)));
-            self.native.place(bounds, visible);
+        let cutouts = self.occluders.cutouts(visible, self.layer);
+        let next = AppliedPlacement { bounds, visible, cutouts };
+        if self.applied.borrow().as_ref() != Some(&next) {
+            self.native.place(next.bounds, next.visible, &next.cutouts);
+            *self.applied.borrow_mut() = Some(next);
         }
     }
 }
@@ -304,22 +331,46 @@ struct Occluder {
 }
 
 #[derive(Default)]
-struct Occluders(RefCell<Vec<Weak<Occluder>>>);
+struct Occluders {
+    strips: RefCell<Vec<Weak<Occluder>>>,
+    cutouts: RefCell<Vec<Weak<Occluder>>>,
+}
 
 impl Occluders {
-    fn add(&self, occluder: &Rc<Occluder>) {
-        let mut list = self.0.borrow_mut();
+    fn push(list: &RefCell<Vec<Weak<Occluder>>>, occluder: &Rc<Occluder>) {
+        let mut list = list.borrow_mut();
         list.retain(|weak| weak.strong_count() > 0);
         list.push(Rc::downgrade(occluder));
+    }
+
+    fn add(&self, occluder: &Rc<Occluder>) {
+        Self::push(&self.strips, occluder);
+    }
+
+    fn add_cutout(&self, occluder: &Rc<Occluder>) {
+        Self::push(&self.cutouts, occluder);
     }
 
     /// What is left of `visible` once the occluders above `layer` are cut away, each by the edge
     /// that keeps the most.
     fn visible(&self, mut visible: Bounds<Pixels>, layer: Layer) -> Bounds<Pixels> {
-        for occluder in self.0.borrow().iter().filter_map(Weak::upgrade).filter(|occluder| occluder.layer > layer) {
+        for occluder in self.strips.borrow().iter().filter_map(Weak::upgrade).filter(|occluder| occluder.layer > layer) {
             visible = cut(visible, occluder.bounds.get());
         }
         visible
+    }
+
+    fn cutouts(&self, visible: Bounds<Pixels>, layer: Layer) -> Vec<Bounds<Pixels>> {
+        self.cutouts
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|occluder| occluder.layer > layer)
+            .filter_map(|occluder| {
+                let hit = visible.intersect(&occluder.bounds.get());
+                (hit.size.width > px(0.) && hit.size.height > px(0.)).then_some(hit)
+            })
+            .collect()
     }
 }
 
@@ -356,12 +407,18 @@ fn occluders(window: &Window, cx: &mut App) -> Rc<Occluders> {
 /// Base-plane content drawn over web views of lower layers: fills its parent, which must be
 /// positioned, and keeps those views out of its bounds while it is drawn.
 pub fn occluder(id: impl Into<ElementId>, layer: Layer) -> OccluderElement {
-    OccluderElement { id: id.into(), layer }
+    OccluderElement { id: id.into(), layer, cutout: false }
+}
+
+/// Like [`occluder`], but punches a hole in lower-layer web views without strip-clipping the rest.
+pub fn cutout(id: impl Into<ElementId>, layer: Layer) -> OccluderElement {
+    OccluderElement { id: id.into(), layer, cutout: true }
 }
 
 pub struct OccluderElement {
     id: ElementId,
     layer: Layer,
+    cutout: bool,
 }
 
 impl IntoElement for OccluderElement {
@@ -396,10 +453,15 @@ impl Element for OccluderElement {
         let Some(id) = id else { return };
         let registry = occluders(window, cx);
         let layer = self.layer;
+        let is_cutout = self.cutout;
         window.with_element_state::<Rc<Occluder>, _>(id, |occluder, _| {
             let occluder = occluder.filter(|occluder| occluder.layer == layer).unwrap_or_else(|| {
                 let occluder = Rc::new(Occluder { layer, bounds: Cell::new(bounds) });
-                registry.add(&occluder);
+                if is_cutout {
+                    registry.add_cutout(&occluder);
+                } else {
+                    registry.add(&occluder);
+                }
                 occluder
             });
             occluder.bounds.set(bounds);
@@ -408,6 +470,102 @@ impl Element for OccluderElement {
     }
 
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window, _: &mut App) {}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ScrollArea {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub can_up: bool,
+    pub can_down: bool,
+}
+
+impl ScrollArea {
+    pub(super) fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+}
+
+pub(super) fn parse_scroll_areas(raw: &str) -> Option<Vec<ScrollArea>> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if value.get("jsonrpc")?.as_str()? != "2.0" || value.get("method")?.as_str()? != "t3/notifications/scroll-areas" {
+        return None;
+    }
+    let items = value.get("params")?.get("areas")?.as_array()?;
+    let mut areas = Vec::with_capacity(items.len().min(64));
+    for item in items.iter().take(64) {
+        let Some(left) = item.get("left").and_then(serde_json::Value::as_f64).filter(|n| n.is_finite()) else { continue };
+        let Some(top) = item.get("top").and_then(serde_json::Value::as_f64).filter(|n| n.is_finite()) else { continue };
+        let Some(right) = item.get("right").and_then(serde_json::Value::as_f64).filter(|n| n.is_finite()) else { continue };
+        let Some(bottom) = item.get("bottom").and_then(serde_json::Value::as_f64).filter(|n| n.is_finite()) else { continue };
+        if right <= left || bottom <= top {
+            continue;
+        }
+        areas.push(ScrollArea {
+            left,
+            top,
+            right,
+            bottom,
+            can_up: item.get("canUp") == Some(&serde_json::Value::Bool(true)),
+            can_down: item.get("canDown") == Some(&serde_json::Value::Bool(true)),
+        });
+    }
+    Some(areas)
+}
+
+pub(super) fn page_consumes_vertical_scroll(areas: &[ScrollArea], x: f64, y: f64, delta_y: f64) -> bool {
+    if delta_y == 0. {
+        return false;
+    }
+    areas.iter().any(|area| {
+        area.contains(x, y) && ((delta_y > 0. && area.can_up) || (delta_y < 0. && area.can_down))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct RectF {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+pub(super) fn subtract_cutouts(width: f64, height: f64, cutouts: &[RectF]) -> Vec<RectF> {
+    if width <= 0. || height <= 0. {
+        return Vec::new();
+    }
+    let mut pieces = vec![RectF { x: 0., y: 0., w: width, h: height }];
+    for cut in cutouts {
+        if cut.w <= 0. || cut.h <= 0. {
+            continue;
+        }
+        let (cx0, cy0, cx1, cy1) = (cut.x, cut.y, cut.x + cut.w, cut.y + cut.h);
+        let mut next = Vec::with_capacity(pieces.len());
+        for p in pieces {
+            let (px1, py1) = (p.x + p.w, p.y + p.h);
+            if px1 <= cx0 || p.x >= cx1 || py1 <= cy0 || p.y >= cy1 {
+                next.push(p);
+                continue;
+            }
+            let (ix0, iy0, ix1, iy1) = (p.x.max(cx0), p.y.max(cy0), px1.min(cx1), py1.min(cy1));
+            if iy0 > p.y {
+                next.push(RectF { x: p.x, y: p.y, w: p.w, h: iy0 - p.y });
+            }
+            if py1 > iy1 {
+                next.push(RectF { x: p.x, y: iy1, w: p.w, h: py1 - iy1 });
+            }
+            if ix0 > p.x {
+                next.push(RectF { x: p.x, y: iy0, w: ix0 - p.x, h: iy1 - iy0 });
+            }
+            if px1 > ix1 {
+                next.push(RectF { x: ix1, y: iy0, w: px1 - ix1, h: iy1 - iy0 });
+            }
+        }
+        pieces = next;
+    }
+    pieces
 }
 
 #[cfg(test)]
@@ -468,5 +626,25 @@ mod tests {
         assert_eq!(f32::from(covered.size.width) * f32::from(covered.size.height), 0.);
         // Apart: untouched.
         assert_eq!(cut(frame, rect(800., 0., 10., 10.)), frame);
+    }
+
+    #[test]
+    fn cutout_subtraction_splits_around_corner_button_without_overlap() {
+        let pieces = super::subtract_cutouts(700., 400., &[super::RectF { x: 668., y: 368., w: 24., h: 24. }]);
+        let total: f64 = pieces.iter().map(|p| p.w * p.h).sum();
+        assert!((total - (700. * 400. - 24. * 24.)).abs() < 1e-6);
+        assert_eq!(pieces.len(), 4);
+    }
+
+    #[test]
+    fn scroll_areas_consume_vertical_wheel_only_when_scrollable_in_direction() {
+        let areas = super::parse_scroll_areas(
+            r#"{"jsonrpc":"2.0","method":"t3/notifications/scroll-areas","params":{"areas":[{"left":10,"top":20,"right":210,"bottom":120,"canUp":false,"canDown":true}]}}"#,
+        )
+        .unwrap();
+        assert!(!super::page_consumes_vertical_scroll(&areas, 5., 50., -5.));
+        assert!(super::page_consumes_vertical_scroll(&areas, 50., 50., -5.));
+        assert!(!super::page_consumes_vertical_scroll(&areas, 50., 50., 5.));
+        assert!(super::parse_scroll_areas(r#"{"jsonrpc":"2.0","method":"other","params":{}}"#).is_none());
     }
 }

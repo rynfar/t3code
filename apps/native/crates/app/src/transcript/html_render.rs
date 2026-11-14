@@ -91,6 +91,19 @@ fn on_page_event(state: &Entity<AppState>, owner: &PageOwner, view: &WebView, ev
             previews.update(cx, |p, cx| p.open_link(owner.thread, url, cx));
         },
         Action::ChangeRequest { target, .. } => crate::pull_requests::open_resolved_link(state, target, cx),
+        Action::OpenImage { src, name } => {
+            view.release_focus();
+            if let Some(thread_view) = owner.view.upgrade() {
+                thread_view.update(cx, |thread_view, cx| {
+                    thread_view.open_media(
+                        vec![crate::media::ViewerItem { source: MediaSource::Direct(src), name: SharedString::from(name) }],
+                        0,
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
         Action::Shortcut(command) => window.dispatch_action(crate::keymap::action_for(&command), cx),
     }
     true
@@ -100,6 +113,8 @@ fn on_page_message(state: &Entity<AppState>, owner: &PageOwner, view: &WebView, 
     let (event, id) = if let Some(link) = html_render::host::read_link(message) {
         let id = link.id.clone();
         (Event::Link(link), Some(id))
+    } else if let Some(image) = html_render::host::read_image(message) {
+        (Event::Image(image), None)
     } else if let Some(key) = html_render::host::read_key(message) {
         (Event::Key(key), None)
     } else { return };
@@ -133,6 +148,7 @@ struct InlineView {
     key: PageKey,
     owner: EntityId,
     view: Weak<WebView>,
+    hovered: bool,
     revision: usize,
     keymap_revision: usize,
     _events: Task<()>,
@@ -145,15 +161,39 @@ pub struct HtmlFrames {
     views: Vec<InlineView>,
     fullscreen: Option<Entity<HtmlFullscreen>>,
     clock: u64,
+    _state_subscription: gpui::Subscription,
 }
 
 struct Frames(Entity<HtmlFrames>);
 
 impl Global for Frames {}
 
+fn owner_matches(state: &AppState, owner: &PageOwner, cx: &App) -> bool {
+    state.environment() == Some(owner.origin.environment.as_str())
+        && owner.view.upgrade().and_then(|view| view.read(cx).html_page_origin(cx)).as_ref() == Some(&owner.origin)
+}
+
 pub fn init(state: &Entity<AppState>, cx: &mut App) {
     if !cx.has_global::<Frames>() {
-        let frames = cx.new(|_| HtmlFrames { state: state.clone(), pages: HashMap::new(), views: Vec::new(), fullscreen: None, clock: 0 });
+        let frames = cx.new(|cx| {
+            let sub = cx.observe(state, |frames: &mut HtmlFrames, _, cx| {
+                if let Some(fullscreen) = &frames.fullscreen {
+                    let owner = fullscreen.read(cx).owner.clone();
+                    if !owner_matches(frames.state.read(cx), &owner, cx) {
+                        frames.fullscreen = None;
+                        cx.refresh_windows();
+                    }
+                }
+            });
+            HtmlFrames {
+                state: state.clone(),
+                pages: HashMap::new(),
+                views: Vec::new(),
+                fullscreen: None,
+                clock: 0,
+                _state_subscription: sub,
+            }
+        });
         cx.set_global(Frames(frames));
     }
 }
@@ -262,6 +302,25 @@ impl HtmlFrames {
         }
     }
 
+    fn inline_hovered(&self, key: &PageKey, owner: EntityId, origin: &PageOrigin) -> Option<bool> {
+        self.views
+            .iter()
+            .find(|inline| &inline.key == key && inline.owner == owner && &inline.origin == origin && inline.view.strong_count() > 0)
+            .map(|inline| inline.hovered)
+    }
+
+    fn set_hovered(&mut self, key: &PageKey, owner: EntityId, origin: &PageOrigin, hovered: bool, cx: &mut Context<Self>) {
+        if let Some(inline) = self
+            .views
+            .iter_mut()
+            .find(|inline| &inline.key == key && inline.owner == owner && &inline.origin == origin)
+            && inline.hovered != hovered
+        {
+            inline.hovered = hovered;
+            self.notify_owners(key, cx);
+        }
+    }
+
     fn on_event(
         &mut self,
         key: &PageKey,
@@ -334,7 +393,7 @@ impl HtmlFrames {
         if self.views.len() >= MAX_INLINE_VIEWS {
             return Slot::Card;
         }
-        let (events, mut received) = mpsc::unbounded();
+        let (events, received) = mpsc::unbounded();
         let page = Page {
             html,
             dark,
@@ -349,16 +408,24 @@ impl HtmlFrames {
         let event_key = key.clone();
         let event_owner = page_owner;
         let event_view = Rc::downgrade(&view);
+        let pump_origin = origin.clone();
         let handle = window.window_handle();
+        let hover_rx = view.watch_hover();
+        enum PumpItem {
+            Web(WebEvent),
+            Hover(bool),
+        }
+        let mut pump_stream = futures::stream::select(received.map(PumpItem::Web), hover_rx.map(PumpItem::Hover));
         let pump = cx.spawn(async move |this, cx| {
-            while let Some(event) = received.next().await {
+            while let Some(item) = pump_stream.next().await {
                 let Some(view) = event_view.upgrade() else {
                     return;
                 };
                 if cx
                     .update_window(handle, |_, window, cx| {
-                        this.update(cx, |frames, cx| {
-                            frames.on_event(&event_key, &event_owner, &view, event, window, cx)
+                        this.update(cx, |frames, cx| match item {
+                            PumpItem::Web(event) => frames.on_event(&event_key, &event_owner, &view, event, window, cx),
+                            PumpItem::Hover(hovered) => frames.set_hovered(&event_key, owner, &pump_origin, hovered, cx),
                         })
                     })
                     .is_err()
@@ -372,6 +439,7 @@ impl HtmlFrames {
             key: key.clone(),
             owner,
             view: Rc::downgrade(&view),
+            hovered: false,
             revision,
             keymap_revision,
             _events: pump,
@@ -428,13 +496,35 @@ pub fn frame_row(row_id: &str, entry: &HtmlRenderEntry, thread: Option<&str>, cx
             .into_any_element(),
         None => div().into_any_element(),
     };
-    let expand = frame.html.clone().map(|html| {
+    let hovered = store.read(cx).inline_hovered(&key, owner, &page_owner.origin);
+    let expand = frame.html.clone().filter(|_| hovered != Some(false)).map(|html| {
         let (store, title) = (store.clone(), SharedString::from(reference.title.clone()));
         let page_owner = page_owner.clone();
         let open = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| open_fullscreen(&store, page_owner.clone(), title.clone(), html.clone(), window, cx);
-        div().flex().justify_end().pt(px(4.)).child(tooltip_icon_button(SharedString::from(format!("html-render-expand-{row_id}")), Icon::Maximize2, "Open full screen", false, open, cx))
+        let button = tooltip_icon_button(SharedString::from(format!("html-render-expand-{row_id}")), Icon::Maximize2, "Open full screen", false, open, cx);
+        div()
+            .id(SharedString::from(format!("html-render-expand-wrap-{row_id}")))
+            .absolute()
+            .top(px(8.))
+            .right(px(8.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(hsla(p.border))
+            .bg(hsla(p.background).opacity(0.85))
+            .when(hovered == Some(true), |this| {
+                this.child(webview::cutout(SharedString::from(format!("html-render-cutout-{row_id}")), Layer::TranscriptChrome))
+            })
+            .when(hovered.is_none(), |this| {
+                this.opacity(0.).group_hover("html-render", |style| style.opacity(1.))
+            })
+            .child(button)
     });
-    div().w_full().min_w_0().child(div().w_full().h(px(height as f32)).relative().child(body)).children(expand).into_any_element()
+    div()
+        .w_full()
+        .min_w_0()
+        .group("html-render")
+        .child(div().w_full().h(px(height as f32)).relative().child(body).children(expand))
+        .into_any_element()
 }
 
 /// The page's view, made once the row is on screen (a row only measured never gets one), or the
@@ -551,9 +641,33 @@ fn open_fullscreen(
     window.refresh();
 }
 
+/// Whether a valid full-screen HTML frame is currently open (`MessagesTimeline.tsx:1329`).
+pub fn is_fullscreen_open(cx: &App) -> bool {
+    let Some(store) = frames(cx) else { return false };
+    let frames = store.read(cx);
+    let Some(view) = &frames.fullscreen else { return false };
+    owner_matches(frames.state.read(cx), &view.read(cx).owner, cx)
+}
+
 /// The open full-screen page, drawn over the window by the workspace.
 pub fn fullscreen(_: &mut Window, cx: &mut App) -> Option<AnyElement> {
-    let view = frames(cx)?.read(cx).fullscreen.clone()?;
+    let store = frames(cx)?;
+    let frames = store.read(cx);
+    let view = frames.fullscreen.clone()?;
+    if !owner_matches(frames.state.read(cx), &view.read(cx).owner, cx) {
+        let store = store.clone();
+        cx.defer(move |cx| {
+            store.update(cx, |frames, cx| {
+                if let Some(current) = &frames.fullscreen
+                    && !owner_matches(frames.state.read(cx), &current.read(cx).owner, cx)
+                {
+                    frames.fullscreen = None;
+                    cx.refresh_windows();
+                }
+            });
+        });
+        return None;
+    }
     Some(view.into_any_element())
 }
 
@@ -875,5 +989,17 @@ pub mod fixture {
             item,
         });
         Cow::Owned(items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn fullscreen_flag_defaults_false_without_open_frame(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+        });
     }
 }

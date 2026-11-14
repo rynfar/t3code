@@ -100,6 +100,34 @@ pub fn web_url(url: &str) -> bool {
         && url::Url::parse(url).ok().is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRequest {
+    pub src: String,
+    pub name: String,
+}
+
+pub fn image_src(src: &str) -> bool {
+    web_url(src)
+        || (src.len() <= 16 * 1024 * 1024
+            && src.get(..11).is_some_and(|s| s.eq_ignore_ascii_case("data:image/"))
+            && !src.contains('\0')
+            && crate::media::decode_data_url(src).is_some_and(|bytes| !bytes.is_empty()))
+}
+
+pub fn read_image(value: &Value) -> Option<ImageRequest> {
+    let p = params(value, "t3/notifications/open-image")?;
+    let src = p.get("src")?.as_str()?;
+    if !image_src(src) {
+        return None;
+    }
+    let trimmed = p.get("name").and_then(Value::as_str).map(super::js_trim).unwrap_or("");
+    let label = super::utf16_prefix(trimmed, super::MAX_TITLE_LENGTH);
+    Some(ImageRequest {
+        src: src.into(),
+        name: if label.is_empty() { "Image".into() } else { label.into() },
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyDown {
     pub key: String,

@@ -49,6 +49,8 @@ impl MediaViewer {
         MediaViewer { items: Vec::new(), index: 0, zoom: 1., pan: Point::default(), drag: None, dragged: false, focus: cx.focus_handle(), restore_focus: None }
     }
 
+    pub fn is_open(&self) -> bool { !self.items.is_empty() }
+
     pub fn open(&mut self, items: Vec<ViewerItem>, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if items.is_empty() {
             return;
@@ -62,7 +64,7 @@ impl MediaViewer {
         cx.notify();
     }
 
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.items.clear();
         self.drag = None;
         if let Some(cache) = cx.try_global::<super::Media>().map(|media| media.cache.clone()) {
