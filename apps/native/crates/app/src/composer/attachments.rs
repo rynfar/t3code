@@ -81,6 +81,46 @@ impl Composer {
         self.attachments.staged.get(target).map(Vec::as_slice).unwrap_or_default()
     }
 
+    pub(super) fn has_pending_attachments(&self, target: &Target) -> bool {
+        self.attachments.preparations.count(&super::drafts::key(target)) > 0
+            || self.staged_for(target).iter().any(|entry| matches!(entry.attachment.upload, Upload::Uploading))
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn begin_test_preparation(&mut self, key: &str) {
+        self.attachments.preparations.begin(key);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn seed_test_attachments(&mut self, thread_id: &str, count: usize) {
+        let target = Target::Thread(thread_id.to_owned());
+        let attachments = (0..count)
+            .map(|i| Attachment {
+                id: format!("att-{i}"),
+                kind: AttachmentKind::File,
+                name: format!("file-{i}.txt"),
+                mime_type: "text/plain".into(),
+                size_bytes: 1,
+                pasted_text: false,
+                upload: Upload::Ready { attachment_id: format!("uploaded-{i}") },
+            })
+            .collect();
+        self.seed_attachments(&target, attachments);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn test_staged_thread_attachments(&self, thread_id: &str) -> Vec<crate::app_state::RestoredAttachment> {
+        self.staged_for(&Target::Thread(thread_id.to_owned()))
+            .iter()
+            .map(|entry| crate::app_state::RestoredAttachment {
+                kind: entry.attachment.kind,
+                name: entry.attachment.name.clone(),
+                mime_type: entry.attachment.mime_type.clone(),
+                bytes: entry.bytes.as_deref().cloned().unwrap_or_default(),
+            })
+            .collect()
+    }
+
     /// Attachments a saved draft restores: uploaded, without their bytes or preview.
     pub(super) fn seed_attachments(&mut self, target: &Target, restored: Vec<Attachment>) {
         if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
@@ -229,6 +269,31 @@ impl Composer {
             Classified::File { mime_type } => (AttachmentKind::File, mime_type),
             Classified::UnsupportedImage => return,
         };
+        self.push_staged_entry(target, kind, name, mime_type, bytes, pasted_text, cx);
+    }
+
+    pub(super) fn restore_reverted_attachments(&mut self, thread_id: &str, attachments: Vec<crate::app_state::RestoredAttachment>, cx: &mut Context<Self>) {
+        if attachments.is_empty() { return; }
+        let target = Target::Thread(thread_id.to_owned());
+        if self.attachment_target().as_ref() == Some(&target) { self.cancel_pending_send(); }
+        for restored in attachments {
+            if self.reserved_attachment_count(&target) >= rules::MAX_ATTACHMENTS { break; }
+            self.push_staged_entry(&target, restored.kind, restored.name, restored.mime_type, restored.bytes, false, cx);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_staged_entry(
+        &mut self,
+        target: &Target,
+        kind: AttachmentKind,
+        name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+        pasted_text: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let size = bytes.len() as u64;
         let preview = (kind == AttachmentKind::Image)
             .then(|| image_format(&mime_type))
             .flatten()

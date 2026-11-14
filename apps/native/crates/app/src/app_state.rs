@@ -73,6 +73,21 @@ pub enum AppEvent {
     SshPrompt,
 }
 
+/// Attachment payload handed back to the composer when rewinding a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredAttachment {
+    pub kind: t3_core::composer::attachments::AttachmentKind,
+    pub name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+struct ComposerRestore {
+    thread_id: String,
+    prompt: String,
+    attachments: Vec<RestoredAttachment>,
+}
+
 pub struct AppState {
     pub(crate) github_star: crate::github_star_prompt::GitHubStarPrompt,
     pub(crate) announcements: crate::announcements::Announcements,
@@ -119,8 +134,8 @@ pub struct AppState {
     pub(crate) side_threads: crate::side_chat::SideThreads,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
-    /// A prompt handed back to the composer for a thread, as "Edit from here" restores one.
-    composer_restore: Option<(String, String)>,
+    /// A prompt and attachments handed back to the composer for a thread, as "Edit from here" restores one.
+    composer_restore: Option<ComposerRestore>,
     /// A terminal selection added to a thread's chat, as the drawer hands it over.
     composer_terminal_context: Option<(String, t3_core::composer::context::TerminalSelection)>,
     pub review_comments: std::collections::HashMap<String, Vec<t3_core::composer::review::ReviewComment>>,
@@ -813,14 +828,18 @@ impl AppState {
         }
     }
 
-    /// Hands `prompt` to the composer of `thread_id`, which joins it to its draft and focuses.
-    pub fn restore_composer_prompt(&mut self, thread_id: &str, prompt: String, cx: &mut Context<Self>) {
-        self.composer_restore = Some((thread_id.to_owned(), prompt));
+    /// Hands `prompt` and `attachments` to the composer of `thread_id`, which joins them to its draft and focuses.
+    pub fn restore_composer_prompt(&mut self, thread_id: &str, prompt: String, attachments: Vec<RestoredAttachment>, cx: &mut Context<Self>) {
+        self.composer_restore = Some(ComposerRestore { thread_id: thread_id.to_owned(), prompt, attachments });
         cx.emit(AppEvent::ComposerRestore);
     }
 
-    pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<String> {
-        if self.composer_restore.as_ref().is_some_and(|(thread, _)| thread == thread_id) { self.composer_restore.take().map(|(_, prompt)| prompt) } else { None }
+    pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<(String, Vec<RestoredAttachment>)> {
+        if self.composer_restore.as_ref().is_some_and(|restore| restore.thread_id == thread_id) {
+            self.composer_restore.take().map(|restore| (restore.prompt, restore.attachments))
+        } else {
+            None
+        }
     }
 
     pub fn set_review_comments(&mut self, thread: &str, comments: Vec<t3_core::composer::review::ReviewComment>, cx: &mut Context<Self>) {

@@ -255,6 +255,31 @@ pub(crate) fn insert_artifact_template(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RewindComposerPrecheck {
+    pub send_busy: bool,
+    pub pending_attachments: bool,
+    pub staged_count: usize,
+}
+
+pub(crate) fn rewind_precheck(thread_id: &str, cx: &App) -> RewindComposerPrecheck {
+    let target = Target::Thread(thread_id.to_owned());
+    let Some(reg) = cx.try_global::<RegisteredComposers>() else {
+        return RewindComposerPrecheck::default();
+    };
+    let mut out = RewindComposerPrecheck::default();
+    for weak in &reg.0 {
+        let Some(entity) = weak.upgrade() else { continue };
+        let composer = entity.read(cx);
+        if composer.thread_id().as_deref() == Some(thread_id) {
+            out.send_busy |= composer.sending || composer.pending_send.is_pending();
+            out.pending_attachments |= composer.has_pending_attachments(&target);
+            out.staged_count = out.staged_count.max(composer.staged_for(&target).len());
+        }
+    }
+    out
+}
+
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_for(state, None, window, cx)
@@ -765,12 +790,15 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
     }
 
-    /// "Edit from here": the restored prompt joins the draft (`rewindToMessage`), cursor at the end.
+    /// "Edit from here": the restored prompt and attachments join the draft (`rewindToMessage`), cursor at the end.
     fn restore_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.thread_id() else { return };
-        let Some(restored) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else { return };
-        let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
-        self.set_prompt(&prompt, window, cx);
+        let Some((restored, attachments)) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else { return };
+        if !restored.is_empty() {
+            let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
+            self.set_prompt(&prompt, window, cx);
+        }
+        self.restore_reverted_attachments(&thread_id, attachments, cx);
         self.focus(window, cx);
         cx.notify();
     }
