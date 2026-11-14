@@ -22,6 +22,7 @@ pub mod requests;
 mod rewind;
 mod rows;
 mod status;
+mod t3_mcp;
 mod time;
 mod locale;
 mod host_locale;
@@ -78,9 +79,11 @@ pub use inspector::{
 };
 pub use entries::{EntriesCache, derive_entries, item_type_name, update_entries};
 pub use presentation::{
-    SummaryKind, ToolGroupAction, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label, skill_args,
-    summary_icon, summarize_tool_group, tool_group_action, work_entry_display_indicates_tool_failure, work_entry_display_label,
-    work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_log_entry_is_tool_like,
+    SummaryKind, ToolGroupAction, ViewedImageAsset, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label,
+    resolve_viewed_image_asset, skill_args, summary_icon, summarize_tool_group, thread_read_label_prefix, thread_read_target_id,
+    thread_read_target_title, tool_group_action, tool_surface_icon, work_entry_display_indicates_tool_failure, work_entry_display_label,
+    work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_entry_viewed_image, work_entry_viewed_image_path,
+    work_log_entry_is_tool_like,
 };
 pub use changed_files::{
     ChangedFileRow, DiffStat, TreeNode, changed_file_rows, changed_file_tree, changed_files_label, directory_paths, has_directories, hidden_files_label,

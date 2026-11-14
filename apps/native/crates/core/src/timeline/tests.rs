@@ -382,6 +382,18 @@ fn command_program_names_follow_the_web() {
         ("source ~/.nvm/nvm.sh && nvm use", Some("nvm")),
         ("unset DEBUG; node app.js", Some("node")),
         ("timeout 10s python3 script.py", Some("python3")),
+        ("& 'C:\\Program Files\\Git\\bin\\git.exe' status", Some("git")),
+        ("$env:FOO='bar'; cargo test", Some("cargo")),
+        ("Set-Location repo; npm test", Some("npm")),
+        ("cmd /c \"git status\"", Some("git")),
+        ("powershell -NoProfile -Command \"rg needle\"", Some("rg")),
+        ("pwsh -File build.ps1", Some("build.ps1")),
+        ("pwsh -EncodedCommand abc", None),
+        ("Start-Process -Wait -FilePath git", Some("git")),
+        ("$map = @{ a = 1; b = 2 }", None),
+        ("$items = @(1; 2); cargo check", None),
+        ("$x = 'hello'; cargo check", Some("cargo")),
+        ("@\"\nfoo; bar\n\"@; rg needle", Some("rg")),
         ("zsh -lc 'git status", None),
         ("if test -f package.json; then vp test; fi", None),
         ("export NODE_ENV=test", None),
@@ -1912,4 +1924,124 @@ fn branch_mismatch_rules_gate_on_worktree_content_and_dismissal() {
     assert!(!should_show_branch_mismatch_banner(Some(&key), false, false, Some("t1:feat/b:main")));
     assert!(!should_show_branch_mismatch_banner(Some(&key), true, true, Some(&key)));
     assert!(!should_show_branch_mismatch_banner(None, false, true, Some(&key)));
+}
+
+fn projected_dynamic_tool(
+    id: &str,
+    tool_name: &str,
+    status: &str,
+    input: Value,
+    output: Option<Value>,
+    viewed_image_path: Option<&str>,
+) -> WorkLogEntry {
+    let item: crate::turn_item::TurnItem = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "threadId": "thread-main",
+        "runId": "run-1",
+        "nodeId": null,
+        "parentItemId": null,
+        "ordinal": 1,
+        "status": status,
+        "title": null,
+        "startedAt": null,
+        "completedAt": null,
+        "updatedAt": "2026-11-01T00:00:00Z",
+        "type": "dynamic_tool",
+        "toolName": tool_name,
+        "input": input,
+        "output": output,
+        "viewedImagePath": viewed_image_path,
+    }))
+    .expect("dynamic_tool decodes");
+    let row = crate::thread::ProjectedTurnItem {
+        position: 0,
+        visibility: crate::thread::Visibility::Local,
+        source_thread_id: "thread-main".into(),
+        source_item_id: id.into(),
+        item: Arc::new(item),
+    };
+    entries::projected_work_entry(&row)
+}
+
+#[test]
+fn t3_mcp_work_entries_resolve_labels_icons_failures_and_group_summaries() {
+    let pr_link = projected_dynamic_tool(
+        "dt-pr",
+        "mcp__t3_code__link_pull_request",
+        "completed",
+        serde_json::json!({ "url": "https://github.com/t3dotgg/t3code/pull/42" }),
+        None,
+        None,
+    );
+    assert_eq!(work_entry_display_label(&pr_link, None), "Linked PR #42");
+    assert_eq!(work_entry_icon(&pr_link), WorkIcon::PullRequest);
+    assert!(!work_entry_display_indicates_tool_failure(&pr_link));
+
+    let mr_watch = projected_dynamic_tool(
+        "dt-mr",
+        "t3_code_direct · watch_pull_request",
+        "completed",
+        serde_json::json!({ "url": "https://gitlab.com/org/repo/-/merge_requests/7" }),
+        Some(serde_json::json!({ "ok": false, "error": "MR watch failed" })),
+        None,
+    );
+    assert_eq!(work_entry_display_label(&mr_watch, None), "Failed to watch MR #7");
+    assert_eq!(work_entry_icon(&mr_watch), WorkIcon::PullRequest);
+    assert!(work_entry_display_indicates_tool_failure(&mr_watch));
+
+    let queued = projected_dynamic_tool(
+        "dt-queue",
+        "t3-code-xyz_t3_queue",
+        "completed",
+        serde_json::json!({ "action": "promote_to_steer" }),
+        None,
+        None,
+    );
+    assert_eq!(work_entry_display_label(&queued, None), "Requested steering with a queued message");
+
+    let device = projected_dynamic_tool(
+        "dt-device",
+        "mcp__t3-code-direct__device_screenshot",
+        "completed",
+        serde_json::json!({}),
+        None,
+        Some(".t3/shots/home.png"),
+    );
+    assert_eq!(work_entry_icon(&device), WorkIcon::Device);
+    let viewed = work_entry_viewed_image(&device, Some("thread-main"), Some("/repo")).expect("viewed image");
+    assert_eq!(viewed.path, ".t3/shots/home.png");
+    assert_eq!(viewed.alt, "home.png");
+
+    let mut notion = projected_dynamic_tool("dt-notion", "mcp__notion__search", "completed", serde_json::json!({}), None, None);
+    notion.tool_source = Some(ToolSource { key: "notion".into(), name: "Notion".into(), kind: "integration".into() });
+
+    let group_entries = [&pr_link, &mr_watch];
+    assert_eq!(presentation::tool_group_summary_kind(&group_entries), SummaryKind::PullRequest);
+    assert_eq!(summary_icon(SummaryKind::PullRequest), WorkIcon::PullRequest);
+
+    let mixed_group = [&pr_link, &notion];
+    let (summary, _open_group) = summarize_tool_group(&mixed_group);
+    assert_eq!(summary, "Used Notion integration and linked 1 pull request");
+    assert_eq!(tool_surface_icon("browser"), WorkIcon::Browser);
+    assert_eq!(tool_surface_icon("device"), WorkIcon::Device);
+    assert_eq!(tool_surface_icon("other"), WorkIcon::Computer);
+}
+
+#[test]
+fn thread_read_helpers_extract_target_and_strip_deleted_or_archived_titles() {
+    let read = projected_dynamic_tool(
+        "dt-thread-read",
+        "mcp__t3_code__t3_thread_read",
+        "completed",
+        serde_json::json!({ "threadId": "thread-child-9" }),
+        None,
+        None,
+    );
+    assert_eq!(thread_read_target_id(&read).as_deref(), Some("thread-child-9"));
+    let label = work_entry_display_label(&read, None);
+    assert_eq!(thread_read_label_prefix(&label).as_deref(), Some("Read thread"));
+    assert_eq!(thread_read_target_title("Investigate bug", None, None).as_deref(), Some("Investigate bug"));
+    assert_eq!(thread_read_target_title("Investigate bug", Some("2026-11-01T00:00:00Z"), None), None);
+    assert_eq!(thread_read_target_title("Investigate bug", None, Some("2026-11-01T00:00:00Z")), None);
+    assert_eq!(thread_read_target_title("   ", None, None), None);
 }

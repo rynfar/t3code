@@ -1,18 +1,23 @@
 //! Work-log labels, actions and status: `packages/client-runtime/src/work-log/presentation.ts`,
+//! `packages/shared/src/t3McpToolPresentation.ts`, `packages/client-runtime/src/t3ToolSummary.ts`,
 //! the label helpers of `MessagesTimeline.logic.ts` and icons from
-//! `apps/web/src/components/chat/TimelineWorkEntryRow.logic.ts`. T3's own MCP tool labels
-//! (`t3McpToolPresentation.ts`) are not ported yet; those calls use the generic labels.
+//! `apps/web/src/components/chat/TimelineWorkEntryRow.logic.ts`.
 
 use std::collections::BTreeSet;
 
 use serde_json::Value;
 
+use super::t3_mcp::{
+    T3McpSummaryAction, T3McpToolIcon, T3ToolOutcome, T3ToolSummaryCall, pr_short_label_and_number, resolve_t3_mcp_summary_action,
+    resolve_t3_mcp_tool_definition, summarize_t3_tool_calls, t3_tool_result_indicates_failure, unwrap_t3_tool_input,
+};
 use super::tool_activity::{
     ToolActivityAction, classify_tool_activity, claude_skill_invocation, collect_tool_file_paths, command_display_text,
     command_program_name, dynamic_tool_title, format_read_tool_label, format_search_tool_label, is_javascript_repl_tool,
     tool_output_indicates_failure,
 };
 use super::{SourceActivity, Tone, ToolStatus, WorkLogEntry};
+use crate::media::{AssetResource, MarkdownImageSource, MediaKind, MediaSource, classify_markdown_image_source, resolve_media_source};
 use crate::turn_item::TurnItemKind;
 
 const TOOL_LIFECYCLE_ITEM_TYPES: [&str; 7] =
@@ -37,6 +42,11 @@ fn indicates_failure(entry: &WorkLogEntry, include_command: bool) -> bool {
     }
     if !presentation_tool_like(entry) || entry.item_type == Some("reasoning") {
         return false;
+    }
+    if resolve_t3_mcp_tool_definition(work_entry_tool_name(entry), None).is_some()
+        && t3_tool_result_indicates_failure(work_entry_tool_output(entry))
+    {
+        return true;
     }
     if let Some(TurnItemKind::CommandExecution { exit_code, output_indicates_failure, output, .. }) = entry.item.as_ref().map(|i| &i.kind) {
         if let Some(code) = exit_code {
@@ -104,6 +114,11 @@ pub fn work_entry_indicates_tool_neutral_status(entry: &WorkLogEntry) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ToolGroupAction {
+    LinkPr,
+    UnlinkPr,
+    ListPrs,
+    WatchPr,
+    UnwatchPr,
     Read,
     Edit,
     Command,
@@ -118,6 +133,7 @@ pub enum ToolGroupAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryKind {
+    PullRequest,
     Action(ToolGroupAction),
     DynamicTool,
     Reasoning,
@@ -156,6 +172,74 @@ fn dynamic_tool(entry: &WorkLogEntry) -> Option<(Option<&str>, &Value)> {
     }
 }
 
+fn work_entry_tool_name(entry: &WorkLogEntry) -> Option<&str> {
+    if let Some((Some(name), _)) = dynamic_tool(entry)
+        && !name.is_empty()
+    {
+        return Some(name);
+    }
+    if let Some(title) = entry.tool_title.as_deref()
+        && resolve_t3_mcp_tool_definition(Some(title), None).is_some()
+    {
+        return Some(title);
+    }
+    Some(entry.label.as_str())
+}
+
+fn work_entry_tool_input(entry: &WorkLogEntry) -> Option<&Value> {
+    dynamic_tool(entry).map(|(_, input)| input)
+}
+
+fn work_entry_tool_output(entry: &WorkLogEntry) -> Option<&Value> {
+    match entry.item.as_ref().map(|i| &i.kind) {
+        Some(TurnItemKind::DynamicTool { output, .. }) => output.as_ref(),
+        _ => None,
+    }
+}
+
+struct T3WorkPresentation {
+    display_name: String,
+    icon: T3McpToolIcon,
+    action: Option<ToolGroupAction>,
+}
+
+fn resolve_work_entry_tool_presentation(entry: &WorkLogEntry, override_status: Option<ToolStatus>) -> Option<T3WorkPresentation> {
+    let raw_input = work_entry_tool_input(entry);
+    let unwrapped = unwrap_t3_tool_input(raw_input).map(Value::Object);
+    let input = unwrapped.as_ref().or(raw_input);
+    let definition = resolve_t3_mcp_tool_definition(work_entry_tool_name(entry), input)?;
+    let status = if t3_tool_result_indicates_failure(work_entry_tool_output(entry)) {
+        Some(ToolStatus::Failed)
+    } else {
+        override_status.or(entry.status)
+    };
+    let verb = match status {
+        Some(ToolStatus::InProgress) => definition.running.to_owned(),
+        Some(ToolStatus::Completed) => definition.completed.to_owned(),
+        Some(ToolStatus::Failed) => format!("Failed to {}", definition.action.to_lowercase()),
+        Some(ToolStatus::Declined) => format!("Declined to {}", definition.action.to_lowercase()),
+        Some(ToolStatus::Stopped) => format!("Stopped {}", definition.running.to_lowercase()),
+        _ => definition.running.to_owned(),
+    };
+    let action = match definition.summary_action {
+        T3McpSummaryAction::LinkPr => Some(ToolGroupAction::LinkPr),
+        T3McpSummaryAction::UnlinkPr => Some(ToolGroupAction::UnlinkPr),
+        T3McpSummaryAction::ListPrs => Some(ToolGroupAction::ListPrs),
+        T3McpSummaryAction::WatchPr => Some(ToolGroupAction::WatchPr),
+        T3McpSummaryAction::UnwatchPr => Some(ToolGroupAction::UnwatchPr),
+        _ => None,
+    };
+    let target = if action.is_some()
+        && action != Some(ToolGroupAction::ListPrs)
+        && let Some((short_label, number)) = pr_short_label_and_number(input.and_then(Value::as_object))
+    {
+        format!("{short_label} #{number}")
+    } else {
+        definition.detail.to_owned()
+    };
+    Some(T3WorkPresentation { display_name: format!("{verb} {target}"), icon: definition.icon, action })
+}
+
 /// `toolGroupAction`.
 pub fn tool_group_action(entry: &WorkLogEntry) -> ToolGroupAction {
     facts(entry).action
@@ -165,6 +249,17 @@ fn compute_tool_group_action(entry: &WorkLogEntry) -> ToolGroupAction {
     use ToolGroupAction::*;
     if entry.item_type == Some("thread_created") {
         return ThreadCreate;
+    }
+    if let Some(pres) = resolve_work_entry_tool_presentation(entry, None) {
+        if let Some(action) = pres.action {
+            return action;
+        }
+        if pres.icon == T3McpToolIcon::Browser {
+            return Browser;
+        }
+        if pres.icon == T3McpToolIcon::Device {
+            return Device;
+        }
     }
     if entry.request_kind.as_deref() == Some("file-read") || entry.viewed_image_path.is_some() {
         return Read;
@@ -228,6 +323,11 @@ fn action_label(action: ToolGroupAction, count: usize) -> String {
     use ToolGroupAction::*;
     let times = |count| plural(count, "time", "times");
     match action {
+        LinkPr => format!("Linked {}", plural(count, "pull request", "pull requests")),
+        UnlinkPr => format!("Unlinked {}", plural(count, "pull request", "pull requests")),
+        WatchPr => format!("Watching {}", plural(count, "pull request", "pull requests")),
+        UnwatchPr => format!("Stopped watching {}", plural(count, "pull request", "pull requests")),
+        ListPrs => if count == 1 { "Checked linked pull requests".into() } else { format!("Checked linked pull requests {}", times(count)) },
         Read => format!("Read {}", plural(count, "file", "files")),
         Edit => format!("Changed {}", plural(count, "file", "files")),
         Command => format!("Ran {}", plural(count, "command", "commands")),
@@ -241,10 +341,52 @@ fn action_label(action: ToolGroupAction, count: usize) -> String {
     }
 }
 
-fn action_priority(action: ToolGroupAction) -> u8 {
-    match action {
-        ToolGroupAction::Command | ToolGroupAction::Edit | ToolGroupAction::ThreadCreate => 0,
-        ToolGroupAction::Other | ToolGroupAction::Update => 2,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryGroupKey {
+    Action(ToolGroupAction),
+    T3(T3McpSummaryAction),
+}
+
+fn summary_action_priority(key: SummaryGroupKey) -> u8 {
+    match key {
+        SummaryGroupKey::Action(ToolGroupAction::Command | ToolGroupAction::Edit | ToolGroupAction::ThreadCreate) => 0,
+        SummaryGroupKey::Action(ToolGroupAction::Other | ToolGroupAction::Update) => 2,
+        SummaryGroupKey::T3(action) => {
+            use T3McpSummaryAction as T;
+            match action {
+                T::Delegate
+                | T::TaskCancel
+                | T::ThreadCreate
+                | T::ThreadSend
+                | T::ThreadInterrupt
+                | T::WorkflowStop
+                | T::BackgroundWait
+                | T::ScheduleCreate
+                | T::ScheduleUpdate
+                | T::ScheduleDelete
+                | T::ScheduleRun
+                | T::ThreadConfigure
+                | T::ThreadFork
+                | T::ThreadMerge
+                | T::ThreadOrganize
+                | T::ThreadUpdate
+                | T::QueueEdit
+                | T::QueueCancel
+                | T::QueueReorder
+                | T::QueueSteer
+                | T::QuestionRespond
+                | T::WorktreeHandoff
+                | T::ProjectCreate
+                | T::ProjectUpdate
+                | T::ProjectDelete
+                | T::ProjectClone
+                | T::EnvironmentUpdate
+                | T::AttachmentPrepare
+                | T::AttachmentDiscard
+                | T::AttachmentSend => 0,
+                _ => 1,
+            }
+        }
         _ => 1,
     }
 }
@@ -267,6 +409,13 @@ fn lowercase_first(text: &str) -> String {
     chars.next().map(|first| first.to_lowercase().chain(chars).collect()).unwrap_or_default()
 }
 
+struct ToolSummaryGroup<'a> {
+    key: SummaryGroupKey,
+    action: ToolGroupAction,
+    t3_action: Option<T3McpSummaryAction>,
+    entries: Vec<&'a WorkLogEntry>,
+}
+
 /// `summarizeToolGroup`: (summary, has_failure).
 pub fn summarize_tool_group(entries: &[&WorkLogEntry]) -> (String, bool) {
     let tools: Vec<&WorkLogEntry> = entries.iter().copied().filter(|e| e.item_type != Some("reasoning")).collect();
@@ -274,27 +423,55 @@ pub fn summarize_tool_group(entries: &[&WorkLogEntry]) -> (String, bool) {
         let summary = if entries.len() == 1 { "Thought".to_owned() } else { format!("Thought (×{})", entries.len()) };
         return (summary, false);
     }
-    let mut groups: Vec<(ToolGroupAction, Vec<&WorkLogEntry>)> = Vec::new();
+    let mut groups: Vec<ToolSummaryGroup<'_>> = Vec::new();
     let mut sources: Vec<(String, String, String)> = Vec::new();
     for entry in &tools {
-        if let Some(source) = &entry.tool_source {
+        let unwrapped_input = unwrap_t3_tool_input(work_entry_tool_input(entry)).map(Value::Object);
+        let t3_action = resolve_t3_mcp_summary_action(work_entry_tool_name(entry), unwrapped_input.as_ref());
+        if let Some(source) = &entry.tool_source
+            && t3_action.is_none()
+        {
             if !sources.iter().any(|(key, _, _)| *key == source.key) {
                 sources.push((source.key.clone(), source.name.clone(), source.kind.clone()));
             }
             continue;
         }
         let action = tool_group_action(entry);
-        match groups.iter_mut().find(|(candidate, _)| *candidate == action) {
-            Some((_, group)) => group.push(entry),
-            None => groups.push((action, vec![entry])),
+        let key = t3_action.map_or(SummaryGroupKey::Action(action), SummaryGroupKey::T3);
+        match groups.iter_mut().find(|candidate| candidate.key == key) {
+            Some(group) => group.entries.push(entry),
+            None => groups.push(ToolSummaryGroup { key, action, t3_action, entries: vec![entry] }),
         }
     }
     let summaries: Vec<(usize, usize, u8, String, usize)> = groups
         .iter()
         .enumerate()
-        .map(|(index, (action, group))| {
-            let failed = group.iter().filter(|e| work_entry_display_indicates_tool_failure(e)).count();
-            (index, group.len(), action_priority(*action), action_label(*action, action_count(*action, group)), failed)
+        .map(|(index, group)| {
+            let (label, failed) = match group.t3_action {
+                Some(t3_action) => {
+                    let calls: Vec<T3ToolSummaryCall<'_>> = group
+                        .entries
+                        .iter()
+                        .map(|entry| T3ToolSummaryCall {
+                            input: work_entry_tool_input(entry),
+                            output: work_entry_tool_output(entry),
+                            outcome: if matches!(entry.status, Some(ToolStatus::Failed | ToolStatus::Declined)) || entry.tone == Tone::Error {
+                                T3ToolOutcome::Failed
+                            } else if entry.status == Some(ToolStatus::Completed) {
+                                T3ToolOutcome::Completed
+                            } else {
+                                T3ToolOutcome::Unfinished
+                            },
+                        })
+                        .collect();
+                    summarize_t3_tool_calls(t3_action, &calls)
+                }
+                None => (
+                    action_label(group.action, action_count(group.action, &group.entries)),
+                    group.entries.iter().filter(|e| work_entry_display_indicates_tool_failure(e)).count(),
+                ),
+            };
+            (index, group.entries.len(), summary_action_priority(group.key), label, failed)
         })
         .collect();
     let mut selected: Vec<&(usize, usize, u8, String, usize)> = summaries.iter().collect();
@@ -318,7 +495,10 @@ pub fn summarize_tool_group(entries: &[&WorkLogEntry]) -> (String, bool) {
         let suffix = if all_integrations { if names.len() == 1 { " integration" } else { " integrations" } } else { "" };
         labels.insert(0, format!("Used {formatted}{suffix}"));
     }
-    let sourced = tools.iter().filter(|e| e.tool_source.is_some()).count();
+    let sourced = tools
+        .iter()
+        .filter(|e| e.tool_source.is_some() && resolve_t3_mcp_tool_definition(work_entry_tool_name(e), None).is_none())
+        .count();
     let covered: usize = selected.iter().map(|(_, count, ..)| *count).sum();
     let remaining = tools.len().saturating_sub(sourced + covered);
     if remaining > 0 {
@@ -332,6 +512,9 @@ pub fn tool_group_summary_kind(entries: &[&WorkLogEntry]) -> SummaryKind {
     let tools: Vec<&WorkLogEntry> = entries.iter().copied().filter(|e| e.item_type != Some("reasoning")).collect();
     if !entries.is_empty() && tools.is_empty() {
         return SummaryKind::Reasoning;
+    }
+    if !tools.is_empty() && tools.iter().all(|e| resolve_work_entry_tool_presentation(e, None).is_some_and(|p| p.icon == T3McpToolIcon::PullRequest)) {
+        return SummaryKind::PullRequest;
     }
     let actions: BTreeSet<ToolGroupAction> = tools.iter().map(|e| tool_group_action(e)).collect();
     if actions.len() != 1 {
@@ -421,6 +604,9 @@ pub fn work_entry_display_label(entry: &WorkLogEntry, workspace_root: Option<&st
         let thought = entry.detail.as_deref().map(collapse_whitespace).unwrap_or_default();
         return if thought.is_empty() { entry.label.clone() } else { thought };
     }
+    if let Some(pres) = resolve_work_entry_tool_presentation(entry, None) {
+        return pres.display_name;
+    }
     if let Some(command) = entry.command.as_deref().filter(|c| !c.trim().is_empty()) {
         return command_display_text(command);
     }
@@ -501,6 +687,9 @@ pub fn live_work_entry_label(entry: &WorkLogEntry, workspace_root: Option<&str>,
             return thought;
         }
         return if status == ToolStatus::InProgress { "Thinking".into() } else { "Thought".into() };
+    }
+    if let Some(pres) = resolve_work_entry_tool_presentation(entry, Some(status)) {
+        return pres.display_name;
     }
     if let Some(command) = entry.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         let verb = match status {
@@ -634,6 +823,9 @@ pub enum WorkIcon {
     MessageCircle,
     ListTodo,
     Code,
+    Browser,
+    Device,
+    PullRequest,
     Computer,
     T3,
 }
@@ -641,11 +833,14 @@ pub enum WorkIcon {
 pub fn summary_icon(kind: SummaryKind) -> WorkIcon {
     use ToolGroupAction as A;
     match kind {
+        SummaryKind::PullRequest
+        | SummaryKind::Action(A::LinkPr | A::UnlinkPr | A::ListPrs | A::WatchPr | A::UnwatchPr) => WorkIcon::PullRequest,
         SummaryKind::Action(A::Read) => WorkIcon::Eye,
         SummaryKind::Action(A::Edit) => WorkIcon::SquarePen,
         SummaryKind::Action(A::Command) => WorkIcon::Terminal,
         SummaryKind::Action(A::ThreadCreate) => WorkIcon::T3,
-        SummaryKind::Action(A::Browser | A::Device) => WorkIcon::Computer,
+        SummaryKind::Action(A::Browser) => WorkIcon::Browser,
+        SummaryKind::Action(A::Device) => WorkIcon::Device,
         SummaryKind::Action(A::Search) => WorkIcon::Globe,
         SummaryKind::Action(A::CodeSearch) => WorkIcon::Search,
         SummaryKind::Action(A::Other) => WorkIcon::Wrench,
@@ -663,6 +858,14 @@ fn tone_icon(tone: Tone) -> WorkIcon {
         Tone::Thinking => WorkIcon::Brain,
         Tone::Info => WorkIcon::Check,
         Tone::Tool => WorkIcon::Zap,
+    }
+}
+
+pub fn tool_surface_icon(surface: &str) -> WorkIcon {
+    match surface {
+        "browser" => WorkIcon::Browser,
+        "device" => WorkIcon::Device,
+        _ => WorkIcon::Computer,
     }
 }
 
@@ -686,11 +889,19 @@ pub fn work_entry_icon(entry: &WorkLogEntry) -> WorkIcon {
     if entry.item_type == Some("todo_list") {
         return WorkIcon::ListTodo;
     }
-    if entry.tool_surface.is_some() {
-        return WorkIcon::Computer;
+    if let Some(surface) = entry.tool_surface.as_deref() {
+        return tool_surface_icon(surface);
     }
     if dynamic_tool(entry).is_some_and(|(name, _)| is_javascript_repl_tool(name)) {
         return WorkIcon::Code;
+    }
+    if let Some(pres) = resolve_work_entry_tool_presentation(entry, None) {
+        return match pres.icon {
+            T3McpToolIcon::PullRequest => WorkIcon::PullRequest,
+            T3McpToolIcon::Browser => WorkIcon::Browser,
+            T3McpToolIcon::Device => WorkIcon::Device,
+            T3McpToolIcon::T3Code => WorkIcon::T3,
+        };
     }
     let action = tool_group_action(entry);
     if action != ToolGroupAction::Other {
@@ -701,6 +912,100 @@ pub fn work_entry_icon(entry: &WorkLogEntry) -> WorkIcon {
         Some("subagent") => WorkIcon::Bot,
         _ => tone_icon(entry.tone),
     }
+}
+
+const IMAGE_PREVIEW_EXTENSIONS: [&str; 13] =
+    [".avif", ".bmp", ".gif", ".ico", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"];
+
+fn is_workspace_image_preview_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    IMAGE_PREVIEW_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// `workEntryViewedImagePath`.
+pub fn work_entry_viewed_image_path(entry: &WorkLogEntry) -> Option<String> {
+    if let Some(path) = entry.viewed_image_path.as_deref().map(str::trim)
+        && !path.is_empty()
+        && !path.contains(['\r', '\n'])
+        && is_workspace_image_preview_path(path)
+    {
+        return Some(path.to_owned());
+    }
+    if tool_group_action(entry) == ToolGroupAction::Read
+        && let Some(detail) = entry.detail.as_deref().map(str::trim)
+        && !detail.is_empty()
+        && !detail.contains(['\r', '\n'])
+        && is_workspace_image_preview_path(detail)
+    {
+        return Some(detail.to_owned());
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewedImageAsset {
+    pub path: String,
+    pub alt: String,
+    pub source: MediaSource,
+}
+
+/// `resolveViewedImageAsset`.
+pub fn resolve_viewed_image_asset(source: &str, thread_id: &str, workspace_root: Option<&str>) -> Option<ViewedImageAsset> {
+    let MarkdownImageSource::WorkspaceFile(classified_path) = classify_markdown_image_source(source, Some(workspace_root.unwrap_or("."))) else {
+        return None;
+    };
+    let resolved_path = if workspace_root.is_none() {
+        classified_path.strip_prefix("./").unwrap_or(&classified_path).to_owned()
+    } else {
+        classified_path
+    };
+    let resolved = resolve_media_source(source, Some(thread_id), workspace_root.or(Some(".")), false)?;
+    if resolved.kind != MediaKind::Image {
+        return None;
+    }
+    resolved.source?;
+    Some(ViewedImageAsset {
+        path: source.to_owned(),
+        alt: resolved.name,
+        source: MediaSource::Asset(AssetResource::MediaFile { thread_id: thread_id.to_owned(), path: resolved_path }),
+    })
+}
+
+pub fn work_entry_viewed_image(entry: &WorkLogEntry, thread_id: Option<&str>, workspace_root: Option<&str>) -> Option<ViewedImageAsset> {
+    let thread_id = thread_id.filter(|id| !id.trim().is_empty())?;
+    let path = work_entry_viewed_image_path(entry)?;
+    resolve_viewed_image_asset(&path, thread_id, workspace_root)
+}
+
+/// `threadReadTargetId`.
+pub fn thread_read_target_id(entry: &WorkLogEntry) -> Option<String> {
+    let (tool_name, input) = dynamic_tool(entry)?;
+    let def = resolve_t3_mcp_tool_definition(tool_name, Some(input))?;
+    if def.summary_action != T3McpSummaryAction::ThreadRead {
+        return None;
+    }
+    input
+        .as_object()
+        .and_then(|o| o.get("threadId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// `threadReadLabelPrefix`.
+pub fn thread_read_label_prefix(label: &str) -> Option<String> {
+    const SUFFIX: &str = " a T3 thread";
+    label.strip_suffix(SUFFIX).map(|prefix| format!("{prefix} thread"))
+}
+
+/// `threadReadTargetTitle`.
+pub fn thread_read_target_title(title: &str, archived_at: Option<&str>, deleted_at: Option<&str>) -> Option<String> {
+    if archived_at.is_some() || deleted_at.is_some() {
+        return None;
+    }
+    let trimmed = title.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// `skill.args` for a Claude skill call, which the row shows as its plain output.
