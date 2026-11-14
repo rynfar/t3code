@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use gpui::Context;
 use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::lineage::{
-    AgentTiming, RelationshipGraph, RelationshipKind, RelationshipRow, STOP_WORKFLOW, Subagent, WorkflowGroup, group_relationships,
-    immediate_relationships, is_parent_relationship, keep_relationship_row, latest_merge_back_run, merge_back_command, merge_back_target,
-    order_rows, relationship_graph, relationship_label, relationship_status_label, row_status, stop_subagent_command, stop_workflow_request,
-    subagent_display_title, subagents_of, unlisted_title_ids, workflow_group,
+    AgentTiming, GET_THREAD_TITLES, RelationshipGraph, RelationshipKind, RelationshipRow, STOP_WORKFLOW, Subagent, WorkflowGroup, decode_thread_titles,
+    group_relationships, immediate_relationships, is_parent_relationship, keep_relationship_row, latest_merge_back_run, merge_back_command,
+    merge_back_target, order_rows, relationship_graph, relationship_label, relationship_status_label, row_status, stop_subagent_command,
+    stop_workflow_request, subagent_display_title, subagent_prompt_title, subagents_of, thread_titles_request, unlisted_title_ids, workflow_group,
 };
 use t3_core::shell::ThreadShell;
 use t3_core::thread::ThreadProjection;
@@ -320,9 +320,7 @@ fn resolve_linked_target(state: &AppState, canonical_env_id: &str, thread_id: &s
 
 /// The runtime title `projectedSubagentsToRuntime` gives a subagent: its title, else its prompt.
 fn runtime_title(agent: &Subagent) -> String {
-    agent.title.clone().unwrap_or_else(|| {
-        if agent.prompt.chars().count() > 80 { format!("{}...", agent.prompt.chars().take(77).collect::<String>()) } else { agent.prompt.clone() }
-    })
+    agent.title.clone().unwrap_or_else(|| subagent_prompt_title(&agent.prompt))
 }
 
 impl AppState {
@@ -373,6 +371,60 @@ impl AppState {
         {
             self.open_related_thread(thread_id, cx);
         }
+    }
+
+    /// Checks `orchestration.getThreadTitles` on the parent thread's environment before opening it
+    /// so a deleted remote parent keeps the child thread open with an info toast.
+    pub fn open_delegated_parent(&mut self, environment_id: &str, thread_id: &str, cx: &mut Context<Self>) {
+        if self.opening_delegated_parent {
+            return;
+        }
+        let fleet_owner = self
+            .fleet
+            .environments
+            .iter()
+            .find(|entry| entry.summary.owner.canonical_id.as_deref() == Some(environment_id))
+            .map(|entry| entry.summary.owner.clone())
+            .filter(|owner| self.scoped_ready(owner, ORCHESTRATION_READ_SCOPE));
+        let local_match = self.fleet.environments.is_empty()
+            && self.server_config.config.as_ref().is_some_and(|config| config.environment.environment_id == environment_id);
+        let destination = fleet_owner.as_ref().map(|owner| self.connections.destination(owner, ORCHESTRATION_READ_SCOPE));
+        let local_rpc = local_match.then(|| self.rpc(GET_THREAD_TITLES, thread_titles_request(&[thread_id.to_owned()])));
+        if destination.is_none() && local_rpc.is_none() {
+            return;
+        }
+        self.opening_delegated_parent = true;
+        let origin_thread = self.selected_thread.clone();
+        let origin_connection = self.connection_id();
+        let thread_id = thread_id.to_owned();
+        let payload = thread_titles_request(std::slice::from_ref(&thread_id));
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<HashMap<String, String>, String> = async {
+                let raw = match destination {
+                    Some(dest) => dest.await.map_err(|e| format!("{e:?}"))?.client.request(GET_THREAD_TITLES, payload).await.map_err(|e| e.to_string())?,
+                    None => local_rpc.expect("local_rpc checked").await.map_err(|e| e.to_string())?,
+                };
+                decode_thread_titles(raw)
+            }
+            .await;
+            let _ = this.update(cx, |state, cx| {
+                state.opening_delegated_parent = false;
+                if state.selected_thread != origin_thread || state.connection_id() != origin_connection {
+                    return;
+                }
+                match outcome {
+                    Err(_) => state.show_toast(Toast::new(ToastKind::Error, "Could not open the parent thread"), cx),
+                    Ok(titles) if !titles.contains_key(&thread_id) => {
+                        state.show_toast(Toast::new(ToastKind::Info, "The parent thread was deleted"), cx);
+                    }
+                    Ok(_) => match fleet_owner {
+                        Some(owner) => state.navigate_scoped(owner, ScopedRouteAction::Thread(thread_id), cx),
+                        None => state.open_related_thread(&thread_id, cx),
+                    },
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn run_stop_action(&mut self, action: &StopAction, cx: &mut Context<Self>) {
@@ -778,5 +830,64 @@ mod tests {
                 })
             );
         });
+    }
+
+    #[gpui::test]
+    async fn delegated_parent_checks_thread_titles_and_shows_deleted_toast(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ((state, mut fixture), _notice_sub) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            let sub = cx.subscribe(&installed.0, move |_, event, _| {
+                if matches!(event, crate::app_state::AppEvent::Notice) {
+                    let _ = notice_tx.send(());
+                }
+            });
+            (installed, sub)
+        });
+        state.update(cx, |state, cx| {
+            state.select_thread("menu-thread", cx);
+            state.open_delegated_parent("fixture-env", "deleted-parent", cx);
+            assert!(state.opening_delegated_parent);
+            // Concurrent duplicate click is ignored while in-flight.
+            state.open_delegated_parent("fixture-env", "deleted-parent", cx);
+        });
+        let (params, reply) = loop {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == GET_THREAD_TITLES {
+                break (params, reply);
+            }
+            reply.send(Ok(serde_json::json!({}))).unwrap();
+        };
+        assert_eq!(params["threadIds"], serde_json::json!(["deleted-parent"]));
+        reply.send(Ok(serde_json::json!({}))).unwrap();
+        notice_rx.recv().await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert!(!state.opening_delegated_parent);
+            assert_eq!(state.selected_thread.as_deref(), Some("menu-thread"));
+            assert_eq!(
+                state.toasts.latest().map(|t| (t.kind, t.title.as_ref())),
+                Some((ToastKind::Info, "The parent thread was deleted"))
+            );
+        });
+
+        state.update(cx, |state, cx| state.open_delegated_parent("fixture-env", "parent-2", cx));
+        let (_, reply) = loop {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == GET_THREAD_TITLES {
+                break (params, reply);
+            }
+            reply.send(Ok(serde_json::json!({}))).unwrap();
+        };
+        reply.send(Err(t3_client::session::RpcError::Closed)).unwrap();
+        notice_rx.recv().await.unwrap();
+        state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.toasts.latest().map(|t| (t.kind, t.title.as_ref())),
+                Some((ToastKind::Error, "Could not open the parent thread"))
+            );
+        });
+        drop(_notice_sub);
     }
 }

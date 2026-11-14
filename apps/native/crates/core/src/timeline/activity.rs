@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::ChatMessage;
-use crate::thread::{Entity, Run, ThreadProjection};
+use crate::thread::{Run, ThreadProjection};
 
 /// `TimelineLatestRun`.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -19,6 +19,8 @@ pub struct LatestRun {
     pub completed_at: Option<String>,
     /// The run's latest provider turn finished while the run itself is still open.
     pub turn_ended: bool,
+    /// Replaces `"Thinking"` while an open run's provider has not started a turn yet.
+    pub provider_starting_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -34,27 +36,51 @@ pub struct ThreadActivity {
 
 const ACTIVITY: [&str; 4] = ["preparing", "starting", "running", "waiting"];
 const INTERRUPTIBLE: [&str; 3] = ["preparing", "starting", "running"];
+const PROVIDER_STARTING_RUN_STATUSES: [&str; 2] = ["starting", "running"];
 
 fn latest_matching(runs: &[Run], predicate: impl Fn(&Run) -> bool) -> Option<&Run> {
     runs.iter().filter(|run| predicate(run)).max_by_key(|run| run.ordinal)
 }
 
-/// `summarizeThreadRun`: an open run whose latest provider turn has stopped reports `turnEnded`.
-fn summarize(run: &Run, provider_turns: &[Entity]) -> LatestRun {
+fn provider_starting_label(projection: &ThreadProjection, run: &Run) -> String {
+    let driver = projection
+        .provider_sessions
+        .iter()
+        .rev()
+        .find(|session| session.value.get("providerInstanceId").and_then(Value::as_str) == Some(run.provider_instance_id.as_str()))
+        .and_then(|session| session.value.get("driver").and_then(Value::as_str));
+    let known = matches!(
+        driver,
+        Some("antigravity" | "codex" | "claudeAgent" | "cursor" | "grok" | "fx" | "kiro" | "muse" | "acpRegistry" | "pi" | "opencode")
+    );
+    match driver.filter(|_| known) {
+        Some(driver) => format!("Starting {}", crate::providers::driver_label(driver)),
+        None => "Starting".to_owned(),
+    }
+}
+
+/// `summarizeThreadRun`: an open run whose latest provider turn has stopped reports `turnEnded`,
+/// while one whose provider has not started a turn yet reports `providerStartingLabel`.
+fn summarize(run: &Run, projection: &ThreadProjection) -> LatestRun {
     let turn_status = ACTIVITY.contains(&run.status.as_str()).then(|| {
         let attempt = run.active_attempt_id.as_deref()?;
-        provider_turns
+        projection
+            .provider_turns
             .iter()
             .filter(|turn| turn.value.get("runAttemptId").and_then(Value::as_str) == Some(attempt))
             .max_by_key(|turn| turn.value.get("ordinal").and_then(Value::as_u64).unwrap_or(0))
             .and_then(|turn| turn.value.get("status").and_then(Value::as_str))
     });
+    let turn_status = turn_status.flatten();
+    let provider_starting_label = (turn_status.is_none() && PROVIDER_STARTING_RUN_STATUSES.contains(&run.status.as_str()))
+        .then(|| provider_starting_label(projection, run));
     LatestRun {
         run_id: run.id.clone(),
         status: run.status.clone(),
         started_at: run.started_at.clone(),
         completed_at: run.completed_at.clone(),
-        turn_ended: matches!(turn_status.flatten(), Some(status) if status != "pending" && status != "running"),
+        turn_ended: matches!(turn_status, Some(status) if status != "pending" && status != "running"),
+        provider_starting_label,
     }
 }
 
@@ -94,7 +120,7 @@ pub fn derive_activity(projection: &ThreadProjection) -> ThreadActivity {
         .map(|request| request.id.clone())
         .collect();
     ThreadActivity {
-        latest_run: activity_run.map(|run| summarize(run, &projection.provider_turns)),
+        latest_run: activity_run.map(|run| summarize(run, projection)),
         running_run_id,
         is_working,
         runless_work_active: runless.is_some(),

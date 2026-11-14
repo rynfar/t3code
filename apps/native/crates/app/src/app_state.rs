@@ -146,6 +146,7 @@ pub struct AppState {
     pub(crate) omitted: crate::omitted_rows::OmittedRows,
     pub(crate) notifications: crate::notifications::NotificationCenter,
     pub(crate) side_threads: crate::side_chat::SideThreads,
+    pub(crate) opening_delegated_parent: bool,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
     /// Prompts and attachments handed back to the composer per thread, as "Edit from here" restores one.
@@ -260,6 +261,7 @@ impl AppState {
             omitted: Default::default(),
             notifications: Default::default(),
             side_threads: Default::default(),
+            opening_delegated_parent: false,
             select_when_listed: None,
             composer_restores: Default::default(),
             rewinds: Default::default(),
@@ -558,6 +560,7 @@ impl AppState {
         // A resubscribed shell is live again at its completion marker, even with nothing new.
         let mut resynchronized = false;
         let mut side_changed = false;
+        let mut removed_draft_threads: Vec<String> = Vec::new();
         for event in batch {
             match event {
                 ClientEvent::Status(ConnectionStatus::NeedsPairing { reason }) => { if let Some(id) = self.environments.active.clone() { self.environment_credentials_rejected(&id, reason, cx); } },
@@ -565,6 +568,9 @@ impl AppState {
                 ClientEvent::Shell(item) => {
                     error_changed |= self.clear_stream_error("shell");
                     resynchronized |= matches!(item, ShellStreamItem::Synchronized);
+                    if let ShellStreamItem::ThreadRemoved { thread_id, .. } = &item {
+                        self.collect_side_chats_for_deleted_thread(thread_id, &mut removed_draft_threads);
+                    }
                     let quiet = crate::sidebar::controller::is_streaming_tick(&self.shell, &item);
                     if self.shell.apply(item) {
                         shell_changed = true;
@@ -595,6 +601,9 @@ impl AppState {
         }
         self.sync_shell_views(shell_changed, sidebar_changed, resynchronized, cx);
         if thread_changed && self.thread.deleted {
+            if let Some(selected) = self.selected_thread.clone() {
+                self.collect_side_chats_for_deleted_thread(&selected, &mut removed_draft_threads);
+            }
             // The web treats a deleted open thread as missing and goes home.
             if !self.hold_pending_thread_deletion() {
                 self.close_selected_thread(cx);
@@ -602,6 +611,7 @@ impl AppState {
         } else if thread_changed || error_changed {
             cx.emit(AppEvent::Thread);
         }
+        self.clear_deleted_thread_drafts_later(removed_draft_threads, cx);
         if thread_changed || side_changed {
             self.check_rewinds(cx);
         }

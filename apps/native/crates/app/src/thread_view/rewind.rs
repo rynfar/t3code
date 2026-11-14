@@ -297,6 +297,16 @@ impl ThreadView {
     /// `rewindToMessage`: validate composer/attachments, download message attachments, dispatch
     /// the rollback, then wait for the projection to show it.
     fn confirm_rewind(&mut self, restore_files: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let can_restore_files = self.rewind.confirm.as_ref().is_some_and(|confirm| {
+            self.thread_state(self.state.read(cx))
+                .projection
+                .as_ref()
+                .and_then(|projection| find_revert_checkpoint(&projection.checkpoints, confirm.turn_count))
+                .is_some_and(|checkpoint| checkpoint.status == "ready")
+        });
+        if restore_files && !can_restore_files {
+            return;
+        }
         let Some(Confirm { message_id, turn_count, text, restore_focus }) = self.rewind.confirm.take() else { return };
         if let Some(focus) = restore_focus {
             window.focus(&focus, cx);
@@ -461,7 +471,13 @@ impl ThreadView {
     /// `RevertConfirmHost`: an alert dialog with Cancel, "Revert files too" and "Revert and keep
     /// changes". Escape cancels; Enter keeps changes, the dialog's primary action.
     pub(super) fn render_rewind_confirm(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.rewind.confirm.as_ref()?;
+        let confirm = self.rewind.confirm.as_ref()?;
+        let can_restore_files = self
+            .thread_state(self.state.read(cx))
+            .projection
+            .as_ref()
+            .and_then(|projection| find_revert_checkpoint(&projection.checkpoints, confirm.turn_count))
+            .is_some_and(|checkpoint| checkpoint.status == "ready");
         let focus = self.rewind.focus.clone()?;
         let p = palette(cx);
         let viewport = window.viewport_size();
@@ -520,10 +536,14 @@ impl ThreadView {
                     .rounded_b(px(15.))
                     .bg(hsla(p.muted).opacity(0.72))
                     .child(button("rewind-cancel", "Cancel", p.popover, p.foreground, p.input).on_click(cx.listener(|this, _, window, cx| this.cancel_rewind(window, cx))))
-                    .child(
-                        button("rewind-revert-files", REVERT_FILES, p.popover, p.destructive_foreground, p.input)
-                            .on_click(cx.listener(|this, _, window, cx| this.confirm_rewind(true, window, cx))),
-                    )
+                    .child({
+                        let revert_files = button("rewind-revert-files", REVERT_FILES, p.popover, p.destructive_foreground, p.input);
+                        if can_restore_files {
+                            revert_files.on_click(cx.listener(|this, _, window, cx| this.confirm_rewind(true, window, cx)))
+                        } else {
+                            revert_files.opacity(0.45).cursor_default().hover(|this| this.opacity(0.45))
+                        }
+                    })
                     .child(
                         button("rewind-keep-changes", KEEP_CHANGES, p.primary, p.primary_foreground, p.primary)
                             .on_click(cx.listener(|this, _, window, cx| this.confirm_rewind(false, window, cx))),
@@ -1058,6 +1078,14 @@ mod tests {
         cx.run_until_parked();
 
         // Deliver the side-chat rollback projection update; embedded side composer must receive it, not main composer.
+        let (rewind_tx, mut rewind_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rewind_sub = cx.update(|cx| {
+            cx.subscribe(&state, move |state, event, cx| {
+                if matches!(event, AppEvent::Rewind) && !state.read(cx).is_thread_rewinding("side-t") {
+                    let _ = rewind_tx.send(());
+                }
+            })
+        });
         let mut rolled_back = side_projection;
         rolled_back.runs[0].status = "rolled_back".to_owned();
         state.update(cx, |state, cx| {
@@ -1077,6 +1105,11 @@ mod tests {
             );
         });
         cx.run_until_parked();
+        if state.read_with(cx, |state, _| state.is_thread_rewinding("side-t")) {
+            let _ = rewind_rx.recv().await;
+            cx.run_until_parked();
+        }
+        drop(rewind_sub);
         side_view.read_with(cx, |view, cx| assert!(!view.is_rewind_busy(cx)));
         side_composer.read_with(cx, |composer, cx| {
             assert_eq!(composer.test_prompt(cx), "Side prompt");
@@ -1102,6 +1135,43 @@ mod tests {
             cx.clear_globals();
         });
         drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn missing_checkpoint_allows_conversation_only_rewind_and_disables_file_restore(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (state, _fixture, runtime, window) = setup_rewind_test(cx, Vec::new());
+        let (view, composer) = window.read_with(cx, |h, _| (h.view.clone(), h.composer.clone())).unwrap();
+        let _ = window.update(cx, |_, window, cx| {
+            state.update(cx, |state, _| {
+                if let Some(projection) = state.thread.projection.as_mut() {
+                    projection.checkpoints[0].value["status"] = json!("missing");
+                }
+            });
+            view.update(cx, |view, cx| {
+                view.sync(cx);
+                assert_eq!(view.rewind.counts.get("msg-u1").copied(), Some(0));
+                view.request_rewind("msg-u1", 0, "Earlier prompt", window, cx);
+                assert!(view.rewind.confirm.is_some());
+                // Passing restore_files=true is ignored when checkpoint status is "missing".
+                view.confirm_rewind(true, window, cx);
+                assert!(view.rewind.confirm.is_some());
+                assert!(!view.is_rewind_busy(cx));
+                // Conversation-only rewind proceeds.
+                view.confirm_rewind(false, window, cx);
+                assert!(view.rewind.confirm.is_none());
+                assert!(view.is_rewind_busy(cx));
+            });
+            composer.read_with(cx, |composer, cx| assert!(composer.is_rewinding(cx)));
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
         drop(runtime);
         cx.run_until_parked();
     }

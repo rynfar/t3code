@@ -474,3 +474,16 @@ fn agent_timing_derives_phase_and_formats_full_and_compact_elapsed() {
     let phase_timing = AgentTiming::from_phase(&group.phases[0]).expect("phase timing");
     assert_eq!(phase_timing.format(0, false), "1m 05s");
 }
+
+#[test]
+fn waiting_label_and_surrogate_safe_subagent_truncation_match_web() {
+    assert_eq!(waiting_on_subagents_label(1), "Waiting on a subagent");
+    assert_eq!(waiting_on_subagents_label(3), "Waiting on 3 subagents");
+
+    let prompt = format!("{}😀 and more work.", "a".repeat(76));
+    assert_eq!(subagent_prompt_title(&prompt), format!("{}...", "a".repeat(76)));
+
+    assert_eq!(subagent_detail_preview("running", Some(" Done "), Some("\u{FEFF}\u{2029}")), Some("Done".to_owned()));
+    let overflow = format!("{}😀", "x".repeat(279));
+    assert_eq!(subagent_detail_preview("failed", Some(&overflow), None), Some(format!("{}…", "x".repeat(279))));
+}

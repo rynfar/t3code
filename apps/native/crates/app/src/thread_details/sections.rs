@@ -186,6 +186,68 @@ pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement
     (!rows.is_empty()).then(|| section_with_options(false, None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
 }
 
+fn open_thread_pr_url(state: &Entity<AppState>, url: &str, cx: &mut App) {
+    if crate::settings::client_settings(cx).pull_request_links_open_in_app() {
+        crate::pull_requests::open_context_link(state, url, cx);
+    } else {
+        cx.open_url(url);
+    }
+}
+
+/// `ThreadDetailsThreadPrRows`: linked PR rows shown when a thread has no git repository
+/// (e.g. a scratch/`No project` thread or non-git folder).
+fn thread_pr_rows(ctx: &Ctx, thread: &t3_core::shell::ThreadShell, _cx: &App) -> Option<AnyElement> {
+    use t3_core::pull_requests::detail::StateKind;
+    use t3_core::pull_requests::link::visible_links;
+    use t3_core::pull_requests::thread_badge::{linked_snapshot_status, pr_status_indicator, resolve_thread_current_pull_request_link};
+
+    let visible = visible_links(&thread.pull_requests);
+    if visible.is_empty() {
+        return None;
+    }
+    let current = resolve_thread_current_pull_request_link(&thread.pull_requests);
+    let mut ordered = Vec::with_capacity(visible.len());
+    if let Some(current) = current {
+        ordered.push(current);
+    }
+    for link in visible {
+        if current.is_none_or(|c| c.number != link.number || !c.repository.eq_ignore_ascii_case(&link.repository) || !c.host.eq_ignore_ascii_case(&link.host)) {
+            ordered.push(link);
+        }
+    }
+    let rows: Vec<AnyElement> = ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, link)| {
+            let status = linked_snapshot_status(link);
+            let title = status
+                .as_ref()
+                .map(|s| s.pr.title.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("#{}: {t}", link.number))
+                .unwrap_or_else(|| format!("#{}", link.number));
+            let tooltip = status
+                .as_ref()
+                .map(|s| pr_status_indicator(&s.pr, Some(s.provider)).label)
+                .unwrap_or_else(|| link.url.clone());
+            let icon = match status.as_ref().map(|s| StateKind::of(s.pr.state, s.pr.is_draft)) {
+                Some(StateKind::Merged) => Icon::GitMerge,
+                Some(StateKind::Closed) => Icon::GitPullRequestClosed,
+                Some(StateKind::Draft) => Icon::GitPullRequestDraft,
+                _ => Icon::GitPullRequest,
+            };
+            let state = ctx.state.clone();
+            let url = link.url.clone();
+            Row::new(SharedString::from(format!("details-linked-pr-{index}")), title)
+                .icon(icon)
+                .tooltip(tooltip)
+                .on_click(move |_, _, cx| open_thread_pr_url(&state, &url, cx))
+                .into_any_element()
+        })
+        .collect();
+    Some(v_flex().w_full().children(rows).into_any_element())
+}
+
 /// The branch row and its picker, and the PR row under it while the checkout is the thread's
 /// branch (`BranchToolbarBranchSelector` in panel mode).
 fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
@@ -220,11 +282,13 @@ fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
         .filter(|branch| status.and_then(|status| status.local.ref_name.as_deref()) == Some(*branch))
         .and_then(|_| status.and_then(|status| status.remote.pr.clone()));
     let terms = t3_core::git_actions::terminology(status.and_then(|status| status.provider_kind()));
+    let pr_state = ctx.state.clone();
     v_flex()
         .w_full()
         .child(trigger)
         .children(pr.map(|pr| {
             let url = pr.url.clone();
+            let state = pr_state.clone();
             let state_label = match pr.state.as_str() {
                 "merged" => "Merged",
                 "closed" => "Closed",
@@ -234,7 +298,7 @@ fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
             Row::new("details-pr", format!("#{}: {}", pr.number, pr.title))
                 .icon(Icon::GitPullRequest)
                 .tooltip(format!("{} #{} - {}: {}", terms.short_label, pr.number, state_label, pr.title))
-                .on_click(move |_, _, cx| cx.open_url(&url))
+                .on_click(move |_, _, cx| open_thread_pr_url(&state, &url, cx))
         }))
         .into_any_element()
 }
@@ -244,18 +308,22 @@ pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &Ap
     let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
     let project_id = thread.map(|thread| thread.project_id.as_str()).or(app.draft_project.as_deref())?;
     let project = app.shell.project(project_id)?;
-    if app.is_scratch_project(project_id) || project.workspace_root.is_empty() {
-        return None;
-    }
+    // Scratch (`No project`) threads never offer git actions / Initialize Git, nor before config loads.
+    let offers_git = app.server_config.config.is_some() && !app.is_scratch_project(project_id) && !project.workspace_root.is_empty();
     let details = ctx.details.read(cx);
-    let is_repo = ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
+    let is_repo = offers_git && ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
     let no_runs_yet = thread.is_none_or(|thread| thread.latest_run_id.is_none());
     let thread_branch = thread.and_then(|thread| thread.branch.as_deref());
     let compact_actions = !density.is_full();
+    let show_branch = offers_git && is_repo && details.shows("branch") && item_visible_at_density("branch", density);
+    let show_pull_requests = !(offers_git && is_repo) && details.shows("branch") && item_visible_at_density("branch", density);
+    let show_git_actions = offers_git && details.shows("gitActions") && item_visible_at_density("gitActions", density);
+    let show_changes = offers_git && is_repo && details.shows("changes") && item_visible_at_density("changes", density);
     let rows: Vec<AnyElement> = [
-        (is_repo && details.shows("branch") && item_visible_at_density("branch", density)).then(|| branch_rows(ctx, thread_branch, cx)),
-        (details.shows("gitActions") && item_visible_at_density("gitActions", density)).then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, compact_actions, cx)).flatten(),
-        (is_repo && details.shows("changes") && item_visible_at_density("changes", density)).then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
+        show_branch.then(|| branch_rows(ctx, thread_branch, cx)),
+        show_pull_requests.then(|| thread.and_then(|t| thread_pr_rows(ctx, t, cx))).flatten(),
+        show_git_actions.then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, compact_actions, cx)).flatten(),
+        show_changes.then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
     ]
     .into_iter()
     .flatten()
@@ -469,7 +537,7 @@ fn delegated_from_row(ctx: &Ctx, item: &DelegatedFromRow, cx: &App) -> AnyElemen
     row = row.tooltip(format!("{}\n{hint}", item.title));
     if item.connected {
         let (state, env_id, thread_id) = (ctx.state.clone(), item.environment_id.clone(), item.thread_id.clone());
-        row = row.on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_linked_thread(&env_id, &thread_id, cx)));
+        row = row.on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_delegated_parent(&env_id, &thread_id, cx)));
     }
     row.into_any_element()
 }

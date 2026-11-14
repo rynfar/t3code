@@ -6,10 +6,47 @@
 use serde_json::{Value, json};
 
 use crate::commands::CREATION_SOURCE;
+use crate::composer::{compatible_runtime_modes, effective_selection, interaction_mode};
+use crate::model::ModelSelection;
+use crate::providers;
+use crate::server_config::{InteractionMode, RuntimeMode, ServerConfig};
 use crate::shell::ThreadShell;
 use crate::thread::Run;
+use crate::traits;
 
 pub const SIDE_CHAT_TITLE: &str = "Side chat";
+
+/// `useSideChat` + `ChatView` / `useThreadComposerState`: the parent composer's effective
+/// permission mode and model selection (with explicit dispatch options) for a new side chat.
+pub fn resolve_parent_settings(
+    config: Option<&ServerConfig>,
+    parent: &ThreadShell,
+    choice_model: Option<&ModelSelection>,
+    choice_runtime_mode: Option<RuntimeMode>,
+    plan_mode_enabled: bool,
+) -> (RuntimeMode, Option<ModelSelection>) {
+    let chosen = choice_model.cloned().or_else(|| Some(parent.model_selection.clone()));
+    let entries = config.map(|config| providers::entries(config, Some(&parent.project_id))).unwrap_or_default();
+    let model = match config {
+        Some(_) => effective_selection(&entries, chosen.as_ref()),
+        None => chosen,
+    };
+    let driver_provider = model.as_ref().and_then(|model| config?.provider(&model.instance_id));
+    let runtime = choice_runtime_mode.or_else(|| RuntimeMode::parse(&parent.runtime_mode)).unwrap_or(RuntimeMode::FullAccess);
+    let (_, runtime_mode) = compatible_runtime_modes(runtime, driver_provider);
+    let model_selection = match driver_provider {
+        Some(provider) => {
+            let provider_model = model.as_ref().and_then(|selection| provider.models.iter().find(|m| m.slug == selection.model));
+            let parent_interaction = InteractionMode::parse(&parent.interaction_mode).unwrap_or(InteractionMode::Default);
+            let (plan_enabled, _) = interaction_mode(plan_mode_enabled, Some(provider), parent_interaction);
+            let explicit = traits::selections(model.as_ref().and_then(|model| model.options.as_ref()));
+            let options = traits::composer_options(&provider.driver, provider_model, plan_enabled, &explicit);
+            model.map(|model| traits::model_selection(&model.instance_id, &model.model, &options.dispatch))
+        }
+        None => model,
+    };
+    (runtime_mode, model_selection)
+}
 
 /// `thread.fork` from the latest stable point into a hidden side chat; works while the parent runs.
 pub fn fork_command(command_id: &str, source_thread_id: &str, target_thread_id: &str) -> Value {
@@ -26,9 +63,17 @@ pub fn fork_command(command_id: &str, source_thread_id: &str, target_thread_id: 
     })
 }
 
-/// The side chat's first message, as `startThreadTurn` sends it without a model override.
-pub fn first_message_command(command_id: &str, thread_id: &str, message_id: &str, text: &str) -> Value {
-    json!({
+/// The side chat's first message, as `startThreadTurn` sends it with the parent composer's mode
+/// and model selection.
+pub fn first_message_command(
+    command_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    text: &str,
+    runtime_mode: Option<RuntimeMode>,
+    model_selection: Option<&ModelSelection>,
+) -> Value {
+    let mut command = json!({
         "type": "message.dispatch",
         "commandId": command_id,
         "createdBy": "user",
@@ -40,7 +85,14 @@ pub fn first_message_command(command_id: &str, thread_id: &str, message_id: &str
         "titleSeed": crate::composer::title_seed(text),
         "deliveryIntent": "auto",
         "dispatchMode": { "type": "start_immediately" },
-    })
+    });
+    if let Some(mode) = runtime_mode {
+        command["runtimeMode"] = json!(mode);
+    }
+    if let Some(selection) = model_selection {
+        command["modelSelection"] = json!(selection);
+    }
+    command
 }
 
 /// `thread.delete`. With `only_if_unused` the server keeps a side chat that has a run or message,

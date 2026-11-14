@@ -23,7 +23,6 @@ use t3_core::timeline::minimap::{self, MinimapItem, MinimapPreview, RailPointer,
 use super::ThreadView;
 use gpui_component::ActiveTheme;
 use crate::icons::Icon;
-use crate::selectable_text::SelectionGroup;
 use crate::theme::{hsla, palette, rem};
 
 /// App-wide arbitration across `ThreadView` instances (e.g. main transcript vs side chat) so at
@@ -131,6 +130,7 @@ fn tooltip_dismiss_area(dismiss: impl Fn(TooltipDismiss, &mut Window, &mut gpui:
 struct Measured {
     range: Option<(usize, usize)>,
     current: Option<usize>,
+    at_end: bool,
     persistent: bool,
     hit_width: f32,
 }
@@ -149,13 +149,22 @@ impl ListLayout {
     fn measure(&self) -> Measured {
         let viewport = self.list.viewport_bounds();
         let width = f32::from(viewport.size.width);
+        let viewport_h = f32::from(viewport.size.height);
         let lane = (width - self.lane_padding).max(0.);
         let lane = self.lane_max.map_or(lane, |max| lane.min(max));
         let scroll = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
-        let range = minimap::visible_range(self.row_count, scroll, f32::from(viewport.size.height), |index| f32::from(self.list.offset_for_item(self.header + index)));
+        let range = minimap::visible_range(self.row_count, scroll, viewport_h, |index| f32::from(self.list.offset_for_item(self.header + index)));
+        let current_inset = minimap::CURRENT_RANGE_INSET;
+        let current_range = minimap::visible_range(self.row_count, scroll + current_inset, (viewport_h - current_inset).max(0.), |index| {
+            f32::from(self.list.offset_for_item(self.header + index))
+        });
+        let max_scroll = f32::from(self.list.max_offset_for_scrollbar().y).max(0.);
+        // The exact bottom, not the follow re-arm zone: Next turn can still scroll inside that zone.
+        let at_end = viewport_h > 0. && (max_scroll - scroll) <= 1.;
         Measured {
             range,
-            current: minimap::current_index(range, self.rows.iter().copied()),
+            current: minimap::current_index(current_range, self.rows.iter().copied()),
+            at_end,
             persistent: minimap::has_persistent_gutter(width, lane),
             hit_width: minimap::hit_strip_width(width, lane),
         }
@@ -222,11 +231,7 @@ pub struct MinimapUi {
     active: Option<usize>,
     last_preview: Option<(usize, MinimapPreview)>,
     preview: Option<(usize, MinimapPreview)>,
-    preview_selection: Option<SelectionGroup>,
-    preview_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    rail_pointer: Option<(f32, f32)>,
     strip_hovered: bool,
-    preview_hovered: bool,
     nav_hovered: bool,
     nav_hovers: [bool; 2],
     nav_tooltip_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 2],
@@ -324,7 +329,6 @@ impl ThreadView {
         self.minimap.nav_tooltip_task = None;
         self.minimap.active = None;
         self.minimap.strip_hovered = false;
-        self.minimap.preview_hovered = false;
         self.minimap.nav_hovered = false;
         self.minimap.nav_hovers = [false; 2];
         if changed {
@@ -394,9 +398,10 @@ impl ThreadView {
     }
 
     fn minimap_tab(&mut self, part: minimap::FocusPart, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.minimap.measured.get().current.filter(|i| *i < self.minimap.items.len());
+        let measured = self.minimap.measured.get();
+        let current = measured.current.filter(|i| *i < self.minimap.items.len());
         let previous = current.is_some_and(|i| i > 0);
-        let next = current.is_some_and(|i| i + 1 < self.minimap.items.len());
+        let next = !measured.at_end && current.is_some_and(|i| i + 1 < self.minimap.items.len());
         if let Some(target) = minimap::tab_target(part, backwards, previous, next) {
             let focus = match target {
                 minimap::FocusPart::Previous => self.minimap.previous_focus.as_ref(),
@@ -416,31 +421,26 @@ impl ThreadView {
 
     /// Previous or next turn from the one being read.
     fn step_minimap(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.minimap.measured.get().current.and_then(|current| current.checked_add_signed(delta));
+        let measured = self.minimap.measured.get();
+        if delta > 0 && measured.at_end {
+            return;
+        }
+        let target = measured.current.and_then(|current| current.checked_add_signed(delta));
         if let Some(target) = target.filter(|target| *target < self.minimap.items.len()) {
             self.jump_to_minimap_item(target, window, cx);
         }
     }
 
-    /// A leave is settled after the event, once the rail, preview, and safe-polygon corridor report.
+    /// A leave is settled after the event, once the rail reports.
     fn minimap_hover_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.minimap.active.is_some() || self.minimap.strip_hovered || self.minimap.preview_hovered {
+        if self.minimap.active.is_some() || self.minimap.strip_hovered {
             claim_minimap_tooltip_ownership(&cx.entity().downgrade(), cx);
         }
         self.notify_minimap(cx);
-        let cursor = window.mouse_position();
         cx.defer_in(window, move |view, _window, cx| {
             let ui = &mut view.minimap;
-            if !ui.strip_hovered && !ui.preview_hovered && ui.active.is_some() {
-                let in_corridor = ui.rail_pointer.zip(ui.preview_bounds.get()).is_some_and(|(origin, bounds)| {
-                    let pt = (f32::from(cursor.x), f32::from(cursor.y));
-                    minimap::point_in_safe_polygon(origin, bounds_to_rect_f(bounds), pt, 6.)
-                });
-                if in_corridor {
-                    return;
-                }
+            if !ui.strip_hovered && ui.active.is_some() {
                 ui.active = None;
-                ui.rail_pointer = None;
                 view.notify_minimap(cx);
             }
         });
@@ -490,7 +490,7 @@ impl ThreadView {
         let navigation = interactive && minimap::navigation_interactive(measured.hit_width);
         // A rail that stops taking the pointer can no longer report a leave.
         if !interactive && !focus.contains_focused(window, cx) {
-            (self.minimap.active, self.minimap.strip_hovered, self.minimap.preview_hovered) = (None, false, false);
+            (self.minimap.active, self.minimap.strip_hovered) = (None, false);
             self.minimap.pointer = RailPointer::default();
         }
         if !navigation {
@@ -500,21 +500,14 @@ impl ThreadView {
             let now = self.minimap_tooltip_now(cx);
             for index in 0..2 { self.minimap.tooltips.hover(index, false, now); }
         }
-        let rail_height = minimap::rail_height(count, f32::from(window.viewport_size().height) - minimap::MAX_HEIGHT_INSET * rem_px);
+        let viewport_h = f32::from(self.list.viewport_bounds().size.height);
+        let max_height = minimap::max_rail_height(if viewport_h > 0. { viewport_h } else { f32::from(window.viewport_size().height) }, rem_px);
+        let rail_height = minimap::rail_height(count, max_height);
         let active = self.minimap.active.filter(|index| *index < count);
         let preview = active.map(|index| (index, self.minimap.preview(index)));
         let preview_open = preview.is_some();
         if let Some((index, ref data)) = preview {
-            if self.minimap.last_preview.as_ref().is_some_and(|(prev_ix, prev_data)| {
-                *prev_ix != index || (prev_data.assistant_text.is_some() && data.assistant_text.is_none())
-            }) && let Some(group) = &self.minimap.preview_selection
-            {
-                group.reset(cx);
-            }
             self.minimap.last_preview = Some((index, data.clone()));
-            if self.minimap.preview_selection.is_none() {
-                self.minimap.preview_selection = Some(SelectionGroup::new(cx));
-            }
         }
         let preview_progress = transition_to(
             "minimap-preview-motion",
@@ -526,22 +519,16 @@ impl ThreadView {
         )[0];
         if !preview_open && preview_progress == 0. {
             self.minimap.last_preview = None;
-            self.minimap.preview_bounds.set(None);
-            if let Some(group) = self.minimap.preview_selection.take() {
-                group.reset(cx);
-            }
         }
         let rendered_preview = preview.or_else(|| (preview_progress > 0.).then(|| self.minimap.last_preview.clone()).flatten());
-        let width = if preview_open { minimap::EXPANDED_HIT_STRIP_WIDTH * rem_px } else { measured.hit_width };
+        let width = measured.hit_width;
         let focused = focus.contains_focused(window, cx)
             || self.minimap.previous_focus.as_ref().is_some_and(|focus| focus.is_focused(window))
             || self.minimap.next_focus.as_ref().is_some_and(|focus| focus.is_focused(window));
-        let revealed = self.minimap.strip_hovered || self.minimap.preview_hovered || self.minimap.nav_hovered || active.is_some() || focused;
+        let revealed = self.minimap.strip_hovered || self.minimap.nav_hovered || active.is_some() || focused;
 
         let rail = self.render_minimap_rail(active, revealed, rem_px, window, cx);
         let ring = hsla(palette(cx).ring).opacity(0.7);
-        let preview_selection = self.minimap.preview_selection.clone();
-        let preview_bounds = self.minimap.preview_bounds.clone();
         let jump = div()
             .id("timeline-minimap")
             .absolute()
@@ -579,9 +566,7 @@ impl ThreadView {
                     rail_height,
                     preview,
                     preview_progress,
-                    preview_selection.unwrap_or_else(|| SelectionGroup::new(cx)),
                     self.minimap.preview_height.clone(),
-                    preview_bounds,
                     self.minimap.repaint.unwrap(),
                     cx,
                 )
@@ -599,18 +584,9 @@ impl ThreadView {
                         let ui = &mut view.minimap;
                         let action = ui.pointer.handle(RailPointerEvent::Move { on_rail: true, pressed: event.pressed_button.is_some() });
                         let index = ui.index_at(event.position.y);
-                        let pt = (f32::from(event.position.x), f32::from(event.position.y));
-                        let in_safe = ui.active.is_some()
-                            && index != ui.active
-                            && ui.rail_pointer.zip(ui.preview_bounds.get()).is_some_and(|(origin, bounds)| {
-                                minimap::point_in_safe_polygon(origin, bounds_to_rect_f(bounds), pt, 6.)
-                            });
-                        if !in_safe {
-                            ui.rail_pointer = Some(pt);
-                            if action == RailPointerAction::Track && index != ui.active {
-                                ui.active = index;
-                                view.notify_minimap(cx);
-                            }
+                        if action == RailPointerAction::Track && index != ui.active {
+                            ui.active = index;
+                            view.notify_minimap(cx);
                         }
                     }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, _| {
@@ -641,7 +617,7 @@ impl ThreadView {
             });
         let current = measured.current.filter(|current| *current < count);
         let previous = current.and_then(|current| current.checked_sub(1));
-        let next = current.map(|current| current + 1).filter(|next| *next < count);
+        let next = (!measured.at_end).then(|| current.map(|current| current + 1).filter(|next| *next < count)).flatten();
         for (index, focus) in [self.minimap.previous_focus.as_ref().unwrap(), self.minimap.next_focus.as_ref().unwrap()].into_iter().enumerate() {
             if sync_navigation_focus(&mut self.minimap.tooltips, index, focus, window) { self.minimap.nav_tooltip_task = None; }
         }
@@ -703,6 +679,7 @@ impl ThreadView {
     /// rail, shown only while hovered.
     fn render_minimap_nav(&mut self, delta: isize, enabled: bool, interactive: bool, rail_height: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let rem_px = f32::from(window.rem_size()) / 16.;
         let previous = delta < 0;
         let label = if previous { minimap::PREVIOUS_TURN } else { minimap::NEXT_TURN };
         let icon = if previous { Icon::ChevronUp } else { Icon::ChevronDown };
@@ -742,7 +719,7 @@ impl ThreadView {
             .id(if previous { "timeline-minimap-previous" } else { "timeline-minimap-next" })
             .absolute()
             .left(rem(-6.))
-            .map(|this| if previous { this.bottom(px(rail_height + 2.)) } else { this.top(px(rail_height + 2.)) })
+            .map(|this| if previous { this.bottom(px(rail_height + 6. * rem_px)) } else { this.top(px(rail_height + 6. * rem_px)) })
             .opacity(opacity)
             .when(enabled, |this| this.track_focus(&focus))
             .role(gpui::Role::Button)
@@ -846,20 +823,18 @@ fn render_preview(
     rail_height: f32,
     preview: MinimapPreview,
     progress: f32,
-    selection_group: SelectionGroup,
     measured_height: Rc<Cell<f32>>,
-    measured_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     view: gpui::EntityId,
     cx: &mut Context<ThreadView>,
 ) -> AnyElement {
     let p = palette(cx);
     let height = measured_height.get();
     let measure = canvas(move |bounds, window, _| {
-        measured_bounds.set(Some(bounds));
         let next = f32::from(bounds.size.height);
         if measured_height.replace(next) != next { window.on_next_frame(move |_, cx| cx.notify(view)); }
     }, |_, _, _, _| {}).absolute().size_full();
     let backdrop_inset = px((1. - progress) * 3.);
+    // Display-only: overlaps the message column without intercepting clicks, hovers, or wheel events.
     let card = div()
         .id("timeline-minimap-preview")
         .relative()
@@ -873,16 +848,6 @@ fn render_preview(
             BoxShadow { color: gpui::black().opacity(0.25), offset: point(px(0.), px(20.)), blur_radius: px(25.), spread_radius: px(-5.), inset: false },
             BoxShadow { color: gpui::black().opacity(0.25), offset: point(px(0.), px(8.)), blur_radius: px(10.), spread_radius: px(-6.), inset: false },
         ])
-        .occlude()
-        .on_mouse_move(|_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| view.forward_minimap_wheel(event, cx)))
-        .on_hover(cx.listener(|view, hovered: &bool, window, cx| {
-            if view.minimap.preview_hovered == *hovered { return; }
-            view.minimap.preview_hovered = *hovered;
-            view.minimap_hover_changed(window, cx);
-        }))
         .child(div().absolute().inset(backdrop_inset).child(crate::glass::backdrop(12., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx)))
         .child(crate::webview::occluder("timeline-minimap-preview-cover", crate::webview::Layer::TranscriptChrome))
         .child(measure)
@@ -891,12 +856,7 @@ fn render_preview(
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(hsla(p.popover_foreground))
-                .child(
-                    crate::selectable_text::SelectableText::new(("minimap-preview-user", index), preview.user_text.unwrap_or_else(|| minimap::USER_MESSAGE.to_owned()))
-                        .selection_group(selection_group.clone(), 0)
-                        .tab_stop(false)
-                        .tail_ellipsis(),
-                ),
+                .child(preview.user_text.unwrap_or_else(|| minimap::USER_MESSAGE.to_owned())),
         )
         .children(preview.assistant_text.map(|text| {
             div()
@@ -904,18 +864,13 @@ fn render_preview(
                 .line_clamp(3)
                 .text_ellipsis()
                 .text_color(hsla(p.muted_foreground))
-                .child(
-                    crate::selectable_text::SelectableText::new(("minimap-preview-assistant", index), text)
-                        .selection_group(selection_group, 1)
-                        .tab_stop(false)
-                        .tail_ellipsis(),
-                )
+                .child(text)
         }));
     div()
         .absolute()
         .left(rem(32.))
         .ml(px(-4. * (1. - progress)))
-        .top(px(rail_height * minimap::top_percent(index, count) / 100. + minimap::preview_offset(index, count, height)))
+        .top(px(rail_height * minimap::top_percent(index, count) / 100. + minimap::preview_offset(height)))
         .w(rem(320.))
         .opacity(progress)
         .child(card)

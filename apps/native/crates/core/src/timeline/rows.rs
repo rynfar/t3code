@@ -593,6 +593,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
         rows.extend(working_row());
     }
     let turn_ended = activity.latest_run.as_ref().is_some_and(|run| run.turn_ended);
+    let provider_starting = activity.latest_run.as_ref().and_then(|run| run.provider_starting_label.clone());
     if is_working
         && !turn_ended
         && !setup_owns_working_slot
@@ -604,16 +605,44 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             Some(anchor) => {
                 let group_id = work_group_id(&anchor.id);
                 let expanded = input.expanded_work_group_ids.contains(&group_id);
-                rows.push(row(LIVE_ACTIVITY_ROW_ID, activity.active_turn_started_at.clone(), RowKind::Thinking { group_id: Some(group_id.clone()), expanded }));
+                rows.push(row(
+                    LIVE_ACTIVITY_ROW_ID,
+                    activity.active_turn_started_at.clone(),
+                    RowKind::Thinking { group_id: Some(group_id.clone()), expanded, label: None },
+                ));
                 if expanded {
                     rows.push(expanded_group_row(&group_id, &anchor.created_at, visible_active.iter().filter_map(|e| e.work().cloned()).collect()));
                 }
             }
-            None => rows.push(row(LIVE_ACTIVITY_ROW_ID, activity.active_turn_started_at.clone(), RowKind::Thinking { group_id: None, expanded: false })),
+            None => {
+                let waiting_on = unsettled.as_deref().map_or(0, |run_id| running_subagents_at_run_tail(entries, run_id));
+                let waiting_label = (waiting_on > 0).then(|| crate::lineage::waiting_on_subagents_label(waiting_on));
+                let label = provider_starting.or(waiting_label);
+                rows.push(row(
+                    LIVE_ACTIVITY_ROW_ID,
+                    activity.active_turn_started_at.clone(),
+                    RowKind::Thinking { group_id: None, expanded: false, label },
+                ));
+            }
         }
     }
     let rows = attach_trailing_tool_groups(attach_created_thread_summaries(rows, entries, &collapsed_members));
     finalize_grouping(rows)
+}
+
+/// Counts live foreground subagent events at the tail of `run_id` before any later parent work.
+fn running_subagents_at_run_tail(entries: &[Arc<TimelineEntry>], run_id: &str) -> usize {
+    let mut running = 0usize;
+    for entry in entries.iter().rev() {
+        let Some(item) = entry.event() else { break };
+        if !matches!(item.kind, TurnItemKind::Subagent { .. }) || item.run_id.as_deref() != Some(run_id) {
+            break;
+        }
+        if crate::lineage::is_active_status(&item.status) {
+            running += 1;
+        }
+    }
+    running
 }
 
 /// Places the setup card after the first user message, or under the working row it speaks for
@@ -889,7 +918,7 @@ mod tests {
             status: status.into(),
             started_at: Some("2026-11-01T00:00:00.000Z".into()),
             completed_at: (status != "running").then(|| "2026-11-01T00:10:00.000Z".into()),
-            turn_ended: false,
+            ..LatestRun::default()
         }
     }
 

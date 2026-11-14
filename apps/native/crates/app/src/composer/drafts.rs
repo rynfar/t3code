@@ -315,6 +315,94 @@ impl Composer {
         }
     }
 
+    pub(crate) fn clear_deleted_drafts(&mut self, thread_ids: &[String], cx: &mut Context<Self>) {
+        let mut changed = false;
+        for id in thread_ids {
+            let target = Target::Thread(id.clone());
+            let attachments = self.take_draft_attachments(&target);
+            if !attachments.is_empty() {
+                self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments }, cx);
+                changed = true;
+            }
+            let storage_key = key(&target);
+            let had_draft = self.drafts.store.get(&storage_key).is_some();
+            if had_draft || self.choices.contains_key(&target) {
+                self.discard_draft(&target, cx);
+                changed = true;
+            }
+            self.clear_mentions(&target);
+            self.context.records.remove(&target);
+            self.context.reviews.remove(&target);
+            self.clear_terminals(&target);
+        }
+        if changed {
+            store::save_ui_state(rules::STORE_NAME, &self.drafts.store.to_value());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn seed_model_selection(&mut self, thread_id: &str, selection: t3_core::model::ModelSelection, cx: &mut Context<Self>) {
+        let target = Target::Thread(thread_id.to_owned());
+        let storage_key = key(&target);
+        let mut draft = self.drafts.store.get(&storage_key).cloned().unwrap_or_default();
+        draft.model_selection = Some(selection);
+        draft.updated_at = now_ms();
+        self.restore_draft_choices(&target, &draft, cx);
+        if self.drafts.store.set(&storage_key, draft) {
+            self.schedule_draft_save(&target, cx);
+            store::save_ui_state(rules::STORE_NAME, &self.drafts.store.to_value());
+        }
+        cx.notify();
+    }
+}
+
+pub(crate) fn seed_side_chat_model_selection(thread_id: &str, selection: t3_core::model::ModelSelection, cx: &mut gpui::App) {
+    let live: Vec<gpui::Entity<Composer>> = cx
+        .try_global::<super::RegisteredComposers>()
+        .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
+        .unwrap_or_default();
+    if live.is_empty() {
+        let storage_key = rules::thread_key(thread_id);
+        let mut drafts = DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref());
+        let mut draft = drafts.get(&storage_key).cloned().unwrap_or_default();
+        draft.model_selection = Some(selection);
+        draft.updated_at = now_ms();
+        if drafts.set(&storage_key, draft) {
+            store::save_ui_state(rules::STORE_NAME, &drafts.to_value());
+        }
+        return;
+    }
+    for composer in live {
+        composer.update(cx, |composer, cx| composer.seed_model_selection(thread_id, selection.clone(), cx));
+    }
+}
+
+pub(crate) fn clear_deleted_thread_drafts(thread_ids: &[String], cx: &mut gpui::App) {
+    if thread_ids.is_empty() {
+        return;
+    }
+    let live: Vec<gpui::Entity<Composer>> = cx
+        .try_global::<super::RegisteredComposers>()
+        .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
+        .unwrap_or_default();
+    if live.is_empty() {
+        let mut drafts = DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref());
+        let mut changed = false;
+        for id in thread_ids {
+            changed |= drafts.remove(&rules::thread_key(id));
+        }
+        if changed {
+            store::save_ui_state(rules::STORE_NAME, &drafts.to_value());
+        }
+        return;
+    }
+    for composer in live {
+        composer.update(cx, |composer, cx| composer.clear_deleted_drafts(thread_ids, cx));
+    }
+}
+
+impl Composer {
+
     #[cfg(feature = "snapshot")]
     pub(crate) fn set_thread_draft_fixture(
         &mut self,
@@ -343,5 +431,15 @@ impl Composer {
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn test_prompt(&self, cx: &gpui::App) -> String {
         self.prompt(cx)
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn has_thread_draft(&self, thread_id: &str) -> bool {
+        self.drafts.store.get(&key(&Target::Thread(thread_id.to_owned()))).is_some()
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn stored_draft_prompt(&self, project_id: &str) -> Option<&str> {
+        self.drafts.store.get(&key(&Target::Draft(project_id.to_owned()))).map(|draft| draft.prompt.as_str())
     }
 }

@@ -64,18 +64,24 @@ pub fn available_revert_turn_counts(projection: &ThreadProjection) -> HashSet<u6
     available
 }
 
-/// A checkpoint a rewind targets (`OrchestrationV2Checkpoint` id and scope).
+/// A checkpoint a rewind targets (`OrchestrationV2Checkpoint` id, scope, and status).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevertCheckpoint {
     pub id: String,
     pub scope_id: String,
+    pub status: String,
 }
 
-/// `findRevertCheckpoint`: the last ready checkpoint for `turn_count`; zero is the thread start.
+pub fn is_rewindable_checkpoint_status(status: &str) -> bool {
+    matches!(status, "ready" | "missing")
+}
+
+/// `findRevertCheckpoint`: the last ready or missing checkpoint for `turn_count`; zero is the thread start.
 pub fn find_revert_checkpoint(checkpoints: &[Entity], turn_count: u64) -> Option<RevertCheckpoint> {
     checkpoints.iter().rev().find_map(|checkpoint| {
         let value = &checkpoint.value;
-        if text(value, "status") != Some("ready") {
+        let status = text(value, "status")?;
+        if !is_rewindable_checkpoint_status(status) {
             return None;
         }
         let ordinal = value.get("appRunOrdinal").and_then(Value::as_u64);
@@ -84,14 +90,18 @@ pub fn find_revert_checkpoint(checkpoints: &[Entity], turn_count: u64) -> Option
         } else {
             ordinal == Some(turn_count)
         };
-        matches.then(|| RevertCheckpoint { id: checkpoint.id.clone(), scope_id: text(value, "scopeId").unwrap_or_default().to_owned() })
+        matches.then(|| RevertCheckpoint {
+            id: checkpoint.id.clone(),
+            scope_id: text(value, "scopeId").unwrap_or_default().to_owned(),
+            status: status.to_owned(),
+        })
     })
 }
 
 pub struct RevertInput<'a> {
     pub entries: &'a [Arc<TimelineEntry>],
     pub checkpoints: &'a [Entity],
-    /// The thread-start checkpoint is ready and no earlier history is left to page in.
+    /// The thread-start checkpoint is ready or missing and no earlier history is left to page in.
     pub thread_start_ready: bool,
     pub available: &'a HashSet<u64>,
     pub unsettled_run_id: Option<&'a str>,
@@ -99,12 +109,15 @@ pub struct RevertInput<'a> {
     pub inherited: &'a HashSet<String>,
 }
 
-/// `deriveRevertTurnCountByUserMessageId`: each turn-starting user message rewinds to the ready
+/// `deriveRevertTurnCountByUserMessageId`: each turn-starting user message rewinds to the rewindable
 /// checkpoint of the run before it. Run ordinals keep increasing after a rewind, so only the
 /// runs visible here define predecessors.
 pub fn revert_turn_counts(input: &RevertInput) -> HashMap<String, u64> {
-    let ready: HashMap<String, u64> =
-        turn_diff_summaries(input.checkpoints).into_iter().filter(|summary| summary.status == "ready").map(|summary| (summary.run_id, summary.turn_count)).collect();
+    let ready: HashMap<String, u64> = turn_diff_summaries(input.checkpoints)
+        .into_iter()
+        .filter(|summary| is_rewindable_checkpoint_status(&summary.status))
+        .map(|summary| (summary.run_id, summary.turn_count))
+        .collect();
     let mut targets: HashMap<String, Option<u64>> = HashMap::new();
     let mut by_message = HashMap::new();
     let mut previous: Option<String> = None;
