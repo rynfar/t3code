@@ -352,6 +352,9 @@ impl AppState {
         self.thread = ThreadState::default();
         // Side subscriptions and a side chat start (with its timeout) belong to this environment.
         self.side_threads = Default::default();
+        self.rewinds.clear();
+        self.rewind_errors.clear();
+        self.composer_restores.clear();
         self.server_config = ServerConfigState::default();
         crate::theme::set_environment_themes(&[], cx);
         self.draft_project = None;
@@ -422,6 +425,9 @@ impl AppState {
     pub(crate) fn install_active_environment(&mut self, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, cx: &mut Context<Self>) {
         self.client = Some(client);
         self.connection += 1;
+        self.rewinds.clear();
+        self.rewind_errors.clear();
+        self.composer_restores.clear();
         self.shell = shell;
         self.server_config = config;
         self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
@@ -582,7 +588,7 @@ impl AppState {
         } else if thread_changed || error_changed {
             cx.emit(AppEvent::Thread);
         }
-        if thread_changed {
+        if thread_changed || side_changed {
             self.check_rewinds(cx);
         }
         if shell_changed || resynchronized {
@@ -863,13 +869,6 @@ impl AppState {
 
     pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<(String, Vec<RestoredAttachment>)> {
         self.composer_restores.remove(thread_id).map(|restore| (restore.prompt, restore.attachments))
-    }
-
-    pub fn drain_composer_restores(&mut self) -> Vec<(String, String, Vec<RestoredAttachment>)> {
-        self.composer_restores
-            .drain()
-            .map(|(thread_id, restore)| (thread_id, restore.prompt, restore.attachments))
-            .collect()
     }
 
     pub fn set_review_comments(&mut self, thread: &str, comments: Vec<t3_core::composer::review::ReviewComment>, cx: &mut Context<Self>) {

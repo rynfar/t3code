@@ -80,14 +80,15 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(REWIND_TIMEOUT_SECS)).await;
             let _ = this.update(cx, |state, cx| {
+                let watched = state.is_thread_watched(&thread_id);
                 let Some(ThreadRewindPhase::Active(active)) = state.rewinds.get_mut(&thread_id) else { return };
                 if active.watch.request_id != command_id {
                     return;
                 }
-                if state.selected_thread.as_deref() == Some(thread_id.as_str()) {
+                if watched {
                     state.fail_rewind(thread_id, REWIND_TIMED_OUT.to_owned(), cx);
                 } else {
-                    // Wait until the user returns to this thread before expiring an off-route rewind.
+                    // Wait until the thread is open or watched in a side chat before expiring an off-route rewind.
                     active._timeout = None;
                 }
             });
@@ -110,9 +111,13 @@ impl AppState {
         cx.notify();
         let dispatch_thread = thread_id.clone();
         let dispatch_id = command_id.clone();
+        let start_connection = self.connection_id();
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |state, cx| {
+                if state.connection_id() != start_connection {
+                    return;
+                }
                 let Some(ThreadRewindPhase::Active(active)) = state.rewinds.get_mut(&dispatch_thread) else { return };
                 if active.watch.request_id != dispatch_id {
                     return;
@@ -134,28 +139,33 @@ impl AppState {
     }
 
     pub(crate) fn check_rewinds(&mut self, cx: &mut Context<Self>) {
-        let Some(projection) = self.thread.projection.as_ref() else { return };
-        let thread_id = projection.thread.id.clone();
-        let Some(ThreadRewindPhase::Active(active)) = self.rewinds.get(&thread_id) else { return };
-        match rewind_progress(&active.watch, projection) {
-            RewindProgress::Failed(message) => {
-                self.fail_rewind(thread_id, message, cx);
-            }
-            RewindProgress::Done if active.accepted => {
-                let Some(ThreadRewindPhase::Active(active)) = self.rewinds.remove(&thread_id) else { return };
-                let prompt = recallable_prompt(&active.text);
-                self.restore_composer_prompt(&thread_id, prompt, active.attachments, cx);
-                cx.emit(AppEvent::Rewind);
-                cx.notify();
-            }
-            RewindProgress::Pending if active._timeout.is_none() && self.selected_thread.as_deref() == Some(thread_id.as_str()) => {
-                let command_id = active.watch.request_id.clone();
-                let timeout = self.arm_rewind_timeout(&thread_id, &command_id, cx);
-                if let Some(ThreadRewindPhase::Active(active)) = self.rewinds.get_mut(&thread_id) {
-                    active._timeout = Some(timeout);
+        let ids: Vec<String> = self.rewinds.keys().cloned().collect();
+        for thread_id in ids {
+            let Some(ThreadRewindPhase::Active(active)) = self.rewinds.get(&thread_id) else { continue };
+            let Some(projection) = self.thread_state(&thread_id).projection.as_ref() else { continue };
+            let progress = rewind_progress(&active.watch, projection);
+            let accepted = active.accepted;
+            let needs_timeout = active._timeout.is_none() && self.is_thread_watched(&thread_id);
+            let request_id = active.watch.request_id.clone();
+            match progress {
+                RewindProgress::Failed(message) => {
+                    self.fail_rewind(thread_id, message, cx);
                 }
+                RewindProgress::Done if accepted => {
+                    let Some(ThreadRewindPhase::Active(active)) = self.rewinds.remove(&thread_id) else { continue };
+                    let prompt = recallable_prompt(&active.text);
+                    self.restore_composer_prompt(&thread_id, prompt, active.attachments, cx);
+                    cx.emit(AppEvent::Rewind);
+                    cx.notify();
+                }
+                RewindProgress::Pending if needs_timeout => {
+                    let timeout = self.arm_rewind_timeout(&thread_id, &request_id, cx);
+                    if let Some(ThreadRewindPhase::Active(active)) = self.rewinds.get_mut(&thread_id) {
+                        active._timeout = Some(timeout);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -364,6 +374,8 @@ impl ThreadView {
             state.rewinds.insert(thread_id.clone(), ThreadRewindPhase::Preparing { generation });
             cx.emit(AppEvent::Rewind);
             cx.notify();
+            let start_env = state.environments.active.clone();
+            let start_connection = state.connection_id();
             let runtime = state.runtime().clone();
             let task = runtime.spawn(async move { prepare_reverted_attachments(&client, &specs).await });
             let prep_thread = thread_id.clone();
@@ -371,6 +383,12 @@ impl ThreadView {
                 let fetched = task.await.unwrap_or_else(|_| Err(REWIND_FAILED.to_owned()));
                 let _ = this.update(cx, |state, cx| {
                     if !matches!(state.rewinds.get(&prep_thread), Some(ThreadRewindPhase::Preparing { generation: g }) if *g == generation) {
+                        return;
+                    }
+                    if state.environments.active != start_env || state.connection_id() != start_connection {
+                        state.rewinds.remove(&prep_thread);
+                        cx.emit(AppEvent::Rewind);
+                        cx.notify();
                         return;
                     }
                     let attachments = match fetched {
@@ -860,6 +878,9 @@ mod tests {
             composer.update(cx, |composer, cx| {
                 assert!(composer.is_rewinding(cx));
                 assert!(!composer.can_attach(cx));
+                composer.toggle_picker(window, cx);
+                composer.open_permissions(window, cx);
+                composer.open_workspace(window, cx);
                 composer.stash_prompt(window, cx);
                 assert_eq!(composer.test_prompt(cx), "Current draft", "stash must not clear prompt while rewinding");
                 composer.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
@@ -928,6 +949,153 @@ mod tests {
         });
 
         server_task.abort();
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn side_chat_rewind_restores_embedded_composer_without_stealing_and_clears_on_env_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (state, mut fixture, runtime, window) = setup_rewind_test(cx, Vec::new());
+        let side_projection: t3_core::thread::ThreadProjection = serde_json::from_str(r#"{
+            "thread": {
+                "id": "side-t", "projectId": "checkout-b", "title": "side-t",
+                "providerInstanceId": "replay",
+                "activeProviderThreadId": "pt-side",
+                "modelSelection": { "instanceId": "replay", "model": "replay" },
+                "runtimeMode": "full-access", "interactionMode": "default",
+                "lineage": { "rootThreadId": "menu-thread", "parentThreadId": "menu-thread", "sideChat": true },
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+            },
+            "runs": [{
+                "id": "run-side-1", "ordinal": 1, "providerInstanceId": "replay",
+                "modelSelection": { "instanceId": "replay", "model": "replay" },
+                "userMessageId": "msg-side-1", "rootNodeId": null,
+                "status": "completed", "requestedAt": "2026-01-01T00:00:01Z",
+                "startedAt": "2026-01-01T00:00:01Z", "completedAt": "2026-01-01T00:00:02Z"
+            }],
+            "attempts": [], "nodes": [], "subagents": [],
+            "providerSessions": [],
+            "providerThreads": [{ "id": "pt-side", "providerSessionId": "ps-1", "providerInstanceId": "replay" }],
+            "providerTurns": [],
+            "runtimeRequests": [], "messages": [], "plans": [], "turnItems": [],
+            "checkpointScopes": [],
+            "checkpoints": [
+                { "id": "cp-s0", "scopeId": "scope-s0", "runId": null, "appRunOrdinal": null, "ordinalWithinScope": 0, "status": "ready", "files": [], "capturedAt": "2026-01-01T00:00:00Z" },
+                { "id": "cp-s1", "scopeId": "scope-s1", "runId": "run-side-1", "appRunOrdinal": 1, "ordinalWithinScope": 1, "status": "ready", "files": [], "capturedAt": "2026-01-01T00:00:02Z" }
+            ],
+            "contextHandoffs": [], "contextTransfers": [],
+            "visibleTurnItems": [{
+                "position": 0,
+                "visibility": "local",
+                "sourceThreadId": "side-t",
+                "sourceItemId": "msg-side-1",
+                "item": {
+                    "id": "msg-side-1", "threadId": "side-t", "runId": "run-side-1", "nodeId": null,
+                    "providerThreadId": null, "providerTurnId": null, "nativeItemRef": null,
+                    "parentItemId": null, "ordinal": 1, "status": "completed",
+                    "title": null, "startedAt": "2026-01-01T00:00:01Z",
+                    "completedAt": "2026-01-01T00:00:01Z", "updatedAt": "2026-01-01T00:00:01Z",
+                    "type": "user_message",
+                    "messageId": "msg-side-1",
+                    "text": "Side prompt",
+                    "attachments": [],
+                    "inputIntent": "turn_start"
+                }
+            }],
+            "updatedAt": "2026-01-01T00:00:02Z"
+        }"#)
+        .unwrap();
+        let mut side_thread_state = t3_core::thread::ThreadState::default();
+        side_thread_state.projection = Some(side_projection.clone());
+        side_thread_state.synchronized = true;
+        state.update(cx, |state, cx| {
+            let side_shell: t3_core::shell::ThreadShell = serde_json::from_value(json!({
+                "id": "side-t", "projectId": "checkout-b", "title": "side-t",
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:02Z",
+                "providerInstanceId": "replay", "modelSelection": { "instanceId": "replay", "model": "replay" },
+                "runtimeMode": "full-access", "interactionMode": "default",
+                "lineage": { "rootThreadId": "menu-thread", "parentThreadId": "menu-thread", "sideChat": true },
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+            }))
+            .unwrap();
+            state.shell.snapshot.as_mut().unwrap().threads.push(side_shell);
+            state.side_threads.insert_for_test("side-t".into(), side_thread_state);
+            state.panels.panels.open("menu-thread", t3_core::right_panel::Surface::side_chat("side-t"));
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::SideThread);
+        });
+        let main_composer = window.read_with(cx, |h, _| h.composer.clone()).unwrap();
+        let side_window = cx.open_window(size(px(500.), px(600.)), |window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::embedded(state.clone(), "side-t".into(), window, cx));
+            let view = cx.new(|cx| {
+                let mut view = ThreadView::embedded(state.clone(), "side-t".into(), window, cx);
+                view.sync(cx);
+                view
+            });
+            RewindHarness { view, composer }
+        });
+        let (side_view, side_composer) = side_window.read_with(cx, |h, _| (h.view.clone(), h.composer.clone())).unwrap();
+        let _ = side_window.update(cx, |_, window, cx| {
+            side_view.update(cx, |view, cx| {
+                view.request_rewind("msg-side-1", 0, "Side prompt", window, cx);
+                view.confirm_rewind(false, window, cx);
+                assert!(view.is_rewind_busy(cx));
+            });
+        });
+
+        let (method, _, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        let _ = reply.send(Ok(json!({})));
+        cx.run_until_parked();
+
+        // Deliver the side-chat rollback projection update; embedded side composer must receive it, not main composer.
+        let mut rolled_back = side_projection;
+        rolled_back.runs[0].status = "rolled_back".to_owned();
+        state.update(cx, |state, cx| {
+            state.apply_batch(
+                vec![t3_client::supervisor::ClientEvent::Thread {
+                    thread_id: "side-t".into(),
+                    item: Box::new(t3_core::thread::ThreadStreamItem::Snapshot {
+                        snapshot_sequence: 2,
+                        projection: Box::new(rolled_back),
+                        has_more_history: Some(false),
+                        history_cursor: None,
+                        latest_local_turn_ordinal: None,
+                        turn_items_omit_local_visible: Some(false),
+                    }),
+                }],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        side_view.read_with(cx, |view, cx| assert!(!view.is_rewind_busy(cx)));
+        side_composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.test_prompt(cx), "Side prompt");
+        });
+        main_composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.test_prompt(cx), "");
+        });
+
+        // Switching/clearing environment state wipes rewinds, rewind_errors, and pending composer_restores.
+        state.update(cx, |state, cx| {
+            state.rewinds.insert("side-t".into(), ThreadRewindPhase::Preparing { generation: 99 });
+            state.rewind_errors.insert("side-t".into(), "stale".into());
+            state.restore_composer_prompt("other", "stale".to_string(), Vec::new(), cx);
+            state.clear_connection_state(cx);
+            assert!(state.rewinds.is_empty());
+            assert!(state.rewind_errors.is_empty());
+            assert!(state.take_composer_restore("other").is_none());
+        });
+
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();

@@ -217,7 +217,7 @@ impl Composer {
     }
 
     pub(super) fn submit_plan_follow_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sending || self.snapshot.setup_blocks_send {
+        if self.sending || self.is_rewinding(cx) || self.snapshot.setup_blocks_send {
             return;
         }
         let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
@@ -293,7 +293,7 @@ impl Composer {
     }
 
     pub(super) fn submit_plan_in_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sending || self.snapshot.setup_blocks_send {
+        if self.sending || self.is_rewinding(cx) || self.snapshot.setup_blocks_send {
             return;
         }
         let Some(plan) = self.active_plan_follow_up(cx).cloned() else { return };
@@ -636,6 +636,9 @@ impl Composer {
     }
 
     pub(super) fn respond_to_approval(&mut self, request_id: String, decision: ApprovalDecision, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
         if !self.snapshot.pending.approvals.iter().any(|approval| approval.request_id == request_id && approval.live) {
             return;

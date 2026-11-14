@@ -350,8 +350,16 @@ impl Composer {
                 if *event == AppEvent::Rewind {
                     if this.is_rewinding(cx) {
                         let _ = this.cancel_pending_send();
+                        this.picker_open = false;
+                        this.permissions_open = false;
+                        this.approval_menu_open = false;
+                        this.plan_menu_open = false;
+                        this.workspace.open = false;
+                        this.close_stash_menu(cx);
+                        let _ = this.close_context_details(cx);
                     }
                     this.sync_input_state(window, cx);
+                    this.restore_prompt(window, cx);
                     cx.notify();
                 }
                 if *event == AppEvent::RemoveReviewComment
@@ -560,6 +568,7 @@ impl Composer {
         self.attachment_fixture(cx);
         self.sync_queued_edit(window, cx);
         self.sync_answering(window, cx);
+        self.restore_prompt(window, cx);
         self.sync_menu(true, cx);
         // The provider, its skills or the compact rule may have changed under the open menu.
         if self.menu_open() {
@@ -684,7 +693,7 @@ impl Composer {
     }
 
     pub fn toggle_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.snapshot.target.is_none() {
+        if self.snapshot.target.is_none() || self.is_rewinding(cx) {
             return;
         }
         self.picker_open = !self.picker_open;
@@ -700,7 +709,7 @@ impl Composer {
 
     /// `composer.mode`: the permissions chip when it shows, else the model picker that holds them.
     pub fn open_permissions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.snapshot.target.is_none() {
+        if self.snapshot.target.is_none() || self.is_rewinding(cx) {
             return;
         }
         let resolved = self.resolve(cx);
@@ -714,6 +723,10 @@ impl Composer {
     }
 
     fn on_picker(&mut self, event: &PickerEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            self.picker_open = false;
+            return;
+        }
         match event {
             PickerEvent::Model { instance_id, model } => {
                 let selection = ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None };
@@ -747,6 +760,9 @@ impl Composer {
     }
 
     fn set_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         if let Some(choices) = self.choices_mut() {
             choices.runtime_mode = Some(mode);
         }
@@ -757,6 +773,9 @@ impl Composer {
 
     /// Shift+Tab: outdent the list item under the caret, else toggle plan mode.
     fn toggle_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let edit = {
             let input = self.input.read(cx);
             let range = input.selected_range();
@@ -807,31 +826,19 @@ impl Composer {
 
     /// "Edit from here": the restored prompt and attachments join the draft (`rewindToMessage`), cursor at the end.
     fn restore_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let restores = if let Some(fixed) = self.fixed.clone() {
-            self.state
-                .update(cx, |state, _| state.take_composer_restore(&fixed))
-                .into_iter()
-                .map(|(prompt, attachments)| (fixed.clone(), prompt, attachments))
-                .collect()
-        } else {
-            self.state.update(cx, |state, _| state.drain_composer_restores())
-        };
-        if restores.is_empty() {
+        if self.answering.is_some() {
             return;
         }
-        let active_thread = self.thread_id();
-        for (thread_id, restored, attachments) in restores {
-            if active_thread.as_deref() == Some(thread_id.as_str()) {
-                if !restored.is_empty() {
-                    let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
-                    self.set_prompt(&prompt, window, cx);
-                }
-                self.restore_reverted_attachments(&thread_id, attachments, cx);
-                self.focus(window, cx);
-            } else {
-                self.merge_off_thread_restore(&thread_id, &restored, attachments, cx);
-            }
+        let Some(thread_id) = self.thread_id() else { return };
+        let Some((restored, attachments)) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else {
+            return;
+        };
+        if !restored.is_empty() {
+            let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
+            self.set_prompt(&prompt, window, cx);
         }
+        self.restore_reverted_attachments(&thread_id, attachments, cx);
+        self.focus(window, cx);
         cx.notify();
     }
 

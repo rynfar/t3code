@@ -147,7 +147,7 @@ impl Composer {
     }
 
     pub(crate) fn open_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.workspace_enabled() {
+        if self.is_rewinding(cx) || !self.workspace_enabled() {
             if self.workspace.open {self.workspace.open = false; cx.notify();}
             return;
         }
@@ -217,6 +217,9 @@ impl Composer {
     }
 
     pub(crate) fn use_previous_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         self.sync_workspace(false, cx);
         if !self.workspace.is_repo {
             return;
@@ -243,7 +246,7 @@ impl Composer {
         };
         let tooltip = previous.map(|seed| seed.branch.as_deref().unwrap_or(&seed.worktree_path)).unwrap_or(label);
         let tooltip = crate::keymap::label("composer.workspace", cx).map_or(tooltip.to_owned(), |shortcut| format!("{tooltip} · {shortcut}"));
-        let enabled = self.workspace_enabled();
+        let enabled = self.workspace_enabled() && !self.is_rewinding(cx);
         let mut popup = menu_surface(cx)
             .w(px(336.))
             .occlude()

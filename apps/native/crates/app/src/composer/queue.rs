@@ -56,7 +56,7 @@ impl Composer {
 
     fn send_queued_now(&mut self, run_id: String, cx: &mut Context<Self>) {
         let Some(thread_id) = self.thread_id() else { return };
-        if self.queue.busy.is_some() {
+        if self.queue.busy.is_some() || self.is_rewinding(cx) {
             return;
         }
         let Some(command) = rules::send_now(&self.snapshot.queue, &uuid_v4(), &thread_id, &run_id) else { return };
@@ -65,7 +65,7 @@ impl Composer {
 
     fn remove_queued(&mut self, run_id: String, cx: &mut Context<Self>) {
         let Some(thread_id) = self.thread_id() else { return };
-        if self.queue.busy.is_some() {
+        if self.queue.busy.is_some() || self.is_rewinding(cx) {
             return;
         }
         let command = rules::cancel_queued_run(&uuid_v4(), &thread_id, &run_id);
@@ -74,6 +74,9 @@ impl Composer {
 
     /// Opens a queued message in the composer, setting the thread's draft aside.
     fn begin_queued_edit(&mut self, run: &QueuedRun, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some(thread_id) = self.thread_id() else { return };
         if !run.editable || rules::edit_blocked_reason(self.snapshot.pending.user_inputs.len()).is_some() {
             return;
@@ -120,6 +123,9 @@ impl Composer {
 
     /// Send while editing saves the queued message in place.
     pub(super) fn save_queued_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some(editing) = self.queue.editing.clone() else { return };
         let prompt = self.prompt(cx).trim().to_owned();
         if prompt.is_empty() && !editing.has_attachments {
@@ -158,7 +164,7 @@ impl Composer {
         let visible = if collapsible && !self.queue.show_all { &queue.queued[..rules::VISIBLE_ROWS - 1] } else { &queue.queued[..] };
         let blocked = rules::edit_blocked_reason(self.snapshot.pending.user_inputs.len());
         let editing_run = self.queue.editing.as_ref().map(|editing| editing.run_id.as_str());
-        let busy = self.queue.busy.is_some();
+        let busy = self.queue.busy.is_some() || self.is_rewinding(cx);
         let rows = visible.iter().enumerate().map(|(position, run)| {
             let editing = editing_run == Some(run.run_id.as_str());
             let preview = rules::preview_text(run);
@@ -205,7 +211,13 @@ impl Composer {
                         this.child(div().px(px(4.)).text_color(hsla(p.foreground)).child("Editing in the composer")).child(
                             Button::new(("queued-cancel-edit", position), ButtonVariant::Ghost, ButtonSize::Xs)
                                 .label("Cancel")
-                                .on_click(cx.listener(|this, _, window, cx| this.cancel_queued_edit(window, cx))),
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if this.is_rewinding(cx) {
+                                        return;
+                                    }
+                                    this.cancel_queued_edit(window, cx);
+                                })),
                         )
                     } else {
                         this.child(

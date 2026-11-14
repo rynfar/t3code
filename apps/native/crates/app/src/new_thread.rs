@@ -217,6 +217,7 @@ pub struct DraftHero {
     heading_width: Rc<Cell<f32>>,
     dismissed: Option<Instant>,
     triage_copied_until: Option<Instant>,
+    scratch_request: u64,
     search: Option<Entity<InputState>>,
     search_sub: Option<Subscription>,
     order: RefCell<Vec<String>>,
@@ -224,19 +225,23 @@ pub struct DraftHero {
     scroll: ScrollHandle,
     popup_focus: FocusHandle,
     return_focus: Option<FocusHandle>,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DraftHero {
     pub fn new(state: Entity<AppState>, composer: Entity<Composer>, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
-            if matches!(event, AppEvent::Selection | AppEvent::Shell) {
-                this.projects_open = false;
-                this.order.borrow_mut().clear();
-                this.highlighted = None;
-                cx.notify();
-            }
-        });
+        let subscriptions = vec![
+            cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Selection | AppEvent::Shell) {
+                    this.projects_open = false;
+                    this.scratch_request = this.scratch_request.wrapping_add(1);
+                    this.order.borrow_mut().clear();
+                    this.highlighted = None;
+                    cx.notify();
+                }
+            }),
+            cx.observe(&composer, |_, _, cx| cx.notify()),
+        ];
         DraftHero {
             state,
             composer,
@@ -246,6 +251,7 @@ impl DraftHero {
             heading_width: Rc::new(Cell::new(0.)),
             dismissed: None,
             triage_copied_until: None,
+            scratch_request: 0,
             search: None,
             search_sub: None,
             order: RefCell::new(Vec::new()),
@@ -253,7 +259,7 @@ impl DraftHero {
             scroll: ScrollHandle::new(),
             popup_focus: cx.focus_handle(),
             return_focus: None,
-            _subscription: subscription,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -429,6 +435,7 @@ impl DraftHero {
     }
 
     fn select_entry(&mut self, entry: HeroPickerEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.scratch_request = self.scratch_request.wrapping_add(1);
         self.close_picker(Some(window), false, cx);
         let (current, active_env) = {
             let app = self.state.read(cx);
@@ -495,9 +502,14 @@ impl DraftHero {
         if !scratch_ready {
             return;
         }
+        self.scratch_request = self.scratch_request.wrapping_add(1);
+        let request_id = self.scratch_request;
         cx.spawn_in(window, async move |this, cx| {
             let result = rpc.await;
             let _ = this.update_in(cx, |hero, window, cx| {
+                if hero.scratch_request != request_id {
+                    return;
+                }
                 match result.as_ref().ok().and_then(t3_core::home::ensure_scratch_project_id) {
                     Some(scratch_id) => {
                         let app = hero.state.read(cx);
@@ -610,6 +622,7 @@ impl DraftHero {
                     .child(
                         h_flex()
                             .id("triage-machine-label")
+                            .debug_selector(|| "triage-machine-label".to_owned())
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
@@ -976,7 +989,6 @@ impl Render for DraftHero {
         let app = self.state.read(cx);
         let project = app.draft_project.as_deref().and_then(|id| app.shell.project(id)).map(|project| (project.id.clone(), project.title.clone()));
         let scratch_draft = project.as_ref().is_some_and(|(id, _)| app.is_scratch_project(id));
-        let has_resolved = project.is_some() && !scratch_draft;
         let scratch_available = app.scratch_root().is_some();
         let shortcut = crate::keymap::label("chat.newWithoutProject", cx);
         let viewport_width = f32::from(window.viewport_size().width);
@@ -1076,10 +1088,11 @@ impl Render for DraftHero {
             None
         } else if scratch_draft {
             Some(self.picker_trigger("No project".into(), None, can_choose, cx))
-        } else if has_resolved || can_choose {
+        } else {
             Some(
                 div()
                     .id("draft-without-project")
+                    .debug_selector(|| "draft-without-project".to_owned())
                     .cursor_pointer()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(hsla(p.muted_foreground))
@@ -1089,8 +1102,6 @@ impl Render for DraftHero {
                     .on_click(cx.listener(|this, _, window, cx| this.start_without_project(window, cx)))
                     .into_any_element(),
             )
-        } else {
-            None
         };
 
         v_flex()
@@ -1140,11 +1151,14 @@ mod tests {
     struct HeroHarness {
         hero: Entity<DraftHero>,
         composer: Entity<crate::composer::Composer>,
+        render_hero: bool,
+        unfocus: FocusHandle,
     }
 
     impl Render for HeroHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
+            let _ = &self.unfocus;
+            if self.render_hero { div().size_full().child(self.hero.clone()) } else { div() }
         }
     }
 
@@ -1160,7 +1174,9 @@ mod tests {
         let window = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let hero = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
-            HeroHarness { hero, composer }
+            let unfocus = cx.focus_handle();
+            window.focus(&unfocus, cx);
+            HeroHarness { hero, composer, render_hero: false, unfocus }
         });
         (state, fixture, runtime, window)
     }
@@ -1244,22 +1260,45 @@ mod tests {
     }
 
     #[gpui::test]
-    fn draft_hero_heading_and_empty_projects_follow_width_and_pickability(cx: &mut gpui::TestAppContext) {
-        let (state, fixture, runtime, window) = open_hero_harness(cx);
-        let hero = window.read_with(cx, |harness, _| harness.hero.clone()).unwrap();
-        let _ = window.update(cx, |_, window, cx| {
+    async fn draft_hero_heading_and_empty_projects_follow_width_and_pickability(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (harness, vcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let hero = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
+            let unfocus = cx.focus_handle();
+            window.focus(&unfocus, cx);
+            HeroHarness { hero, composer, render_hero: true, unfocus }
+        });
+        let (hero, composer, unfocus) = harness.read_with(vcx, |h, _| (h.hero.clone(), h.composer.clone(), h.unfocus.clone()));
+        vcx.update(|window, cx| {
             let short = inline_heading_width("Alpha", window, cx);
             let long = inline_heading_width(&"SuperLongProjectName".repeat(6), window, cx);
             assert!(short < 600., "short project fits inline inside desktop container: {short}");
             assert!(long > 1024., "very long project overflows max-w-5xl container: {long}");
 
-            // Clear all projects -> entries() is empty (canChooseProject == false)
+            // Clear all non-scratch projects (`can_choose == false`), keep scratch root: `"or start without a project"` still renders.
             state.update(cx, |state, cx| {
                 state.fleet = std::sync::Arc::new(Default::default());
                 state.sidebar.grouping_projects.clear();
+                let scratch_root = "/tmp/t3-scratch".to_owned();
+                state.server_config.config = Some(serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "fixture-env", "label": "Fixture", "platform": "darwin", "homeDir": "/tmp", "capabilities": {}, "serverVersion": "1.2.3" },
+                    "providers": [],
+                    "auth": {},
+                    "scratchWorkspaceRoot": scratch_root
+                })).unwrap());
                 if let Some(snapshot) = state.shell.snapshot.as_mut() {
                     snapshot.projects.clear();
                 }
+                state.draft_project = None;
                 state.clear_selection(cx);
             });
             let (entries, _) = hero.read(cx).entries(cx);
@@ -1267,8 +1306,102 @@ mod tests {
             let (rows, _) = hero.read(cx).visible_rows(cx);
             assert_eq!(rows.len(), 1);
             assert!(matches!(rows[0], PickerRow::AddProject));
+        });
+        vcx.update(|window, cx| {
+            window.focus(&unfocus, cx);
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("draft-without-project").is_some(), "scratch CTA shows even when 0 non-scratch projects exist");
 
-            // Triage prompt detection + copy state.
+        // Triage hero reacts live to composer edits on a scratch draft.
+        harness.update(vcx, |h, _| h.render_hero = false);
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                if let Some(snapshot) = state.shell.snapshot.as_mut() {
+                    snapshot.projects.push(t3_core::shell::ProjectShell {
+                        id: "scratch-proj".into(),
+                        title: "Scratch".into(),
+                        workspace_root: "/tmp/t3-scratch".into(),
+                        repository_identity: None,
+                        default_model_selection: None,
+                        pinned_at: None,
+                        archived_at: None,
+                        favicon_path: None,
+                        project_icon: None,
+                        scripts: Vec::new(),
+                        created_at: "2026-04-01T00:00:00.000Z".into(),
+                        updated_at: "2026-04-01T00:00:00.000Z".into(),
+                    });
+                }
+                state.start_draft("scratch-proj", cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            harness.update(cx, |h, cx| {
+                h.render_hero = true;
+                cx.notify();
+            });
+            composer.update(cx, |composer, cx| {
+                composer.set_test_prompt("See [triage-playbook.md](file:///tmp/triage-playbook.md)", window, cx);
+            });
+            window.focus(&unfocus, cx);
+        });
+        vcx.update(|window, cx| {
+            window.focus(&unfocus, cx);
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("triage-machine-label").is_some(), "editing composer to triage prompt activates TriageDraftHero live");
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_test_prompt("Regular prompt", window, cx);
+            });
+            window.focus(&unfocus, cx);
+        });
+        vcx.update(|window, cx| {
+            window.focus(&unfocus, cx);
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("triage-machine-label").is_none(), "clearing triage prompt leaves TriageDraftHero live");
+        harness.update(vcx, |h, _| h.render_hero = false);
+
+        // `start_without_project` drops stale RPC results if the user selects away before ensureScratch replies.
+        vcx.update(|window, cx| {
+            state.update(cx, |state, cx| state.clear_selection(cx));
+            hero.update(cx, |hero, cx| {
+                hero.start_without_project(window, cx);
+                let token_during = hero.scratch_request;
+                hero.select_entry(
+                    HeroPickerEntry {
+                        key: "other".into(),
+                        project_id: "other-proj".into(),
+                        label: "Other".into(),
+                        pinned: false,
+                        owner: None,
+                        pin_target: None,
+                        env_badge: None,
+                        visual: ProjectVisual::default(),
+                    },
+                    window,
+                    cx,
+                );
+                assert_ne!(hero.scratch_request, token_during);
+            });
+        });
+        loop {
+            let (method, _, reply) = fixture.next_request().await;
+            if method == t3_core::home::PROJECTS_ENSURE_SCRATCH {
+                let _ = reply.send(Ok(serde_json::json!({ "projectId": "scratch-proj" })));
+                break;
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        }
+        vcx.run_until_parked();
+        state.read_with(vcx, |state, _| {
+            assert_eq!(state.draft_project.as_deref(), Some("other-proj"), "stale ensureScratch reply must not overwrite selection");
+        });
+
+        vcx.update(|_, cx| {
             assert!(is_triage_prompt("See [triage-playbook.md](file:///tmp/triage-playbook.md)"));
             assert!(!is_triage_prompt("Regular prompt"));
             hero.update(cx, |hero, cx| {
@@ -1281,6 +1414,7 @@ mod tests {
             );
         });
 
+        drop(vcx);
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();

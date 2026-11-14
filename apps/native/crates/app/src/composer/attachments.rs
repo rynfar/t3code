@@ -497,7 +497,7 @@ impl Composer {
 
     /// ⌘⇧V: the clipboard's text goes into the prompt as is, however large.
     pub(super) fn paste_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_question().is_some_and(|(request, question)| !question.allows_custom_answer() || self.question_responding(&request, cx)) { return; }
+        if self.is_rewinding(cx) || self.active_question().is_some_and(|(request, question)| !question.allows_custom_answer() || self.question_responding(&request, cx)) { return; }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
         self.input.update(cx, |input, cx| input.insert(text, window, cx));
     }
@@ -520,6 +520,7 @@ impl Composer {
             return None;
         }
         let p = palette(cx);
+        let rewinding = self.is_rewinding(cx);
         let images: Vec<&Staged> = staged.iter().filter(|staged| staged.attachment.kind == AttachmentKind::Image).collect();
         let files: Vec<&Staged> = staged.iter().filter(|staged| staged.attachment.kind == AttachmentKind::File).collect();
         let tiles = (!images.is_empty()).then(|| {
@@ -573,16 +574,20 @@ impl Composer {
                         let id = id.clone();
                         this.child(
                             div().absolute().top(px(4.)).left(px(4.)).child(
-                                media_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, cx)
+                                media_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, rewinding, cx)
                                     .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
-                                    .on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx))),
+                                    .when(!rewinding, |this| {
+                                        this.on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx)))
+                                    }),
                             ),
                         )
                     })
                     .child(
                         div().absolute().top(px(4.)).right(px(4.)).child(
-                            media_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, cx)
-                                .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx))),
+                            media_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, rewinding, cx)
+                                .when(!rewinding, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx)))
+                                }),
                         ),
                     )
             }))
@@ -608,14 +613,18 @@ impl Composer {
                     .when_some(failed_reason(attachment), |this, reason| {
                         let id = id.clone();
                         this.child(
-                            ghost_icon_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, cx)
+                            ghost_icon_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, rewinding, cx)
                                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
-                                .on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx))),
+                                .when(!rewinding, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx)))
+                                }),
                         )
                     })
                     .child(
-                        ghost_icon_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, cx)
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx))),
+                        ghost_icon_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, rewinding, cx)
+                            .when(!rewinding, |this| {
+                                this.on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx)))
+                            }),
                     )
             }))
         });
@@ -624,6 +633,9 @@ impl Composer {
 
     /// Drop target for files from Finder.
     pub(super) fn on_drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_attach(cx) {
+            return;
+        }
         self.attach_paths(paths.paths().to_vec(), window, cx);
         self.focus(window, cx);
     }
@@ -637,7 +649,7 @@ fn failed_reason(attachment: &Attachment) -> Option<SharedString> {
 }
 
 /// The `media-close` button on a thumbnail: a small dark circle (`icon-xs`, 24).
-fn media_button(id: SharedString, icon: Icon, _cx: &App) -> gpui::Stateful<gpui::Div> {
+fn media_button(id: SharedString, icon: Icon, disabled: bool, _cx: &App) -> gpui::Stateful<gpui::Div> {
     let white = gpui::white();
     div()
         .id(id)
@@ -649,13 +661,13 @@ fn media_button(id: SharedString, icon: Icon, _cx: &App) -> gpui::Stateful<gpui:
         .bg(gpui::black().opacity(0.65))
         .border_1()
         .border_color(white.opacity(0.2))
-        .cursor_pointer()
-        .hover(|this| this.bg(gpui::black().opacity(0.8)))
+        .when(disabled, |this| this.opacity(0.5))
+        .when(!disabled, |this| this.cursor_pointer().hover(|this| this.bg(gpui::black().opacity(0.8))))
         .child(icon.render(px(14.), white))
 }
 
 /// A ghost `icon-xs` button for a file row.
-fn ghost_icon_button(id: SharedString, icon: Icon, cx: &App) -> gpui::Stateful<gpui::Div> {
+fn ghost_icon_button(id: SharedString, icon: Icon, disabled: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let p = palette(cx);
     div()
         .id(id)
@@ -665,8 +677,8 @@ fn ghost_icon_button(id: SharedString, icon: Icon, cx: &App) -> gpui::Stateful<g
         .items_center()
         .justify_center()
         .rounded(px(6.))
-        .cursor_pointer()
-        .hover(|this| this.bg(hsla(p.accent)))
+        .when(disabled, |this| this.opacity(0.5))
+        .when(!disabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.accent))))
         .child(icon.render(px(14.), hsla(p.muted_foreground)))
 }
 
