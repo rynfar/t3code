@@ -347,6 +347,13 @@ impl Composer {
                 if *event == AppEvent::ComposerRestore {
                     this.restore_prompt(window, cx);
                 }
+                if *event == AppEvent::Rewind {
+                    if this.is_rewinding(cx) {
+                        let _ = this.cancel_pending_send();
+                    }
+                    this.sync_input_state(window, cx);
+                    cx.notify();
+                }
                 if *event == AppEvent::RemoveReviewComment
                     && let Some(thread_id) = this.thread_id()
                     && let Some(id) = this.state.update(cx, |state, _| state.take_removed_review_comment(&thread_id))
@@ -779,6 +786,14 @@ impl Composer {
         cx.notify();
     }
 
+    pub(crate) fn prompt_text(&self, cx: &App) -> String {
+        self.prompt(cx)
+    }
+
+    pub(crate) fn is_rewinding(&self, cx: &App) -> bool {
+        self.thread_id().is_some_and(|id| self.state.read(cx).is_thread_rewinding(&id))
+    }
+
     fn prompt(&self, cx: &App) -> String {
         self.input.read(cx).value().to_string()
     }
@@ -792,14 +807,31 @@ impl Composer {
 
     /// "Edit from here": the restored prompt and attachments join the draft (`rewindToMessage`), cursor at the end.
     fn restore_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.thread_id() else { return };
-        let Some((restored, attachments)) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else { return };
-        if !restored.is_empty() {
-            let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
-            self.set_prompt(&prompt, window, cx);
+        let restores = if let Some(fixed) = self.fixed.clone() {
+            self.state
+                .update(cx, |state, _| state.take_composer_restore(&fixed))
+                .into_iter()
+                .map(|(prompt, attachments)| (fixed.clone(), prompt, attachments))
+                .collect()
+        } else {
+            self.state.update(cx, |state, _| state.drain_composer_restores())
+        };
+        if restores.is_empty() {
+            return;
         }
-        self.restore_reverted_attachments(&thread_id, attachments, cx);
-        self.focus(window, cx);
+        let active_thread = self.thread_id();
+        for (thread_id, restored, attachments) in restores {
+            if active_thread.as_deref() == Some(thread_id.as_str()) {
+                if !restored.is_empty() {
+                    let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
+                    self.set_prompt(&prompt, window, cx);
+                }
+                self.restore_reverted_attachments(&thread_id, attachments, cx);
+                self.focus(window, cx);
+            } else {
+                self.merge_off_thread_restore(&thread_id, &restored, attachments, cx);
+            }
+        }
         cx.notify();
     }
 

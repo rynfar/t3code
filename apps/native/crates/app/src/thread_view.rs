@@ -138,6 +138,10 @@ impl ThreadView {
                 this.watch_banner_grants(cx);
                 this.sync_command_outputs(cx);
             },
+            AppEvent::Rewind => {
+                this.check_rewind(cx);
+                cx.notify();
+            }
             AppEvent::CitationSource => this.open_citation_source(cx),
             _ => {}
         });
@@ -1073,7 +1077,7 @@ impl ThreadView {
             fork_support: &self.fork_support,
             forking: &self.forking,
             revert_counts: &self.rewind.counts,
-            rewind_disabled: self.rewind.busy() || self.activity.is_working,
+            rewind_disabled: self.rewind.busy || self.activity.is_working,
             command_outputs: self.streams_output.then_some(&self.command_outputs),
             setup: &self.setup_env,
         };

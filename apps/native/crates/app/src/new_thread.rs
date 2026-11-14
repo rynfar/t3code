@@ -2,16 +2,17 @@
 //! new-thread controls, and the draft hero above the composer. Ports `resolveThreadActionProjectRef`
 //! and `startNewThreadFromContext` (`web/src/lib/chatThreadActions.ts`), `resolveDefaultProjectRef`
 //! (`web/src/hooks/useHandleNewThread.ts`), the project breadcrumb in `ChatHeader.tsx`, and
-//! `DraftHeroProjectHeading.tsx` and `DraftHeroHeadline.tsx` (the project picker, "or start without
-//! a project", and the scratch draft's "What should we work on?"). The draft's first send launches
-//! the thread (see `composer`). `TriageDraftHero` waits on the triage flow, which is not ported.
+//! `DraftHeroProjectHeading.tsx`, `DraftHeroHeadline.tsx`, and `TriageDraftHero.tsx` (the project
+//! picker, "or start without a project", the scratch draft's "What should we work on?", and the
+//! triage hero's "What went wrong?" + `npx t3 triage` copy prompt). The draft's first send
+//! launches the thread (see `composer`).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Point, Render,
+    AnyElement, App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Point, Render,
     ScrollHandle, SharedString, Styled, Subscription, TextRun, Window, actions, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
@@ -199,6 +200,13 @@ fn inline_heading_width(project_title: &str, window: &mut Window, cx: &App) -> f
     f32::from(shaped.width) + 16.
 }
 
+const TRIAGE_PROMPT_FILE_NAME: &str = "triage-playbook.md";
+const TRIAGE_CLI_COMMAND: &str = "npx t3 triage";
+
+fn is_triage_prompt(prompt: &str) -> bool {
+    prompt.contains(&format!("[{TRIAGE_PROMPT_FILE_NAME}]("))
+}
+
 /// The draft's page: "What should we build in <project>?" over the composer, centered.
 pub struct DraftHero {
     state: Entity<AppState>,
@@ -208,6 +216,7 @@ pub struct DraftHero {
     trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     heading_width: Rc<Cell<f32>>,
     dismissed: Option<Instant>,
+    triage_copied_until: Option<Instant>,
     search: Option<Entity<InputState>>,
     search_sub: Option<Subscription>,
     order: RefCell<Vec<String>>,
@@ -236,6 +245,7 @@ impl DraftHero {
             trigger_bounds: Rc::new(Cell::new(None)),
             heading_width: Rc::new(Cell::new(0.)),
             dismissed: None,
+            triage_copied_until: None,
             search: None,
             search_sub: None,
             order: RefCell::new(Vec::new()),
@@ -490,8 +500,10 @@ impl DraftHero {
             let _ = this.update_in(cx, |hero, window, cx| {
                 match result.as_ref().ok().and_then(t3_core::home::ensure_scratch_project_id) {
                     Some(scratch_id) => {
-                        let same_draft = hero.state.read(cx).draft_project == from_project
-                            && hero.state.read(cx).environments.active == active_env;
+                        let app = hero.state.read(cx);
+                        let same_draft = app.selected_thread.is_none()
+                            && app.draft_project == from_project
+                            && app.environments.active == active_env;
                         if !same_draft {
                             return;
                         }
@@ -525,6 +537,112 @@ impl DraftHero {
         let Some(pin_target) = entry.pin_target else { return false };
         self.toggle_pin(pin_target, !entry.pinned, cx);
         true
+    }
+
+    fn copy_triage_command(&mut self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(TRIAGE_CLI_COMMAND.to_owned()));
+        let until = Instant::now() + Duration::from_millis(1500);
+        self.triage_copied_until = Some(until);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |hero, cx| {
+                if hero.triage_copied_until == Some(until) {
+                    hero.triage_copied_until = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_triage_hero(&self, heading_size: Pixels, heading_lh: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let app = self.state.read(cx);
+        let machine_label = app
+            .active_environment()
+            .map(|env| env.label.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "This machine".to_owned());
+        let server_version = app
+            .server_config
+            .config
+            .as_ref()
+            .map(|config| config.environment.server_version.clone())
+            .filter(|version| !version.is_empty());
+        let copied = self.triage_copied_until.is_some_and(|until| Instant::now() < until);
+        let mono = crate::theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx);
+        let copy_row = if copied {
+            div().child("Copied").into_any_element()
+        } else {
+            h_flex()
+                .items_baseline()
+                .gap(px(4.))
+                .child("or run")
+                .child(div().font_family(mono).text_xs().child(TRIAGE_CLI_COMMAND))
+                .into_any_element()
+        };
+
+        v_flex()
+            .w_full()
+            .max_w(px(HEADING_MAX_WIDTH))
+            .mx_auto()
+            .px(px(48.))
+            .items_center()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_center()
+                    .text_size(heading_size)
+                    .line_height(heading_lh)
+                    .text_color(hsla(p.foreground))
+                    .child("What went wrong?"),
+            )
+            .child(
+                h_flex()
+                    .mt(px(8.))
+                    .h(px(24.))
+                    .w_full()
+                    .justify_center()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_sm()
+                    .child(
+                        h_flex()
+                            .id("triage-machine-label")
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.foreground))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("The agent reads T3 Code's logs and source here, and asks before it applies a fix or posts anything.")
+                                    .build(window, cx)
+                            })
+                            .child(machine_label)
+                            .when_some(server_version, |this, version| {
+                                this.child(
+                                    div()
+                                        .ml(px(6.))
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(hsla(p.muted_foreground))
+                                        .child(format!("v{version}")),
+                                )
+                            }),
+                    )
+                    .child(div().text_color(hsla(p.muted_foreground)).child("·"))
+                    .child(
+                        div()
+                            .id("triage-copy-command")
+                            .cursor_pointer()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.muted_foreground))
+                            .hover(|this| this.underline().text_color(hsla(p.foreground)))
+                            .tooltip(|window, cx| Tooltip::new("Copy command, for a terminal").build(window, cx))
+                            .child(copy_row)
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_triage_command(cx))),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The project picker trigger (`InlineButton tone="picker"`), or dotted "Add a project" trigger
@@ -866,6 +984,18 @@ impl Render for DraftHero {
         let (heading_size, heading_lh) = if large_heading { (px(30.), px(36.)) } else { (px(24.), px(32.)) };
         let heading_width = self.heading_width.clone();
         let view_id = cx.entity_id();
+        let triage_hero = scratch_draft && is_triage_prompt(&self.composer.read(cx).prompt_text(cx));
+
+        if triage_hero {
+            let hero_block = self.render_triage_hero(heading_size, heading_lh, cx);
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .child(hero_block)
+                .child(div().h(px(16.)))
+                .child(self.composer.clone())
+                .children(self.render_popup(cx));
+        }
 
         let headline = match &project {
             Some((_, title)) if !scratch_draft => {
@@ -1137,6 +1267,18 @@ mod tests {
             let (rows, _) = hero.read(cx).visible_rows(cx);
             assert_eq!(rows.len(), 1);
             assert!(matches!(rows[0], PickerRow::AddProject));
+
+            // Triage prompt detection + copy state.
+            assert!(is_triage_prompt("See [triage-playbook.md](file:///tmp/triage-playbook.md)"));
+            assert!(!is_triage_prompt("Regular prompt"));
+            hero.update(cx, |hero, cx| {
+                hero.copy_triage_command(cx);
+                assert!(hero.triage_copied_until.is_some());
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(TRIAGE_CLI_COMMAND.to_owned())
+            );
         });
 
         state.update(cx, |state, _| state.stop_pump());

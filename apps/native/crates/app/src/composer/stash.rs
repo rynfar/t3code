@@ -46,6 +46,7 @@ impl Composer {
     }
 
     pub(super) fn toggle_stash_menu(&mut self, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) { return; }
         self.stash_state.open = !self.stash_state.open;
         self.stash_state.highlighted = None;
         cx.notify();
@@ -60,13 +61,13 @@ impl Composer {
     }
 
     /// Mod+S (`handleStashShortcut`, `stashCurrentPrompt`).
-    pub(super) fn stash_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn stash_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.snapshot.target.clone() else { return };
         if !self.snapshot.pending.user_inputs.is_empty() {
             self.toggle_stash_menu(cx);
             return;
         }
-        if self.editing_queued().is_some() || self.sending {
+        if self.editing_queued().is_some() || self.sending || self.is_rewinding(cx) {
             return;
         }
         let prompt = self.prompt(cx).trim().to_owned();
@@ -120,6 +121,7 @@ impl Composer {
     /// Restores an entry into the open target: the prompt joins what is typed, its mentions and
     /// attachments come back, and it leaves the stash.
     pub(super) fn restore_stash_entry(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) { return; }
         let Some(target) = self.snapshot.target.clone() else { return };
         let Some(entry) = self.stash_state.store.take(id) else { return };
         self.save_stash();
@@ -141,6 +143,7 @@ impl Composer {
     }
 
     fn delete_stash_entry(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) { return; }
         if let Some(entry) = self.stash_state.store.take(id) {
             self.release_saved(&entry.attachments, cx);
             self.save_stash();
@@ -213,7 +216,7 @@ impl Composer {
     /// `ComposerStashBadge`: the shoulder tab over the card while anything is stashed.
     pub(super) fn render_stash_badge(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let count = self.stash_state.store.entries.len();
-        if count == 0 || self.menu_open() {
+        if count == 0 || self.menu_open() || self.is_rewinding(cx) {
             return None;
         }
         let p = palette(cx);
@@ -243,7 +246,7 @@ impl Composer {
 
     /// `ComposerStashMenu`: the stashed prompts as an attached list.
     pub(super) fn render_stash_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.stash_state.open || self.menu_open() {
+        if !self.stash_state.open || self.menu_open() || self.is_rewinding(cx) {
             return None;
         }
         let p = palette(cx);

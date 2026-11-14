@@ -55,9 +55,10 @@ impl Composer {
     /// Placeholder and disabled state follow what the agent waits on; written only on change.
     pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placeholder = self.placeholder(cx);
-        let disabled = self.active_question().is_some_and(|(request_id, question)| {
-            !question.allows_custom_answer() || self.question_responding(&request_id, cx)
-        });
+        let disabled = self.is_rewinding(cx)
+            || self.active_question().is_some_and(|(request_id, question)| {
+                !question.allows_custom_answer() || self.question_responding(&request_id, cx)
+            });
         if self.input_state == Some((placeholder, disabled)) {
             return;
         }
@@ -95,7 +96,7 @@ impl Composer {
                     .max_label_width(224.)
                     .suffix(suffix)
                     .pressed(self.picker_open)
-                    .disabled(self.sending)
+                    .disabled(self.sending || self.is_rewinding(cx))
                     .tooltip(tooltip)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if Self::guard_reopen(&mut this.picker_dismissed) {
@@ -211,7 +212,7 @@ impl Composer {
             return stop().into_any_element();
         }
         if !running && !editing_queued && self.active_plan_follow_up(cx).is_some() && (self.has_text || !self.snapshot.can_resume) {
-            let disabled = self.sending || resolved.model.is_none() || self.snapshot.setup_blocks_send;
+            let disabled = self.sending || self.is_rewinding(cx) || resolved.model.is_none() || self.snapshot.setup_blocks_send;
             return self.render_plan_primary(self.has_text, disabled, cx);
         }
         let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
@@ -226,11 +227,13 @@ impl Composer {
             (false, true, _) => (RoundKind::Steer, "Steer message"),
             _ => (RoundKind::Send, "Submit message"),
         };
-        let blocked = self.snapshot.setup_blocks_send;
+        let blocked = self.snapshot.setup_blocks_send || self.is_rewinding(cx);
         let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some() || blocked;
         let tooltip: SharedString = if resolved.model.is_none() {
             "No provider available".into()
-        } else if blocked {
+        } else if self.is_rewinding(cx) {
+            "Reverting checkpoint...".into()
+        } else if self.snapshot.setup_blocks_send {
             t3_core::worktree_setup::SEND_BLOCKED.into()
         } else if let Some(reason) = attachment_block {
             reason.into()
@@ -261,6 +264,7 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_input_state(window, cx);
         let resolved = self.resolve(cx);
+        let rewinding = self.is_rewinding(cx);
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let error = self.error.clone().or_else(|| self.snapshot.last_error.clone());
@@ -363,6 +367,7 @@ impl Render for Composer {
                     div().relative().children(self.render_menu(cx)).child(
                     v_flex()
                         .id("composer-card")
+                        .when(rewinding, |this| this.opacity(0.65))
                         .rounded(px(16.))
                         .border_1()
                         .border_color(outline.opacity(0.))

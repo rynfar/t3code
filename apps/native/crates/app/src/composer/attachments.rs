@@ -156,8 +156,8 @@ impl Composer {
         self.snapshot.target.clone()
     }
 
-    pub(super) fn can_attach(&self, cx: &App) -> bool {
-        if self.editing_queued().is_some() { return false; }
+    pub(crate) fn can_attach(&self, cx: &App) -> bool {
+        if self.editing_queued().is_some() || self.is_rewinding(cx) { return false; }
         if let Some(Target::Question(key)) = self.attachment_target() { return self.question_can_attach(&key, cx, IntakePhase::Start); }
         self.snapshot.target.is_some() && self.snapshot.pending.user_inputs.is_empty()
     }
@@ -237,6 +237,7 @@ impl Composer {
             let Some(target) = super::drafts::target(&key) else { continue };
             let eligible = match &target {
                 Target::Question(question) => self.question_can_attach(question, cx, IntakePhase::Preparing),
+                Target::Thread(id) => !self.state.read(cx).is_thread_rewinding(id),
                 _ => true,
             };
             for picked in self.attachments.preparations.take_completed(&key, eligible) {
@@ -256,6 +257,7 @@ impl Composer {
     /// Admits one file (`addComposerAttachments`) and starts its upload.
     fn stage(&mut self, target: &Target, name: String, bytes: Vec<u8>, pasted_text: bool, cx: &mut Context<Self>) {
         if let Target::Question(key) = target && !self.question_can_attach(key, cx, IntakePhase::Preparing) { return; }
+        if matches!(target, Target::Thread(id) if self.state.read(cx).is_thread_rewinding(id)) { return; }
         if self.attachment_target().as_ref() == Some(target) { self.cancel_pending_send(); }
         let classified = if pasted_text { Classified::File { mime_type: "text/plain;charset=utf-8".to_owned() } } else { rules::classify(&name) };
         let staged = self.reserved_attachment_count(target);
@@ -390,7 +392,7 @@ impl Composer {
 
     /// Removes a tile. An uploaded file the message never carried is deleted on the server.
     pub(super) fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
+        if self.is_rewinding(cx) || self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
         let Some(target) = self.attachment_target() else { return };
         let Some(staged) = self.attachments.staged.get_mut(&target) else { return };
         let Some(index) = staged.iter().position(|staged| staged.attachment.id == id) else { return };

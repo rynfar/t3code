@@ -47,7 +47,7 @@ struct Outgoing {
 
 impl Composer {
     /// Submit, as the send button and Enter do.
-    pub(super) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "snapshot")]
         if let Some(audit) = cx.try_global::<super::SnapshotAudit>() {
             audit.submissions.set(audit.submissions.get() + 1);
@@ -56,7 +56,7 @@ impl Composer {
         if !self.close_citation_comment("outside-press", window, cx) {
             return;
         }
-        if self.sending {
+        if self.sending || self.is_rewinding(cx) {
             return;
         }
         let answering = !self.snapshot.pending.user_inputs.is_empty();
@@ -197,6 +197,10 @@ impl Composer {
             let _ = this.update_in(cx, |this, window, cx| {
                 if !this.pending_send.finish(generation) { return; }
                 this.sending = false;
+                if this.is_rewinding(cx) {
+                    cx.notify();
+                    return;
+                }
                 let same_connection = matches!(this.state.read(cx).phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected))
                     && this.question_revision(cx) == this.pending_questions
                     && this.state.read(cx).connection_id() == connection

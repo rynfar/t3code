@@ -120,6 +120,26 @@ impl Composer {
         }
     }
 
+    /// Merges a completed rewind's prompt + attachments into `thread_id`'s stored draft while another thread is open.
+    pub(super) fn merge_off_thread_restore(
+        &mut self,
+        thread_id: &str,
+        restored: &str,
+        attachments: Vec<crate::app_state::RestoredAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        let target = Target::Thread(thread_id.to_owned());
+        if !restored.is_empty() {
+            let current = self.drafts.store.get(&key(&target)).map(|draft| draft.prompt.as_str()).unwrap_or_default();
+            let merged = t3_core::timeline::merge_restored_prompt(current, restored);
+            let draft = self.capture_draft(&target, merged);
+            if self.drafts.store.set(&key(&target), draft) {
+                self.schedule_draft_save(&target, cx);
+            }
+        }
+        self.restore_reverted_attachments(thread_id, attachments, cx);
+    }
+
     /// Forgets a new-thread draft once it launched, as the web deletes the draft thread.
     pub(super) fn discard_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
         self.choices.remove(target);

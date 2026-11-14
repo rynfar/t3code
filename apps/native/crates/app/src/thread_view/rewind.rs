@@ -18,21 +18,19 @@ use t3_core::media::{AssetResource, CREATE_ASSET_URL, decode_asset_url, resolve_
 use t3_core::thread::Visibility;
 use t3_core::timeline::{
     CONFIRM_DESCRIPTION, CONFIRM_TITLE, EntryKind, INTERRUPT_FIRST, KEEP_CHANGES, NO_ROLLBACK, REVERT_FILES, REWIND_FAILED, REWIND_TIMED_OUT, REWIND_TIMEOUT_SECS,
-    RevertInput, RewindProgress, RewindWatch, available_revert_turn_counts, find_revert_checkpoint, recallable_prompt, revert_turn_counts, rewind_progress,
+    RevertInput, RevertCheckpoint, RewindProgress, available_revert_turn_counts, find_revert_checkpoint, recallable_prompt, revert_turn_counts, rewind_progress,
     rollback_command, unsettled_run_id, watch_rewind,
 };
 use t3_core::turn_item::TurnItemKind;
 
 use super::ThreadView;
-use crate::app_state::{AppState, Phase};
+use crate::app_state::{ActiveRewind, AppEvent, AppState, Phase, RestoredAttachment, ThreadRewindPhase};
 use crate::theme::{hsla, palette};
 
 const PENDING_ATTACHMENTS: &str = "Wait for attachments to finish preparing before rewinding.";
 const MAX_ATTACHMENTS_REACHED: &str = "Make room for this message's attachments in the composer before rewinding.";
 const UNSUPPORTED_ATTACHMENT: &str = "This message has an attachment that cannot be restored.";
 const INVALID_ATTACHMENT_URL: &str = "The environment returned an invalid attachment URL.";
-
-use crate::app_state::RestoredAttachment;
 
 #[derive(Clone)]
 struct AttachmentSpec {
@@ -49,33 +47,128 @@ struct Confirm {
     restore_focus: Option<FocusHandle>,
 }
 
-struct Active {
-    watch: RewindWatch,
-    text: String,
-    attachments: Vec<RestoredAttachment>,
-    accepted: bool,
-    _timeout: Task<()>,
-}
-
 #[derive(Default)]
 pub(super) struct RewindUi {
     /// The turn count each user message rewinds to, for the messages that can.
     pub counts: HashMap<String, u64>,
+    pub busy: bool,
     confirm: Option<Confirm>,
-    preparing: bool,
-    prepare_generation: u64,
-    active: Option<Active>,
     focus: Option<FocusHandle>,
 }
 
-impl RewindUi {
-    pub fn busy(&self) -> bool {
-        self.preparing || self.active.is_some()
+fn can_operate_thread(state: &AppState) -> bool {
+    state
+        .client_handle()
+        .and_then(|c| c.session_state().borrow().as_ref().map(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE)))
+        .unwrap_or(true)
+}
+
+struct DispatchRewind {
+    thread_id: String,
+    text: String,
+    restore_files: bool,
+    attachments: Vec<RestoredAttachment>,
+    checkpoint: RevertCheckpoint,
+    watch: t3_core::timeline::RewindWatch,
+    command_id: String,
+}
+
+impl AppState {
+    fn arm_rewind_timeout(&mut self, thread_id: &str, command_id: &str, cx: &mut Context<Self>) -> Task<()> {
+        let thread_id = thread_id.to_owned();
+        let command_id = command_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(REWIND_TIMEOUT_SECS)).await;
+            let _ = this.update(cx, |state, cx| {
+                let Some(ThreadRewindPhase::Active(active)) = state.rewinds.get_mut(&thread_id) else { return };
+                if active.watch.request_id != command_id {
+                    return;
+                }
+                if state.selected_thread.as_deref() == Some(thread_id.as_str()) {
+                    state.fail_rewind(thread_id, REWIND_TIMED_OUT.to_owned(), cx);
+                } else {
+                    // Wait until the user returns to this thread before expiring an off-route rewind.
+                    active._timeout = None;
+                }
+            });
+        })
+    }
+
+    fn fail_rewind(&mut self, thread_id: String, message: String, cx: &mut Context<Self>) {
+        self.rewinds.remove(&thread_id);
+        self.rewind_errors.insert(thread_id, message);
+        cx.emit(AppEvent::Rewind);
+        cx.notify();
+    }
+
+    fn dispatch_rewind(&mut self, args: DispatchRewind, cx: &mut Context<Self>) {
+        let DispatchRewind { thread_id, text, restore_files, attachments, checkpoint, watch, command_id } = args;
+        let request = self.rpc(t3_core::commands::method::DISPATCH_COMMAND, rollback_command(&command_id, &watch.thread_id, &checkpoint, restore_files));
+        let timeout = self.arm_rewind_timeout(&thread_id, &command_id, cx);
+        self.rewinds.insert(thread_id.clone(), ThreadRewindPhase::Active(Box::new(ActiveRewind { watch, text, attachments, accepted: false, _timeout: Some(timeout) })));
+        cx.emit(AppEvent::Rewind);
+        cx.notify();
+        let dispatch_thread = thread_id.clone();
+        let dispatch_id = command_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |state, cx| {
+                let Some(ThreadRewindPhase::Active(active)) = state.rewinds.get_mut(&dispatch_thread) else { return };
+                if active.watch.request_id != dispatch_id {
+                    return;
+                }
+                match result {
+                    Ok(_) => {
+                        active.accepted = true;
+                        state.check_rewinds(cx);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        state.fail_rewind(dispatch_thread, if message.trim().is_empty() { REWIND_FAILED.to_owned() } else { message }, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn check_rewinds(&mut self, cx: &mut Context<Self>) {
+        let Some(projection) = self.thread.projection.as_ref() else { return };
+        let thread_id = projection.thread.id.clone();
+        let Some(ThreadRewindPhase::Active(active)) = self.rewinds.get(&thread_id) else { return };
+        match rewind_progress(&active.watch, projection) {
+            RewindProgress::Failed(message) => {
+                self.fail_rewind(thread_id, message, cx);
+            }
+            RewindProgress::Done if active.accepted => {
+                let Some(ThreadRewindPhase::Active(active)) = self.rewinds.remove(&thread_id) else { return };
+                let prompt = recallable_prompt(&active.text);
+                self.restore_composer_prompt(&thread_id, prompt, active.attachments, cx);
+                cx.emit(AppEvent::Rewind);
+                cx.notify();
+            }
+            RewindProgress::Pending if active._timeout.is_none() && self.selected_thread.as_deref() == Some(thread_id.as_str()) => {
+                let command_id = active.watch.request_id.clone();
+                let timeout = self.arm_rewind_timeout(&thread_id, &command_id, cx);
+                if let Some(ThreadRewindPhase::Active(active)) = self.rewinds.get_mut(&thread_id) {
+                    active._timeout = Some(timeout);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 impl ThreadView {
+    pub(super) fn is_rewind_busy(&self, cx: &gpui::App) -> bool {
+        self.thread_id.as_deref().is_some_and(|id| self.state.read(cx).is_thread_rewinding(id))
+    }
+
     fn supports_rollback(&self, state: &AppState) -> bool {
+        if !can_operate_thread(state) {
+            return false;
+        }
         let Some(projection) = self.thread_state(state).projection.as_ref() else {
             return false;
         };
@@ -94,25 +187,20 @@ impl ThreadView {
         let Some(projection) = self.thread_state(state).projection.as_ref() else {
             return Err(None);
         };
-        let client = state.client_handle();
-        if client
-            .as_ref()
-            .and_then(|c| c.session_state().borrow().as_ref().map(|session| !session.grants(ORCHESTRATION_OPERATE_SCOPE)))
-            .unwrap_or(false)
-        {
+        if !can_operate_thread(state) {
             return Err(None);
         }
         if !self.supports_rollback(state) {
             return Err(Some(NO_ROLLBACK.to_owned()));
         }
-        let Some(client) = client.filter(|_| state.phase == Phase::Online(ConnectionStatus::Connected)) else {
+        let client = state.client_handle().filter(|_| state.phase == Phase::Online(ConnectionStatus::Connected)).ok_or_else(|| {
             let label = state
                 .active_environment()
                 .map(|env| env.label.as_str())
                 .filter(|label| !label.is_empty())
                 .unwrap_or("this environment");
-            return Err(Some(format!("Reconnect {label} before reverting checkpoints.")));
-        };
+            Some(format!("Reconnect {label} before reverting checkpoints."))
+        })?;
         if !self.rewind.counts.contains_key(message_id) {
             return Err(Some(NO_ROLLBACK.to_owned()));
         }
@@ -173,7 +261,7 @@ impl ThreadView {
 
     /// `onRevertToTurnCount` before the confirmation: the guards, then the dialog.
     pub fn request_rewind(&mut self, message_id: &str, turn_count: u64, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rewind.busy() {
+        if self.is_rewind_busy(cx) {
             return;
         }
         if let Err(error) = self.rewind_guard_error(message_id, cx) {
@@ -204,7 +292,7 @@ impl ThreadView {
             window.focus(&focus, cx);
         }
         cx.notify();
-        if self.rewind.busy() {
+        if self.is_rewind_busy(cx) {
             return;
         }
         let (thread_id, client) = match self.rewind_guard_error(&message_id, cx) {
@@ -232,148 +320,124 @@ impl ThreadView {
             self.show_local_error(MAX_ATTACHMENTS_REACHED.to_owned(), cx);
             return;
         }
+        let (checkpoint, watch) = {
+            let state = self.state.read(cx);
+            let Some(projection) = self.thread_state(state).projection.as_ref() else { return };
+            let Some(checkpoint) = find_revert_checkpoint(&projection.checkpoints, turn_count) else {
+                self.show_local_error(REWIND_FAILED.to_owned(), cx);
+                return;
+            };
+            let command_id = crate::app_state::uuid_v4();
+            let watch = match watch_rewind(projection, turn_count, &command_id) {
+                Ok(watch) => watch,
+                Err(message) => {
+                    self.show_local_error(message, cx);
+                    return;
+                }
+            };
+            (checkpoint, (watch, command_id))
+        };
+        let (watch, command_id) = watch;
+        self.local_error = None;
         if specs.is_empty() {
-            self.start_rewind_dispatch(&message_id, turn_count, text, restore_files, Vec::new(), cx);
+            self.state.update(cx, |state, cx| {
+                state.rewind_errors.remove(&thread_id);
+                state.dispatch_rewind(
+                    DispatchRewind { thread_id, text, restore_files, attachments: Vec::new(), checkpoint, watch, command_id },
+                    cx,
+                );
+            });
             return;
         }
-        self.rewind.preparing = true;
-        self.rewind.prepare_generation = self.rewind.prepare_generation.wrapping_add(1);
-        let generation = self.rewind.prepare_generation;
-        self.local_error = None;
-        cx.notify();
-        let runtime = self.state.read(cx).runtime().clone();
-        let task = runtime.spawn(async move { prepare_reverted_attachments(&client, &specs).await });
-        cx.spawn(async move |this, cx| {
-            let fetched = task.await.unwrap_or_else(|_| Err(REWIND_FAILED.to_owned()));
-            let _ = this.update(cx, |view, cx| {
-                if view.rewind.prepare_generation != generation {
-                    return;
-                }
-                view.rewind.preparing = false;
-                if view.thread_id.as_deref() != Some(thread_id.as_str()) {
-                    return;
-                }
-                let attachments = match fetched {
-                    Ok(attachments) => attachments,
-                    Err(message) => {
-                        view.show_local_error(message, cx);
+        let generation = self.state.update(cx, |state, cx| {
+            state.rewind_errors.remove(&thread_id);
+            let generation = state
+                .rewinds
+                .values()
+                .filter_map(|phase| match phase {
+                    ThreadRewindPhase::Preparing { generation } => Some(*generation),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+                .wrapping_add(1);
+            state.rewinds.insert(thread_id.clone(), ThreadRewindPhase::Preparing { generation });
+            cx.emit(AppEvent::Rewind);
+            cx.notify();
+            let runtime = state.runtime().clone();
+            let task = runtime.spawn(async move { prepare_reverted_attachments(&client, &specs).await });
+            let prep_thread = thread_id.clone();
+            cx.spawn(async move |this, cx| {
+                let fetched = task.await.unwrap_or_else(|_| Err(REWIND_FAILED.to_owned()));
+                let _ = this.update(cx, |state, cx| {
+                    if !matches!(state.rewinds.get(&prep_thread), Some(ThreadRewindPhase::Preparing { generation: g }) if *g == generation) {
+                        return;
+                    }
+                    let attachments = match fetched {
+                        Ok(attachments) => attachments,
+                        Err(message) => {
+                            state.fail_rewind(prep_thread, message, cx);
+                            return;
+                        }
+                    };
+                    if !can_operate_thread(state) {
+                        state.rewinds.remove(&prep_thread);
+                        cx.emit(AppEvent::Rewind);
                         cx.notify();
                         return;
                     }
-                };
-                if let Err(error) = view.rewind_guard_error(&message_id, cx) {
-                    if let Some(message) = error {
-                        view.show_local_error(message, cx);
+                    if state.phase != Phase::Online(ConnectionStatus::Connected) {
+                        let label = state
+                            .active_environment()
+                            .map(|env| env.label.as_str())
+                            .filter(|label| !label.is_empty())
+                            .unwrap_or("this environment");
+                        state.fail_rewind(prep_thread, format!("Reconnect {label} before reverting checkpoints."), cx);
+                        return;
                     }
-                    cx.notify();
-                    return;
-                }
-                let precheck = crate::composer::rewind_precheck(&thread_id, cx);
-                if precheck.pending_attachments {
-                    view.show_local_error(PENDING_ATTACHMENTS.to_owned(), cx);
-                    cx.notify();
-                    return;
-                }
-                if precheck.staged_count + attachments.len() > MAX_ATTACHMENTS {
-                    view.show_local_error(MAX_ATTACHMENTS_REACHED.to_owned(), cx);
-                    cx.notify();
-                    return;
-                }
-                view.start_rewind_dispatch(&message_id, turn_count, text, restore_files, attachments, cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn start_rewind_dispatch(
-        &mut self,
-        message_id: &str,
-        turn_count: u64,
-        text: String,
-        restore_files: bool,
-        attachments: Vec<RestoredAttachment>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.rewind.counts.contains_key(message_id) {
-            return;
-        }
-        let state = self.state.read(cx);
-        let Some(projection) = self.thread_state(state).projection.as_ref() else { return };
-        let Some(checkpoint) = find_revert_checkpoint(&projection.checkpoints, turn_count) else {
-            self.show_local_error(REWIND_FAILED.to_owned(), cx);
-            return;
-        };
-        let command_id = crate::app_state::uuid_v4();
-        let watch = match watch_rewind(projection, turn_count, &command_id) {
-            Ok(watch) => watch,
-            Err(message) => {
-                self.show_local_error(message, cx);
-                return;
-            }
-        };
-        let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, rollback_command(&command_id, &watch.thread_id, &checkpoint, restore_files));
-        self.local_error = None;
-        let timeout = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(REWIND_TIMEOUT_SECS)).await;
-            let _ = this.update(cx, |view, cx| {
-                if view.rewind.active.take().is_some() {
-                    view.show_local_error(REWIND_TIMED_OUT.to_owned(), cx);
-                    cx.notify();
-                }
-            });
+                    let precheck = crate::composer::rewind_precheck(&prep_thread, cx);
+                    if precheck.send_busy {
+                        state.fail_rewind(prep_thread, INTERRUPT_FIRST.to_owned(), cx);
+                        return;
+                    }
+                    if precheck.pending_attachments {
+                        state.fail_rewind(prep_thread, PENDING_ATTACHMENTS.to_owned(), cx);
+                        return;
+                    }
+                    if precheck.staged_count + attachments.len() > MAX_ATTACHMENTS {
+                        state.fail_rewind(prep_thread, MAX_ATTACHMENTS_REACHED.to_owned(), cx);
+                        return;
+                    }
+                    state.dispatch_rewind(
+                        DispatchRewind { thread_id: prep_thread, text, restore_files, attachments, checkpoint, watch, command_id },
+                        cx,
+                    );
+                });
+            })
+            .detach();
+            generation
         });
-        self.rewind.active = Some(Active { watch, text, attachments, accepted: false, _timeout: timeout });
-        cx.spawn(async move |this, cx| {
-            let result = request.await;
-            let _ = this.update(cx, |view, cx| {
-                let Some(active) = view.rewind.active.as_mut().filter(|active| active.watch.request_id == command_id) else { return };
-                match result {
-                    Ok(_) => {
-                        active.accepted = true;
-                        view.check_rewind(cx);
-                    }
-                    Err(error) => {
-                        view.rewind.active = None;
-                        let message = error.to_string();
-                        view.show_local_error(if message.trim().is_empty() { REWIND_FAILED.to_owned() } else { message }, cx);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        let _ = generation;
     }
 
-    /// Called on every projection change while a rewind is out.
+    /// Called on every projection or rewind state change.
     pub(super) fn check_rewind(&mut self, cx: &mut Context<Self>) {
-        let Some(active) = self.rewind.active.as_ref() else { return };
-        let state = self.state.read(cx);
-        let Some(projection) = self.thread_state(state).projection.as_ref().filter(|projection| projection.thread.id == active.watch.thread_id) else { return };
-        match rewind_progress(&active.watch, projection) {
-            RewindProgress::Failed(message) => {
-                self.rewind.active = None;
-                self.show_local_error(message, cx);
-            }
-            RewindProgress::Done if active.accepted => {
-                let Some(active) = self.rewind.active.take() else { return };
-                let prompt = recallable_prompt(&active.text);
-                let thread_id = active.watch.thread_id;
-                self.state.update(cx, |state, cx| state.restore_composer_prompt(&thread_id, prompt, active.attachments, cx));
-            }
-            _ => return,
+        let error = self.state.update(cx, |state, cx| {
+            state.check_rewinds(cx);
+            self.thread_id.as_deref().and_then(|id| state.rewind_errors.remove(id))
+        });
+        self.rewind.busy = self.is_rewind_busy(cx);
+        if let Some(message) = error {
+            self.show_local_error(message, cx);
         }
-        cx.notify();
     }
 
-    /// Leaving the thread drops a pending confirmation; a rewind already sent keeps running on
-    /// the server, but nothing here waits for it.
+    /// Leaving the thread drops the view's counts and confirmation dialog; in-flight rewinds live
+    /// on `AppState::rewinds` so switching threads cannot unlock or drop restore.
     pub(super) fn reset_rewind(&mut self) {
         self.rewind.counts.clear();
+        self.rewind.busy = false;
         self.rewind.confirm = None;
-        self.rewind.preparing = false;
-        self.rewind.prepare_generation = self.rewind.prepare_generation.wrapping_add(1);
-        self.rewind.active = None;
     }
 
     /// `RevertConfirmHost`: an alert dialog with Cancel, "Revert files too" and "Revert and keep
@@ -661,9 +725,11 @@ mod tests {
         );
         let (view, composer) = window.read_with(cx, |h, _| (h.view.clone(), h.composer.clone())).unwrap();
         let _ = window.update(cx, |_, window, cx| {
-            // 1. Permission denied silently blocks request_rewind.
+            // 1. Permission denied hides revert counts on sync and silently blocks request_rewind.
             fixture.grants.send_replace(Some(crate::context_menu::project_filter_tests::session(false)));
             view.update(cx, |view, cx| {
+                view.sync(cx);
+                assert!(view.rewind.counts.is_empty());
                 view.request_rewind("msg-u1", 0, "Earlier prompt", window, cx);
                 assert!(view.rewind.confirm.is_none());
                 assert!(view.local_error.is_none());
@@ -671,6 +737,7 @@ mod tests {
 
             // 2. Offline environment produces Reconnect <label> error.
             fixture.grants.send_replace(Some(crate::context_menu::project_filter_tests::session(true)));
+            view.update(cx, |view, cx| view.sync(cx));
             state.update(cx, |state, cx| {
                 state.set_phase(
                     Phase::Online(ConnectionStatus::Reconnecting { reason: "offline".into(), attempt: 1 }),
@@ -704,7 +771,7 @@ mod tests {
                 assert!(view.rewind.confirm.is_some());
                 view.confirm_rewind(false, window, cx);
                 assert_eq!(view.local_error.as_deref(), Some(UNSUPPORTED_ATTACHMENT));
-                assert!(!view.rewind.busy());
+                assert!(!view.is_rewind_busy(cx));
             });
 
             // 5. Staged attachment count + message attachments > MAX_ATTACHMENTS blocks confirm_rewind.
@@ -780,6 +847,7 @@ mod tests {
         let (view, composer) = window.read_with(cx, |h, _| (h.view.clone(), h.composer.clone())).unwrap();
         state.update(cx, |_, cx| cx.emit(crate::app_state::AppEvent::Thread));
         cx.run_until_parked();
+        let saved_projection = state.read_with(cx, |state, _| state.thread.projection.clone().unwrap());
         let _ = window.update(cx, |_, window, cx| {
             composer.update(cx, |composer, cx| {
                 composer.set_test_prompt("Current draft", window, cx);
@@ -787,7 +855,15 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.request_rewind("msg-u1", 0, "Earlier prompt", window, cx);
                 view.confirm_rewind(false, window, cx);
-                assert!(view.rewind.preparing);
+                assert!(view.is_rewind_busy(cx));
+            });
+            composer.update(cx, |composer, cx| {
+                assert!(composer.is_rewinding(cx));
+                assert!(!composer.can_attach(cx));
+                composer.stash_prompt(window, cx);
+                assert_eq!(composer.test_prompt(cx), "Current draft", "stash must not clear prompt while rewinding");
+                composer.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
+                assert_eq!(composer.test_prompt(cx), "Current draft", "submit must not run while rewinding");
             });
         });
 
@@ -800,16 +876,34 @@ mod tests {
         let (rollback_method, _, rollback_reply) = fixture.next_request().await;
         assert_eq!(rollback_method, t3_core::commands::method::DISPATCH_COMMAND);
         cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            let active = view.rewind.active.as_ref().expect("active rewind holds downloaded attachments");
+        state.read_with(cx, |state, _| {
+            let Some(ThreadRewindPhase::Active(active)) = state.rewinds.get("menu-thread") else {
+                panic!("active rewind holds downloaded attachments");
+            };
             assert_eq!(active.attachments.len(), 1);
             assert_eq!(active.attachments[0].kind, AttachmentKind::File);
             assert_eq!(active.attachments[0].name, "notes.txt");
             assert_eq!(active.attachments[0].mime_type, "text/plain");
             assert_eq!(active.attachments[0].bytes, b"hello-attachment");
         });
+
+        // Switch away to another thread while rollback is running, acknowledge RPC off-route, then switch back.
+        state.update(cx, |state, cx| state.select_thread("other-thread", cx));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| assert!(state.is_thread_rewinding("menu-thread")));
         let _ = rollback_reply.send(Ok(json!({})));
         cx.run_until_parked();
+
+        // Switch back before rolled_back lands: rewind lock and composer inertness persist.
+        state.update(cx, |state, cx| {
+            state.select_thread("menu-thread", cx);
+            state.thread.projection = Some(saved_projection);
+            state.thread.synchronized = true;
+            cx.emit(crate::app_state::AppEvent::Thread);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| assert!(view.is_rewind_busy(cx)));
+        composer.read_with(cx, |composer, cx| assert!(composer.is_rewinding(cx)));
 
         // Simulate the rolled-back projection arriving and verify Composer receives prompt + attachment.
         state.update(cx, |state, cx| {
@@ -818,8 +912,9 @@ mod tests {
             cx.emit(crate::app_state::AppEvent::Thread);
         });
         cx.run_until_parked();
-        view.read_with(cx, |view, _| assert!(view.rewind.active.is_none()));
+        view.read_with(cx, |view, cx| assert!(!view.is_rewind_busy(cx)));
         composer.read_with(cx, |composer, cx| {
+            assert!(!composer.is_rewinding(cx));
             assert_eq!(composer.test_prompt(cx), "Current draft\n\nEarlier prompt");
             assert_eq!(
                 composer.test_staged_thread_attachments("menu-thread"),
