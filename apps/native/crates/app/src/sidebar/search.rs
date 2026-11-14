@@ -694,7 +694,7 @@ impl SidebarPane {
         let now = state.sidebar.now_override.unwrap_or(self.now);
         #[cfg(not(feature = "snapshot"))]
         let now = self.now;
-        let timestamp = thread.latest_user_message_at.or(thread.updated_at).map(|at| compact_relative_label(at, now));
+        let timestamp = t3_core::sidebar::thread::activity_timestamp(thread).map(|at| compact_relative_label(at, now));
         let pr_links = scoped
             .and_then(|row| scoped_thread_shell(state, &row.owner, &row.thread.id))
             .or_else(|| if id.environment_id.is_empty() { state.thread_shell(&id.thread_id) } else { None })

@@ -740,12 +740,16 @@ impl SidebarPane {
         let status_slot = match &state.top {
             Some(top) if top.icon == StatusIcon::Woke => self.render_woke_badge(key, &thread.id, state.woke_at, px(16.), tone_color(top.tone, p), cx),
             Some(top) => {
+                let server_now = key
+                    .map(|k| k.environment_id.as_str())
+                    .or_else(|| self.state.read(cx).environments.active.as_deref())
+                    .map_or(now, |id| t3_core::clock::to_server_clock(id, now));
                 let duration = match state.status {
                     ThreadStatus::Preparing | ThreadStatus::Working => status::working_started_at(thread),
                     ThreadStatus::Waiting => thread.latest_run.as_ref().and_then(|run| run.completed_at),
                     _ => None,
                 }
-                .map(|started| working_duration_label(now - started));
+                .map(|started| working_duration_label(server_now - started));
                 if duration.is_some() {
                     self.note_live_row(cx);
                 }
@@ -762,7 +766,7 @@ impl SidebarPane {
             }
             None => div()
                 .text_color(hsla(p.sidebar_secondary_label))
-                .children(thread.latest_user_message_at.or(thread.updated_at).map(|at| compact_relative_label(at, now)))
+                .children(t3_core::sidebar::thread::activity_timestamp(thread).map(|at| compact_relative_label(at, now)))
                 .into_any_element(),
         };
         let discard_id = thread.id.clone();
@@ -912,7 +916,7 @@ impl SidebarPane {
                     .into_any_element()
             }),
             Section::Settled => settled_timestamp(thread).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
-            _ => thread.latest_user_message_at.or(thread.updated_at).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
+            _ => t3_core::sidebar::thread::activity_timestamp(thread).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
         };
         let id = thread.id.clone();
         let action_key = key.cloned();

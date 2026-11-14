@@ -11,6 +11,8 @@ struct Fixture {
     #[serde(default)]
     dialog: bool,
     #[serde(default)]
+    checking: bool,
+    #[serde(default)]
     counts: Vec<(String, usize)>,
     #[serde(default)]
     busy: Option<String>,
@@ -59,6 +61,7 @@ pub(super) fn show(value: serde_json::Value, window: &mut Window, cx: &mut App) 
             control.dialog.update(cx, |dialog, cx| {
                 dialog.open(fixture.plan, true, window, cx);
                 dialog.counts = fixture.counts;
+                dialog.set_checking(fixture.checking, cx);
             });
         }
         cx.notify();

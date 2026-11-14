@@ -100,6 +100,15 @@ pub enum EnvironmentEvent {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct ThreadTitleRegenerationState {
+    pub sequence: u64,
+    pub disconnected: bool,
+    pub thread_exists: bool,
+    pub last_title_regeneration: Option<t3_core::shell::LastTitleRegeneration>,
+    pub title_regeneration: Option<serde_json::Value>,
+}
+
 enum Command {
     #[cfg(feature = "test-support")]
     Fixture { id: String, generation: u64, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, reply: tokio::sync::oneshot::Sender<mpsc::Sender<ClientEvent>> },
@@ -107,6 +116,7 @@ enum Command {
     ApplyKeybindings { owner: EnvironmentOwner, value: serde_json::Value, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     Destination { owner: EnvironmentOwner, scope: String, reply: tokio::sync::oneshot::Sender<Result<Destination, DestinationError>> },
     Client { id: String, reply: tokio::sync::oneshot::Sender<Option<ClientHandle>> },
+    ThreadTitleRegeneration { id: String, thread_id: String, reply: tokio::sync::oneshot::Sender<Option<ThreadTitleRegenerationState>> },
     Watch {
         id: String,
         generation: u64,
@@ -207,6 +217,20 @@ impl Environments {
         async move { response.await.ok().flatten() }
     }
 
+    pub fn thread_title_regeneration(
+        &self,
+        id: &str,
+        thread_id: &str,
+    ) -> impl std::future::Future<Output = Option<ThreadTitleRegenerationState>> + Send + 'static + use<> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(Command::ThreadTitleRegeneration {
+            id: id.into(),
+            thread_id: thread_id.into(),
+            reply,
+        });
+        async move { response.await.ok().flatten() }
+    }
+
     pub fn apply_settings_reply(&self, owner: &EnvironmentOwner, settings: t3_core::server_config::ServerSettings, sent_revision: u64) -> impl std::future::Future<Output = Result<bool, DestinationError>> + Send + 'static + use<> {
         let (reply, response) = tokio::sync::oneshot::channel();
         let _ = self.commands.send(Command::ApplySettings { owner: owner.clone(), settings: Box::new(settings), revision: sent_revision, reply });
@@ -247,6 +271,15 @@ struct Entry {
     shell: ShellState,
     config: ServerConfigState,
     status: ConnectionStatus,
+    clock_requested_at_ms: i64,
+    clock_recorded: bool,
+}
+
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl Drop for Entry {
@@ -508,7 +541,7 @@ async fn run(
                     let (tx, events) = mpsc::channel(128);
                     let relay = tokio::spawn(relay_events(events, client.session_state(), client.connection_generation(), frames.clone(), id.clone(), generation));
                     let credentials = Credentials { http_base: "http://fixture.invalid".into(), access_token: String::new() };
-                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status });
+                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status, clock_requested_at_ms: wall_now_ms(), clock_recorded: false });
                     publish(&entries, &id, true, &view);
                     #[cfg(test)]
                     let now = current_now(manual_now);
@@ -535,6 +568,25 @@ async fn run(
                 }
                 Some(Command::Destination { owner, scope, reply }) => { let _ = reply.send(entries.get(&owner.saved_id).ok_or(DestinationError::Missing).and_then(|entry| entry.destination(&owner, &scope))); }
                 Some(Command::Client { id, reply }) => { let _ = reply.send(entries.get(&id).map(|entry| entry.client.clone())); }
+                Some(Command::ThreadTitleRegeneration { id, thread_id, reply }) => {
+                    let snapshot = entries.get(&id).map(|entry| {
+                        let thread = entry.shell.snapshot.as_ref().and_then(|snapshot| {
+                            snapshot
+                                .threads
+                                .iter()
+                                .chain(&snapshot.archived_threads)
+                                .find(|thread| thread.id == thread_id)
+                        });
+                        ThreadTitleRegenerationState {
+                            sequence: entry.shell.sequence().unwrap_or(0),
+                            disconnected: entry.status != ConnectionStatus::Connected || !entry.shell.synchronized,
+                            thread_exists: thread.is_some(),
+                            last_title_regeneration: thread.and_then(|thread| thread.last_title_regeneration.clone()),
+                            title_regeneration: thread.and_then(|thread| thread.title_regeneration.clone()),
+                        }
+                    });
+                    let _ = reply.send(snapshot);
+                }
                 Some(Command::Watch { id, generation, credentials, prepare }) => {
                     if entries.get(&id).is_some_and(|e| e.credentials == credentials) { continue; }
                     let prior = entries.remove(&id);
@@ -544,7 +596,7 @@ async fn run(
                     let mut shell = prior.as_ref().map(|e| e.shell.clone()).unwrap_or_default();
                     shell.synchronized = false;
                     let config = prior.as_ref().map(|e| e.config.clone()).unwrap_or_default();
-                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status: ConnectionStatus::Connecting });
+                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status: ConnectionStatus::Connecting, clock_requested_at_ms: wall_now_ms(), clock_recorded: false });
                     publish(&entries, &id, true, &view);
                     tracing::info!(environment = %id, watched = entries.len(), "watching environment with one supervisor");
                     #[cfg(test)]
@@ -602,11 +654,35 @@ async fn run(
                         ClientEvent::Shell(item) => {
                             changed |= apply_shell(entry, item);
                         }
-                        ClientEvent::ServerConfig(event) => { config_changed |= entry.config.apply(*event.clone()); }
+                        ClientEvent::ServerConfig(event) => {
+                            if let t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: snapshot } = &**event
+                                && !entry.clock_recorded
+                            {
+                                let received_at_ms = wall_now_ms();
+                                let server_time_ms = snapshot.server_time.0.as_deref().and_then(t3_core::sidebar::time::parse_iso);
+                                t3_core::clock::record_server_clock(&id, server_time_ms, entry.clock_requested_at_ms, received_at_ms);
+                                if !snapshot.environment.environment_id.is_empty() && snapshot.environment.environment_id != id {
+                                    t3_core::clock::record_server_clock(
+                                        &snapshot.environment.environment_id,
+                                        server_time_ms,
+                                        entry.clock_requested_at_ms,
+                                        received_at_ms,
+                                    );
+                                }
+                                entry.clock_recorded = true;
+                            }
+                            config_changed |= entry.config.apply(*event.clone());
+                        }
                         ClientEvent::Status(status) => {
                             lifecycle_changed |= entry.status != *status;
                             entry.status = status.clone();
-                            if *status != ConnectionStatus::Connected { entry.shell.synchronized = false; }
+                            if *status != ConnectionStatus::Connected {
+                                entry.shell.synchronized = false;
+                                entry.clock_recorded = false;
+                            }
+                            if matches!(status, ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. }) {
+                                entry.clock_requested_at_ms = wall_now_ms();
+                            }
                             let _ = output.send(EnvironmentEvent::Status { id: id.clone(), generation: epoch, status: status.clone() }).await;
                         }
                         ClientEvent::Moved { http_base } => { lifecycle_changed = true; let _ = output.send(EnvironmentEvent::Moved { id: id.clone(), generation: epoch, http_base: http_base.clone() }).await; }

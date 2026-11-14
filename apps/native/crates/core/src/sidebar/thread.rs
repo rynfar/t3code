@@ -121,6 +121,33 @@ impl SidebarThread {
             _ => true,
         }
     }
+
+    /// `withoutRemovedCheckout` (`SidebarThreadRow.tsx`): strips stale checkout fields
+    /// once local VCS status confirms the working tree is no longer a repository.
+    pub fn without_removed_checkout(mut self, is_repo: Option<bool>) -> Self {
+        if is_repo == Some(false) {
+            self.branch = None;
+            self.worktree_path = None;
+        }
+        self
+    }
+}
+
+/// `resolveThreadActivityTimestamp` (`client-runtime/src/state/threadSort.ts`):
+/// maximum of `latestUserMessageAt`, `latestRun.requestedAt`, `latestRun.startedAt`,
+/// and `latestRun.completedAt`, falling back to `updatedAt`.
+pub fn activity_timestamp(thread: &SidebarThread) -> Option<Ms> {
+    let run = thread.latest_run.as_ref();
+    [
+        thread.latest_user_message_at,
+        run.and_then(|run| run.requested_at),
+        run.and_then(|run| run.started_at),
+        run.and_then(|run| run.completed_at),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .or(thread.updated_at)
 }
 
 /// `formatWorktreePathForDisplay` (`apps/web/src/worktreeCleanup.ts`): the last path segment.
@@ -325,4 +352,95 @@ pub(crate) fn contributions_with_delegated(threads: &[ThreadShell], delegated: &
 pub(crate) fn pending_subagent_requests_with_delegated(threads: &[ThreadShell], delegated: &[(&str, SubagentRequest)]) -> HashMap<String, SubagentRequest> {
     let contributions = contributions_with_delegated(threads, delegated);
     requests_from_contributions(&contributions, &threads.iter().map(|thread| (thread.id.as_str(), &thread.lineage)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ModelSelection;
+
+    fn bare_thread() -> SidebarThread {
+        SidebarThread {
+            id: "t1".into(),
+            project_id: "p1".into(),
+            title: "Thread".into(),
+            model_selection: ModelSelection { instance_id: "codex".into(), model: "gpt-5".into(), options: None },
+            branch: Some("feat/branch".into()),
+            worktree_path: Some("/tmp/wt".into()),
+            interaction_mode: "default".into(),
+            listed: true,
+            latest_run: None,
+            runtime: None,
+            blocked_on_thread_wait: false,
+            latest_user_message_at: None,
+            latest_user_authored_message_at: None,
+            has_pending_approvals: false,
+            has_pending_user_input: false,
+            pending_user_input_at: None,
+            has_pending_runtime_request: false,
+            pending_subagent_request: None,
+            pending_guest_message_count: 0,
+            has_actionable_proposed_plan: false,
+            background_holds_completion: false,
+            goal_active: false,
+            created_at: None,
+            updated_at: Some(1_000),
+            archived: false,
+            deleted: false,
+            settled_override: None,
+            settled_at: None,
+            unsettled_at: None,
+            snoozed_until: None,
+            snoozed_at: None,
+            pinned: false,
+            pin_order_key: None,
+            active_order_key: None,
+            auto_settle_disabled: false,
+            last_visited_at: None,
+            regenerating_title: false,
+            opens: None,
+            provider_instance_id: "codex".into(),
+            provider_instance_history: Vec::new(),
+            pull_requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn activity_timestamp_takes_latest_of_user_message_run_or_updated_at() {
+        let mut thread = bare_thread();
+        assert_eq!(activity_timestamp(&thread), Some(1_000));
+
+        thread.latest_user_message_at = Some(2_000);
+        assert_eq!(activity_timestamp(&thread), Some(2_000));
+
+        thread.latest_run = Some(RunSummary {
+            run_id: "r1".into(),
+            status: "running".into(),
+            requested_at: Some(2_500),
+            started_at: Some(3_000),
+            completed_at: None,
+        });
+        assert_eq!(activity_timestamp(&thread), Some(3_000));
+
+        thread.latest_run.as_mut().unwrap().completed_at = Some(4_000);
+        assert_eq!(activity_timestamp(&thread), Some(4_000));
+
+        thread.updated_at = Some(5_000);
+        assert_eq!(activity_timestamp(&thread), Some(4_000));
+    }
+
+    #[test]
+    fn without_removed_checkout_clears_branch_and_worktree_only_when_not_a_repo() {
+        let kept_unknown = bare_thread().without_removed_checkout(None);
+        assert_eq!(kept_unknown.branch.as_deref(), Some("feat/branch"));
+        assert_eq!(kept_unknown.worktree_path.as_deref(), Some("/tmp/wt"));
+
+        let kept_repo = bare_thread().without_removed_checkout(Some(true));
+        assert_eq!(kept_repo.branch.as_deref(), Some("feat/branch"));
+        assert_eq!(kept_repo.worktree_path.as_deref(), Some("/tmp/wt"));
+
+        let stripped = bare_thread().without_removed_checkout(Some(false));
+        assert_eq!(stripped.branch, None);
+        assert_eq!(stripped.worktree_path, None);
+    }
 }
