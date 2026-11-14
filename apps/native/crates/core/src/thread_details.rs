@@ -10,8 +10,9 @@ use url::Url;
 
 use crate::preview::DiscoveredServer;
 use crate::preview::address::normalize_preview_url;
-use crate::settings::scheduled_tasks::{ScheduledTask, relative_run_label};
+use crate::settings::scheduled_tasks::{Schedule, ScheduledTask, relative_run_label};
 use crate::shell::LinkOrigin;
+use crate::sidebar::time::parse_iso;
 
 /// `THREAD_DETAILS_ITEMS` from `apps/web/src/components/chat/threadDetailsItems.ts`.
 /// Ids are persisted, so never rename one.
@@ -330,9 +331,55 @@ pub fn tasks_for_thread<'a>(tasks: &'a [ScheduledTask], thread_id: &str) -> Vec<
     tasks.iter().filter(|task| task.thread_id.as_deref() == Some(thread_id)).collect()
 }
 
+/// Short label for the server zone a fixed-time schedule runs in (`scheduleTimeZoneLabel`).
+pub fn schedule_time_zone_label(time_zone: Option<&str>, run_at: Option<&str>) -> Option<String> {
+    let time_zone = time_zone?.trim();
+    if time_zone.is_empty() {
+        return None;
+    }
+    if matches!(time_zone, "Etc/UTC" | "UTC" | "GMT") {
+        return Some("UTC".to_owned());
+    }
+    let parsed: chrono_tz::Tz = time_zone.parse().ok()?;
+    let ms = run_at.and_then(parse_iso).unwrap_or(0);
+    use chrono::TimeZone;
+    let abbr = parsed.timestamp_millis_opt(ms).single().map(|at| at.format("%Z").to_string())?;
+    if run_at.is_some() {
+        Some(abbr)
+    } else {
+        // Without a target instant, return a non-DST-biased short generic name when possible.
+        let winter = parsed.timestamp_millis_opt(1_799_999_999_000).single().map(|at| at.format("%Z").to_string());
+        let summer = parsed.timestamp_millis_opt(1_815_900_000_000).single().map(|at| at.format("%Z").to_string());
+        match (winter, summer) {
+            (Some(w), Some(s)) if w == s => Some(w),
+            (Some(w), Some(s)) if w.len() == 3 && s.len() == 3 && w.chars().next() == s.chars().next() && w.ends_with('T') && s.ends_with('T') => {
+                Some(format!("{}T", w.chars().next()?))
+            }
+            _ => Some(abbr),
+        }
+    }
+}
+
 /// `taskScheduleLine` (`ThreadAutomationsPanel.tsx`): schedule + `blockedByPolicy`, or `next <rel>`, or `paused`.
 pub fn automation_schedule_line(task: &ScheduledTask, once_label: impl Fn(i64) -> String, now_ms: i64) -> String {
-    let schedule = task.schedule.label(once_label);
+    automation_schedule_line_in(task, once_label, None, now_ms)
+}
+
+/// `taskScheduleLine` with server `timeZone` forwarded to fixed-time labels.
+pub fn automation_schedule_line_in(
+    task: &ScheduledTask,
+    once_label: impl Fn(i64) -> String,
+    time_zone: Option<&str>,
+    now_ms: i64,
+) -> String {
+    let base = task.schedule.label(once_label);
+    let schedule = if matches!(task.schedule, Schedule::FixedTime { .. })
+        && let Some(zone) = schedule_time_zone_label(time_zone, task.next_run_at.as_deref())
+    {
+        format!("{base} {zone}")
+    } else {
+        base
+    };
     if let Some(reason) = &task.blocked_by_policy {
         format!("{schedule} \u{00b7} {reason}")
     } else if !task.enabled {
@@ -547,6 +594,41 @@ mod tests {
         assert_eq!(
             automation_schedule_line(&upcoming, |_| String::new(), crate::sidebar::time::parse_iso("2026-01-01T00:00:00Z").unwrap()),
             "Every 1 min \u{00b7} next in 10m"
+        );
+        assert_eq!(schedule_time_zone_label(None, None), None);
+        assert_eq!(schedule_time_zone_label(Some("Unsupported/Zone"), None), None);
+        assert_eq!(schedule_time_zone_label(Some("Etc/UTC"), None).as_deref(), Some("UTC"));
+        assert_eq!(schedule_time_zone_label(Some("America/Los_Angeles"), None).as_deref(), Some("PT"));
+        assert_eq!(
+            schedule_time_zone_label(Some("America/Los_Angeles"), Some("2027-01-15T17:00:00Z")).as_deref(),
+            Some("PST")
+        );
+        assert_eq!(
+            schedule_time_zone_label(Some("America/Los_Angeles"), Some("2027-07-15T16:00:00Z")).as_deref(),
+            Some("PDT")
+        );
+        let fixed = ScheduledTask {
+            id: "c".into(),
+            title: "Morning".into(),
+            prompt: "hi".into(),
+            enabled: true,
+            schedule: Schedule::FixedTime { time_of_day: "09:00".into(), weekdays: vec![1, 2, 3, 4, 5] },
+            schedule_raw: json!({ "type": "fixed_time", "timeOfDay": "09:00", "weekdays": [1, 2, 3, 4, 5] }),
+            project_id: "p1".into(),
+            thread_id: Some("t1".into()),
+            workspace_strategy: json!({}),
+            model_selection: list[0].model_selection.clone(),
+            runtime_mode: "full-access".into(),
+            interaction_mode: "default".into(),
+            next_run_at: Some("2027-01-15T17:00:00Z".into()),
+            last_run_status: crate::settings::scheduled_tasks::RunStatus::Never,
+            last_run_error: None,
+            webhook: None,
+            blocked_by_policy: None,
+        };
+        assert_eq!(
+            automation_schedule_line_in(&fixed, |_| String::new(), Some("America/Los_Angeles"), crate::sidebar::time::parse_iso("2027-01-15T16:50:00Z").unwrap()),
+            "Weekdays at 09:00 PST \u{00b7} next in 10m"
         );
     }
 

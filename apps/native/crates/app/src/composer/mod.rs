@@ -292,6 +292,32 @@ pub(crate) fn rewind_precheck(thread_id: &str, cx: &App) -> RewindComposerPreche
     out
 }
 
+pub(crate) fn thread_choices(thread_id: &str, cx: &App) -> (Option<ModelSelection>, Option<RuntimeMode>) {
+    let Some(reg) = cx.try_global::<RegisteredComposers>() else {
+        return (None, None);
+    };
+    let target = Target::Thread(thread_id.to_owned());
+    let composer = reg
+        .0
+        .iter()
+        .filter_map(|weak| weak.upgrade())
+        .find(|entity| {
+            let c = entity.read(cx);
+            c.fixed.is_none() && c.thread_id().as_deref() == Some(thread_id)
+        })
+        .or_else(|| {
+            reg.0
+                .iter()
+                .filter_map(|weak| weak.upgrade())
+                .find(|entity| entity.read(cx).thread_id().as_deref() == Some(thread_id))
+        });
+    let Some(entity) = composer else {
+        return (None, None);
+    };
+    let choices = entity.read(cx).choices.get(&target);
+    (choices.and_then(|c| c.model.clone()), choices.and_then(|c| c.runtime_mode))
+}
+
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_for(state, None, window, cx)
@@ -843,6 +869,11 @@ impl Composer {
         self.close_citation_comment("prompt-replaced", window, cx);
         self.has_text = !text.trim().is_empty();
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+    }
+
+    pub(crate) fn replace_prompt_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_prompt(text, window, cx);
+        self.draft_changed(cx);
     }
 
     /// "Edit from here": the restored prompt and attachments join the draft (`rewindToMessage`), cursor at the end.

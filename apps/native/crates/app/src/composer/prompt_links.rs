@@ -70,7 +70,7 @@ impl Composer {
             let key = super::drafts::key(&target);
             let mut draft = self.drafts.store.get(&key).cloned().unwrap_or_default();
             draft.prompt = prompt.text;
-            self.drafts.store.set(&key, draft);
+            self.mutate_drafts(cx, |store| store.set(&key, draft));
             self.schedule_draft_save(&target, cx);
         }
         let description = std::iter::once("Read it before you send.".to_owned())

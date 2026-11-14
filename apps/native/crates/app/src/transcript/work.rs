@@ -177,6 +177,7 @@ fn subagent_notification_link(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Conte
     };
     let detail_color = hsla(if failed { p.destructive } else { p.muted_foreground });
     let title = format_subagent_display_title(agent.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Subagent"));
+    let tooltip = super::notices::subagent_tooltip_text(&title, effective, remote_label.as_deref(), agent.result.as_deref(), agent.progress.as_deref());
     let right_time = if !resumed {
         Some(timestamp(&env.clock, &entry.created_at, false, cx))
     } else if active {
@@ -203,6 +204,7 @@ fn subagent_notification_link(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Conte
         .px(px(8.))
         .py(px(6.))
         .rounded(px(6.))
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
         .child(
             div()
                 .relative()
@@ -816,9 +818,10 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
 }
 
 /// `ThinkingTimelineRow`.
-pub fn thinking_row(id: &str, group_id: Option<&str>, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn thinking_row(id: &str, group_id: Option<&str>, label: Option<&str>, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
-    let activity = live_activity(div().text_color(hsla(p.secondary_label)).child("Thinking").into_any_element(), Icon::WorkBrain, false, cx);
+    let label = label.unwrap_or("Thinking").to_owned();
+    let activity = live_activity(div().text_color(hsla(p.secondary_label)).child(label).into_any_element(), Icon::WorkBrain, false, cx);
     let frame = work_row_frame(SharedString::from(format!("thinking:{id}")), false).child(activity);
     match group_id {
         Some(group_id) => {

@@ -1886,3 +1886,27 @@ fn environment_summary_preserves_pull_requests_for_non_active_remote_search() {
     assert_eq!(summary.threads[0].thread.pull_requests.len(), 1);
     assert_eq!(summary.threads[0].thread.pull_requests[0].number, 22889);
 }
+
+#[test]
+fn idle_active_provider_thread_id_does_not_fabricate_shell_runtime() {
+    let idle = present_thread(
+        &serde_json::from_value(wire_thread("idle-provider", json!({
+            "activeProviderThreadId": "pt-1",
+            "latestRunId": null
+        })))
+        .unwrap(),
+        None,
+    );
+    assert!(idle.runtime.is_none());
+
+    let holding = present_thread(
+        &serde_json::from_value(wire_thread("bg-hold", json!({
+            "activeProviderThreadId": "pt-1",
+            "latestRunId": null,
+            "pendingBackgroundTasks": [{"taskId": "bg-1", "kind": "background_task"}]
+        })))
+        .unwrap(),
+        None,
+    );
+    assert_eq!(holding.runtime.as_ref().map(|r| r.status.as_str()), Some("idle"));
+}

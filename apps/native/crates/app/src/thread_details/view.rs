@@ -289,16 +289,14 @@ impl Render for DetailsView {
             let details = self.details.read(cx);
             let app = self.state.read(cx);
             let git = self.git.read(cx);
-            let project_id = app
-                .selected_thread
-                .as_deref()
-                .and_then(|id| app.thread_shell(id))
-                .map(|t| t.project_id.as_str())
-                .or(app.draft_project.as_deref());
-            let has_git_cwd = project_id.and_then(|id| app.shell.project(id).map(|p| (id, p))).is_some_and(|(id, p)| {
-                !app.is_scratch_project(id) && !p.workspace_root.is_empty()
-            });
+            let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
+            let project_id = thread.map(|t| t.project_id.as_str()).or(app.draft_project.as_deref());
+            let has_git_cwd = app.server_config.config.is_some()
+                && project_id
+                    .and_then(|id| app.shell.project(id).map(|p| (id, p)))
+                    .is_some_and(|(id, p)| !app.is_scratch_project(id) && !p.workspace_root.is_empty());
             let is_repo = has_git_cwd && git.status.as_ref().is_none_or(|status| status.local.is_repo);
+            let has_linked_pr = thread.is_some_and(|t| !t3_core::pull_requests::link::visible_links(&t.pull_requests).is_empty());
             let has_scripts = project_scripts(app).is_some_and(|(_, s)| !s.is_empty());
             let rel = self.inputs.as_ref().map(|i| &i.lineage);
             DensityInputs {
@@ -306,7 +304,7 @@ impl Render for DetailsView {
                 open_in: details.shows("openIn"),
                 scripts: details.shows("scripts") && has_scripts,
                 branch: details.shows("branch") && is_repo,
-                pr_row: false,
+                pr_row: details.shows("branch") && if is_repo { git.status.as_ref().and_then(|s| s.remote.pr.as_ref()).is_some() } else { has_linked_pr },
                 git_actions: details.shows("gitActions") && has_git_cwd,
                 changes: details.shows("changes") && is_repo,
                 servers_rows: if show_servers { thread_id.map_or(0, |id| self.servers.count_for(id)) } else { 0 },

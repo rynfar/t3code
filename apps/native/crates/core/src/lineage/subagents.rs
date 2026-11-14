@@ -103,6 +103,70 @@ pub fn is_terminal_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
 }
 
+/// `waitingOnSubagentsLabel`.
+pub fn waiting_on_subagents_label(count: usize) -> String {
+    if count == 1 { "Waiting on a subagent".to_owned() } else { format!("Waiting on {count} subagents") }
+}
+
+/// Surrogate-safe UTF-16 truncation of an untitled subagent's prompt (`promptTitle`).
+pub fn subagent_prompt_title(prompt: &str) -> String {
+    if prompt.chars().map(char::len_utf16).sum::<usize>() <= 80 {
+        return prompt.to_owned();
+    }
+    let mut out = String::new();
+    let mut units = 0usize;
+    for ch in prompt.chars() {
+        let next = ch.len_utf16();
+        if units + next > 77 {
+            break;
+        }
+        out.push(ch);
+        units += next;
+    }
+    out.push_str("...");
+    out
+}
+
+fn is_js_whitespace(ch: char) -> bool {
+    ch.is_whitespace() || ch == '\u{FEFF}'
+}
+
+/// `subagentDetailPreview`: normalizes Unicode whitespace and truncates cleanly at 280 UTF-16
+/// code units without splitting surrogate pairs.
+pub fn subagent_detail_preview(status: &str, result: Option<&str>, progress: Option<&str>) -> Option<String> {
+    let terminal = is_terminal_status(status);
+    let (preferred, fallback) = if terminal { (result, progress) } else { (progress, result) };
+    fn trim_start(value: Option<&str>) -> Option<&str> {
+        value.map(|s| s.trim_start_matches(is_js_whitespace)).filter(|s| !s.is_empty())
+    }
+    let detail = trim_start(preferred).or_else(|| trim_start(fallback))?;
+    let mut compact = String::new();
+    let mut units = 0usize;
+    let mut pending_space = false;
+    for ch in detail.chars() {
+        if is_js_whitespace(ch) {
+            if !compact.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+        let prefix = if pending_space { 1 } else { 0 };
+        let next = ch.len_utf16();
+        if units + prefix + next > 280 {
+            let trimmed = compact.trim_end_matches(is_js_whitespace);
+            return Some(format!("{trimmed}…"));
+        }
+        if pending_space {
+            compact.push(' ');
+            units += 1;
+            pending_space = false;
+        }
+        compact.push(ch);
+        units += next;
+    }
+    (!compact.is_empty()).then_some(compact)
+}
+
 fn millis(value: Option<&str>) -> i64 {
     value.and_then(parse_iso_ms).unwrap_or(0)
 }

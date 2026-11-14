@@ -138,7 +138,12 @@ impl RenderOnce for Row {
         let fill = hover_fill(cx);
         let interactive = !self.disabled && (self.on_click.is_some() || self.opens_menu);
         let p = palette(cx);
-        focusable(self.base, self.id, interactive, window, cx)
+        #[cfg(test)]
+        let debug_name = match &self.id {
+            ElementId::Name(name) => Some(name.clone()),
+            _ => None,
+        };
+        let base = focusable(self.base, self.id, interactive, window, cx)
             .flex()
             .items_center()
             .w_full()
@@ -159,7 +164,10 @@ impl RenderOnce for Row {
             .children(self.trailing)
             .when(self.chevron, |this| this.child(Icon::ChevronDown.sized(px(16.)).text_color(hsla(p.muted_foreground))))
             .when_some(self.tooltip, |this, text| this.tooltip(move |window, cx| tooltip_view(text.clone(), window, cx)))
-            .when_some(self.on_click.filter(|_| interactive), |this, handler| this.on_click(move |event, window, cx| handler(event, window, cx)))
+            .when_some(self.on_click.filter(|_| interactive), |this, handler| this.on_click(move |event, window, cx| handler(event, window, cx)));
+        #[cfg(test)]
+        let base = base.when_some(debug_name, |this, name| this.debug_selector(move || name.to_string()));
+        base
     }
 }
 

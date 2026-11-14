@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use gpui::{Context, EventEmitter, Task, Window};
+use gpui::{BorrowAppContext, Context, EventEmitter, Task, Window};
 use t3_client::store;
 use t3_core::composer::drafts::{self as rules, Draft, DraftStore, SavedAttachment};
 
@@ -15,7 +15,79 @@ use crate::sidebar::controller::now_ms;
 #[derive(Default)]
 pub(super) struct Drafts {
     pub(super) store: DraftStore,
+    pruned: Vec<String>,
+}
+
+#[derive(Default)]
+struct SharedDraftStore {
+    loaded: bool,
+    store: DraftStore,
     save: Option<Task<()>>,
+}
+
+impl gpui::Global for SharedDraftStore {}
+
+fn load_shared_store(cx: &mut gpui::App) -> DraftStore {
+    let loaded = cx.default_global::<SharedDraftStore>().loaded;
+    if !loaded {
+        let initial = DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref());
+        cx.update_global::<SharedDraftStore, _>(|shared, _| {
+            shared.store = initial;
+            shared.loaded = true;
+        });
+    }
+    cx.global::<SharedDraftStore>().store.clone()
+}
+
+fn live_composers(cx: &gpui::App) -> Vec<gpui::Entity<Composer>> {
+    cx.try_global::<super::RegisteredComposers>()
+        .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
+        .unwrap_or_default()
+}
+
+fn sync_composers_draft_store(skip: Option<gpui::EntityId>, snapshot: &DraftStore, cx: &mut gpui::App) {
+    for composer in live_composers(cx) {
+        if Some(composer.entity_id()) == skip {
+            continue;
+        }
+        let next = snapshot.clone();
+        composer.update(cx, |composer, cx| {
+            composer.drafts.store = next;
+            cx.notify();
+        });
+    }
+}
+
+fn save_shared_now(cx: &mut gpui::App) {
+    let value = cx.update_global::<SharedDraftStore, _>(|shared, _| {
+        shared.save = None;
+        shared.store.to_value()
+    });
+    store::save_ui_state(rules::STORE_NAME, &value);
+}
+
+fn emit_draft_events(target: &Target, pruned: &[String], cx: &mut Context<Composer>) {
+    match target {
+        Target::Draft(project_id) => cx.emit(DraftsChanged { project_id: project_id.clone() }),
+        Target::Thread(_) => cx.emit(ThreadDraftsChanged),
+        Target::Question(_) => {}
+    }
+    for key in pruned {
+        if let Some(project_id) = key.strip_prefix("draft:") { cx.emit(DraftsChanged { project_id: project_id.to_owned() }); }
+        if key.starts_with("thread:") { cx.emit(ThreadDraftsChanged); }
+    }
+}
+
+fn broadcast_draft_events(target: &Target, pruned: &[String], self_id: gpui::EntityId, cx: &mut Context<Composer>) {
+    emit_draft_events(target, pruned, cx);
+    for composer in live_composers(cx) {
+        if composer.entity_id() == self_id {
+            continue;
+        }
+        let t = target.clone();
+        let p = pruned.to_vec();
+        composer.update(cx, |_, cx| emit_draft_events(&t, &p, cx));
+    }
 }
 
 pub(super) fn key(target: &Target) -> String {
@@ -42,7 +114,7 @@ impl Composer {
     /// Loads the saved drafts: choices, mentions and uploaded attachments go back to their
     /// targets; prompts load when a target opens.
     pub(super) fn load_drafts(&mut self, cx: &mut Context<Self>) {
-        let store = DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref());
+        let store = load_shared_store(cx);
         for key in store.keys() {
             let (Some(target), Some(draft)) = (target(key), store.get(key)) else { continue };
             self.restore_draft_choices(&target, draft, cx);
@@ -54,6 +126,19 @@ impl Composer {
             self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect());
         }
         self.drafts.store = store;
+    }
+
+    pub(super) fn mutate_drafts<R>(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut DraftStore) -> R) -> R {
+        let _ = load_shared_store(cx);
+        let (out, pruned, snapshot) = cx.update_global::<SharedDraftStore, _>(|shared, _| {
+            let out = edit(&mut shared.store);
+            let pruned = shared.store.take_pruned_keys();
+            (out, pruned, shared.store.clone())
+        });
+        self.drafts.store = snapshot.clone();
+        self.drafts.pruned.extend(pruned);
+        sync_composers_draft_store(Some(cx.entity_id()), &snapshot, cx);
+        out
     }
 
     fn publish_review_comments(&self, target: &Target, prompt: &str, cx: &mut Context<Self>) {
@@ -116,7 +201,7 @@ impl Composer {
     pub(super) fn record_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
         let draft = self.current_draft(target, cx);
         self.publish_review_comments(target, &draft.prompt, cx);
-        if self.drafts.store.set(&key(target), draft) {
+        if self.mutate_drafts(cx, |store| store.set(&key(target), draft)) {
             self.schedule_draft_save(target, cx);
         }
     }
@@ -125,7 +210,7 @@ impl Composer {
     pub(super) fn discard_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
         self.choices.remove(target);
         self.sync_provider_target(cx);
-        if self.drafts.store.remove(&key(target)) {
+        if self.mutate_drafts(cx, |store| store.remove(&key(target))) {
             self.schedule_draft_save(target, cx);
         }
     }
@@ -144,7 +229,7 @@ impl Composer {
             self.reset_context_history(from, &leaving);
             self.publish_review_comments(from, &leaving, cx);
             let draft = self.capture_draft(from, leaving);
-            if self.drafts.store.set(&key(from), draft) {
+            if self.mutate_drafts(cx, |store| store.set(&key(from), draft)) {
                 self.schedule_draft_save(from, cx);
             }
         }
@@ -155,19 +240,15 @@ impl Composer {
     }
 
     pub(super) fn schedule_draft_save(&mut self, target: &Target, cx: &mut Context<Self>) {
-        match target {
-            Target::Draft(project_id) => cx.emit(DraftsChanged { project_id: project_id.clone() }),
-            Target::Thread(_) => cx.emit(ThreadDraftsChanged),
-            Target::Question(_) => {}
-        }
-        for key in self.drafts.store.take_pruned_keys() {
-            if let Some(project_id) = key.strip_prefix("draft:") { cx.emit(DraftsChanged { project_id: project_id.to_owned() }); }
-            if key.starts_with("thread:") { cx.emit(ThreadDraftsChanged); }
-        }
-        self.drafts.save = Some(cx.spawn(async move |this, cx| {
+        let pruned = std::mem::take(&mut self.drafts.pruned);
+        broadcast_draft_events(target, &pruned, cx.entity_id(), cx);
+        let task = gpui::App::spawn(cx, async move |cx| {
             cx.background_executor().timer(Duration::from_millis(rules::PERSIST_DEBOUNCE_MS)).await;
-            let _ = this.update(cx, |this, _| store::save_ui_state(rules::STORE_NAME, &this.drafts.store.to_value()));
-        }));
+            cx.update(save_shared_now);
+        });
+        cx.update_global::<SharedDraftStore, _>(|shared, _| {
+            shared.save = Some(task);
+        });
     }
 }
 
@@ -199,7 +280,7 @@ impl Composer {
         let draft = self.drafts.store.get(&storage_key)?.clone();
         if keep_choices && !draft.has_user_content() { return None; }
         if keep_choices {
-            if self.drafts.store.clear_content(&storage_key, now_ms()) {
+            if self.mutate_drafts(cx, |store| store.clear_content(&storage_key, now_ms())) {
                 self.schedule_draft_save(target, cx);
             }
         } else {
@@ -223,7 +304,7 @@ impl Composer {
     fn restore_target_draft(&mut self, target: &Target, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
         let DiscardedDraft { draft, attachments } = discarded;
         let live = self.current_draft(target, cx);
-        if !self.drafts.store.restore(&key(target), draft.clone(), &live) {
+        if !self.mutate_drafts(cx, |store| store.restore(&key(target), draft.clone(), &live)) {
             self.commit_sidebar_discard(DiscardedDraft { draft, attachments }, cx);
             self.error = Some("Failed to restore draft: The draft has new content.".into());
             cx.notify();
@@ -296,7 +377,7 @@ impl Composer {
         self.seed_mentions(&to, draft.thread_contexts());
         self.seed_terminals(&to, draft.terminals.clone());
         self.seed_reviews(&to, draft.review_comments.clone());
-        if self.drafts.store.set(&key(&to), draft.clone()) {
+        if self.mutate_drafts(cx, |store| store.set(&key(&to), draft.clone())) {
             self.schedule_draft_save(&to, cx);
         }
         self.restore_draft_attachments(&to, attachments, cx);
@@ -315,6 +396,102 @@ impl Composer {
         }
     }
 
+    pub(crate) fn clear_deleted_drafts(&mut self, thread_ids: &[String], cx: &mut Context<Self>) {
+        let mut changed = false;
+        for id in thread_ids {
+            let target = Target::Thread(id.clone());
+            let attachments = self.take_draft_attachments(&target);
+            if !attachments.is_empty() {
+                self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments }, cx);
+                changed = true;
+            }
+            let storage_key = key(&target);
+            let had_draft = self.drafts.store.get(&storage_key).is_some();
+            if had_draft || self.choices.contains_key(&target) {
+                self.discard_draft(&target, cx);
+                changed = true;
+            }
+            self.clear_mentions(&target);
+            self.context.records.remove(&target);
+            self.context.reviews.remove(&target);
+            self.clear_terminals(&target);
+        }
+        if changed {
+            self.drafts.pruned.clear();
+            broadcast_draft_events(&Target::Thread(String::new()), &[], cx.entity_id(), cx);
+            save_shared_now(cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn seed_model_selection(&mut self, thread_id: &str, selection: t3_core::model::ModelSelection, cx: &mut Context<Self>) {
+        let target = Target::Thread(thread_id.to_owned());
+        let storage_key = key(&target);
+        let mut draft = self.drafts.store.get(&storage_key).cloned().unwrap_or_default();
+        draft.model_selection = Some(selection);
+        draft.updated_at = now_ms();
+        self.restore_draft_choices(&target, &draft, cx);
+        if self.mutate_drafts(cx, |store| store.set(&storage_key, draft)) {
+            let pruned = std::mem::take(&mut self.drafts.pruned);
+            broadcast_draft_events(&target, &pruned, cx.entity_id(), cx);
+            save_shared_now(cx);
+        }
+        cx.notify();
+    }
+}
+
+pub(crate) fn seed_side_chat_model_selection(thread_id: &str, selection: t3_core::model::ModelSelection, cx: &mut gpui::App) {
+    let live = live_composers(cx);
+    if let Some(first) = live.first() {
+        first.update(cx, |composer, cx| composer.seed_model_selection(thread_id, selection.clone(), cx));
+        for composer in live.into_iter().skip(1) {
+            let mut draft = load_shared_store(cx).get(&rules::thread_key(thread_id)).cloned().unwrap_or_default();
+            draft.model_selection = Some(selection.clone());
+            composer.update(cx, |composer, cx| {
+                composer.restore_draft_choices(&Target::Thread(thread_id.to_owned()), &draft, cx);
+            });
+        }
+        return;
+    }
+    let _ = load_shared_store(cx);
+    let storage_key = rules::thread_key(thread_id);
+    let changed = cx.update_global::<SharedDraftStore, _>(|shared, _| {
+        let mut draft = shared.store.get(&storage_key).cloned().unwrap_or_default();
+        draft.model_selection = Some(selection);
+        draft.updated_at = now_ms();
+        shared.store.set(&storage_key, draft)
+    });
+    if changed {
+        save_shared_now(cx);
+    }
+}
+
+pub(crate) fn clear_deleted_thread_drafts(thread_ids: &[String], cx: &mut gpui::App) {
+    if thread_ids.is_empty() {
+        return;
+    }
+    let live = live_composers(cx);
+    if live.is_empty() {
+        let _ = load_shared_store(cx);
+        let changed = cx.update_global::<SharedDraftStore, _>(|shared, _| {
+            let mut changed = false;
+            for id in thread_ids {
+                changed |= shared.store.remove(&rules::thread_key(id));
+            }
+            changed
+        });
+        if changed {
+            save_shared_now(cx);
+        }
+        return;
+    }
+    for composer in live {
+        composer.update(cx, |composer, cx| composer.clear_deleted_drafts(thread_ids, cx));
+    }
+}
+
+impl Composer {
+
     #[cfg(feature = "snapshot")]
     pub(crate) fn set_thread_draft_fixture(
         &mut self,
@@ -328,8 +505,9 @@ impl Composer {
         let draft = Draft { prompt: prompt.to_owned(), model_selection, updated_at, ..Default::default() };
         self.restore_draft_choices(&target, &draft, cx);
         let key = key(&target);
-        if self.drafts.store.set(&key, draft) {
-            cx.emit(ThreadDraftsChanged);
+        if self.mutate_drafts(cx, |store| store.set(&key, draft)) {
+            let pruned = std::mem::take(&mut self.drafts.pruned);
+            broadcast_draft_events(&target, &pruned, cx.entity_id(), cx);
         }
         cx.notify();
     }
@@ -343,5 +521,15 @@ impl Composer {
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn test_prompt(&self, cx: &gpui::App) -> String {
         self.prompt(cx)
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn has_thread_draft(&self, thread_id: &str) -> bool {
+        self.drafts.store.get(&key(&Target::Thread(thread_id.to_owned()))).is_some()
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn stored_draft_prompt(&self, project_id: &str) -> Option<&str> {
+        self.drafts.store.get(&key(&Target::Draft(project_id.to_owned()))).map(|draft| draft.prompt.as_str())
     }
 }
