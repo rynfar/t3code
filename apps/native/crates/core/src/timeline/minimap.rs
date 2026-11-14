@@ -483,6 +483,27 @@ impl NavigationTooltips {
         active.is_some()
     }
 
+    /// Dismisses any visible or pending minimap tooltip when another tooltip outside the minimap
+    /// takes ownership (`app-wide tooltip arbitration`) or when focus/pointer leaves.
+    pub fn dismiss_all(&mut self, instant: bool) -> bool {
+        let had = self.open.is_some() || self.pending.is_some();
+        for index in 0..2 {
+            self.hovered[index] = false;
+            self.focused[index] = false;
+            self.pointer[index] = None;
+            self.dismiss(index, instant);
+        }
+        had
+    }
+
+    pub fn hovered_index(&self) -> Option<usize> {
+        self.hovered.iter().position(|hovered| *hovered)
+    }
+
+    pub fn focused_index(&self) -> Option<usize> {
+        self.focused.iter().position(|focused| *focused)
+    }
+
     fn dismiss(&mut self, index: usize, instant: bool) {
         self.dismissed[index] = true;
         self.hover_closing[index] = None;
@@ -537,6 +558,74 @@ pub fn keyboard_action(active: Option<usize>, count: usize, key: &str) -> Keyboa
 
 pub fn preview_offset(index: usize, count: usize, height: f32) -> f32 {
     if index == 0 { 0. } else if index + 1 == count { -height } else { -height / 2. }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RectF {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl RectF {
+    pub fn expand(self, margin: f32) -> Self {
+        Self {
+            left: self.left - margin,
+            top: self.top - margin,
+            right: self.right + margin,
+            bottom: self.bottom + margin,
+        }
+    }
+
+    pub fn contains(self, point: (f32, f32)) -> bool {
+        point.0 >= self.left && point.0 <= self.right && point.1 >= self.top && point.1 <= self.bottom
+    }
+}
+
+fn cross2(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
+fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
+    let d1 = cross2(p, a, b);
+    let d2 = cross2(p, b, c);
+    let d3 = cross2(p, c, a);
+    let has_neg = d1 < 0. || d2 < 0. || d3 < 0.;
+    let has_pos = d1 > 0. || d2 > 0. || d3 > 0.;
+    !(has_neg && has_pos)
+}
+
+/// Base UI `safePolygon` corridor from pointer `origin` toward popup `target`: returns true if
+/// `point` lies inside the expanded `target` rect or inside the convex hull spanning from `origin`
+/// to the extreme corners of `target`.
+pub fn point_in_safe_polygon(origin: (f32, f32), target: RectF, point: (f32, f32), margin: f32) -> bool {
+    let target = target.expand(margin);
+    if target.contains(point) {
+        return true;
+    }
+    if target.contains(origin) {
+        return false;
+    }
+    let corners = [
+        (target.left, target.top),
+        (target.right, target.top),
+        (target.right, target.bottom),
+        (target.left, target.bottom),
+    ];
+    for i in 0..corners.len() {
+        let a = corners[i];
+        let b = corners[(i + 1) % corners.len()];
+        if point_in_triangle(point, origin, a, b) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classifies discrete notched mouse-wheel events vs fine trackpad pixel streams for wheel glide.
+pub fn is_discrete_wheel(is_lines: bool, delta_y: f32) -> bool {
+    is_lines || delta_y.abs() >= 36.
 }
 
 #[cfg(test)]

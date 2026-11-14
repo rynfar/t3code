@@ -551,3 +551,31 @@ fn navigation_tooltip_close_fades_belong_to_each_trigger() {
     tips.hover(1, true, ms(655));
     assert_eq!(tips.visible(), None, "reduced motion ends both close fades immediately");
 }
+
+#[test]
+fn safe_polygon_protects_diagonal_corridor_and_rejects_outside_moves() {
+    let preview = RectF { left: 44., top: 100., right: 364., bottom: 220. };
+    let origin = (24., 130.);
+    // Moving diagonally across the gap between rail (x=24) and preview (x=44) stays inside corridor.
+    assert!(point_in_safe_polygon(origin, preview, (34., 120.), 4.));
+    assert!(point_in_safe_polygon(origin, preview, (34., 180.), 4.));
+    assert!(point_in_safe_polygon(origin, preview, (100., 150.), 4.));
+    // Moving straight up away from the preview corridor exits immediately.
+    assert!(!point_in_safe_polygon(origin, preview, (24., 70.), 4.));
+    assert!(!point_in_safe_polygon(origin, preview, (10., 130.), 4.));
+}
+
+#[test]
+fn navigation_tooltip_dismiss_all_clears_open_and_pending_for_arbitration() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut tips = NavigationTooltips::default();
+    tips.hover(0, true, ms(0));
+    tips.pointer_move(0, 10., 20., ms(0));
+    tips.advance(ms(600));
+    assert_eq!(tips.visible(), Some(0));
+    assert!(tips.dismiss_all(true));
+    assert_eq!(tips.visible(), None);
+    assert_eq!(tips.deadline(), None);
+    assert!(tips.instant(0));
+}

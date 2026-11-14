@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, HighlightStyle,
+    App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, HighlightStyle,
     Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Styled, StyledText, Subscription, TextLayout,
     TextStyleRefinement, WeakEntity, Window, WrappedLineLayout, div, fill, point, px,
@@ -20,7 +20,7 @@ use gpui::{
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Copy, SelectAll};
 use gpui_component::menu::ContextMenuExt;
-use t3_core::text_selection::{Granularity, Hit, Selection};
+use t3_core::text_selection::{Granularity, GroupPoint, GroupSelection, Hit, Selection};
 
 const CONTEXT: &str = "SelectableText";
 /// A drag held past the scroller's edge scrolls it this often, by how far past it is, up to
@@ -34,9 +34,117 @@ pub fn init(cx: &mut App) {
 
 pub type Highlights = Arc<[(Range<usize>, HighlightStyle)]>;
 
+#[derive(Clone)]
+enum ActiveTarget {
+    Single(WeakEntity<State>),
+    Group(WeakEntity<GroupState>),
+}
+
 #[derive(Default)]
-struct ActiveSelection(Option<WeakEntity<State>>);
+struct ActiveSelection(Option<ActiveTarget>);
 impl Global for ActiveSelection {}
+
+/// Coordinates drag, click-away, SelectAll, and Copy across multiple sibling `SelectableText`
+/// blocks (such as the minimap hover preview's user and assistant paragraphs).
+#[derive(Clone)]
+pub struct SelectionGroup(Entity<GroupState>);
+
+struct GroupMember {
+    part: usize,
+    state: WeakEntity<State>,
+    bounds: Bounds<Pixels>,
+    text: SharedString,
+    visible_end: usize,
+    layout: Option<TextLayout>,
+}
+
+#[derive(Default)]
+struct GroupState {
+    parts: Vec<GroupMember>,
+    selection: Option<GroupSelection>,
+    anchor_span: Option<(usize, Range<usize>)>,
+    dragging: bool,
+    granularity: Option<Granularity>,
+}
+
+impl GroupState {
+    fn upsert_member(&mut self, member: GroupMember) {
+        if let Some(existing) = self.parts.iter_mut().find(|item| item.part == member.part) {
+            *existing = member;
+        } else {
+            self.parts.push(member);
+            self.parts.sort_by_key(|item| item.part);
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        if selection.is_empty() || self.parts.is_empty() {
+            return None;
+        }
+        let max_part = self.parts.iter().map(|m| m.part).max().unwrap_or(0);
+        let mut ordered = vec![""; max_part + 1];
+        for member in &self.parts {
+            let end = member.visible_end.min(member.text.len());
+            ordered[member.part] = &member.text[..end];
+        }
+        let text = selection.extract_text(&ordered, "\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn contains_point(&self, point: Point<Pixels>) -> bool {
+        self.parts.iter().any(|member| member.bounds.contains(&point))
+    }
+
+    fn hit_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let target = self
+            .parts
+            .iter()
+            .find(|member| position.y <= member.bounds.bottom())
+            .or_else(|| self.parts.last())?;
+        let layout = target.layout.as_ref()?;
+        let lines = layout.line_layouts();
+        let hit = Lines::new(&lines, layout).hit(position);
+        Some((target.part, hit.caret.min(target.visible_end)))
+    }
+
+    fn sync_members(&self, cx: &mut App) {
+        for member in &self.parts {
+            let range = self.selection.and_then(|selection| selection.range_for_part(member.part, member.visible_end));
+            if let Some(state) = member.state.upgrade() {
+                state.update(cx, |state, cx| {
+                    if state.group_range != range {
+                        state.group_range = range;
+                        cx.notify();
+                    }
+                });
+            }
+        }
+    }
+
+    fn clear_selection(&mut self, cx: &mut App) {
+        self.selection = None;
+        self.anchor_span = None;
+        self.dragging = false;
+        self.granularity = None;
+        self.sync_members(cx);
+    }
+}
+
+impl SelectionGroup {
+    pub fn new(cx: &mut App) -> Self {
+        Self(cx.new(|_| GroupState::default()))
+    }
+
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
+        self.0.read(cx).selected_text()
+    }
+
+    pub fn clear(&self, cx: &mut App) {
+        self.0.update(cx, |group, cx| group.clear_selection(cx));
+        clear_active_selection_if_group(&self.0, cx);
+    }
+}
 
 /// Handle to a rendered `SelectableText` instance for reading or clearing its selection.
 #[derive(Clone)]
@@ -65,6 +173,8 @@ impl SelectableTextHandle {
             text,
             origin: 0,
             selection: None,
+            group: None,
+            group_range: None,
             dragging: false,
             menu: None,
             scroll: None,
@@ -88,24 +198,43 @@ impl SelectableTextHandle {
 }
 
 pub fn active_selected_text(cx: &App) -> Option<String> {
-    let weak = cx.try_global::<ActiveSelection>()?.0.as_ref()?;
-    let entity = weak.upgrade()?;
-    entity.read(cx).selected().map(str::to_owned)
+    match cx.try_global::<ActiveSelection>()?.0.as_ref()? {
+        ActiveTarget::Single(weak) => weak.upgrade()?.read(cx).selected().map(str::to_owned),
+        ActiveTarget::Group(weak) => weak.upgrade()?.read(cx).selected_text(),
+    }
 }
 
 pub fn clear_active_selection(cx: &mut App) {
-    let Some(entity) = cx.try_global::<ActiveSelection>().and_then(|active| active.0.as_ref()).and_then(WeakEntity::upgrade) else {
+    let Some(target) = cx.try_global::<ActiveSelection>().and_then(|active| active.0.clone()) else {
         return;
     };
-    SelectableTextHandle(entity).clear_selection(cx);
+    match target {
+        ActiveTarget::Single(weak) => {
+            if let Some(entity) = weak.upgrade() {
+                SelectableTextHandle(entity).clear_selection(cx);
+            }
+        }
+        ActiveTarget::Group(weak) => {
+            if let Some(group) = weak.upgrade() {
+                SelectionGroup(group).clear(cx);
+            }
+        }
+    }
 }
 
 fn set_active_selection(entity: &Entity<State>, cx: &mut App) {
-    let weak = entity.downgrade();
+    set_active_target(ActiveTarget::Single(entity.downgrade()), cx);
+}
+
+fn set_active_group_selection(group: &Entity<GroupState>, cx: &mut App) {
+    set_active_target(ActiveTarget::Group(group.downgrade()), cx);
+}
+
+fn set_active_target(target: ActiveTarget, cx: &mut App) {
     if cx.has_global::<ActiveSelection>() {
-        cx.global_mut::<ActiveSelection>().0 = Some(weak);
+        cx.global_mut::<ActiveSelection>().0 = Some(target);
     } else {
-        cx.set_global(ActiveSelection(Some(weak)));
+        cx.set_global(ActiveSelection(Some(target)));
     }
 }
 
@@ -113,7 +242,17 @@ fn clear_active_selection_if(entity: &Entity<State>, cx: &mut App) {
     let id = entity.entity_id();
     if cx.has_global::<ActiveSelection>() {
         let active = cx.global_mut::<ActiveSelection>();
-        if active.0.as_ref().is_some_and(|weak| weak.entity_id() == id) {
+        if matches!(active.0.as_ref(), Some(ActiveTarget::Single(weak)) if weak.entity_id() == id) {
+            active.0 = None;
+        }
+    }
+}
+
+fn clear_active_selection_if_group(group: &Entity<GroupState>, cx: &mut App) {
+    let id = group.entity_id();
+    if cx.has_global::<ActiveSelection>() {
+        let active = cx.global_mut::<ActiveSelection>();
+        if matches!(active.0.as_ref(), Some(ActiveTarget::Group(weak)) if weak.entity_id() == id) {
             active.0 = None;
         }
     }
@@ -128,6 +267,7 @@ pub struct SelectableText {
     highlights: Option<Highlights>,
     origin: usize,
     scroll: Option<ScrollHandle>,
+    group: Option<(SelectionGroup, usize)>,
     tab_stop: bool,
     tail_ellipsis: bool,
     on_state: Option<StateCallback>,
@@ -142,10 +282,16 @@ impl SelectableText {
             highlights: None,
             origin: 0,
             scroll: None,
+            group: None,
             tab_stop: true,
             tail_ellipsis: false,
             on_state: None,
         }
+    }
+
+    pub fn selection_group(mut self, group: SelectionGroup, part: usize) -> Self {
+        self.group = Some((group, part));
+        self
     }
 
     pub fn on_state(mut self, f: impl Fn(&SelectableTextHandle, &mut App) + 'static) -> Self {
@@ -184,12 +330,28 @@ impl SelectableText {
     }
 }
 
+impl SelectionGroup {
+    pub fn select_all(&self, cx: &mut App) {
+        self.0.update(cx, |group, cx| {
+            let (Some(first), Some(last)) = (group.parts.first(), group.parts.last()) else { return };
+            group.selection = Some(GroupSelection {
+                anchor: GroupPoint { part: first.part, offset: 0 },
+                focus: GroupPoint { part: last.part, offset: last.visible_end },
+            });
+            group.sync_members(cx);
+        });
+        set_active_group_selection(&self.0, cx);
+    }
+}
+
 struct State {
     focus: FocusHandle,
     /// The text the selection's offsets index, and where it starts in its stream.
     text: SharedString,
     origin: usize,
     selection: Option<Selection>,
+    group: Option<(SelectionGroup, usize)>,
+    group_range: Option<Range<usize>>,
     dragging: bool,
     /// Held while this text's context menu is open: a click on the menu, or the one that
     /// dismisses it, must not clear the selection it copies.
@@ -216,8 +378,16 @@ impl State {
         self.origin = origin;
     }
 
+    fn selected_range(&self) -> Option<Range<usize>> {
+        if self.group.is_some() {
+            self.group_range.clone().filter(|range| !range.is_empty())
+        } else {
+            self.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty())
+        }
+    }
+
     fn selected(&self) -> Option<&str> {
-        self.selection.as_ref().map(|selection| selection.text(&self.text)).filter(|text| !text.is_empty())
+        self.selected_range().and_then(|range| self.text.get(range))
     }
 
     /// A drag step at `pointer`: scrolls the scroller when the pointer is past its edge, then
@@ -308,7 +478,15 @@ fn lift_fills(highlights: &[(Range<usize>, HighlightStyle)], selected: Range<usi
 }
 
 fn copy(state: &Entity<State>, cx: &mut App) {
-    match state.read(cx).selected().map(str::to_owned) {
+    let text = {
+        let read = state.read(cx);
+        if let Some((group, _)) = &read.group {
+            group.selected_text(cx)
+        } else {
+            read.selected().map(str::to_owned)
+        }
+    };
+    match text {
         Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
         // Nothing selected here; the window's own selection (markdown) may still copy.
         None => cx.propagate(),
@@ -323,6 +501,8 @@ impl RenderOnce for SelectableText {
             text: initial.0,
             origin: initial.1,
             selection: None,
+            group: None,
+            group_range: None,
             dragging: false,
             menu: None,
             scroll: None,
@@ -332,10 +512,15 @@ impl RenderOnce for SelectableText {
             pointer: Point::default(),
             autoscrolling: false,
         });
+        let group = self.group.clone();
         let (focus, selected) = state.update(cx, |state, _| {
             state.sync(&self.text, self.origin);
             state.scroll = self.scroll;
-            (state.focus.clone(), state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()))
+            if state.group.as_ref().map(|(g, p)| (g.0.entity_id(), *p)) != group.as_ref().map(|(g, p)| (g.0.entity_id(), *p)) {
+                state.group_range = None;
+            }
+            state.group = group.clone();
+            (state.focus.clone(), state.selected_range())
         });
         if selected.is_none() {
             clear_active_selection_if(&state, cx);
@@ -354,18 +539,27 @@ impl RenderOnce for SelectableText {
             .font_family(cx.theme().font_family.clone())
             .on_action(move |_: &Copy, _, cx| copy(&copy_state, cx))
             .on_action(move |_: &SelectAll, _, cx| {
-                all_state.update(cx, |state, cx| {
-                    state.selection = Some(Selection::all(&state.text));
-                    cx.notify();
-                });
-                set_active_selection(&all_state, cx);
+                let group = all_state.read(cx).group.as_ref().map(|(group, _)| group.clone());
+                if let Some(group) = group {
+                    group.select_all(cx);
+                } else {
+                    all_state.update(cx, |state, cx| {
+                        state.selection = Some(Selection::all(&state.text));
+                        cx.notify();
+                    });
+                    set_active_selection(&all_state, cx);
+                }
             })
             .child(TextElement::new(state, self.text, self.highlights, selected, font_family, self.tail_ellipsis))
             .context_menu(move |menu, _, cx| {
                 let popup = cx.entity();
                 let selected = menu_state.update(cx, |state, cx| {
                     state.menu = Some(cx.subscribe(&popup, |state, _, _: &DismissEvent, _| state.menu = None));
-                    state.selected().is_some()
+                    if let Some((group, _)) = &state.group {
+                        group.selected_text(cx).is_some()
+                    } else {
+                        state.selected().is_some()
+                    }
                 });
                 menu.action_context(menu_focus.clone()).menu_with_disabled("Copy", Box::new(Copy), !selected).menu("Select all", Box::new(SelectAll))
             })
@@ -441,13 +635,32 @@ impl Element for TextElement {
         cx: &mut App,
     ) {
         let text_layout = self.text.layout().clone();
-        let (range, dragging, selected) = self.state.update(cx, |state, _| {
-            state.visible_end = if self.tail_ellipsis { t3_core::text_selection::visible_prefix_end(&state.text, &text_layout.text()) }
+        let (range, dragging, selected, group_info) = self.state.update(cx, |state, _| {
+            let visible_end = if self.tail_ellipsis { t3_core::text_selection::visible_prefix_end(&state.text, &text_layout.text()) }
                 else if text_layout.len() == state.text.len() { Some(state.text.len()) } else { None };
+            state.visible_end = visible_end;
             state.layout = Some(text_layout.clone());
             state.painted_scroll = state.scroll.as_ref().map_or(px(0.), |scroll| scroll.offset().y);
-            (state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()), state.dragging, state.selection.is_some())
+            let group_info = state.group.as_ref().map(|(group, part)| {
+                (group.clone(), *part, state.text.clone(), visible_end.unwrap_or(0))
+            });
+            let active_any = state.selected_range().is_some() || state.selection.is_some();
+            (state.selected_range(), state.dragging, active_any, group_info)
         });
+        if let Some((group, part, text, visible_end)) = group_info {
+            let weak_state = self.state.downgrade();
+            let member_layout = text_layout.clone();
+            group.0.update(cx, |group_state, _| {
+                group_state.upsert_member(GroupMember {
+                    part,
+                    state: weak_state,
+                    bounds,
+                    text,
+                    visible_end,
+                    layout: Some(member_layout),
+                });
+            });
+        }
         if let Some(range) = range {
             let color = cx.theme().selection;
             let lines = text_layout.line_layouts();
@@ -471,23 +684,53 @@ impl Element for TextElement {
                 // The row behind must not read the press as a click, nor the window start its own
                 // selection from it.
                 cx.stop_propagation();
-                let Some(end) = state.read(cx).visible_end else { return };
+                let (end, focus, group) = {
+                    let read = state.read(cx);
+                    let Some(end) = read.visible_end else { return };
+                    (end, read.focus.clone(), read.group.clone())
+                };
                 let hit = hit_test(&text_layout, event.position);
                 let hit = Hit { caret: hit.caret.min(end), under: hit.under.min(end) };
-                let focus = state.read(cx).focus.clone();
                 window.focus(&focus, cx);
-                state.update(cx, |state, cx| {
-                    let text = state.text.clone();
-                    match state.selection.as_mut() {
-                        Some(selection) if event.modifiers.shift => {
-                            selection.extend(&text, hit);
+                if let Some((group, part)) = group {
+                    let granularity = Granularity::from_clicks(event.click_count);
+                    let text = state.read(cx).text.clone();
+                    let initial = Selection::press(&text, hit, granularity);
+                    group.0.update(cx, |group_state, cx| {
+                        if event.modifiers.shift && let Some(selection) = group_state.selection.as_mut() {
+                            selection.focus = GroupPoint { part, offset: hit.caret };
+                        } else {
+                            let initial_range = initial.range();
+                            let focus_offset = if initial_range.is_empty() { hit.caret } else { initial_range.end };
+                            group_state.selection = Some(GroupSelection {
+                                anchor: GroupPoint { part, offset: initial_range.start },
+                                focus: GroupPoint { part, offset: focus_offset },
+                            });
+                            group_state.anchor_span = Some((part, initial_range));
+                            group_state.granularity = Some(granularity);
                         }
-                        _ => state.selection = Some(Selection::press(&text, hit, Granularity::from_clicks(event.click_count))),
-                    }
-                    state.dragging = true;
-                    cx.notify();
-                });
-                set_active_selection(&state, cx);
+                        group_state.dragging = true;
+                        group_state.sync_members(cx);
+                    });
+                    state.update(cx, |state, cx| {
+                        state.dragging = true;
+                        cx.notify();
+                    });
+                    set_active_group_selection(&group.0, cx);
+                } else {
+                    state.update(cx, |state, cx| {
+                        let text = state.text.clone();
+                        match state.selection.as_mut() {
+                            Some(selection) if event.modifiers.shift => {
+                                selection.extend(&text, hit);
+                            }
+                            _ => state.selection = Some(Selection::press(&text, hit, Granularity::from_clicks(event.click_count))),
+                        }
+                        state.dragging = true;
+                        cx.notify();
+                    });
+                    set_active_selection(&state, cx);
+                }
             }
         });
         // Capture phase, so the drag follows the pointer over anything that stops it.
@@ -495,6 +738,18 @@ impl Element for TextElement {
             let state = self.state.clone();
             move |event: &MouseMoveEvent, phase, _, cx| {
                 if !phase.capture() || !state.read(cx).dragging {
+                    return;
+                }
+                if let Some((group, _)) = state.read(cx).group.clone() {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        state.update(cx, |state, cx| {
+                            state.dragging = false;
+                            cx.notify();
+                        });
+                        group.0.update(cx, |group_state, _| group_state.dragging = false);
+                    } else {
+                        extend_group_selection(&group, event.position, cx);
+                    }
                     return;
                 }
                 state.update(cx, |state, cx| {
@@ -512,6 +767,23 @@ impl Element for TextElement {
             let state = self.state.clone();
             move |event: &MouseUpEvent, phase, _, cx| {
                 if phase.capture() && event.button == MouseButton::Left && state.read(cx).dragging {
+                    if let Some((group, _)) = state.read(cx).group.clone() {
+                        extend_group_selection(&group, event.position, cx);
+                        state.update(cx, |state, cx| {
+                            state.dragging = false;
+                            cx.notify();
+                        });
+                        let has_selection = group.0.update(cx, |group_state, _| {
+                            group_state.dragging = false;
+                            group_state.selected_text().is_some()
+                        });
+                        if has_selection {
+                            set_active_group_selection(&group.0, cx);
+                        } else {
+                            clear_active_selection_if_group(&group.0, cx);
+                        }
+                        return;
+                    }
                     let has_selection = state.update(cx, |state, cx| {
                         // The release settles the end, even where an auto-scroll step left it behind.
                         state.extend_to(event.position);
@@ -530,8 +802,15 @@ impl Element for TextElement {
         if selected {
             window.on_mouse_event({
                 let (state, hitbox) = (self.state.clone(), hitbox.clone());
-                move |_: &MouseDownEvent, phase, window, cx| {
+                move |event: &MouseDownEvent, phase, window, cx| {
                     if !phase.capture() || hitbox.is_hovered(window) || state.read(cx).menu.is_some() {
+                        return;
+                    }
+                    if let Some((group, _)) = state.read(cx).group.clone() {
+                        if group.0.read(cx).contains_point(event.position) {
+                            return;
+                        }
+                        group.clear(cx);
                         return;
                     }
                     state.update(cx, |state, cx| {
@@ -543,6 +822,32 @@ impl Element for TextElement {
             });
         }
     }
+}
+
+fn extend_group_selection(group: &SelectionGroup, position: Point<Pixels>, cx: &mut App) {
+    group.0.update(cx, |group_state, cx| {
+        let Some((part, offset)) = group_state.hit_at(position) else { return };
+        let Some(mut selection) = group_state.selection else { return };
+        if let Some((anchor_part, span)) = &group_state.anchor_span {
+            let next = GroupPoint { part, offset };
+            let span_start = GroupPoint { part: *anchor_part, offset: span.start };
+            let span_end = GroupPoint { part: *anchor_part, offset: span.end };
+            if next < span_start {
+                selection.anchor = span_end;
+                selection.focus = next;
+            } else if next > span_end {
+                selection.anchor = span_start;
+                selection.focus = next;
+            } else {
+                selection.anchor = span_start;
+                selection.focus = span_end;
+            }
+        } else {
+            selection.focus = GroupPoint { part, offset };
+        }
+        group_state.selection = Some(selection);
+        group_state.sync_members(cx);
+    });
 }
 
 fn hit_test(layout: &TextLayout, position: Point<Pixels>) -> Hit {
@@ -766,5 +1071,47 @@ mod tests {
         // Painted at the top, then scrolled 40px (two rows) before the pointer moved.
         assert_eq!(text.hit_scrolled(at(10., 5.), px(-40.)).caret, 2 * 6 + 1, "the third row, drawn where the first was");
         assert_eq!(text.hit_scrolled(at(10., 5.), px(0.)).caret, 1);
+    }
+
+    #[gpui::test]
+    fn cross_paragraph_group_selects_and_copies_across_parts(cx: &mut gpui::TestAppContext) {
+        use gpui::{Context, Render, size};
+        cx.update(gpui_component::init);
+        struct Preview {
+            group: SelectionGroup,
+        }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(300.))
+                    .flex()
+                    .flex_col()
+                    .child(SelectableText::new("group-p0", "User prompt text").selection_group(self.group.clone(), 0))
+                    .child(SelectableText::new("group-p1", "Assistant reply text").selection_group(self.group.clone(), 1))
+            }
+        }
+        let group = cx.update(SelectionGroup::new);
+        let preview_group = group.clone();
+        let window = cx.open_window(size(px(320.), px(160.)), |_, _| Preview { group: preview_group });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear());
+        let (start, end) = group.0.read_with(visual, |g, _| {
+            assert_eq!(g.parts.len(), 2);
+            (
+                point(g.parts[0].bounds.left() + px(12.), g.parts[0].bounds.center().y),
+                point(g.parts[1].bounds.left() + px(100.), g.parts[1].bounds.center().y),
+            )
+        });
+        visual.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Default::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        let selected = visual.update(|_, cx| active_selected_text(cx));
+        assert!(
+            selected.as_deref().is_some_and(|text| text.contains("\n\n") && text.contains("prompt") && text.contains("Assistant")),
+            "expected cross-paragraph selection across both parts, got {selected:?}"
+        );
+        visual.simulate_mouse_down(point(px(310.), px(150.)), MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(point(px(310.), px(150.)), MouseButton::Left, Default::default());
+        assert_eq!(visual.update(|_, cx| active_selected_text(cx)), None);
     }
 }

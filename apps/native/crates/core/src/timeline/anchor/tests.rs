@@ -182,3 +182,116 @@ fn pinned_tail_captures_visible_rows_and_holds_position_on_append() {
         Some(Anchor::At(ScrollTop { item: 3, offset: 20. })),
     );
 }
+
+#[test]
+fn timeline_follow_hysteresis_and_debounce_pill() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut follow = TimelineFollow::default();
+    assert!(follow.is_following());
+    assert!(follow.is_at_end());
+
+    // Passive growth while Following keeps Following even past 40px.
+    follow.on_passive_distance(false, ms(10));
+    assert!(follow.is_following());
+    assert_eq!(follow.pill_state(false, true, ms(200)), (false, None));
+
+    // Navigating while still <= 40px enters Released { at_end: true } without showing pill.
+    follow.on_user_navigation(ScrollSource::Wheel, true, ms(300));
+    assert!(!follow.is_following());
+    assert!(follow.is_at_end());
+    assert_eq!(follow.pill_state(false, true, ms(500)), (false, None));
+
+    // Scrolling past 40px starts the 150ms reveal timer; hidden while find is open.
+    follow.on_user_navigation(ScrollSource::Wheel, false, ms(600));
+    assert!(!follow.is_at_end());
+    assert_eq!(follow.pill_state(false, true, ms(650)), (false, Some(ms(750))));
+    assert_eq!(follow.pill_state(false, true, ms(750)), (true, None));
+    assert_eq!(follow.pill_state(true, true, ms(760)), (false, None));
+    // Re-hides while find was open; restarts 150ms debounce once find closes while still released.
+    assert_eq!(follow.pill_state(false, true, ms(800)), (false, Some(ms(950))));
+
+    // Returning within 40px from away re-engages Following and clears pill.
+    follow.on_user_navigation(ScrollSource::Wheel, true, ms(960));
+    assert!(follow.is_following());
+    assert!(follow.is_at_end());
+    assert_eq!(follow.pill_state(false, true, ms(1200)), (false, None));
+
+    // Scrollbar/EndKey explicitly re-arms Following.
+    follow.on_user_navigation(ScrollSource::Scrollbar, false, ms(1300));
+    assert!(!follow.is_following());
+    follow.on_user_navigation(ScrollSource::EndKey, false, ms(1310));
+    assert!(follow.is_following());
+}
+
+#[test]
+fn new_turn_anchor_only_anchors_first_user_message_and_releases_on_tool_or_settle() {
+    let mut follow = TimelineFollow::default();
+    let initial = [RunAnchorSnapshot { run_id: "r0", status: "completed", user_message_id: "m0", has_tool_or_reasoning: false }];
+    // Initial hydration does not anchor historical turns.
+    assert_eq!(follow.observe_runs(&initial, 1, |id| id == "m0"), AnchorEffect::None);
+
+    // Follow-up second user message does NOT anchor (web commit 2274444e92).
+    let followup = [
+        RunAnchorSnapshot { run_id: "r0", status: "completed", user_message_id: "m0", has_tool_or_reasoning: false },
+        RunAnchorSnapshot { run_id: "r1", status: "running", user_message_id: "m1", has_tool_or_reasoning: false },
+    ];
+    assert_eq!(follow.observe_runs(&followup, 2, |id| id == "m0"), AnchorEffect::None);
+
+    // First user message on a fresh thread anchors, holds while streaming plain text, and releases on tool activity.
+    let mut fresh = TimelineFollow::default();
+    assert_eq!(fresh.observe_runs(&[], 0, |_| false), AnchorEffect::None);
+    let first_start = [RunAnchorSnapshot { run_id: "r1", status: "starting", user_message_id: "m1", has_tool_or_reasoning: false }];
+    assert_eq!(
+        fresh.observe_runs(&first_start, 1, |id| id == "m1"),
+        AnchorEffect::Anchor { user_message_id: "m1".to_owned() },
+    );
+    assert_eq!(fresh.anchored_user_message_id(), Some("m1"));
+    let streaming = [RunAnchorSnapshot { run_id: "r1", status: "running", user_message_id: "m1", has_tool_or_reasoning: false }];
+    assert_eq!(
+        fresh.observe_runs(&streaming, 1, |id| id == "m1"),
+        AnchorEffect::Keep { user_message_id: "m1".to_owned() },
+    );
+    let tool_started = [RunAnchorSnapshot { run_id: "r1", status: "running", user_message_id: "m1", has_tool_or_reasoning: true }];
+    assert_eq!(fresh.observe_runs(&tool_started, 1, |id| id == "m1"), AnchorEffect::ReleaseAndScrollToEnd);
+    assert_eq!(fresh.anchored_user_message_id(), None);
+}
+
+#[test]
+fn remembered_positions_enforces_lru_cap_and_updates_recency() {
+    let mut cache = RememberedPositions::default();
+    let make = |offset: f32| SavedThreadPosition {
+        row_id: Some("row".to_owned()),
+        offset_within_row: offset,
+        scroll_top: offset,
+        at_end: false,
+        expanded_runs: Default::default(),
+        expanded_attempts: Default::default(),
+        expanded_groups: Default::default(),
+    };
+    for i in 0..REMEMBERED_POSITIONS_LIMIT {
+        cache.save(format!("t{i}"), make(i as f32));
+    }
+    assert_eq!(cache.len(), REMEMBERED_POSITIONS_LIMIT);
+    // Touch t0 so t1 becomes LRU.
+    assert_eq!(cache.get("t0").unwrap().offset_within_row, 0.);
+    cache.save("t_new", make(999.));
+    assert_eq!(cache.len(), REMEMBERED_POSITIONS_LIMIT);
+    assert!(cache.get("t0").is_some());
+    assert!(cache.get("t1").is_none());
+}
+
+#[test]
+fn smooth_step_fraction_recovers_exact_ease_out_cubic_curve() {
+    let mut pos = 0.0f32;
+    let target = 1000.0f32;
+    let steps = [0.25f32, 0.5, 0.75, 1.0];
+    let mut prev = 0.0f32;
+    for t in steps {
+        let frac = smooth_step_fraction(prev, t);
+        pos += (target - pos) * frac;
+        assert!((pos - target * ease_out_cubic(t)).abs() < 1e-2, "t={t}, pos={pos}");
+        prev = t;
+    }
+    assert_eq!(pos, target);
+}

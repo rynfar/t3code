@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 mod citations;
 mod find;
@@ -25,12 +26,14 @@ use t3_client::history::HistoryQuery;
 use t3_core::history::{HistoryControl, HistoryStep, PageOutcome, WorkPageOutcome};
 use t3_core::timeline::anchor::{self, Anchor, ScrollTop, VisibleRows};
 use t3_core::timeline::{
-    EntriesCache, GET_TURN_ITEM, RowKind, open_command_items, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
+    EntriesCache, EntryKind, GET_TURN_ITEM, Role, RowKind, open_command_items, RowsCache, RowsInput, ThreadActivity, TimelineRow, WorkLogEntry, decode_detail, derive_activity,
     derive_rows, detail_request, detail_revision, entry_fetches_detail, fork_support, rows_equal, turn_diffs_by_message, update_entries,
 };
 use t3_core::diff::TurnDiffSummary;
 
 use crate::app_state::{AppEvent, AppState};
+use crate::glass;
+use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::MarkdownStore;
 use crate::transcript::{Clock, CommandOutputSlot, Detail, FoldWorkState, RowEnv, SetupEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
@@ -39,6 +42,22 @@ use crate::worktree_setup::{SetupEvent, WorktreeSetupStore};
 actions!(thread_view, [FindInThread]);
 
 const DETAIL_CACHE_LIMIT: usize = 64;
+const SMOOTH_SCROLL_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy)]
+enum SmoothTarget {
+    Bottom,
+    Item { item_ix: usize, view_offset: f32 },
+    Delta { remaining: f32 },
+}
+
+struct SmoothScroll {
+    target: SmoothTarget,
+    started_at: Instant,
+    last_progress: f32,
+    source: anchor::ScrollSource,
+    _task: gpui::Task<()>,
+}
 
 pub struct ThreadView {
     pub(crate) state: Entity<AppState>,
@@ -58,11 +77,21 @@ pub struct ThreadView {
     command_outputs: HashMap<String, CommandOutputSlot>,
     /// `commandOutputStreaming`, as of the last sync.
     streams_output: bool,
-    group_lists: RefCell<HashMap<String, ListState>>,
+    group_lists: Rc<RefCell<HashMap<String, ListState>>>,
     /// A row whose top must sit this far below the viewport's top; its next prepaint asks the
     /// list to scroll up into the rows above it, which only then have heights.
     anchor_gap: Rc<RefCell<Option<(String, f32)>>>,
     disclosure: anchor::DisclosureFollow,
+    follow: anchor::TimelineFollow,
+    remembered_positions: anchor::RememberedPositions,
+    pending_restore: Option<anchor::SavedThreadPosition>,
+    follow_epoch: Instant,
+    scroll_to_end_task: Option<gpui::Task<()>>,
+    smooth_scroll: Option<SmoothScroll>,
+    pending_scroll_source: Option<anchor::ScrollSource>,
+    last_scroll_snapshot: Option<(usize, f32, usize)>,
+    last_row_count_seen: usize,
+    suppress_scroll_release: bool,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
     citation_ui: citations::CitationUi,
@@ -195,9 +224,19 @@ impl ThreadView {
             details: HashMap::new(),
             command_outputs: HashMap::new(),
             streams_output: false,
-            group_lists: RefCell::new(HashMap::new()),
+            group_lists: Rc::default(),
             anchor_gap: Rc::default(),
             disclosure: anchor::DisclosureFollow::default(),
+            follow: anchor::TimelineFollow::default(),
+            remembered_positions: anchor::RememberedPositions::default(),
+            pending_restore: None,
+            follow_epoch: cx.background_executor().now(),
+            scroll_to_end_task: None,
+            smooth_scroll: None,
+            pending_scroll_source: None,
+            last_scroll_snapshot: None,
+            last_row_count_seen: 0,
+            suppress_scroll_release: false,
             working_timer: None,
             find: None,
             citation_ui: citations::CitationUi::new(cx),
@@ -255,7 +294,34 @@ impl ThreadView {
             return;
         }
         if selected != self.thread_id {
+            if let Some(previous_id) = self.thread_id.take() && !self.rows.is_empty() {
+                let (distance, viewport) = disclosure_end_distance(&self.list);
+                let top = self.list.logical_scroll_top();
+                let row_id = top.item_ix.checked_sub(self.header_count()).and_then(|ix| self.rows.get(ix)).map(|r| r.id.clone());
+                let scroll_top = f32::from(-self.list.scroll_px_offset_for_scrollbar().y);
+                let at_end = if viewport > 0. { self.follow.is_following() || anchor::at_end(distance, viewport) } else { self.follow.is_following() };
+                self.remembered_positions.save(
+                    previous_id,
+                    anchor::SavedThreadPosition {
+                        row_id,
+                        offset_within_row: f32::from(top.offset_in_item),
+                        scroll_top,
+                        at_end,
+                        expanded_runs: self.ui.expanded_runs.clone(),
+                        expanded_attempts: self.ui.expanded_attempts.clone(),
+                        expanded_groups: self.ui.expanded_groups.clone(),
+                    },
+                );
+            }
             self.disclosure.cancel();
+            self.smooth_scroll = None;
+            self.scroll_to_end_task = None;
+            self.pending_scroll_source = None;
+            self.last_scroll_snapshot = None;
+            self.last_row_count_seen = 0;
+            self.suppress_scroll_release = false;
+            self.list.set_tail_reservation(None);
+            self.follow.reset();
             self.dismiss_citation_selection(cx);
             self.thread_id = selected;
             self.ui = TranscriptUi::default();
@@ -284,6 +350,19 @@ impl ThreadView {
             self.list.reset(0);
             self.setup_env = SetupEnv::default();
             self.read_setup(cx);
+            if let Some(saved) = self.thread_id.as_deref().and_then(|id| self.remembered_positions.get(id)).cloned() {
+                self.ui.expanded_runs = saved.expanded_runs.clone();
+                self.ui.expanded_attempts = saved.expanded_attempts.clone();
+                self.ui.expanded_groups = saved.expanded_groups.clone();
+                if saved.at_end {
+                    self.pending_restore = None;
+                } else {
+                    self.follow.restore_released(false, self.follow_now(cx));
+                    self.pending_restore = Some(saved);
+                }
+            } else {
+                self.pending_restore = None;
+            }
         }
         let mutation = self.thread_state(self.state.read(cx)).projection.as_ref().and_then(t3_core::media::workspace_mutation_id);
         if self.workspace_mutation_id != mutation {
@@ -334,9 +413,30 @@ impl ThreadView {
         let visible = self.visible_rows(cx);
         self.sync_history(cx);
         let changed = self.rederive_rows(cx);
-        let follow = !paused && changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
-        if follow { self.list.scroll_to_end(); } else { self.keep_place(visible); }
+        if self.find.is_some() {
+            self.pending_restore = None;
+        }
+        let restored = self.apply_pending_restore();
+        if !restored {
+            let anchored = if !paused {
+                self.apply_new_turn_anchor(cx)
+            } else {
+                self.list.set_tail_reservation(None);
+                false
+            };
+            if !anchored {
+                let disclosure_follow = !paused && changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
+                let keep_end = (self.follow.is_following() && !paused && self.follow.anchored_user_message_id().is_none()) || disclosure_follow;
+                if keep_end {
+                    self.suppress_scroll_release = true;
+                    self.list.scroll_to_end();
+                } else {
+                    self.keep_place(visible);
+                }
+            }
+        }
         if changed { self.disclosure.changed(); }
+        self.last_row_count_seen = self.rows.len();
         let pending_work = self.sync_work_folds(cx);
         self.load_deferred_work(pending_work, cx);
         self.sync_revert_counts(cx);
@@ -346,6 +446,7 @@ impl ThreadView {
         self.refresh_open_details(cx);
         self.refresh_find_after_change(cx);
         self.advance_citation_source(cx);
+        self.sync_scroll_to_end_pill(cx);
     }
 
     /// The control above the first row: shown, hidden, or relabelled without touching rows.
@@ -730,9 +831,11 @@ impl ThreadView {
             Some(Anchor::At(top)) => {
                 self.anchor_gap.borrow_mut().take();
                 let top = anchor::include_preceding_rows(top, |ix| f32::from(self.list.offset_for_item(ix + 1) - self.list.offset_for_item(ix)));
+                self.suppress_scroll_release = true;
                 self.list.scroll_to(ListOffset { item_ix: top.item, offset_in_item: px(top.offset) });
             }
             Some(Anchor::Below { item, gap }) => {
+                self.suppress_scroll_release = true;
                 self.list.scroll_to(ListOffset { item_ix: item, offset_in_item: px(0.) });
                 let row = self.rows.get(item - self.header_count()).map(|row| row.id.clone());
                 *self.anchor_gap.borrow_mut() = row.map(|row| (row, gap));
@@ -988,7 +1091,12 @@ impl ThreadView {
             }
         }
         drop(lists);
-        if follow { self.list.scroll_to_end(); } else { self.keep_place(visible); }
+        if follow {
+            self.suppress_scroll_release = true;
+            self.list.scroll_to_end();
+        } else {
+            self.keep_place(visible);
+        }
         self.disclosure.changed();
     }
 
@@ -1371,6 +1479,422 @@ fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>, g
         .into_any_element()
 }
 
+impl ThreadView {
+    fn follow_now(&self, cx: &gpui::App) -> Duration {
+        cx.background_executor().now().saturating_duration_since(self.follow_epoch)
+    }
+
+    fn apply_pending_restore(&mut self) -> bool {
+        let Some(saved) = self.pending_restore.take() else { return false };
+        if self.rows.is_empty() {
+            self.pending_restore = Some(saved);
+            return false;
+        }
+        if let Some(row_id) = saved.row_id.as_deref()
+            && let Some(index) = self.rows.iter().position(|row| row.id == row_id)
+        {
+            self.suppress_scroll_release = true;
+            self.list.scroll_to(ListOffset { item_ix: self.header_count() + index, offset_in_item: px(saved.offset_within_row) });
+            return true;
+        }
+        if saved.scroll_top > 0. {
+            self.suppress_scroll_release = true;
+            self.list.set_offset_from_scrollbar(point(px(0.), px(-saved.scroll_top)));
+            return true;
+        }
+        false
+    }
+
+    fn apply_new_turn_anchor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(projection) = self.thread_state(self.state.read(cx)).projection.as_ref() else {
+            self.list.set_tail_reservation(None);
+            return false;
+        };
+        let tool_runs: HashSet<&str> = self
+            .entries_cache
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Work(work) => work.run_id.as_deref(),
+                EntryKind::HtmlRender(html) => html.run_id.as_deref(),
+                EntryKind::McpApp(app) => app.run_id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        let snapshots: Vec<anchor::RunAnchorSnapshot<'_>> = projection
+            .runs
+            .iter()
+            .map(|run| anchor::RunAnchorSnapshot {
+                run_id: run.id.as_str(),
+                status: run.status.as_str(),
+                user_message_id: run.user_message_id.as_str(),
+                has_tool_or_reasoning: tool_runs.contains(run.id.as_str()),
+            })
+            .collect();
+        let user_ids: Vec<&str> = self
+            .rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                RowKind::Message { message, .. } if message.role == Role::User && message.meta.sender_thread_id.is_none() => {
+                    Some(message.id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let effect = self.follow.observe_runs(&snapshots, user_ids.len(), |id| user_ids.first().copied() == Some(id));
+        match effect {
+            anchor::AnchorEffect::Anchor { user_message_id } | anchor::AnchorEffect::Keep { user_message_id } => {
+                if self.list.tail_reservation_filled() {
+                    self.list.set_tail_reservation(None);
+                    self.follow.scroll_to_end();
+                    self.suppress_scroll_release = true;
+                    self.list.scroll_to_end();
+                    return true;
+                }
+                if let Some(row_ix) = self.rows.iter().position(|row| matches!(&row.kind, RowKind::Message { message, .. } if message.id == user_message_id)) {
+                    self.list.set_tail_reservation(Some((self.header_count() + row_ix, px(anchor::ANCHOR_TOP_OFFSET_PX))));
+                    self.suppress_scroll_release = true;
+                    self.list.scroll_to_end();
+                    return true;
+                }
+                self.list.set_tail_reservation(None);
+                false
+            }
+            anchor::AnchorEffect::ReleaseAndScrollToEnd => {
+                self.list.set_tail_reservation(None);
+                self.suppress_scroll_release = true;
+                self.list.scroll_to_end();
+                true
+            }
+            anchor::AnchorEffect::ReleaseOnly => {
+                self.list.set_tail_reservation(None);
+                false
+            }
+            anchor::AnchorEffect::None => false,
+        }
+    }
+
+    fn sync_scroll_to_end_pill(&mut self, cx: &mut Context<Self>) {
+        let now = self.follow_now(cx);
+        let (_, deadline) = self.follow.pill_state(self.find.is_some(), !self.rows.is_empty(), now);
+        if let Some(deadline) = deadline {
+            let wait = deadline.saturating_sub(now).max(Duration::from_millis(1));
+            self.scroll_to_end_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |view, cx| {
+                    view.scroll_to_end_task = None;
+                    view.sync_scroll_to_end_pill(cx);
+                    cx.notify();
+                });
+            }));
+        } else {
+            self.scroll_to_end_task = None;
+        }
+    }
+
+    pub(super) fn on_observed_list_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let (distance, viewport) = disclosure_end_distance(&self.list);
+        if viewport <= 0. {
+            return;
+        }
+        let top = self.list.logical_scroll_top();
+        let snapshot = (top.item_ix, f32::from(top.offset_in_item), self.rows.len());
+        let prev = self.last_scroll_snapshot.replace(snapshot);
+        let changed = prev != Some(snapshot);
+        let same_row_count = prev.is_some_and(|(_, _, count)| count == self.rows.len());
+        let source = self.pending_scroll_source.take();
+        let at_end = anchor::at_end(distance, viewport);
+        let now = self.follow_now(cx);
+        let was_visible = self.follow.pill_state(self.find.is_some(), !self.rows.is_empty(), now).0;
+
+        if std::mem::take(&mut self.suppress_scroll_release) {
+            self.follow.on_passive_distance(at_end, now);
+            if self.follow.anchored_user_message_id().is_some() && self.list.tail_reservation_filled() {
+                self.list.set_tail_reservation(None);
+                self.follow.scroll_to_end();
+                self.suppress_scroll_release = true;
+                self.list.scroll_to_end();
+            }
+        } else if let Some(source) = source {
+            self.list.set_tail_reservation(None);
+            self.follow.on_user_navigation(source, at_end, now);
+        } else if self.list.is_scrollbar_dragging() {
+            self.smooth_scroll = None;
+            self.pending_restore = None;
+            self.list.set_tail_reservation(None);
+            self.follow.on_user_navigation(anchor::ScrollSource::Scrollbar, at_end, now);
+        } else if changed && same_row_count && (!self.follow.is_following() || !at_end) {
+            self.list.set_tail_reservation(None);
+            self.follow.on_user_navigation(anchor::ScrollSource::Wheel, at_end, now);
+        } else {
+            self.follow.on_passive_distance(at_end, now);
+        }
+
+        self.sync_scroll_to_end_pill(cx);
+        let now_visible = self.follow.pill_state(self.find.is_some(), !self.rows.is_empty(), self.follow_now(cx)).0;
+        if now_visible != was_visible {
+            cx.notify();
+        }
+    }
+
+    fn snap_to_item(&mut self, target: usize, view_offset: f32, source: anchor::ScrollSource, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let (item_ix, offset, remaining) =
+            t3_core::timeline::minimap::jump_anchor(target, view_offset, |ix| f32::from(self.list.offset_for_item(ix + 1) - self.list.offset_for_item(ix)));
+        self.pending_scroll_source = Some(source);
+        self.list.scroll_to(ListOffset { item_ix, offset_in_item: px(offset) });
+        if remaining > 0. {
+            let list = self.list.clone();
+            let view = cx.entity_id();
+            if let Some(window) = window {
+                window.on_next_frame(move |_, cx| {
+                    let top = list.logical_scroll_top();
+                    if top.item_ix == item_ix && top.offset_in_item == px(0.) {
+                        list.scroll_by(px(-remaining));
+                        cx.notify(view);
+                    }
+                });
+            } else {
+                list.scroll_by(px(-remaining));
+            }
+        }
+        self.on_observed_list_scroll(cx);
+        cx.notify();
+    }
+
+    fn start_smooth_scroll(&mut self, target: SmoothTarget, source: anchor::ScrollSource, cx: &mut Context<Self>) {
+        let started_at = cx.background_executor().now();
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SMOOTH_SCROLL_FRAME_INTERVAL).await;
+                let keep_going = this.update(cx, |view, cx| view.step_smooth_scroll(cx)).unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        });
+        self.smooth_scroll = Some(SmoothScroll {
+            target,
+            started_at,
+            last_progress: 0.,
+            source,
+            _task: task,
+        });
+        self.step_smooth_scroll(cx);
+    }
+
+    fn step_smooth_scroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(mut anim) = self.smooth_scroll.take() else { return false };
+        let elapsed = cx.background_executor().now().saturating_duration_since(anim.started_at);
+        let next_t = (elapsed.as_secs_f32() / anchor::SMOOTH_SCROLL_DURATION.as_secs_f32()).clamp(0., 1.);
+        let frac = anchor::smooth_step_fraction(anim.last_progress, next_t);
+        anim.last_progress = next_t;
+
+        match anim.target {
+            SmoothTarget::Bottom => {
+                self.suppress_scroll_release = true;
+                if next_t >= 1. {
+                    self.list.scroll_to_end();
+                } else {
+                    let cur_y = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+                    let target_y = -f32::from(self.list.max_offset_for_scrollbar().y);
+                    self.list.set_offset_from_scrollbar(point(px(0.), px(cur_y + (target_y - cur_y) * frac)));
+                }
+                self.on_observed_list_scroll(cx);
+                cx.notify();
+            }
+            SmoothTarget::Item { item_ix, view_offset } => {
+                if next_t >= 1. {
+                    self.snap_to_item(item_ix, view_offset, anim.source, None, cx);
+                } else {
+                    self.pending_scroll_source = Some(anim.source);
+                    let cur_y = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+                    let max_scroll = f32::from(self.list.max_offset_for_scrollbar().y);
+                    let target_y = -(f32::from(self.list.offset_for_item(item_ix)) - view_offset).clamp(0., max_scroll);
+                    self.list.set_offset_from_scrollbar(point(px(0.), px(cur_y + (target_y - cur_y) * frac)));
+                    self.on_observed_list_scroll(cx);
+                    cx.notify();
+                }
+            }
+            SmoothTarget::Delta { ref mut remaining } => {
+                let step = if next_t >= 1. { *remaining } else { *remaining * frac };
+                *remaining -= step;
+                self.pending_scroll_source = Some(anim.source);
+                let top = self.list.scroll_px_offset_for_scrollbar();
+                self.list.set_offset_from_scrollbar(point(px(0.), top.y + px(step)));
+                self.on_observed_list_scroll(cx);
+                cx.notify();
+            }
+        }
+
+        if next_t >= 1. {
+            return false;
+        }
+        self.smooth_scroll = Some(anim);
+        true
+    }
+
+    pub(super) fn smooth_jump_to_item(&mut self, target: usize, view_offset: f32, source: anchor::ScrollSource, window: &mut Window, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
+        self.pending_restore = None;
+        self.list.set_tail_reservation(None);
+        if cx.reduce_motion() {
+            self.snap_to_item(target, view_offset, source, Some(window), cx);
+            return;
+        }
+        self.start_smooth_scroll(SmoothTarget::Item { item_ix: target, view_offset }, source, cx);
+    }
+
+    fn smooth_scroll_by(&mut self, delta: f32, source: anchor::ScrollSource, cx: &mut Context<Self>) {
+        if delta == 0. {
+            return;
+        }
+        self.disclosure.cancel();
+        self.pending_restore = None;
+        self.list.set_tail_reservation(None);
+        if cx.reduce_motion() {
+            self.pending_scroll_source = Some(source);
+            let top = self.list.scroll_px_offset_for_scrollbar();
+            self.list.set_offset_from_scrollbar(point(px(0.), top.y + px(delta)));
+            self.on_observed_list_scroll(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(mut existing) = self.smooth_scroll.take()
+            && let SmoothTarget::Delta { ref mut remaining } = existing.target
+            && existing.source == source
+        {
+            *remaining += delta;
+            existing.started_at = cx.background_executor().now();
+            existing.last_progress = 0.;
+            self.smooth_scroll = Some(existing);
+            self.step_smooth_scroll(cx);
+            return;
+        }
+        self.start_smooth_scroll(SmoothTarget::Delta { remaining: delta }, source, cx);
+    }
+
+    pub(super) fn forward_wheel_with_follow(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) -> bool {
+        let delta = f32::from(event.delta.pixel_delta(px(20.)).y);
+        if event.modifiers.control || delta == 0. {
+            return false;
+        }
+        self.disclosure.cancel();
+        self.pending_restore = None;
+        self.list.set_tail_reservation(None);
+        if t3_core::timeline::minimap::is_discrete_wheel(matches!(event.delta, gpui::ScrollDelta::Lines(_)), delta) {
+            self.smooth_scroll_by(delta, anchor::ScrollSource::Wheel, cx);
+            return true;
+        }
+        self.smooth_scroll = None;
+        self.pending_scroll_source = Some(anchor::ScrollSource::Wheel);
+        let moved = minimap::forward_wheel(&self.list, &mut self.disclosure, event);
+        self.on_observed_list_scroll(cx);
+        cx.notify();
+        moved
+    }
+
+    pub fn scroll_to_end_from_pill(&mut self, cx: &mut Context<Self>) {
+        self.disclosure.cancel();
+        self.pending_restore = None;
+        self.list.set_tail_reservation(None);
+        self.follow.scroll_to_end();
+        self.sync_scroll_to_end_pill(cx);
+        if cx.reduce_motion() {
+            self.smooth_scroll = None;
+            self.suppress_scroll_release = true;
+            self.list.scroll_to_end();
+            self.on_observed_list_scroll(cx);
+            cx.notify();
+            return;
+        }
+        self.start_smooth_scroll(SmoothTarget::Bottom, anchor::ScrollSource::EndKey, cx);
+    }
+
+    fn handle_scroll_key_down(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = event.keystroke.modifiers;
+        if m.platform || m.control || m.alt || self.is_follow_paused(cx) || self.rows.is_empty() {
+            return false;
+        }
+        if self.find.is_some() && !self.citation_ui.selection_focus.is_focused(window) {
+            return false;
+        }
+        let viewport = f32::from(self.list.viewport_bounds().size.height).max(200.);
+        let page = (viewport - 48.).max(120.);
+        match event.keystroke.key.as_str() {
+            "up" if !m.shift => self.smooth_scroll_by(40., anchor::ScrollSource::Keyboard, cx),
+            "down" if !m.shift => self.smooth_scroll_by(-40., anchor::ScrollSource::Keyboard, cx),
+            "pageup" if !m.shift => self.smooth_scroll_by(page, anchor::ScrollSource::Keyboard, cx),
+            "pagedown" if !m.shift => self.smooth_scroll_by(-page, anchor::ScrollSource::Keyboard, cx),
+            "space" => self.smooth_scroll_by(if m.shift { page } else { -page }, anchor::ScrollSource::Keyboard, cx),
+            "home" if !m.shift => self.smooth_jump_to_item(0, 0., anchor::ScrollSource::Keyboard, window, cx),
+            "end" if !m.shift => self.scroll_to_end_from_pill(cx),
+            _ => return false,
+        }
+        cx.stop_propagation();
+        true
+    }
+
+    fn render_scroll_to_end_pill(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let now = self.follow_now(cx);
+        let (visible, _) = self.follow.pill_state(self.find.is_some(), !self.rows.is_empty(), now);
+        if !visible || self.is_follow_paused(cx) {
+            return None;
+        }
+        let state = self.state.read(cx);
+        let queued = self.thread_state(state).projection.as_ref().map_or(0, |p| t3_core::composer::queue::queue_state(p).queued.len());
+        let approvals = self.pending_approvals.len();
+        let waiting_children = match (self.thread_id.as_deref(), state.shell.snapshot.as_ref()) {
+            (Some(id), Some(snapshot)) => t3_core::timeline::child_inputs(&snapshot.threads, id, false).is_some(),
+            _ => false,
+        };
+        let summary = anchor::scroll_to_end_summary(queued, approvals, waiting_children);
+        let p = palette(cx);
+        let fg = hsla(p.foreground);
+        let muted = hsla(p.muted_foreground);
+        let fill = hsla(p.dropdown_surface);
+        let border = hsla(p.dropdown_border);
+        let hover = hsla(p.accent).opacity(0.4);
+
+        let pill = div()
+            .id("scroll-to-end-pill")
+            .relative()
+            .occlude()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(28.))
+            .px(px(12.))
+            .rounded_full()
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(fg)
+            .shadow_md()
+            .hover(move |s| s.bg(hover))
+            .on_click(cx.listener(|this, _, _, cx| this.scroll_to_end_from_pill(cx)))
+            .child(glass::backdrop(999., fill, border, cx))
+            .child(crate::webview::occluder("scroll-to-end-pill-cover", crate::webview::Layer::TranscriptChrome))
+            .child(Icon::ChevronDown.render(px(14.), fg))
+            .child("Scroll to end")
+            .when_some(summary, |el, summary| el.child(div().text_color(muted).child(format!("· {summary}"))));
+
+        Some(
+            div()
+                .absolute()
+                .bottom(px(12.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(pill)
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(feature = "snapshot")]
@@ -1398,12 +1922,20 @@ impl Render for ThreadView {
         }
         let find_bar = self.render_find_bar(cx);
         let banners = self.render_banners(cx);
+        let scroll_to_end = self.render_scroll_to_end_pill(cx);
         let minimap = self.minimap_layer.clone().cached(gpui::StyleRefinement::default().absolute().inset_0());
         if let Some(generation) = self.disclosure.generation() {
             // Match the web's two-frame disclosure settle; newer layouts invalidate this ticket.
             cx.on_next_frame(window, move |_, window, cx| {
                 cx.on_next_frame(window, move |view, _, cx| {
-                    if !view.is_follow_paused(cx) && settle_disclosure(&view.list, &mut view.disclosure, generation) { cx.notify(); }
+                    if !view.is_follow_paused(cx) {
+                        view.suppress_scroll_release = true;
+                        if settle_disclosure(&view.list, &mut view.disclosure, generation) {
+                            cx.notify();
+                        } else {
+                            view.suppress_scroll_release = false;
+                        }
+                    }
                 });
             });
         }
@@ -1416,17 +1948,29 @@ impl Render for ThreadView {
                     cx.propagate();
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && this.dismiss_approval_popovers(cx) {
                     cx.stop_propagation();
+                    return;
+                }
+                let _ = this.handle_scroll_key_down(event, window, cx);
+            }))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
+                this.smooth_scroll = None;
+                this.pending_restore = None;
+                this.dismiss_citation_selection(cx);
+                if !this.citation_ui.selection_focus.contains_focused(window, cx) {
+                    window.focus(&this.citation_ui.selection_focus, cx);
                 }
             }))
-            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.dismiss_citation_selection(cx)))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.smooth_scroll = None;
+                this.pending_restore = None;
                 this.disclosure.cancel();
+                this.pending_scroll_source = Some(anchor::ScrollSource::Wheel);
                 this.dismiss_citation_selection(cx);
             }))
-            .relative().size_full().child(transcript).child(minimap).children(banners).children(find_bar).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+            .relative().size_full().child(transcript).child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }
 
@@ -2715,5 +3259,292 @@ mod tests {
             assert_eq!(view.open_approval_menu, None);
         });
         vcx.run_until_parked();
+    }
+
+    fn test_snapshot_json(thread_id: &str, runs: serde_json::Value, visible_items: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "kind": "snapshot",
+            "snapshotSequence": 1,
+            "hasMoreHistory": false,
+            "projection": {
+                "thread": {
+                    "id": thread_id, "projectId": "checkout-a", "title": thread_id,
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "replay", "modelSelection": {"instanceId": "replay", "model": "replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId": thread_id}
+                },
+                "runs": runs,
+                "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                "messages": [], "plans": [],
+                "turnItems": [], "checkpointScopes": [], "checkpoints": [],
+                "contextHandoffs": [], "contextTransfers": [],
+                "visibleTurnItems": visible_items,
+                "updatedAt": "2026-04-01T00:00:05.000Z"
+            }
+        })
+        .to_string()
+    }
+
+    fn test_user_item(thread_id: &str, pos: usize, msg_id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "position": pos, "visibility": "local", "sourceThreadId": thread_id, "sourceItemId": msg_id,
+            "item": {
+                "id": msg_id, "threadId": thread_id, "runId": null, "nodeId": null, "parentItemId": null,
+                "ordinal": pos + 1, "type": "user_message", "status": "completed", "title": null,
+                "startedAt": null, "completedAt": null, "updatedAt": "2026-04-01T00:00:01.000Z",
+                "messageId": msg_id, "text": text, "inputIntent": "message"
+            }
+        })
+    }
+
+    fn test_assistant_item(thread_id: &str, pos: usize, msg_id: &str, run_id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "position": pos, "visibility": "local", "sourceThreadId": thread_id, "sourceItemId": msg_id,
+            "item": {
+                "id": msg_id, "threadId": thread_id, "runId": run_id, "nodeId": null, "parentItemId": null,
+                "ordinal": pos + 1, "type": "assistant_message", "status": "completed", "title": null,
+                "startedAt": null, "completedAt": "2026-04-01T00:00:02.000Z", "updatedAt": "2026-04-01T00:00:02.000Z",
+                "messageId": msg_id, "text": text, "streaming": false
+            }
+        })
+    }
+
+    #[gpui::test]
+    fn follow_release_150ms_pill_position_restore_and_keyboard_scroll(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let mut items_t1 = Vec::new();
+        for i in 0..24usize {
+            let msg_id = format!("t1-m{i}");
+            let text = format!("Long message {i}\n{}\n{}\n{}", "line a", "line b", "line c");
+            items_t1.push(if i % 2 == 0 {
+                test_user_item("t1", i, &msg_id, &text)
+            } else {
+                test_assistant_item("t1", i, &msg_id, "r0", &text)
+            });
+        }
+        let items_t2 = vec![
+            test_user_item("t2", 0, "t2-m0", "Other thread"),
+            test_assistant_item("t2", 1, "t2-m1", "r2", "Reply in t2"),
+        ];
+        let snap_t1 = test_snapshot_json("t1", serde_json::json!([]), items_t1);
+        let snap_t2 = test_snapshot_json("t2", serde_json::json!([]), items_t2);
+
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "t1", "projectId": "checkout-a", "title": "T1",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "lastVisitedAt": null, "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                    "status": "idle", "hasActionableProposedPlan": false, "itemCount": 24, "visibleItemCount": 24
+                }))
+                .unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "id": "t2", "projectId": "checkout-a", "title": "T2",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "lastVisitedAt": null, "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t2"},
+                    "status": "idle", "hasActionableProposedPlan": false, "itemCount": 2, "visibleItemCount": 2
+                }))
+                .unwrap(),
+            ];
+            state.install_active_environment(read_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t1).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        // Starts following at bottom without Scroll-to-end pill.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.follow.is_following());
+                let now = view.follow_now(cx);
+                assert!(!view.follow.pill_state(false, true, now).0);
+            });
+        });
+
+        // Keyboard PageUp releases follow and smooth-scrolls upward; pill waits 150ms before appearing.
+        vcx.update(|window, cx| {
+            let focus = view.read(cx).citation_ui.selection_focus.clone();
+            window.focus(&focus, cx);
+        });
+        vcx.simulate_keystrokes("pageup");
+        vcx.background_executor.advance_clock(Duration::from_millis(80));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(!view.follow.is_following(), "PageUp must release follow");
+                let now = view.follow_now(cx);
+                assert!(!view.follow.pill_state(false, true, now).0, "pill must still wait before 150ms");
+            });
+        });
+
+        // Advancing past 150ms reveals the Scroll-to-end pill; scroll_to_end_from_pill restores follow.
+        vcx.background_executor.advance_clock(Duration::from_millis(160));
+        vcx.run_until_parked();
+        let saved_top = vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let now = view.follow_now(cx);
+                assert!(view.follow.pill_state(false, true, now).0, "pill must appear after 150ms away from end");
+                view.list.logical_scroll_top().item_ix
+            })
+        });
+        assert!(saved_top < 20, "PageUp must have scrolled away from the bottom");
+
+        // Switch to t2 and back to t1: t1 restores released follow and remembered scroll position.
+        state.update(vcx, |state, cx| {
+            state.select_thread("t2", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t2).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| assert!(view.follow.is_following()));
+
+        state.update(vcx, |state, cx| {
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t1).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following(), "returning to t1 must restore released follow");
+            assert_eq!(view.list.logical_scroll_top().item_ix, saved_top);
+        });
+
+        // Clicking Scroll to end (EndKey path) re-engages follow and hides pill.
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.scroll_to_end_from_pill(cx)));
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.follow.is_following(), "scroll_to_end_from_pill must re-engage follow");
+                let now = view.follow_now(cx);
+                assert!(!view.follow.pill_state(false, true, now).0);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn new_turn_anchors_first_user_message_with_tail_reservation_and_releases_on_tool(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let empty_snap = test_snapshot_json("t1", serde_json::json!([]), vec![]);
+
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&empty_snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        // First prompt starts run r1: anchors first user message at 24px inset.
+        let started_snap = test_snapshot_json(
+            "t1",
+            serde_json::json!([{
+                "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId": "replay", "model": "replay"},
+                "userMessageId": "m1", "rootNodeId": null, "status": "running",
+                "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+                "completedAt": null
+            }]),
+            vec![test_user_item("t1", 0, "m1", "First prompt")],
+        );
+        state.update(vcx, |state, cx| {
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&started_snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.follow.anchored_user_message_id(), Some("m1"));
+        });
+
+        // Tool item arrives on r1: releases tail reservation and stays following.
+        let tool_snap = test_snapshot_json(
+            "t1",
+            serde_json::json!([{
+                "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId": "replay", "model": "replay"},
+                "userMessageId": "m1", "rootNodeId": null, "status": "running",
+                "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+                "completedAt": null
+            }]),
+            vec![
+                test_user_item("t1", 0, "m1", "First prompt"),
+                serde_json::json!({
+                    "position": 1, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "w1",
+                    "item": {
+                        "id": "w1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                        "ordinal": 2, "type": "command_execution", "status": "running", "title": "ls",
+                        "startedAt": "2026-04-01T00:00:02.000Z", "completedAt": null, "updatedAt": "2026-04-01T00:00:02.000Z",
+                        "input": "ls", "output": ""
+                    }
+                }),
+            ],
+        );
+        state.update(vcx, |state, cx| {
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&tool_snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.follow.anchored_user_message_id(), None);
+            assert!(view.follow.is_following());
+        });
     }
 }
