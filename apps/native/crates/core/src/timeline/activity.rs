@@ -273,6 +273,7 @@ pub struct UserFileCard {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UserAttachmentPartition {
     pub images: Vec<serde_json::Value>,
+    pub videos: Vec<serde_json::Value>,
     pub audios: Vec<serde_json::Value>,
     pub files: Vec<UserFileCard>,
     pub file_cards_only: bool,
@@ -318,6 +319,8 @@ pub fn partition_user_attachments(attachments: &[serde_json::Value], display_tex
         let mime = att.get("mimeType").and_then(serde_json::Value::as_str).unwrap_or("");
         if is_audio_attachment(att) {
             out.audios.push(att.clone());
+        } else if crate::media::is_video_attachment(att) {
+            out.videos.push(att.clone());
         } else if ty == Some("image") || kind == Some("image") || mime.to_ascii_lowercase().starts_with("image/") {
             out.images.push(att.clone());
         } else {
@@ -335,8 +338,8 @@ pub fn partition_user_attachments(attachments: &[serde_json::Value], display_tex
         }
     }
     let text_empty = display_text.trim().is_empty();
-    out.file_cards_only = text_empty && out.images.is_empty() && out.audios.is_empty() && !out.files.is_empty();
-    out.audio_only = text_empty && out.images.is_empty() && out.files.is_empty() && !out.audios.is_empty();
+    out.file_cards_only = text_empty && out.images.is_empty() && out.videos.is_empty() && out.audios.is_empty() && !out.files.is_empty();
+    out.audio_only = text_empty && out.images.is_empty() && out.videos.is_empty() && out.files.is_empty() && !out.audios.is_empty();
     out
 }
 
@@ -528,12 +531,14 @@ mod tests {
         let atts = vec![
             json!({ "id": "a1", "type": "file", "name": "notes.txt", "mimeType": "text/plain", "sizeBytes": 42, "source": { "_tag": "pasted-text" } }),
             json!({ "id": "a2", "kind": "audio", "name": "voice.webm", "mimeType": "audio/webm" }),
+            json!({ "id": "v1", "type": "file", "name": "clip.mp4", "mimeType": "video/mp4" }),
         ];
         let part = partition_user_attachments(&atts, "");
         assert_eq!(part.files.len(), 1);
         assert_eq!(part.files[0].label, "Pasted text");
         assert!(part.files[0].pasted_text);
         assert_eq!(part.audios.len(), 1);
+        assert_eq!(part.videos.len(), 1);
         assert!(!part.file_cards_only);
 
         let files_only = partition_user_attachments(&atts[..1], "");

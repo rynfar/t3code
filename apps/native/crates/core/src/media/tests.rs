@@ -113,3 +113,98 @@ fn percent_decoding_keeps_invalid_input() {
     assert_eq!(percent_decode("%E2%82%AC"), "€");
     assert_eq!(percent_decode("%FF"), "%FF");
 }
+
+#[test]
+fn source_control_media_parses_github_urls_and_preserves_repository() {
+    let attachment = "https://github.com/user-attachments/assets/1a1842fb-6383-492f-873c-57aa0033fa6c";
+    assert_eq!(
+        parse_source_control_media_url(attachment),
+        Some(SourceControlMediaUrl {
+            fetch_url: attachment.into(),
+            file_name: Some("1a1842fb-6383-492f-873c-57aa0033fa6c".into()),
+            kind: Some(MediaKind::Video),
+            immutable: true,
+        })
+    );
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(
+        parse_source_control_media_url(&format!("https://github.com/owner/repo/blob/{sha}/docs/shot.png")),
+        Some(SourceControlMediaUrl {
+            fetch_url: format!("https://raw.githubusercontent.com/owner/repo/{sha}/docs/shot.png"),
+            file_name: Some("shot.png".into()),
+            kind: None,
+            immutable: true,
+        })
+    );
+    assert_eq!(
+        parse_source_control_media_url("https://media.githubusercontent.com/media/owner/repo/main/a.mp4"),
+        Some(SourceControlMediaUrl {
+            fetch_url: "https://media.githubusercontent.com/media/owner/repo/main/a.mp4".into(),
+            file_name: Some("a.mp4".into()),
+            kind: None,
+            immutable: false,
+        })
+    );
+    for blocked in [
+        "https://example.com/shot.png",
+        "http://github.com/user-attachments/assets/1a1842fb",
+        "https://github.com/owner/repo/pull/1",
+        "https://github.com/owner/repo/blob/main/",
+    ] {
+        assert_eq!(parse_source_control_media_url(blocked), None, "{blocked}");
+    }
+
+    let resolved = resolve_media_source_with_options(
+        "https://github.com/owner/repo/blob/main/shot.png",
+        Some("t1"),
+        Some("/repo"),
+        true,
+        MediaResolveOptions {
+            explicit_video: false,
+            source_control_media: true,
+            source_control_cwd: Some("/repo"),
+            source_control_repository: Some("upstream/repo"),
+        },
+    )
+    .expect("source control media");
+    assert_eq!(resolved.kind, MediaKind::Image);
+    assert_eq!(resolved.name, "shot.png");
+    let expected_resource = AssetResource::SourceControlMedia {
+        cwd: "/repo".into(),
+        url: "https://raw.githubusercontent.com/owner/repo/main/shot.png".into(),
+        repository: Some("upstream/repo".into()),
+    };
+    assert_eq!(resolved.source, Some(MediaSource::Asset(expected_resource.clone())));
+    assert_eq!(
+        expected_resource.to_json(),
+        json!({
+            "_tag": "github-media",
+            "cwd": "/repo",
+            "url": "https://raw.githubusercontent.com/owner/repo/main/shot.png",
+            "repository": "upstream/repo",
+        })
+    );
+}
+
+#[test]
+fn video_attachments_and_title_hints_roundtrip() {
+    let atts = vec![
+        json!({ "id": "v1", "type": "file", "name": "clip.mp4", "mimeType": "video/mp4" }),
+        json!({ "id": "v2", "type": "file", "name": "demo.webm", "mimeType": "application/octet-stream", "downloadable": false }),
+        json!({ "id": "i1", "type": "file", "name": "pic.png", "mimeType": "image/png" }),
+    ];
+    let videos = video_attachments(&atts);
+    assert_eq!(videos.len(), 2);
+    assert_eq!(videos[0].id, "v1");
+    assert!(videos[0].downloadable);
+    assert_eq!(videos[1].id, "v2");
+    assert!(!videos[1].downloadable);
+    assert!(is_workspace_video_preview_path("dir/clip.M4V"));
+    assert!(!is_workspace_video_preview_path("dir/clip.png"));
+
+    let encoded = encode_media_title(MediaHints { width: Some(320), height: Some(180), explicit_video: true }, Some("Demo")).unwrap();
+    let (title, hints) = decode_media_title(Some(&encoded));
+    assert_eq!(title.as_deref(), Some("Demo"));
+    assert_eq!(hints, MediaHints { width: Some(320), height: Some(180), explicit_video: true });
+    assert_eq!(strip_media_title_meta(&format!("before {encoded} after")), "before Demo after");
+}

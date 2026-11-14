@@ -54,7 +54,7 @@ pub fn resolve_asset_url(base: &str, relative: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarkdownMediaRun {
     Prose(String),
-    Image { url: String, alt: String, link: Option<String> },
+    Image { url: String, alt: String, link: Option<String>, hints: super::MediaHints },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +75,9 @@ pub fn markdown_image_action(link: Option<&str>, modified: bool) -> MarkdownImag
     if !markdown_external_link(link) { return MarkdownImageAction::Inert; }
     if !modified && let Ok(url) = url::Url::parse(link) && matches!(url.scheme(), "http" | "https") {
         let extension = url.path().rfind('.').map(|at| &url.path()[at..]).unwrap_or_default();
-        if image_mime_from_extension(extension).is_some() { return MarkdownImageAction::PreviewLink(link); }
+        if image_mime_from_extension(extension).is_some() || video_mime_from_extension(extension).is_some() {
+            return MarkdownImageAction::PreviewLink(link);
+        }
     }
     MarkdownImageAction::OpenLink(link)
 }
@@ -165,10 +167,29 @@ fn same_definitions(a: &std::collections::HashMap<String, MarkdownDefinition>, b
 
 impl MarkdownMediaIndex {
     fn parse(source: &str, start: usize, previous: Option<&Self>) -> Self {
+        Self::parse_with_definitions(source, start, previous, None)
+    }
+
+    fn parse_with_definitions(
+        source: &str,
+        start: usize,
+        previous: Option<&Self>,
+        inherited: Option<&std::collections::HashMap<String, MarkdownDefinition>>,
+    ) -> Self {
         use markdown::mdast::Node;
         if source.is_empty() { return Self::default(); }
-        let mut definitions: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|index| index.definitions.iter())
-            .filter(|(_, definition)| definition.start < start).map(|(id, definition)| (id.clone(), definition.clone())).collect();
+        let mut definitions: std::collections::HashMap<_, _> = inherited
+            .into_iter()
+            .flat_map(|defs| defs.iter())
+            .map(|(id, definition)| (id.clone(), definition.clone()))
+            .chain(
+                previous
+                    .into_iter()
+                    .flat_map(|index| index.definitions.iter())
+                    .filter(|(_, definition)| definition.start < start)
+                    .map(|(id, definition)| (id.clone(), definition.clone())),
+            )
+            .collect();
         let mut multiline_titles: Vec<_> = previous.into_iter().flat_map(|index| index.multiline_titles.iter()).filter(|(position, _)| *position < start).copied().collect();
         let mut fragment = source[start..].to_owned();
         let real_end = fragment.len();
@@ -188,7 +209,7 @@ impl MarkdownMediaIndex {
         collect(&root, &fragment, start, real_end, &mut definitions, &mut multiline_titles);
         // A changed effective definition can resolve an earlier literal reference, or change its target.
         if start > 0 && previous.is_some_and(|previous| !same_definitions(&previous.definitions, &definitions)) {
-            return Self::parse(source, 0, None);
+            return Self::parse_with_definitions(source, 0, None, inherited);
         }
         let definitions = match previous.filter(|previous| *previous.definitions == definitions) {
             Some(previous) => previous.definitions.clone(),
@@ -201,7 +222,7 @@ impl MarkdownMediaIndex {
         let parser = MarkdownMediaParser { definitions: &definitions };
         fn paragraphs_in(node: &Node, parser: &MarkdownMediaParser<'_>, source: &str, range: (usize, usize), last: bool, out: &mut std::collections::HashMap<usize, std::sync::Arc<Vec<MarkdownMediaRun>>>, gaps: &mut std::collections::HashMap<usize, bool>) {
             let (start, end) = range;
-            if matches!(node, Node::Paragraph(_) | Node::Heading(_)) && let Some(position) = node.position() && position.start.offset < end {
+            if matches!(node, Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_)) && let Some(position) = node.position() && position.start.offset < end {
                 let runs = parser.runs(node, source);
                 if !runs.is_empty() {
                     out.insert(start + position.start.offset, std::sync::Arc::new(runs));
@@ -235,6 +256,24 @@ impl MarkdownMediaIndex {
 
 impl MarkdownMediaDocument {
     pub fn new(source: std::sync::Arc<str>) -> Self { Self { source, index: Default::default() } }
+    pub fn with_inherited_definitions(&self, source: std::sync::Arc<str>) -> Self {
+        let index = MarkdownMediaIndex::parse_with_definitions(&source, 0, None, Some(&self.index().definitions));
+        Self { source, index: std::sync::OnceLock::from(index) }
+    }
+    pub fn gallery_images(&self) -> Vec<(String, String, super::MediaHints)> {
+        let index = self.index();
+        let mut blocks: Vec<_> = index.paragraphs.iter().map(|(&offset, runs)| (offset, runs)).collect();
+        blocks.sort_by_key(|(offset, _)| *offset);
+        let mut out = Vec::new();
+        for (_, runs) in blocks {
+            for run in runs.iter() {
+                if let MarkdownMediaRun::Image { url, alt, link: None, hints } = run {
+                    out.push((url.clone(), alt.clone(), *hints));
+                }
+            }
+        }
+        out
+    }
     fn index(&self) -> &MarkdownMediaIndex { self.index.get_or_init(|| MarkdownMediaIndex::parse(&self.source, 0, None)) }
     pub fn prepare(self) -> Self { self.index(); self }
     pub fn source(&self) -> &std::sync::Arc<str> { &self.source }
@@ -290,7 +329,7 @@ impl MarkdownMediaParser<'_> {
     }
 
     pub fn runs(&self, node: &markdown::mdast::Node, source: &str) -> Vec<MarkdownMediaRun> {
-        if !matches!(node, markdown::mdast::Node::Paragraph(_) | markdown::mdast::Node::Heading(_)) { return Vec::new(); }
+        if !matches!(node, markdown::mdast::Node::Paragraph(_) | markdown::mdast::Node::Heading(_) | markdown::mdast::Node::TableCell(_)) { return Vec::new(); }
         let runs = self.split(node, source, matches!(node, markdown::mdast::Node::Heading(_)));
         if !runs.iter().any(|run| matches!(run, MarkdownMediaRun::Image { .. })) { return Vec::new(); }
         let mut refs = Vec::new();
@@ -309,12 +348,15 @@ impl MarkdownMediaParser<'_> {
         use markdown::mdast::Node;
         let original = inline_source(node, source, heading);
         let image = match node {
-            Node::Image(image) => Some((image.url.clone(), image.alt.clone())),
-            Node::ImageReference(image) => self.definitions.get(&image.identifier).map(|definition| (definition.url.clone(), image.alt.clone())),
+            Node::Image(image) => Some((image.url.clone(), image.alt.clone(), image.title.as_deref())),
+            Node::ImageReference(image) => self.definitions.get(&image.identifier).map(|definition| (definition.url.clone(), image.alt.clone(), definition.title.as_deref())),
             _ => None,
         };
-        if let Some((url, alt)) = image { return vec![MarkdownMediaRun::Image { url, alt, link: None }]; }
-        if !matches!(node, Node::Paragraph(_) | Node::Heading(_) | Node::Emphasis(_) | Node::Strong(_) | Node::Delete(_) | Node::Link(_) | Node::LinkReference(_)) {
+        if let Some((url, alt, title)) = image {
+            let (_, hints) = super::decode_media_title(title);
+            return vec![MarkdownMediaRun::Image { url, alt, link: None, hints }];
+        }
+        if !matches!(node, Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_) | Node::Emphasis(_) | Node::Strong(_) | Node::Delete(_) | Node::Link(_) | Node::LinkReference(_)) {
             return vec![MarkdownMediaRun::Prose(original)];
         }
         let children = node.children().unwrap();
@@ -328,7 +370,7 @@ impl MarkdownMediaParser<'_> {
             Node::LinkReference(link) => Some(self.definitions.get(&link.identifier).map(|definition| definition.url.clone()).unwrap_or_default()),
             _ => None,
         };
-        if !matches!(node, Node::Paragraph(_) | Node::Heading(_)) {
+        if !matches!(node, Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_)) {
             let position = node.position().unwrap();
             let first = children.first().and_then(Node::position).unwrap();
             let last = children.last().and_then(Node::position).unwrap();
@@ -569,7 +611,7 @@ mod paragraph_tests {
             assert_eq!(prose_html(&root, &MarkdownMediaDocument::new(text.into())).replace('\n', ""), expected, "{text}");
         }
         // Link ownership is checked without invoking an opener.
-        assert_eq!(runs("[![chart](a.png)](https://example.com)"), vec![MarkdownMediaRun::Image { url: "a.png".into(), alt: "chart".into(), link: Some("https://example.com".into()) }]);
+        assert_eq!(runs("[![chart](a.png)](https://example.com)"), vec![MarkdownMediaRun::Image { url: "a.png".into(), alt: "chart".into(), link: Some("https://example.com".into()), hints: crate::media::MediaHints::default() }]);
     }
 
     #[test]
@@ -661,7 +703,7 @@ mod paragraph_tests {
         let result = runs("[**left ![chart][pic] right**][guide]\n\n[pic]: local.png\n[guide]: https://example.com/first\n[guide]: javascript:bad");
         assert_eq!(result, vec![
             MarkdownMediaRun::Prose("[**left**][guide] \n\n[guide]: https://example.com/first".into()),
-            MarkdownMediaRun::Image { url: "local.png".into(), alt: "chart".into(), link: Some("https://example.com/first".into()) },
+            MarkdownMediaRun::Image { url: "local.png".into(), alt: "chart".into(), link: Some("https://example.com/first".into()), hints: crate::media::MediaHints::default() },
             MarkdownMediaRun::Prose(" [**right**][guide]\n\n[guide]: https://example.com/first".into()),
         ]);
         for label in ["[a &amp; b]", "[a &amp; b][]", "[a &amp; b][a &amp; b]"] {
@@ -744,9 +786,9 @@ mod paragraph_tests {
         let paragraph = &root.children().unwrap()[0];
         assert_eq!(MarkdownMediaDocument::new(text.into()).runs_at(paragraph, 0), vec![
             MarkdownMediaRun::Prose("Before **bold** ".into()),
-            MarkdownMediaRun::Image { url: "img/a.png".into(), alt: "chart".into(), link: None },
+            MarkdownMediaRun::Image { url: "img/a.png".into(), alt: "chart".into(), link: None, hints: crate::media::MediaHints::default() },
             MarkdownMediaRun::Prose(" and ".into()),
-            MarkdownMediaRun::Image { url: "b.svg".into(), alt: "two".into(), link: None },
+            MarkdownMediaRun::Image { url: "b.svg".into(), alt: "two".into(), link: None, hints: crate::media::MediaHints::default() },
             MarkdownMediaRun::Prose(" after.".into()),
         ]);
         let empty = runs("![x](a.png) [](https://example.com)");
@@ -763,5 +805,26 @@ mod paragraph_tests {
         assert_eq!(resolve_asset_url("http://host:1/base", "/api/assets/a"), Some("http://host:1/api/assets/a".into()));
         assert_eq!(resolve_asset_url("http://host:1", "https://local:2/api/assets/a"), Some("https://local:2/api/assets/a".into()));
         assert_eq!(resolve_asset_url("http://host:1", "javascript:bad"), None);
+    }
+
+    #[test]
+    fn table_cells_inherited_definitions_gallery_order_and_video_links() {
+        let parent = MarkdownMediaDocument::new(
+            "# Head ![first](one.png)\n\n[![linked](skip.png)](https://example.com)\n\n| Col |\n| --- |\n| ![cell][pic] |\n\n![last](two.png)\n\n[pic]: cell.png".into(),
+        )
+        .prepare();
+        let gallery = parent.gallery_images();
+        let urls: Vec<_> = gallery.iter().map(|(url, _, _)| url.as_str()).collect();
+        assert_eq!(urls, vec!["one.png", "cell.png", "two.png"]);
+
+        let cell_doc = parent.with_inherited_definitions("See ![cell][pic]".into()).prepare();
+        let cell_root = markdown::to_mdast(cell_doc.source(), &markdown::ParseOptions::gfm()).unwrap();
+        let cell_runs = cell_doc.runs_at(&cell_root.children().unwrap()[0], 0);
+        assert!(matches!(&cell_runs[1], MarkdownMediaRun::Image { url, .. } if url == "cell.png"));
+
+        assert_eq!(
+            markdown_image_action(Some("https://example.com/demo.mp4"), false),
+            MarkdownImageAction::PreviewLink("https://example.com/demo.mp4")
+        );
     }
 }

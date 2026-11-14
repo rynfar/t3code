@@ -210,7 +210,15 @@ impl DocumentView {
         let viewer = cx.new(crate::media::MediaViewer::new);
         Self {
             text: fixture.text.clone().into(), markdown: crate::transcript::markdown::MarkdownStore::new(cx.entity_id()),
-            scope: crate::media::MediaScope { owner: cx.entity_id(), thread_id: fixture.thread_id.clone(), workspace_root: fixture.base_dir.clone(), workspace_mutation_id: None, viewer: viewer.downgrade() },
+            scope: crate::media::MediaScope {
+                owner: cx.entity_id(),
+                thread_id: fixture.thread_id.clone(),
+                workspace_root: fixture.base_dir.clone(),
+                workspace_mutation_id: None,
+                source_control_media: false,
+                source_control_media_repository: None,
+                viewer: viewer.downgrade(),
+            },
             _viewer: viewer,
         }
     }
