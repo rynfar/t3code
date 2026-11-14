@@ -140,6 +140,8 @@ impl Preview {
             self.key = key.clone();
             self.generation += 1;
             self._fetch = None;
+            crate::media::video::retire_owner(cx.entity_id(), cx);
+            self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
             let cached = key.as_ref().and_then(|key| self.cache.iter().position(|file| file.key == *key));
             match (key, cached) {
                 (None, _) => self.replace_content(Content::Empty, cx),
@@ -229,6 +231,7 @@ impl Preview {
             };
             let viewer_handle = self.viewer.downgrade();
             let viewer_item = crate::media::ViewerItem::video(source.clone(), key.path.clone());
+            let expand_scope = scope.clone();
             let options = crate::media::video::VideoPlayerOptions {
                 source: source.clone(),
                 name: key.path.clone().into(),
@@ -238,7 +241,7 @@ impl Preview {
                 max_width: 820.,
                 max_height: 540.,
                 on_expand: Some(std::sync::Arc::new(move |window, cx| {
-                    let _ = viewer_handle.update(cx, |viewer, cx| viewer.open(vec![viewer_item.clone()], 0, window, cx));
+                    let _ = viewer_handle.update(cx, |viewer, cx| viewer.open_with_scope(vec![viewer_item.clone()], 0, Some(expand_scope.clone()), window, cx));
                 })),
                 on_open_external: None,
                 on_close_modal: None,

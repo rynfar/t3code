@@ -240,7 +240,7 @@ fn preprocess_html_containers(source: &str, is_dark: bool) -> String {
             }
         }
 
-        if let Some(next_tag) = find_next_html_container_outside_code(rest) {
+        if let Some(next_tag) = find_next_html_container_outside_code(rest, line_start) {
             out.push_str(&rest[..next_tag.offset]);
             let tag_abs = pos + next_tag.offset;
             let rewritten = match next_tag.kind {
@@ -284,10 +284,41 @@ struct NextHtmlTag {
     kind: HtmlContainer,
 }
 
-fn find_next_html_container_outside_code(input: &str) -> Option<NextHtmlTag> {
+fn find_next_html_container_outside_code(input: &str, at_line_start: bool) -> Option<NextHtmlTag> {
     let bytes = input.as_bytes();
     let mut i = 0;
+    let mut fence: Option<(u8, usize)> = None;
     while i < bytes.len() {
+        let line_start = if i == 0 { at_line_start } else { bytes[i - 1] == b'\n' };
+        if let Some((fc, flen)) = fence {
+            let line_end = input[i..].find('\n').map(|n| i + n + 1).unwrap_or(bytes.len());
+            let trimmed = input[i..line_end].trim_start_matches(' ');
+            if input[i..line_end].len() - trimmed.len() <= 3 {
+                let close_len = trimmed.bytes().take_while(|&b| b == fc).count();
+                if close_len >= flen && trimmed[close_len..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            i = line_end;
+            continue;
+        }
+        if line_start {
+            let trimmed = input[i..].trim_start_matches(' ');
+            if input[i..].len() - trimmed.len() <= 3
+                && let Some(fc @ (b'`' | b'~')) = trimmed.as_bytes().first().copied()
+            {
+                let count = trimmed.bytes().take_while(|&b| b == fc).count();
+                if count >= 3 {
+                    let line_end = input[i..].find('\n').map(|n| i + n + 1).unwrap_or(bytes.len());
+                    let info = trimmed[count..].split('\n').next().unwrap_or("");
+                    if fc != b'`' || !info.contains('`') {
+                        fence = Some((fc, count));
+                        i = line_end;
+                        continue;
+                    }
+                }
+            }
+        }
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             i += 2;
             continue;
@@ -421,6 +452,15 @@ fn parse_html_dimension(value: Option<String>) -> Option<u32> {
     digits.parse::<u32>().ok().filter(|&n| n > 0 && n <= 16_384)
 }
 
+fn format_markdown_destination(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().any(char::is_whitespace) || trimmed.contains(['(', ')', '<', '>']) {
+        format!("<{}>", trimmed.replace('<', "%3C").replace('>', "%3E"))
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 fn format_markdown_media(alt: &str, src: &str, title: Option<&str>, hints: crate::media::MediaHints) -> Option<String> {
     let src = src.trim();
     if src.is_empty() {
@@ -428,11 +468,7 @@ fn format_markdown_media(alt: &str, src: &str, title: Option<&str>, hints: crate
     }
     let escaped_alt = alt.replace(['\r', '\n'], " ").replace(']', "\\]");
     let encoded_title = crate::media::encode_media_title(hints, title);
-    let dest = if src.chars().any(char::is_whitespace) || src.contains(['(', ')', '<', '>']) {
-        format!("<{}>", src.replace('<', "%3C").replace('>', "%3E"))
-    } else {
-        src.to_owned()
-    };
+    let dest = format_markdown_destination(src);
     let title_part = encoded_title
         .map(|t| format!(" \"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")))
         .unwrap_or_default();
@@ -515,11 +551,7 @@ fn rewrite_media_anchor(input: &str, is_dark: bool) -> Option<(String, usize)> {
     if label.is_empty() {
         return None;
     }
-    let dest = if href.chars().any(char::is_whitespace) || href.contains(['(', ')', '<', '>']) {
-        format!("<{}>", href.trim())
-    } else {
-        href.trim().to_owned()
-    };
+    let dest = format_markdown_destination(&href);
     Some((format!("[{label}]({dest})"), open_end + 1 + close_rel + "</a>".len()))
 }
 
@@ -671,17 +703,25 @@ fn normalize_html_table_cell(raw_cell: &str, is_dark: bool) -> String {
     let mut i = 0;
     while i < with_media.len() {
         let rest = &with_media[i..];
-        if rest.starts_with('<')
-            && let Some(end) = find_tag_end(rest)
+        if rest.starts_with("](<")
+            && let Some(close) = rest[3..].find('>')
         {
-            let tag = &rest[..=end];
+            let span = 3 + close + 1;
+            out.push_str(&rest[..span]);
+            i += span;
+            continue;
+        }
+        if rest.starts_with('<')
+            && let Some(len) = html_tag_len(rest)
+        {
+            let tag = &rest[..len];
             let lower = tag.to_ascii_lowercase();
             if lower.starts_with("<br") {
                 out.push(' ');
             } else if lower.starts_with("<code") || lower.starts_with("</code") {
                 out.push('`');
             }
-            i += end + 1;
+            i += len;
             continue;
         }
         let ch = rest.chars().next().unwrap();
@@ -849,16 +889,53 @@ fn extract_html_attr(tag: &str, attr: &str) -> Option<String> {
     None
 }
 
+fn html_tag_len(slice: &str) -> Option<usize> {
+    if let Some(after_comment) = slice.strip_prefix("<!--") {
+        return after_comment.find("-->").map(|end| 4 + end + 3);
+    }
+    let after = slice.strip_prefix('<')?;
+    let (closing, name_slice) = match after.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, after),
+    };
+    if !matches!(name_slice.as_bytes().first(), Some(b) if b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name_len = name_slice.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'-').count();
+    let boundary = &name_slice[name_len..];
+    let valid_boundary = if closing {
+        boundary.starts_with('>') || boundary.starts_with(char::is_whitespace)
+    } else {
+        matches_tag_boundary(boundary)
+    };
+    if !valid_boundary {
+        return None;
+    }
+    find_tag_end(slice).map(|end| end + 1)
+}
+
 fn strip_simple_html_tags(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    let mut in_tag = false;
-    for ch in input.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut i = 0;
+    while i < input.len() {
+        let rest = &input[i..];
+        if rest.starts_with("](<")
+            && let Some(close) = rest[3..].find('>')
+        {
+            let span = 3 + close + 1;
+            out.push_str(&rest[..span]);
+            i += span;
+            continue;
         }
+        if rest.starts_with('<')
+            && let Some(len) = html_tag_len(rest)
+        {
+            i += len;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -1041,5 +1118,25 @@ mod tests {
         let raw_disabled = preprocess_markdown_for_display_with_html(md, true, None, false);
         assert!(raw_disabled.contains("<img src=\"logo.png\""));
         assert!(raw_disabled.contains("<video controls"));
+    }
+
+    #[test]
+    fn preserves_bracketed_media_urls_comparisons_and_multiline_code_fences() {
+        let md = concat!(
+            "<h1><img src=\"my folder/logo (1).png\" alt=\"Logo\"> <span>Heading</span></h1>\n\n",
+            "<table><tr><th>Preview</th><th>Expr</th></tr>",
+            "<tr><td><a href=\"https://example.com/a<b (1)\"><img src=\"https://example.com/my shot (2).png\" alt=\"Shot\"></a></td>",
+            "<td>a < b > c and <https://example.com></td></tr></table>\n\n",
+            "Inline `code` then fence:\n",
+            "```html\n<img src=\"first.png\">\n\n<video src=\"second.mp4\"></video>\n```\n",
+        );
+        let out = preprocess_markdown_for_display(md, true, None);
+        assert!(out.contains("# ![Logo](<my folder/logo (1).png>) Heading"), "heading dest preserved: {out}");
+        assert!(
+            out.contains("[![Shot](<https://example.com/my shot (2).png>)](<https://example.com/a%3Cb (1)>)"),
+            "anchor and table media dest preserved: {out}"
+        );
+        assert!(out.contains("a < b > c and <https://example.com>"), "literal comparisons preserved: {out}");
+        assert!(out.contains("<img src=\"first.png\">\n\n<video src=\"second.mp4\"></video>"), "blank line fence untouched: {out}");
     }
 }

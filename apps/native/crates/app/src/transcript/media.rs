@@ -275,12 +275,13 @@ fn parse_media_block(node: &mdast::Node, context: &MarkdownParseContext, documen
 fn render_media_runs(node: &MarkdownNode, selections: &MediaSelections, gallery_doc: Option<&MediaDocument>, scope: Option<&MediaScope>, window: &mut Window, cx: &mut App) -> AnyElement {
     use t3_core::media::MarkdownMediaRun;
     let Some(block) = node.data::<MediaBlock>().cloned() else { return div().into_any_element() };
-    let block_id = format!("media-block:{}:{}", window.current_view(), block.start);
+    let scope_key = format!("{}:{}", window.current_view(), block.start);
+    let block_id = format!("media-block:{scope_key}");
     let standalone = block.runs.iter().all(|run| !matches!(run, MarkdownMediaRun::Prose(text) if !text.trim().is_empty()));
     let children = block.runs.into_iter().enumerate().filter_map(|(index, run)| match run {
         MarkdownMediaRun::Prose(text) if text.trim().is_empty() => None,
         MarkdownMediaRun::Prose(text) => Some(ProseElement { id: format!("{block_id}:prose:{index}").into(), text, heading: block.heading, selection: selections.clone(), key: (block.start, index) }.into_any_element()),
-        MarkdownMediaRun::Image { url, alt, link, hints } => Some(markdown_image(&MarkdownImage { url, alt, link, hints }, index, gallery_doc, scope, cx)),
+        MarkdownMediaRun::Image { url, alt, link, hints } => Some(markdown_image(&MarkdownImage { url, alt, link, hints }, &scope_key, index, gallery_doc, scope, cx)),
     }).collect::<Vec<_>>();
     let content = if standalone { v_flex().gap(px(8.)).items_start().children(children).into_any_element() }
         else { h_flex().flex_wrap().gap(px(4.)).items_end().children(children).into_any_element() };
@@ -415,11 +416,11 @@ fn open_gallery_item(gallery_doc: Option<&MediaDocument>, scope: &MediaScope, fa
         Some(index) => (items, index),
         None => (vec![fallback], 0),
     };
-    let _ = scope.viewer.update(cx, |viewer, cx| viewer.open(items, index, window, cx));
+    let _ = scope.viewer.update(cx, |viewer, cx| viewer.open_with_scope(items, index, Some(scope.clone()), window, cx));
 }
 
-fn markdown_image(image: &MarkdownImage, index: usize, gallery_doc: Option<&MediaDocument>, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
-    let content = markdown_image_content(image, index, gallery_doc, scope, cx);
+fn markdown_image(image: &MarkdownImage, scope_key: &str, index: usize, gallery_doc: Option<&MediaDocument>, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
+    let content = markdown_image_content(image, scope_key, index, gallery_doc, scope, cx);
     let Some(link) = image.link.as_ref().filter(|link| t3_core::media::markdown_external_link(link)).cloned() else { return content };
     let viewer = scope.map(|scope| scope.viewer.clone());
     let link_scope = scope.cloned();
@@ -451,7 +452,7 @@ fn markdown_image(image: &MarkdownImage, index: usize, gallery_doc: Option<&Medi
 
 /// A markdown image or video (`ChatMarkdownMedia.tsx`): at most 480 wide (or authored HTML width/height),
 /// its own aspect, radius 8, clicking opens the full message gallery in `MediaViewer`.
-fn markdown_image_content(image: &MarkdownImage, index: usize, gallery_doc: Option<&MediaDocument>, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
+fn markdown_image_content(image: &MarkdownImage, scope_key: &str, index: usize, gallery_doc: Option<&MediaDocument>, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
     let Some(scope) = scope else { return unavailable("Image", &image.alt, cx) };
     let Some(resolved) = resolve_with_scope(&image.url, scope, image.hints.explicit_video) else {
         return unavailable(if image.hints.explicit_video { "Video unavailable" } else { "Image unavailable" }, &image.alt, cx);
@@ -481,10 +482,10 @@ fn markdown_image_content(image: &MarkdownImage, index: usize, gallery_doc: Opti
             on_open_external: None,
             on_close_modal: None,
         };
-        return crate::media::video::inline_video_player(format!("md-video:{}:{}", image.url, index), options, Some(scope), cx);
+        return crate::media::video::inline_video_player(md_video_key(scope_key, index, &image.url), options, Some(scope), cx);
     }
     let Some(source) = resolved.source else { return unavailable("Image unavailable", &image.alt, cx) };
-    let id = SharedString::from(format!("md-media:{index}:{}", image.url));
+    let id = SharedString::from(md_image_id(scope_key, index, &image.url));
     framed_image(id, source, name, ImageFrame { alt: &image.alt, max_height: 480., preview: image.link.is_none(), hints: image.hints, gallery: gallery_doc.cloned() }, scope, cx)
 }
 
@@ -586,6 +587,14 @@ pub fn answer_attachment(id: SharedString, attachment: &AnswerAttachment, cx: &m
     }
 }
 
+fn md_video_key(scope_key: &str, index: usize, url: &str) -> String {
+    format!("md-video:{scope_key}:{index}:{url}")
+}
+
+fn md_image_id(scope_key: &str, index: usize, url: &str) -> String {
+    format!("md-media:{scope_key}:{index}:{url}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +633,13 @@ mod tests {
         let plain = resolve_with_scope("https://github.com/user-attachments/assets/abc", &scope, false).unwrap();
         assert_eq!(plain.kind, MediaKind::Image);
         assert_eq!(plain.source, Some(MediaSource::Direct("https://github.com/user-attachments/assets/abc".into())));
+    }
+
+    #[test]
+    fn block_media_keys_isolate_duplicate_urls_across_blocks() {
+        let same_url = "https://example.com/demo.mp4";
+        assert_ne!(md_video_key("12:0", 0, same_url), md_video_key("12:48", 0, same_url));
+        assert_ne!(md_video_key("12:0", 0, same_url), md_video_key("13:0", 0, same_url));
+        assert_ne!(md_image_id("12:0", 0, same_url), md_image_id("12:48", 0, same_url));
     }
 }

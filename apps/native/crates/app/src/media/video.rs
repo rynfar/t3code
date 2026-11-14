@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -204,6 +204,37 @@ pub struct VideoPlayerOptions {
     pub on_close_modal: Option<VideoAction>,
 }
 
+fn is_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    (trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("http://"))
+        || (trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://"))
+}
+
+fn allows_external_open(source: &MediaSource, on_open_external: Option<&VideoAction>) -> bool {
+    if on_open_external.is_some() {
+        return true;
+    }
+    match source {
+        MediaSource::Direct(url) => is_http_url(url),
+        MediaSource::Asset(_) => true,
+    }
+}
+
+fn scope_matches(a: Option<&MediaScope>, b: Option<&MediaScope>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.owner == b.owner
+                && a.thread_id == b.thread_id
+                && a.workspace_root == b.workspace_root
+                && a.workspace_mutation_id == b.workspace_mutation_id
+                && a.source_control_media == b.source_control_media
+                && a.source_control_media_repository == b.source_control_media_repository
+        }
+        _ => false,
+    }
+}
+
 pub struct VideoPlayer {
     options: VideoPlayerOptions,
     scope: Option<MediaScope>,
@@ -213,14 +244,25 @@ pub struct VideoPlayer {
     playing: bool,
     leased: bool,
     webview: Option<MountedWebview>,
+    mount_count: Arc<AtomicUsize>,
+    unmount_tx: mpsc::UnboundedSender<()>,
+    _unmount_task: Task<()>,
 }
 
 impl VideoPlayer {
-    pub fn new(options: VideoPlayerOptions, scope: Option<MediaScope>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(options: VideoPlayerOptions, scope: Option<MediaScope>, cx: &mut Context<Self>) -> Self {
         let leased = options.modal;
-        if leased {
-            // Modal takes priority immediately; inline players check lease pool on render.
-        }
+        let mount_count = Arc::new(AtomicUsize::new(0));
+        let (unmount_tx, mut unmount_rx) = mpsc::unbounded();
+        let _unmount_task = cx.spawn(async move |this, cx| {
+            while unmount_rx.next().await.is_some() {
+                let _ = this.update(cx, |player, cx| {
+                    if player.mount_count.load(Ordering::Acquire) == 0 && (player.webview.is_some() || player.leased || player.playing) {
+                        player.release_webview(cx);
+                    }
+                });
+            }
+        });
         Self {
             options,
             scope,
@@ -230,11 +272,29 @@ impl VideoPlayer {
             playing: false,
             leased,
             webview: None,
+            mount_count,
+            unmount_tx,
+            _unmount_task,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn scope_for_test(&self) -> Option<&MediaScope> {
+        self.scope.as_ref()
     }
 
     pub fn update_options(&mut self, options: VideoPlayerOptions, scope: Option<MediaScope>, cx: &mut Context<Self>) {
         let source_changed = self.options.source != options.source;
+        let display_changed = self.options.name != options.name
+            || self.options.revision != options.revision
+            || self.options.hints != options.hints
+            || self.options.modal != options.modal
+            || (self.options.max_width - options.max_width).abs() > f32::EPSILON
+            || (self.options.max_height - options.max_height).abs() > f32::EPSILON
+            || self.options.on_expand.is_some() != options.on_expand.is_some()
+            || self.options.on_open_external.is_some() != options.on_open_external.is_some()
+            || self.options.on_close_modal.is_some() != options.on_close_modal.is_some()
+            || !scope_matches(self.scope.as_ref(), scope.as_ref());
         self.options = options;
         self.scope = scope;
         if source_changed {
@@ -242,6 +302,8 @@ impl VideoPlayer {
             self.natural_size = None;
             self.playing = false;
             self.drop_webview();
+            cx.notify();
+        } else if display_changed {
             cx.notify();
         }
     }
@@ -257,6 +319,8 @@ impl VideoPlayer {
         self.pause();
         self.drop_webview();
         self.leased = false;
+        let id = cx.entity_id();
+        cx.default_global::<VideoLeasePool>().release(id);
         cx.notify();
     }
 
@@ -273,6 +337,23 @@ impl VideoPlayer {
         }
         let id = cx.entity_id();
         let entity = cx.entity().downgrade();
+        let candidates = cx.default_global::<VideoLeasePool>().leases.clone();
+        let stale: Vec<Entity<VideoPlayer>> = candidates
+            .into_iter()
+            .filter_map(|(existing, weak)| {
+                if existing == id {
+                    return None;
+                }
+                let player = weak.upgrade()?;
+                let guard = player.read(cx);
+                let unmounted = guard.mount_count.load(Ordering::Acquire) == 0;
+                let hidden = guard.webview.as_ref().is_some_and(|(_, view, _, _)| !view.is_shown());
+                (unmounted || hidden).then_some(player)
+            })
+            .collect();
+        for victim in stale {
+            victim.update(cx, |player, cx| player.release_webview(cx));
+        }
         let pool = cx.default_global::<VideoLeasePool>();
         let (granted, evicted) = pool.claim(id, entity);
         self.leased = granted;
@@ -430,13 +511,18 @@ impl VideoPlayer {
         cx.notify();
     }
 
+    fn can_open_external(&self) -> bool {
+        allows_external_open(&self.options.source, self.options.on_open_external.as_ref())
+    }
+
     fn open_external(&self, window: &mut Window, cx: &mut App) {
         if let Some(callback) = &self.options.on_open_external {
             callback(window, cx);
             return;
         }
         match &self.options.source {
-            MediaSource::Direct(url) => cx.open_url(url),
+            MediaSource::Direct(url) if is_http_url(url) => cx.open_url(url.trim()),
+            MediaSource::Direct(_) => {}
             MediaSource::Asset(resource) => super::open_asset(resource, cx),
         }
     }
@@ -467,6 +553,9 @@ impl Render for VideoPlayer {
         let modal = self.options.modal;
         let name = self.options.name.clone();
         let expand = self.options.on_expand.clone();
+        let can_open = self.can_open_external();
+        let mount_id: SharedString = format!("video-mount-{}", cx.entity_id().as_u64()).into();
+        let tracker = mount_tracker(mount_id, self.mount_count.clone(), self.unmount_tx.clone());
         let open_btn_id: SharedString = format!("video-open-{}", cx.entity_id().as_u64()).into();
         let expand_btn_id: SharedString = format!("video-expand-{}", cx.entity_id().as_u64()).into();
         let retry_btn_id: SharedString = format!("video-retry-{}", cx.entity_id().as_u64()).into();
@@ -509,24 +598,26 @@ impl Render for VideoPlayer {
                                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                         )
-                        .child(
-                            h_flex()
-                                .id(SharedString::from(format!("video-err-open-{}", cx.entity_id().as_u64())))
-                                .cursor_pointer()
-                                .gap(px(4.))
-                                .px(px(10.))
-                                .py(px(5.))
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(hsla(p.border))
-                                .bg(hsla(p.secondary))
-                                .text_xs()
-                                .text_color(hsla(p.foreground))
-                                .child(Icon::ExternalLink.render(px(12.), hsla(p.foreground)))
-                                .child("Open")
-                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, window, cx| this.open_external(window, cx))),
-                        ),
+                        .when(can_open, |row| {
+                            row.child(
+                                h_flex()
+                                    .id(SharedString::from(format!("video-err-open-{}", cx.entity_id().as_u64())))
+                                    .cursor_pointer()
+                                    .gap(px(4.))
+                                    .px(px(10.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(hsla(p.border))
+                                    .bg(hsla(p.secondary))
+                                    .text_xs()
+                                    .text_color(hsla(p.foreground))
+                                    .child(Icon::ExternalLink.render(px(12.), hsla(p.foreground)))
+                                    .child("Open")
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(|this, _, window, cx| this.open_external(window, cx))),
+                            )
+                        }),
                 )
                 .into_any_element()
         } else if matches!(url_state, VideoUrlState::Loading) && active_src.is_none() {
@@ -604,17 +695,19 @@ impl Render for VideoPlayer {
                                         .on_click(move |_, window, cx| expand(window, cx)),
                                 )
                             })
-                            .child(
-                                div()
-                                    .id(open_btn_id)
-                                    .cursor_pointer()
-                                    .p(px(4.))
-                                    .rounded(px(4.))
-                                    .hover(|s| s.bg(hsla(p.accent)))
-                                    .child(Icon::ExternalLink.render(px(13.), hsla(p.secondary_label)))
-                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                    .on_click(cx.listener(|this, _, window, cx| this.open_external(window, cx))),
-                            ),
+                            .when(can_open, |bar| {
+                                bar.child(
+                                    div()
+                                        .id(open_btn_id)
+                                        .cursor_pointer()
+                                        .p(px(4.))
+                                        .rounded(px(4.))
+                                        .hover(|s| s.bg(hsla(p.accent)))
+                                        .child(Icon::ExternalLink.render(px(13.), hsla(p.secondary_label)))
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(|this, _, window, cx| this.open_external(window, cx))),
+                                )
+                            }),
                     ),
             )
         };
@@ -628,7 +721,67 @@ impl Render for VideoPlayer {
             .bg(hsla(p.card))
             .children(header)
             .child(div().w(px(box_w)).h(px(box_h)).bg(hsla(p.card)).child(body))
+            .child(tracker)
     }
+}
+
+pub(super) fn mount_tracker(id: SharedString, count: Arc<AtomicUsize>, tx: mpsc::UnboundedSender<()>) -> impl IntoElement {
+    MountTracker { id, count, tx }
+}
+
+struct MountGuard {
+    count: Arc<AtomicUsize>,
+    tx: mpsc::UnboundedSender<()>,
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _ = self.tx.unbounded_send(());
+        }
+    }
+}
+
+struct MountTracker {
+    id: SharedString,
+    count: Arc<AtomicUsize>,
+    tx: mpsc::UnboundedSender<()>,
+}
+
+impl IntoElement for MountTracker {
+    type Element = Self;
+    fn into_element(self) -> Self { self }
+}
+
+impl gpui::Element for MountTracker {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        Some(self.id.clone().into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, window: &mut Window, cx: &mut App) -> (gpui::LayoutId, ()) {
+        let style = gpui::Style { size: gpui::size(px(0.).into(), px(0.).into()), ..Default::default() };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(&mut self, id: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, _: &mut (), window: &mut Window, _: &mut App) {
+        let Some(id) = id else { return };
+        window.with_element_state::<MountGuard, _>(id, |guard, _| match guard {
+            Some(guard) => ((), guard),
+            None => {
+                self.count.fetch_add(1, Ordering::AcqRel);
+                ((), MountGuard { count: self.count.clone(), tx: self.tx.clone() })
+            }
+        });
+    }
+
+    fn paint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, _: &mut (), _: &mut (), _: &mut Window, _: &mut App) {}
 }
 
 #[derive(Default)]
@@ -639,6 +792,10 @@ struct VideoLeasePool {
 impl Global for VideoLeasePool {}
 
 impl VideoLeasePool {
+    fn release(&mut self, id: EntityId) {
+        self.leases.retain(|(existing, w)| *existing != id && w.upgrade().is_some());
+    }
+
     fn claim(&mut self, id: EntityId, entity: WeakEntity<VideoPlayer>) -> (bool, Vec<WeakEntity<VideoPlayer>>) {
         self.leases.retain(|(_, w)| w.upgrade().is_some());
         if self.leases.iter().any(|(existing, _)| *existing == id) {
@@ -671,13 +828,40 @@ struct InlinePlayerRegistry {
 
 impl Global for InlinePlayerRegistry {}
 
+/// Releases WebViews and active leases for every inline video player owned by `owner`
+/// (for example when switching threads or files).
+pub fn retire_owner(owner: EntityId, cx: &mut App) {
+    let mut victims: Vec<Entity<VideoPlayer>> = Vec::new();
+    if let Some(registry) = cx.try_global::<InlinePlayerRegistry>() {
+        for (_, entity) in registry.players.values() {
+            if entity.read(cx).scope.as_ref().is_some_and(|scope| scope.owner == owner) {
+                victims.push(entity.clone());
+            }
+        }
+    }
+    if let Some(pool) = cx.try_global::<VideoLeasePool>() {
+        for (_, weak) in &pool.leases {
+            if let Some(entity) = weak.upgrade()
+                && entity.read(cx).scope.as_ref().is_some_and(|scope| scope.owner == owner)
+                && !victims.iter().any(|existing| existing.entity_id() == entity.entity_id())
+            {
+                victims.push(entity);
+            }
+        }
+    }
+    for victim in victims {
+        victim.update(cx, |player, cx| player.release_webview(cx));
+    }
+}
+
 /// Gets or updates a persistent `VideoPlayer` entity for an inline transcript/user-attachment video.
 pub fn inline_video_player(key: String, options: VideoPlayerOptions, scope: Option<&MediaScope>, cx: &mut App) -> AnyElement {
     let scope_owned = scope.cloned();
-    let entity = {
+    let (entity, evicted) = {
         let registry = cx.default_global::<InlinePlayerRegistry>();
         registry.frame += 1;
         let frame = registry.frame;
+        let mut evicted = Vec::new();
         if registry.players.len() > MAX_CACHED_INLINE_PLAYERS {
             let stale: Vec<_> = registry
                 .players
@@ -686,11 +870,16 @@ pub fn inline_video_player(key: String, options: VideoPlayerOptions, scope: Opti
                 .map(|(k, _)| k.clone())
                 .collect();
             for k in stale {
-                registry.players.remove(&k);
+                if let Some((_, entity)) = registry.players.remove(&k) {
+                    evicted.push(entity);
+                }
             }
         }
-        registry.players.get(&key).map(|(_, entity)| entity.clone())
+        (registry.players.get(&key).map(|(_, entity)| entity.clone()), evicted)
     };
+    for victim in evicted {
+        victim.update(cx, |player, cx| player.release_webview(cx));
+    }
     let entity = match entity {
         Some(entity) => {
             entity.update(cx, |player, cx| player.update_options(options, scope_owned, cx));
@@ -765,5 +954,80 @@ mod tests {
         let html = video_html("https://example.com/a.mp4?token=\"1&2\"", true);
         assert!(html.contains("<video id=\"player\" controls playsinline preload=\"metadata\" src=\"https://example.com/a.mp4?token=&quot;1&amp;2&quot;\"></video>"));
         assert!(!html.contains("token=\"1"));
+    }
+
+    #[test]
+    fn external_open_allows_http_and_assets_only() {
+        assert!(allows_external_open(&MediaSource::Direct("https://example.com/a.mp4".into()), None));
+        assert!(allows_external_open(&MediaSource::Direct("HTTP://example.com/a.mp4".into()), None));
+        assert!(!allows_external_open(&MediaSource::Direct("data:video/mp4;base64,AAAA".into()), None));
+        assert!(!allows_external_open(&MediaSource::Direct("blob:https://example.com/1".into()), None));
+        assert!(!allows_external_open(&MediaSource::Direct("javascript:alert(1)".into()), None));
+        assert!(allows_external_open(
+            &MediaSource::Asset(t3_core::media::AssetResource::MediaFile { thread_id: "t1".into(), path: "a.mp4".into() }),
+            None,
+        ));
+    }
+
+    #[gpui::test]
+    fn unmount_and_owner_retire_release_lease_and_update_options_notifies(cx: &mut gpui::TestAppContext) {
+        let options = |name: &str, hints: MediaHints| VideoPlayerOptions {
+            source: MediaSource::Direct("https://example.com/demo.mp4".into()),
+            name: name.to_owned().into(),
+            revision: Some("r1".into()),
+            hints,
+            modal: false,
+            max_width: 560.,
+            max_height: 360.,
+            on_expand: None,
+            on_open_external: None,
+            on_close_modal: None,
+        };
+        let (owner_view, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let owner_id = owner_view.entity_id();
+        let viewer = cx.update(|_, cx| cx.new(crate::media::MediaViewer::new));
+        let scope = MediaScope {
+            owner: owner_id,
+            thread_id: Some("t1".into()),
+            workspace_root: None,
+            workspace_mutation_id: None,
+            source_control_media: false,
+            source_control_media_repository: None,
+            viewer: viewer.downgrade(),
+        };
+
+        let mut player_entity: Option<Entity<VideoPlayer>> = None;
+        cx.update(|_, cx| {
+            let _ = inline_video_player("k1".into(), options("first.mp4", MediaHints::default()), Some(&scope), cx);
+            player_entity = cx.global::<InlinePlayerRegistry>().players.get("k1").map(|(_, e)| e.clone());
+        });
+        let player = player_entity.expect("registered player");
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let n = notifications.clone();
+        cx.update(|_, cx| {
+            cx.observe(&player, move |_, _| { n.fetch_add(1, Ordering::Relaxed); }).detach();
+            // Same source, changed name/hints must notify.
+            let _ = inline_video_player("k1".into(), options("renamed.mp4", MediaHints { width: Some(320), height: Some(180), explicit_video: true }), Some(&scope), cx);
+        });
+        assert!(notifications.load(Ordering::Relaxed) >= 1, "update_options should notify on display changes");
+
+        // Simulating an active lease + playing flag clears cleanly on retire_owner.
+        cx.update(|_, cx| {
+            player.update(cx, |p, cx| {
+                p.leased = true;
+                p.playing = true;
+                let id = cx.entity_id();
+                let weak = cx.entity().downgrade();
+                cx.default_global::<VideoLeasePool>().leases.push((id, weak));
+            });
+            retire_owner(owner_id, cx);
+        });
+        cx.read(|cx| {
+            let p = player.read(cx);
+            assert!(!p.leased);
+            assert!(!p.playing);
+            assert!(cx.global::<VideoLeasePool>().leases.is_empty());
+        });
     }
 }

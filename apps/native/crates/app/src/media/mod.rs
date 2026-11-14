@@ -65,11 +65,17 @@ pub fn set_scope(scope: MediaScope, cx: &mut App) {
     }
 }
 
-/// The image for `source`, as drawn by `owner`.
+/// The image for `source`, as drawn by `owner` using global `Media::scope`.
 pub fn image(source: &MediaSource, variant: Variant, owner: EntityId, cx: &mut App) -> ImageState {
+    let scope = cx.try_global::<Media>().and_then(|media| media.scope.clone());
+    image_in_scope(source, variant, owner, scope.as_ref(), cx)
+}
+
+/// The image for `source`, resolved against an explicit surface `scope` when supplied.
+pub fn image_in_scope(source: &MediaSource, variant: Variant, owner: EntityId, scope: Option<&MediaScope>, cx: &mut App) -> ImageState {
     let Some(cache) = cx.try_global::<Media>().map(|media| media.cache.clone()) else { return ImageState::Loading };
-    let scope = cx.try_global::<Media>().and_then(|media| media.scope.as_ref());
-    let revision = scope.and_then(|scope| revision_for(source, scope)).map(str::to_owned);
+    let global_scope = cx.try_global::<Media>().and_then(|media| media.scope.as_ref());
+    let revision = scope.or(global_scope).and_then(|scope| revision_for(source, scope)).map(str::to_owned);
     cache.update(cx, |cache, cx| cache.image(source, variant, owner, revision.as_deref(), cx))
 }
 

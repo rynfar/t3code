@@ -4,14 +4,19 @@
 //! zooms up to 8x, drag pans; Enter, + / -, 0 and the arrow keys do the same from the keyboard.
 //! Escape or a click on the scrim closes it and gives focus back.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use futures::StreamExt;
+use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, FontWeight, Global, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Styled, WeakEntity, Window, anchored, deferred, div, hsla as gpui_hsla, img, point, prelude::*, px,
+    AnyElement, AnyWindowHandle, App, AppContext, Context, Entity, FocusHandle, FontWeight, Global, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, Styled, Task, WeakEntity, Window, anchored, deferred, div, hsla as gpui_hsla, img, point, prelude::*, px,
 };
 use t3_core::media::{MediaHints, MediaKind, MediaSource};
 
 use super::video::{VideoPlayer, VideoPlayerOptions};
-use super::{ImageState, Variant};
+use super::{ImageState, MediaScope, Variant};
 use crate::icons::Icon;
 
 const MAX_ZOOM: f32 = 8.;
@@ -42,6 +47,8 @@ impl ViewerItem {
 pub struct MediaViewer {
     items: Vec<ViewerItem>,
     index: usize,
+    scope: Option<MediaScope>,
+    window_handle: Option<AnyWindowHandle>,
     zoom: f32,
     /// Offset of the zoomed image's visible window from its top-left corner.
     pan: Point<Pixels>,
@@ -50,6 +57,9 @@ pub struct MediaViewer {
     video_player: Option<(MediaSource, Entity<VideoPlayer>)>,
     focus: FocusHandle,
     restore_focus: Option<FocusHandle>,
+    mount_count: Arc<AtomicUsize>,
+    unmount_tx: mpsc::UnboundedSender<()>,
+    _unmount_task: Task<()>,
 }
 
 struct Frame {
@@ -64,37 +74,95 @@ struct Frame {
 
 impl MediaViewer {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        MediaViewer { items: Vec::new(), index: 0, zoom: 1., pan: Point::default(), drag: None, dragged: false, video_player: None, focus: cx.focus_handle(), restore_focus: None }
+        let mount_count = Arc::new(AtomicUsize::new(0));
+        let (unmount_tx, mut unmount_rx) = mpsc::unbounded();
+        let _unmount_task = cx.spawn(async move |this, cx| {
+            while unmount_rx.next().await.is_some() {
+                let _ = this.update(cx, |viewer, cx| {
+                    if viewer.mount_count.load(Ordering::Acquire) == 0 && viewer.is_open() {
+                        viewer.dismiss(cx);
+                    }
+                });
+            }
+        });
+        MediaViewer {
+            items: Vec::new(),
+            index: 0,
+            scope: None,
+            window_handle: None,
+            zoom: 1.,
+            pan: Point::default(),
+            drag: None,
+            dragged: false,
+            video_player: None,
+            focus: cx.focus_handle(),
+            restore_focus: None,
+            mount_count,
+            unmount_tx,
+            _unmount_task,
+        }
     }
 
     pub fn is_open(&self) -> bool { !self.items.is_empty() }
 
     pub fn open(&mut self, items: Vec<ViewerItem>, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_with_scope(items, index, None, window, cx);
+    }
+
+    pub fn open_with_scope(&mut self, items: Vec<ViewerItem>, index: usize, scope: Option<MediaScope>, window: &mut Window, cx: &mut Context<Self>) {
         if items.is_empty() {
             return;
         }
         self.restore_focus = window.focused(cx);
+        self.scope = scope.or_else(|| cx.try_global::<super::Media>().and_then(|media| media.scope.clone()));
+        self.window_handle = Some(window.window_handle());
         self.items = items;
         self.index = index.min(self.items.len() - 1);
         self.reset_zoom();
-        self.video_player = None;
+        if let Some((_, player)) = self.video_player.take() {
+            player.update(cx, |p, cx| p.release_webview(cx));
+        }
         self.pin(cx);
         window.focus(&self.focus, cx);
+        self.sync_fullscreen_with(crate::webview::available(window), cx);
+        window.refresh();
         cx.notify();
     }
 
-    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_fullscreen_with(&self, can_webview: bool, cx: &mut Context<Self>) {
+        let active_video = self.items.get(self.index).is_some_and(|item| item.kind == MediaKind::Video);
+        if active_video && can_webview {
+            cx.default_global::<FullscreenViewer>().0 = Some(cx.entity().downgrade());
+        } else {
+            clear_fullscreen_for(cx.entity_id(), cx);
+        }
+    }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        let had_state = !self.items.is_empty() || self.video_player.is_some() || self.scope.is_some();
         self.items.clear();
         self.drag = None;
-        self.video_player = None;
+        self.scope = None;
+        self.window_handle = None;
+        if let Some((_, player)) = self.video_player.take() {
+            player.update(cx, |p, cx| p.release_webview(cx));
+        }
         clear_fullscreen_for(cx.entity_id(), cx);
         if let Some(cache) = cx.try_global::<super::Media>().map(|media| media.cache.clone()) {
             cache.update(cx, |cache, _| cache.unpin_all());
         }
+        if had_state {
+            cx.refresh_windows();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss(cx);
         if let Some(focus) = self.restore_focus.take() {
             window.focus(&focus, cx);
         }
-        cx.notify();
+        window.refresh();
     }
 
     fn pin(&self, cx: &mut Context<Self>) {
@@ -120,15 +188,19 @@ impl MediaViewer {
         self.pan = Point::default();
     }
 
-    fn navigate(&mut self, step: isize, cx: &mut Context<Self>) {
+    fn navigate(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.items.len() as isize;
         if count <= 1 {
             return;
         }
         self.index = (self.index as isize + step).rem_euclid(count) as usize;
         self.reset_zoom();
-        self.video_player = None;
+        if let Some((_, player)) = self.video_player.take() {
+            player.update(cx, |p, cx| p.release_webview(cx));
+        }
         self.pin(cx);
+        self.sync_fullscreen_with(crate::webview::available(window), cx);
+        window.refresh();
         cx.notify();
     }
 
@@ -192,8 +264,8 @@ impl MediaViewer {
                 self.clamp_pan(&frame);
                 cx.notify();
             }
-            ("left", _) => self.navigate(-1, cx),
-            ("right", _) => self.navigate(1, cx),
+            ("left", _) => self.navigate(-1, window, cx),
+            ("right", _) => self.navigate(1, window, cx),
             ("enter" | "space", Some(natural)) => self.zoom_to(if self.zoom > 1. { 1. } else { 2. }, None, natural, window, cx),
             ("+" | "=", Some(natural)) => self.zoom_to(self.zoom * 1.5, None, natural, window, cx),
             ("-", Some(natural)) => self.zoom_to(self.zoom / 1.5, None, natural, window, cx),
@@ -216,7 +288,11 @@ fn clear_fullscreen_for(id: gpui::EntityId, cx: &mut App) {
 /// sits above GPUI overlays and occludes transcript webviews underneath.
 pub fn fullscreen(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     let viewer = cx.try_global::<FullscreenViewer>()?.0.as_ref()?.upgrade()?;
-    let active_video = viewer.read(cx).items.get(viewer.read(cx).index).is_some_and(|item| item.kind == MediaKind::Video);
+    let guard = viewer.read(cx);
+    if guard.window_handle != Some(window.window_handle()) {
+        return None;
+    }
+    let active_video = guard.items.get(guard.index).is_some_and(|item| item.kind == MediaKind::Video);
     if !active_video || !crate::webview::available(window) {
         return None;
     }
@@ -240,7 +316,7 @@ fn media_button(id: &'static str, icon: Icon, size: f32, filled: bool) -> gpui::
 
 impl MediaViewer {
     fn video_entity(&mut self, item: &ViewerItem, viewport: gpui::Size<Pixels>, cx: &mut Context<Self>) -> Entity<VideoPlayer> {
-        let scope = cx.try_global::<super::Media>().and_then(|media| media.scope.clone());
+        let scope = self.scope.clone().or_else(|| cx.try_global::<super::Media>().and_then(|media| media.scope.clone()));
         let revision = scope.as_ref().and_then(|scope| super::revision_for(&item.source, scope).map(str::to_owned));
         let viewer_handle = cx.entity().downgrade();
         let options = VideoPlayerOptions {
@@ -289,11 +365,11 @@ impl MediaViewer {
                 None,
             )
         } else {
-            let full = super::image(&item.source, Variant::Full, owner, cx);
+            let full = super::image_in_scope(&item.source, Variant::Full, owner, self.scope.as_ref(), cx);
             let shown = match full {
                 ImageState::Ready(image) => Ok(Some(image)),
                 ImageState::Failed(message) => Err(message),
-                ImageState::Loading => match super::image(&item.source, Variant::Thumb, owner, cx) {
+                ImageState::Loading => match super::image_in_scope(&item.source, Variant::Thumb, owner, self.scope.as_ref(), cx) {
                     ImageState::Ready(image) => Ok(Some(image)),
                     _ => Ok(None),
                 },
@@ -419,14 +495,14 @@ impl MediaViewer {
                     div().absolute().left(px(16.)).top_0().bottom_0().flex().items_center().child(
                         media_button("media-viewer-previous", Icon::ChevronLeft, 36., false)
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(|this, _, _, cx| this.navigate(-1, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.navigate(-1, window, cx))),
                     ),
                 )
                 .child(
                     div().absolute().right(px(16.)).top_0().bottom_0().flex().items_center().child(
                         media_button("media-viewer-next", Icon::ChevronRight, 36., false)
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(|this, _, _, cx| this.navigate(1, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.navigate(1, window, cx))),
                     ),
                 )
             });
@@ -440,16 +516,19 @@ impl MediaViewer {
 
 impl Render for MediaViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mount_id: SharedString = format!("media-viewer-mount-{}", cx.entity_id().as_u64()).into();
+        let tracker = super::video::mount_tracker(mount_id, self.mount_count.clone(), self.unmount_tx.clone());
         let Some(item) = self.items.get(self.index).cloned() else {
             clear_fullscreen_for(cx.entity_id(), cx);
-            return div().into_any_element();
+            return div().child(tracker).into_any_element();
         };
         if item.kind == MediaKind::Video && crate::webview::available(window) {
+            self.window_handle = Some(window.window_handle());
             cx.default_global::<FullscreenViewer>().0 = Some(cx.entity().downgrade());
-            return div().into_any_element();
+            return div().child(tracker).into_any_element();
         }
         clear_fullscreen_for(cx.entity_id(), cx);
-        self.render_modal(false, window, cx)
+        div().child(tracker).child(self.render_modal(false, window, cx)).into_any_element()
     }
 }
 
@@ -469,13 +548,78 @@ mod tests {
                 v.open(items, 0, window, cx);
                 assert!(v.is_open());
                 assert_eq!(v.index, 0);
-                v.navigate(1, cx);
+                v.navigate(1, window, cx);
                 assert_eq!(v.index, 1);
                 assert_eq!(v.items[1].kind, MediaKind::Video);
-                v.navigate(-1, cx);
+                v.navigate(-1, window, cx);
                 assert_eq!(v.index, 0);
                 v.close(window, cx);
                 assert!(!v.is_open());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn open_with_scope_syncs_fullscreen_preserves_surface_scope_and_dismisses_cleanly(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = cx.add_window_view(|_, cx| MediaViewer::new(cx));
+        let global_viewer = cx.update(|_, cx| cx.new(MediaViewer::new));
+        let global_scope = MediaScope {
+            owner: global_viewer.entity_id(),
+            thread_id: Some("thread-global".into()),
+            workspace_root: Some("/global".into()),
+            workspace_mutation_id: Some("mut-global".into()),
+            source_control_media: false,
+            source_control_media_repository: None,
+            viewer: global_viewer.downgrade(),
+        };
+        let preview_scope = MediaScope {
+            owner: viewer.entity_id(),
+            thread_id: Some("thread-preview".into()),
+            workspace_root: Some("/preview/docs".into()),
+            workspace_mutation_id: Some("mut-preview".into()),
+            source_control_media: false,
+            source_control_media_repository: None,
+            viewer: viewer.downgrade(),
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let items = vec![
+            ViewerItem::video(MediaSource::Direct("https://example.com/clip.mp4".into()), "clip.mp4"),
+            ViewerItem::image(MediaSource::Direct("data:image/png;base64,iVBORw0KGgo=".into()), "two.png"),
+        ];
+        cx.update(|window, cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx));
+            crate::media::cache(&state, cx);
+            crate::media::set_scope(global_scope, cx);
+
+            viewer.update(cx, |v, cx| {
+                v.open_with_scope(items, 0, Some(preview_scope.clone()), window, cx);
+                assert_eq!(v.scope.as_ref().and_then(|s| s.workspace_root.as_deref()), Some("/preview/docs"));
+                assert_eq!(v.scope.as_ref().and_then(|s| s.workspace_mutation_id.as_deref()), Some("mut-preview"));
+                assert_eq!(v.window_handle, Some(window.window_handle()));
+                let viewport = window.viewport_size();
+                let player = v.video_entity(&v.items[0].clone(), viewport, cx);
+                assert_eq!(
+                    player.read(cx).scope_for_test().and_then(|s| s.workspace_root.as_deref()),
+                    Some("/preview/docs"),
+                    "modal VideoPlayer must inherit the opening surface scope rather than global Media::scope",
+                );
+                // Even before render(), opening a video updates FullscreenViewer when webviews are enabled.
+                v.sync_fullscreen_with(true, cx);
+                assert!(cx.try_global::<FullscreenViewer>().and_then(|g| g.0.as_ref()).is_some());
+                // Stepping from video -> image clears FullscreenViewer.
+                v.navigate(1, window, cx);
+                assert!(cx.try_global::<FullscreenViewer>().and_then(|g| g.0.as_ref()).is_none());
+                // Stepping back to video restores FullscreenViewer, and dismiss() clears it without a Window.
+                v.navigate(-1, window, cx);
+                v.sync_fullscreen_with(true, cx);
+                assert!(cx.try_global::<FullscreenViewer>().and_then(|g| g.0.as_ref()).is_some());
+                v.dismiss(cx);
+                assert!(!v.is_open());
+                assert!(v.scope.is_none());
+                assert!(cx.try_global::<FullscreenViewer>().and_then(|g| g.0.as_ref()).is_none());
             });
         });
     }

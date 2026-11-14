@@ -257,6 +257,8 @@ impl ThreadView {
         if selected != self.thread_id {
             self.disclosure.cancel();
             self.dismiss_citation_selection(cx);
+            crate::media::video::retire_owner(cx.entity_id(), cx);
+            self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
             self.thread_id = selected;
             self.ui = TranscriptUi::default();
             self.markdown.clear();
