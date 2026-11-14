@@ -55,9 +55,10 @@ impl Composer {
     /// Placeholder and disabled state follow what the agent waits on; written only on change.
     pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placeholder = self.placeholder(cx);
-        let disabled = self.active_question().is_some_and(|(request_id, question)| {
-            !question.allows_custom_answer() || self.question_responding(&request_id, cx)
-        });
+        let disabled = self.is_rewinding(cx)
+            || self.active_question().is_some_and(|(request_id, question)| {
+                !question.allows_custom_answer() || self.question_responding(&request_id, cx)
+            });
         if self.input_state == Some((placeholder, disabled)) {
             return;
         }
@@ -95,7 +96,7 @@ impl Composer {
                     .max_label_width(224.)
                     .suffix(suffix)
                     .pressed(self.picker_open)
-                    .disabled(self.sending)
+                    .disabled(self.sending || self.is_rewinding(cx))
                     .tooltip(tooltip)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if Self::guard_reopen(&mut this.picker_dismissed) {
@@ -124,6 +125,7 @@ impl Composer {
     fn render_permissions_chip(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
         let mode = resolved.runtime_mode;
         let modes = resolved.runtime_modes.clone();
+        let rewinding = self.is_rewinding(cx);
         div()
             .relative()
             .child(
@@ -132,16 +134,17 @@ impl Composer {
                     .label(runtime_mode_label(mode))
                     .emphasized(true)
                     .pressed(self.permissions_open)
+                    .disabled(rewinding)
                     .tooltip(format!("Permissions: {}. {}", runtime_mode_label(mode), runtime_mode_description(mode)))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if Self::guard_reopen(&mut this.menu_dismissed) {
+                        if this.is_rewinding(cx) || Self::guard_reopen(&mut this.menu_dismissed) {
                             return;
                         }
                         this.permissions_open = !this.permissions_open;
                         cx.notify();
                     })),
             )
-            .when(self.permissions_open, |this| {
+            .when(self.permissions_open && !rewinding, |this| {
                 this.child(floating(
                     Float::AboveStart,
                     menu_surface(cx)
@@ -167,6 +170,7 @@ impl Composer {
             .icon(if plan { Icon::PencilRuler } else { Icon::Bot })
             .label(if plan { "Plan" } else { "Build" })
             .emphasized(plan)
+            .disabled(self.is_rewinding(cx))
             .tooltip(tooltip)
             .on_click(cx.listener(|this, _, window, cx| this.toggle_plan_mode(window, cx)))
             .into_any_element()
@@ -174,9 +178,14 @@ impl Composer {
 
     fn render_primary(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
         let running = self.snapshot.running;
+        let rewinding = self.is_rewinding(cx);
         let stop = || {
             RoundButton::new("stop", RoundKind::Stop, "Interrupt")
+                .disabled(rewinding)
                 .on_click(cx.listener(|this, _, _, cx| {
+                    if this.is_rewinding(cx) {
+                        return;
+                    }
                     let fixed = this.fixed.clone();
                     this.state.update(cx, |state, cx| match fixed {
                         Some(id) => state.stop_thread(&id, cx),
@@ -185,7 +194,7 @@ impl Composer {
                 }))
         };
         if let (Some(input), Some(progress)) = (self.active_input(), self.progress(cx)) {
-            let responding = self.question_responding(&input.request_id, cx) || !input.can_respond();
+            let responding = rewinding || self.question_responding(&input.request_id, cx) || !input.can_respond();
             let enabled = if progress.is_last_question { progress.is_complete } else { progress.can_advance };
             return h_flex()
                 .gap(px(8.))
@@ -211,7 +220,7 @@ impl Composer {
             return stop().into_any_element();
         }
         if !running && !editing_queued && self.active_plan_follow_up(cx).is_some() && (self.has_text || !self.snapshot.can_resume) {
-            let disabled = self.sending || resolved.model.is_none() || self.snapshot.setup_blocks_send;
+            let disabled = self.sending || self.is_rewinding(cx) || resolved.model.is_none() || self.snapshot.setup_blocks_send;
             return self.render_plan_primary(self.has_text, disabled, cx);
         }
         let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
@@ -226,11 +235,13 @@ impl Composer {
             (false, true, _) => (RoundKind::Steer, "Steer message"),
             _ => (RoundKind::Send, "Submit message"),
         };
-        let blocked = self.snapshot.setup_blocks_send;
+        let blocked = self.snapshot.setup_blocks_send || self.is_rewinding(cx);
         let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some() || blocked;
         let tooltip: SharedString = if resolved.model.is_none() {
             "No provider available".into()
-        } else if blocked {
+        } else if self.is_rewinding(cx) {
+            "Reverting checkpoint...".into()
+        } else if self.snapshot.setup_blocks_send {
             t3_core::worktree_setup::SEND_BLOCKED.into()
         } else if let Some(reason) = attachment_block {
             reason.into()
@@ -261,6 +272,7 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_input_state(window, cx);
         let resolved = self.resolve(cx);
+        let rewinding = self.is_rewinding(cx);
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let error = self.error.clone().or_else(|| self.snapshot.last_error.clone());
@@ -363,6 +375,7 @@ impl Render for Composer {
                     div().relative().children(self.render_menu(cx)).child(
                     v_flex()
                         .id("composer-card")
+                        .when(rewinding, |this| this.opacity(0.65))
                         .rounded(px(16.))
                         .border_1()
                         .border_color(outline.opacity(0.))
@@ -378,8 +391,10 @@ impl Render for Composer {
                             }])
                         })
                         // Files dragged in from Finder (`isDragOverComposer`).
-                        .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))
-                        .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| this.on_drop_paths(paths, window, cx)))
+                        .when(!rewinding, |this| {
+                            this.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))
+                                .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| this.on_drop_paths(paths, window, cx)))
+                        })
                         .child(
                             div()
                                 .px(px(16.))
@@ -403,6 +418,7 @@ impl Render for Composer {
                                         div().mr(px(8.)).child(
                                             Button::new("attach-files", ButtonVariant::Ghost, ButtonSize::IconSm)
                                                 .icon(Icon::Paperclip)
+                                                .disabled(rewinding)
                                                 .tooltip("Attach files")
                                                 .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx))),
                                         ),

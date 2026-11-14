@@ -54,8 +54,10 @@ pub enum AppEvent {
     SidebarSelection,
     /// The narrow-window sheet opened or closed, or the window crossed the sheet breakpoint.
     SidebarVisibility,
-    /// A prompt is waiting for the composer (`take_composer_restore`).
+    /// A prompt is waiting for the composer (`take_composer_restore` / `drain_composer_restores`).
     ComposerRestore,
+    /// Per-thread rewind preparing, active, finished, or failed (`rewinds`).
+    Rewind,
     /// A terminal selection is waiting for the composer (`take_terminal_context`).
     ComposerTerminalContext,
     ComposerReviewComment,
@@ -71,6 +73,33 @@ pub enum AppEvent {
     ThreadFind,
     /// An SSH password prompt arrived or was answered (`ssh_prompts`).
     SshPrompt,
+}
+
+/// Attachment payload handed back to the composer when rewinding a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredAttachment {
+    pub kind: t3_core::composer::attachments::AttachmentKind,
+    pub name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+struct ComposerRestore {
+    prompt: String,
+    attachments: Vec<RestoredAttachment>,
+}
+
+pub(crate) struct ActiveRewind {
+    pub watch: t3_core::timeline::RewindWatch,
+    pub text: String,
+    pub attachments: Vec<RestoredAttachment>,
+    pub accepted: bool,
+    pub _timeout: Option<Task<()>>,
+}
+
+pub(crate) enum ThreadRewindPhase {
+    Preparing { generation: u64 },
+    Active(Box<ActiveRewind>),
 }
 
 pub struct AppState {
@@ -119,8 +148,12 @@ pub struct AppState {
     pub(crate) side_threads: crate::side_chat::SideThreads,
     /// A thread just launched from the draft, selected once the shell lists it.
     select_when_listed: Option<String>,
-    /// A prompt handed back to the composer for a thread, as "Edit from here" restores one.
-    composer_restore: Option<(String, String)>,
+    /// Prompts and attachments handed back to the composer per thread, as "Edit from here" restores one.
+    composer_restores: std::collections::HashMap<String, ComposerRestore>,
+    /// Per-thread in-flight rewinds (kept across thread switches so navigation cannot unlock or drop restore).
+    pub(crate) rewinds: std::collections::HashMap<String, ThreadRewindPhase>,
+    /// Unseen per-thread rewind failure messages if a rewind fails while the thread is off-screen.
+    pub(crate) rewind_errors: std::collections::HashMap<String, String>,
     /// A terminal selection added to a thread's chat, as the drawer hands it over.
     composer_terminal_context: Option<(String, t3_core::composer::context::TerminalSelection)>,
     pub review_comments: std::collections::HashMap<String, Vec<t3_core::composer::review::ReviewComment>>,
@@ -228,7 +261,9 @@ impl AppState {
             notifications: Default::default(),
             side_threads: Default::default(),
             select_when_listed: None,
-            composer_restore: None,
+            composer_restores: Default::default(),
+            rewinds: Default::default(),
+            rewind_errors: Default::default(),
             composer_terminal_context: None,
             review_comments: Default::default(),
             remove_review_comment: None,
@@ -317,6 +352,9 @@ impl AppState {
         self.thread = ThreadState::default();
         // Side subscriptions and a side chat start (with its timeout) belong to this environment.
         self.side_threads = Default::default();
+        self.rewinds.clear();
+        self.rewind_errors.clear();
+        self.composer_restores.clear();
         self.server_config = ServerConfigState::default();
         crate::theme::set_environment_themes(&[], cx);
         self.draft_project = None;
@@ -387,6 +425,9 @@ impl AppState {
     pub(crate) fn install_active_environment(&mut self, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, cx: &mut Context<Self>) {
         self.client = Some(client);
         self.connection += 1;
+        self.rewinds.clear();
+        self.rewind_errors.clear();
+        self.composer_restores.clear();
         self.shell = shell;
         self.server_config = config;
         self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
@@ -546,6 +587,9 @@ impl AppState {
             }
         } else if thread_changed || error_changed {
             cx.emit(AppEvent::Thread);
+        }
+        if thread_changed || side_changed {
+            self.check_rewinds(cx);
         }
         if shell_changed || resynchronized {
             self.land_home(cx);
@@ -813,14 +857,18 @@ impl AppState {
         }
     }
 
-    /// Hands `prompt` to the composer of `thread_id`, which joins it to its draft and focuses.
-    pub fn restore_composer_prompt(&mut self, thread_id: &str, prompt: String, cx: &mut Context<Self>) {
-        self.composer_restore = Some((thread_id.to_owned(), prompt));
+    pub fn is_thread_rewinding(&self, thread_id: &str) -> bool {
+        self.rewinds.contains_key(thread_id)
+    }
+
+    /// Hands `prompt` and `attachments` to the composer of `thread_id`, which joins them to its draft and focuses.
+    pub fn restore_composer_prompt(&mut self, thread_id: &str, prompt: String, attachments: Vec<RestoredAttachment>, cx: &mut Context<Self>) {
+        self.composer_restores.insert(thread_id.to_owned(), ComposerRestore { prompt, attachments });
         cx.emit(AppEvent::ComposerRestore);
     }
 
-    pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<String> {
-        if self.composer_restore.as_ref().is_some_and(|(thread, _)| thread == thread_id) { self.composer_restore.take().map(|(_, prompt)| prompt) } else { None }
+    pub fn take_composer_restore(&mut self, thread_id: &str) -> Option<(String, Vec<RestoredAttachment>)> {
+        self.composer_restores.remove(thread_id).map(|restore| (restore.prompt, restore.attachments))
     }
 
     pub fn set_review_comments(&mut self, thread: &str, comments: Vec<t3_core::composer::review::ReviewComment>, cx: &mut Context<Self>) {

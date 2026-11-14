@@ -268,6 +268,8 @@ pub struct Options {
     palette: bool,
     /// Opens the new-thread draft, as `chat.new` does.
     new_thread: bool,
+    /// Opens a scratch draft for triage hero snapshots.
+    triage_draft: bool,
     draft_workspace_fixture: Option<PathBuf>,
     composer_audit: Option<PathBuf>,
     recovery_fixture: bool,
@@ -339,6 +341,7 @@ impl Options {
             environment_attach_fixture: has("--environment-attach-fixture"),
             palette: has("--palette"),
             new_thread: has("--new-thread"),
+            triage_draft: has("--triage-draft"),
             draft_workspace_fixture: flag("--draft-workspace-fixture").map(PathBuf::from),
             composer_audit: flag("--composer-audit").map(PathBuf::from),
             recovery_fixture: has("--composer-recovery-fixture"),
@@ -828,6 +831,42 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
     if options.composer_audit.is_some() || options.workspace_availability_fixture {cx.update(|cx| cx.set_global(crate::composer::SnapshotAudit::default()));}
     if options.new_thread {
         cx.update(|cx| cx.dispatch_action(&crate::new_thread::NewThread));
+        pump(&mut cx, 1., |_| false);
+    }
+    if options.triage_draft {
+        state.update(&mut cx, |state, cx| {
+            state.stop_pump();
+            let config = state.server_config.config.get_or_insert_with(Default::default);
+            let scratch_root = config.scratch_workspace_root.get_or_insert_with(|| "/tmp/t3-scratch".into()).clone();
+            if config.environment.server_version.is_empty() {
+                config.environment.server_version = "0.1.0-preview".into();
+            }
+            let scratch_id = if let Some(existing) = state.shell.snapshot.as_ref().and_then(|shell| shell.projects.iter().find(|p| p.workspace_root == scratch_root)) {
+                existing.id.clone()
+            } else {
+                let id = "snapshot-scratch".to_owned();
+                if let Some(shell) = state.shell.snapshot.as_mut() {
+                    shell.projects.push(t3_core::shell::ProjectShell {
+                        id: id.clone(),
+                        title: "Scratch".into(),
+                        workspace_root: scratch_root,
+                        repository_identity: None,
+                        default_model_selection: None,
+                        pinned_at: None,
+                        archived_at: None,
+                        favicon_path: None,
+                        project_icon: None,
+                        scripts: Vec::new(),
+                        created_at: "2026-04-01T00:00:00.000Z".into(),
+                        updated_at: "2026-04-01T00:00:00.000Z".into(),
+                    });
+                }
+                id
+            };
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+            cx.emit(crate::app_state::AppEvent::Shell);
+            state.start_draft(&scratch_id, cx);
+        });
         pump(&mut cx, 1., |_| false);
     }
     if !options.attach.is_empty() || options.prompt.is_some() {

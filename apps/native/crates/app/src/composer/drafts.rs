@@ -238,6 +238,73 @@ impl Composer {
         self.schedule_draft_save(target, cx);
         cx.notify();
     }
+
+    /// Moves a non-empty draft from `from_project` to `to_project` when the user switches projects
+    /// in the draft hero (`DraftHeroHeadline.tsx`: `selectProject`). Empty drafts are left alone so
+    /// switching away never clobbers the destination project's saved draft.
+    pub(crate) fn retarget_draft(
+        &mut self,
+        from_project: &str,
+        to_project: &str,
+        keep_attachments: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if from_project == to_project {
+            return false;
+        }
+        let from = Target::Draft(from_project.to_owned());
+        let to = Target::Draft(to_project.to_owned());
+        let mut draft = self.current_draft(&from, cx);
+        if !draft.has_user_content() {
+            return false;
+        }
+        if !keep_attachments
+            && draft.prompt.trim().is_empty()
+            && draft.terminals.is_empty()
+            && draft.review_comments.is_empty()
+        {
+            return false;
+        }
+        draft.workspace = None;
+        let attachments = if keep_attachments {
+            self.take_draft_attachments(&from)
+        } else {
+            let dropped = self.take_draft_attachments(&from);
+            self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments: dropped }, cx);
+            draft.attachments.clear();
+            draft.pending_attachment_count = 0;
+            Vec::new()
+        };
+        let old_to = self.take_draft_attachments(&to);
+        self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments: old_to }, cx);
+        self.discard_draft(&from, cx);
+        self.clear_mentions(&from);
+        self.context.records.remove(&from);
+        self.context.reviews.remove(&from);
+        self.clear_terminals(&from);
+        if self.snapshot.target.as_ref() == Some(&from) {
+            self.set_prompt("", window, cx);
+        }
+        self.context.records.remove(&to);
+        self.context.reviews.remove(&to);
+        self.clear_terminals(&to);
+        self.clear_mentions(&to);
+        self.restore_draft_choices(&to, &draft, cx);
+        self.seed_records(&to, draft.context_records.clone());
+        self.seed_mentions(&to, draft.thread_contexts());
+        self.seed_terminals(&to, draft.terminals.clone());
+        self.seed_reviews(&to, draft.review_comments.clone());
+        if self.drafts.store.set(&key(&to), draft.clone()) {
+            self.schedule_draft_save(&to, cx);
+        }
+        self.restore_draft_attachments(&to, attachments, cx);
+        if self.snapshot.target.as_ref() == Some(&to) {
+            self.set_prompt(&draft.restored_prompt(), window, cx);
+        }
+        cx.notify();
+        true
+    }
 }
 
 impl Composer {
@@ -264,5 +331,16 @@ impl Composer {
             cx.emit(ThreadDraftsChanged);
         }
         cx.notify();
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn set_test_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_prompt(text, window, cx);
+        self.draft_changed(cx);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn test_prompt(&self, cx: &gpui::App) -> String {
+        self.prompt(cx)
     }
 }

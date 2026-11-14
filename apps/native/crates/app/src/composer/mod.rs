@@ -255,6 +255,31 @@ pub(crate) fn insert_artifact_template(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RewindComposerPrecheck {
+    pub send_busy: bool,
+    pub pending_attachments: bool,
+    pub staged_count: usize,
+}
+
+pub(crate) fn rewind_precheck(thread_id: &str, cx: &App) -> RewindComposerPrecheck {
+    let target = Target::Thread(thread_id.to_owned());
+    let Some(reg) = cx.try_global::<RegisteredComposers>() else {
+        return RewindComposerPrecheck::default();
+    };
+    let mut out = RewindComposerPrecheck::default();
+    for weak in &reg.0 {
+        let Some(entity) = weak.upgrade() else { continue };
+        let composer = entity.read(cx);
+        if composer.thread_id().as_deref() == Some(thread_id) {
+            out.send_busy |= composer.sending || composer.pending_send.is_pending();
+            out.pending_attachments |= composer.has_pending_attachments(&target);
+            out.staged_count = out.staged_count.max(composer.staged_for(&target).len());
+        }
+    }
+    out
+}
+
 impl Composer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_for(state, None, window, cx)
@@ -321,6 +346,21 @@ impl Composer {
                 }
                 if *event == AppEvent::ComposerRestore {
                     this.restore_prompt(window, cx);
+                }
+                if *event == AppEvent::Rewind {
+                    if this.is_rewinding(cx) {
+                        let _ = this.cancel_pending_send();
+                        this.picker_open = false;
+                        this.permissions_open = false;
+                        this.approval_menu_open = false;
+                        this.plan_menu_open = false;
+                        this.workspace.open = false;
+                        this.close_stash_menu(cx);
+                        let _ = this.close_context_details(cx);
+                    }
+                    this.sync_input_state(window, cx);
+                    this.restore_prompt(window, cx);
+                    cx.notify();
                 }
                 if *event == AppEvent::RemoveReviewComment
                     && let Some(thread_id) = this.thread_id()
@@ -528,6 +568,7 @@ impl Composer {
         self.attachment_fixture(cx);
         self.sync_queued_edit(window, cx);
         self.sync_answering(window, cx);
+        self.restore_prompt(window, cx);
         self.sync_menu(true, cx);
         // The provider, its skills or the compact rule may have changed under the open menu.
         if self.menu_open() {
@@ -652,7 +693,7 @@ impl Composer {
     }
 
     pub fn toggle_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.snapshot.target.is_none() {
+        if self.snapshot.target.is_none() || self.is_rewinding(cx) {
             return;
         }
         self.picker_open = !self.picker_open;
@@ -668,7 +709,7 @@ impl Composer {
 
     /// `composer.mode`: the permissions chip when it shows, else the model picker that holds them.
     pub fn open_permissions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.snapshot.target.is_none() {
+        if self.snapshot.target.is_none() || self.is_rewinding(cx) {
             return;
         }
         let resolved = self.resolve(cx);
@@ -682,6 +723,10 @@ impl Composer {
     }
 
     fn on_picker(&mut self, event: &PickerEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            self.picker_open = false;
+            return;
+        }
         match event {
             PickerEvent::Model { instance_id, model } => {
                 let selection = ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None };
@@ -715,6 +760,9 @@ impl Composer {
     }
 
     fn set_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         if let Some(choices) = self.choices_mut() {
             choices.runtime_mode = Some(mode);
         }
@@ -725,6 +773,9 @@ impl Composer {
 
     /// Shift+Tab: outdent the list item under the caret, else toggle plan mode.
     fn toggle_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let edit = {
             let input = self.input.read(cx);
             let range = input.selected_range();
@@ -754,6 +805,14 @@ impl Composer {
         cx.notify();
     }
 
+    pub(crate) fn prompt_text(&self, cx: &App) -> String {
+        self.prompt(cx)
+    }
+
+    pub(crate) fn is_rewinding(&self, cx: &App) -> bool {
+        self.thread_id().is_some_and(|id| self.state.read(cx).is_thread_rewinding(&id))
+    }
+
     fn prompt(&self, cx: &App) -> String {
         self.input.read(cx).value().to_string()
     }
@@ -765,12 +824,20 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
     }
 
-    /// "Edit from here": the restored prompt joins the draft (`rewindToMessage`), cursor at the end.
+    /// "Edit from here": the restored prompt and attachments join the draft (`rewindToMessage`), cursor at the end.
     fn restore_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.answering.is_some() {
+            return;
+        }
         let Some(thread_id) = self.thread_id() else { return };
-        let Some(restored) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else { return };
-        let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
-        self.set_prompt(&prompt, window, cx);
+        let Some((restored, attachments)) = self.state.update(cx, |state, _| state.take_composer_restore(&thread_id)) else {
+            return;
+        };
+        if !restored.is_empty() {
+            let prompt = t3_core::timeline::merge_restored_prompt(&self.prompt(cx), &restored);
+            self.set_prompt(&prompt, window, cx);
+        }
+        self.restore_reverted_attachments(&thread_id, attachments, cx);
         self.focus(window, cx);
         cx.notify();
     }

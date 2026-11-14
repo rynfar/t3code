@@ -108,6 +108,9 @@ impl Composer {
 
     /// `onAdvanceActivePendingUserInput`: next question, or submit on the last.
     pub(super) fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some(input) = self.active_input().cloned() else { return };
         if !input.can_respond() || self.question_responding(&input.request_id, cx) {
             return;
@@ -130,7 +133,7 @@ impl Composer {
     }
 
     pub(super) fn previous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
+        if self.is_rewinding(cx) || self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
         let Some(answers) = self.answering.as_ref().and_then(|request_id| self.answers.get_mut(request_id)) else { return };
         answers.index = answers.index.saturating_sub(1);
         self.show_active_answer(window, cx);
@@ -139,6 +142,9 @@ impl Composer {
 
     /// Picks an option. Single-select questions move on once the pick settles, as the web does.
     pub(super) fn toggle_option(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some((request_id, question)) = self.active_question() else { return };
         if self.question_responding(&request_id, cx) {
             return;
@@ -170,6 +176,9 @@ impl Composer {
     }
 
     fn submit_answers(&mut self, request_id: String, answers: serde_json::Map<String, serde_json::Value>, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
         let Some(input) = self.active_input().filter(|input| input.request_id == request_id && input.can_respond()).cloned() else { return };
         if !self.can_answer(cx) || self.question_responding(&request_id, cx) { return; }
@@ -181,6 +190,9 @@ impl Composer {
     }
 
     fn dismiss(&mut self, request_id: String, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
         if !self.can_answer(cx) || self.question_responding(&request_id, cx) || !self.active_input().is_some_and(|input| input.request_id == request_id && input.can_respond() && input.dismissible) { return; }
         let key = self.answer_key(&request_id);
@@ -191,6 +203,9 @@ impl Composer {
 
     /// The digit shortcuts (1–9) pick options while the prompt is not focused.
     pub(super) fn pick_by_digit(&mut self, digit: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.is_rewinding(cx) {
+            return false;
+        }
         let Some((_, question)) = self.active_question() else { return false };
         let Some(option) = question.options.get(digit.wrapping_sub(1)) else { return false };
         self.toggle_option(option.answer_value().to_owned(), window, cx);
@@ -207,7 +222,7 @@ impl Composer {
             "mcp-elicitation" => Icon::Hammer,
             _ => Icon::Wrench,
         };
-        let responding = self.responding.contains(&approval.request_id);
+        let responding = self.is_rewinding(cx) || self.responding.contains(&approval.request_id);
         let (primary, more) = approval.split_options();
         let more: Vec<(ApprovalDecision, String, bool)> =
             more.into_iter().map(|option| (option.decision, option.label.clone(), option.warning.is_some())).collect();
@@ -233,15 +248,15 @@ impl Composer {
                         .icon(Icon::Ellipsis)
                         .tooltip("More approval options")
                         .disabled(responding)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if Self::guard_reopen(&mut this.menu_dismissed) {
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if responding || Self::guard_reopen(&mut this.menu_dismissed) {
                                 return;
                             }
                             this.approval_menu_open = !this.approval_menu_open;
                             cx.notify();
                         })),
                 )
-                .when(self.approval_menu_open, |this| {
+                .when(self.approval_menu_open && !responding, |this| {
                     let request_id = approval.request_id.clone();
                     this.child(floating(
                         Float::AboveEnd,
@@ -327,7 +342,7 @@ impl Composer {
         let p = palette(cx);
         let index = self.question_index(input);
         let Some(question) = input.questions.get(index) else { return div().into_any_element() };
-        let responding = self.question_responding(&input.request_id, cx) || !input.can_respond();
+        let responding = self.is_rewinding(cx) || self.question_responding(&input.request_id, cx) || !input.can_respond();
         let drafts = self.answers.get(&self.answer_key(&input.request_id)).map(|answers| &answers.drafts);
         let draft = drafts.and_then(|drafts| drafts.get(&question.id));
         let request_id = input.request_id.clone();

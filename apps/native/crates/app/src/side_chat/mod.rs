@@ -51,6 +51,11 @@ impl SideThreads {
     pub fn is_starting(&self) -> bool {
         self.starting.is_some()
     }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn insert_for_test(&mut self, id: String, thread: ThreadState) {
+        self.threads.insert(id, thread);
+    }
 }
 
 impl AppState {
@@ -74,6 +79,10 @@ impl AppState {
 
     pub(crate) fn has_side_thread(&self, thread_id: &str) -> bool {
         self.side_threads.threads.contains_key(thread_id)
+    }
+
+    pub(crate) fn is_thread_watched(&self, thread_id: &str) -> bool {
+        self.selected_thread.as_deref() == Some(thread_id) || self.side_threads.threads.contains_key(thread_id)
     }
 
     pub(crate) fn thread_state_mut(&mut self, thread_id: &str) -> Option<&mut ThreadState> {

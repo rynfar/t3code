@@ -110,6 +110,7 @@ impl Composer {
         }
         let p = palette(cx);
         let color = hsla(p.context_chip_citation);
+        let rewinding = self.is_rewinding(cx);
         Some(
             h_flex()
                 .id("citation-chips")
@@ -121,14 +122,14 @@ impl Composer {
                     let go = citation.clone();
                     let edit = CommentAnchor { link: link.clone(), inserted_spaces: None };
                     let remove = link.clone();
-                    let open = self.citation_editor.as_ref().is_some_and(|editor| editor.anchor.link == link);
+                    let open = !rewinding && self.citation_editor.as_ref().is_some_and(|editor| editor.anchor.link == link);
                     div()
                         .relative()
                         .child(
                             h_flex()
                                 .gap(px(2.))
-                                .child(chip_shell(&format!("citation-{i}"), Icon::Quote, citation.label(), Ink::Accent(p.context_chip_citation), true, cx).on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                                .child(chip_shell(&format!("citation-{i}"), Icon::Quote, citation.label(), Ink::Accent(p.context_chip_citation), !rewinding, cx).when(!rewinding, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| {
                                         let environment = this.environment_id(cx);
                                         if go.environment_id != environment {
                                             return;
@@ -138,34 +139,43 @@ impl Composer {
                                             state.citation_source = Some(go.clone());
                                             cx.emit(AppEvent::CitationSource);
                                         });
-                                    },
-                                )))
+                                    }))
+                                }))
                                 .child(
                                     div()
                                         .id(("citation-comment", i))
-                                        .tab_index(0)
-                                        .cursor_pointer()
                                         .rounded(px(4.))
-                                        .hover(|s| s.bg(color.opacity(0.17)))
-                                        .on_click(cx.listener(move |this, _, window, cx| this.open_citation_comment(edit.clone(), window, cx)))
+                                        .when(rewinding, |s| s.opacity(0.5))
+                                        .when(!rewinding, |s| {
+                                            s.tab_index(0)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(color.opacity(0.17)))
+                                                .on_click(cx.listener(move |this, _, window, cx| this.open_citation_comment(edit.clone(), window, cx)))
+                                        })
                                         .child(Icon::Pencil.render(px(12.), color)),
                                 )
                                 .child(
                                     div()
                                         .id(("remove-citation", i))
-                                        .tab_index(0)
-                                        .cursor_pointer()
                                         .rounded(px(4.))
-                                        .hover(|s| s.bg(color.opacity(0.17)))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.citation_editor = None;
-                                            let prompt = this.prompt(cx);
-                                            if let Some(edit) = remove.replace(&prompt, String::new()) {
-                                                this.apply_citation_edit(edit, window, cx);
-                                                this.focus(window, cx);
-                                                cx.notify();
-                                            }
-                                        }))
+                                        .when(rewinding, |s| s.opacity(0.5))
+                                        .when(!rewinding, |s| {
+                                            s.tab_index(0)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(color.opacity(0.17)))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    if this.is_rewinding(cx) {
+                                                        return;
+                                                    }
+                                                    this.citation_editor = None;
+                                                    let prompt = this.prompt(cx);
+                                                    if let Some(edit) = remove.replace(&prompt, String::new()) {
+                                                        this.apply_citation_edit(edit, window, cx);
+                                                        this.focus(window, cx);
+                                                        cx.notify();
+                                                    }
+                                                }))
+                                        })
                                         .child(Icon::X.render(px(12.), color)),
                                 ),
                         )

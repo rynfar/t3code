@@ -213,6 +213,9 @@ impl Composer {
 
     /// Removes every link to `context_id` from the prompt, as one undoable edit.
     fn remove_context(&mut self, context_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) {
+            return;
+        }
         let prompt = self.prompt(cx);
         let (next, caret) = rules::remove_reference(&prompt, context_id);
         if next == prompt {
@@ -384,6 +387,7 @@ impl Composer {
     fn with_remove(&self, shell: gpui::Stateful<gpui::Div>, context_id: &str, ink: Ink, cx: &mut Context<Self>) -> impl IntoElement {
         let color = ink_color(ink, cx);
         let ring_color = hsla(palette(cx).ring);
+        let rewinding = self.is_rewinding(cx);
         let remove_id = context_id.to_owned();
         h_flex().items_center().child(shell).child(
             div()
@@ -395,12 +399,15 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .rounded(px(4.))
-                .cursor_pointer()
-                .hover(move |style| style.bg(color.opacity(0.17)))
-                .tab_index(0)
-                .focus_visible(move |style| style.shadow(ring(ring_color, 1.)))
-                .tooltip(text_tooltip("Remove".to_owned()))
-                .on_click(cx.listener(move |this, _, window, cx| this.remove_context(&remove_id, window, cx)))
+                .when(rewinding, |this| this.opacity(0.5))
+                .when(!rewinding, |this| {
+                    this.cursor_pointer()
+                        .hover(move |style| style.bg(color.opacity(0.17)))
+                        .tab_index(0)
+                        .focus_visible(move |style| style.shadow(ring(ring_color, 1.)))
+                        .tooltip(text_tooltip("Remove".to_owned()))
+                        .on_click(cx.listener(move |this, _, window, cx| this.remove_context(&remove_id, window, cx)))
+                })
                 .child(Icon::X.render(px(CHIP_TEXT * 0.85), color)),
         )
     }

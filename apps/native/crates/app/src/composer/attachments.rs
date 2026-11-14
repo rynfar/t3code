@@ -81,6 +81,46 @@ impl Composer {
         self.attachments.staged.get(target).map(Vec::as_slice).unwrap_or_default()
     }
 
+    pub(super) fn has_pending_attachments(&self, target: &Target) -> bool {
+        self.attachments.preparations.count(&super::drafts::key(target)) > 0
+            || self.staged_for(target).iter().any(|entry| matches!(entry.attachment.upload, Upload::Uploading))
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn begin_test_preparation(&mut self, key: &str) {
+        self.attachments.preparations.begin(key);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn seed_test_attachments(&mut self, thread_id: &str, count: usize) {
+        let target = Target::Thread(thread_id.to_owned());
+        let attachments = (0..count)
+            .map(|i| Attachment {
+                id: format!("att-{i}"),
+                kind: AttachmentKind::File,
+                name: format!("file-{i}.txt"),
+                mime_type: "text/plain".into(),
+                size_bytes: 1,
+                pasted_text: false,
+                upload: Upload::Ready { attachment_id: format!("uploaded-{i}") },
+            })
+            .collect();
+        self.seed_attachments(&target, attachments);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn test_staged_thread_attachments(&self, thread_id: &str) -> Vec<crate::app_state::RestoredAttachment> {
+        self.staged_for(&Target::Thread(thread_id.to_owned()))
+            .iter()
+            .map(|entry| crate::app_state::RestoredAttachment {
+                kind: entry.attachment.kind,
+                name: entry.attachment.name.clone(),
+                mime_type: entry.attachment.mime_type.clone(),
+                bytes: entry.bytes.as_deref().cloned().unwrap_or_default(),
+            })
+            .collect()
+    }
+
     /// Attachments a saved draft restores: uploaded, without their bytes or preview.
     pub(super) fn seed_attachments(&mut self, target: &Target, restored: Vec<Attachment>) {
         if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
@@ -116,8 +156,8 @@ impl Composer {
         self.snapshot.target.clone()
     }
 
-    pub(super) fn can_attach(&self, cx: &App) -> bool {
-        if self.editing_queued().is_some() { return false; }
+    pub(crate) fn can_attach(&self, cx: &App) -> bool {
+        if self.editing_queued().is_some() || self.is_rewinding(cx) { return false; }
         if let Some(Target::Question(key)) = self.attachment_target() { return self.question_can_attach(&key, cx, IntakePhase::Start); }
         self.snapshot.target.is_some() && self.snapshot.pending.user_inputs.is_empty()
     }
@@ -197,6 +237,7 @@ impl Composer {
             let Some(target) = super::drafts::target(&key) else { continue };
             let eligible = match &target {
                 Target::Question(question) => self.question_can_attach(question, cx, IntakePhase::Preparing),
+                Target::Thread(id) => !self.state.read(cx).is_thread_rewinding(id),
                 _ => true,
             };
             for picked in self.attachments.preparations.take_completed(&key, eligible) {
@@ -216,6 +257,7 @@ impl Composer {
     /// Admits one file (`addComposerAttachments`) and starts its upload.
     fn stage(&mut self, target: &Target, name: String, bytes: Vec<u8>, pasted_text: bool, cx: &mut Context<Self>) {
         if let Target::Question(key) = target && !self.question_can_attach(key, cx, IntakePhase::Preparing) { return; }
+        if matches!(target, Target::Thread(id) if self.state.read(cx).is_thread_rewinding(id)) { return; }
         if self.attachment_target().as_ref() == Some(target) { self.cancel_pending_send(); }
         let classified = if pasted_text { Classified::File { mime_type: "text/plain;charset=utf-8".to_owned() } } else { rules::classify(&name) };
         let staged = self.reserved_attachment_count(target);
@@ -229,6 +271,31 @@ impl Composer {
             Classified::File { mime_type } => (AttachmentKind::File, mime_type),
             Classified::UnsupportedImage => return,
         };
+        self.push_staged_entry(target, kind, name, mime_type, bytes, pasted_text, cx);
+    }
+
+    pub(super) fn restore_reverted_attachments(&mut self, thread_id: &str, attachments: Vec<crate::app_state::RestoredAttachment>, cx: &mut Context<Self>) {
+        if attachments.is_empty() { return; }
+        let target = Target::Thread(thread_id.to_owned());
+        if self.attachment_target().as_ref() == Some(&target) { self.cancel_pending_send(); }
+        for restored in attachments {
+            if self.reserved_attachment_count(&target) >= rules::MAX_ATTACHMENTS { break; }
+            self.push_staged_entry(&target, restored.kind, restored.name, restored.mime_type, restored.bytes, false, cx);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_staged_entry(
+        &mut self,
+        target: &Target,
+        kind: AttachmentKind,
+        name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+        pasted_text: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let size = bytes.len() as u64;
         let preview = (kind == AttachmentKind::Image)
             .then(|| image_format(&mime_type))
             .flatten()
@@ -325,7 +392,7 @@ impl Composer {
 
     /// Removes a tile. An uploaded file the message never carried is deleted on the server.
     pub(super) fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
+        if self.is_rewinding(cx) || self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
         let Some(target) = self.attachment_target() else { return };
         let Some(staged) = self.attachments.staged.get_mut(&target) else { return };
         let Some(index) = staged.iter().position(|staged| staged.attachment.id == id) else { return };
@@ -430,7 +497,7 @@ impl Composer {
 
     /// ⌘⇧V: the clipboard's text goes into the prompt as is, however large.
     pub(super) fn paste_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_question().is_some_and(|(request, question)| !question.allows_custom_answer() || self.question_responding(&request, cx)) { return; }
+        if self.is_rewinding(cx) || self.active_question().is_some_and(|(request, question)| !question.allows_custom_answer() || self.question_responding(&request, cx)) { return; }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
         self.input.update(cx, |input, cx| input.insert(text, window, cx));
     }
@@ -453,6 +520,7 @@ impl Composer {
             return None;
         }
         let p = palette(cx);
+        let rewinding = self.is_rewinding(cx);
         let images: Vec<&Staged> = staged.iter().filter(|staged| staged.attachment.kind == AttachmentKind::Image).collect();
         let files: Vec<&Staged> = staged.iter().filter(|staged| staged.attachment.kind == AttachmentKind::File).collect();
         let tiles = (!images.is_empty()).then(|| {
@@ -506,16 +574,20 @@ impl Composer {
                         let id = id.clone();
                         this.child(
                             div().absolute().top(px(4.)).left(px(4.)).child(
-                                media_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, cx)
+                                media_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, rewinding, cx)
                                     .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
-                                    .on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx))),
+                                    .when(!rewinding, |this| {
+                                        this.on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx)))
+                                    }),
                             ),
                         )
                     })
                     .child(
                         div().absolute().top(px(4.)).right(px(4.)).child(
-                            media_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, cx)
-                                .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx))),
+                            media_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, rewinding, cx)
+                                .when(!rewinding, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx)))
+                                }),
                         ),
                     )
             }))
@@ -541,14 +613,18 @@ impl Composer {
                     .when_some(failed_reason(attachment), |this, reason| {
                         let id = id.clone();
                         this.child(
-                            ghost_icon_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, cx)
+                            ghost_icon_button(SharedString::from(format!("retry-{}", attachment.id)), Icon::RefreshCw, rewinding, cx)
                                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
-                                .on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx))),
+                                .when(!rewinding, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| this.retry_upload(id.clone(), cx)))
+                                }),
                         )
                     })
                     .child(
-                        ghost_icon_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, cx)
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx))),
+                        ghost_icon_button(SharedString::from(format!("remove-{}", attachment.id)), Icon::X, rewinding, cx)
+                            .when(!rewinding, |this| {
+                                this.on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(&id, cx)))
+                            }),
                     )
             }))
         });
@@ -557,6 +633,9 @@ impl Composer {
 
     /// Drop target for files from Finder.
     pub(super) fn on_drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_attach(cx) {
+            return;
+        }
         self.attach_paths(paths.paths().to_vec(), window, cx);
         self.focus(window, cx);
     }
@@ -570,7 +649,7 @@ fn failed_reason(attachment: &Attachment) -> Option<SharedString> {
 }
 
 /// The `media-close` button on a thumbnail: a small dark circle (`icon-xs`, 24).
-fn media_button(id: SharedString, icon: Icon, _cx: &App) -> gpui::Stateful<gpui::Div> {
+fn media_button(id: SharedString, icon: Icon, disabled: bool, _cx: &App) -> gpui::Stateful<gpui::Div> {
     let white = gpui::white();
     div()
         .id(id)
@@ -582,13 +661,13 @@ fn media_button(id: SharedString, icon: Icon, _cx: &App) -> gpui::Stateful<gpui:
         .bg(gpui::black().opacity(0.65))
         .border_1()
         .border_color(white.opacity(0.2))
-        .cursor_pointer()
-        .hover(|this| this.bg(gpui::black().opacity(0.8)))
+        .when(disabled, |this| this.opacity(0.5))
+        .when(!disabled, |this| this.cursor_pointer().hover(|this| this.bg(gpui::black().opacity(0.8))))
         .child(icon.render(px(14.), white))
 }
 
 /// A ghost `icon-xs` button for a file row.
-fn ghost_icon_button(id: SharedString, icon: Icon, cx: &App) -> gpui::Stateful<gpui::Div> {
+fn ghost_icon_button(id: SharedString, icon: Icon, disabled: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let p = palette(cx);
     div()
         .id(id)
@@ -598,8 +677,8 @@ fn ghost_icon_button(id: SharedString, icon: Icon, cx: &App) -> gpui::Stateful<g
         .items_center()
         .justify_center()
         .rounded(px(6.))
-        .cursor_pointer()
-        .hover(|this| this.bg(hsla(p.accent)))
+        .when(disabled, |this| this.opacity(0.5))
+        .when(!disabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.accent))))
         .child(icon.render(px(14.), hsla(p.muted_foreground)))
 }
 
