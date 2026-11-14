@@ -251,3 +251,12 @@ fn grouping_override_record_matches_contract_and_preserves_raw_settings() {
         assert_eq!(doc.entries()["sidebarProjectGroupingOverrides"], value);
     }
 }
+
+#[test]
+fn math_rendering_enabled_defaults_to_false_and_toggles() {
+    let mut doc = ClientSettingsDoc::default();
+    assert!(!doc.math_rendering_enabled());
+    assert!(doc.apply(&ClientSettingChange::MathRenderingEnabled(true)));
+    assert!(doc.math_rendering_enabled());
+    assert_eq!(doc.entries()["mathRenderingEnabled"], serde_json::Value::Bool(true));
+}

@@ -225,6 +225,7 @@ pub enum ClientSettingChange {
     ResetFont(FontRole),
     SeparateFonts(bool),
     WordWrap(bool),
+    MathRenderingEnabled(bool),
     ComposerRichText(bool),
     SendShortcut(crate::composer::SendShortcut),
     FollowUpBehavior(crate::composer::FollowUpBehavior),
@@ -255,6 +256,7 @@ impl ClientSettingChange {
             ClientSettingChange::ResetFont(role) => (role.family_key(), text("")),
             ClientSettingChange::SeparateFonts(on) => (ADVANCED_KEY, Value::Bool(*on)),
             ClientSettingChange::WordWrap(on) => ("wordWrap", Value::Bool(*on)),
+            ClientSettingChange::MathRenderingEnabled(on) => ("mathRenderingEnabled", Value::Bool(*on)),
             ClientSettingChange::DiffLayout(layout) => ("diffLayout", serde_json::json!(layout)),
             ClientSettingChange::DiffIgnoreWhitespace(on) => {
                 ("diffIgnoreWhitespace", Value::Bool(*on))
@@ -602,6 +604,11 @@ impl ClientSettingsDoc {
             ThemePreference::Default(mode) => mode,
             ThemePreference::Named(_) => AppearanceMode::Light,
         }
+    }
+
+    /// Opt-in TeX math rendering (`mathRenderingEnabled` in `contracts/settings.ts`, false by default).
+    pub fn math_rendering_enabled(&self) -> bool {
+        self.flag("mathRenderingEnabled", false)
     }
 }
 

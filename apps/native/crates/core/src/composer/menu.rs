@@ -939,6 +939,7 @@ pub fn title_text(text: &str) -> String {
         cursor = reference.end;
     }
     prose.push_str(&text[cursor..]);
+    let prose = crate::assistant_citations::to_plain_text(&prose);
     let normalized = prose.split_whitespace().collect::<Vec<_>>().join(" ");
     match (normalized.is_empty(), images.len()) {
         (false, _) | (true, 0) => normalized,
