@@ -276,18 +276,24 @@ fn comment_completion_and_dictation_hooks_work_end_to_end(cx: &mut gpui::TestApp
             assert!(panel.accept_completion(None, window, cx));
             assert_eq!(panel.read_comment_draft(cx).as_deref(), Some("Ask @alice "));
 
-            // Dictation inserts at caret and blocks submit while active.
+            // Dictation inserts at caret, suppresses completion, and blocks submit while active.
             panel.set_comment_dictation_state(CommentDictationState::Active, cx);
             assert!(panel.insert_comment_text("about #42", window, cx));
             assert_eq!(panel.read_comment_draft(cx).as_deref(), Some("Ask @alice about #42"));
-            let ref_items = panel.active_completion_items();
-            assert_eq!(ref_items.len(), 1);
-            assert_eq!(ref_items[0].insert_text(), "#42");
+            assert!(panel.active_completion_items().is_empty());
             panel.submit_comment(cx);
             assert!(submitted.lock().unwrap().is_empty());
 
-            // Clearing dictation lets the comment submit cleanly through the external hook.
+            // Clearing dictation restores completion on #42, and Escape + editing can reopen it.
             panel.set_comment_dictation_state(CommentDictationState::Idle, cx);
+            let ref_items = panel.active_completion_items();
+            assert_eq!(ref_items.len(), 1);
+            assert_eq!(ref_items[0].insert_text(), "#42");
+            assert!(panel.comments.completion.dismiss());
+            assert!(panel.active_completion_items().is_empty());
+            assert!(panel.commit_comment_draft("Ask @alice about #4".into(), Some(19), window, cx));
+            assert_eq!(panel.active_completion_items().len(), 1);
+            assert!(panel.commit_comment_draft("Ask @alice about #42".into(), Some(20), window, cx));
             panel.submit_comment(cx);
         });
     });

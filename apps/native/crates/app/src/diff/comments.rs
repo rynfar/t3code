@@ -12,7 +12,7 @@ use gpui::{
     div, prelude::*, px,
 };
 use gpui_component::{
-    h_flex,
+    ActiveTheme, h_flex,
     input::{Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
     v_flex,
 };
@@ -69,11 +69,12 @@ pub(super) struct Comments {
     utility_range: Option<Selection>,
     highlight: HashSet<(Side, u32)>,
     pub editor: Option<Editor>,
-    completion: PrCompletionState,
+    pub completion: PrCompletionState,
     completion_loading: bool,
     completion_error: Option<String>,
     completion_query_key: Option<String>,
     last_caret_snapshot: Option<(usize, usize)>,
+    focused: bool,
     _completion_task: Option<Task<()>>,
 }
 
@@ -268,22 +269,31 @@ impl DiffPanel {
         let Some(file_key) = self.view.as_ref().and_then(|view| view.key(file)).map(str::to_owned) else { return };
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Add a comment…"));
         let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Change | InputEvent::Focus => {
+            InputEvent::Change => {
+                this.comments.completion.clear_dismissed();
+                this.sync_comment_completion(cx);
+                cx.notify();
+            }
+            InputEvent::Focus => {
+                this.comments.focused = true;
+                this.comments.completion.clear_dismissed();
                 this.sync_comment_completion(cx);
                 cx.notify();
             }
             InputEvent::Blur => {
-                if this.comments.completion.dismiss() {
-                    this.comments.completion_loading = false;
-                    this.comments._completion_task = None;
-                    this.invalidate_comment_row();
-                    cx.notify();
-                }
+                this.comments.focused = false;
+                this.comments.completion.trigger = None;
+                this.comments.completion_loading = false;
+                this.comments.completion_query_key = None;
+                this.comments._completion_task = None;
+                this.invalidate_comment_row();
+                cx.notify();
             }
             InputEvent::PressEnter { .. } => {}
         });
         input.update(cx, |input, cx| input.focus(window, cx));
         self.comments.editor = Some(Editor { file_key, comment, input, _subscription: subscription });
+        self.comments.focused = true;
         self.comments.completion = PrCompletionState::default();
         self.comments.completion_loading = false;
         self.comments.completion_error = None;
@@ -407,6 +417,7 @@ impl DiffPanel {
             return;
         }
         self.comments_config.dictation_state = state;
+        self.sync_comment_completion(cx);
         cx.notify();
     }
 
@@ -472,6 +483,7 @@ impl DiffPanel {
             input.replace(next, window, cx);
             input.set_selected_range(end..end, cx);
         });
+        self.comments.completion.clear_dismissed();
         self.sync_comment_completion(cx);
         self.invalidate_comment_row();
         cx.notify();
@@ -498,6 +510,15 @@ impl DiffPanel {
         let Some(editor) = &self.comments.editor else {
             return;
         };
+        if !self.comments.focused || self.comments_config.dictation_state.is_frozen() {
+            self.comments.completion.trigger = None;
+            self.comments.completion_loading = false;
+            self.comments.completion_error = None;
+            self.comments.completion_query_key = None;
+            self.comments._completion_task = None;
+            self.invalidate_comment_row();
+            return;
+        }
         let (value, caret) = {
             let input = editor.input.read(cx);
             (input.value().to_string(), input.cursor())
@@ -642,6 +663,7 @@ impl DiffPanel {
             input.set_selected_range(caret..caret, cx);
         });
         self.reset_comment_completion();
+        self.comments.completion.clear_dismissed();
         self.sync_comment_completion(cx);
         self.invalidate_comment_row();
         cx.notify();
@@ -946,121 +968,132 @@ fn render_completion_popover(
     p: &crate::theme::Palette,
     cx: &mut Context<DiffPanel>,
 ) -> AnyElement {
-    let heading = match trigger.kind {
-        t3_core::diff::TriggerKind::Mention => "Mention user",
-        t3_core::diff::TriggerKind::Reference(_) => "Reference PR or issue",
+    let (heading, pending_copy, failed_copy, none_copy) = match trigger.kind {
+        t3_core::diff::TriggerKind::Mention => (
+            "Mention a user",
+            "Searching users...",
+            "Couldn't search users on the host",
+            "No matching users",
+        ),
+        t3_core::diff::TriggerKind::Reference(_) => (
+            "Reference an issue or change request",
+            "Searching...",
+            "Couldn't search the host",
+            "No matching issues or change requests",
+        ),
     };
 
     v_flex()
         .id("diff-comment-completion-popover")
+        .relative()
         .w_full()
         .max_w(px(420.))
         .p(px(4.))
-        .gap(px(2.))
         .rounded(px(8.))
-        .border_1()
-        .border_color(hsla(p.border))
-        .bg(hsla(p.popover))
         .text_color(hsla(p.popover_foreground))
-        .shadow_sm()
+        .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
+        .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
         .child(
-            div()
-                .px(px(8.))
-                .py(px(2.))
-                .text_xs()
-                .text_color(hsla(p.muted_foreground))
-                .child(heading),
-        )
-        .when(items.is_empty() && loading, |this| {
-            this.child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .text_sm()
-                    .text_color(hsla(p.muted_foreground))
-                    .child("Searching…"),
-            )
-        })
-        .when_some(error.filter(|_| items.is_empty()), |this, err| {
-            this.child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .text_sm()
-                    .text_color(hsla(p.error_foreground))
-                    .child(gpui::SharedString::from(err.to_owned())),
-            )
-        })
-        .when(items.is_empty() && !loading && error.is_none(), |this| {
-            this.child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .text_sm()
-                    .text_color(hsla(p.muted_foreground))
-                    .child(match trigger.kind {
-                        t3_core::diff::TriggerKind::Mention => "No matching people",
-                        t3_core::diff::TriggerKind::Reference(_) => "No matching PRs or issues",
-                    }),
-            )
-        })
-        .children(items.iter().enumerate().map(|(ix, item)| {
-            let active = ix == selected;
-            let (icon, icon_color) = completion_item_icon(item, p);
-            let (primary_label, secondary_label) = match item {
-                CompletionItem::Mention(author) => (
-                    author.login.clone(),
-                    author
-                        .name
-                        .clone()
-                        .filter(|name| name != &author.login)
-                        .unwrap_or_default(),
-                ),
-                CompletionItem::Reference { candidate, .. } => {
-                    (item.insert_text(), candidate.title.clone())
-                }
-            };
-            let secondary_color = if active {
-                hsla(p.accent_foreground).opacity(0.75)
-            } else {
-                hsla(p.muted_foreground)
-            };
-            h_flex()
-                .id(("diff-comment-completion-item", ix))
+            v_flex()
+                .relative()
                 .w_full()
-                .gap(px(8.))
-                .px(px(8.))
-                .py(px(5.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(active, |row| {
-                    row.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground))
-                })
-                .hover(|row| row.bg(hsla(p.accent).opacity(0.6)))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.accept_completion(Some(ix), window, cx);
-                    cx.stop_propagation();
-                }))
-                .child(icon.render(px(14.), icon_color))
+                .gap(px(2.))
                 .child(
                     div()
-                        .flex_none()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(gpui::SharedString::from(primary_label)),
+                        .px(px(8.))
+                        .py(px(2.))
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(heading),
                 )
-                .when(!secondary_label.is_empty(), |row| {
-                    row.child(
+                .when(items.is_empty() && loading, |this| {
+                    this.child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
+                            .px(px(8.))
+                            .py(px(6.))
                             .text_sm()
-                            .text_color(secondary_color)
-                            .child(gpui::SharedString::from(secondary_label)),
+                            .text_color(hsla(p.muted_foreground))
+                            .child(pending_copy),
                     )
                 })
-        }))
+                .when_some(error.filter(|_| items.is_empty()), |this, _| {
+                    this.child(
+                        div()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .text_sm()
+                            .text_color(hsla(p.error_foreground))
+                            .child(failed_copy),
+                    )
+                })
+                .when(items.is_empty() && !loading && error.is_none(), |this| {
+                    this.child(
+                        div()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .text_sm()
+                            .text_color(hsla(p.muted_foreground))
+                            .child(none_copy),
+                    )
+                })
+                .children(items.iter().enumerate().map(|(ix, item)| {
+                    let active = ix == selected;
+                    let (icon, icon_color) = completion_item_icon(item, p);
+                    let (primary_label, secondary_label) = match item {
+                        CompletionItem::Mention(author) => (
+                            author.login.clone(),
+                            author
+                                .name
+                                .clone()
+                                .filter(|name| name != &author.login)
+                                .unwrap_or_default(),
+                        ),
+                        CompletionItem::Reference { candidate, .. } => {
+                            (item.insert_text(), candidate.title.clone())
+                        }
+                    };
+                    let secondary_color = if active {
+                        hsla(p.accent_foreground).opacity(0.75)
+                    } else {
+                        hsla(p.muted_foreground)
+                    };
+                    h_flex()
+                        .id(("diff-comment-completion-item", ix))
+                        .w_full()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(5.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when(active, |row| {
+                            row.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground))
+                        })
+                        .hover(|row| row.bg(hsla(p.accent).opacity(0.6)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.accept_completion(Some(ix), window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(icon.render(px(14.), icon_color))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(gpui::SharedString::from(primary_label)),
+                        )
+                        .when(!secondary_label.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(secondary_color)
+                                    .child(gpui::SharedString::from(secondary_label)),
+                            )
+                        })
+                })),
+        )
         .into_any_element()
 }
