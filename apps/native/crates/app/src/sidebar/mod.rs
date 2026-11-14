@@ -3838,10 +3838,54 @@ mod sb_380_tests {
                 "Delete from header menu must open confirmation dialog via thread_shell fallback"
             );
         });
+        confirm.update_in(vcx, |dialog, window, cx| {
+            dialog.resolve_for_test(false, window, cx);
+        });
         assert!(
             !vcx.update(|window, cx| crate::settings::overlay(window, cx).is_some()),
             "settings overlay must be closed before ProjectSettings activation"
         );
+        vcx.update(|_, cx| {
+            let mut patch = serde_json::Map::new();
+            patch.insert("confirmThreadArchive".into(), json!(true));
+            crate::settings::store::install_committed_client(&state, patch, cx);
+        });
+        menu.update_in(vcx, |menu, window, cx| {
+            menu.open_for_header("menu-thread", gpui::point(px(20.), px(20.)), window, cx);
+            menu.activate(
+                crate::context_menu::MenuAction::Thread(ThreadAction::Archive),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        confirm.read_with(vcx, |dialog, _| {
+            assert!(
+                dialog.is_open(),
+                "Archive from header menu must open confirmation dialog instead of silently archiving"
+            );
+        });
+        assert!(
+            !fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND),
+            "Archive must wait for confirmation before dispatching"
+        );
+        confirm.update_in(vcx, |dialog, window, cx| {
+            dialog.resolve_for_test(false, window, cx);
+        });
+        vcx.update(|_, cx| {
+            let mut patch = serde_json::Map::new();
+            patch.insert("confirmThreadArchive".into(), json!(false));
+            crate::settings::store::install_committed_client(&state, patch, cx);
+        });
+        menu.update_in(vcx, |menu, window, cx| {
+            menu.open_snooze("menu-thread", gpui::point(px(20.), px(20.)), window, cx);
+        });
+        menu.read_with(vcx, |menu, _| {
+            assert!(
+                menu.is_open(),
+                "Snooze must remain enabled on project-filtered loaded threads"
+            );
+        });
+        menu.update(vcx, |menu, cx| menu.close(cx));
         menu.update_in(vcx, |menu, window, cx| {
             menu.open_for_header("menu-thread", gpui::point(px(20.), px(20.)), window, cx);
             menu.activate(
@@ -3854,7 +3898,10 @@ mod sb_380_tests {
             vcx.update(|window, cx| crate::settings::overlay(window, cx).is_some()),
             "ProjectSettings from header menu must open settings via thread_shell fallback"
         );
-        state.update(vcx, |s, _| s.stop_pump());
+        state.update(vcx, |s, cx| {
+            s.set_project_scope(t3_core::sidebar::grouping::ProjectScope::default(), cx);
+            s.stop_pump();
+        });
     }
 
     #[gpui::test]

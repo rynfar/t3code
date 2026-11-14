@@ -93,7 +93,7 @@ pub(crate) fn is_open(cx: &App) -> bool {
 
 impl AppState {
     fn thread_title(&self, thread_id: &str) -> String {
-        self.sidebar.model.thread(thread_id).map_or_else(|| "this thread".to_owned(), |thread| thread.title.clone())
+        self.snapshot_thread(thread_id).map_or_else(|| "this thread".to_owned(), |thread| thread.title)
     }
 
     /// Unpins, asking first while "Confirm thread unpin" is on.
@@ -129,7 +129,7 @@ impl AppState {
     /// Archives, asking first while "Confirm thread archive" is on. A thread that cannot be
     /// archived says why without asking.
     pub fn request_archive_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let archivable = self.sidebar.model.thread(thread_id).is_some_and(|thread| thread.can_archive());
+        let archivable = self.snapshot_thread(thread_id).is_some_and(|thread| thread.can_archive());
         if !archivable || !crate::settings::client_settings(cx).confirm_thread_archive() {
             return self.archive_thread(thread_id, cx);
         }
