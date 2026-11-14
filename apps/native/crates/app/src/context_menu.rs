@@ -568,7 +568,7 @@ impl ContextMenu {
         }
     }
 
-    fn activate(&mut self, action: MenuAction, cx: &mut Context<Self>) {
+    pub(crate) fn activate(&mut self, action: MenuAction, cx: &mut Context<Self>) {
         let Some(open) = self.open.take() else { return };
         self.restore_focus(open.previous_focus.clone(), open.window, cx);
         cx.emit(DismissEvent);
@@ -646,7 +646,7 @@ impl ContextMenu {
                 if let Some(owner) = open.owner { crate::guest_share::open(owner, open.window, cx); }
             }
             MenuAction::Thread(ThreadAction::ProjectSettings) => {
-                let project_id = self.state.read(cx).sidebar.model.thread(&open.target_id).map(|thread| thread.project_id.clone());
+                let project_id = self.state.read(cx).snapshot_thread(&open.target_id).map(|thread| thread.project_id);
                 if let Some(project_id) = project_id {
                     crate::settings::open_project(&project_id, cx);
                 }

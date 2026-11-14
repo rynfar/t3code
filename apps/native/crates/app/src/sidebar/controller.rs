@@ -1204,7 +1204,7 @@ impl AppState {
         }));
     }
 
-    fn snapshot_thread(&self, thread_id: &str) -> Option<t3_core::sidebar::thread::SidebarThread> {
+    pub(crate) fn snapshot_thread(&self, thread_id: &str) -> Option<t3_core::sidebar::thread::SidebarThread> {
         self.sidebar
             .model
             .thread(thread_id)

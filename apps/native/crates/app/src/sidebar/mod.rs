@@ -464,7 +464,7 @@ impl SidebarPane {
                     if !crate::settings::client_settings(cx).confirm_thread_delete() {
                         return this.state.update(cx, |state, cx| state.delete_thread(thread_id, cx));
                     }
-                    let Some(title) = this.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
+                    let Some(title) = this.state.read(cx).snapshot_thread(thread_id).map(|t| t.title) else { return };
                     let (heading, description) = t3_core::thread_actions::delete_confirmation(&title);
                     let owner = owner.clone();
                     let previous_focus = focus.clone();
@@ -3742,6 +3742,9 @@ mod sb_380_tests {
                     .unwrap(),
                 );
                 s.sync_server_config(cx);
+                s.sidebar.capabilities.config_loaded = true;
+                s.sidebar.capabilities.can_operate = true;
+                s.selected_thread = Some("menu-thread".into());
                 if let Some(thread) = s
                     .shell
                     .snapshot
@@ -3756,14 +3759,19 @@ mod sb_380_tests {
             });
             (state, fixture)
         });
+        let confirm_slot: std::rc::Rc<std::cell::RefCell<Option<Entity<ConfirmDialog>>>> =
+            Default::default();
+        let confirm_capture = confirm_slot.clone();
         let (root, vcx) = cx.add_window_view(|window, cx| {
             let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
             let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            *confirm_capture.borrow_mut() = Some(confirm.clone());
             let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
             super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
+        let confirm = confirm_slot.borrow().clone().unwrap();
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
         let menu = root.read_with(vcx, |host, _| host.menu.clone());
         vcx.run_until_parked();
@@ -3820,6 +3828,32 @@ mod sb_380_tests {
         menu.read_with(vcx, |menu, _| {
             assert!(menu.is_open(), "header menu must open for project-filtered loaded thread");
         });
+        menu.update(vcx, |menu, cx| {
+            menu.activate(crate::context_menu::MenuAction::Thread(ThreadAction::Delete), cx);
+        });
+        vcx.run_until_parked();
+        confirm.read_with(vcx, |dialog, _| {
+            assert!(
+                dialog.is_open(),
+                "Delete from header menu must open confirmation dialog via thread_shell fallback"
+            );
+        });
+        assert!(
+            !vcx.update(|window, cx| crate::settings::overlay(window, cx).is_some()),
+            "settings overlay must be closed before ProjectSettings activation"
+        );
+        menu.update_in(vcx, |menu, window, cx| {
+            menu.open_for_header("menu-thread", gpui::point(px(20.), px(20.)), window, cx);
+            menu.activate(
+                crate::context_menu::MenuAction::Thread(ThreadAction::ProjectSettings),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.update(|window, cx| crate::settings::overlay(window, cx).is_some()),
+            "ProjectSettings from header menu must open settings via thread_shell fallback"
+        );
         state.update(vcx, |s, _| s.stop_pump());
     }
 
