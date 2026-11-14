@@ -137,6 +137,8 @@ pub(super) struct NativeView {
     hover: Rc<HoverTarget>,
     zoom: Rc<Cell<f64>>,
     activation: Activation,
+    escape_dismiss: Rc<Cell<bool>>,
+    escape_senders: Rc<RefCell<Vec<UnboundedSender<()>>>>,
 }
 
 /// wry builds a child web view in the view a window handle names; this one names the container.
@@ -261,8 +263,22 @@ impl NativeView {
             senders: RefCell::new(Vec::new()),
         });
         HoverTarget::register(&hover);
-        let activation = Activation::new(&container);
-        Some(NativeView { host, container, page: page_view, webview, _policy: policy, scroll, hover, zoom, activation })
+        let escape_dismiss = Rc::new(Cell::new(false));
+        let escape_senders = Rc::new(RefCell::new(Vec::new()));
+        let activation = Activation::new(&container, escape_dismiss.clone(), escape_senders.clone());
+        Some(NativeView {
+            host,
+            container,
+            page: page_view,
+            webview,
+            _policy: policy,
+            scroll,
+            hover,
+            zoom,
+            activation,
+            escape_dismiss,
+            escape_senders,
+        })
     }
 
     pub(super) fn is_focused(&self) -> bool {
@@ -331,6 +347,16 @@ impl NativeView {
 
     pub(super) fn watch_hover(&self) -> UnboundedReceiver<bool> {
         self.hover.watch()
+    }
+
+    pub(super) fn set_dismiss_on_escape(&self, dismiss: bool) {
+        self.escape_dismiss.set(dismiss);
+    }
+
+    pub(super) fn watch_escape(&self) -> UnboundedReceiver<()> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        self.escape_senders.borrow_mut().push(tx);
+        rx
     }
 
     pub(super) fn evaluate(&self, script: &str) {
@@ -582,6 +608,10 @@ impl HoverTarget {
     }
 }
 
+fn should_intercept_escape(focused: bool, key_code: u16, has_modifiers: bool, dismiss_on_escape: bool) -> bool {
+    focused && dismiss_on_escape && !has_modifiers && key_code == 53
+}
+
 /// User activation comes from AppKit events in this view, never from the document's IPC data.
 struct Activation {
     at: Rc<Cell<Option<Instant>>>,
@@ -589,7 +619,11 @@ struct Activation {
 }
 
 impl Activation {
-    fn new(container: &NSView) -> Self {
+    fn new(
+        container: &NSView,
+        escape_dismiss: Rc<Cell<bool>>,
+        escape_senders: Rc<RefCell<Vec<UnboundedSender<()>>>>,
+    ) -> Self {
         let at = Rc::new(Cell::new(None));
         let noted = at.clone();
         let container = container.retain();
@@ -611,7 +645,10 @@ impl Activation {
                                 | NSEventModifierFlags::Control
                                 | NSEventModifierFlags::Option
                                 | NSEventModifierFlags::Shift);
-                        if mods == NSEventModifierFlags::Command
+                        if should_intercept_escape(focused, event_ref.keyCode(), !mods.is_empty(), escape_dismiss.get()) {
+                            escape_senders.borrow_mut().retain(|tx| tx.unbounded_send(()).is_ok());
+                            consume = true;
+                        } else if mods == NSEventModifierFlags::Command
                             && let Some(chars) = event_ref.charactersIgnoringModifiers()
                             && let Some(mtm) = MainThreadMarker::new()
                         {
@@ -671,5 +708,14 @@ mod tests {
                 assert_eq!(response.headers()["Content-Security-Policy"], format!("{expected}; {restrictions}"));
             }
         }
+    }
+
+    #[test]
+    fn escape_monitor_intercepts_only_unmodified_focused_fullscreen_dismiss() {
+        assert!(should_intercept_escape(true, 53, false, true));
+        assert!(!should_intercept_escape(false, 53, false, true));
+        assert!(!should_intercept_escape(true, 53, false, false));
+        assert!(!should_intercept_escape(true, 53, true, true));
+        assert!(!should_intercept_escape(true, 36, false, true));
     }
 }

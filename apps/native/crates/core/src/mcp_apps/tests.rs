@@ -31,7 +31,12 @@ fn initializes_then_delivers_input_and_normalized_result_once() {
     let init = receive(&mut h, json!(1), "ui/initialize", json!({"protocolVersion":"old"}));
     assert_eq!(message(&init[0])["result"]["protocolVersion"], PROTOCOL_VERSION);
     assert_eq!(message(&init[0])["result"]["hostCapabilities"]["sandbox"]["csp"], app().csp);
-    assert!(message(&init[0])["result"]["hostCapabilities"].get("message").is_none());
+    assert_eq!(message(&init[0])["result"]["hostCapabilities"]["message"], json!({"text":{}}));
+    assert_eq!(
+        message(&init[0])["result"]["hostCapabilities"]["updateModelContext"],
+        json!({"text":{},"structuredContent":{}})
+    );
+    assert_eq!(message(&init[0])["result"]["hostCapabilities"]["downloadFile"], json!({}));
     let sent = receive(&mut h, Value::Null, "ui/notifications/initialized", json!({}));
     assert_eq!(sent.len(), 2);
     assert_eq!(message(&sent[0])["params"], json!({"arguments":{"city":"Oslo"}}));
@@ -104,7 +109,13 @@ fn rejects_bad_requests_limits_inflight_and_ignores_after_dispose() {
         ("resources/read", json!({}), -32602),
         ("ui/open-link", json!({"url":"javascript:x"}), -32602),
         ("sampling/createMessage", json!({}), -32601),
-        ("ui/message", json!({}), -32601),
+        ("ui/message", json!({}), -32602),
+        ("ui/message", json!({"role":"assistant","content":{"type":"text","text":"hi"}}), -32602),
+        ("ui/message", json!({"role":"user","content":[{"type":"image","data":"x"}]}), -32602),
+        ("ui/message", json!({"role":"user","content":{"type":"text","text":"   "}}), -32602),
+        ("ui/update-model-context", json!({"content":"not-array"}), -32602),
+        ("ui/update-model-context", json!({"structuredContent":[]}), -32602),
+        ("ui/download-file", json!({"contents":[{}]}), -32602),
     ] {
         let sent = receive(&mut h, json!(1), method, params);
         assert_eq!(message(&sent[0])["error"]["code"], code);
@@ -251,4 +262,98 @@ fn references_match_source_and_keep_policy_narrow() {
     let mut app = value["t3McpApp"].clone();
     app["resourceUri"] = json!("https://example.com");
     assert!(read_reference(&app).is_none());
+}
+
+#[test]
+fn parses_permissions_and_forwards_message_context_download_and_display_modes() {
+    let reference = read_reference(&json!({
+        "attachmentId": "app",
+        "server": "weather",
+        "tool": "get_weather",
+        "resourceUri": "ui://weather/dashboard",
+        "permissions": { "camera": {}, "clipboardWrite": {}, "unknown": {}, "microphone": true }
+    }))
+    .unwrap();
+    assert_eq!(reference.permissions, json!({ "camera": {}, "clipboardWrite": {} }));
+
+    let mut ctx = context();
+    ctx["availableDisplayModes"] = json!(["inline", "fullscreen"]);
+    let mut h = Host::new(reference, ctx.clone(), "1.0.0");
+    let init = receive(
+        &mut h,
+        json!(1),
+        "ui/initialize",
+        json!({ "appCapabilities": { "availableDisplayModes": ["inline", "fullscreen"] } }),
+    );
+    assert_eq!(
+        message(&init[0])["result"]["hostCapabilities"]["sandbox"]["permissions"],
+        json!({ "camera": {}, "clipboardWrite": {} })
+    );
+    receive(&mut h, Value::Null, "ui/notifications/initialized", json!({}));
+
+    // ui/message accepts one block or an array of blocks
+    for (id, content, expected) in [
+        (json!(2), json!({"type":"text","text":"one"}), "one"),
+        (json!(3), json!([{"type":"text","text":"two"},{"type":"text","text":"three"}]), "two\nthree"),
+    ] {
+        let sent = receive(&mut h, id.clone(), "ui/message", json!({"role":"user","content":content}));
+        let Action::Request { token, operation } = &sent[0] else { panic!() };
+        assert_eq!(operation, &Operation::SendMessage { text: expected.into() });
+        let done = h.complete(*token, Ok(json!({})));
+        assert_eq!(message(&done[0])["id"], id);
+        assert_eq!(message(&done[0])["result"], json!({}));
+    }
+
+    // ui/update-model-context
+    let sent = receive(
+        &mut h,
+        json!(4),
+        "ui/update-model-context",
+        json!({"content":[{"type":"text","text":"2 overdue"}],"structuredContent":{"overdue":2}}),
+    );
+    let Action::Request { token, operation } = &sent[0] else { panic!() };
+    assert!(matches!(operation, Operation::UpdateModelContext { content: Some(_), structured_content: Some(_) }));
+    assert_eq!(message(&h.complete(*token, Ok(json!({})))[0])["result"], json!({}));
+
+    // ui/download-file (embedded + link + sanitized names + refusal via isError)
+    let sent = receive(
+        &mut h,
+        json!(5),
+        "ui/download-file",
+        json!({
+            "contents": [
+                {"type":"resource","resource":{"uri":"file:///re:po?rt.csv","mimeType":"text/csv","text":"a,b"}},
+                {"type":"resource_link","uri":"ui://todos/ex*port","name":"bad/name\n.txt"}
+            ]
+        }),
+    );
+    let Action::Request { token, operation } = &sent[0] else { panic!() };
+    assert_eq!(
+        operation,
+        &Operation::DownloadFile {
+            files: vec![
+                DownloadItem::Embedded { name: "rt.csv".into(), mime_type: "text/csv".into(), bytes: b"a,b".to_vec() },
+                DownloadItem::Link { name: "bad-name-.txt".into(), uri: "ui://todos/ex*port".into(), mime_type: None },
+            ]
+        }
+    );
+    assert_eq!(message(&h.complete(*token, Ok(json!({"isError":true})))[0])["result"], json!({"isError":true}));
+
+    // ui/request-display-mode: pip refused immediately; fullscreen proxied; in fullscreen, size-changed ignored and teardown exits fullscreen
+    assert_eq!(
+        message(&receive(&mut h, json!(6), "ui/request-display-mode", json!({"mode":"pip"}))[0])["result"],
+        json!({"mode":"inline"})
+    );
+    let sent = receive(&mut h, json!(7), "ui/request-display-mode", json!({"mode":"fullscreen"}));
+    let Action::Request { token, operation } = &sent[0] else { panic!() };
+    assert_eq!(operation, &Operation::RequestDisplayMode { mode: "fullscreen".into() });
+    ctx["displayMode"] = json!("fullscreen");
+    let changed = h.update_context(ctx);
+    assert_eq!(message(&changed[0])["params"], json!({"displayMode":"fullscreen"}));
+    assert_eq!(message(&h.complete(*token, Ok(json!({"mode":"fullscreen"})))[0])["result"], json!({"mode":"fullscreen"}));
+    assert!(receive(&mut h, Value::Null, "ui/notifications/size-changed", json!({"height":120})).is_empty());
+    assert_eq!(
+        receive(&mut h, Value::Null, "ui/notifications/request-teardown", json!({})),
+        vec![Action::ExitFullscreen]
+    );
 }
