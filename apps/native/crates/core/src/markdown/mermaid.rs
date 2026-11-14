@@ -1286,7 +1286,7 @@ fn escape_xml(input: &str) -> String {
 }
 
 fn strip_keyword_ci<'a>(line: &'a str, kw: &str) -> Option<&'a str> {
-    if line.len() < kw.len() || !line[..kw.len()].eq_ignore_ascii_case(kw) {
+    if line.len() < kw.len() || !line.is_char_boundary(kw.len()) || !line[..kw.len()].eq_ignore_ascii_case(kw) {
         return None;
     }
     let rest = &line[kw.len()..];
@@ -1327,6 +1327,10 @@ mod tests {
 
         let pie = render_mermaid_svg("pie title Coverage\n  \"Done\" : 80\n  \"Pending\" : 20", false).unwrap();
         assert!(pie.svg.contains("Coverage") && pie.svg.contains("80.0%"));
+
+        // Multi-byte UTF-8 landing across keyword byte lengths must not panic in `strip_keyword_ci`.
+        let utf8_flow = render_mermaid_svg("flowchart LR\n  \"🎉状態\" --> \"日本語テスト\"", true).unwrap();
+        assert!(utf8_flow.svg.contains("🎉状態") && utf8_flow.svg.contains("日本語テスト"));
 
         assert!(render_mermaid_svg("gantt\n  title Unsupported", true).is_err());
         assert!(render_mermaid_svg("", true).is_err());

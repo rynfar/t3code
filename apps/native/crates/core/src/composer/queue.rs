@@ -152,7 +152,7 @@ pub fn preview_text(run: &QueuedRun) -> String {
         cursor = reference.end;
     }
     out.push_str(&text[cursor..]);
-    out.trim().to_owned()
+    crate::assistant_citations::to_plain_text(&out).trim().to_owned()
 }
 
 /// `stripAttachmentOnlyBootstrapPrompt`: the text an edit starts from.

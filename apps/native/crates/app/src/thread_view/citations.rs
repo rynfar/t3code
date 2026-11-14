@@ -13,6 +13,15 @@ use std::sync::Arc;
 use t3_core::assistant_citations::{self as rules, Citation, CitedMessage, HistoryAction, SelectionHint};
 use t3_core::timeline::Role;
 
+fn current_selection_quote(window: &mut Window, cx: &mut gpui::App) -> String {
+    let tv = TextSelection::selected_text(window, cx);
+    if tv.trim().is_empty() {
+        crate::selectable_text::active_selected_text(cx).unwrap_or_default()
+    } else {
+        tv
+    }
+}
+
 pub(super) struct CitationUi {
     selection: Option<(Citation, Point<Pixels>)>,
     selection_connection: Option<u64>,
@@ -68,7 +77,7 @@ impl ThreadView {
                 let current = this.entries_cache.entries().iter().any(|entry| matches!(&entry.kind,
                     t3_core::timeline::EntryKind::Message(current) if current.id == message && (*current.text == *source || current.text.contains(&*source))));
                 if !current { return; }
-                let quote = TextSelection::selected_text(window, cx);
+                let quote = current_selection_quote(window, cx);
                 let (vertical_fraction, horizontal_fraction) = match hint_bounds {
                     Some(bounds) if f32::from(bounds.size.height) > 1.0 => (
                         Some(((f32::from(pointer.y) - f32::from(bounds.origin.y)) / f32::from(bounds.size.height)).clamp(0.0, 1.0)),
@@ -374,6 +383,7 @@ impl ThreadView {
             || self.citation_ui.selection_connection.is_none() || self.citation_ui.selection_connection != self.state.read(cx).connection_id() { return; }
         self.state.update(cx, |state, cx| { state.composer_citation = Some(citation.clone()); cx.emit(AppEvent::ComposerCitation); });
         TextSelection::clear(window, cx);
+        crate::selectable_text::clear_active_selection(cx);
         self.dismiss_citation_selection(cx);
     }
 
@@ -400,6 +410,7 @@ impl ThreadView {
         if event.key == "escape" {
             self.dismiss_citation_selection(cx);
             TextSelection::clear(window, cx);
+            crate::selectable_text::clear_active_selection(cx);
             cx.stop_propagation();
         }
     }
@@ -408,6 +419,7 @@ impl ThreadView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::markdown::blocks::NestedSelection;
     use gpui::AppContext;
     use gpui_component::text::TextViewState;
 
@@ -419,7 +431,7 @@ mod tests {
         let nested = cx.update(|cx| cx.new(|cx| TextViewState::markdown("token", cx)));
         cx.run_until_parked();
         let nested_views = crate::transcript::markdown::blocks::NestedViews::default();
-        nested_views.lock().unwrap().insert("repeat:0".into(), nested.clone());
+        nested_views.lock().unwrap().insert("repeat:0".into(), NestedSelection::Markdown(nested.clone()));
         let state = MarkdownState::from(&tv).with_nested_views_for_test(nested_views);
         nested.update(cx, |s, cx| s.select_all(cx));
         cx.update(|cx| {
@@ -441,5 +453,18 @@ mod tests {
             .expect("hint must disambiguate repeated quote");
             assert!(cited.start > 30);
         });
+    }
+
+    #[gpui::test]
+    fn active_selectable_text_fallback_reaches_citation_when_text_selection_empty(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let cx = cx.add_empty_window();
+        let handle = cx.update(|_, cx| crate::selectable_text::SelectableTextHandle::new_for_test("graph LR\n  A --> B", cx));
+        cx.update(|_, cx| handle.select_all(cx));
+        let quote = cx.update(current_selection_quote);
+        assert_eq!(quote, "graph LR\n  A --> B");
+        cx.update(|_, cx| crate::selectable_text::clear_active_selection(cx));
+        let cleared = cx.update(current_selection_quote);
+        assert!(cleared.is_empty());
     }
 }

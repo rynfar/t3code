@@ -89,6 +89,8 @@ fn rows_read_like_sent_messages() {
     let image = json!({ "type": "image", "id": "a" });
     assert_eq!(preview_text(&queued("see ![x.png](t3-context://v1/image/image_1) and [T](t3-context://v1/thread/t2)", vec![image])), "see  and T");
     assert_eq!(preview_text(&queued("see ![x.png](t3-context://v1/image/image_1)", vec![])), "see x.png");
+    let cite = crate::assistant_citations::Citation::from_selection("e".into(), "t".into(), "m".into(), "hello world", 0..11).unwrap().with_comment("why?");
+    assert_eq!(preview_text(&queued(&format!("Please {}", cite.serialize()), vec![])), "Please hello world\nComment: why?");
     assert_eq!(editable_text(&format!("Ultrathink:\n{ATTACHMENT_ONLY_PROMPT}")), "Ultrathink:");
     assert_eq!(editable_text("keep me"), "keep me");
     assert_eq!(edit_blocked_reason(1), Some("Answer the question to edit queued messages"));

@@ -303,6 +303,27 @@ pub fn collect(prompt: &str) -> Vec<(Range<usize>, Citation)> {
     out
 }
 
+/// Mirrors `assistantCitationsToPlainText` for queued previews and thread title seeds.
+pub fn to_plain_text(prompt: &str) -> String {
+    let matches = collect(prompt);
+    if matches.is_empty() {
+        return prompt.to_owned();
+    }
+    let mut out = String::with_capacity(prompt.len());
+    let mut cursor = 0;
+    for (range, citation) in matches {
+        out.push_str(&prompt[cursor..range.start]);
+        out.push_str(&citation.text);
+        if let Some(comment) = &citation.comment {
+            out.push_str("\nComment: ");
+            out.push_str(comment);
+        }
+        cursor = range.end;
+    }
+    out.push_str(&prompt[cursor..]);
+    out
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommentDismissal {
     Commit(String),
@@ -419,7 +440,18 @@ fn markdown_projection(source: &str, media: Option<&crate::media::MarkdownMediaD
             Node::Code(code) => out.push_str(&code.value),
             Node::InlineMath(math) => out.push_str(&math.value),
             Node::Math(math) => out.push_str(&math.value),
-            Node::Image(_) | Node::Html(_) => {}
+            Node::Image(_) => {}
+            Node::Html(html) => {
+                if let Some(inner) = extract_details_inner_markdown(&html.value) {
+                    let text = markdown_projection(&inner, None).0;
+                    if !text.is_empty() {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(&text);
+                    }
+                }
+            }
             _ => {
                 if let Some(children) = node.children() {
                     for child in children {
@@ -445,6 +477,35 @@ fn markdown_projection(source: &str, media: Option<&crate::media::MarkdownMediaD
     let mut blocks = Vec::new();
     visit(&root, source, &mut out, media, &mut blocks);
     (out.trim_end().to_owned(), blocks)
+}
+
+fn extract_details_inner_markdown(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("<details") && !lower.contains("<summary") {
+        return None;
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after_lt = &rest[lt + 1..];
+        let Some(gt) = after_lt.find('>') else {
+            out.push_str(&rest[lt..]);
+            rest = "";
+            break;
+        };
+        let tag = after_lt[..gt].trim().to_ascii_lowercase();
+        if (tag.starts_with("/summary") || tag.starts_with("/details") || tag.starts_with("details"))
+            && !out.ends_with('\n')
+            && !out.is_empty()
+        {
+            out.push('\n');
+        }
+        rest = &after_lt[gt + 1..];
+    }
+    out.push_str(rest);
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn raw_ranges(source: &str, ranges: &[Range<usize>]) -> Option<Vec<Range<usize>>> {
@@ -989,6 +1050,15 @@ mod tests {
         let inline_presented = present_user_citations(&inline_raw, &inline_raw);
         assert_eq!(inline_presented.citations.len(), 1);
         assert!(inline_presented.display_text.contains(&format!("[{}]({})", c1.label(), c1.href())));
+
+        let commented = citation().with_comment("Check edge case");
+        let plain = to_plain_text(&format!("Inspect {} and {}", c1.serialize(), commented.serialize()));
+        assert_eq!(plain, "Inspect hello 🦀 and hello 🦀\nComment: Check edge case");
+
+        let compact_details = "<details><summary>Inspect details</summary>\nInside **compact** details\n</details>";
+        let details_text = markdown_text(compact_details);
+        assert!(details_text.contains("Inspect details") && details_text.contains("Inside compact details"));
+        assert!(Citation::from_rendered_selection("e".into(), "t".into(), "m".into(), &details_text, "Inside compact details").is_some());
     }
 
 }

@@ -7,6 +7,7 @@ pub mod blocks;
 pub mod links;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
@@ -15,7 +16,9 @@ use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
 use t3_core::markdown::{DisplayMarkdownOptions, prepare_display_markdown};
 
-use self::blocks::{CodeFenceMetaMap, NestedViews, SharedActionContext, SharedCodeMeta, attach_rich_extensions};
+use self::blocks::{
+    CodeFenceMetaMap, NestedSelection, NestedViews, SharedActionContext, SharedCodeMeta, SharedMathEnabled, attach_rich_extensions,
+};
 use self::links::MarkdownActionContext;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -30,6 +33,8 @@ struct Cached {
     prepared: Arc<str>,
     is_dark: bool,
     cwd: Option<String>,
+    math_enabled: bool,
+    math_enabled_flag: SharedMathEnabled,
     state: Entity<TextViewState>,
     drawn: u64,
     /// Set once the text holds image syntax; it stays on so the parse is not redone.
@@ -112,9 +117,26 @@ impl MarkdownState {
         }
         let nested = self.nested_views.lock().unwrap();
         for child in nested.values() {
-            let selected = child.read(cx).selected_text();
-            if !selected.trim().is_empty() && selected == quote {
-                return Some(selected);
+            match child {
+                NestedSelection::Markdown(child) => {
+                    let selected = child.read(cx).selected_text();
+                    if !selected.trim().is_empty() && selected == quote {
+                        return Some(selected);
+                    }
+                }
+                NestedSelection::Selectable { handle, rendered, raw_fallback } => {
+                    let Some(selected) = handle.selected_text(cx) else {
+                        continue;
+                    };
+                    if !selected.trim().is_empty() && selected == quote {
+                        if *selected == *rendered
+                            && let Some(raw) = raw_fallback.as_ref().filter(|raw| !raw.trim().is_empty())
+                        {
+                            return Some(raw.clone());
+                        }
+                        return Some(selected);
+                    }
+                }
             }
         }
         None
@@ -124,7 +146,10 @@ impl MarkdownState {
     pub(crate) fn clear_nested_selections(&self, cx: &mut App) {
         let children: Vec<_> = self.nested_views.lock().unwrap().values().cloned().collect();
         for child in children {
-            child.update(cx, |state, cx| state.clear_selection(cx));
+            match child {
+                NestedSelection::Markdown(child) => child.update(cx, |state, cx| state.clear_selection(cx)),
+                NestedSelection::Selectable { handle, .. } => handle.clear_selection(cx),
+            }
         }
     }
 
@@ -210,21 +235,24 @@ impl MarkdownStore {
     ) -> MarkdownState {
         let is_dark = cx.theme().mode.is_dark();
         let cwd = action_ctx.as_ref().and_then(|c| c.cwd.clone());
+        let math_enabled = crate::settings::client_settings(cx).math_rendering_enabled();
 
         if let Some(cached) = self.states.get_mut(key) {
             cached.drawn = self.frame;
             *cached.action_ctx.lock().unwrap() = action_ctx;
             let text_changed = !Arc::ptr_eq(&cached.text, text) && *cached.text != **text;
-            let env_changed = cached.is_dark != is_dark || cached.cwd != cwd;
+            let env_changed = cached.is_dark != is_dark || cached.cwd != cwd || cached.math_enabled != math_enabled;
             if text_changed || env_changed {
                 let previous_prepared = cached.prepared.clone();
                 let prepared: Arc<str> = Arc::from(prepare_display_markdown(
                     text,
-                    DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled: true },
+                    DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
                 ));
                 cached.text = text.clone();
                 cached.is_dark = is_dark;
                 cached.cwd = cwd;
+                cached.math_enabled = math_enabled;
+                cached.math_enabled_flag.store(math_enabled, Ordering::Relaxed);
                 cached.media |= has_image_syntax(&prepared);
                 if *cached.prepared != *prepared {
                     cached.prepared = prepared.clone();
@@ -268,7 +296,7 @@ impl MarkdownStore {
 
         let prepared: Arc<str> = Arc::from(prepare_display_markdown(
             text,
-            DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled: true },
+            DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
         ));
         let media = has_image_syntax(&prepared);
         let state = cx.new(|cx| TextViewState::markdown(if media { "" } else { &prepared }, cx).selectable(true));
@@ -285,8 +313,15 @@ impl MarkdownStore {
                 CodeFenceMetaMap::default()
             },
         ));
+        let math_enabled_flag: SharedMathEnabled = Arc::new(AtomicBool::new(math_enabled));
         let media_ext = super::media::markdown_extensions_with_selections(document.clone(), None, selections.clone());
-        let extensions = attach_rich_extensions(media_ext, shared_ctx.clone(), nested_views.clone(), code_meta.clone());
+        let extensions = attach_rich_extensions(
+            media_ext,
+            shared_ctx.clone(),
+            nested_views.clone(),
+            code_meta.clone(),
+            math_enabled_flag.clone(),
+        );
         let updates = media.then(|| MediaUpdates::new(&state, document.clone(), Arc::from(""), prepared.clone(), cx));
         self.states.insert(
             key.to_owned(),
@@ -295,6 +330,8 @@ impl MarkdownStore {
                 prepared,
                 is_dark,
                 cwd,
+                math_enabled,
+                math_enabled_flag,
                 state: state.clone(),
                 drawn: self.frame,
                 media,
@@ -623,7 +660,7 @@ mod context_tests {
         let nested = cx.update(|cx| cx.new(|cx| TextViewState::markdown("Quoted inside alert", cx)));
         cx.run_until_parked();
         let nested_views = NestedViews::default();
-        nested_views.lock().unwrap().insert("alert:0".into(), nested.clone());
+        nested_views.lock().unwrap().insert("alert:0".into(), NestedSelection::Markdown(nested.clone()));
         let state = MarkdownState {
             entity: parent,
             media: false,
@@ -650,5 +687,194 @@ mod context_tests {
         });
         cx.update(|cx| state.clear_nested_selections(cx));
         cx.update(|cx| assert!(nested.read(cx).selected_text().is_empty()));
+    }
+
+    #[gpui::test]
+    fn selectable_text_nested_selection_reaches_citation_and_clears(cx: &mut gpui::TestAppContext) {
+        use crate::selectable_text::{SelectableTextHandle, active_selected_text};
+
+        cx.update(gpui_component::init);
+        let parent = cx.update(|cx| cx.new(|cx| TextViewState::markdown("", cx)));
+        cx.run_until_parked();
+
+        // Math block: rendered unicode maps back to raw TeX source when selected in full.
+        let math_source: Arc<str> = "Before\n\n$$\nx^2 + y^2 = z^2\n$$\n\nAfter".into();
+        let rendered_math = t3_core::markdown::math::render_tex_unicode("x^2 + y^2 = z^2");
+        let math_handle = cx.update(|cx| SelectableTextHandle::new_for_test(rendered_math.clone(), cx));
+        let math_views = NestedViews::default();
+        math_views.lock().unwrap().insert(
+            "math:0".into(),
+            NestedSelection::Selectable {
+                handle: math_handle.clone(),
+                rendered: rendered_math.clone(),
+                raw_fallback: Some("x^2 + y^2 = z^2".into()),
+            },
+        );
+        let math_state = MarkdownState {
+            entity: parent.clone(),
+            media: false,
+            rich: true,
+            extensions: None,
+            selections: Default::default(),
+            document: None,
+            nested_views: math_views,
+            action_ctx: Default::default(),
+            code_meta: Default::default(),
+        };
+        cx.update(|cx| math_handle.select_all(cx));
+        cx.update(|cx| {
+            let quote = active_selected_text(cx).expect("active selectable text must be exposed");
+            assert_eq!(quote, rendered_math);
+            let citation = crate::thread_view::ThreadView::citation_from_markdown_selection(
+                &math_state,
+                &math_source,
+                &quote,
+                ("env".into(), "t1".into(), "m1".into()),
+                cx,
+            )
+            .expect("math SelectableText selection must resolve to raw TeX citation");
+            assert_eq!(citation.text.trim(), "x^2 + y^2 = z^2");
+        });
+        cx.update(|cx| math_state.clear_nested_selections(cx));
+        cx.update(|cx| {
+            assert!(math_handle.selected_text(cx).is_none());
+            assert!(active_selected_text(cx).is_none());
+        });
+
+        // Mermaid code fallback: selected source code resolves to citation cleanly.
+        let mermaid_code = "graph TD\n  A --> B";
+        let mermaid_source: Arc<str> = format!("```mermaid\n{mermaid_code}\n```").into();
+        let mermaid_handle = cx.update(|cx| SelectableTextHandle::new_for_test(mermaid_code, cx));
+        let mermaid_views = NestedViews::default();
+        mermaid_views.lock().unwrap().insert(
+            "mermaid:0".into(),
+            NestedSelection::Selectable {
+                handle: mermaid_handle.clone(),
+                rendered: mermaid_code.into(),
+                raw_fallback: None,
+            },
+        );
+        let mermaid_state = MarkdownState {
+            entity: parent,
+            media: false,
+            rich: true,
+            extensions: None,
+            selections: Default::default(),
+            document: None,
+            nested_views: mermaid_views,
+            action_ctx: Default::default(),
+            code_meta: Default::default(),
+        };
+        cx.update(|cx| mermaid_handle.select_all(cx));
+        cx.update(|cx| {
+            let quote = active_selected_text(cx).expect("mermaid selectable text must be active");
+            let citation = crate::thread_view::ThreadView::citation_from_markdown_selection(
+                &mermaid_state,
+                &mermaid_source,
+                &quote,
+                ("env".into(), "t1".into(), "m2".into()),
+                cx,
+            )
+            .expect("mermaid SelectableText selection must resolve to citation");
+            assert_eq!(citation.text.trim(), mermaid_code);
+        });
+        cx.update(|cx| mermaid_state.clear_nested_selections(cx));
+        cx.update(|cx| assert!(active_selected_text(cx).is_none()));
+    }
+
+    #[gpui::test]
+    fn math_rendering_setting_defaults_false_and_respects_toggle(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let app_state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx))
+        });
+        let mut store = MarkdownStore::new(EntityId::from(1u64));
+        let source: Arc<str> = "Before\n\n$$\nx^2 + y^2\n$$\n\nAfter".into();
+
+        // Commit explicit false first so ambient settings cannot affect default behavior, then toggle true.
+        cx.update(|cx| {
+            assert!(!t3_core::client_settings::ClientSettingsDoc::default().math_rendering_enabled());
+            crate::settings::store::install_client_commit(
+                &app_state,
+                t3_client::store::ClientCommit {
+                    sequence: 1,
+                    patch: serde_json::Map::from_iter([("mathRenderingEnabled".into(), serde_json::Value::Bool(false))]),
+                },
+                cx,
+            );
+            let _state = store.state_in_context("math-row", &source, None, cx);
+            let cached = store.states.get("math-row").unwrap();
+            assert!(!cached.prepared.contains("```t3-math"));
+            assert!(!cached.math_enabled);
+            assert!(!cached.math_enabled_flag.load(Ordering::Relaxed));
+
+            crate::settings::store::install_client_commit(
+                &app_state,
+                t3_client::store::ClientCommit {
+                    sequence: 2,
+                    patch: serde_json::Map::from_iter([("mathRenderingEnabled".into(), serde_json::Value::Bool(true))]),
+                },
+                cx,
+            );
+            store.begin_frame();
+            let _state = store.state_in_context("math-row", &source, None, cx);
+            let cached = store.states.get("math-row").unwrap();
+            assert!(cached.prepared.contains("```t3-math"));
+            assert!(cached.math_enabled);
+            assert!(cached.math_enabled_flag.load(Ordering::Relaxed));
+
+            crate::settings::store::install_client_commit(
+                &app_state,
+                t3_client::store::ClientCommit {
+                    sequence: 3,
+                    patch: serde_json::Map::from_iter([("mathRenderingEnabled".into(), serde_json::Value::Bool(false))]),
+                },
+                cx,
+            );
+            store.begin_frame();
+            let _state = store.state_in_context("math-row", &source, None, cx);
+            let cached = store.states.get("math-row").unwrap();
+            assert!(!cached.prepared.contains("```t3-math"));
+            assert!(!cached.math_enabled);
+            assert!(!cached.math_enabled_flag.load(Ordering::Relaxed));
+        });
+    }
+
+    #[gpui::test]
+    fn compact_details_citation_matches_rendered_markdown(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let source: Arc<str> = "<details><summary>Reasoning</summary>\nQuoted inside compact details\n</details>".into();
+        let parent = cx.update(|cx| cx.new(|cx| TextViewState::markdown("", cx)));
+        let nested = cx.update(|cx| cx.new(|cx| TextViewState::markdown("Quoted inside compact details", cx)));
+        cx.run_until_parked();
+        let nested_views = NestedViews::default();
+        nested_views.lock().unwrap().insert("details:0".into(), NestedSelection::Markdown(nested.clone()));
+        let state = MarkdownState {
+            entity: parent,
+            media: false,
+            rich: true,
+            extensions: None,
+            selections: Default::default(),
+            document: None,
+            nested_views,
+            action_ctx: Default::default(),
+            code_meta: Default::default(),
+        };
+        nested.update(cx, |view, cx| view.select_all(cx));
+        cx.update(|cx| {
+            let quote = nested.read(cx).selected_text();
+            let citation = crate::thread_view::ThreadView::citation_from_markdown_selection(
+                &state,
+                &source,
+                &quote,
+                ("env".into(), "t1".into(), "m3".into()),
+                cx,
+            )
+            .expect("compact <details> block selection must resolve to citation");
+            assert_eq!(citation.text.trim(), "Quoted inside compact details");
+        });
     }
 }

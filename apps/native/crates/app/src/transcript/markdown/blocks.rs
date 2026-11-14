@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
@@ -21,7 +22,7 @@ use t3_core::markdown::table::TableData;
 
 use super::links::MarkdownActionContext;
 use crate::icons::Icon;
-use crate::selectable_text::SelectableText;
+use crate::selectable_text::{SelectableText, SelectableTextHandle};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 use crate::transcript::parts;
@@ -32,9 +33,20 @@ pub const MATH_NODE: &str = "t3-math-block";
 pub const MERMAID_NODE: &str = "t3-mermaid-block";
 pub const TABLE_NODE: &str = "t3-table-block";
 
-pub type NestedViews = Arc<Mutex<HashMap<String, Entity<TextViewState>>>>;
+#[derive(Clone)]
+pub enum NestedSelection {
+    Markdown(Entity<TextViewState>),
+    Selectable {
+        handle: SelectableTextHandle,
+        rendered: String,
+        raw_fallback: Option<String>,
+    },
+}
+
+pub type NestedViews = Arc<Mutex<HashMap<String, NestedSelection>>>;
 pub type SharedActionContext = Arc<Mutex<Option<MarkdownActionContext>>>;
 pub type SharedCodeMeta = Arc<Mutex<CodeFenceMetaMap>>;
+pub type SharedMathEnabled = Arc<AtomicBool>;
 
 #[derive(Clone)]
 struct AlertNodeData {
@@ -99,8 +111,9 @@ pub fn attach_rich_extensions(
     action_ctx: SharedActionContext,
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
+    math_enabled: SharedMathEnabled,
 ) -> MarkdownExtensions {
-    attach_extensions_inner(base, action_ctx, nested_views, code_meta, true)
+    attach_extensions_inner(base, action_ctx, nested_views, code_meta, math_enabled, true)
 }
 
 fn attach_extensions_inner(
@@ -108,52 +121,63 @@ fn attach_extensions_inner(
     action_ctx: SharedActionContext,
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
+    math_enabled: SharedMathEnabled,
     intercept_tables: bool,
 ) -> MarkdownExtensions {
     let ctx_for_child = action_ctx.clone();
     let nested_for_child = nested_views.clone();
     let meta_for_child = code_meta.clone();
+    let math_for_parser = math_enabled.clone();
+    let math_for_child = math_enabled;
 
-    let with_parsers = base.block_parser(move |node, context| parse_rich_block(node, context, intercept_tables));
+    let with_parsers = base.block_parser(move |node, context| {
+        parse_rich_block(node, context, intercept_tables, math_for_parser.load(Ordering::Relaxed))
+    });
 
     let ctx_alert = ctx_for_child.clone();
     let nested_alert = nested_for_child.clone();
     let meta_alert = meta_for_child.clone();
+    let math_alert = math_for_child.clone();
 
     let ctx_details = ctx_for_child.clone();
     let nested_details = nested_for_child.clone();
     let meta_details = meta_for_child.clone();
+    let math_details = math_for_child.clone();
+
+    let nested_math = nested_for_child.clone();
 
     let ctx_mermaid = ctx_for_child.clone();
+    let nested_mermaid = nested_for_child.clone();
 
     let ctx_table = ctx_for_child;
     let nested_table = nested_for_child;
     let meta_table = meta_for_child;
+    let math_table = math_for_child;
 
     with_parsers
         .block_renderer(ALERT_NODE, move |node, window, cx| {
             let Some(data) = node.data::<AlertNodeData>() else { return div().into_any_element() };
-            render_alert_block(data, &ctx_alert, &nested_alert, &meta_alert, window, cx)
+            render_alert_block(data, &ctx_alert, &nested_alert, &meta_alert, &math_alert, window, cx)
         })
         .block_renderer(DETAILS_NODE, move |node, window, cx| {
             let Some(data) = node.data::<DetailsNodeData>() else { return div().into_any_element() };
-            render_details_block(data, &ctx_details, &nested_details, &meta_details, window, cx)
+            render_details_block(data, &ctx_details, &nested_details, &meta_details, &math_details, window, cx)
         })
-        .block_renderer(MATH_NODE, |node, window, cx| {
+        .block_renderer(MATH_NODE, move |node, window, cx| {
             let Some(data) = node.data::<MathNodeData>() else { return div().into_any_element() };
-            render_math_block(data, window, cx)
+            render_math_block(data, &nested_math, window, cx)
         })
         .block_renderer(MERMAID_NODE, move |node, window, cx| {
             let Some(data) = node.data::<MermaidNodeData>() else { return div().into_any_element() };
-            render_mermaid_block(data, &ctx_mermaid, window, cx)
+            render_mermaid_block(data, &ctx_mermaid, &nested_mermaid, window, cx)
         })
         .block_renderer(TABLE_NODE, move |node, window, cx| {
             let Some(data) = node.data::<TableNodeData>() else { return div().into_any_element() };
-            render_table_block(data, &ctx_table, &nested_table, &meta_table, window, cx)
+            render_table_block(data, &ctx_table, &nested_table, &meta_table, &math_table, window, cx)
         })
 }
 
-fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, intercept_tables: bool) -> Option<MarkdownNode> {
+fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, intercept_tables: bool, math_enabled: bool) -> Option<MarkdownNode> {
     let key = node_key(node);
     match node {
         mdast::Node::Blockquote(bq) => {
@@ -204,7 +228,7 @@ fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, inte
             let closed = node
                 .position()
                 .is_some_and(|p| is_code_fence_closed(context.source(), p.start.offset));
-            if lang == Some("t3-math") || (closed && is_math_language(lang)) {
+            if math_enabled && (lang == Some("t3-math") || (closed && is_math_language(lang))) {
                 let display = render_tex_unicode(&code.value);
                 let raw = context.node_source(node).unwrap_or(&code.value).to_owned();
                 return Some(
@@ -255,6 +279,7 @@ fn render_alert_block(
     action_ctx: &SharedActionContext,
     nested_views: &NestedViews,
     code_meta: &SharedCodeMeta,
+    math_enabled: &SharedMathEnabled,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -280,9 +305,9 @@ fn render_alert_block(
         }
         s.entity.clone()
     });
-    nested_views.lock().unwrap().insert(data.key.clone(), entity.clone());
+    nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
 
-    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), true);
+    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), math_enabled.clone(), true);
     let view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -323,6 +348,7 @@ fn render_details_block(
     action_ctx: &SharedActionContext,
     nested_views: &NestedViews,
     code_meta: &SharedCodeMeta,
+    math_enabled: &SharedMathEnabled,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -343,10 +369,12 @@ fn render_details_block(
         (s.open, s.entity.clone())
     });
     if open {
-        nested_views.lock().unwrap().insert(data.key.clone(), entity.clone());
+        nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
+    } else {
+        nested_views.lock().unwrap().remove(&data.key);
     }
 
-    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), true);
+    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), math_enabled.clone(), true);
     let body_view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -407,7 +435,7 @@ fn render_details_block(
         .into_any_element()
 }
 
-fn render_math_block(data: &MathNodeData, window: &mut Window, cx: &mut App) -> AnyElement {
+fn render_math_block(data: &MathNodeData, nested_views: &NestedViews, window: &mut Window, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     let key = SharedString::from(format!("math:{}", data.key));
     let ui = window.use_keyed_state(key, cx, |_, _| MathUiState { show_tex: false });
@@ -478,7 +506,23 @@ fn render_math_block(data: &MathNodeData, window: &mut Window, cx: &mut App) -> 
                                 .text_size(cx.theme().mono_font_size)
                         })
                         .text_color(hsla(p.foreground))
-                        .child(SelectableText::new(SharedString::from(format!("math-sel:{}", data.key)), shown_text)),
+                        .child({
+                            let nested = nested_views.clone();
+                            let key = format!("math:{}", data.key);
+                            let rendered = shown_text.clone();
+                            let raw_fallback = (shown_text != data.tex).then(|| data.tex.clone());
+                            SelectableText::new(SharedString::from(format!("math-sel:{}", data.key)), shown_text)
+                                .on_state(move |handle, _| {
+                                    nested.lock().unwrap().insert(
+                                        key.clone(),
+                                        NestedSelection::Selectable {
+                                            handle: handle.clone(),
+                                            rendered: rendered.clone(),
+                                            raw_fallback: raw_fallback.clone(),
+                                        },
+                                    );
+                                })
+                        }),
                 ),
         )
         .into_any_element()
@@ -487,6 +531,7 @@ fn render_math_block(data: &MathNodeData, window: &mut Window, cx: &mut App) -> 
 fn render_mermaid_block(
     data: &MermaidNodeData,
     action_ctx: &SharedActionContext,
+    nested_views: &NestedViews,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -629,6 +674,7 @@ fn render_mermaid_block(
                 ),
         )
         .child(if show_diagram {
+            nested_views.lock().unwrap().remove(&format!("mermaid-code:{}", data.key));
             let rendered_img = image.unwrap();
             let display_w = intrinsic_width.max(240.0);
             div()
@@ -644,6 +690,9 @@ fn render_mermaid_block(
                 )
                 .into_any_element()
         } else {
+            let nested = nested_views.clone();
+            let key = format!("mermaid-code:{}", data.key);
+            let code_text = data.code.clone();
             div()
                 .id(SharedString::from(format!("mermaid-code:{}", data.key)))
                 .w_full()
@@ -654,7 +703,19 @@ fn render_mermaid_block(
                 .text_size(cx.theme().mono_font_size)
                 .line_height(cx.theme().mono_font_size * 1.375)
                 .text_color(hsla(p.foreground))
-                .child(SelectableText::new(SharedString::from(format!("mermaid-sel:{}", data.key)), data.code.clone()))
+                .child(
+                    SelectableText::new(SharedString::from(format!("mermaid-sel:{}", data.key)), data.code.clone())
+                        .on_state(move |handle, _| {
+                            nested.lock().unwrap().insert(
+                                key.clone(),
+                                NestedSelection::Selectable {
+                                    handle: handle.clone(),
+                                    rendered: code_text.clone(),
+                                    raw_fallback: None,
+                                },
+                            );
+                        }),
+                )
                 .into_any_element()
         })
         .into_any_element()
@@ -665,6 +726,7 @@ fn render_table_block(
     action_ctx: &SharedActionContext,
     nested_views: &NestedViews,
     code_meta: &SharedCodeMeta,
+    math_enabled: &SharedMathEnabled,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -682,9 +744,9 @@ fn render_table_block(
         }
         s.entity.clone()
     });
-    nested_views.lock().unwrap().insert(data.key.clone(), entity.clone());
+    nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
 
-    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), false);
+    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), math_enabled.clone(), false);
     let table_view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),

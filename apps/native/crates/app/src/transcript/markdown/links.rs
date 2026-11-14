@@ -107,7 +107,7 @@ pub fn handle_markdown_link_click(
         }
         MarkdownLinkKind::File(file) => {
             if let Some(ctx) = action_ctx {
-                open_file_link(&file, event, &ctx.state, cx);
+                open_file_link(&file, event, ctx, cx);
             } else if file.media_kind == FileLinkMediaKind::Pdf || file.full_path.starts_with('/') {
                 cx.open_url(&file_url(&file.full_path));
             }
@@ -178,18 +178,41 @@ pub fn open_thread_link(target: &ThreadLinkTarget, state: &Entity<AppState>, cx:
     });
 }
 
-fn open_file_link(file: &ResolvedFileLink, event: &ClickEvent, state: &Entity<AppState>, cx: &mut App) {
+fn resolve_action_target(ctx: &MarkdownActionContext, app: &AppState) -> (Option<String>, Option<String>) {
+    let thread_id = ctx.thread_id.clone().or_else(|| app.selected_thread.clone());
+    let cwd = ctx
+        .cwd
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            thread_id.as_deref().and_then(|id| {
+                let thread = app.thread_shell(id)?;
+                let project = app.shell.project(&thread.project_id)?;
+                let root = thread.worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone());
+                (!root.is_empty()).then_some(root)
+            })
+        })
+        .or_else(|| app.file_workspace().map(|w| w.cwd));
+    (thread_id, cwd)
+}
+
+fn open_file_link(file: &ResolvedFileLink, event: &ClickEvent, ctx: &MarkdownActionContext, cx: &mut App) {
+    let state = &ctx.state;
     if event.modifiers().alt {
-        reveal_or_open_in_editor(state, file, true, cx);
+        reveal_or_open_in_editor(ctx, file, true, cx);
         return;
     }
     if event.modifiers().platform {
-        reveal_or_open_in_editor(state, file, false, cx);
+        reveal_or_open_in_editor(ctx, file, false, cx);
         return;
     }
     if file.media_kind == FileLinkMediaKind::Pdf {
+        let target_thread = {
+            let app = state.read(cx);
+            resolve_action_target(ctx, app).0
+        };
         if let Some(previews) = crate::preview::previews(cx)
-            && let Some(thread_id) = state.read(cx).selected_thread.clone()
+            && let Some(thread_id) = target_thread
         {
             previews.update(cx, |p, cx| p.open_link(thread_id, file_url(&file.full_path), cx));
         } else {
@@ -197,17 +220,26 @@ fn open_file_link(file: &ResolvedFileLink, event: &ClickEvent, state: &Entity<Ap
         }
         return;
     }
-    let has_workspace = state.read(cx).file_workspace().is_some();
-    if has_workspace {
-        state.update(cx, |app, cx| app.open_file(&file.full_path, file.line, cx));
+    let (panel_open, action_cwd) = {
+        let app = state.read(cx);
+        (app.panel_thread().is_some(), resolve_action_target(ctx, app).1)
+    };
+    if panel_open && let Some(cwd) = action_cwd {
+        let target = t3_core::files::file_surface_path(&file.full_path, Some(&cwd));
+        state.update(cx, |app, cx| {
+            app.mutate_panels(cx, |panels, thread| panels.panels.open_file(thread, target.as_deref(), file.line));
+        });
     } else if file.full_path.starts_with('/') {
         cx.open_url(&file_url(&file.full_path));
     }
 }
 
-fn reveal_or_open_in_editor(state: &Entity<AppState>, file: &ResolvedFileLink, reveal: bool, cx: &mut App) {
-    let target = state.read(cx).file_workspace();
-    let cwd = target.as_ref().map(|w| w.cwd.clone()).unwrap_or_else(|| "/".to_owned());
+fn reveal_or_open_in_editor(ctx: &MarkdownActionContext, file: &ResolvedFileLink, reveal: bool, cx: &mut App) {
+    let state = &ctx.state;
+    let cwd = {
+        let app = state.read(cx);
+        resolve_action_target(ctx, app).1.unwrap_or_else(|| "/".to_owned())
+    };
     let path_for_editor = file.relative_path.as_deref().unwrap_or(&file.full_path);
 
     if reveal {
@@ -246,8 +278,8 @@ fn open_external_link(url: &str, action_ctx: Option<&MarkdownActionContext>, cx:
     {
         let app = ctx.state.read(cx);
         let environment = app.environment();
-        let project = app
-            .selected_thread
+        let target_thread = resolve_action_target(ctx, app).0;
+        let project = target_thread
             .as_deref()
             .and_then(|id| app.thread_shell(id))
             .map(|t| t.project_id.as_str())
@@ -321,22 +353,22 @@ pub fn navigate_to_citation_source(citation: Citation, state: &Entity<AppState>,
 /// Runs a closed shell fence in the active thread's terminal drawer (`Run in terminal`).
 pub fn run_shell_code_block(command: &str, action_ctx: Option<&MarkdownActionContext>, window: &mut Window, cx: &mut App) {
     let Some(ctx) = action_ctx else { return };
-    let (workspace, client, runtime) = {
+    let (thread_id, cwd, client, runtime) = {
         let app = ctx.state.read(cx);
-        let Some(ws) = app.file_workspace() else {
+        let (Some(tid), Some(cwd)) = resolve_action_target(ctx, app) else {
             ctx.state.update(cx, |app, cx| {
                 app.show_toast(Toast::new(ToastKind::Error, "Open a project thread to run shell commands"), cx);
             });
             return;
         };
         let Some(client) = app.client_handle() else { return };
-        (ws, client, app.runtime().clone())
+        (tid, cwd, client, app.runtime().clone())
     };
 
     let seq = TERMINAL_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
     let terminal_id = format!("md-run-{seq}");
-    let open = project_scripts::open_terminal(&workspace.thread_id, &terminal_id, &workspace.cwd, None);
-    let write = project_scripts::write_terminal(&workspace.thread_id, &terminal_id, &project_scripts::terminal_input(command));
+    let open = project_scripts::open_terminal(&thread_id, &terminal_id, &cwd, None);
+    let write = project_scripts::write_terminal(&thread_id, &terminal_id, &project_scripts::terminal_input(command));
     window.dispatch_action(Box::new(crate::worktree_setup::OpenSetupTerminal { terminal_id }), cx);
 
     let state = ctx.state.clone();
@@ -359,5 +391,110 @@ fn file_url(path: &str) -> String {
         format!("file://{path}")
     } else {
         format!("file:///{}", path.replace('\\', "/"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AppContext;
+    use t3_core::shell::{ShellSnapshot, ShellState};
+
+    #[gpui::test]
+    fn resolve_action_target_prefers_side_chat_thread_and_cwd_over_selected_thread(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        state.update(cx, |app, _| {
+            let projects = [("p-primary", "/tmp/primary-root"), ("p-side", "/tmp/side-root")]
+                .into_iter()
+                .map(|(id, path)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id,
+                        "title": id,
+                        "workspaceRoot": path,
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            let threads = [("t-primary", "p-primary", "/tmp/primary-wt"), ("t-side", "p-side", "/tmp/side-shell-wt")]
+                .into_iter()
+                .map(|(id, project_id, wt)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id,
+                        "projectId": project_id,
+                        "title": id,
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z",
+                        "lastVisitedAt": null,
+                        "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "runtimeMode": "auto",
+                        "interactionMode": "default",
+                        "worktreePath": wt,
+                        "lineage": {"rootThreadId": id},
+                        "status": "idle",
+                        "hasActionableProposedPlan": false,
+                        "itemCount": 0,
+                        "visibleItemCount": 0
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            let mut shell = ShellState::default();
+            shell.snapshot = Some(ShellSnapshot {
+                projects,
+                threads,
+                ..Default::default()
+            });
+            app.shell = shell;
+            app.selected_thread = Some("t-primary".into());
+        });
+
+        cx.update(|cx| {
+            let app = state.read(cx);
+            let owner = state.entity_id();
+            let explicit_ctx = MarkdownActionContext {
+                state: state.clone(),
+                owner,
+                thread_id: Some("t-side".into()),
+                cwd: Some("/tmp/side-explicit".into()),
+                thread_view: None,
+            };
+            assert_eq!(
+                resolve_action_target(&explicit_ctx, app),
+                (Some("t-side".into()), Some("/tmp/side-explicit".into()))
+            );
+
+            let thread_only_ctx = MarkdownActionContext {
+                state: state.clone(),
+                owner,
+                thread_id: Some("t-side".into()),
+                cwd: None,
+                thread_view: None,
+            };
+            assert_eq!(
+                resolve_action_target(&thread_only_ctx, app),
+                (Some("t-side".into()), Some("/tmp/side-shell-wt".into()))
+            );
+
+            let fallback_ctx = MarkdownActionContext {
+                state: state.clone(),
+                owner,
+                thread_id: None,
+                cwd: None,
+                thread_view: None,
+            };
+            assert_eq!(
+                resolve_action_target(&fallback_ctx, app),
+                (Some("t-primary".into()), Some("/tmp/primary-wt".into()))
+            );
+        });
     }
 }
