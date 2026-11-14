@@ -176,7 +176,6 @@ pub struct Composer {
     picker: Entity<ModelPicker>,
     picker_open: bool,
     permissions_open: bool,
-    approval_menu_open: bool,
     plan_menu_open: bool,
     choices: HashMap<Target, Choices>,
     /// The model and mode a new draft starts from: what the thread before it ran.
@@ -188,6 +187,8 @@ pub struct Composer {
     answers: HashMap<String, Answers>,
     /// The request whose active question the prompt edits, and the prompt it set aside.
     answering: Option<String>,
+    question_collapsed: Option<String>,
+    question_markdown: crate::transcript::markdown::MarkdownStore,
     stash: Option<String>,
     sending: bool,
     pending_send: t3_core::composer::attachments::PendingSend,
@@ -363,7 +364,6 @@ impl Composer {
                         let _ = this.cancel_pending_send();
                         this.picker_open = false;
                         this.permissions_open = false;
-                        this.approval_menu_open = false;
                         this.plan_menu_open = false;
                         this.workspace.open = false;
                         this.close_stash_menu(cx);
@@ -411,7 +411,6 @@ impl Composer {
             picker,
             picker_open: false,
             permissions_open: false,
-            approval_menu_open: false,
             plan_menu_open: false,
             choices: HashMap::new(),
             carry: (None, None),
@@ -421,6 +420,8 @@ impl Composer {
             responding: HashSet::new(),
             answers: HashMap::new(),
             answering: None,
+            question_collapsed: None,
+            question_markdown: crate::transcript::markdown::MarkdownStore::new(cx.entity_id()),
             stash: None,
             sending: false,
             pending_send: Default::default(),
@@ -557,7 +558,6 @@ impl Composer {
             self.switch_draft(previous.as_ref(), next.target.as_ref(), window, cx);
             self.picker_open = false;
             self.permissions_open = false;
-            self.approval_menu_open = false;
             self.error = None;
             self.auto_advance = None;
             if matches!(next.target, Some(Target::Draft(_))) {
@@ -576,7 +576,7 @@ impl Composer {
             if let Ok(parts) = serde_json::from_str::<Vec<String>>(request_id) {
                 return parts.len() == 3 && (!next.loaded || parts[0] != next.environment || Some(&parts[1]) != next.target.as_ref().and_then(|target| if let Target::Thread(id) = target { Some(id) } else { None }) || pending_ids.iter().any(|id| **id == parts[2]));
             }
-            pending_ids.contains(&request_id) || next.pending.approvals.iter().any(|approval| approval.request_id == *request_id)
+            pending_ids.contains(&request_id)
         });
         self.snapshot = next;
         self.sync_provider_target(cx);
@@ -1784,5 +1784,163 @@ mod stream_error_tests {
         });
         vcx.update(|window, cx| window.draw(cx).clear());
         assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+    }
+
+    #[gpui::test]
+    fn pending_user_input_question_collapses_renders_markdown_toasts_displaced_text_and_gates_operate_scope(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let (op_client, _op_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let apply_question_snapshot = |state: &mut AppState, cx: &mut Context<AppState>| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t-q", "projectId": "checkout-a", "title": "Question Thread",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t-q"},
+                "status": "running", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+            }))
+            .unwrap()];
+            state.shell = shell;
+            state.select_thread("t-q", cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot",
+                "snapshotSequence": 1,
+                "hasMoreHistory": false,
+                "projection": {
+                    "thread": {
+                        "id": "t-q", "projectId": "checkout-a", "title": "Question Thread",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t-q"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "running",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+                        "completedAt": null
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [],
+                    "runtimeRequests": [{
+                        "id": "q-req-1",
+                        "kind": "user_input",
+                        "status": "pending",
+                        "responseCapability": { "type": "live" },
+                        "createdAt": "2026-04-01T00:00:02.000Z"
+                    }],
+                    "messages": [], "plans": [],
+                    "turnItems": [{
+                        "id": "item-q1",
+                        "threadId": "t-q",
+                        "runId": "r1",
+                        "nodeId": null,
+                        "parentItemId": null,
+                        "ordinal": 1,
+                        "status": "running",
+                        "title": null,
+                        "startedAt": "2026-04-01T00:00:02.000Z",
+                        "completedAt": null,
+                        "updatedAt": "2026-04-01T00:00:02.000Z",
+                        "type": "user_input_request",
+                        "requestId": "q-req-1",
+                        "providerRequestId": "q-req-1",
+                        "statusDetail": "pending",
+                        "questions": [{
+                            "id": "q1",
+                            "header": "Mode",
+                            "question": "Pick **mode** with `Markdown`?",
+                            "multiSelect": false,
+                            "options": [{"label": "Fast", "value": "fast", "description": "Use fast mode"}]
+                        }],
+                        "answers": null
+                    }],
+                    "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+            cx.emit(AppEvent::Selection);
+        };
+
+        state.update(cx, |state, cx| {
+            state.install_active_environment(read_client, shell.clone(), state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            apply_question_snapshot(state, cx);
+        });
+
+        let (composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("question-toggle").is_some());
+        assert!(vcx.debug_bounds("question-body").is_some());
+
+        // Without orchestration:operate scope, digit selection is ignored and drafts stay untouched.
+        composer.update(vcx, |composer, cx| {
+            assert!(!composer.can_answer(cx));
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert!(!composer.pick_by_digit(1, window, cx));
+            });
+        });
+
+        // Switch to operate scope, verify collapse hides the body and disables digit shortcuts.
+        state.update(vcx, |state, cx| {
+            state.install_active_environment(op_client, shell.clone(), state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            apply_question_snapshot(state, cx);
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        composer.update(vcx, |composer, cx| {
+            assert!(composer.can_answer(cx));
+            composer.question_collapsed = Some("q1".to_owned());
+            cx.notify();
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("question-toggle").is_some());
+        assert!(vcx.debug_bounds("question-body").is_none());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert!(!composer.pick_by_digit(1, window, cx));
+                composer.question_collapsed = None;
+                cx.notify();
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("question-body").is_some());
+
+        // Typing custom text then picking an option displaces the text and emits the info toast.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("my typed answer", window, cx);
+                composer.on_prompt_change(cx);
+                assert!(composer.pick_by_digit(1, window, cx));
+            });
+        });
+        let toast_title = state.read_with(vcx, |state, _| state.toasts.latest().map(|t| t.title.to_string()));
+        assert_eq!(toast_title.as_deref(), Some("Your typed text was set aside"));
     }
 }

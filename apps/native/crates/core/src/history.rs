@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::thread::{ApplyOptions, ProjectedTurnItem, ThreadProjection, ThreadState, Visibility, is_item_visible};
+use crate::thread::{ApplyOptions, ItemVisibilityFilter, ProjectedTurnItem, ThreadProjection, ThreadState, Visibility};
 use crate::turn_item::{TurnItem, TurnItemKind};
 use crate::wire;
 
@@ -175,6 +175,7 @@ pub fn merge_older_history_with_work(
     for item in projection.turn_items.iter().filter(|item| page_item_ids.contains(item.id.as_str())) {
         known.insert(item.id.as_str(), item);
     }
+    let visibility_filter = ItemVisibilityFilter::new(projection);
     let mut page: Vec<ProjectedTurnItem> = Vec::new();
     let mut page_keys: HashSet<(String, String)> = HashSet::new();
     let mut dropped: HashSet<usize> = HashSet::new();
@@ -196,7 +197,7 @@ pub fn merge_older_history_with_work(
             if !matches!(
                 item.kind,
                 TurnItemKind::RunInterruptRequest { .. } | TurnItemKind::ApprovalRequest { .. } | TurnItemKind::UserInputRequest { .. }
-            ) || !is_item_visible(projection, item)
+            ) || !visibility_filter.is_visible(item)
             {
                 continue;
             }

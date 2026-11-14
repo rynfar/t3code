@@ -27,6 +27,7 @@ use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, 
 /// The lines after the last row, in the web's order.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct FooterLines {
+    unmatched_approvals: Vec<t3_core::requests::PendingApproval>,
     stop: Option<RunStop>,
     /// Subagents and side chats waiting on the user.
     children: Option<ChildInputs>,
@@ -40,7 +41,13 @@ struct FooterLines {
 
 impl FooterLines {
     fn is_shown(&self) -> bool {
-        self.stop.is_some() || self.children.is_some() || self.background.is_some() || self.syncing.is_some() || self.goal.is_some() || self.status.is_some()
+        !self.unmatched_approvals.is_empty()
+            || self.stop.is_some()
+            || self.children.is_some()
+            || self.background.is_some()
+            || self.syncing.is_some()
+            || self.goal.is_some()
+            || self.status.is_some()
     }
 }
 
@@ -241,6 +248,7 @@ impl ThreadView {
         let turn_items = thread.projection.as_ref().map(|projection| projection.turn_items.as_slice());
         let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
         let next = FooterLines {
+            unmatched_approvals: self.unmatched_pending_approvals(),
             stop: thread.projection.as_ref().and_then(|projection| run_stop(projection, background)),
             children,
             background: shell.filter(|_| !working).and_then(|shell| match turn_items {
@@ -343,7 +351,7 @@ impl ThreadView {
         cx.notify();
     }
 
-    fn remeasure_footer(&self) {
+    pub(super) fn remeasure_footer(&self) {
         if self.footer.lines.is_shown() {
             let end = self.header_count() + self.rows.len();
             self.list.remeasure_items(end..end + 1);
@@ -403,13 +411,17 @@ impl ThreadView {
             .into_any_element()
     }
 
-    pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let muted = hsla(p.muted_foreground);
         let detail = if cx.theme().is_dark() { muted.opacity(0.6) } else { muted.opacity(0.8) };
         let line = || h_flex().w_full().min_w_0().gap(px(6.)).px(px(4.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(muted);
         let actions = || h_flex().flex_none().ml(px(6.)).gap(px(10.));
         let mut lines: Vec<AnyElement> = Vec::new();
+        let unmatched = self.footer.lines.unmatched_approvals.clone();
+        for approval in &unmatched {
+            lines.push(self.with_env(|env, _| crate::transcript::approval_card(approval, None, false, env, cx)));
+        }
         let stop_line = self.footer.lines.stop.as_ref().map(|stop| {
             let icon = if stop.unresponsive { Icon::TriangleAlert.render(px(14.), hsla(p.warning_foreground)) } else { Icon::CircleStop.render(px(14.), muted) };
             let can_force = stop.unresponsive && self.state.read(cx).server_config.config.as_ref().is_some_and(|config| config.environment.capabilities.thread_force_stop == Some(true));

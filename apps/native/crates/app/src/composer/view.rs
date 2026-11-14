@@ -56,9 +56,10 @@ impl Composer {
     pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placeholder = self.placeholder(cx);
         let disabled = self.is_rewinding(cx)
-            || self.active_question().is_some_and(|(request_id, question)| {
-                !question.allows_custom_answer() || self.question_responding(&request_id, cx)
-            });
+            || self.active_input().is_some_and(|input| {
+                !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
+            })
+            || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer());
         if self.input_state == Some((placeholder, disabled)) {
             return;
         }
@@ -194,7 +195,7 @@ impl Composer {
                 }))
         };
         if let (Some(input), Some(progress)) = (self.active_input(), self.progress(cx)) {
-            let responding = rewinding || self.question_responding(&input.request_id, cx) || !input.can_respond();
+            let responding = rewinding || !self.can_answer(cx) || self.question_responding(&input.request_id, cx) || !input.can_respond();
             let enabled = if progress.is_last_question { progress.is_complete } else { progress.can_advance };
             return h_flex()
                 .gap(px(8.))
@@ -270,14 +271,13 @@ impl Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.question_markdown.begin_frame();
         self.sync_input_state(window, cx);
         let resolved = self.resolve(cx);
         let rewinding = self.is_rewinding(cx);
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let error = self.error.clone().or_else(|| self.snapshot.last_error.clone());
-        let approval = self.snapshot.pending.approvals.first().cloned();
-        let approval_count = self.snapshot.pending.approvals.len();
         let question = self.active_input().cloned();
         let surface = hsla(p.composer_surface);
         let outline = hsla(p.composer_outline);
@@ -346,10 +346,9 @@ impl Render for Composer {
                     if this.close_context_details(cx) {
                         return;
                     }
-                    if this.workspace.open || this.permissions_open || this.approval_menu_open {
+                    if this.workspace.open || this.permissions_open {
                         this.workspace.open = false;
                         this.permissions_open = false;
-                        this.approval_menu_open = false;
                         cx.notify();
                     } else {
                         cx.propagate();
@@ -365,11 +364,8 @@ impl Render for Composer {
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))) && self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_branch_mismatch_banner(cx)))
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_usage_limits_banner(false, cx)))
-                .children(question.as_ref().map(|input| self.render_question(input, cx)))
-                .when(question.is_none(), |this| {
-                    this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))
-                })
-                .when(question.is_none() && approval.is_none(), |this| {
+                .when_some(question, |this, input| this.child(self.render_question(&input, cx)))
+                .when(self.active_input().is_none(), |this| {
                     this.children(self.active_plan_follow_up(cx).map(|plan| self.render_plan_follow_up_banner(plan, cx)))
                 })
                 .children(self.render_stash_badge(cx))

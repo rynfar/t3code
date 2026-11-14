@@ -31,6 +31,7 @@ pub use command_output::CommandOutputSlot;
 pub use notices::history_control;
 pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_button, inline_button};
 pub use timer::{TimerKind, WorkingTimer};
+pub use work::approval_card;
 pub use worktree_setup::SetupEnv;
 
 /// Loading and retry error status for one expanded run or attempt fold (`useDeferredWorkLoading`).
@@ -93,7 +94,13 @@ pub struct RowEnv<'a> {
     pub clock: Clock,
     pub workspace_root: Option<&'a str>,
     pub ui: &'a TranscriptUi,
-    pub pending_approvals: &'a HashSet<String>,
+    pub approvals: &'a [t3_core::requests::PendingApproval],
+    pub responding_approvals: &'a HashSet<String>,
+    pub open_approval_menu: Option<&'a str>,
+    pub open_approval_override: Option<&'a str>,
+    pub approval_errors: &'a HashMap<String, String>,
+    pub can_operate_thread: bool,
+    pub rewinding: bool,
     pub window_height: f32,
     pub details: &'a HashMap<String, Detail>,
     /// Scroll state of each open work group's own virtualized list.

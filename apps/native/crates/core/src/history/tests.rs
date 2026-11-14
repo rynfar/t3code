@@ -217,3 +217,77 @@ fn non_advancing_complete_page_fails_even_when_auto_page_is_off() {
     assert!(!state.history.loading);
     assert_eq!(state.history.error.as_deref(), Some("History did not advance."));
 }
+
+fn question_item(id: &str, run_id: &str, ordinal: u64, request_id: &str) -> Value {
+    json!({
+        "id": id, "threadId": "t1", "runId": run_id, "nodeId": null, "parentItemId": null,
+        "ordinal": ordinal, "status": "running", "title": null,
+        "startedAt": T, "completedAt": null, "updatedAt": T,
+        "type": "user_input_request",
+        "requestId": request_id, "providerRequestId": request_id, "statusDetail": "pending",
+        "questions": [{
+            "id": "q1", "header": "Confirm", "question": "Proceed?", "options": []
+        }],
+        "answers": null
+    })
+}
+
+fn question_row(id: &str, run_id: &str, ordinal: u64, position: usize, request_id: &str) -> Value {
+    json!({
+        "position": position, "visibility": "local", "sourceThreadId": "t1",
+        "sourceItemId": id, "item": question_item(id, run_id, ordinal, request_id)
+    })
+}
+
+fn snapshot_with_pending_question(run_status: &str) -> ThreadStreamItem {
+    serde_json::from_value(json!({
+        "kind": "snapshot", "snapshotSequence": 5, "historyCursor": "c1", "hasMoreHistory": true,
+        "latestLocalTurnOrdinal": 20,
+        "projection": {
+            "thread": thread(),
+            "runs": [{
+                "id": "r-old", "threadId": "t1", "ordinal": 1, "providerInstanceId": "codex",
+                "modelSelection": {"instanceId": "codex", "model": "gpt"}, "userMessageId": "m0",
+                "rootNodeId": null, "status": run_status, "requestedAt": T, "startedAt": T, "completedAt": T
+            }],
+            "attempts": [], "nodes": [], "subagents": [], "providerSessions": [], "providerThreads": [],
+            "providerTurns": [],
+            "runtimeRequests": [{
+                "id": "req-1", "threadId": "t1", "runId": "r-old", "providerSessionId": "s1",
+                "kind": "user_input", "status": "pending",
+                "responseCapability": { "type": "live" },
+                "createdAt": T, "requestedAt": T, "resolvedAt": null
+            }],
+            "messages": [], "plans": [],
+            "turnItems": [question_item("req-item", "r-old", 1, "req-1"), item("recent", 2)],
+            "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+            "visibleTurnItems": [row("recent", 2, 0)],
+            "updatedAt": T
+        }
+    }))
+    .unwrap()
+}
+
+#[test]
+fn pending_question_from_completed_run_stays_actionable_and_pages_back_while_rolled_back_drops() {
+    let mut completed = ThreadState::default();
+    completed.apply(snapshot_with_pending_question("completed"));
+    let pending = crate::requests::pending_requests(completed.projection.as_ref().unwrap());
+    assert_eq!(pending.user_inputs.len(), 1);
+    assert_eq!(pending.user_inputs[0].request_id, "req-1");
+    let cursor = completed.begin_history_load().unwrap();
+    let older = decode_history_page(json!({
+        "snapshotSequence": 5,
+        "items": [question_row("req-item", "r-old", 1, 0, "req-1")],
+        "nextCursor": null, "hasMoreHistory": false
+    }))
+    .unwrap();
+    assert_eq!(completed.apply_history_page(&cursor, older.clone()), HistoryStep::Done);
+    assert_eq!(visible(&completed), ["req-item", "recent"]);
+
+    let mut rolled_back = ThreadState::default();
+    rolled_back.apply(snapshot_with_pending_question("rolled_back"));
+    let cursor = rolled_back.begin_history_load().unwrap();
+    assert_eq!(rolled_back.apply_history_page(&cursor, older), HistoryStep::Done);
+    assert_eq!(visible(&rolled_back), ["recent"]);
+}
